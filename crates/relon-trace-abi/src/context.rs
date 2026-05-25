@@ -24,11 +24,17 @@
 //! | 2   | `deopt_state`                 | `Option<DeoptStateSnapshot>`        |
 //! | 3   | `host_hooks`                  | `HostHookTable`                     |
 //! | 4   | `pending_recoverable_writes`  | `Vec<RecoverableWriteRecord>`       |
+//! | 5   | `dict_lookup_ic`              | `[DictIcSlot; DICT_LOOKUP_IC_SLOT_COUNT]` |
 //!
 //! Putting `ssa_slots` first lets the emitter address it through a
 //! zero-offset load of the context pointer — the most frequent
 //! operation in the trace body. `result_slot` follows so its offset
 //! (16 = sizeof(Box fat ptr)) is also constant-known at emit time.
+//!
+//! Idx 5 (`dict_lookup_ic`) was appended after the original 5-field
+//! contract; emitter callers always resolve offsets through
+//! `mem::offset_of!`, so re-ordering here only requires re-running
+//! the layout smoke tests.
 
 use crate::deopt::{DeoptStateSnapshot, RecoverableWriteRecord};
 
@@ -131,6 +137,64 @@ pub struct HostHookTable {
 unsafe impl Send for HostHookTable {}
 unsafe impl Sync for HostHookTable {}
 
+/// Slot count of the trace-local dict-lookup inline cache embedded
+/// in [`TraceContext::dict_lookup_ic`]. Power-of-two so cranelift
+/// can mask the slot index with a single `band` instead of a `urem`.
+///
+/// 16 is intentionally small: per-context residency dominates working
+/// set on cold traces, and per-call entry to the helper amortises
+/// the IC writeback only when the cache hit rate is meaningfully
+/// above slot count / live key count. W5 (10 hot keys) sits well
+/// inside the 16-slot budget; broader workloads degrade to the
+/// helper call.
+pub const DICT_LOOKUP_IC_SLOT_COUNT: usize = 16;
+
+/// One slot of the inline cache the cranelift emitter probes before
+/// calling `__relon_trace_dict_lookup_prechecked_v2`.
+///
+/// `#[repr(C)]` is load-bearing: the emitter accesses `dict_ptr`,
+/// `key_ptr`, `value` via raw byte offsets resolved through
+/// `mem::offset_of!` at lowering time. Field order is **fixed**.
+///
+/// ## Probe contract
+///
+/// - **Tag**: the pair `(dict_ptr, key_ptr)` of raw pointers. The
+///   matching `DictShapeGuard` upstream already verified the dict's
+///   shape header before the loop body, so a pointer-equal `dict_ptr`
+///   identifies the same record envelope. The `key_ptr` is the
+///   trace's incoming key SSA — for string-key dicts this is the
+///   `StringRef` pointer, which is stable for as long as the trace's
+///   arena holds the key alive.
+/// - **Value**: the dict-lookup result the helper would have
+///   returned. Cached on miss so subsequent hits skip the extern
+///   call boundary entirely.
+/// - **Empty slot**: all fields zero. The emitter initialises every
+///   `TraceContext` IC array to zero and the host runtime never
+///   stores a zero key/dict pointer (both are real heap addresses),
+///   so a zero `dict_ptr` is a reliable "empty" sentinel.
+///
+/// ## ABA safety
+///
+/// In the production trace path, `dict_ptr` and `key_ptr` outlive
+/// the trace (they live in the recorder's evaluator arenas), so
+/// pointer identity is sufficient. Unit tests that synthesise dict
+/// / key records on the stack inside a tight loop should call
+/// [`TraceContext::reset_dict_lookup_ic`] between cases to avoid
+/// false hits from address reuse.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DictIcSlot {
+    /// Dict record pointer the slot caches a lookup for. Zero when
+    /// the slot is empty.
+    pub dict_ptr: u64,
+    /// Key record pointer the slot caches a lookup for. Zero when
+    /// the slot is empty.
+    pub key_ptr: u64,
+    /// Cached i64 value the helper returned for `(dict_ptr,
+    /// key_ptr)`. Meaningful only when the slot is occupied.
+    pub value: u64,
+}
+
 /// The runtime state every cranelift-emitted trace operates on.
 ///
 /// **Layout invariant**: field order is load-bearing. See the module
@@ -161,6 +225,14 @@ pub struct TraceContext {
     /// deopt path drains the entire vector into
     /// `deopt_state.recoverable_writes` and clears it.
     pub pending_recoverable_writes: Vec<RecoverableWriteRecord>,
+    /// Per-context inline cache the cranelift emitter probes inline
+    /// before falling through to the `__relon_trace_dict_lookup_*`
+    /// helper. See [`DictIcSlot`] for the probe contract and slot
+    /// layout.
+    ///
+    /// Sized to [`DICT_LOOKUP_IC_SLOT_COUNT`] so the emitter can
+    /// mask the slot index with a single `band` instead of `urem`.
+    pub dict_lookup_ic: [DictIcSlot; DICT_LOOKUP_IC_SLOT_COUNT],
 }
 
 impl TraceContext {
@@ -172,6 +244,7 @@ impl TraceContext {
             deopt_state: None,
             host_hooks: HostHookTable::default(),
             pending_recoverable_writes: Vec::new(),
+            dict_lookup_ic: [DictIcSlot::default(); DICT_LOOKUP_IC_SLOT_COUNT],
         }
     }
 
@@ -193,6 +266,22 @@ impl TraceContext {
             deopt_state: None,
             host_hooks,
             pending_recoverable_writes: Vec::new(),
+            dict_lookup_ic: [DictIcSlot::default(); DICT_LOOKUP_IC_SLOT_COUNT],
+        }
+    }
+
+    /// Clear all [`DICT_LOOKUP_IC_SLOT_COUNT`] dict-lookup IC slots
+    /// back to the "empty" sentinel (`dict_ptr` / `key_ptr` / `value`
+    /// all zero).
+    ///
+    /// Mostly used by unit tests that synthesise dict / key records
+    /// on the stack inside a loop where address reuse would
+    /// otherwise produce false IC hits. Production traces don't
+    /// need to call this — the IC self-evicts naturally as new
+    /// (dict, key) pairs hash into existing slots.
+    pub fn reset_dict_lookup_ic(&mut self) {
+        for slot in self.dict_lookup_ic.iter_mut() {
+            *slot = DictIcSlot::default();
         }
     }
 
@@ -214,6 +303,11 @@ impl Default for TraceContext {
 
 impl std::fmt::Debug for TraceContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ic_occupied = self
+            .dict_lookup_ic
+            .iter()
+            .filter(|s| s.dict_ptr != 0)
+            .count();
         f.debug_struct("TraceContext")
             .field("ssa_slots_len", &self.ssa_slots.len())
             .field("result_slot", &self.result_slot)
@@ -223,6 +317,7 @@ impl std::fmt::Debug for TraceContext {
                 "pending_recoverable_writes_len",
                 &self.pending_recoverable_writes.len(),
             )
+            .field("dict_lookup_ic_occupied", &ic_occupied)
             .finish()
     }
 }
@@ -273,5 +368,43 @@ mod tests {
         assert!(ctx.ssa_slots.is_empty());
         assert_eq!(ctx.result_slot, 0);
         assert!(ctx.deopt_state.is_none());
+    }
+
+    #[test]
+    fn dict_lookup_ic_starts_zeroed() {
+        let ctx = TraceContext::with_capacity(0);
+        assert_eq!(ctx.dict_lookup_ic.len(), DICT_LOOKUP_IC_SLOT_COUNT);
+        for slot in ctx.dict_lookup_ic.iter() {
+            assert_eq!(slot.dict_ptr, 0);
+            assert_eq!(slot.key_ptr, 0);
+            assert_eq!(slot.value, 0);
+        }
+    }
+
+    #[test]
+    fn reset_dict_lookup_ic_clears_all_slots() {
+        let mut ctx = TraceContext::with_capacity(0);
+        for (i, slot) in ctx.dict_lookup_ic.iter_mut().enumerate() {
+            slot.dict_ptr = 0x1000 + i as u64;
+            slot.key_ptr = 0x2000 + i as u64;
+            slot.value = 0x3000 + i as u64;
+        }
+        ctx.reset_dict_lookup_ic();
+        for slot in ctx.dict_lookup_ic.iter() {
+            assert_eq!(slot.dict_ptr, 0);
+            assert_eq!(slot.key_ptr, 0);
+            assert_eq!(slot.value, 0);
+        }
+    }
+
+    #[test]
+    fn dict_ic_slot_layout_is_3x_u64() {
+        // The emitter relies on these byte offsets when computing
+        // `slot_addr + 0/8/16` for the inline probe.
+        assert_eq!(std::mem::size_of::<DictIcSlot>(), 24);
+        assert_eq!(std::mem::align_of::<DictIcSlot>(), 8);
+        assert_eq!(std::mem::offset_of!(DictIcSlot, dict_ptr), 0);
+        assert_eq!(std::mem::offset_of!(DictIcSlot, key_ptr), 8);
+        assert_eq!(std::mem::offset_of!(DictIcSlot, value), 16);
     }
 }

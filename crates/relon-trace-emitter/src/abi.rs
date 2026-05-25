@@ -28,9 +28,9 @@
 use cranelift_codegen::ir;
 
 pub use relon_trace_abi::{
-    AbiSignature, AbiType, DeoptStateSnapshot, EffectClass, ExternalAddr, ExternalPc, ExternalSlot,
-    HostHookTable, ObservedType, RecoverableWriteRecord, TraceContext, TraceEntryStatus,
-    TRACE_ENTRY_SIG,
+    AbiSignature, AbiType, DeoptStateSnapshot, DictIcSlot, EffectClass, ExternalAddr, ExternalPc,
+    ExternalSlot, HostHookTable, ObservedType, RecoverableWriteRecord, TraceContext,
+    TraceEntryStatus, DICT_LOOKUP_IC_SLOT_COUNT, TRACE_ENTRY_SIG,
 };
 
 /// Backwards-compatible alias for the old emitter-local `CraneliftType`
@@ -123,6 +123,48 @@ pub const fn result_slot_offset() -> i32 {
 /// recompiling installed traces.
 pub const fn host_hooks_offset() -> i32 {
     std::mem::offset_of!(TraceContext, host_hooks) as i32
+}
+
+/// Byte offset of [`TraceContext::dict_lookup_ic`]. The cranelift
+/// emitter probes the inline cache before falling through to the
+/// `__relon_trace_dict_lookup_prechecked_v2` helper:
+///
+/// ```text
+/// slot_addr = ctx + dict_lookup_ic_offset() + slot_idx * dict_ic_slot_size()
+/// ```
+pub const fn dict_lookup_ic_offset() -> i32 {
+    std::mem::offset_of!(TraceContext, dict_lookup_ic) as i32
+}
+
+/// Size of a single [`DictIcSlot`] in bytes (3 × `u64` = 24 on every
+/// supported 64-bit target). The emitter scales the slot index by
+/// this constant when computing the probe address.
+pub const fn dict_ic_slot_size() -> i32 {
+    std::mem::size_of::<DictIcSlot>() as i32
+}
+
+/// Number of slots in the [`TraceContext::dict_lookup_ic`] array.
+/// Re-exported so the emitter can mask the slot index with
+/// `band slot_count - 1` (the layout invariant requires this to be a
+/// power of two).
+pub const fn dict_ic_slot_count() -> usize {
+    DICT_LOOKUP_IC_SLOT_COUNT
+}
+
+/// Byte offset of [`DictIcSlot::dict_ptr`] inside a single IC slot
+/// (always 0; explicit for emitter readability).
+pub const fn dict_ic_slot_dict_ptr_offset() -> i32 {
+    std::mem::offset_of!(DictIcSlot, dict_ptr) as i32
+}
+
+/// Byte offset of [`DictIcSlot::key_ptr`] inside a single IC slot.
+pub const fn dict_ic_slot_key_ptr_offset() -> i32 {
+    std::mem::offset_of!(DictIcSlot, key_ptr) as i32
+}
+
+/// Byte offset of [`DictIcSlot::value`] inside a single IC slot.
+pub const fn dict_ic_slot_value_offset() -> i32 {
+    std::mem::offset_of!(DictIcSlot, value) as i32
 }
 
 /// Byte offset of the supplied [`HostHookId`] slot **inside** the
@@ -318,6 +360,23 @@ mod tests {
         assert_eq!(sig.returns.len(), 1);
         assert_eq!(sig.params[0].value_type, ir::types::I64);
         assert_eq!(sig.returns[0].value_type, ir::types::I32);
+    }
+
+    #[test]
+    fn dict_ic_layout_constants_are_consistent() {
+        // Slot index must be maskable with a single `band`, so the
+        // slot count is required to be a power of two by the
+        // emitter's lowering contract.
+        assert!(dict_ic_slot_count().is_power_of_two());
+        assert_eq!(dict_ic_slot_size(), 24);
+        assert_eq!(dict_ic_slot_dict_ptr_offset(), 0);
+        assert_eq!(dict_ic_slot_key_ptr_offset(), 8);
+        assert_eq!(dict_ic_slot_value_offset(), 16);
+        // The IC array must land past every existing field — adding
+        // it after `pending_recoverable_writes` was a load-bearing
+        // ordering choice (existing emitter constants don't shift).
+        assert!(dict_lookup_ic_offset() > result_slot_offset());
+        assert!(dict_lookup_ic_offset() > host_hooks_offset());
     }
 
     #[test]

@@ -1524,11 +1524,53 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
     }
 
     /// F-D8-E.2/v2: lower `TraceOp::DictLookupPrechecked { dst,
-    /// dict_ptr, key_ptr }` to the collision-safe v2 helper. The
-    /// matching `DictShapeGuard` already verified the shape header
-    /// upstream, so this call skips only that compare; it still uses
-    /// the dict record length side table to bounds-check the record
-    /// and byte-compare key payloads after hash hits.
+    /// dict_ptr, key_ptr }` to a `TraceContext`-resident inline cache
+    /// probe with a `__relon_trace_dict_lookup_prechecked_v2` helper
+    /// fallback on miss.
+    ///
+    /// ## IR shape
+    ///
+    /// ```text
+    ///   probe:
+    ///     mix       = bxor dict_v, key_v
+    ///     slot_idx  = (mix >> 4) & (slot_count - 1)
+    ///     slot_addr = ctx + dict_lookup_ic_offset + slot_idx * 24
+    ///     cached_d  = load.i64 [slot_addr + 0]
+    ///     cached_k  = load.i64 [slot_addr + 8]
+    ///     hit_d     = icmp_eq cached_d, dict_v
+    ///     hit_k     = icmp_eq cached_k, key_v
+    ///     hit       = band hit_d, hit_k
+    ///     brif hit, hit_block, miss_block
+    ///
+    ///   hit_block:
+    ///     val = load.i64 [slot_addr + 16]
+    ///     jump merge_block(val)
+    ///
+    ///   miss_block:
+    ///     val' = call helper(dict_v, record_len, key_v, ctx)
+    ///     is_deopt = icmp_eq val', i64::MIN
+    ///     brif is_deopt, deopt_block(0, 0), store_block
+    ///
+    ///   store_block:
+    ///     store [slot_addr + 0]  = dict_v
+    ///     store [slot_addr + 8]  = key_v
+    ///     store [slot_addr + 16] = val'
+    ///     jump merge_block(val')
+    ///
+    ///   merge_block(val_final):
+    ///     bind dst to val_final
+    /// ```
+    ///
+    /// ## Hit-rate contract
+    ///
+    /// The matching `DictShapeGuard` is hoisted out of the loop by
+    /// the optimizer's `dict_ic_hoist` pass, so once a `(dict_ptr,
+    /// key_ptr)` pair has been resolved through the helper, every
+    /// subsequent loop iteration with the same key skips the extern
+    /// call. For workloads like W5 (10 hot keys, dict is the
+    /// per-iteration loop carrier) this collapses the per-key cost
+    /// from one helper call (~100ns including the v2 byte-payload
+    /// re-check) to ~6 loads + 2 compares (~5ns) on the hit path.
     fn emit_dict_lookup_prechecked(
         &mut self,
         dst: SsaVar,
@@ -1547,27 +1589,103 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
             .builder
             .ins()
             .iconst(self.pointer_ty, i64::from(record_len));
+
+        // --- IC probe ---------------------------------------------
+        // Slot index: mix the two pointers, discard the 4 low bits
+        // (both StringRef and dict records are at least 16-byte
+        // aligned, so the low nibble carries no entropy), mask down
+        // to the IC slot count.
+        let slot_count = crate::abi::dict_ic_slot_count();
+        debug_assert!(
+            slot_count.is_power_of_two(),
+            "dict-lookup IC slot count must be a power of two"
+        );
+        let mask = (slot_count - 1) as i64;
+        let mix = self.builder.ins().bxor(dict_v, key_v);
+        let shifted = self.builder.ins().ushr_imm(mix, 4);
+        let masked = self.builder.ins().band_imm(shifted, mask);
+        let slot_size = i64::from(crate::abi::dict_ic_slot_size());
+        let scaled = self.builder.ins().imul_imm(masked, slot_size);
+        let ic_base_off = i64::from(crate::abi::dict_lookup_ic_offset());
+        let slot_byte_off = self.builder.ins().iadd_imm(scaled, ic_base_off);
+        let slot_addr = self.builder.ins().iadd(self.trace_ctx_ptr, slot_byte_off);
+
+        let cached_d_off = crate::abi::dict_ic_slot_dict_ptr_offset();
+        let cached_k_off = crate::abi::dict_ic_slot_key_ptr_offset();
+        let cached_v_off = crate::abi::dict_ic_slot_value_offset();
+        let cached_d = self
+            .builder
+            .ins()
+            .load(I64, MemFlags::trusted(), slot_addr, cached_d_off);
+        let cached_k = self
+            .builder
+            .ins()
+            .load(I64, MemFlags::trusted(), slot_addr, cached_k_off);
+        let hit_d = self.builder.ins().icmp(IntCC::Equal, cached_d, dict_v);
+        let hit_k = self.builder.ins().icmp(IntCC::Equal, cached_k, key_v);
+        let hit = self.builder.ins().band(hit_d, hit_k);
+
+        let hit_block = self.builder.create_block();
+        let miss_block = self.builder.create_block();
+        let store_block = self.builder.create_block();
+        let merge_block = self.builder.create_block();
+        let merge_val = self.builder.append_block_param(merge_block, I64);
+
+        self.builder
+            .ins()
+            .brif(hit, hit_block, &[], miss_block, &[]);
+
+        // --- Hit: load cached value, jump to merge ----------------
+        self.builder.switch_to_block(hit_block);
+        self.builder.seal_block(hit_block);
+        let cached_val =
+            self.builder
+                .ins()
+                .load(I64, MemFlags::trusted(), slot_addr, cached_v_off);
+        self.builder
+            .ins()
+            .jump(merge_block, &[BlockArg::Value(cached_val)]);
+
+        // --- Miss: call helper, branch deopt on sentinel ----------
+        self.builder.switch_to_block(miss_block);
+        self.builder.seal_block(miss_block);
         let inst = self
             .builder
             .ins()
             .call(helper, &[dict_v, record_len_v, key_v, self.trace_ctx_ptr]);
-        let val = self.builder.inst_results(inst)[0];
-
+        let helper_val = self.builder.inst_results(inst)[0];
         let sentinel = self.builder.ins().iconst(I64, i64::MIN);
-        let miss = self.builder.ins().icmp(IntCC::Equal, val, sentinel);
-        let ok_block = self.builder.create_block();
+        let is_deopt = self.builder.ins().icmp(IntCC::Equal, helper_val, sentinel);
         let guard_pc = self.builder.ins().iconst(I32, 0);
         let external_pc = self.builder.ins().iconst(I64, 0);
         self.builder.ins().brif(
-            miss,
+            is_deopt,
             self.deopt_block,
             &[BlockArg::Value(guard_pc), BlockArg::Value(external_pc)],
-            ok_block,
+            store_block,
             &[],
         );
-        self.builder.seal_block(ok_block);
-        self.builder.switch_to_block(ok_block);
-        self.bind(dst, val);
+
+        // --- Helper succeeded: prime the IC slot, jump to merge ---
+        self.builder.switch_to_block(store_block);
+        self.builder.seal_block(store_block);
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), dict_v, slot_addr, cached_d_off);
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), key_v, slot_addr, cached_k_off);
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), helper_val, slot_addr, cached_v_off);
+        self.builder
+            .ins()
+            .jump(merge_block, &[BlockArg::Value(helper_val)]);
+
+        // --- Merge: the resolved value flows downstream -----------
+        self.builder.switch_to_block(merge_block);
+        self.builder.seal_block(merge_block);
+        self.bind(dst, merge_val);
         Ok(())
     }
 
@@ -2407,6 +2525,90 @@ mod tests {
             ..Default::default()
         };
         TraceEmitter::emit_with_hooks(&trace, &mut ctx, I64, hook_ids).expect("emit ok");
+    }
+
+    /// The inline IC lowering must emit a probe (mask + 2 loads +
+    /// 2 compares + brif) **before** the helper call, plus a hit
+    /// block that loads the cached value and a merge block that
+    /// rejoins both paths. Asserted via opcode count rather than
+    /// IR string-match so unrelated cranelift verifier changes
+    /// don't trip the test.
+    #[test]
+    fn dict_lookup_prechecked_emits_inline_ic_probe() {
+        use cranelift_codegen::ir::Opcode;
+
+        let mut b = TraceBuffer::new();
+        let dict = b.fresh_ssa();
+        let key = b.fresh_ssa();
+        let dst = b.fresh_ssa();
+        b.append(TraceOp::ConstI64 {
+            dst: dict,
+            value: 0x2000,
+        });
+        b.append(TraceOp::ConstI64 {
+            dst: key,
+            value: 0x3000,
+        });
+        b.append(TraceOp::DictShapeGuard {
+            dict_ptr: dict,
+            shape_hash: 0xfeed_face_dead_beef,
+        });
+        b.append(TraceOp::DictLookupPrechecked {
+            dst,
+            dict_ptr: dict,
+            key_ptr: key,
+        });
+        b.record_dict_record_len_hint(dict, 128);
+        b.append(TraceOp::Return { value: dst });
+
+        let trace = b.into_optimized();
+        let mut ctx = CodegenContext::new();
+        let hook_ids = HostHookFuncIds {
+            dict_lookup_prechecked: Some(9),
+            ..Default::default()
+        };
+        TraceEmitter::emit_with_hooks(&trace, &mut ctx, I64, hook_ids).expect("emit ok");
+
+        let func = &ctx.func;
+        let mut bxor_count = 0usize;
+        let mut band_count = 0usize;
+        let mut call_count = 0usize;
+        let mut brif_count = 0usize;
+        let mut store_count = 0usize;
+        for block in func.layout.blocks() {
+            for inst in func.layout.block_insts(block) {
+                match func.dfg.insts[inst].opcode() {
+                    Opcode::Bxor => bxor_count += 1,
+                    Opcode::Band => band_count += 1,
+                    Opcode::Call => call_count += 1,
+                    Opcode::Brif => brif_count += 1,
+                    Opcode::Store => store_count += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            bxor_count >= 1,
+            "IC probe must mix dict_ptr ^ key_ptr (bxor)"
+        );
+        assert!(
+            band_count >= 1,
+            "IC probe must AND the two pointer-equality bits into a single hit flag"
+        );
+        // Two helper calls expected: the dict lookup itself (miss
+        // path) + the shared deopt block's `save_deopt` call.
+        assert_eq!(
+            call_count, 2,
+            "miss path: helper call + shared save_deopt call"
+        );
+        assert!(
+            brif_count >= 2,
+            "lowering must branch at least on (hit?) and (helper deopt?)"
+        );
+        assert!(
+            store_count >= 3,
+            "store path must prime dict/key/value back to the IC slot"
+        );
     }
 
     #[test]

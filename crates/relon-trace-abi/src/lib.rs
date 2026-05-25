@@ -59,7 +59,8 @@ pub mod hash;
 pub mod observed;
 
 pub use context::{
-    HostHookTable, TraceContext, TraceHookFn, TraceIcLookupFn, TraceResolveCallFn, TraceSaveDeoptFn,
+    DictIcSlot, HostHookTable, TraceContext, TraceHookFn, TraceIcLookupFn, TraceResolveCallFn,
+    TraceSaveDeoptFn, DICT_LOOKUP_IC_SLOT_COUNT,
 };
 pub use deopt::{DeoptStateSnapshot, RecoverableWriteRecord};
 pub use effect::EffectClass;
