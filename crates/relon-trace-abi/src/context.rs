@@ -141,13 +141,20 @@ unsafe impl Sync for HostHookTable {}
 /// in [`TraceContext::dict_lookup_ic`]. Power-of-two so cranelift
 /// can mask the slot index with a single `band` instead of a `urem`.
 ///
-/// 16 is intentionally small: per-context residency dominates working
-/// set on cold traces, and per-call entry to the helper amortises
-/// the IC writeback only when the cache hit rate is meaningfully
-/// above slot count / live key count. W5 (10 hot keys) sits well
-/// inside the 16-slot budget; broader workloads degrade to the
-/// helper call.
-pub const DICT_LOOKUP_IC_SLOT_COUNT: usize = 16;
+/// **Sizing rationale**: under the birthday-paradox bound the
+/// expected number of key-on-key collisions for `k` live keys in
+/// `N` slots is roughly `k² / (2N)`. With 10 hot keys (the W5 hot
+/// path) at `N = 16` that's ~3 expected collisions and a ~95%
+/// chance of at least one — manifesting as bimodal bench variance
+/// (some process invocations get clean key layouts, others
+/// thrash). At `N = 32` the expected collisions drop to ~1.6 and
+/// the at-least-one probability drops to ~74%; at `N = 64` it
+/// drops to ~50% and ~54% respectively. We pick 32 as the
+/// inflection where the variance reduction outweighs the
+/// per-context residency cost (32 × 24B = 768B per
+/// `TraceContext`, still well under one 4 KiB page even with the
+/// surrounding fields).
+pub const DICT_LOOKUP_IC_SLOT_COUNT: usize = 32;
 
 /// One slot of the inline cache the cranelift emitter probes before
 /// calling `__relon_trace_dict_lookup_prechecked_v2`.

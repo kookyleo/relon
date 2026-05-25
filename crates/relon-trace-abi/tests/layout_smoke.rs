@@ -93,13 +93,13 @@ fn trace_context_size_is_stable() {
     //                                       carry `value_stack_copy`)
     //   host_hooks                      32 (4 x Option<fn ptr>)
     //   pending_recoverable_writes      24 (Vec<T> = (ptr, len, cap))
-    //   dict_lookup_ic                  384 (16 x DictIcSlot, 3 x u64 each)
-    // Total: 536 bytes on 64-bit targets.
+    //   dict_lookup_ic                  768 (32 x DictIcSlot, 3 x u64 each)
+    // Total: 920 bytes on 64-bit targets.
     //
     // If this assertion trips, *figure out which field grew* and
     // bump the expected size here AND update every emitter constant
     // that reads past the growing field.
-    assert_eq!(size_of::<TraceContext>(), 536);
+    assert_eq!(size_of::<TraceContext>(), 920);
 }
 
 #[test]
