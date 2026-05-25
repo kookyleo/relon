@@ -135,6 +135,24 @@ impl OptimizerPass for IvOverflowElim {
             }
         }
 
+        // Const-safe arithmetic overflow strip: `Mod a, b` cannot
+        // overflow except in the single `a == i64::MIN && b == -1`
+        // corner. If `b` is a known constant other than `-1`, the
+        // matching `Guard(ArithOverflow(dst))` is statically dead and
+        // we can drop it without inserting any runtime check. Saves a
+        // brif per Mod-in-hot-loop iteration (W5: `i % 10` per iter).
+        for (pc, op) in trace.ops.iter().enumerate() {
+            if let TraceOp::Guard {
+                kind: GuardKind::ArithOverflow(v),
+                ..
+            } = op
+            {
+                if mod_overflow_provably_safe(trace, *v) {
+                    drop_pcs.insert(pc);
+                }
+            }
+        }
+
         if drop_pcs.is_empty() {
             return report;
         }
@@ -144,6 +162,21 @@ impl OptimizerPass for IvOverflowElim {
         rebuild_with_entry_guards(trace, &drop_pcs, &entries);
         report
     }
+}
+
+/// True iff `v` is defined by `TraceOp::Mod { rhs }` with `rhs` a
+/// known constant other than `-1`. In that case the only overflow
+/// case (`i64::MIN % -1`) is unreachable and the corresponding
+/// `Guard(ArithOverflow(v))` is statically dead.
+fn mod_overflow_provably_safe(trace: &TraceBuffer, v: SsaVar) -> bool {
+    for op in &trace.ops {
+        if let TraceOp::Mod { dst, rhs, .. } = op {
+            if *dst == v {
+                return matches!(const_i64_anywhere(trace, *rhs), Some(c) if c != -1);
+            }
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy)]

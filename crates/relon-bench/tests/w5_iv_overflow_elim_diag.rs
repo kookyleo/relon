@@ -195,18 +195,19 @@ fn w5_loop_arith_overflow_guards_diag() {
     println!("pipeline reports: {reports:#?}");
     println!("ArithOverflow guards: before={arith_overflow_before} after={arith_overflow_after}");
 
-    // Per-phi IV pass: only the counter i+1 overflow guard qualifies
-    // for removal; count's accumulator step is i64 dict value (not
-    // Bool/const) and Mod / ListGet phis don't even match the Add
-    // pattern. So exactly one ArithOverflow guard must be stripped.
+    // IV pass strips two ArithOverflow guards on W5:
+    //   1. i + 1 (counter, per-phi IV proof, entry guard inserted)
+    //   2. Mod(i, 10) (const +divisor ≠ -1, statically safe)
+    // count's accumulator step is i64 dict value (not Bool/const) so
+    // count's overflow guard stays.
     assert!(
         arith_overflow_before >= 2,
         "expected ≥ 2 ArithOverflow guards pre-pipeline (Mod, count+value, i+1), got {arith_overflow_before}"
     );
     assert_eq!(
         arith_overflow_before - arith_overflow_after,
-        1,
-        "per-phi IV pass must strip exactly one ArithOverflow guard on W5 (i + 1's), leaving count's and Mod's intact"
+        2,
+        "IV pass must strip exactly two ArithOverflow guards on W5 (i + 1, Mod 10), leaving count's intact"
     );
 
     // The entry guard triple (Cmp Gt + Guard IsZero) should be spliced
