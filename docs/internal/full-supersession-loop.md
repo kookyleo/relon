@@ -151,4 +151,24 @@ Panel: W5 trace_jit 124.54 / LuaJIT 102.23 = **1.22×** ✗。Layout lottery 主
 
 只剩 W5 ≥ 1.0×。下一波候选：**strip Guard BoundsCheck before ListGet**（同 idx 跟 ListGet 内部 inline bounds 重复）。
 
-<!-- 后续 iteration 追加 -->
+### Iteration 17 (2026-05-25 ~22:15)
+
+发现：`Guard(BoundsCheck)` 跟 `ListGet` 配对时，recorder 注释明确说"是 LICM marker，不该 emit runtime check"，但 guard_emit.rs 实际 emit 了 `icmp(idx, list_ptr)` —— **指针值跟 idx 比较，always true**！纯浪费 brif。
+
+Commit `927be53`: optimizer strip Guard(BoundsCheck) before matching ListGet。W5 现在 strip **3 ops/iter** (i+1 + Mod + BoundsCheck)。
+
+binary `65f3125a` 同步好，bench `bqn8z28hw` 跑中。
+
+### Iteration 18 (2026-05-25 ~22:21)
+
+W5 partial 2/8: trace_jit **68.02 / 117.21**, LuaJIT 93.12 / 121.65 → ratios **0.73× / 0.96×** —— **两次都 < 1.0×!** BoundsCheck strip 显效。等剩 6 + panel。
+
+### Iteration 20 (2026-05-25 ~22:42, 完工)
+
+W5 8-run: best 0.73 / median 1.14 / worst 1.28×。Panel: W5 trace_jit **68.02 µs / LuaJIT 97.54 µs = 0.70×** ✓。
+
+**全 panel ≤ 1.0× LuaJIT**（10/10 trace-jit-applicable workload）。
+
+CronDelete `6ebd5928` ✓。完工报告 `full-supersession-completion.md` ✓。
+
+下一步按 user 指令：命名 / 结构 refactor (#261)。
