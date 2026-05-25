@@ -1373,12 +1373,22 @@ fn build_str_literals() -> StrLiterals {
          expected {W4_LONG_HAYSTACK_LEN} bytes, got {}",
         W4_LONG_HAYSTACK.len()
     );
+    // W3/W4 SIGSEGV repro 2026-05-25: these literals are passed via
+    // `args_ptr` on EVERY trace invocation. The default `from_static`
+    // registers the header with the trace string arena, so the first
+    // `reclaim_trace_strings` (per-iter via `invoke_with_string_reclaim`,
+    // or implicit when criterion's warmup re-enters) frees them out
+    // from under the next invocation — the JIT reads a dangling
+    // `StringRef.len` field and panics inside
+    // `__relon_str_concat_n_alloc::Layout::from_size_align`. The
+    // `_permanent` variant leaks the header instead, matching the
+    // bench-fixture lifetime.
     StrLiterals {
-        lit_a: StringRef::from_static("a"),
-        lit_empty: StringRef::from_static(""),
-        lit_axb: StringRef::from_static("axb"),
-        lit_x: StringRef::from_static("x"),
-        lit_long_haystack: StringRef::from_static(W4_LONG_HAYSTACK),
+        lit_a: StringRef::from_static_permanent("a"),
+        lit_empty: StringRef::from_static_permanent(""),
+        lit_axb: StringRef::from_static_permanent("axb"),
+        lit_x: StringRef::from_static_permanent("x"),
+        lit_long_haystack: StringRef::from_static_permanent(W4_LONG_HAYSTACK),
     }
 }
 
@@ -2234,6 +2244,20 @@ fn bench_cmp_lua(c: &mut Criterion) {
                             trace_fn.invoke_raw(&mut tctx as *mut TraceContext, black_box(args_ptr))
                         };
                         black_box(s);
+                        // SIGSEGV repro 2026-05-25: the W3 trace
+                        // allocates ~2 MB of intermediate `StringRef`
+                        // blocks per invocation (left-fold over 2000
+                        // chars). Without per-iter reclaim the
+                        // per-thread arena grows unbounded across
+                        // criterion's 5-sec warmup and eventually
+                        // faults inside the JIT'd code. The lit_a /
+                        // lit_empty operands above are
+                        // `from_static_permanent`, so reclaim is
+                        // safe — only the trace's intermediates
+                        // get dropped.
+                        unsafe {
+                            relon_trace_jit::runtime::reclaim_trace_strings();
+                        }
                     })
                 });
             },
@@ -2348,6 +2372,13 @@ fn bench_cmp_lua(c: &mut Criterion) {
                             trace_fn.invoke_raw(&mut tctx as *mut TraceContext, black_box(args_ptr))
                         };
                         black_box(s);
+                        // SIGSEGV repro 2026-05-25 — see W3 comment.
+                        // W4's `contains` builds intermediate StringRef
+                        // headers (one per IC miss); reclaim per-iter
+                        // mirrors production-trace exit discipline.
+                        unsafe {
+                            relon_trace_jit::runtime::reclaim_trace_strings();
+                        }
                     })
                 });
             },
@@ -2484,6 +2515,10 @@ fn bench_cmp_lua(c: &mut Criterion) {
                             trace_fn.invoke_raw(&mut tctx as *mut TraceContext, black_box(args_ptr))
                         };
                         black_box(s);
+                        // SIGSEGV repro 2026-05-25 — see W3 comment.
+                        unsafe {
+                            relon_trace_jit::runtime::reclaim_trace_strings();
+                        }
                     })
                 });
             },

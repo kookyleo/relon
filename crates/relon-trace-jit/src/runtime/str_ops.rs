@@ -357,6 +357,22 @@ impl StringRef {
         header as *const StringRef
     }
 
+    /// Build a `StringRef` from a `&'static str` source whose header
+    /// is **leaked** — never registered with the trace string arena.
+    /// Returns a pointer that outlives every
+    /// [`reclaim_trace_strings`] call on the calling thread.
+    ///
+    /// Use this for bench / fixture constants that the trace's JIT'd
+    /// code reads on every invocation (e.g. `lit_a` operand passed
+    /// via `args_ptr`). The default [`Self::from_static`] registers
+    /// the header so reclaim can drop it, which is the right contract
+    /// for per-trace inputs but causes a use-after-free when the same
+    /// pointer is re-used across invocations interleaved with
+    /// reclaim (the W3/W4 cmp_lua bench SIGSEGV repro on 2026-05-25).
+    pub fn from_static_permanent(s: &'static str) -> *const StringRef {
+        Box::into_raw(Box::new(StringRef::borrow(s))) as *const StringRef
+    }
+
     /// Read back a `&str` slice from the pointer. Returns `None` if
     /// `ptr` is null.
     ///
