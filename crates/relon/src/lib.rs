@@ -26,6 +26,7 @@
 
 pub mod auto_evaluator;
 pub mod builder;
+pub mod jit;
 pub mod projector;
 
 use relon_analyzer::{
@@ -44,7 +45,15 @@ use std::sync::Arc;
 
 pub use auto_evaluator::{is_trivial_scalar_main, is_trivial_scalar_main_node, AutoEvaluator};
 pub use builder::{EvaluatorBuilder, TrustLevel};
+pub use jit::{JitEvaluator, JitTier};
 pub use projector::{JsonProjector, Projector};
+// Dart-style canonical AOT entry, re-exported through the facade so
+// hosts can spell `relon::AotEvaluator` alongside `relon::JitEvaluator`
+// without a second crate dep. Mirrors the `JitEvaluator` re-export
+// above — the two together are the v1 of the naming-alignment split
+// (see `crates/relon/src/jit.rs` top-comment and the design note).
+#[cfg(feature = "cranelift-aot")]
+pub use relon_codegen_native::AotEvaluator;
 pub use relon_analyzer;
 // Curated runtime surface. The wildcard re-exports of
 // `relon_evaluator` / `relon_eval_api` / `relon_parser` were dropped
