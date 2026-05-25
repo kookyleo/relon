@@ -153,6 +153,45 @@ impl OptimizerPass for IvOverflowElim {
             }
         }
 
+        // Redundant `Guard(BoundsCheck(idx, list_ssa))` strip.
+        //
+        // Per `recorder.rs::emit_list_get` the BoundsCheck guard is
+        // documented as a LICM anchor only — the real bounds compare
+        // lives inside `emit_list_get` which loads the list length
+        // from `[list_ptr + 0]` and `brif idx < len`. The current
+        // `guard_emit.rs` BoundsCheck arm however emits a real
+        // `icmp(UnsignedLessThan, idx, list_ssa_value)` brif —
+        // comparing the index against the LIST POINTER value (which
+        // is a heap address, always huge), so the predicate is
+        // effectively always true. That's a dead brif per iter in
+        // hot loops with ListGet (W5: `keys[i % 10]` per iter).
+        //
+        // We only strip when the very next op IS the matching
+        // `ListGet { idx, list_ptr }` so we don't touch any other
+        // future use of BoundsCheck.
+        for pc in 0..trace.ops.len() {
+            let (idx, limit) = match &trace.ops[pc] {
+                TraceOp::Guard {
+                    kind: GuardKind::BoundsCheck(idx, limit),
+                    ..
+                } => (*idx, *limit),
+                _ => continue,
+            };
+            let Some(next) = trace.ops.get(pc + 1) else {
+                continue;
+            };
+            if let TraceOp::ListGet {
+                list_ptr: lp,
+                idx: li,
+                ..
+            } = next
+            {
+                if *lp == limit && *li == idx {
+                    drop_pcs.insert(pc);
+                }
+            }
+        }
+
         if drop_pcs.is_empty() {
             return report;
         }
