@@ -1812,6 +1812,59 @@ impl BytecodeVm {
                 let matched = relon_ir::glob::glob_match(s.as_ref(), pat.as_ref());
                 stack.push(if matched { 1 } else { 0 });
             }
+            BcOp::StrContains => {
+                // Bytecode-coverage-expansion B-1: `[haystack, needle]
+                // -> [bool]`. Pops the needle first (top-of-stack), then
+                // the haystack. Resolves both handles in the StringArena
+                // and defers to Rust's stdlib `str::contains` byte-
+                // substring search. Mirrors `TraceOp::StrContains` so a
+                // trace-jit deopt that landed on a bytecode `.contains`
+                // call can resume without the VM walking the raw-memory
+                // `contains_string` body the bytecode envelope rejects.
+                let needle_h = pop(stack, bc_idx)? as u32;
+                let s_h = pop(stack, bc_idx)? as u32;
+                let s = memory.strings.get(s_h).map_err(arena_to_vm_error)?.clone();
+                let needle = memory
+                    .strings
+                    .get(needle_h)
+                    .map_err(arena_to_vm_error)?
+                    .clone();
+                stack.push(if s.as_ref().contains(needle.as_ref()) {
+                    1
+                } else {
+                    0
+                });
+            }
+            BcOp::StrSubstring => {
+                // Bytecode-coverage-expansion B-1: `[s, i64 start, i64
+                // length] -> [s_substring_handle]`. Pops `length` first
+                // (top-of-stack), then `start`, then the string handle.
+                // Clamps `start` / `length` into `[0, len(s)]` (the
+                // same clamp posture the trace-jit `__relon_str_substring`
+                // shim applies) and allocates a fresh `StringArena` slot
+                // for the byte-range slice.
+                //
+                // Byte indexing is intentional: tree-walker / cranelift
+                // / trace-jit all treat `substring` as byte-indexed so
+                // the bytecode path stays behaviour-equivalent. Callers
+                // wanting Unicode-aware slicing live one layer up.
+                let len_i64 = pop(stack, bc_idx)? as i64;
+                let start_i64 = pop(stack, bc_idx)? as i64;
+                let s_h = pop(stack, bc_idx)? as u32;
+                let s = memory.strings.get(s_h).map_err(arena_to_vm_error)?.clone();
+                let s_len = s.as_ref().len() as i64;
+                let start = start_i64.clamp(0, s_len) as usize;
+                let len = len_i64.clamp(0, s_len - start as i64) as usize;
+                let slice = &s.as_ref().as_bytes()[start..start + len];
+                // Safe: the input is valid UTF-8 and we slice on byte
+                // bounds. The trace-jit shim has the same safety
+                // posture (it relies on the recorder having clamped to
+                // a valid UTF-8 boundary; callers passing mid-codepoint
+                // offsets get the same garbled output here as there).
+                let slice_str = std::str::from_utf8(slice).unwrap_or("");
+                let handle = memory.strings.alloc(slice_str);
+                stack.push(handle as u64);
+            }
             BcOp::MakeDict { len } => {
                 // `[k_0, v_0, ..., k_{n-1}, v_{n-1}] -> [dict_handle]`.
                 // Pops `len * 2` slots; the keys are string handles

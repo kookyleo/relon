@@ -95,6 +95,33 @@ pub(crate) const FULL_CASEFOLD_LOOKUP_INDEX: u32 = 34;
 /// the trace recorder gains its own constant.
 pub const GLOB_MATCH_INDEX: u32 = 37;
 
+/// Stable slot of `concat(String, String) -> String`. Mirrors
+/// [`relon_trace_recorder::lowering::STDLIB_IDX_CONCAT`] (drift
+/// guard cross-checked by `stdlib_index_consistency`).
+///
+/// Bytecode-coverage-expansion B-1: the bytecode VM intercepts
+/// `Op::Call { fn_index = CONCAT_INDEX, arg_count = 2 }` and routes
+/// onto the dedicated `BcOp::StrConcat` dispatch instead of inlining
+/// the bundled `concat_string_string` IR body — that body uses raw-
+/// memory `Load*AtAbsolute` ops the bytecode VM's scalar envelope
+/// rejects. Same routing as the `GLOB_MATCH_INDEX` short-circuit above
+/// so trace-jit deopts that land mid-string-concat resume cleanly.
+pub const CONCAT_INDEX: u32 = 6;
+
+/// Stable slot of `substring(String, Int, Int) -> String`. Mirrors
+/// [`relon_trace_recorder::lowering::STDLIB_IDX_SUBSTRING`].
+///
+/// Bytecode-coverage-expansion B-1: routed onto `BcOp::StrSubstring`
+/// by the bytecode compile pass — same rationale as `CONCAT_INDEX`.
+pub const SUBSTRING_INDEX: u32 = 9;
+
+/// Stable slot of `contains(String, String) -> Bool`. Mirrors
+/// [`relon_trace_recorder::lowering::STDLIB_IDX_CONTAINS`].
+///
+/// Bytecode-coverage-expansion B-1: routed onto `BcOp::StrContains`
+/// by the bytecode compile pass — same rationale as `CONCAT_INDEX`.
+pub const CONTAINS_INDEX: u32 = 36;
+
 /// v3++ b-7 reframed: stable slot of the
 /// `__final_sigma_check(s_ptr, byte_offset, cased_addr, ignorable_addr) -> i32`
 /// helper. Returns `1` when `Σ` at `byte_offset` in the input UTF-8

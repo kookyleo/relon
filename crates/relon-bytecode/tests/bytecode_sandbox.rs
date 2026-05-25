@@ -2219,6 +2219,180 @@ fn compile_routes_glob_match_call_to_str_glob_match_op() {
     );
 }
 
+// ---- Bytecode-coverage-expansion B-1: str.contains / str.substring ----
+//
+// Each new `BcOp::Str*` mirrors a `TraceOp::Str*` (see
+// `relon_trace_jit::trace_ir::TraceOp`). The pair-wise tests below pin:
+//
+//   1. VM dispatch semantics (haystack/needle and start/length clamp).
+//   2. Compile pass routes the matching stdlib slot
+//      (`CONCAT_INDEX` / `CONTAINS_INDEX` / `SUBSTRING_INDEX`) onto the
+//      dedicated op instead of inlining the raw-memory body the bytecode
+//      envelope rejects.
+//
+// Same shape as the `StrGlobMatch` pair above so the four string ops
+// stay one cohesive family.
+
+#[test]
+fn str_contains_matches_and_misses() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    let make = |s: &str, needle: &str| BcFunction {
+        ops: vec![
+            BcOp::StrConst { idx: 0 },
+            BcOp::StrConst { idx: 1 },
+            BcOp::StrContains,
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4],
+        string_pool: vec![s.to_string(), needle.to_string()],
+        stack_recipe: vec![vec![]; 4],
+        fn_id: None,
+        closure_bodies: Vec::new(),
+        requires_cap_consult: false,
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+
+    // Hit: substring present.
+    assert_eq!(vm.invoke(&make("hello world", "world"), &[]).value, Some(1));
+    // Miss: substring absent.
+    assert_eq!(vm.invoke(&make("hello world", "xyz"), &[]).value, Some(0));
+    // Empty needle: Rust's `str::contains("")` is `true` for any
+    // haystack — tree-walker / trace-jit shim share this convention.
+    assert_eq!(vm.invoke(&make("hello", ""), &[]).value, Some(1));
+    // Unicode payload: multi-byte codepoint match.
+    assert_eq!(vm.invoke(&make("αβγ🦀rust", "🦀"), &[]).value, Some(1));
+}
+
+#[test]
+fn str_substring_clamps_and_slices() {
+    use relon_bytecode::op::{BcFunction, BcOp};
+
+    // substring(s, start, length) -> store handle in local 0 then load
+    // back; we can't directly assert the string payload through the
+    // legacy-i64 return shape, but we CAN re-feed the slot into
+    // StrLen to assert the resulting length matches expectations.
+    let make = |s: &str, start: i64, length: i64| BcFunction {
+        ops: vec![
+            BcOp::StrConst { idx: 0 },
+            BcOp::ConstI64(start),
+            BcOp::ConstI64(length),
+            BcOp::StrSubstring,
+            BcOp::StrLen,
+            BcOp::Return,
+        ],
+        locals: 0,
+        ir_pc_map: vec![1, 2, 3, 4, 5, 6],
+        string_pool: vec![s.to_string()],
+        stack_recipe: vec![vec![]; 6],
+        fn_id: None,
+        closure_bodies: Vec::new(),
+        requires_cap_consult: false,
+    };
+    let vm = BytecodeVm::new(BcVmConfig::default());
+
+    // "hello".substring(1, 3) = "ell" — 3 codepoints.
+    assert_eq!(vm.invoke(&make("hello", 1, 3), &[]).value, Some(3));
+    // Start past end: clamps to len, length clamps to 0 → empty.
+    assert_eq!(vm.invoke(&make("hi", 99, 5), &[]).value, Some(0));
+    // Negative start: clamps to 0; length clamped to s_len.
+    assert_eq!(vm.invoke(&make("abc", -10, 99), &[]).value, Some(3));
+    // Negative length: clamps to 0 → empty slice.
+    assert_eq!(vm.invoke(&make("abc", 0, -5), &[]).value, Some(0));
+}
+
+/// Drift guard for the bytecode-coverage-expansion B-1 routing: each of
+/// the three string-stdlib slots must short-circuit onto its dedicated
+/// `BcOp::Str*` instead of inlining the raw-memory IR body.
+#[test]
+fn compile_routes_str_stdlib_calls_to_dedicated_str_ops() {
+    use relon_bytecode::op::BcOp;
+    use relon_ir::ir::{Func, Op, TaggedOp};
+    use relon_ir::IrType;
+    use relon_parser::TokenRange;
+
+    fn tt(op: Op) -> TaggedOp {
+        TaggedOp {
+            op,
+            range: TokenRange::default(),
+        }
+    }
+
+    let make_caller = |fn_index: u32, params: Vec<IrType>, ret_ty: IrType| Func {
+        name: format!("uses_stdlib_{fn_index}"),
+        params: params.clone(),
+        ret: ret_ty,
+        body: {
+            let arg_count = params.len() as u32;
+            let mut body: Vec<TaggedOp> = (0..arg_count).map(|i| tt(Op::LocalGet(i))).collect();
+            body.push(tt(Op::Call {
+                fn_index,
+                arg_count,
+                param_tys: params,
+                ret_ty,
+            }));
+            body.push(tt(Op::Return));
+            body
+        },
+        range: TokenRange::default(),
+    };
+
+    // concat(String, String) -> String → BcOp::StrConcat
+    let bc = relon_bytecode::compile::compile_function_in_module(
+        &make_caller(
+            relon_ir::CONCAT_INDEX,
+            vec![IrType::String, IrType::String],
+            IrType::String,
+        ),
+        &[],
+        &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
+    )
+    .expect("concat compile");
+    assert!(
+        bc.ops.iter().any(|op| matches!(op, BcOp::StrConcat)),
+        "concat call must lower to BcOp::StrConcat, got {:?}",
+        bc.ops
+    );
+
+    // contains(String, String) -> Bool → BcOp::StrContains
+    let bc = relon_bytecode::compile::compile_function_in_module(
+        &make_caller(
+            relon_ir::CONTAINS_INDEX,
+            vec![IrType::String, IrType::String],
+            IrType::Bool,
+        ),
+        &[],
+        &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
+    )
+    .expect("contains compile");
+    assert!(
+        bc.ops.iter().any(|op| matches!(op, BcOp::StrContains)),
+        "contains call must lower to BcOp::StrContains, got {:?}",
+        bc.ops
+    );
+
+    // substring(String, Int, Int) -> String → BcOp::StrSubstring
+    let bc = relon_bytecode::compile::compile_function_in_module(
+        &make_caller(
+            relon_ir::SUBSTRING_INDEX,
+            vec![IrType::String, IrType::I64, IrType::I64],
+            IrType::String,
+        ),
+        &[],
+        &std::collections::BTreeMap::new(),
+        &std::collections::BTreeMap::new(),
+    )
+    .expect("substring compile");
+    assert!(
+        bc.ops.iter().any(|op| matches!(op, BcOp::StrSubstring)),
+        "substring call must lower to BcOp::StrSubstring, got {:?}",
+        bc.ops
+    );
+}
+
 // -- M2-B phase 4b-continuation: dict ops -------------------------
 
 /// `MakeDict` + `DictLookupStr` round-trip: build `{ a: 1, b: 2 }`,

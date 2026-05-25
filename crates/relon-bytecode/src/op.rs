@@ -297,6 +297,38 @@ pub enum BcOp {
     /// behaviour-equivalent with the tree-walker and cranelift backends.
     StrGlobMatch,
 
+    /// Bytecode-coverage-expansion B-1: `(haystack, needle) -> Bool`
+    /// substring search. `[s_handle, needle_handle] -> [bool]`. Pops
+    /// the needle first (top-of-stack), then the haystack; resolves
+    /// both via the `StringArena`, runs `haystack.contains(needle)`
+    /// (Rust standard byte-substring search), pushes `1` on match,
+    /// `0` otherwise.
+    ///
+    /// Mirrors `TraceOp::StrContains` so the bytecode VM can resume
+    /// from a trace-jit deopt that fired inside (or just after) a
+    /// `s.contains(...)` call without the VM needing to re-walk the
+    /// `contains_string` IR body (which uses raw-memory `Load` ops
+    /// the bytecode VM's scalar envelope rejects).
+    ///
+    /// Emitted by the bytecode compile pass when it spots
+    /// `Op::Call { fn_index = relon_trace_recorder::STDLIB_IDX_CONTAINS }`
+    /// (mirroring the `GLOB_MATCH_INDEX` short-circuit above) instead
+    /// of walking the bundled stdlib body.
+    StrContains,
+
+    /// Bytecode-coverage-expansion B-1: `(s, start, length) -> String`
+    /// byte-indexed substring. `[s_handle, i64 start, i64 length] -> [s_substring_handle]`.
+    /// Pops `length` first (top-of-stack), then `start`, then the
+    /// string handle; clamps `start` / `length` into `[0, len(s)]`
+    /// (matching the trace-jit shim's clamp posture) and allocates a
+    /// fresh `StringArena` slot for the byte-range slice.
+    ///
+    /// Mirrors `TraceOp::StrSubstring`. Emitted by the bytecode
+    /// compile pass when it spots
+    /// `Op::Call { fn_index = relon_trace_recorder::STDLIB_IDX_SUBSTRING }`
+    /// instead of inlining the raw-memory `substring_string` body.
+    StrSubstring,
+
     /// M2-B phase 4b-continuation: allocate a dict slot from
     /// `len` key/value pairs. `[k_0, v_0, k_1, v_1, ..., k_{n-1},
     /// v_{n-1}] -> [dict_handle]`. Pops `len * 2` slots in

@@ -98,7 +98,9 @@ pub use index::{
     stdlib_closure_arg_signature, stdlib_function_count, stdlib_function_index, stdlib_method_index,
 };
 pub use registry::builtin_stdlib;
-pub use signatures::{StdlibFunction, GLOB_MATCH_INDEX};
+pub use signatures::{
+    StdlibFunction, CONCAT_INDEX, CONTAINS_INDEX, GLOB_MATCH_INDEX, SUBSTRING_INDEX,
+};
 
 #[cfg(test)]
 mod tests {
@@ -313,5 +315,37 @@ mod glob_match_index_tests {
     #[test]
     fn glob_match_extends_bundle_to_38_entries() {
         assert_eq!(stdlib_function_count(), 38);
+    }
+}
+
+/// Bytecode-coverage-expansion B-1: drift guard for the public
+/// `CONCAT_INDEX` / `SUBSTRING_INDEX` / `CONTAINS_INDEX` constants the
+/// bytecode VM short-circuits against. The trace recorder mirrors the
+/// same slots via its own `STDLIB_IDX_*` constants — see
+/// `relon-trace-recorder` for the parallel guard. Any reordering of
+/// the bundle that drifts these slots silently re-routes a different
+/// op through `BcOp::Str*` and almost certainly produces a wrong
+/// answer on the first call.
+#[cfg(test)]
+mod str_stdlib_index_consistency_tests {
+    use super::*;
+    use signatures::{CONCAT_INDEX, CONTAINS_INDEX, SUBSTRING_INDEX};
+
+    #[test]
+    fn concat_index_matches_registry() {
+        assert_eq!(stdlib_function_index("concat"), Some(CONCAT_INDEX));
+        assert_eq!(CONCAT_INDEX, 6);
+    }
+
+    #[test]
+    fn substring_index_matches_registry() {
+        assert_eq!(stdlib_function_index("substring"), Some(SUBSTRING_INDEX));
+        assert_eq!(SUBSTRING_INDEX, 9);
+    }
+
+    #[test]
+    fn contains_index_matches_registry() {
+        assert_eq!(stdlib_function_index("contains"), Some(CONTAINS_INDEX));
+        assert_eq!(CONTAINS_INDEX, 36);
     }
 }

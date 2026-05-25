@@ -533,8 +533,17 @@ impl<'a> CompileState<'a> {
                 self.pop_n(1);
                 self.push_snapshot();
             }
-            BcOp::StrConcat | BcOp::StrEq | BcOp::StrGlobMatch => {
+            BcOp::StrConcat | BcOp::StrEq | BcOp::StrGlobMatch | BcOp::StrContains => {
+                // Bytecode-coverage-expansion B-1: `StrContains` mirrors
+                // `StrGlobMatch`'s (haystack, needle) -> bool shape.
                 self.pop_n(2);
+                self.push_snapshot();
+            }
+            BcOp::StrSubstring => {
+                // Bytecode-coverage-expansion B-1: `(s, start, length)
+                // -> s_substring`. Pops the three operands, pushes the
+                // fresh handle. Mirrors `TraceOp::StrSubstring`.
+                self.pop_n(3);
                 self.push_snapshot();
             }
             BcOp::StrConcatN { argc } => {
@@ -615,6 +624,27 @@ impl<'a> CompileState<'a> {
         // `relon_ir::glob::glob_match` with the live string handles.
         if fn_index == relon_ir::GLOB_MATCH_INDEX && arg_count == 2 {
             self.emit_with_effect(BcOp::StrGlobMatch, call_pc);
+            return Ok(());
+        }
+        // Bytecode-coverage-expansion B-1: string-stdlib short-circuits.
+        // The bundled bodies for `concat` / `contains` / `substring`
+        // all use raw-memory `Load*AtAbsolute` ops the bytecode VM's
+        // scalar envelope rejects (see `relon_ir::stdlib::defs`). Mirror
+        // the `GLOB_MATCH_INDEX` route: emit the dedicated `BcOp::Str*`
+        // op so the VM defers to the same arena-aware Rust helpers the
+        // trace-jit shim uses. Keeps bytecode VM behaviour-equivalent
+        // with the tree-walker and cranelift paths and unlocks resume-
+        // from-deopt for `TraceOp::StrConcat / StrContains / StrSubstring`.
+        if fn_index == relon_ir::CONCAT_INDEX && arg_count == 2 {
+            self.emit_with_effect(BcOp::StrConcat, call_pc);
+            return Ok(());
+        }
+        if fn_index == relon_ir::CONTAINS_INDEX && arg_count == 2 {
+            self.emit_with_effect(BcOp::StrContains, call_pc);
+            return Ok(());
+        }
+        if fn_index == relon_ir::SUBSTRING_INDEX && arg_count == 3 {
+            self.emit_with_effect(BcOp::StrSubstring, call_pc);
             return Ok(());
         }
         if self.inline_depth >= MAX_INLINE_DEPTH {
