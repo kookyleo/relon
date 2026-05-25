@@ -184,6 +184,42 @@ fn try_build_bytecode(src: &str, label: &str) -> Option<Box<dyn RelonEvaluator>>
     }
 }
 
+/// Dart-style naming-alignment (2026-05-25): build a `JitEvaluator`
+/// (the canonical user-facing JIT entry) over `src`. Always returns a
+/// usable evaluator — the wrapper internally falls back to the
+/// tree-walker when the M2-A bytecode envelope rejects the source, so
+/// no n/a path is needed here. Panics on parse / analyzer errors
+/// because those are caller bugs the bench should surface loudly.
+fn build_jit(src: &str, label: &str) -> relon::JitEvaluator {
+    relon::JitEvaluator::new(src)
+        .unwrap_or_else(|e| panic!("[cmp_lua {label}] JitEvaluator setup failed: {e}"))
+}
+
+/// Dart-style naming-alignment (2026-05-25): try to build an
+/// `AotEvaluator` (the canonical user-facing AOT entry) over `src`.
+/// Returns `Some(ev)` when the cranelift codegen pipeline accepts the
+/// source; `None` (logged to stderr) when any setup failure
+/// surfaces — list / dict / closure / stdlib sources commonly trip
+/// the AOT envelope. The bench row mirrors the `try_build_bytecode`
+/// n/a contract: skip the timed inner loop instead of panicking.
+///
+/// The `relon-bench` crate always pulls in `relon-codegen-native`, so
+/// the cranelift codegen path is unconditionally available here; no
+/// feature-gate stub needed.
+fn try_build_aot(src: &str, label: &str) -> Option<Box<dyn RelonEvaluator>> {
+    match new_relon_evaluator(src, RelonBackend::CraneliftAot) {
+        Ok(ev) => Some(ev),
+        Err(BackendError::CraneliftAot(reason)) => {
+            eprintln!("[cmp_lua {label}] aot row n/a (UnsupportedShape: {reason})");
+            None
+        }
+        Err(other) => {
+            eprintln!("[cmp_lua {label}] aot row n/a (setup error: {other})");
+            None
+        }
+    }
+}
+
 /// Build a Lua function from source: the source must be a `return function(...) ... end`
 /// expression. The returned `mlua::Function` is cached for hot-loop calls.
 fn lua_fn(lua: &mlua::Lua, src: &str) -> mlua::Function {
@@ -3197,6 +3233,127 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 b.iter(|| {
                     let v = ev.run_main(w12_relon_args(black_box(7))).unwrap();
                     black_box(v);
+                });
+            });
+        }
+    }
+
+    // =================================================================
+    // ===== Dart-style canonical panel: relon_jit + relon_aot =========
+    // =================================================================
+    //
+    // Naming-alignment (2026-05-25). The 12 workloads above keep the
+    // engineer-facing tier breakdown rows (`relon_tree_walk` /
+    // `relon_bytecode` / `relon_trace_jit`) so existing baselines stay
+    // comparable; the two new rows below collapse all internal tiers
+    // behind the user-facing `JitEvaluator` / `AotEvaluator` types so
+    // hosts see a single canonical entry per mode (Dart-style:
+    // `dart run` vs `dart compile exe`).
+    //
+    // Per-row dispatch:
+    //
+    // * `relon_jit` always runs — `JitEvaluator::new` constructs a
+    //   tree-walker plus (when the M2-A envelope accepts) a bytecode
+    //   tier; the wrapper picks the best-available tier on each
+    //   `run_main`. Trace-install hooks attach at the bytecode tier
+    //   automatically once a host wires them.
+    // * `relon_aot` records `n/a` for sources the cranelift codegen
+    //   rejects today (list / dict / closure / stdlib shapes) so the
+    //   panel layout stays uniform across the workloads; the timed
+    //   inner loop only runs when the AOT setup succeeded.
+    //
+    // The rows pin the same per-workload throughput / args helpers
+    // the tier-breakdown rows above used, so direct comparison with
+    // the LuaJIT row stays apples-to-apples.
+
+    // (label, source, throughput, args_factory)
+    type ArgsFactory = fn() -> HashMap<String, Value>;
+    let canonical_panel: &[(&str, &str, u64, ArgsFactory)] = &[
+        ("W1_int_sum", w1_relon_src(), W1_N as u64, || args_w_n(W1_N)),
+        ("W2_f64_dot", w2_relon_src(), W2_N as u64, || args_w_n(W2_N)),
+        (
+            "W3_string_concat",
+            w3_relon_src(),
+            STRING_CONCAT_N,
+            || args_w_n(STRING_CONCAT_N as i64),
+        ),
+        (
+            "W4_string_contains",
+            w4_relon_src(),
+            TREE_WALK_N,
+            || args_w_n(TREE_WALK_N as i64),
+        ),
+        (
+            "W4_long_haystack",
+            w4_relon_src(),
+            TREE_WALK_N,
+            || args_w_n(TREE_WALK_N as i64),
+        ),
+        (
+            "W5_dict_str_key",
+            w5_relon_src(),
+            TREE_WALK_N,
+            || args_w_n(TREE_WALK_N as i64),
+        ),
+        (
+            "W6_dict_num_key",
+            w6_relon_src(),
+            TREE_WALK_N,
+            || args_w_n(TREE_WALK_N as i64),
+        ),
+        ("W7_fib", w7_relon_src(), FIB_N, || args_w_n(FIB_N as i64)),
+        (
+            "W8_poly_callsite",
+            w8_relon_src(),
+            TREE_WALK_N,
+            || args_w_n(TREE_WALK_N as i64),
+        ),
+        (
+            "W9_nested_matrix",
+            w9_relon_src(),
+            W9_N as u64,
+            w9_relon_n_arg,
+        ),
+        (
+            "W10_config_eval",
+            w10_relon_src(),
+            CONFIG_QUERIES_N,
+            || args_w_n(CONFIG_QUERIES_N as i64),
+        ),
+        ("W12_p99_tail", w12_relon_src(), 1, || w12_relon_args(7)),
+    ];
+
+    for (label, src, throughput_n, args_factory) in canonical_panel {
+        group.throughput(Throughput::Elements(*throughput_n));
+
+        // relon_jit row — the canonical user-facing JIT entry.
+        let jit = build_jit(src, label);
+        // Consistency check: drive once before the timed loop. Failure
+        // panics so a regression in `JitEvaluator` dispatch surfaces
+        // before the bench writes a misleading number.
+        let _ = jit
+            .run_main(args_factory())
+            .unwrap_or_else(|e| panic!("[cmp_lua {label}] relon_jit consistency run failed: {e}"));
+        group.bench_function(BenchmarkId::new(*label, "relon_jit"), |b| {
+            b.iter_custom(|iters| {
+                timed_with_warmup(iters, || {
+                    let v = jit.run_main(args_factory()).unwrap();
+                    black_box(v);
+                })
+            });
+        });
+
+        // relon_aot row — n/a when the cranelift codegen rejects.
+        if let Some(aot) = try_build_aot(src, label) {
+            let _ = aot.run_main(args_factory()).unwrap_or_else(|e| {
+                panic!("[cmp_lua {label}] relon_aot consistency run failed: {e}")
+            });
+            group.bench_function(BenchmarkId::new(*label, "relon_aot"), |b| {
+                b.iter_custom(|iters| {
+                    timed_with_warmup(iters, || {
+                        let v = aot.run_main(args_factory()).unwrap();
+                        black_box(v);
+                    })
                 });
             });
         }
