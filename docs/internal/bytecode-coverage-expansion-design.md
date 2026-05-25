@@ -102,14 +102,62 @@ cmp_lua 增加 `deopt_recovery` workload group:
 - `relon_deopt_to_tree_walk` (current 行为 baseline)
 - `relon_deopt_to_bytecode` (期望 5-50× 比 tree_walk 快)
 
-## Naming alignment (顺手)
+## Naming alignment — 采用 Dart 二分法 + 子环节统一前缀
 
-跟 bytecode 扩张同 PR 做：
-- `CraneliftAotEvaluator` → `AotEvaluator` (drop `Cranelift` prefix in user-facing type)
-- 新增 panel row 用 `relon_aot` 命名 (不要 `relon_cranelift_aot`)
-- crate 名 (`relon-codegen-native`) 保留
+用户视角：**JIT 模式** vs **AOT 模式**（Dart-style binary）。内部 tier 用 `jit_` 前缀分组：
 
-Search/replace 约 30-60 callsites。
+### 用户面向类型
+
+```rust
+// 当前 (4 个并列 Evaluator)
+TreeWalkEvaluator / BytecodeEvaluator / CraneliftAotEvaluator
++ trace_jit 通过 dispatcher hook
+
+// 目标 (2 个顶层 + 内部 tier)
+JitEvaluator       // 管理 tree_walk → bytecode → trace 自动 tier 迁移
+AotEvaluator       // AOT 编译产物
+```
+
+`JitEvaluator` 内部按 hot-counter 阈值自动 tier 迁移 —— 跟 Dart VM / LuaJIT canonical pattern 一致。用户不选 tier。
+
+### 内部 tier 命名
+
+| 当前 | 重组后 | 角色 |
+|---|---|---|
+| `TreeWalkEvaluator` | `JitTier::TreeWalk` (or `tier::tree_walk`) | 初始解释 + fallback |
+| `BytecodeEvaluator` | `JitTier::Bytecode` | trace deopt landing |
+| trace_jit dispatcher | `JitTier::Trace` | hot path JIT |
+| `CraneliftAotEvaluator` | `AotEvaluator` (drop `Cranelift`, `Native` 冗余) | 独立 AOT 编译路径 |
+
+### Bench 标签
+
+```
+当前:                 重组后:
+relon_tree_walk    → relon_jit:tree_walk    (engineer-facing tier breakdown)
+relon_bytecode     → relon_jit:bytecode
+relon_trace_jit    → relon_jit:trace
+(none)             → relon_jit              ← **新增** 集成 panel (auto-tier，对标 LuaJIT)
+relon_aot          → relon_aot              ← 新增 (cmp_lua 当前没注册)
+```
+
+新增 `relon_jit` row 是默认 mode 端到端跟 LuaJIT 比，省去用户头脑里 tier 选择 —— 跟 LuaJIT 单点比较一致。tier breakdown 给 engineer。
+
+### 落地工作量
+
+| 项 | 量 |
+|---|---|
+| Type rename (`CraneliftAotEvaluator` → `AotEvaluator` 等) | 30-60 callsites, 0.5 天 |
+| 顶层 `JitEvaluator` wrapper | 1 天 |
+| `relon_jit` 集成 bench row (auto-tier) | 0.5 天 |
+| `relon_aot` 集成 bench row | 0.5 天 |
+| Crate 名重组（`relon-codegen-native` → `relon-aot`, etc.） | **延后到下个 season**（高成本 + 低 ROI） |
+
+合计 ~2.5 天，跟 bytecode 扩覆盖项目同 PR 做。
+
+### 不动的部分
+
+- crate 名 `relon-codegen-native` 暂保留（rename 牵涉太多 import）
+- 已有 `relon_tree_walk` / `relon_bytecode` / `relon_trace_jit` bench label 保留**别名兼容** 1-2 season 防破坏历史 baseline 比较
 
 ## 验收标准
 
