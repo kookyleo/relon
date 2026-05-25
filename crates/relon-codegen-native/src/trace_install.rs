@@ -127,6 +127,31 @@ pub const MAX_FN_ID: usize = 1024;
 /// default (10) per `docs/internal/v6-gamma-trace-jit-design.md` §1.2.
 pub const RELON_HOT_THRESHOLD: u32 = 10;
 
+/// Op-count gate for the runtime trace dispatcher. Traces whose
+/// optimised body is **strictly fewer** ops than this threshold skip
+/// the trace-entry prologue entirely and route straight to the
+/// caller's fallback closure.
+///
+/// ## Rationale (W12 p99 tail)
+///
+/// The trace-entry path pays a fixed prologue per invoke (~80ns on
+/// a 2.1 GHz Broadwell: TraceContext init, extern call boundary,
+/// `result_slot` readback, deopt-state branch). For micro-traces
+/// like W12's 4-op `LocalGet + ConstI64 + Add + Return` body, that
+/// prologue dwarfs the body itself; the fallback closure
+/// (`|args| *args + 1`) runs in <10ns. The gate exists so the
+/// dispatcher can give those workloads the obviously-cheaper path
+/// without invalidating or never-installing the trace (the
+/// inline-emit path still benefits from it).
+///
+/// `5` is picked so the gate triggers on W12's recorded body (4
+/// ops, plus the unconditional `Return`) and a typical 1-stmt
+/// function `(LocalGet + Add + Return = 3)`, but skips real loop
+/// bodies (W2 / W5 / W6 / W10 all clear 10 ops with room to
+/// spare). Lower values miss the gate; higher values risk gating
+/// out genuinely hot paths.
+pub const TINY_TRACE_OP_THRESHOLD: usize = 5;
+
 /// Symbol the cranelift codegen would use if it imported the counters
 /// table by name. v6-γ M2 inlines the table base as an `iconst.i64`
 /// since the address is known at compile time; the symbol name is
@@ -369,6 +394,16 @@ impl JITedTraceFn {
     /// the [`TraceJitState`] write lock.
     pub fn inline_trace(&self) -> Arc<OptimizedTrace> {
         Arc::clone(&self.inline_trace)
+    }
+
+    /// Number of ops in the installed trace body — same value as
+    /// [`OptimizedTrace::op_count`] on the retained IR. Used by the
+    /// runtime dispatcher to gate out micro-traces whose body is too
+    /// short to amortise the trace-entry prologue (TraceContext
+    /// setup + extern call + result-slot read-back). See
+    /// [`TINY_TRACE_OP_THRESHOLD`].
+    pub fn op_count(&self) -> usize {
+        self.inline_trace.op_count()
     }
 
     /// v6-ε-0-A: convenience helper that wraps
@@ -807,6 +842,12 @@ impl TraceJitState {
             None => return fallback(args_ptr, None, None),
         };
 
+        // Tiny-trace gate: route micro-traces around the cranelift
+        // entry. See [`TINY_TRACE_OP_THRESHOLD`].
+        if trace_fn.op_count() < TINY_TRACE_OP_THRESHOLD {
+            return fallback(args_ptr, None, None);
+        }
+
         let mut ctx = TraceContext::with_hooks(slot_count, default_host_hooks());
         let status = unsafe { trace_fn.invoke(&mut ctx as *mut _, args_ptr) };
         match status {
@@ -941,6 +982,14 @@ impl TraceJitState {
             Some(t) => t,
             None => return fallback(args_ptr),
         };
+
+        // Tiny-trace gate: bodies shorter than the threshold cannot
+        // amortise the trace-entry prologue; route straight to the
+        // fallback closure. See [`TINY_TRACE_OP_THRESHOLD`] for the
+        // sizing rationale.
+        if trace_fn.op_count() < TINY_TRACE_OP_THRESHOLD {
+            return fallback(args_ptr);
+        }
 
         // Reset per-call state (IC table persists across calls).
         ctx.deopt_state = None;

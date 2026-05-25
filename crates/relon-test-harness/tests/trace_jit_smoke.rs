@@ -609,12 +609,40 @@ fn recording_registry_round_trip() {
 fn invoke_with_fallback_returns_trace_result_on_success() {
     let state = TraceJitState::new();
     let mut buffer = TraceBuffer::new();
+    // Trace body must clear `TINY_TRACE_OP_THRESHOLD` so the
+    // dispatcher actually invokes the trace rather than gating it
+    // straight to the fallback. A chained `Add` sequence over a
+    // const seed produces an op_count >= 5 while keeping the trace
+    // semantically equivalent to "return 0x77".
+    let zero = buffer.fresh_ssa();
+    let one = buffer.fresh_ssa();
+    let a = buffer.fresh_ssa();
+    let b = buffer.fresh_ssa();
+    let c = buffer.fresh_ssa();
     let v = buffer.fresh_ssa();
     buffer.append(TraceOp::ConstI64 {
-        dst: v,
-        value: 0x77,
+        dst: zero,
+        value: 0x77 - 3,
     });
-    buffer.append(TraceOp::Return { value: v });
+    buffer.append(TraceOp::ConstI64 { dst: one, value: 1 });
+    buffer.append(TraceOp::Add {
+        dst: a,
+        lhs: zero,
+        rhs: one,
+    });
+    buffer.append(TraceOp::Add {
+        dst: b,
+        lhs: a,
+        rhs: one,
+    });
+    buffer.append(TraceOp::Add {
+        dst: c,
+        lhs: b,
+        rhs: one,
+    });
+    buffer.append(TraceOp::ConstI64 { dst: v, value: 0 });
+    let _ = v; // intentionally unused to keep SSA monotonic
+    buffer.append(TraceOp::Return { value: c });
     let trace_fn = state
         .jit_compile_buffer_for_fn(801, buffer)
         .expect("compile");
@@ -629,6 +657,42 @@ fn invoke_with_fallback_returns_trace_result_on_success() {
     };
     assert_eq!(result, 0x77);
     assert!(!fallback_called.get(), "trace Success must skip fallback");
+}
+
+/// `TINY_TRACE_OP_THRESHOLD` gate: micro-traces whose body is
+/// below the threshold MUST route directly to the fallback closure
+/// rather than incurring the trace-entry prologue. Guards W12's
+/// 2.08× regression fix; see `TINY_TRACE_OP_THRESHOLD` docs.
+#[test]
+fn invoke_with_fallback_gates_micro_traces_to_fallback() {
+    let state = TraceJitState::new();
+    let mut buffer = TraceBuffer::new();
+    let v = buffer.fresh_ssa();
+    buffer.append(TraceOp::ConstI64 {
+        dst: v,
+        value: 0xdead,
+    });
+    buffer.append(TraceOp::Return { value: v });
+    let trace_fn = state
+        .jit_compile_buffer_for_fn(803, buffer)
+        .expect("compile");
+    state.install_trace(803, trace_fn);
+
+    let fallback_called = std::cell::Cell::new(false);
+    let result = unsafe {
+        state.invoke_with_fallback(803, std::ptr::null(), 32, |_| {
+            fallback_called.set(true);
+            0xbeef
+        })
+    };
+    assert_eq!(
+        result, 0xbeef,
+        "micro-trace must route to fallback, not the trace body"
+    );
+    assert!(
+        fallback_called.get(),
+        "fallback closure must have been invoked"
+    );
 }
 
 #[test]
