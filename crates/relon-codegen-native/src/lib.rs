@@ -113,9 +113,10 @@ pub use trace_ic::{TraceIcSlot, IC_WAYS};
 pub use trace_inline::{compile_inline_host_fn, InlineHostFn, InlineHostFnError};
 pub use trace_install::{
     clear_recording, default_host_hooks, global_trace_jit_state, hot_counter_peek,
-    hot_counter_reset, hot_counter_reset_all, hot_counters_base, jump_helper_call_count,
-    recording_registration_count, register_recording, register_trace_runtime_symbols,
-    reset_jump_helper_call_count, JITedTraceFn, RecordingRegistration, TraceEntryFn, TraceJitError,
-    TraceJitState, HOT_COUNTERS_SYMBOL, MAX_FN_ID, RELON_HOT_THRESHOLD, TINY_TRACE_OP_THRESHOLD,
+    hot_counter_reset, hot_counter_reset_all, hot_counters_base, install_recorder_trace_warmup,
+    jump_helper_call_count, recording_registration_count, register_recording,
+    register_trace_runtime_symbols, reset_jump_helper_call_count, JITedTraceFn,
+    RecordingRegistration, TraceEntryFn, TraceJitError, TraceJitState, HOT_COUNTERS_SYMBOL,
+    MAX_FN_ID, RELON_HOT_THRESHOLD, TINY_TRACE_OP_THRESHOLD,
 };
 pub use trace_recording::{RecordingOutcome, StackCell, TraceRecordingEvaluator};

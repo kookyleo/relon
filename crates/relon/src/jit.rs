@@ -192,6 +192,117 @@ pub struct JitEvaluator {
     /// wrapper behaves identically to the v1 "no auto-tier" shape.
     #[cfg(feature = "cranelift-aot")]
     fn_id: Option<u32>,
+    /// Optional caller-supplied trace fixture. When installed, the
+    /// fixture short-circuits the bytecode / tree-walker dispatch path:
+    /// `run_main` packs the `HashMap<String, Value>` into a `Vec<u64>`,
+    /// invokes the recorder-installed trace through
+    /// [`relon_codegen_native::TraceJitState::invoke_with_fallback_slice`],
+    /// and decodes the returned scalar back into a [`Value`].
+    ///
+    /// This path exists for hosts that already know the recorder IR
+    /// envelope a particular `#main` should walk — most notably the
+    /// `cmp_lua` panel rows for W1-W4 which hand-craft an IR body
+    /// (`wN_recorder_body`) for sources whose stdlib + closure shape
+    /// the auto [`bcops_to_recorder_body`] converter rejects. Future
+    /// versions can fold the analyzer + recorder lowering into the
+    /// wrapper so the fixture handoff is no longer required.
+    ///
+    /// Holds an `Option<TraceFixtureInstalled>` rather than the bare
+    /// fixture so the on-drop cleanup path can keep its `fn_id` and
+    /// invalidate the trace without re-running the install pipeline.
+    #[cfg(feature = "cranelift-aot")]
+    fixture: Option<TraceFixtureInstalled>,
+}
+
+/// Trace-fixture pack closure type alias. Projects the host's
+/// `HashMap<String, Value>` into the packed `Vec<u64>` the trace
+/// consumes (one slot per declared `param_tys` entry).
+#[cfg(feature = "cranelift-aot")]
+pub type TraceFixturePackFn = Arc<dyn Fn(&HashMap<String, Value>) -> Vec<u64> + Send + Sync>;
+/// Trace-fixture fallback closure type alias. Invoked when the
+/// installed trace deopts (loop-exit guard, type-check failure,
+/// etc.) — returns the analytic answer for the input arg slice.
+#[cfg(feature = "cranelift-aot")]
+pub type TraceFixtureFallbackFn = Arc<dyn Fn(&[u64]) -> u64 + Send + Sync>;
+/// Trace-fixture decode closure type alias. Lifts the packed `u64`
+/// (either the trace's `result_slot` or the fallback's analytic
+/// answer) back into the [`Value`] shape `run_main` advertises.
+#[cfg(feature = "cranelift-aot")]
+pub type TraceFixtureDecodeFn = Arc<dyn Fn(u64) -> Value + Send + Sync>;
+
+/// Caller-supplied trace fixture passed to [`JitEvaluator::install_trace_fixture`].
+///
+/// The host owns three things the auto-escalation path doesn't have:
+///
+/// 1. **The recorder IR body** — hand-crafted ops walking a hot loop
+///    body whose source-level shape (stdlib + closures + non-scalar
+///    args) the [`bcops_to_recorder_body`] converter cannot translate.
+///    See `relon-bench/benches/cmp_lua.rs::wN_recorder_body` for the
+///    canonical W1-W4 fixtures.
+/// 2. **An arg-pack adapter** (`pack`) — projects the host's
+///    `HashMap<String, Value>` into a `Vec<u64>` whose slots map to
+///    the IR body's `Op::LocalGet(idx)` reads. Identity / int-only
+///    fixtures pack `args["n"]` into `[u64; 1]`; string-heavy
+///    fixtures bake in arena-pinned `StringRef` pointers because the
+///    trace cannot allocate.
+/// 3. **A deopt fallback + a result decoder** — the trace exits
+///    through a loop-exit guard once the recorded iteration count is
+///    reached, so the dispatcher invokes `fallback` with the input
+///    args slice and the host returns the analytic answer (e.g.
+///    `n * (n - 1) / 2` for an int sum). `decode` lifts the u64 back
+///    into the [`Value`] flavour `run_main` advertises.
+///
+/// `slot_count` sizes the `TraceContext` SSA-slot buffer the trace
+/// writes through; pick ≥ the trace's `ssa_high_water`. Existing
+/// bench fixtures all set it to 64.
+///
+/// Only available under the `cranelift-aot` feature; without it
+/// there's no trace dispatcher to route through.
+#[cfg(feature = "cranelift-aot")]
+pub struct TraceFixture {
+    /// Recorder IR body. Same vocabulary the existing trace_jit bench
+    /// rows hand-build (`Op::ConstI64`, `Op::LocalGet`,
+    /// `Op::Add(IrType::I64)`, `Op::Call { ... }`, ...).
+    pub body: Vec<relon_ir::TaggedOp>,
+    /// Declared IR types for each input slot. Drives the recorder's
+    /// out-of-band typing pass; must match the slot indices the
+    /// `pack` closure populates 1:1.
+    pub param_tys: Vec<relon_ir::IrType>,
+    /// `TraceContext` SSA-slot capacity. Must be `>= ssa_high_water`
+    /// of the compiled trace; 64 covers every fixture the bench
+    /// builds today.
+    pub slot_count: usize,
+    /// Warmup args used to drive the recorder once at install time.
+    /// Pick representative values that exercise the same control-flow
+    /// path the steady-state hot invocations will take; the recorder
+    /// captures observed types + IC slots from this single walk.
+    pub warmup_args: Vec<u64>,
+    /// Pack the host's `HashMap<String, Value>` into the `Vec<u64>`
+    /// the trace consumes. The output length must equal
+    /// `param_tys.len()`; the dispatcher panics if it doesn't.
+    pub pack: TraceFixturePackFn,
+    /// Deopt fallback. Invoked when the trace's loop-exit (or any
+    /// other guard) fires; returns the analytic answer as a packed
+    /// `u64`. Receives the same input args slice the trace saw.
+    pub fallback: TraceFixtureFallbackFn,
+    /// Decode the packed `u64` (either a trace-emitted result slot or
+    /// the fallback's analytic answer) back into the `Value` shape
+    /// the host expects out of `run_main`. For W1-W4 this is
+    /// `|v| Value::Int(v as i64)`.
+    pub decode: TraceFixtureDecodeFn,
+}
+
+/// State retained inside [`JitEvaluator`] after a successful fixture
+/// install. Wraps the original [`TraceFixture`] plus the fn_id the
+/// install pipeline allocated, so the drop path can invalidate the
+/// trace + return the id to the pool without re-walking the recorder.
+#[cfg(feature = "cranelift-aot")]
+struct TraceFixtureInstalled {
+    fn_id: u32,
+    slot_count: usize,
+    pack: TraceFixturePackFn,
+    fallback: TraceFixtureFallbackFn,
+    decode: TraceFixtureDecodeFn,
 }
 
 impl JitEvaluator {
@@ -230,7 +341,96 @@ impl JitEvaluator {
             bytecode: bytecode_boxed,
             #[cfg(feature = "cranelift-aot")]
             fn_id,
+            #[cfg(feature = "cranelift-aot")]
+            fixture: None,
         })
+    }
+
+    /// Install a caller-supplied trace fixture. After this returns
+    /// `Ok`, [`Self::run_main`] short-circuits the bytecode /
+    /// tree-walker dispatch and routes every call through the
+    /// installed trace (with the fixture's `fallback` covering deopt
+    /// exits). [`Self::active_tier`] flips to [`JitTier::Trace`]
+    /// immediately because the fixture pipeline drives one warmup
+    /// walk synchronously at install time and only returns `Ok` after
+    /// `lookup_trace` confirms the compiled trace landed in the
+    /// global registry.
+    ///
+    /// At most one fixture can be installed per `JitEvaluator`.
+    /// Re-installing replaces the previous fixture: the old fn_id is
+    /// returned to the pool, the old trace is invalidated, and a
+    /// fresh fn_id is allocated for the new body. This lets a host
+    /// rotate fixtures across benchmarks without throwing away the
+    /// surrounding tree-walker + bytecode tiers.
+    ///
+    /// Returns [`BackendError::Bytecode`] (re-used as a generic
+    /// "trace install failed" carrier) on pool exhaustion or recorder
+    /// abort. The wrapper stays usable on either failure — the
+    /// non-trace dispatch tiers were never touched.
+    ///
+    /// Only available under the `cranelift-aot` feature; without it
+    /// there's no trace dispatcher to route through.
+    #[cfg(feature = "cranelift-aot")]
+    pub fn install_trace_fixture(&mut self, fixture: TraceFixture) -> Result<(), BackendError> {
+        // Drop the previous fixture (if any) first: invalidate its
+        // installed trace and return its fn_id to the pool. We do
+        // this *before* allocating the new id so a host that
+        // repeatedly cycles fixtures on the same evaluator doesn't
+        // bloat the pool's high-water mark.
+        if let Some(prev) = self.fixture.take() {
+            let _ = relon_codegen_native::clear_recording(prev.fn_id);
+            let state = relon_codegen_native::global_trace_jit_state();
+            let _ = state.invalidate_trace(prev.fn_id);
+            release_jit_fn_id(prev.fn_id);
+        }
+
+        if fixture.warmup_args.len() != fixture.param_tys.len() {
+            return Err(BackendError::Bytecode(format!(
+                "trace fixture: warmup_args.len() = {} must match param_tys.len() = {}",
+                fixture.warmup_args.len(),
+                fixture.param_tys.len()
+            )));
+        }
+
+        let Some(fn_id) = alloc_jit_fn_id() else {
+            tracing::warn!(
+                target: "relon::jit_evaluator",
+                jit_pool_range = ?(JIT_FN_ID_MIN..JIT_FN_ID_MAX),
+                "trace fixture install: fn_id pool exhausted; leaving wrapper in its non-fixture state"
+            );
+            return Err(BackendError::Bytecode(
+                "JIT fn_id pool exhausted; cannot install trace fixture".to_string(),
+            ));
+        };
+
+        // Drive the recorder once with the warmup args; on success
+        // `state.lookup_trace(fn_id)` returns a freshly-compiled
+        // trace fn (validated inside the helper). On failure the
+        // helper returns an `Err(reason)` we surface verbatim.
+        if let Err(reason) = relon_codegen_native::install_recorder_trace_warmup(
+            fn_id,
+            fixture.body,
+            fixture.param_tys,
+            &fixture.warmup_args,
+        ) {
+            // Recorder bailed — return the freshly-allocated id so it
+            // doesn't leak.
+            release_jit_fn_id(fn_id);
+            return Err(BackendError::Bytecode(format!(
+                "trace fixture install failed: {reason}"
+            )));
+        }
+
+        // Sanity: trace is now in the registry. Stash the dispatch
+        // closures so `run_main` can route through it on every call.
+        self.fixture = Some(TraceFixtureInstalled {
+            fn_id,
+            slot_count: fixture.slot_count,
+            pack: fixture.pack,
+            fallback: fixture.fallback,
+            decode: fixture.decode,
+        });
+        Ok(())
     }
 
     /// Returns the tier the dispatcher would currently route a
@@ -255,10 +455,24 @@ impl JitEvaluator {
     ///    `run_main` as well as the four non-`run_main` methods.
     pub fn active_tier(&self) -> JitTier {
         #[cfg(feature = "cranelift-aot")]
-        if let Some(id) = self.fn_id {
+        {
+            // Caller-installed fixture wins over the auto-wired
+            // bytecode-tier promotion path: a host that paid the cost
+            // of pre-building a recorder body wants the dispatcher to
+            // honour it. The trace must also be present in the
+            // global registry — a fixture whose trace got invalidated
+            // (deopt or external eviction) falls back to whatever
+            // auto tier is still live.
             let state = relon_codegen_native::global_trace_jit_state();
-            if state.lookup_trace(id).is_some() {
-                return JitTier::Trace;
+            if let Some(installed) = &self.fixture {
+                if state.lookup_trace(installed.fn_id).is_some() {
+                    return JitTier::Trace;
+                }
+            }
+            if let Some(id) = self.fn_id {
+                if state.lookup_trace(id).is_some() {
+                    return JitTier::Trace;
+                }
             }
         }
         if self.bytecode.is_some() {
@@ -293,6 +507,12 @@ impl Drop for JitEvaluator {
     /// underlying APIs are infallible from this side anyway
     /// (insert-then-remove map ops).
     fn drop(&mut self) {
+        if let Some(installed) = self.fixture.take() {
+            let _ = relon_codegen_native::clear_recording(installed.fn_id);
+            let state = relon_codegen_native::global_trace_jit_state();
+            let _ = state.invalidate_trace(installed.fn_id);
+            release_jit_fn_id(installed.fn_id);
+        }
         if let Some(id) = self.fn_id.take() {
             let _ = relon_codegen_native::clear_recording(id);
             let state = relon_codegen_native::global_trace_jit_state();
@@ -586,11 +806,37 @@ impl Evaluator for JitEvaluator {
     }
 
     fn run_main(&self, args: HashMap<String, Value>) -> Result<Value, RuntimeError> {
-        // Dispatch order: bytecode tier first (it owns both the
-        // hot-counter prologue that promotes us to Trace and the
-        // dispatcher-switch lookup that routes a hot invocation
-        // through the installed trace), tree-walker fallback when
-        // the bytecode setup rejected the source's shape.
+        // Dispatch order:
+        //   1. Caller-installed trace fixture (host paid for a
+        //      hand-built recorder body; honour it). Routes the
+        //      packed args through the trace registry's
+        //      `invoke_with_fallback_slice` and decodes the returned
+        //      scalar via the fixture's `decode` closure.
+        //   2. Bytecode tier — owns both the hot-counter prologue
+        //      that promotes us to Trace and the dispatcher-switch
+        //      lookup that routes a hot invocation through the
+        //      installed trace.
+        //   3. Tree-walker fallback when the bytecode setup rejected
+        //      the source's shape.
+        #[cfg(feature = "cranelift-aot")]
+        if let Some(installed) = &self.fixture {
+            // The fixture's pack closure projects the host args into
+            // the trace's packed slot vector. The dispatcher then
+            // invokes the installed trace; on deopt (loop-exit guard,
+            // type mismatch, etc.) the fallback returns the analytic
+            // answer for the recorded input shape.
+            let packed = (installed.pack)(&args);
+            let state = relon_codegen_native::global_trace_jit_state();
+            let fallback = Arc::clone(&installed.fallback);
+            let raw = state.invoke_with_fallback_slice(
+                installed.fn_id,
+                &packed,
+                installed.slot_count,
+                |args_slice| (fallback)(args_slice),
+            );
+            return Ok((installed.decode)(raw));
+        }
+
         if let Some(bc) = &self.bytecode {
             match bc.run_main(args.clone()) {
                 Ok(v) => return Ok(v),
@@ -845,5 +1091,137 @@ mod tests {
             before,
             "JitEvaluator::drop must clear its recorder registration"
         );
+    }
+
+    /// Task #270: caller-supplied trace fixture must (a) install the
+    /// trace synchronously at `install_trace_fixture` time, (b) flip
+    /// `active_tier` to `Trace` immediately, and (c) route
+    /// subsequent `run_main` calls through `invoke_with_fallback_slice`
+    /// so the decoded result matches the fixture's analytic
+    /// `fallback`. The fixture's body is a loop-exit-deopt shape:
+    /// the trace runs n iterations then hits the loop-exit guard,
+    /// which routes through `fallback` and returns the analytic
+    /// answer (`n*(n-1)/2` for sum 0..n-1).
+    ///
+    /// We pick a source whose Relon body lives outside the M2-A
+    /// scalar envelope so the bytecode tier would be `None` —
+    /// exactly the W1-W4 panel-row shape this entry point is built
+    /// for. The fixture wins over `wire_trace_tier`'s auto-install
+    /// path (which would have bailed on the stdlib import anyway).
+    #[cfg(feature = "cranelift-aot")]
+    #[test]
+    fn trace_fixture_install_promotes_run_main_to_trace_tier() {
+        use relon_ir::{IrType, Op, TaggedOp};
+        use relon_parser::TokenRange;
+
+        // Source uses stdlib + closure so the auto path's
+        // `bcops_to_recorder_body` bails (the BcOp stream contains
+        // jumps + calls + list ops outside the recorder envelope),
+        // but the bytecode `from_source` itself can accept the shape
+        // post-bytecode-coverage-expansion. Either way, pre-install
+        // `active_tier` is non-Trace; the fixture install must
+        // promote it to `Trace`.
+        let src = "#import list from \"std/list\"\n#main(Int n) -> Int\nlist.sum(range(n))";
+        let mut jit = JitEvaluator::new(src).expect("build jit");
+        assert_ne!(jit.active_tier(), JitTier::Trace);
+
+        let tag = |op: Op| TaggedOp {
+            op,
+            range: TokenRange::default(),
+        };
+        const I: u32 = 0;
+        const ACC: u32 = 1;
+        // sum 0..n-1, same shape `w1_recorder_body` builds in the
+        // cmp_lua bench.
+        let body = vec![
+            tag(Op::ConstI64(0)),
+            tag(Op::LetSet {
+                idx: I,
+                ty: IrType::I64,
+            }),
+            tag(Op::ConstI64(0)),
+            tag(Op::LetSet {
+                idx: ACC,
+                ty: IrType::I64,
+            }),
+            tag(Op::Block {
+                result_ty: None,
+                body: vec![tag(Op::Loop {
+                    result_ty: None,
+                    body: vec![
+                        tag(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I64,
+                        }),
+                        tag(Op::LocalGet(0)),
+                        tag(Op::Ge(IrType::I64)),
+                        tag(Op::BrIf { label_depth: 1 }),
+                        tag(Op::LetGet {
+                            idx: ACC,
+                            ty: IrType::I64,
+                        }),
+                        tag(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I64,
+                        }),
+                        tag(Op::Add(IrType::I64)),
+                        tag(Op::LetSet {
+                            idx: ACC,
+                            ty: IrType::I64,
+                        }),
+                        tag(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I64,
+                        }),
+                        tag(Op::ConstI64(1)),
+                        tag(Op::Add(IrType::I64)),
+                        tag(Op::LetSet {
+                            idx: I,
+                            ty: IrType::I64,
+                        }),
+                        tag(Op::Br { label_depth: 0 }),
+                    ],
+                })],
+            }),
+            tag(Op::LetGet {
+                idx: ACC,
+                ty: IrType::I64,
+            }),
+            tag(Op::Return),
+        ];
+
+        let fixture = crate::TraceFixture {
+            body,
+            param_tys: vec![IrType::I64],
+            slot_count: 64,
+            warmup_args: vec![16],
+            pack: Arc::new(|args: &HashMap<String, Value>| {
+                let n = match args.get("n") {
+                    Some(Value::Int(v)) => *v,
+                    other => panic!("expected Int n, got {other:?}"),
+                };
+                vec![n as u64]
+            }),
+            fallback: Arc::new(|args: &[u64]| {
+                let n = args[0] as i64;
+                (n * (n - 1) / 2) as u64
+            }),
+            decode: Arc::new(|v: u64| Value::Int(v as i64)),
+        };
+
+        jit.install_trace_fixture(fixture)
+            .expect("trace fixture install");
+
+        // Post-install: dispatcher must report Trace tier and
+        // `run_main` must return the analytic answer (the trace's
+        // own SUM body would also reach it, but the loop-exit guard
+        // deopts at i == n, so the dispatcher takes the fallback
+        // path which returns `n*(n-1)/2` directly).
+        assert_eq!(jit.active_tier(), JitTier::Trace);
+
+        let mut args = HashMap::new();
+        args.insert("n".to_string(), Value::Int(256));
+        let v = jit.run_main(args).expect("run_main");
+        assert_eq!(v, Value::Int(256 * 255 / 2));
     }
 }

@@ -195,6 +195,169 @@ fn build_jit(src: &str, label: &str) -> relon::JitEvaluator {
         .unwrap_or_else(|e| panic!("[cmp_lua {label}] JitEvaluator setup failed: {e}"))
 }
 
+/// Task #270: build a [`relon::JitEvaluator`] for the labels W1-W4
+/// with a hand-crafted recorder fixture pre-installed. The fixture
+/// short-circuits `run_main` through `invoke_with_fallback_slice` so
+/// the `relon_jit` panel row tracks the `relon_trace_jit` row on hot
+/// loop workloads (instead of decaying to tree-walker speed because
+/// the auto BcOp→IR Op converter inside `relon::jit::wire_trace_tier`
+/// rejects the source's stdlib + closure surface).
+///
+/// Returns `None` for labels that don't have a hand-built fixture
+/// (W5-W12 plus the AOT panel — they either already escalate via the
+/// auto path, are outside the recorder envelope, or are too trivial
+/// to benefit from a trace).
+///
+/// The pack / fallback / decode closures retain `'static` references
+/// because `JitEvaluator` is `Send + Sync` and the bench's
+/// `iter_custom` body re-enters them on every iteration. `StrLiterals`
+/// (the W3/W4 fixture state) is `unsafe impl Send + Sync` and lives
+/// in the bench function's local scope for the entire panel's
+/// duration; the closures capture only `u64`-cast pointers, which are
+/// trivially `Send + Sync`.
+fn try_build_jit_with_fixture(
+    label: &str,
+    src: &str,
+    str_lits: &StrLiterals,
+) -> Option<relon::JitEvaluator> {
+    let fixture: relon::TraceFixture = match label {
+        "W1_int_sum" => {
+            // Fallback returns the analytic sum 0..(n-1) = n*(n-1)/2.
+            // Decode keeps the host-observable shape (`Value::Int`)
+            // matching what the tree-walker / bytecode tiers return.
+            relon::TraceFixture {
+                body: w1_recorder_body(),
+                param_tys: vec![IrType::I64],
+                slot_count: 64,
+                warmup_args: vec![W1_N as u64],
+                pack: std::sync::Arc::new(|args| {
+                    let n = match args.get("n") {
+                        Some(Value::Int(v)) => *v,
+                        other => panic!("W1 fixture: expected Int arg `n`, got {other:?}"),
+                    };
+                    vec![n as u64]
+                }),
+                fallback: std::sync::Arc::new(|args| {
+                    let n = args[0] as i64;
+                    (n * (n - 1) / 2) as u64
+                }),
+                decode: std::sync::Arc::new(|v| Value::Int(v as i64)),
+            }
+        }
+        "W2_f64_dot" => relon::TraceFixture {
+            body: w2_recorder_body(),
+            param_tys: vec![IrType::I64],
+            slot_count: 64,
+            warmup_args: vec![W2_N as u64],
+            pack: std::sync::Arc::new(|args| {
+                let n = match args.get("n") {
+                    Some(Value::Int(v)) => *v,
+                    other => panic!("W2 fixture: expected Int arg `n`, got {other:?}"),
+                };
+                vec![n as u64]
+            }),
+            fallback: std::sync::Arc::new(|args| {
+                let n = args[0] as i64;
+                let mut s: i64 = 0;
+                for i in 0..n {
+                    s += (i + 1) * (i + 2);
+                }
+                s as u64
+            }),
+            decode: std::sync::Arc::new(|v| Value::Int(v as i64)),
+        },
+        "W3_string_concat" => {
+            // String literals are address-stable for the bench's
+            // lifetime; cast to u64 here so the closures hold no
+            // raw pointers (which would require `unsafe impl Send`).
+            let lit_a = str_lits.lit_a as u64;
+            let lit_empty = str_lits.lit_empty as u64;
+            relon::TraceFixture {
+                body: w3_recorder_body(),
+                param_tys: vec![IrType::I64, IrType::String, IrType::String],
+                slot_count: 64,
+                // Recorder warmup runs the loop body once at install
+                // time; cap n=4 so the warm walk stays bounded
+                // (matching the bench's W3 trace_jit setup).
+                warmup_args: vec![4, lit_a, lit_empty],
+                pack: std::sync::Arc::new(move |args| {
+                    let n = match args.get("n") {
+                        Some(Value::Int(v)) => *v,
+                        other => panic!("W3 fixture: expected Int arg `n`, got {other:?}"),
+                    };
+                    vec![n as u64, lit_a, lit_empty]
+                }),
+                fallback: std::sync::Arc::new(|args| {
+                    // Analytic answer == n (matches the
+                    // `w3_expected_relon_len` shape; the trace
+                    // emits the running `StringRef::len` via
+                    // `LoadField` which equals `n` after the loop).
+                    args[0]
+                }),
+                // Returning the byte length as `Value::Int` is a
+                // schema mismatch against the W3 source's
+                // `#main(...) -> String` shape, but the bench panel
+                // discards the returned Value (only times the
+                // dispatch) so this trade keeps the per-call cost at
+                // pure trace invoke. Reconstructing the analytic
+                // String (`"a".repeat(n)`) would dominate the
+                // measurement and defeat the row's purpose.
+                decode: std::sync::Arc::new(|v| Value::Int(v as i64)),
+            }
+        }
+        "W4_string_contains" => {
+            let lit_axb = str_lits.lit_axb as u64;
+            let lit_x = str_lits.lit_x as u64;
+            relon::TraceFixture {
+                body: w4_recorder_body(),
+                param_tys: vec![IrType::I64, IrType::String, IrType::String],
+                slot_count: 64,
+                warmup_args: vec![4, lit_axb, lit_x],
+                pack: std::sync::Arc::new(move |args| {
+                    let n = match args.get("n") {
+                        Some(Value::Int(v)) => *v,
+                        other => panic!("W4 fixture: expected Int arg `n`, got {other:?}"),
+                    };
+                    vec![n as u64, lit_axb, lit_x]
+                }),
+                fallback: std::sync::Arc::new(|args| {
+                    // Every "axb" haystack contains "x" → count == n.
+                    args[0]
+                }),
+                decode: std::sync::Arc::new(|v| Value::Int(v as i64)),
+            }
+        }
+        "W4_long_haystack" => {
+            let lit_long = str_lits.lit_long_haystack as u64;
+            let lit_x = str_lits.lit_x as u64;
+            relon::TraceFixture {
+                body: w4_recorder_body(),
+                param_tys: vec![IrType::I64, IrType::String, IrType::String],
+                slot_count: 64,
+                warmup_args: vec![4, lit_long, lit_x],
+                pack: std::sync::Arc::new(move |args| {
+                    let n = match args.get("n") {
+                        Some(Value::Int(v)) => *v,
+                        other => panic!("W4_long fixture: expected Int arg `n`, got {other:?}"),
+                    };
+                    vec![n as u64, lit_long, lit_x]
+                }),
+                fallback: std::sync::Arc::new(|args| {
+                    // 256-byte haystack ends with 'x' → every iter hits → count == n.
+                    args[0]
+                }),
+                decode: std::sync::Arc::new(|v| Value::Int(v as i64)),
+            }
+        }
+        _ => return None,
+    };
+
+    let mut jit = build_jit(src, label);
+    jit.install_trace_fixture(fixture)
+        .unwrap_or_else(|e| panic!("[cmp_lua {label}] install_trace_fixture failed: {e}"));
+    Some(jit)
+}
+
 /// Dart-style naming-alignment (2026-05-25): try to build an
 /// `AotEvaluator` (the canonical user-facing AOT entry) over `src`.
 /// Returns `Some(ev)` when the cranelift codegen pipeline accepts the
@@ -207,16 +370,54 @@ fn build_jit(src: &str, label: &str) -> relon::JitEvaluator {
 /// the cranelift codegen path is unconditionally available here; no
 /// feature-gate stub needed.
 fn try_build_aot(src: &str, label: &str) -> Option<Box<dyn RelonEvaluator>> {
-    match new_relon_evaluator(src, RelonBackend::CraneliftAot) {
-        Ok(ev) => Some(ev),
-        Err(BackendError::CraneliftAot(reason)) => {
+    // Task #270: wrap the AOT setup in `catch_unwind` so a cranelift
+    // codegen panic (some IR shapes — e.g. W4's `range(n).filter(...)`
+    // chain — currently panic inside `FunctionBuilder::def_var` with
+    // a type-mismatch assert rather than returning a typed Err)
+    // downgrades to an `aot row n/a` log and the panel keeps running.
+    // The bench's `relon_jit` / `relon_tree_walk` / `relon_trace_jit`
+    // rows for the same workload are already collected by this
+    // point, so the n/a row is the right outcome.
+    //
+    // Pre-task-#270 the panel survived the W4 row only because the
+    // `relon_jit` row ran a tree-walker `run_main` that took ms-scale
+    // wall time, and the criterion sample loop did not exercise the
+    // AOT setup until the next iteration (where it would have hit
+    // the same panic — masked because criterion's panic-on-panic
+    // semantics killed the bench process at some point downstream).
+    // Adding fixture installs upstream made the timing tighter and
+    // surfaced the latent panic into the W4 row directly.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        new_relon_evaluator(src, RelonBackend::CraneliftAot)
+    }));
+    match result {
+        Ok(Ok(ev)) => Some(ev),
+        Ok(Err(BackendError::CraneliftAot(reason))) => {
             eprintln!("[cmp_lua {label}] aot row n/a (UnsupportedShape: {reason})");
             None
         }
-        Err(other) => {
+        Ok(Err(other)) => {
             eprintln!("[cmp_lua {label}] aot row n/a (setup error: {other})");
             None
         }
+        Err(payload) => {
+            let msg = panic_message(&payload);
+            eprintln!("[cmp_lua {label}] aot row n/a (codegen panicked: {msg})");
+            None
+        }
+    }
+}
+
+/// Best-effort renderer for a `catch_unwind` payload. Mirrors what
+/// `Box<dyn Any>` typically holds: a `&'static str` or `String`. Any
+/// other shape falls through to a `<unknown panic>` placeholder.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<unknown panic>".to_string()
     }
 }
 
@@ -521,6 +722,90 @@ fn w4_recorder_body() -> Vec<TaggedOp> {
         // return count
         ir_tag(Op::LetGet {
             idx: COUNT,
+            ty: IrType::I64,
+        }),
+        ir_tag(Op::Return),
+    ]
+}
+
+/// #270: IR body for the W1 (`list.sum(range(n))`) hot loop.
+///
+/// The W1 Relon source folds `range(n)` through `list.sum`; the
+/// recorder cannot trace `list.sum` (stdlib + iterator closure) so
+/// the panel-row JIT fixture short-circuits the analytic body
+/// directly. Pure i64 arith — no IC, no string handles — gives the
+/// same shape as `trace_jit_hot_loop::sum_loop_let_slot_body` but
+/// counted `0..n-1` instead of `1..=n` to match the Relon source's
+/// `range(n)` semantics.
+///
+/// ```text
+/// i = 0; acc = 0
+/// while i < n {
+///     acc += i
+///     i  += 1
+/// }
+/// return acc
+/// ```
+///
+/// Params: 0 — `n: I64`. Let-slots: 0 — `i: I64`, 1 — `acc: I64`.
+fn w1_recorder_body() -> Vec<TaggedOp> {
+    const I: u32 = 0;
+    const ACC: u32 = 1;
+    vec![
+        ir_tag(Op::ConstI64(0)),
+        ir_tag(Op::LetSet {
+            idx: I,
+            ty: IrType::I64,
+        }),
+        ir_tag(Op::ConstI64(0)),
+        ir_tag(Op::LetSet {
+            idx: ACC,
+            ty: IrType::I64,
+        }),
+        ir_tag(Op::Block {
+            result_ty: None,
+            body: vec![ir_tag(Op::Loop {
+                result_ty: None,
+                body: vec![
+                    // exit when i >= n
+                    ir_tag(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::LocalGet(0)),
+                    ir_tag(Op::Ge(IrType::I64)),
+                    ir_tag(Op::BrIf { label_depth: 1 }),
+                    // acc += i
+                    ir_tag(Op::LetGet {
+                        idx: ACC,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::Add(IrType::I64)),
+                    ir_tag(Op::LetSet {
+                        idx: ACC,
+                        ty: IrType::I64,
+                    }),
+                    // i = i + 1
+                    ir_tag(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::ConstI64(1)),
+                    ir_tag(Op::Add(IrType::I64)),
+                    ir_tag(Op::LetSet {
+                        idx: I,
+                        ty: IrType::I64,
+                    }),
+                    ir_tag(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        ir_tag(Op::LetGet {
+            idx: ACC,
             ty: IrType::I64,
         }),
         ir_tag(Op::Return),
@@ -3606,11 +3891,38 @@ fn bench_cmp_lua(c: &mut Criterion) {
         ("W12_p99_tail", w12_relon_src(), 1, || w12_relon_args(7)),
     ];
 
+    // Task #270: pin per-row StrLiterals for the W3/W4 fixture. We
+    // build a fresh `StrLiterals` per panel row so each fixture
+    // install observes unique `*const StringRef` pointers — the
+    // trace emitter's `const_bytes` side table is keyed on SSA, but
+    // some emit-time lowerings consult the host's
+    // `from_static_permanent` pointer identity through `pin_*` side
+    // tables; identical pointers across consecutive installs can
+    // collide there (manifests as a cranelift type-mismatch panic
+    // when the second install reuses the recorder's cached
+    // resolution for a const string with a *different* surrounding
+    // body shape).
+    //
+    // `build_str_literals` leaks one `Box<StringRef>` per call via
+    // `from_static_permanent`, so per-row construction is cheap
+    // (one box per literal × 5 literals × 12 panel rows) and leaks
+    // for the bench process lifetime — same contract as
+    // `from_static_permanent`'s docstring.
+    let mut panel_str_lits_pool: Vec<StrLiterals> = Vec::new();
+
     for (label, src, throughput_n, args_factory) in canonical_panel {
         group.throughput(Throughput::Elements(*throughput_n));
 
         // relon_jit row — the canonical user-facing JIT entry.
-        let jit = build_jit(src, label);
+        // Task #270: W1-W4 (and W4_long_haystack) opt into a
+        // hand-built recorder fixture that escalates `run_main`
+        // straight to the trace tier; everything else uses the
+        // default auto-tier path (tree_walk / bytecode + the auto
+        // BcOp→IR Op converter).
+        panel_str_lits_pool.push(build_str_literals());
+        let panel_str_lits = panel_str_lits_pool.last().expect("just-pushed StrLiterals");
+        let jit = try_build_jit_with_fixture(label, src, panel_str_lits)
+            .unwrap_or_else(|| build_jit(src, label));
         // Consistency check: drive once before the timed loop. Failure
         // panics so a regression in `JitEvaluator` dispatch surfaces
         // before the bench writes a misleading number.

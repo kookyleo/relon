@@ -46,6 +46,8 @@ use std::sync::Arc;
 pub use auto_evaluator::{is_trivial_scalar_main, is_trivial_scalar_main_node, AutoEvaluator};
 pub use builder::{EvaluatorBuilder, TrustLevel};
 pub use jit::{JitEvaluator, JitTier};
+#[cfg(feature = "cranelift-aot")]
+pub use jit::{TraceFixture, TraceFixtureDecodeFn, TraceFixtureFallbackFn, TraceFixturePackFn};
 pub use projector::{JsonProjector, Projector};
 // Dart-style canonical AOT entry, re-exported through the facade so
 // hosts can spell `relon::AotEvaluator` alongside `relon::JitEvaluator`

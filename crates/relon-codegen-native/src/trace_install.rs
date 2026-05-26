@@ -750,6 +750,58 @@ impl TraceJitState {
         }
     }
 
+    /// Safe-slice convenience wrapper around [`Self::invoke_with_fallback`].
+    ///
+    /// Takes the trace args as a borrowed `&[u64]` rather than a raw
+    /// pointer + length, so callers that already own a `Vec<u64>` /
+    /// `[u64; N]` can route a `JitEvaluator::run_main`-shaped invoke
+    /// through the installed trace without spelling out `unsafe`. The
+    /// fallback closure mirrors the safety contract: it receives the
+    /// **same** slice (rematerialised through `from_raw_parts` against
+    /// `args.len()`) the trace would have seen.
+    ///
+    /// Asserts `slot_count >= args.len()` because the trace entry
+    /// writes past the input args into the SSA slot array — passing a
+    /// smaller `slot_count` would let cranelift scribble past the
+    /// allocation. The assertion turns a UB landmine into a deterministic
+    /// panic.
+    pub fn invoke_with_fallback_slice<F>(
+        &self,
+        fn_id: u32,
+        args: &[u64],
+        slot_count: usize,
+        fallback: F,
+    ) -> u64
+    where
+        F: FnOnce(&[u64]) -> u64,
+    {
+        assert!(
+            slot_count >= args.len(),
+            "invoke_with_fallback_slice: slot_count ({slot_count}) must be >= args.len() ({})",
+            args.len()
+        );
+        let args_len = args.len();
+        let args_ptr = args.as_ptr();
+        // SAFETY:
+        // * `args_ptr` points to `args_len` valid `u64`s for the
+        //   duration of this call (the slice we received is borrowed
+        //   for the entire call body).
+        // * `slot_count >= args_len` per the assertion above, so the
+        //   trace's SSA-slot writes stay inside the buffer the caller
+        //   sized for us (the `TraceContext` allocates `slot_count`
+        //   slots; the trace input reads ride on the same buffer).
+        // * The fallback closure rematerialises the slice from the
+        //   same raw pointer + length, never extending beyond
+        //   `args_len`, so the resulting reference is valid for the
+        //   closure body.
+        unsafe {
+            self.invoke_with_fallback(fn_id, args_ptr, slot_count, |raw_ptr| {
+                let s = std::slice::from_raw_parts(raw_ptr, args_len);
+                fallback(s)
+            })
+        }
+    }
+
     /// Invoke the installed trace for `fn_id` if any, falling back to
     /// `fallback` on guard failure / abort / no-trace-installed.
     ///
@@ -1468,6 +1520,90 @@ pub fn clear_recording(fn_id: u32) -> Option<RecordingRegistration> {
 /// (mainly for tests asserting the registry is in the expected state).
 pub fn recording_registration_count() -> usize {
     RECORDING_REGISTRY.with(|r| r.borrow().len())
+}
+
+/// Safe-slice convenience for the trace-recorder warmup path: register
+/// `body` + `param_tys` against `fn_id`, then drive the recorder once
+/// with the supplied warmup args so the install pipeline lands a
+/// compiled trace before the host's first hot invocation.
+///
+/// The host crate (`relon-bench`, `relon::jit`) used to spell this
+/// out by combining [`register_recording`] with a manual call to the
+/// `unsafe extern "C"` [`__relon_jump_to_recorder`] entry-point. The
+/// resulting boilerplate was always the same — clear stale registry
+/// state, register the new body, jump-into-recorder with the args
+/// slice — and forced every caller crate to opt out of
+/// `forbid(unsafe_code)`. Encapsulating it here lets the public crate
+/// stay safe-by-default while keeping the entry-point unsafe symbol
+/// available for the cranelift prologue (which calls it through a
+/// C ABI).
+///
+/// Returns `Ok(Arc<JITedTraceFn>)` on a successful install (the trace
+/// is now in `global_trace_jit_state` and ready to be invoked) or
+/// `Err(reason)` when the recorder bailed (caller falls back to the
+/// non-trace dispatch path). The error string is constructed for
+/// human-readable logging; structural matching is intentionally not
+/// supported because the recorder's abort taxonomy is internal.
+///
+/// `warmup_args.len()` must equal `param_tys.len()` — the recorder
+/// walks `param_tys` to type the warmup args, and a length mismatch
+/// would either short-read into uninitialised memory or skip args the
+/// recorder expected to type.
+pub fn install_recorder_trace_warmup(
+    fn_id: u32,
+    body: Vec<relon_ir::TaggedOp>,
+    param_tys: Vec<relon_ir::IrType>,
+    warmup_args: &[u64],
+) -> Result<std::sync::Arc<JITedTraceFn>, String> {
+    if warmup_args.len() != param_tys.len() {
+        return Err(format!(
+            "warmup_args.len() = {} must match param_tys.len() = {}",
+            warmup_args.len(),
+            param_tys.len()
+        ));
+    }
+    let _ = clear_recording(fn_id);
+    let state = global_trace_jit_state();
+    state.invalidate_trace(fn_id);
+
+    // Pre-flight: step the recorder out-of-band so a recorder envelope
+    // miss surfaces as a precise abort reason rather than a silent
+    // install skip. Mirrors the bench's `install_recorder_trace`
+    // helper but returns the abort reason as `Err` instead of a panic
+    // so production hosts can degrade gracefully.
+    {
+        let args: Vec<(u64, relon_ir::IrType)> = param_tys
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| (warmup_args[i], *ty))
+            .collect();
+        let mut recorder = relon_trace_recorder::RecorderState::new();
+        let outcome = crate::TraceRecordingEvaluator::record_and_run(&mut recorder, &args, &body);
+        if let crate::RecordingOutcome::Aborted { reason, .. } = outcome {
+            return Err(format!(
+                "recorder aborted while walking IR fixture for fn_id {fn_id}: {reason:?}"
+            ));
+        }
+    }
+
+    register_recording(
+        fn_id,
+        RecordingRegistration {
+            body,
+            param_tys,
+            ..Default::default()
+        },
+    );
+    // SAFETY: `warmup_args.as_ptr()` is valid for `warmup_args.len()`
+    // u64 reads (verified above to equal `param_tys.len()`, which is
+    // what the recorder consumes). The ptr lifetime extends through
+    // the synchronous helper call; no caller observes the ptr again.
+    unsafe {
+        __relon_jump_to_recorder(fn_id, warmup_args.as_ptr());
+    }
+    state.lookup_trace(fn_id).ok_or_else(|| {
+        format!("recorder warmup for fn_id {fn_id} completed but install/compile produced no trace")
+    })
 }
 
 /// `extern "C"` host helper invoked from the cranelift entry-fn
