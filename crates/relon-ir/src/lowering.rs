@@ -1924,11 +1924,20 @@ fn lower_fn_call(
 /// through to the normal lowering path), or `Err` when the inner
 /// argument expressions themselves fail to lower.
 ///
-/// Pattern shapes accepted:
+/// Pattern shapes accepted (Open follow-up #2 — IR lowering surface
+/// expansion):
 ///   * `list.sum(range(end))` — `start = 0`.
 ///   * `list.sum(range(start, end))`.
+///   * `list.sum(range(...).map((p) => <body_i64>))` — inlines the
+///     closure body per iteration; the body's i64 result is added to
+///     the running accumulator. Captures into the body are limited to
+///     in-scope let-bindings / `#main` params already reachable from
+///     the outer ctx (no heap-style capture frame; the body is
+///     emitted directly into the outer ctx's op stream so its
+///     captures resolve through the same let-table walk the top-level
+///     body uses).
 ///
-/// Both inner args must be plain positional (no keyword form); the
+/// All inner args must be plain positional (no keyword form); the
 /// inner `range` call must use the bare identifier head (no dotted
 /// receiver).  Anything else falls through to the default path so a
 /// future `list.sum(my_user_fn())` keeps the existing diagnostic.
@@ -1950,28 +1959,142 @@ fn try_lower_list_sum_range(
     if args.len() != 1 || args[0].name.is_some() {
         return Ok(None);
     }
-    // Inner arg must be `range(...)` (single-segment path).
-    let (range_path, range_args) = match &*args[0].value.expr {
-        Expr::FnCall {
-            path: inner_path,
-            args: inner_args,
-        } => (inner_path, inner_args),
-        _ => return Ok(None),
-    };
-    if range_path.len() != 1 {
-        return Ok(None);
-    }
-    let is_range = matches!(&range_path[0], TokenKey::String(s, _, _) if s == "range");
-    if !is_range {
-        return Ok(None);
-    }
-    if range_args.is_empty() || range_args.len() > 2 {
-        return Ok(None);
-    }
-    if range_args.iter().any(|a| a.name.is_some()) {
-        return Ok(None);
-    }
 
+    // Walk the chain rooted at `range(...)`, peeling off
+    // recognized `.map((p) => <body>)` invocations.  Returns the base
+    // range_args plus the per-stage closure adaptor list; otherwise
+    // falls through.
+    let Some(chain) = match_range_chain(&args[0].value.expr) else {
+        return Ok(None);
+    };
+
+    emit_range_sum_loop(&chain, range, ctx)?;
+    Ok(Some(()))
+}
+
+/// One stage in a `range(...).chain(...)` pipeline. Each stage takes
+/// the running per-iteration value (initially the loop counter `i`)
+/// and produces a new value of the recorded `result_ty`.
+#[derive(Debug, Clone)]
+struct ChainStage<'a> {
+    /// Surface method name (`map` / `filter` for now). Pinned so
+    /// downstream loop emitters know what control-flow shape to
+    /// produce.
+    method: &'static str,
+    /// Closure literal supplied as the method's single positional arg.
+    /// Borrowed straight off the parser AST so the loop emitter can
+    /// inline it into the outer ctx's op stream.
+    closure_params: &'a [ClosureParam],
+    closure_body: &'a Node,
+}
+
+/// Decomposition of a `range(...)[. <method>(<closure>)]*` chain. The
+/// `stages` vec walks innermost-to-outermost — `range(...).map(f).map(g)`
+/// produces stages `[(map, f), (map, g)]` so the loop emitter can
+/// pipeline them in source order.
+#[derive(Debug)]
+struct RangeChain<'a> {
+    range_args: &'a [relon_parser::CallArg],
+    stages: Vec<ChainStage<'a>>,
+}
+
+/// Recognise a `range(...)[ . map((p) => body) ]*` pipeline.
+///
+/// Parser shape (cf. `relon-parser` token AST):
+///   `range(n).map(f).filter(g)` →
+///     `FnCall {
+///        path: [Dynamic(FnCall {
+///                 path: [Dynamic(FnCall { path: [String("range")], args: [n] }),
+///                        String("map")],
+///                 args: [f] }),
+///               String("filter")],
+///        args: [g] }`
+///
+/// Each method call wraps its receiver as a `TokenKey::Dynamic(Node)`
+/// at the head of the `path` slice, with the remaining segment being
+/// the method name. This function walks that nesting innermost-out,
+/// peeling each recognised method off until it hits the bare
+/// `range(...)` call (terminal). Anything outside the recognised
+/// shape returns `None` so the caller falls through to the regular
+/// lowering path.
+fn match_range_chain(expr: &Expr) -> Option<RangeChain<'_>> {
+    let mut stages: Vec<ChainStage<'_>> = Vec::new();
+    let mut current: &Expr = expr;
+    loop {
+        let Expr::FnCall { path, args } = current else {
+            return None;
+        };
+        // Bare `range(...)` — terminal case. Validate arity + reject
+        // keyword args; the parent `try_lower_list_sum_range` does the
+        // same for the 0-stage form, but we repeat the check here so
+        // a multi-stage chain bottoms out cleanly.
+        if path.len() == 1
+            && matches!(&path[0], TokenKey::String(s, _, _) if s == "range")
+        {
+            if args.is_empty() || args.len() > 2 {
+                return None;
+            }
+            if args.iter().any(|a| a.name.is_some()) {
+                return None;
+            }
+            // Stages were pushed outermost-first; reverse so the
+            // emitter walks innermost-first (source order).
+            stages.reverse();
+            return Some(RangeChain {
+                range_args: args,
+                stages,
+            });
+        }
+        // Recognised chain step has exactly 2 path segments:
+        //   [Dynamic(receiver_call), String("<method_name>")]
+        // and exactly one positional closure arg.
+        if path.len() != 2 {
+            return None;
+        }
+        let TokenKey::Dynamic(receiver_node, _) = &path[0] else {
+            return None;
+        };
+        let TokenKey::String(method_name, _, _) = &path[1] else {
+            return None;
+        };
+        let method: &'static str = match method_name.as_str() {
+            "map" => "map",
+            _ => return None,
+        };
+        if args.len() != 1 || args[0].name.is_some() {
+            return None;
+        }
+        let Expr::Closure {
+            params,
+            body,
+            return_type: _,
+        } = &*args[0].value.expr
+        else {
+            return None;
+        };
+        if params.len() != 1 {
+            return None;
+        }
+        stages.push(ChainStage {
+            method,
+            closure_params: params.as_slice(),
+            closure_body: body,
+        });
+        // Descend into the receiver (the inner FnCall wrapped in
+        // Dynamic) and continue peeling.
+        current = &receiver_node.expr;
+    }
+}
+
+/// Emit the pure-i64 accumulator loop that implements
+/// `list.sum(range(start, end)[. map(...)]*)`.  Pre-condition: the
+/// caller has already matched the chain via [`match_range_chain`].
+fn emit_range_sum_loop(
+    chain: &RangeChain<'_>,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    let range_args = chain.range_args;
     // Emit the loop body.  We need three i64 let-slots:
     //   start_i — loop counter, initialised to `start`
     //   end_i   — loop bound (cached so the user expression is only
@@ -1986,7 +2109,10 @@ fn try_lower_list_sum_range(
     //   block {
     //     loop {
     //       if start_i >= end_i { br 1 }
-    //       acc_i += start_i
+    //       # for each `.map((p) => body)` stage: bind p = start_i (or
+    //       # the previous stage's output) into a fresh let, lower the
+    //       # body, leaving the i64 result on the vstack.
+    //       acc_i += <element_value>
     //       start_i += 1
     //       br 0
     //     }
@@ -2043,49 +2169,212 @@ fn try_lower_list_sum_range(
     });
     ctx.tstack.pop();
 
-    // Build the inner loop body. We construct it as a separate `Vec<TaggedOp>`
-    // and splice it under `Op::Block { body: [Op::Loop { body: ... }] }`.
-    let mk = |op: Op| TaggedOp { op, range };
-    let loop_body: Vec<TaggedOp> = vec![
-        // if start_i >= end_i { br 1 }   (label_depth 1 = outer block)
-        mk(Op::LetGet {
+    // -----------------------------------------------------------------
+    // Build the inner loop body.
+    //
+    // Strategy: rather than emit a hand-built `Vec<TaggedOp>` (which
+    // can't accommodate arbitrary closure bodies), we temporarily
+    // redirect `ctx.out` into a sub-buffer, lower the loop body into
+    // it (including any in-line closure expansion), then splice the
+    // resulting vec under `Block { body: [Loop { body: ... }] }`.
+    //
+    // The op-stream redirect preserves all the other ctx fields
+    // (let-table, vstack, next_let_idx, intern handle); only `out`
+    // is swapped so the closure body's lowering goes into the loop's
+    // interior. tstack tracking stays correct because every push the
+    // body makes is matched by a corresponding pop after the
+    // accumulator-add.
+    // -----------------------------------------------------------------
+    let saved_out = std::mem::take(&mut ctx.out);
+    // br_if (start_i >= end_i) -> label_depth 1 (outer block)
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
             idx: start_i,
             ty: IrType::I64,
-        }),
-        mk(Op::LetGet {
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
             idx: end_i,
             ty: IrType::I64,
-        }),
-        mk(Op::Ge(IrType::I64)),
-        mk(Op::BrIf { label_depth: 1 }),
-        // acc_i += start_i
-        mk(Op::LetGet {
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp { op: Op::Ge(IrType::I64), range });
+    ctx.out.push(TaggedOp {
+        op: Op::BrIf { label_depth: 1 },
+        range,
+    });
+
+    // For each stage, bind the input value to a fresh let then lower
+    // the body. The 0-stage case just pushes start_i.
+    if chain.stages.is_empty() {
+        ctx.out.push(TaggedOp {
+            op: Op::LetGet {
+                idx: start_i,
+                ty: IrType::I64,
+            },
+            range,
+        });
+        ctx.tstack.push(IrType::I64);
+    } else {
+        // Stage input — the loop counter for the first stage,
+        // overwritten by each stage's output for subsequent stages.
+        // For the W2/W6/W8/W10 single-`.map` shape this is just one
+        // pass; the loop below is written generically so the future
+        // `.filter` stage slots in without restructure.
+        // First, bind the loop counter into a let-binding under the
+        // first stage's parameter name so the closure body's
+        // `Variable(p)` lookups resolve through the same path the
+        // top-level body uses.
+        let mut current_value_idx = start_i;
+        let mut current_value_ty = IrType::I64;
+        for (stage_idx, stage) in chain.stages.iter().enumerate() {
+            // We only support map for now; filter / fold land in a
+            // follow-up commit when more shapes need them.
+            debug_assert_eq!(stage.method, "map");
+            let param = &stage.closure_params[0];
+            // Allocate a fresh let-binding under the closure
+            // parameter's name so `Variable(p)` inside the body
+            // resolves to current_value_idx via the normal walker.
+            let param_let_idx = ctx.next_let_idx;
+            ctx.next_let_idx += 1;
+            ctx.out.push(TaggedOp {
+                op: Op::LetGet {
+                    idx: current_value_idx,
+                    ty: current_value_ty,
+                },
+                range,
+            });
+            ctx.out.push(TaggedOp {
+                op: Op::LetSet {
+                    idx: param_let_idx,
+                    ty: current_value_ty,
+                },
+                range,
+            });
+            // Push a transient let-binding visible to inner
+            // lower_variable lookups for the duration of this stage's
+            // body lowering.
+            ctx.lets.push(LetBinding {
+                name: param.name.clone(),
+                idx: param_let_idx,
+                ty: current_value_ty,
+                schema_brand: None,
+            });
+            // Lower the closure body into ctx.out. lower_expr pushes
+            // the body's result type onto tstack.
+            let body_node = stage.closure_body;
+            lower_expr(&body_node.expr, body_node.range, ctx)?;
+            let produced_ty = ctx.tstack.last().copied().ok_or_else(|| {
+                LoweringError::UnsupportedExpr {
+                    kind: "range-chain map: closure body produced no value".to_string(),
+                    range: body_node.range,
+                }
+            })?;
+            // Pop the transient let-binding. The body has already
+            // emitted any references to it — anything emitted past
+            // this point sees the outer scope.
+            ctx.lets.pop();
+            // Stash the body result into a let so further stages can
+            // pick it up (and so the accumulator-add finds a single
+            // i64 atop the stack regardless of stage count).
+            let result_let_idx = ctx.next_let_idx;
+            ctx.next_let_idx += 1;
+            ctx.out.push(TaggedOp {
+                op: Op::LetSet {
+                    idx: result_let_idx,
+                    ty: produced_ty,
+                },
+                range: body_node.range,
+            });
+            ctx.tstack.pop();
+            current_value_idx = result_let_idx;
+            current_value_ty = produced_ty;
+            // The last stage's output becomes the loop element.
+            if stage_idx == chain.stages.len() - 1 {
+                ctx.out.push(TaggedOp {
+                    op: Op::LetGet {
+                        idx: result_let_idx,
+                        ty: produced_ty,
+                    },
+                    range,
+                });
+                ctx.tstack.push(produced_ty);
+            }
+        }
+        // Element type must be I64 — list.sum operates on Int. Reject
+        // non-i64 element types so a future `range(n).map((i) =>
+        // some_string)` doesn't silently miscompile.
+        let elem_ty = ctx.tstack.last().copied().unwrap_or(IrType::I64);
+        if elem_ty != IrType::I64 {
+            // Restore ctx.out so the caller's diagnostic path sees a
+            // valid stream.
+            let _drained = std::mem::take(&mut ctx.out);
+            ctx.out = saved_out;
+            return Err(LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "list.sum(range(...).map(...)) requires Int-valued map; got {:?}",
+                    elem_ty
+                ),
+                range,
+            });
+        }
+    }
+
+    // acc_i += element  (top of stack is the loop element).
+    // emit: load acc, swap, add, store. Stack discipline: we have
+    // [element] on tstack; load acc -> [element, acc]; we want
+    // [acc + element] so add. Op::Add on I64 pops 2, pushes 1.
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
             idx: acc_i,
             ty: IrType::I64,
-        }),
-        mk(Op::LetGet {
-            idx: start_i,
-            ty: IrType::I64,
-        }),
-        mk(Op::Add(IrType::I64)),
-        mk(Op::LetSet {
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I64);
+    ctx.out.push(TaggedOp { op: Op::Add(IrType::I64), range });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I64);
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
             idx: acc_i,
             ty: IrType::I64,
-        }),
-        // start_i += 1
-        mk(Op::LetGet {
+        },
+        range,
+    });
+    ctx.tstack.pop();
+    // start_i += 1
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
             idx: start_i,
             ty: IrType::I64,
-        }),
-        mk(Op::ConstI64(1)),
-        mk(Op::Add(IrType::I64)),
-        mk(Op::LetSet {
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI64(1),
+        range,
+    });
+    ctx.out.push(TaggedOp { op: Op::Add(IrType::I64), range });
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
             idx: start_i,
             ty: IrType::I64,
-        }),
-        // br 0
-        mk(Op::Br { label_depth: 0 }),
-    ];
+        },
+        range,
+    });
+    // br 0
+    ctx.out.push(TaggedOp {
+        op: Op::Br { label_depth: 0 },
+        range,
+    });
+
+    // Swap the sub-buffer back into place and wrap it under Block/Loop.
+    let loop_body = std::mem::replace(&mut ctx.out, saved_out);
     ctx.out.push(TaggedOp {
         op: Op::Block {
             result_ty: None,
@@ -2110,7 +2399,7 @@ fn try_lower_list_sum_range(
         range,
     });
     ctx.tstack.push(IrType::I64);
-    Ok(Some(()))
+    Ok(())
 }
 
 /// Pop the current vstack head and require it to be `I64`.  Used by
@@ -4313,5 +4602,128 @@ mod str_concat_chain_tests {
             1,
             "expected one Op::Add(IrType::String) for the pair-wise concat"
         );
+    }
+}
+
+// =====================================================================
+// Open follow-up #2 — `list.sum(range(...).map(...))` peephole.
+//
+// Verifies that the extended `try_lower_list_sum_range` recognises the
+// `range(...).map((p) => body)` chain and emits a pure-i64 accumulator
+// loop with no list allocation. The bytecode VM relies on this shape to
+// produce `relon_bytecode` cmp_lua rows for W2 / W6 / W8 / W10 — the
+// scalar envelope rejects any IR that materialises a `List<Int>`.
+// =====================================================================
+
+#[cfg(test)]
+mod range_pipeline_tests {
+    use super::*;
+
+    /// Drives the same parse + analyze + lower pipeline `intern_tests`
+    /// uses, then returns the lowered entry func's flat op stream so
+    /// shape assertions stay focussed on the post-desugar IR.
+    fn lower_and_flatten(src: &str) -> Vec<Op> {
+        let module = intern_tests::test_helpers_lower_source(src);
+        let entry_idx = module.entry_func_index.expect("entry");
+        let entry = &module.funcs[entry_idx];
+        fn walk(body: &[TaggedOp], out: &mut Vec<Op>) {
+            for t in body {
+                out.push(t.op.clone());
+                match &t.op {
+                    Op::If {
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
+                        walk(then_body, out);
+                        walk(else_body, out);
+                    }
+                    Op::Block { body, .. } => walk(body, out),
+                    Op::Loop { body, .. } => walk(body, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut acc = Vec::new();
+        walk(&entry.body, &mut acc);
+        acc
+    }
+
+    /// `list.sum(range(n).map((i) => i + 1))` desugars to a pure i64
+    /// accumulator loop. No `Op::Call` targeting `list_int_map` or
+    /// `list_int_sum` should remain — both would force the bytecode
+    /// scalar envelope to bail.
+    #[test]
+    fn map_sum_chain_desugars_to_pure_loop() {
+        let src = "#unstrict\n\
+                   #import list from \"std/list\"\n\
+                   #main(Int n) -> Int\n\
+                   list.sum(range(n).map((i) => i + 1))";
+        let ops = lower_and_flatten(src);
+        // No buffer-protocol stdlib indirection.
+        let stdlib_list_int_map = stdlib_function_index("list_int_map").unwrap();
+        let stdlib_list_int_sum = stdlib_function_index("list_int_sum").unwrap();
+        for op in &ops {
+            if let Op::Call { fn_index, .. } = op {
+                assert_ne!(
+                    *fn_index, stdlib_list_int_map,
+                    "expected `list_int_map` to be inlined by the peephole"
+                );
+                assert_ne!(
+                    *fn_index, stdlib_list_int_sum,
+                    "expected `list_int_sum` to be inlined by the peephole"
+                );
+            }
+        }
+        // Exactly one Block / Loop pair (the accumulator-loop shape).
+        let blocks = ops
+            .iter()
+            .filter(|op| matches!(op, Op::Block { .. }))
+            .count();
+        let loops = ops
+            .iter()
+            .filter(|op| matches!(op, Op::Loop { .. }))
+            .count();
+        assert_eq!(blocks, 1, "expected one outer Block, got {blocks}");
+        assert_eq!(loops, 1, "expected one inner Loop, got {loops}");
+    }
+
+    /// Chained `.map(...).map(...)` collapses into the same accumulator
+    /// loop shape — pipelining stages stay zero-alloc.
+    #[test]
+    fn chained_map_desugars_to_single_loop() {
+        let src = "#unstrict\n\
+                   #import list from \"std/list\"\n\
+                   #main(Int n) -> Int\n\
+                   list.sum(range(n).map((i) => i + 1).map((j) => j * 2))";
+        let ops = lower_and_flatten(src);
+        let stdlib_list_int_map = stdlib_function_index("list_int_map").unwrap();
+        for op in &ops {
+            if let Op::Call { fn_index, .. } = op {
+                assert_ne!(*fn_index, stdlib_list_int_map);
+            }
+        }
+        let loops = ops
+            .iter()
+            .filter(|op| matches!(op, Op::Loop { .. }))
+            .count();
+        assert_eq!(loops, 1, "expected exactly one fused loop, got {loops}");
+    }
+
+    /// Sanity guard: the 0-stage form (`list.sum(range(n))`) still
+    /// emits the original loop shape. Regression cover for the
+    /// peephole refactor that introduced the chain recogniser.
+    #[test]
+    fn bare_range_sum_still_desugars() {
+        let src = "#import list from \"std/list\"\n\
+                   #main(Int n) -> Int\n\
+                   list.sum(range(n))";
+        let ops = lower_and_flatten(src);
+        let stdlib_list_int_sum = stdlib_function_index("list_int_sum").unwrap();
+        for op in &ops {
+            if let Op::Call { fn_index, .. } = op {
+                assert_ne!(*fn_index, stdlib_list_int_sum);
+            }
+        }
     }
 }
