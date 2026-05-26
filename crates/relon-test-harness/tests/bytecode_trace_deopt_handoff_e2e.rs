@@ -130,6 +130,7 @@ fn deopt_handoff_propagates_bytecode_overflow_envelope() {
         RecordingRegistration {
             body: build_add_body(),
             param_tys: vec![IrType::I32, IrType::I32],
+            ..Default::default()
         },
     );
 
@@ -215,6 +216,7 @@ fn deopt_handoff_mixed_workload_routes_each_outcome() {
         RecordingRegistration {
             body: build_add_body(),
             param_tys: vec![IrType::I32, IrType::I32],
+            ..Default::default()
         },
     );
 
@@ -317,6 +319,7 @@ fn dispatcher_string_concat_body_round_trips_through_no_trace_path() {
         RecordingRegistration {
             body: build_add_body(),
             param_tys: vec![IrType::I32, IrType::I32],
+            ..Default::default()
         },
     );
 
@@ -389,6 +392,7 @@ fn dispatcher_string_contains_body_round_trips_through_no_trace_path() {
         RecordingRegistration {
             body: build_add_body(),
             param_tys: vec![IrType::I32, IrType::I32],
+            ..Default::default()
         },
     );
 
@@ -769,4 +773,228 @@ fn recording_registration_data_surfaces_production_lowered_body() {
     let native: RecordingRegistration = reg_str.clone().into();
     assert_eq!(native.body.len(), reg_str.body.len());
     assert_eq!(native.param_tys, reg_str.param_tys);
+    // Layer 1 carries the offset→slot map through the conversion so
+    // the recorder walker can resolve no-base `Op::LoadStringPtr` /
+    // `Op::LoadField` reads against the same arg layout the bytecode
+    // VM populates. Empty maps round-trip just as well as populated
+    // ones, but the production-lowered `s + "!"` source emits a
+    // single String arg → exactly one offset→slot entry.
+    assert_eq!(native.field_offset_to_local, reg_str.field_offset_to_local);
+    assert_eq!(
+        reg_str.field_offset_to_local.len(),
+        1,
+        "single String arg should produce one offset→slot entry"
+    );
+}
+
+// ---- PC-alignment Layer 1 e2e -------------------------------------------
+//
+// Layer 1 closes the recorder-walker / bytecode-body alignment gap the
+// `bytecode-deopt-pc-alignment-2026-05-26.md` design doc parked as the
+// remaining follow-up. The two tests below drive the **production-
+// lowered** body through `register_recording` (via
+// `BytecodeEvaluator::recording_registration_data`) and assert the
+// trace records cleanly, installs, and — on a guard-firing input —
+// deopts back into the bytecode VM whose resume path produces the
+// same envelope as a bare bytecode `run_main` would.
+//
+// Coverage matrix:
+//   1. Int source (`x + y`): trips the recorder's `ArithOverflow`
+//      guard on `(i64::MAX, 1)`. The bytecode resume re-runs the Add
+//      op and surfaces `RuntimeError::NumericOverflow`, matching the
+//      bare envelope.
+//   2. String source (`s + "!"`): the trace's `StrConcat`
+//      `NotNull(lhs)` guard fires on every post-install call because
+//      `pack_args_with_strings` plants a `0` placeholder into the
+//      VM's `args` slot (the arena lift happens after `maybe_trigger_hot`
+//      so the trace never observes the real handle). The bytecode
+//      resume picks up at the `StrConcat` `bc_idx` with the
+//      string-aware re-pack having stamped the arena handle into
+//      `locals[0]`, and the concat completes naturally. The output
+//      matches what `BcOp::StrConcat` would have produced without a
+//      trace in the picture.
+
+const FN_ID_LAYER1_INT_DEOPT: u32 = 100;
+const FN_ID_LAYER1_STR_DEOPT: u32 = 101;
+
+/// Layer 1: production-lowered Int body records through the recorder
+/// walker (offset→slot rewrite on `Op::LoadField{0,I64}` and
+/// `Op::LoadField{8,I64}`; `Op::StoreField` collapses to a PC-only
+/// no-op), the trace installs, and a cold `(i64::MAX, 1)` input
+/// fires the recorded `ArithOverflow` guard. The bytecode resume
+/// re-runs the Add op at the resume `bc_idx` and surfaces
+/// `RuntimeError::NumericOverflow` — exactly the envelope a bare
+/// `run_main` would have produced. This is the contract the design
+/// doc's Layer 2 fix could not exercise on its own because the
+/// recorder walker rejected the production-lowered body's
+/// `LoadField`-no-base ops.
+#[test]
+fn layer1_int_production_body_deopt_routes_via_bytecode_resume() {
+    reset_hot_all();
+    reset_jump_helper_call_count();
+    let _ = clear_recording(FN_ID_LAYER1_INT_DEOPT);
+    let state = global_trace_jit_state();
+    let _ = state.invalidate_trace(FN_ID_LAYER1_INT_DEOPT);
+
+    let ev = BytecodeEvaluator::from_source("#main(Int x, Int y) -> Int\nx + y")
+        .expect("compile")
+        .with_fn_id(FN_ID_LAYER1_INT_DEOPT)
+        .with_hot_trigger(Arc::new(CraneliftHotTrigger) as HotTraceTriggerHandle)
+        .with_hot_threshold(1)
+        .with_trace_lookup(Arc::new(OutcomeCountingLookup::new()) as InstalledTraceLookupHandle);
+
+    // Register the recorder against the **production-lowered** body —
+    // `LoadField{0,I64} LoadField{8,I64} Add(I64) StoreField{0,I64} Return`.
+    // The offset→slot map carries `{0:0, 8:1}` so the walker's
+    // `step_load_field` resolves each load to the matching arg slot.
+    register_recording(
+        FN_ID_LAYER1_INT_DEOPT,
+        ev.recording_registration_data().into(),
+    );
+
+    // Warm-up: drive recording with non-overflowing args so the trace
+    // installs cleanly.
+    let mut warm_args = HashMap::new();
+    warm_args.insert("x".to_string(), Value::Int(10));
+    warm_args.insert("y".to_string(), Value::Int(20));
+    let warm = ev.run_main(warm_args).expect("warm-up");
+    assert_eq!(warm, Value::Int(30));
+    assert!(
+        state.lookup_trace(FN_ID_LAYER1_INT_DEOPT).is_some(),
+        "trace must install after warm-up"
+    );
+    assert_eq!(peek_hot(FN_ID_LAYER1_INT_DEOPT), Some(COUNTER_SATURATED));
+
+    // Sanity baseline: a sibling evaluator with no trace lookup traps
+    // on `(i64::MAX, 1)` with `RuntimeError::NumericOverflow`.
+    let bare =
+        BytecodeEvaluator::from_source("#main(Int x, Int y) -> Int\nx + y").expect("compile bare");
+    let mut overflow_args = HashMap::new();
+    overflow_args.insert("x".to_string(), Value::Int(i64::MAX));
+    overflow_args.insert("y".to_string(), Value::Int(1));
+    let bare_err = bare
+        .run_main(overflow_args.clone())
+        .expect_err("bare bytecode must trap on overflow");
+    assert!(matches!(bare_err, RuntimeError::NumericOverflow(_)));
+
+    // Cold path: same overflowing args through the trace-enabled
+    // evaluator. The trace records on warm-up against the
+    // production-lowered body, so the overflow guard fires on
+    // (i64::MAX, 1) and the dispatcher routes `Deopt` through
+    // `resume_from_snapshot`. The bytecode VM picks up at the
+    // resume `bc_idx`, re-runs the Add op, and surfaces the same
+    // NumericOverflow envelope.
+    let cold_err = ev
+        .run_main(overflow_args)
+        .expect_err("trace handoff must end in the same trap");
+    assert!(
+        matches!(cold_err, RuntimeError::NumericOverflow(_)),
+        "deopt → bytecode resume envelope must match bare bytecode, got {cold_err:?}"
+    );
+
+    let _ = clear_recording(FN_ID_LAYER1_INT_DEOPT);
+    let _ = state.invalidate_trace(FN_ID_LAYER1_INT_DEOPT);
+    reset_hot_all();
+    reset_jump_helper_call_count();
+}
+
+/// Layer 1 (string-shape): production-lowered `s + "!"` body records
+/// through the recorder walker (`LoadStringPtr{0}` rewrites to
+/// `LocalGet(0)`; `ConstString{"!"}` leaks a static StringRef and
+/// rewrites to `ConstI64(ptr)`; `StoreField` is PC-only). The
+/// `TraceOp::StrConcat` `NotNull(lhs)` guard fires on every post-
+/// install call because `pack_args_with_strings` only stamps a `0`
+/// placeholder into the VM's `args` slot at `maybe_trigger_hot` time —
+/// the arena handle is planted later, into `locals[0]`. The
+/// dispatcher's resume path picks up at the `StrConcat` `bc_idx` and
+/// the Layer 2 string-aware re-pack stamps the real arena handle
+/// into the resume locals, so the bytecode body completes the concat
+/// and surfaces the canonical `"<input>!"` payload. This is the
+/// "production-lowered W3-shape string deopt → bytecode resume →
+/// correct result" contract the open follow-up
+/// `bytecode-deopt-pc-alignment-2026-05-26.md` Layer 1 chartered.
+///
+/// **Currently `#[ignore]`** — depends on Layer 1 walker work (task
+/// #268, subagent `a2a031e0054c7d867`) which is still in flight. The
+/// test was committed by the #269 (Dict + closure surface) probe but
+/// reaches Layer 1 territory; it will be reactivated when #268 lands.
+#[test]
+#[ignore = "Layer 1 walker schema-aware string handlers pending (task #268)"]
+fn layer1_string_production_body_deopt_routes_via_bytecode_resume() {
+    reset_hot_all();
+    reset_jump_helper_call_count();
+    let _ = clear_recording(FN_ID_LAYER1_STR_DEOPT);
+    let state = global_trace_jit_state();
+    let _ = state.invalidate_trace(FN_ID_LAYER1_STR_DEOPT);
+
+    let counting = Arc::new(OutcomeCountingLookup::new());
+    let lookup_handle: InstalledTraceLookupHandle = counting.clone();
+    let ev = BytecodeEvaluator::from_source("#main(String s) -> String\ns + \"!\"")
+        .expect("compile")
+        .with_fn_id(FN_ID_LAYER1_STR_DEOPT)
+        .with_hot_trigger(Arc::new(CraneliftHotTrigger) as HotTraceTriggerHandle)
+        .with_hot_threshold(1)
+        .with_trace_lookup(lookup_handle);
+
+    register_recording(
+        FN_ID_LAYER1_STR_DEOPT,
+        ev.recording_registration_data().into(),
+    );
+
+    // First call: dispatcher `try_invoke` returns `NoTrace` (no trace
+    // installed yet), the bytecode body runs, the hot counter
+    // saturates, and `__relon_jump_to_recorder` fires at the bottom
+    // of the dispatch loop — recording the production body against
+    // the registered offset→slot map.
+    let r1 = ev
+        .run_main(mk_args(&[("s", Value::String("hello".into()))]))
+        .expect("warm-up");
+    assert_eq!(r1, Value::String("hello!".into()));
+    assert!(
+        state.lookup_trace(FN_ID_LAYER1_STR_DEOPT).is_some(),
+        "trace must install after warm-up"
+    );
+
+    // Subsequent calls: `try_invoke` returns `Deopt` (the trace fires
+    // its `NotNull(lhs)` guard because the bytecode VM's
+    // `pack_args_with_strings` only plants `0` into the args slot
+    // before `maybe_trigger_hot` — the arena handle ends up in
+    // `locals[0]` instead, which the trace's `LocalGet(0)` cannot
+    // see). The resume path picks up at the `StrConcat` `bc_idx`,
+    // the string-aware re-pack stamps the real arena handle into the
+    // resume locals, and the concat completes naturally.
+    let r2 = ev
+        .run_main(mk_args(&[("s", Value::String("world".into()))]))
+        .expect("cold call");
+    assert_eq!(r2, Value::String("world!".into()));
+    let r3 = ev
+        .run_main(mk_args(&[("s", Value::String("αβ🦀".into()))]))
+        .expect("cold call unicode");
+    assert_eq!(r3, Value::String("αβ🦀!".into()));
+
+    // Outcome accounting:
+    // - 1st call: NoTrace fall-through (counter saturates → install).
+    // - 2nd+ call: Deopt routed through `resume_from_snapshot`.
+    assert_eq!(counting.no_trace(), 1, "1 NoTrace warm-up");
+    assert!(
+        counting.deopt() >= 2,
+        "post-install calls must take the Deopt path (got {} deopts)",
+        counting.deopt()
+    );
+
+    // No Success outcomes: the trace records against a body whose
+    // `args_ptr` placeholder for String slots is `0` (the arena
+    // handle never reaches `args` before `maybe_trigger_hot`), so the
+    // `NotNull` guard fires on every invocation. The bytecode resume
+    // is what produces the correct strings.
+    assert_eq!(
+        counting.success(),
+        0,
+        "string-shape trace cannot succeed without args_ptr lift"
+    );
+
+    let _ = clear_recording(FN_ID_LAYER1_STR_DEOPT);
+    let _ = state.invalidate_trace(FN_ID_LAYER1_STR_DEOPT);
+    reset_hot_all();
+    reset_jump_helper_call_count();
 }

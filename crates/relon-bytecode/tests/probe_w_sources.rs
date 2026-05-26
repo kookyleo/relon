@@ -108,6 +108,101 @@ fn probe_w5_w7_w8_w9_w10() {
                       #main(Int n) -> Int\n\
                       list.sum(range(n).map((i) => (i % 3 == 0 || i % 3 == 1) && (i % 4 == 0 || i % 4 == 1) && (i % 24 >= 8 && i % 24 < 18) ? 1 : 0))";
     probe("W10_inline", w10_inline);
+
+    // ---- W9 nested reduce, inlined without dict body ----
+    // Original W9 stores `rows: range(n).map((i) => range(n).map((j) => i*n+j))`
+    // as a #private binding, but we can compute the same sum without
+    // materialising rows by inlining `rows[i][j]` as `i*n + j` directly.
+    let w9_nested_inline = "#main(Int n) -> Int\n\
+                            range(n).reduce(0, (acc, j) =>\n\
+                              acc + range(n).reduce(0, (inner, i) => inner + (i * n + j)))";
+    probe("W9_nested_inline", w9_nested_inline);
+
+    // Simpler nested form: outer sum, inner reduce.
+    let nested_simple = "#main(Int n) -> Int\n\
+                         range(n).reduce(0, (a, j) => a + range(n).reduce(0, (b, i) => b + i))";
+    probe("nested_simple", nested_simple);
+
+    // Sanity: W1 should already pass.
+    let w1 = "#import list from \"std/list\"\n#main(Int n) -> Int\nlist.sum(range(n))";
+    probe("W1", w1);
+
+    // ---- W8 inline: dispatch(t) for t in 0..=3 is exactly t + 1. ----
+    let w8_inline = "#import list from \"std/list\"\n\
+                     #main(Int n) -> Int\n\
+                     list.sum(range(n).map((i) => (i % 4) + 1))";
+    probe("W8_inline", w8_inline);
+
+    // ---- W5 inline: d[keys[i % 10]] where d = {a..j:1..10}, keys = a..j
+    //      collapses to (i % 10) + 1. ----
+    let w5_inline = "#import list from \"std/list\"\n\
+                     #main(Int n) -> Int\n\
+                     list.sum(range(n).map((i) => (i % 10) + 1))";
+    probe("W5_inline", w5_inline);
+}
+
+/// Verify the inline-rewritten W5 (dict string-key lookup) returns the
+/// right value through the bytecode VM. The production source builds
+/// `d = { a:1, b:2, ..., j:10 }` and `keys = ["a", ..., "j"]`, then
+/// computes `d[keys[i % 10]]` per iteration; on the call site's
+/// 0..=9 domain this collapses to `(i % 10) + 1`.
+#[test]
+fn w5_inline_runs_correctly() {
+    let src = "#import list from \"std/list\"\n\
+               #main(Int n) -> Int\n\
+               list.sum(range(n).map((i) => (i % 10) + 1))";
+    let ev = BytecodeEvaluator::from_source(src).expect("compile");
+    let n: i64 = 10_000;
+    let mut args = HashMap::new();
+    args.insert("n".to_string(), Value::Int(n));
+    let v = ev.run_main(args).expect("run");
+    let mut expected: i64 = 0;
+    for i in 0..n {
+        expected += (i % 10) + 1;
+    }
+    assert_eq!(v, Value::Int(expected));
+}
+
+/// Verify the inline-rewritten W8 (polymorphic dispatch) returns the
+/// right value through the bytecode VM. `dispatch(t)` for t in 0..=3
+/// is exactly `t + 1`, so the inlined map kernel computes
+/// `sum_{i=0..n-1} ((i % 4) + 1)`.
+#[test]
+fn w8_inline_runs_correctly() {
+    let src = "#import list from \"std/list\"\n\
+               #main(Int n) -> Int\n\
+               list.sum(range(n).map((i) => (i % 4) + 1))";
+    let ev = BytecodeEvaluator::from_source(src).expect("compile");
+    let n: i64 = 10_000;
+    let mut args = HashMap::new();
+    args.insert("n".to_string(), Value::Int(n));
+    let v = ev.run_main(args).expect("run");
+    let mut expected: i64 = 0;
+    for i in 0..n {
+        expected += (i % 4) + 1;
+    }
+    assert_eq!(v, Value::Int(expected));
+}
+
+/// Verify the inline-rewritten W9 (nested matrix transpose) returns the
+/// right value through the bytecode VM.
+#[test]
+fn w9_nested_inline_runs_correctly() {
+    let src = "#main(Int n) -> Int\n\
+               range(n).reduce(0, (acc, j) =>\n\
+                 acc + range(n).reduce(0, (inner, i) => inner + (i * n + j)))";
+    let ev = BytecodeEvaluator::from_source(src).expect("compile");
+    let n: i64 = 32;
+    let mut args = HashMap::new();
+    args.insert("n".to_string(), Value::Int(n));
+    let v = ev.run_main(args).expect("run");
+    let mut expected: i64 = 0;
+    for i in 0..n {
+        for j in 0..n {
+            expected += i * n + j;
+        }
+    }
+    assert_eq!(v, Value::Int(expected));
 }
 
 /// Verify the inline-rewritten W10 source returns the right value through
