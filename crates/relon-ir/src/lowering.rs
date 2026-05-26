@@ -3167,6 +3167,65 @@ fn lower_binary(
     {
         return Ok(());
     }
+    // Short-circuit Boolean operators. Lowered as a guard-style `Op::If`:
+    //
+    // * `a && b` → `a ? b : false`
+    // * `a || b` → `a ? true  : b`
+    //
+    // Each branch lowers in its own sub-stream / tstack via
+    // [`lower_branch`] so a non-Bool side bails cleanly. Short-circuit
+    // semantics fall out of `Op::If`: the unselected branch's ops never
+    // execute, matching the tree-walker's eager-eval-of-LHS-then-RHS
+    // discipline. Open follow-up #264-cont: this unblocks predicate
+    // chains in cmp_lua W10's `allow`-style closures and any future
+    // boolean-heavy workload, without disturbing the arithmetic /
+    // comparison paths below.
+    if matches!(op, Operator::And | Operator::Or) {
+        lower_expr(&lhs.expr, lhs.range, ctx)?;
+        let lhs_ty = ctx.tstack.pop().ok_or(LoweringError::UnsupportedOperator { op, range })?;
+        if lhs_ty != IrType::Bool {
+            return Err(LoweringError::UnsupportedOperator { op, range });
+        }
+        let (then_body, then_ty) = if matches!(op, Operator::And) {
+            // a && b: then-branch is `b`, else-branch is `false`.
+            lower_branch(rhs, range, ctx)?
+        } else {
+            // a || b: then-branch is `true`, else-branch is `b`.
+            let saved_out = std::mem::take(&mut ctx.out);
+            let saved_stack = std::mem::take(&mut ctx.tstack);
+            ctx.out.push(TaggedOp { op: Op::ConstBool(true), range });
+            ctx.tstack.push(IrType::Bool);
+            let body = std::mem::replace(&mut ctx.out, saved_out);
+            let stack = std::mem::replace(&mut ctx.tstack, saved_stack);
+            (body, stack[0])
+        };
+        let (else_body, else_ty) = if matches!(op, Operator::And) {
+            // a && b: else-branch is `false`.
+            let saved_out = std::mem::take(&mut ctx.out);
+            let saved_stack = std::mem::take(&mut ctx.tstack);
+            ctx.out.push(TaggedOp { op: Op::ConstBool(false), range });
+            ctx.tstack.push(IrType::Bool);
+            let body = std::mem::replace(&mut ctx.out, saved_out);
+            let stack = std::mem::replace(&mut ctx.tstack, saved_stack);
+            (body, stack[0])
+        } else {
+            // a || b: else-branch is `b`.
+            lower_branch(rhs, range, ctx)?
+        };
+        if then_ty != IrType::Bool || else_ty != IrType::Bool {
+            return Err(LoweringError::UnsupportedOperator { op, range });
+        }
+        ctx.out.push(TaggedOp {
+            op: Op::If {
+                result_ty: IrType::Bool,
+                then_body,
+                else_body,
+            },
+            range,
+        });
+        ctx.tstack.push(IrType::Bool);
+        return Ok(());
+    }
     if let Some(ir_op_ctor) = arithmetic_op_ctor(op) {
         lower_expr(&lhs.expr, lhs.range, ctx)?;
         lower_expr(&rhs.expr, rhs.range, ctx)?;
