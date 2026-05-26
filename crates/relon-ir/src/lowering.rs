@@ -1736,6 +1736,16 @@ fn lower_fn_call(
     if let Some(()) = try_lower_range_chain_len(path, args, range, ctx)? {
         return Ok(());
     }
+    // Open follow-up #2: `<chain>.reduce(<init>, (acc, elem) => body)`.
+    // The reduce consumer is structurally similar to sum + len but
+    // takes a user-supplied init expression and a 2-arg closure that
+    // updates the accumulator per iteration. Covers cmp_lua W3
+    // (`range(n).map((i) => "a").reduce("", (acc, s) => acc + s)`)
+    // by emitting the same scalar pipeline loop with a string
+    // accumulator stashed in a let-binding.
+    if let Some(()) = try_lower_range_chain_reduce(path, args, range, ctx)? {
+        return Ok(());
+    }
     // Final path segment is the method / function name. Earlier
     // segments either form the receiver (method-call form) or are
     // unused (free-call form has exactly one path segment).
@@ -2025,6 +2035,69 @@ fn try_lower_range_chain_len(
     Ok(Some(()))
 }
 
+/// Open follow-up #2 companion to `try_lower_list_sum_range` /
+/// `try_lower_range_chain_len`: recognise `<chain>.reduce(<init>,
+/// (acc, elem) => body)` and emit a per-iteration accumulator update
+/// driven by the user's body. Returns `Ok(Some(()))` on a successful
+/// desugar (vstack carries the accumulator's type after return),
+/// `Ok(None)` when the pattern didn't match, `Err` when an inner
+/// expression failed to lower.
+///
+/// The cmp_lua W3 workload (`range(n).map((i) => "a").reduce("",
+/// (acc, s) => acc + s)`) is the canonical caller — its string-concat
+/// reduce returns a `String` accumulator the bytecode VM accepts via
+/// the B-1 / B-2 string-arena infrastructure.
+fn try_lower_range_chain_reduce(
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    // Outer call shape: `<receiver>.reduce(<init>, <closure>)` — two
+    // positional args, second is the closure literal.
+    if path.len() != 2 || args.len() != 2 {
+        return Ok(None);
+    }
+    if args.iter().any(|a| a.name.is_some()) {
+        return Ok(None);
+    }
+    let TokenKey::Dynamic(receiver_node, _) = &path[0] else {
+        return Ok(None);
+    };
+    let TokenKey::String(method_name, _, _) = &path[1] else {
+        return Ok(None);
+    };
+    if method_name.as_str() != "reduce" {
+        return Ok(None);
+    }
+    let init_node = &args[0].value;
+    let Expr::Closure {
+        params,
+        body,
+        return_type: _,
+    } = &*args[1].value.expr
+    else {
+        return Ok(None);
+    };
+    if params.len() != 2 {
+        return Ok(None);
+    }
+    let Some(chain) = match_range_chain(&receiver_node.expr) else {
+        return Ok(None);
+    };
+    emit_range_pipeline_loop(
+        &chain,
+        RangeConsumer::Reduce {
+            init: init_node,
+            params: params.as_slice(),
+            body,
+        },
+        range,
+        ctx,
+    )?;
+    Ok(Some(()))
+}
+
 /// One stage in a `range(...).chain(...)` pipeline. Each stage takes
 /// the running per-iteration value (initially the loop counter `i`)
 /// and produces a new value of the recorded `result_ty`.
@@ -2148,15 +2221,28 @@ fn match_range_chain(expr: &Expr) -> Option<RangeChain<'_>> {
 
 /// Consumer terminating a `range(...)` pipeline. Selects how the
 /// per-iteration value (after the final map/filter stage) folds into
-/// the loop's i64 accumulator.
+/// the loop's accumulator.
 #[derive(Debug, Clone, Copy)]
-enum RangeConsumer {
+enum RangeConsumer<'a> {
     /// `list.sum(<chain>)` — accumulator += element (element must be
     /// `I64`).
     SumI64,
     /// `<chain>.len()` — accumulator += 1 per surviving iteration
     /// (element type is irrelevant; only the filter outcome matters).
     Len,
+    /// `<chain>.reduce(<init>, (acc, elem) => body)` — init the
+    /// accumulator from a lowered expression, then update it per
+    /// iteration via the supplied 2-arg closure body.
+    Reduce {
+        /// Init expression's AST node — lowered against the outer
+        /// ctx before the loop opens so its captures resolve through
+        /// the normal walker.
+        init: &'a Node,
+        /// Closure params: [acc_name, elem_name].
+        params: &'a [ClosureParam],
+        /// Closure body expression.
+        body: &'a Node,
+    },
 }
 
 /// Emit the pure-i64 accumulator loop that implements one of the
@@ -2191,11 +2277,15 @@ enum RangeConsumer {
 ///   * inside `loop` body but outside `next-iter`: 0 → loop, 1 → loop-exit
 fn emit_range_pipeline_loop(
     chain: &RangeChain<'_>,
-    consumer: RangeConsumer,
+    consumer: RangeConsumer<'_>,
     range: TokenRange,
     ctx: &mut LowerCtx<'_>,
 ) -> Result<(), LoweringError> {
     let range_args = chain.range_args;
+    // The accumulator type depends on the consumer: SumI64 / Len use
+    // i64; Reduce derives it from the init expression's lowered type.
+    // Stash the determined type so we can re-emit `LetGet` ops later
+    // and also so the post-loop push matches.
     let start_i = ctx.next_let_idx;
     let end_i = ctx.next_let_idx + 1;
     let acc_i = ctx.next_let_idx + 2;
@@ -2232,16 +2322,32 @@ fn emit_range_pipeline_loop(
         range,
     });
     ctx.tstack.pop();
-    // acc = 0
-    ctx.out.push(TaggedOp {
-        op: Op::ConstI64(0),
-        range,
-    });
-    ctx.tstack.push(IrType::I64);
+    // acc = <init>. SumI64 / Len init to i64 zero; Reduce lowers the
+    // user-supplied init expression and inherits its type.
+    let acc_ty = match consumer {
+        RangeConsumer::SumI64 | RangeConsumer::Len => {
+            ctx.out.push(TaggedOp {
+                op: Op::ConstI64(0),
+                range,
+            });
+            ctx.tstack.push(IrType::I64);
+            IrType::I64
+        }
+        RangeConsumer::Reduce { init, .. } => {
+            lower_expr(&init.expr, init.range, ctx)?;
+            ctx.tstack
+                .last()
+                .copied()
+                .ok_or_else(|| LoweringError::UnsupportedExpr {
+                    kind: "range-chain reduce: init expression produced no value".to_string(),
+                    range: init.range,
+                })?
+        }
+    };
     ctx.out.push(TaggedOp {
         op: Op::LetSet {
             idx: acc_i,
-            ty: IrType::I64,
+            ty: acc_ty,
         },
         range,
     });
@@ -2486,6 +2592,105 @@ fn emit_range_pipeline_loop(
             // Silence the unused-let warning when no map stage flows.
             let _ = current_value_idx;
         }
+        RangeConsumer::Reduce { params, body, .. } => {
+            // The reduce closure takes (acc, elem). Bind both as
+            // transient let-bindings under the closure's parameter
+            // names so the body's `Variable(...)` lookups resolve
+            // through the normal walker.
+            if params.len() != 2 {
+                let _ = std::mem::take(&mut ctx.out);
+                ctx.out = saved_iter;
+                let _ = std::mem::take(&mut ctx.out);
+                ctx.out = saved_outer;
+                return Err(LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "range-chain reduce requires 2-arg closure (acc, elem); got {}",
+                        params.len()
+                    ),
+                    range,
+                });
+            }
+            // Bind acc into a fresh let under params[0].name. Source
+            // value: current acc_i contents.
+            let acc_param_let = ctx.next_let_idx;
+            ctx.next_let_idx += 1;
+            ctx.out.push(TaggedOp {
+                op: Op::LetGet {
+                    idx: acc_i,
+                    ty: acc_ty,
+                },
+                range,
+            });
+            ctx.out.push(TaggedOp {
+                op: Op::LetSet {
+                    idx: acc_param_let,
+                    ty: acc_ty,
+                },
+                range,
+            });
+            ctx.lets.push(LetBinding {
+                name: params[0].name.clone(),
+                idx: acc_param_let,
+                ty: acc_ty,
+                schema_brand: None,
+            });
+            // Bind elem into a fresh let under params[1].name. Source
+            // value: current_value_idx.
+            let elem_param_let = ctx.next_let_idx;
+            ctx.next_let_idx += 1;
+            ctx.out.push(TaggedOp {
+                op: Op::LetGet {
+                    idx: current_value_idx,
+                    ty: current_value_ty,
+                },
+                range,
+            });
+            ctx.out.push(TaggedOp {
+                op: Op::LetSet {
+                    idx: elem_param_let,
+                    ty: current_value_ty,
+                },
+                range,
+            });
+            ctx.lets.push(LetBinding {
+                name: params[1].name.clone(),
+                idx: elem_param_let,
+                ty: current_value_ty,
+                schema_brand: None,
+            });
+            // Lower the closure body — leaves the new acc value on
+            // top of the vstack.
+            lower_expr(&body.expr, body.range, ctx)?;
+            let produced = ctx.tstack.last().copied().ok_or_else(|| {
+                LoweringError::UnsupportedExpr {
+                    kind: "range-chain reduce: body produced no value".to_string(),
+                    range: body.range,
+                }
+            })?;
+            if produced.wasm_slot() != acc_ty.wasm_slot() {
+                let _ = std::mem::take(&mut ctx.out);
+                ctx.out = saved_iter;
+                let _ = std::mem::take(&mut ctx.out);
+                ctx.out = saved_outer;
+                return Err(LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "range-chain reduce: body returned {:?}, expected init type {:?}",
+                        produced, acc_ty
+                    ),
+                    range: body.range,
+                });
+            }
+            ctx.lets.pop(); // elem
+            ctx.lets.pop(); // acc
+            ctx.out.push(TaggedOp {
+                op: Op::LetSet {
+                    idx: acc_i,
+                    ty: acc_ty,
+                },
+                range,
+            });
+            ctx.tstack.pop();
+        }
     }
 
     // Pop the "next-iter" sub-buffer and splice it under Op::Block.
@@ -2541,17 +2746,17 @@ fn emit_range_pipeline_loop(
         },
         range,
     });
-    // Push the accumulator so the consumer sees an I64 on top —
-    // matches `list_int_sum`'s return shape for the SumI64 consumer
-    // and the `len()` `list_int_length` return shape for Len.
+    // Push the accumulator so the consumer sees its final value on
+    // top — matches the corresponding `list_int_sum` / `list_int_length`
+    // / `list_int_fold` return shape depending on the consumer.
     ctx.out.push(TaggedOp {
         op: Op::LetGet {
             idx: acc_i,
-            ty: IrType::I64,
+            ty: acc_ty,
         },
         range,
     });
-    ctx.tstack.push(IrType::I64);
+    ctx.tstack.push(acc_ty);
     Ok(())
 }
 

@@ -127,3 +127,53 @@ fn strict_only_diagnostic_no_longer_blocks_build() {
     let _ev = BytecodeEvaluator::from_source(src)
         .expect("strict-only ClosureParamTypeMissing should not block bytecode build");
 }
+
+/// `range(n).reduce(init, (acc, elem) => body)` covers integer
+/// folds. Mirrors W3's accumulator update without the string
+/// arena dependency so the test stays self-contained.
+#[test]
+fn int_reduce_runs() {
+    let src = "#import list from \"std/list\"\n\
+               #main(Int n) -> Int\n\
+               range(n).reduce(0, (acc, i) => acc + i)";
+    let ev = build(src);
+    let n: i64 = 10;
+    let expected: i64 = (0..n).sum();
+    assert_eq!(run_int(&ev, n), expected);
+}
+
+/// W3 cmp_lua shape — `range(n).map((i) => "a").reduce("", (acc, s)
+/// => acc + s)`. Exercises the string-accumulator path that depends
+/// on the B-1 / B-2 string-arena infrastructure.
+#[test]
+fn w3_shape_string_reduce_runs() {
+    let src = "#import list from \"std/list\"\n\
+               #main(Int n) -> String\n\
+               range(n).map((i) => \"a\").reduce(\"\", (acc, s) => acc + s)";
+    let ev = BytecodeEvaluator::from_source(src)
+        .unwrap_or_else(|e| panic!("W3 bytecode build failed: {e}"));
+    let mut args = HashMap::new();
+    args.insert("n".to_string(), Value::Int(5));
+    let v = ev.run_main(args).expect("run_main");
+    match v {
+        Value::String(s) => assert_eq!(s, "aaaaa"),
+        other => panic!("W3 unexpected result: {other:?}"),
+    }
+}
+
+/// Mixed `map().filter().reduce()` pipeline. Stages compose without
+/// the emitter dropping the filter short-circuit or losing the
+/// reduce accumulator type across iterations.
+#[test]
+fn mixed_map_filter_reduce_runs() {
+    let src = "#import list from \"std/list\"\n\
+               #main(Int n) -> Int\n\
+               range(n)\n\
+                 .map((i) => i * 2)\n\
+                 .filter((j) => j > 4)\n\
+                 .reduce(0, (acc, k) => acc + k)";
+    let ev = build(src);
+    let n: i64 = 10;
+    let expected: i64 = (0..n).map(|i| i * 2).filter(|j| *j > 4).sum();
+    assert_eq!(run_int(&ev, n), expected);
+}
