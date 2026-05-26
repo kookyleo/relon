@@ -1593,6 +1593,7 @@ dependencies = [
  "relon-codegen-native",
  "relon-eval-api",
  "relon-evaluator",
+ "relon-ir",
  "relon-parser",
  "serde",
  "serde_json",

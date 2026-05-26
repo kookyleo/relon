@@ -116,6 +116,6 @@ pub use trace_install::{
     hot_counter_reset, hot_counter_reset_all, hot_counters_base, jump_helper_call_count,
     recording_registration_count, register_recording, register_trace_runtime_symbols,
     reset_jump_helper_call_count, JITedTraceFn, RecordingRegistration, TraceEntryFn, TraceJitError,
-    TraceJitState, HOT_COUNTERS_SYMBOL, MAX_FN_ID, RELON_HOT_THRESHOLD,
+    TraceJitState, HOT_COUNTERS_SYMBOL, MAX_FN_ID, RELON_HOT_THRESHOLD, TINY_TRACE_OP_THRESHOLD,
 };
 pub use trace_recording::{RecordingOutcome, StackCell, TraceRecordingEvaluator};

@@ -28,7 +28,16 @@ relon-bytecode = { workspace = true }
 # outside the scalar envelope surface as `BackendError::Bytecode` and
 # the bench row prints `n/a (UnsupportedOp)` rather than the row's
 # numbers — matches the corpus four-way harness's soft-pass policy.
-relon = { workspace = true }
+#
+# JitEvaluator tier escalation (open follow-up #1, 2026-05-26): the
+# wrapper's trace-recorder hookup + dispatcher-switch wiring lives
+# behind the `cranelift-aot` feature (the feature already gates the
+# AOT row in `try_build_aot` below). Enabling it here lets the
+# bench's `relon_jit` row exercise the auto-promoting Trace tier on
+# hot loops; without the feature `JitEvaluator` stays at the v1
+# tree-walk + bytecode dispatch shape and the row reports
+# bytecode-equivalent numbers.
+relon = { workspace = true, features = ["cranelift-aot"] }
 # v5-β-2 stage 4: cranelift-AOT comparison bench. The wasm-AOT
 # backend retired here; the bench crate now only depends on the
 # cranelift-native AOT crate for cold/warm measurement against the
