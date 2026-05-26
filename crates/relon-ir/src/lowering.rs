@@ -1724,6 +1724,18 @@ fn lower_fn_call(
     if let Some(()) = try_lower_list_sum_range(path, args, range, ctx)? {
         return Ok(());
     }
+    // Open follow-up #2: `range(start, end)[. map(...) | . filter(...)]*.len()`
+    // desugars to a pure i64 count accumulator. Without this the
+    // chain would lower into the buffer-protocol list pipeline and
+    // hit the bytecode VM's scalar-envelope rejection at backend
+    // build time, so cmp_lua W4 stays at `n/a`. The desugar fires
+    // before regular method dispatch because the receiver path
+    // (`range(...)` etc.) is not statically reachable as a known
+    // schema in the analyzer's IR-side table — without the peephole
+    // `lower_method_receiver` would emit an `UnresolvedVariable`.
+    if let Some(()) = try_lower_range_chain_len(path, args, range, ctx)? {
+        return Ok(());
+    }
     // Final path segment is the method / function name. Earlier
     // segments either form the receiver (method-call form) or are
     // unused (free-call form has exactly one path segment).
@@ -1961,14 +1973,55 @@ fn try_lower_list_sum_range(
     }
 
     // Walk the chain rooted at `range(...)`, peeling off
-    // recognized `.map((p) => <body>)` invocations.  Returns the base
-    // range_args plus the per-stage closure adaptor list; otherwise
-    // falls through.
+    // recognized `.map((p) => <body>)` / `.filter((p) => <body>)`
+    // invocations.  Returns the base range_args plus the per-stage
+    // closure adaptor list; otherwise falls through.
     let Some(chain) = match_range_chain(&args[0].value.expr) else {
         return Ok(None);
     };
 
-    emit_range_sum_loop(&chain, range, ctx)?;
+    emit_range_pipeline_loop(&chain, RangeConsumer::SumI64, range, ctx)?;
+    Ok(Some(()))
+}
+
+/// Open follow-up #2 companion to `try_lower_list_sum_range`: recognise
+/// `range(...)[ . map(c) | . filter(c) ]*.len()` and emit a pure i64
+/// count accumulator. Returns `Ok(Some(()))` on a successful desugar
+/// (vstack carries one `I64` after return), `Ok(None)` when the
+/// pattern didn't match (caller falls through to default dispatch),
+/// `Err` when an inner expression failed to lower.
+///
+/// The W4 cmp_lua workload (`range(n).map((i) => "axb")
+/// .filter((s) => s.contains("x")).len()`) is the canonical caller.
+/// Without this peephole the call would resolve `range` as an unknown
+/// stdlib method (`range` is a tree-walker host-fn, not an IR stdlib
+/// entry), or — if range were promoted — the filter / map pipeline
+/// would materialise a transient `List<String>` the bytecode scalar
+/// envelope rejects. The peephole side-steps both by emitting the
+/// equivalent scalar loop directly.
+fn try_lower_range_chain_len(
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    // Outer call must be `<receiver>.len()` with no args.
+    if path.len() != 2 || !args.is_empty() {
+        return Ok(None);
+    }
+    let TokenKey::Dynamic(receiver_node, _) = &path[0] else {
+        return Ok(None);
+    };
+    let TokenKey::String(method_name, _, _) = &path[1] else {
+        return Ok(None);
+    };
+    if method_name.as_str() != "len" {
+        return Ok(None);
+    }
+    let Some(chain) = match_range_chain(&receiver_node.expr) else {
+        return Ok(None);
+    };
+    emit_range_pipeline_loop(&chain, RangeConsumer::Len, range, ctx)?;
     Ok(Some(()))
 }
 
@@ -2059,6 +2112,13 @@ fn match_range_chain(expr: &Expr) -> Option<RangeChain<'_>> {
         };
         let method: &'static str = match method_name.as_str() {
             "map" => "map",
+            // Open follow-up #2: `filter` lets the W4-shape
+            // (`range(n).map(c1).filter(c2).len()`) collapse onto the
+            // same accumulator-loop skeleton. The filter's predicate
+            // body lowers to a Bool atop the vstack; the emitter walks
+            // an inner `block { ... }` so a false predicate jumps past
+            // the consumer's accumulator update.
+            "filter" => "filter",
             _ => return None,
         };
         if args.len() != 1 || args[0].name.is_some() {
@@ -2086,38 +2146,56 @@ fn match_range_chain(expr: &Expr) -> Option<RangeChain<'_>> {
     }
 }
 
-/// Emit the pure-i64 accumulator loop that implements
-/// `list.sum(range(start, end)[. map(...)]*)`.  Pre-condition: the
-/// caller has already matched the chain via [`match_range_chain`].
-fn emit_range_sum_loop(
+/// Consumer terminating a `range(...)` pipeline. Selects how the
+/// per-iteration value (after the final map/filter stage) folds into
+/// the loop's i64 accumulator.
+#[derive(Debug, Clone, Copy)]
+enum RangeConsumer {
+    /// `list.sum(<chain>)` — accumulator += element (element must be
+    /// `I64`).
+    SumI64,
+    /// `<chain>.len()` — accumulator += 1 per surviving iteration
+    /// (element type is irrelevant; only the filter outcome matters).
+    Len,
+}
+
+/// Emit the pure-i64 accumulator loop that implements one of the
+/// recognised `range(start, end)[. map(...) | . filter(...)]*` chain
+/// consumers. Pre-condition: the caller has already matched the
+/// chain via [`match_range_chain`]. The emitter walks the stages
+/// in source order, lowering each closure body inline against the
+/// outer ctx so captures resolve through the normal walker.
+///
+/// Control-flow shape (the inner block lets `filter` short-circuit
+/// the consumer update without breaking out of the loop):
+///
+/// ```text
+/// block (loop-exit) {
+///   loop {
+///     if start >= end { br 1 }      // exit the loop-exit block
+///     block (next-iter) {
+///       <stage 0 emit>
+///       <stage 1 emit>              // filter stages emit `br 0` on
+///       ...                         // false to skip the consumer
+///       <consumer update>
+///     }
+///     start += 1
+///     br 0                          // back to loop header
+///   }
+/// }
+/// push acc
+/// ```
+///
+/// Label depths (counted from innermost out):
+///   * inside `next-iter` block: 0 → next-iter, 1 → loop, 2 → loop-exit
+///   * inside `loop` body but outside `next-iter`: 0 → loop, 1 → loop-exit
+fn emit_range_pipeline_loop(
     chain: &RangeChain<'_>,
+    consumer: RangeConsumer,
     range: TokenRange,
     ctx: &mut LowerCtx<'_>,
 ) -> Result<(), LoweringError> {
     let range_args = chain.range_args;
-    // Emit the loop body.  We need three i64 let-slots:
-    //   start_i — loop counter, initialised to `start`
-    //   end_i   — loop bound (cached so the user expression is only
-    //             evaluated once)
-    //   acc_i   — running sum, initialised to `0`
-    //
-    // Pseudo-IR (matches `list_int_sum`'s structural shape, but pure
-    // i64 instead of buffer-protocol):
-    //   start_i = <start expr>          // 0 when 1-arg
-    //   end_i   = <end expr>
-    //   acc_i   = 0i64
-    //   block {
-    //     loop {
-    //       if start_i >= end_i { br 1 }
-    //       # for each `.map((p) => body)` stage: bind p = start_i (or
-    //       # the previous stage's output) into a fresh let, lower the
-    //       # body, leaving the i64 result on the vstack.
-    //       acc_i += <element_value>
-    //       start_i += 1
-    //       br 0
-    //     }
-    //   }
-    //   push acc_i
     let start_i = ctx.next_let_idx;
     let end_i = ctx.next_let_idx + 1;
     let acc_i = ctx.next_let_idx + 2;
@@ -2172,21 +2250,22 @@ fn emit_range_sum_loop(
     // -----------------------------------------------------------------
     // Build the inner loop body.
     //
-    // Strategy: rather than emit a hand-built `Vec<TaggedOp>` (which
-    // can't accommodate arbitrary closure bodies), we temporarily
-    // redirect `ctx.out` into a sub-buffer, lower the loop body into
-    // it (including any in-line closure expansion), then splice the
-    // resulting vec under `Block { body: [Loop { body: ... }] }`.
+    // Strategy: temporarily redirect `ctx.out` into a sub-buffer per
+    // nested control-flow region so we can splice the resulting vec
+    // under the matching Block/Loop op. The op-stream redirect
+    // preserves all other ctx fields (let-table, vstack,
+    // next_let_idx, intern handle); only `out` is swapped so the
+    // closure body's lowering goes into the right region.
     //
-    // The op-stream redirect preserves all the other ctx fields
-    // (let-table, vstack, next_let_idx, intern handle); only `out`
-    // is swapped so the closure body's lowering goes into the loop's
-    // interior. tstack tracking stays correct because every push the
-    // body makes is matched by a corresponding pop after the
-    // accumulator-add.
+    // The sub-buffer dance is needed because the body lowering walks
+    // arbitrary user IR — we don't want to drop a hand-rolled
+    // Vec<TaggedOp> in the middle of `ctx.out` only to re-shuffle it.
     // -----------------------------------------------------------------
-    let saved_out = std::mem::take(&mut ctx.out);
-    // br_if (start_i >= end_i) -> label_depth 1 (outer block)
+
+    // Outer loop body sub-buffer.
+    let saved_outer = std::mem::take(&mut ctx.out);
+
+    // br_if (start_i >= end_i) -> label_depth 1 (outer loop-exit block)
     ctx.out.push(TaggedOp {
         op: Op::LetGet {
             idx: start_i,
@@ -2201,45 +2280,133 @@ fn emit_range_sum_loop(
         },
         range,
     });
-    ctx.out.push(TaggedOp { op: Op::Ge(IrType::I64), range });
+    ctx.out.push(TaggedOp {
+        op: Op::Ge(IrType::I64),
+        range,
+    });
     ctx.out.push(TaggedOp {
         op: Op::BrIf { label_depth: 1 },
         range,
     });
 
-    // For each stage, bind the input value to a fresh let then lower
-    // the body. The 0-stage case just pushes start_i.
-    if chain.stages.is_empty() {
+    // ----- "next-iter" block (filter short-circuit target) ----------
+    let saved_iter = std::mem::take(&mut ctx.out);
+
+    // Walk the stages. `current_value` flows from the loop counter
+    // into each successive map's output; filter stages don't change
+    // it (they only branch out on false).
+    let mut current_value_idx = start_i;
+    let mut current_value_ty = IrType::I64;
+    for stage in chain.stages.iter() {
+        let param = &stage.closure_params[0];
+        // Allocate a fresh let-binding under the closure
+        // parameter's name so `Variable(p)` inside the body
+        // resolves to current_value via the normal walker.
+        let param_let_idx = ctx.next_let_idx;
+        ctx.next_let_idx += 1;
         ctx.out.push(TaggedOp {
             op: Op::LetGet {
-                idx: start_i,
-                ty: IrType::I64,
+                idx: current_value_idx,
+                ty: current_value_ty,
             },
             range,
         });
-        ctx.tstack.push(IrType::I64);
-    } else {
-        // Stage input — the loop counter for the first stage,
-        // overwritten by each stage's output for subsequent stages.
-        // For the W2/W6/W8/W10 single-`.map` shape this is just one
-        // pass; the loop below is written generically so the future
-        // `.filter` stage slots in without restructure.
-        // First, bind the loop counter into a let-binding under the
-        // first stage's parameter name so the closure body's
-        // `Variable(p)` lookups resolve through the same path the
-        // top-level body uses.
-        let mut current_value_idx = start_i;
-        let mut current_value_ty = IrType::I64;
-        for (stage_idx, stage) in chain.stages.iter().enumerate() {
-            // We only support map for now; filter / fold land in a
-            // follow-up commit when more shapes need them.
-            debug_assert_eq!(stage.method, "map");
-            let param = &stage.closure_params[0];
-            // Allocate a fresh let-binding under the closure
-            // parameter's name so `Variable(p)` inside the body
-            // resolves to current_value_idx via the normal walker.
-            let param_let_idx = ctx.next_let_idx;
-            ctx.next_let_idx += 1;
+        ctx.out.push(TaggedOp {
+            op: Op::LetSet {
+                idx: param_let_idx,
+                ty: current_value_ty,
+            },
+            range,
+        });
+        ctx.lets.push(LetBinding {
+            name: param.name.clone(),
+            idx: param_let_idx,
+            ty: current_value_ty,
+            schema_brand: None,
+        });
+        let body_node = stage.closure_body;
+        lower_expr(&body_node.expr, body_node.range, ctx)?;
+        let produced_ty = ctx.tstack.last().copied().ok_or_else(|| {
+            LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "range-chain {}: closure body produced no value",
+                    stage.method
+                ),
+                range: body_node.range,
+            }
+        })?;
+        ctx.lets.pop();
+        match stage.method {
+            "map" => {
+                // Stash the body result into a fresh let so further
+                // stages (and the consumer) can pick it up.
+                let result_let_idx = ctx.next_let_idx;
+                ctx.next_let_idx += 1;
+                ctx.out.push(TaggedOp {
+                    op: Op::LetSet {
+                        idx: result_let_idx,
+                        ty: produced_ty,
+                    },
+                    range: body_node.range,
+                });
+                ctx.tstack.pop();
+                current_value_idx = result_let_idx;
+                current_value_ty = produced_ty;
+            }
+            "filter" => {
+                if produced_ty != IrType::Bool {
+                    // Restore ctx.out to keep the caller's diagnostic
+                    // surface from seeing a corrupt op stream.
+                    let _ = std::mem::take(&mut ctx.out);
+                    ctx.out = saved_iter;
+                    let _ = std::mem::take(&mut ctx.out);
+                    ctx.out = saved_outer;
+                    return Err(LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "range-chain filter predicate must return Bool, got {:?}",
+                            produced_ty
+                        ),
+                        range,
+                    });
+                }
+                // The predicate left a Bool on top. Branch to the
+                // "next-iter" block on FALSE so the consumer update
+                // is skipped. Wasm's `br_if` branches on non-zero —
+                // so we invert first via Op::Sub or Op::Eq with 0.
+                // Simpler: push 0 and `Eq` to get "predicate==0", then
+                // br_if.
+                ctx.out.push(TaggedOp {
+                    op: Op::ConstBool(false),
+                    range,
+                });
+                ctx.tstack.push(IrType::Bool);
+                ctx.out.push(TaggedOp {
+                    op: Op::Eq(IrType::Bool),
+                    range,
+                });
+                ctx.tstack.pop();
+                ctx.tstack.pop();
+                ctx.tstack.push(IrType::Bool);
+                ctx.out.push(TaggedOp {
+                    op: Op::BrIf { label_depth: 0 },
+                    range,
+                });
+                ctx.tstack.pop();
+                // current_value passes through unchanged.
+            }
+            other => {
+                return Err(LoweringError::UnsupportedExpr {
+                    kind: format!("range-chain: unsupported method `{}`", other),
+                    range,
+                });
+            }
+        }
+    }
+
+    // Consumer update.
+    match consumer {
+        RangeConsumer::SumI64 => {
+            // Push the current element and require it i64.
             ctx.out.push(TaggedOp {
                 op: Op::LetGet {
                     idx: current_value_idx,
@@ -2247,107 +2414,91 @@ fn emit_range_sum_loop(
                 },
                 range,
             });
-            ctx.out.push(TaggedOp {
-                op: Op::LetSet {
-                    idx: param_let_idx,
-                    ty: current_value_ty,
-                },
-                range,
-            });
-            // Push a transient let-binding visible to inner
-            // lower_variable lookups for the duration of this stage's
-            // body lowering.
-            ctx.lets.push(LetBinding {
-                name: param.name.clone(),
-                idx: param_let_idx,
-                ty: current_value_ty,
-                schema_brand: None,
-            });
-            // Lower the closure body into ctx.out. lower_expr pushes
-            // the body's result type onto tstack.
-            let body_node = stage.closure_body;
-            lower_expr(&body_node.expr, body_node.range, ctx)?;
-            let produced_ty = ctx.tstack.last().copied().ok_or_else(|| {
-                LoweringError::UnsupportedExpr {
-                    kind: "range-chain map: closure body produced no value".to_string(),
-                    range: body_node.range,
-                }
-            })?;
-            // Pop the transient let-binding. The body has already
-            // emitted any references to it — anything emitted past
-            // this point sees the outer scope.
-            ctx.lets.pop();
-            // Stash the body result into a let so further stages can
-            // pick it up (and so the accumulator-add finds a single
-            // i64 atop the stack regardless of stage count).
-            let result_let_idx = ctx.next_let_idx;
-            ctx.next_let_idx += 1;
-            ctx.out.push(TaggedOp {
-                op: Op::LetSet {
-                    idx: result_let_idx,
-                    ty: produced_ty,
-                },
-                range: body_node.range,
-            });
-            ctx.tstack.pop();
-            current_value_idx = result_let_idx;
-            current_value_ty = produced_ty;
-            // The last stage's output becomes the loop element.
-            if stage_idx == chain.stages.len() - 1 {
-                ctx.out.push(TaggedOp {
-                    op: Op::LetGet {
-                        idx: result_let_idx,
-                        ty: produced_ty,
-                    },
+            ctx.tstack.push(current_value_ty);
+            if current_value_ty != IrType::I64 {
+                let _ = std::mem::take(&mut ctx.out);
+                ctx.out = saved_iter;
+                let _ = std::mem::take(&mut ctx.out);
+                ctx.out = saved_outer;
+                return Err(LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "list.sum(range(...).map(...)) requires Int-valued element; got {:?}",
+                        current_value_ty
+                    ),
                     range,
                 });
-                ctx.tstack.push(produced_ty);
             }
-        }
-        // Element type must be I64 — list.sum operates on Int. Reject
-        // non-i64 element types so a future `range(n).map((i) =>
-        // some_string)` doesn't silently miscompile.
-        let elem_ty = ctx.tstack.last().copied().unwrap_or(IrType::I64);
-        if elem_ty != IrType::I64 {
-            // Restore ctx.out so the caller's diagnostic path sees a
-            // valid stream.
-            let _drained = std::mem::take(&mut ctx.out);
-            ctx.out = saved_out;
-            return Err(LoweringError::UnsupportedExpr {
-                kind: format!(
-                    "list.sum(range(...).map(...)) requires Int-valued map; got {:?}",
-                    elem_ty
-                ),
+            // acc_i += element
+            ctx.out.push(TaggedOp {
+                op: Op::LetGet {
+                    idx: acc_i,
+                    ty: IrType::I64,
+                },
                 range,
             });
+            ctx.tstack.push(IrType::I64);
+            ctx.out.push(TaggedOp {
+                op: Op::Add(IrType::I64),
+                range,
+            });
+            ctx.tstack.pop();
+            ctx.tstack.pop();
+            ctx.tstack.push(IrType::I64);
+            ctx.out.push(TaggedOp {
+                op: Op::LetSet {
+                    idx: acc_i,
+                    ty: IrType::I64,
+                },
+                range,
+            });
+            ctx.tstack.pop();
+        }
+        RangeConsumer::Len => {
+            // acc_i += 1
+            ctx.out.push(TaggedOp {
+                op: Op::LetGet {
+                    idx: acc_i,
+                    ty: IrType::I64,
+                },
+                range,
+            });
+            ctx.tstack.push(IrType::I64);
+            ctx.out.push(TaggedOp {
+                op: Op::ConstI64(1),
+                range,
+            });
+            ctx.tstack.push(IrType::I64);
+            ctx.out.push(TaggedOp {
+                op: Op::Add(IrType::I64),
+                range,
+            });
+            ctx.tstack.pop();
+            ctx.tstack.pop();
+            ctx.tstack.push(IrType::I64);
+            ctx.out.push(TaggedOp {
+                op: Op::LetSet {
+                    idx: acc_i,
+                    ty: IrType::I64,
+                },
+                range,
+            });
+            ctx.tstack.pop();
+            // Silence the unused-let warning when no map stage flows.
+            let _ = current_value_idx;
         }
     }
 
-    // acc_i += element  (top of stack is the loop element).
-    // emit: load acc, swap, add, store. Stack discipline: we have
-    // [element] on tstack; load acc -> [element, acc]; we want
-    // [acc + element] so add. Op::Add on I64 pops 2, pushes 1.
+    // Pop the "next-iter" sub-buffer and splice it under Op::Block.
+    let iter_body = std::mem::replace(&mut ctx.out, saved_iter);
     ctx.out.push(TaggedOp {
-        op: Op::LetGet {
-            idx: acc_i,
-            ty: IrType::I64,
+        op: Op::Block {
+            result_ty: None,
+            body: iter_body,
         },
         range,
     });
-    ctx.tstack.push(IrType::I64);
-    ctx.out.push(TaggedOp { op: Op::Add(IrType::I64), range });
-    ctx.tstack.pop();
-    ctx.tstack.pop();
-    ctx.tstack.push(IrType::I64);
-    ctx.out.push(TaggedOp {
-        op: Op::LetSet {
-            idx: acc_i,
-            ty: IrType::I64,
-        },
-        range,
-    });
-    ctx.tstack.pop();
-    // start_i += 1
+
+    // start_i += 1; br 0 (back to loop)
     ctx.out.push(TaggedOp {
         op: Op::LetGet {
             idx: start_i,
@@ -2359,7 +2510,10 @@ fn emit_range_sum_loop(
         op: Op::ConstI64(1),
         range,
     });
-    ctx.out.push(TaggedOp { op: Op::Add(IrType::I64), range });
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I64),
+        range,
+    });
     ctx.out.push(TaggedOp {
         op: Op::LetSet {
             idx: start_i,
@@ -2367,30 +2521,29 @@ fn emit_range_sum_loop(
         },
         range,
     });
-    // br 0
     ctx.out.push(TaggedOp {
         op: Op::Br { label_depth: 0 },
         range,
     });
 
-    // Swap the sub-buffer back into place and wrap it under Block/Loop.
-    let loop_body = std::mem::replace(&mut ctx.out, saved_out);
+    // Pop the outer loop body and wrap under Block { Loop { ... } }.
+    let outer_body = std::mem::replace(&mut ctx.out, saved_outer);
     ctx.out.push(TaggedOp {
         op: Op::Block {
             result_ty: None,
             body: vec![TaggedOp {
                 op: Op::Loop {
                     result_ty: None,
-                    body: loop_body,
+                    body: outer_body,
                 },
                 range,
             }],
         },
         range,
     });
-    // Loop never touches the vstack post-Block (block/loop are
-    // None-typed); push the accumulator now so the consumer sees an
-    // I64 on top, matching `list_int_sum`'s return shape.
+    // Push the accumulator so the consumer sees an I64 on top —
+    // matches `list_int_sum`'s return shape for the SumI64 consumer
+    // and the `len()` `list_int_length` return shape for Len.
     ctx.out.push(TaggedOp {
         op: Op::LetGet {
             idx: acc_i,
@@ -4675,7 +4828,11 @@ mod range_pipeline_tests {
                 );
             }
         }
-        // Exactly one Block / Loop pair (the accumulator-loop shape).
+        // Block shape: one outer loop-exit block + one inner
+        // next-iter block (the latter exists so future `.filter`
+        // stages have a short-circuit target). The pipeline emits
+        // both unconditionally so the same loop body shape works
+        // across all consumer / stage combinations.
         let blocks = ops
             .iter()
             .filter(|op| matches!(op, Op::Block { .. }))
@@ -4684,7 +4841,7 @@ mod range_pipeline_tests {
             .iter()
             .filter(|op| matches!(op, Op::Loop { .. }))
             .count();
-        assert_eq!(blocks, 1, "expected one outer Block, got {blocks}");
+        assert_eq!(blocks, 2, "expected outer + inner Block, got {blocks}");
         assert_eq!(loops, 1, "expected one inner Loop, got {loops}");
     }
 
@@ -4722,6 +4879,74 @@ mod range_pipeline_tests {
         let stdlib_list_int_sum = stdlib_function_index("list_int_sum").unwrap();
         for op in &ops {
             if let Op::Call { fn_index, .. } = op {
+                assert_ne!(*fn_index, stdlib_list_int_sum);
+            }
+        }
+    }
+
+    /// W4-shape: `range(n).map(c1).filter(c2).len()` desugars to a
+    /// pure scalar count accumulator. The buffer-protocol stdlib
+    /// `list_int_length` / `list_string_length` / `list_int_filter`
+    /// must not show up — every one of them would force the bytecode
+    /// scalar envelope to bail.
+    #[test]
+    fn map_filter_len_chain_desugars_to_count_loop() {
+        let src = "#unstrict\n\
+                   #import list from \"std/list\"\n\
+                   #main(Int n) -> Int\n\
+                   range(n)\n\
+                     .map((i) => \"axb\")\n\
+                     .filter((s) => s.contains(\"x\"))\n\
+                     .len()";
+        let ops = lower_and_flatten(src);
+        let banned = [
+            "list_int_length",
+            "list_string_length",
+            "list_int_filter",
+            "list_int_map",
+        ];
+        for op in &ops {
+            if let Op::Call { fn_index, .. } = op {
+                for name in banned.iter() {
+                    if let Some(idx) = stdlib_function_index(name) {
+                        assert_ne!(
+                            *fn_index, idx,
+                            "expected `{name}` to be inlined by the peephole"
+                        );
+                    }
+                }
+            }
+        }
+        // Exactly one Loop (the outer counter), two Block ops
+        // (the loop-exit + the inner next-iter block where the
+        // filter short-circuits).
+        let blocks = ops
+            .iter()
+            .filter(|op| matches!(op, Op::Block { .. }))
+            .count();
+        let loops = ops
+            .iter()
+            .filter(|op| matches!(op, Op::Loop { .. }))
+            .count();
+        assert_eq!(blocks, 2, "expected outer + inner Block, got {blocks}");
+        assert_eq!(loops, 1, "expected one Loop, got {loops}");
+    }
+
+    /// `range(n).filter(c).sum()` shape uses the same emitter on the
+    /// `SumI64` consumer side. The W-sf shape isn't in cmp_lua but
+    /// exercises the filter -> sum path independent of the W4 chain.
+    #[test]
+    fn filter_sum_chain_uses_pipeline_emitter() {
+        let src = "#unstrict\n\
+                   #import list from \"std/list\"\n\
+                   #main(Int n) -> Int\n\
+                   list.sum(range(n).filter((i) => i % 2 == 0))";
+        let ops = lower_and_flatten(src);
+        let stdlib_list_int_filter = stdlib_function_index("list_int_filter").unwrap();
+        let stdlib_list_int_sum = stdlib_function_index("list_int_sum").unwrap();
+        for op in &ops {
+            if let Op::Call { fn_index, .. } = op {
+                assert_ne!(*fn_index, stdlib_list_int_filter);
                 assert_ne!(*fn_index, stdlib_list_int_sum);
             }
         }
