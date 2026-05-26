@@ -38,7 +38,10 @@ use inkwell::OptimizationLevel;
 use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
 use relon_parser::Node;
 
-use crate::emitter::{emit_function, is_buffer_protocol_signature, EntryShape, ENTRY_SYMBOL};
+use crate::emitter::{
+    emit_fast_entry, emit_function, is_buffer_protocol_signature, EntryShape, FastPathProfile,
+    ENTRY_SYMBOL, ENTRY_SYMBOL_FAST,
+};
 use crate::error::LlvmError;
 use crate::state::ArenaState;
 
@@ -75,6 +78,18 @@ type BufferEntryFn = unsafe extern "C" fn(
     i64, // caps
 ) -> i32;
 
+// Phase D.1 fast-path typed entries. Arity-specialised C ABI shapes
+// up to 8 args — the arity cap matches `emit_fast_entry`'s envelope.
+type FastEntryFn0 = unsafe extern "C" fn() -> i64;
+type FastEntryFn1 = unsafe extern "C" fn(i64) -> i64;
+type FastEntryFn2 = unsafe extern "C" fn(i64, i64) -> i64;
+type FastEntryFn3 = unsafe extern "C" fn(i64, i64, i64) -> i64;
+type FastEntryFn4 = unsafe extern "C" fn(i64, i64, i64, i64) -> i64;
+type FastEntryFn5 = unsafe extern "C" fn(i64, i64, i64, i64, i64) -> i64;
+type FastEntryFn6 = unsafe extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64;
+type FastEntryFn7 = unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64;
+type FastEntryFn8 = unsafe extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64;
+
 /// Owned LLVM JIT state for a single compiled module. The
 /// [`Context`] / [`ExecutionEngine`] pair must outlive every call
 /// into the JITted function pointer; we park them on the heap behind
@@ -88,6 +103,12 @@ struct JitOwned {
     /// Cached so the hot path is a single indirect call (matches the
     /// cranelift backend's `LegacyEntryFn` stash).
     entry_ptr: usize,
+    /// Phase D.1: typed fast entry pointer resolved at construction
+    /// time when the source qualifies for the dispatch-boundary fast
+    /// path. `None` when the IR fails to lower against the fast
+    /// envelope (string ops, sandbox traps, etc.) — `run_main` falls
+    /// back to the buffer entry transparently in that case.
+    fast_entry_ptr: Option<usize>,
     /// Pre-rendered textual LLVM IR. inkwell 0.9's
     /// `ExecutionEngine::get_module*` is missing, so the dump-time
     /// call cannot reach back to the live module — we pay the
@@ -126,6 +147,13 @@ pub struct LlvmAotEvaluator {
     param_names: Vec<String>,
     /// Buffer schema for source-driven entries; `None` for direct-IR.
     buffer_schema: Option<BufferSchema>,
+    /// Phase D.1: when `Some`, the JIT module exported a typed
+    /// `(i64...) -> i64` fast entry alongside the buffer entry. Held
+    /// here so `run_main` can pick the fast pointer when the supplied
+    /// args match the eligible shape. Length equals the fast-entry
+    /// arity (matches `buffer_schema.main_schema.fields.len()` when
+    /// every field is `Int`).
+    fast_path_arity: Option<usize>,
 }
 
 thread_local! {
@@ -277,6 +305,40 @@ impl LlvmAotEvaluator {
         let (_llvm_fn, entry_shape) =
             emit_function(ctx_static, &module, entry, buffer_return_size)?;
 
+        // Phase D.1: attempt to emit the typed fast-path entry
+        // alongside the buffer entry whenever the schema qualifies.
+        // Emission failure is treated as a "no fast path available"
+        // condition rather than a hard error — the IR can stay on
+        // the buffer entry, which is correct (just slower).
+        //
+        // We discover eligibility from the `buffer_schema` (declared
+        // `#main` params + return) and the IR body. Sources that
+        // touch ops outside the fast envelope (strings, sandbox
+        // traps, MakeClosure, etc.) fail emission inside
+        // `emit_fast_entry`; we capture the error to the IR dump for
+        // post-mortem and continue with the buffer-only module.
+        let fast_profile = buffer_schema
+            .as_ref()
+            .and_then(|s| build_fast_path_profile(s).ok());
+        let mut fast_emit_diagnostic: Option<String> = None;
+        if let Some(profile) = fast_profile.as_ref() {
+            match emit_fast_entry(ctx_static, &module, entry, profile) {
+                Ok(_) => {}
+                Err(e) => {
+                    fast_emit_diagnostic = Some(format!("{e}"));
+                    // Roll back the partially-emitted fast entry so
+                    // the module verifies cleanly with just the
+                    // buffer entry. inkwell's `delete` is unsafe
+                    // because it invalidates any outstanding
+                    // `FunctionValue` handle; the emitter dropped
+                    // its handle when `emit_fast_entry` returned.
+                    if let Some(f) = module.get_function(ENTRY_SYMBOL_FAST) {
+                        unsafe { f.delete() };
+                    }
+                }
+            }
+        }
+
         module
             .verify()
             .map_err(|e| LlvmError::Codegen(format!("LLVM verifier rejected module: {e}")))?;
@@ -312,10 +374,31 @@ impl LlvmAotEvaluator {
             ))
         })?;
 
+        // Phase D.1: resolve the typed fast-entry pointer when the
+        // module exported one. Resolution failure here is *not* an
+        // emit-side bug — the symbol simply wasn't emitted (or was
+        // rolled back) — so we treat it as "no fast path" silently.
+        let (fast_entry_ptr, fast_path_arity) = match (&fast_profile, &fast_emit_diagnostic) {
+            (Some(profile), None) => match engine.get_function_address(ENTRY_SYMBOL_FAST) {
+                Ok(ptr) => (Some(ptr), Some(profile.arg_offsets.len())),
+                Err(_) => (None, None),
+            },
+            _ => (None, None),
+        };
+        // Stash the fast-emit diagnostic (if any) into the IR dump so
+        // post-mortem tests can assert on it without needing a
+        // dedicated getter. The dump is only consumed by tests so the
+        // overhead doesn't matter at runtime.
+        let ir_dump = match fast_emit_diagnostic {
+            Some(diag) => format!("; fast-emit diagnostic: {diag}\n{ir_dump}"),
+            None => ir_dump,
+        };
+
         Ok(Self {
             jit: JitOwned {
                 _engine: engine,
                 entry_ptr,
+                fast_entry_ptr,
                 ir_dump,
                 _ctx: ctx_box,
             },
@@ -323,6 +406,7 @@ impl LlvmAotEvaluator {
             entry_arity: entry.params.len(),
             param_names,
             buffer_schema,
+            fast_path_arity,
         })
     }
 
@@ -398,6 +482,136 @@ impl LlvmAotEvaluator {
     /// the test binary.
     pub fn emit_ir_dump(&self) -> &str {
         &self.jit.ir_dump
+    }
+
+    /// Phase D.1: does this evaluator have a JIT-resident fast entry
+    /// the host can dispatch through when args are all-Int? Exposed
+    /// for the smoke tests that assert the fast path is wired up;
+    /// benches use it to log which row hit the fast vs buffer path.
+    pub fn has_fast_path(&self) -> bool {
+        self.jit.fast_entry_ptr.is_some()
+    }
+
+    /// Phase D.1: arity of the typed fast entry, when one was emitted.
+    /// Matches `arity()` for source-driven entries that qualify; `None`
+    /// when the source falls back to the buffer-only path.
+    pub fn fast_path_arity(&self) -> Option<usize> {
+        self.fast_path_arity
+    }
+
+    /// Phase D.1 dispatch-boundary fast path: invoke the typed fast
+    /// entry directly with positional `i64` args. Bypasses the
+    /// `HashMap` pack, `BufferBuilder` writes, arena setup, and
+    /// `BufferReader` decode entirely — the call chain is
+    /// `Rust caller → cached fn pointer → JIT body → i64 return`.
+    ///
+    /// Returns `Err(Unsupported)` when the evaluator was built without
+    /// a fast entry (source past the Int-only envelope, or
+    /// constructed via `from_ir_direct`).
+    pub fn run_main_legacy_i64_fast(&self, args: &[i64]) -> Result<i64, RuntimeError> {
+        let ptr = self
+            .jit
+            .fast_entry_ptr
+            .ok_or_else(|| RuntimeError::Unsupported {
+                reason:
+                    "llvm-aot: fast entry not available; source not Int-only or fast-emit failed"
+                        .into(),
+            })?;
+        let arity = self.fast_path_arity.unwrap_or(0);
+        if args.len() != arity {
+            return Err(RuntimeError::Unsupported {
+                reason: format!(
+                    "llvm-aot fast path: #main expects {arity} arg(s), got {}",
+                    args.len()
+                ),
+            });
+        }
+        // SAFETY: the cached pointer came back from
+        // `ExecutionEngine::get_function_address(ENTRY_SYMBOL_FAST)`
+        // which guarantees the symbol is live for the engine's
+        // lifetime. The arity-specialised dispatch table mirrors the
+        // typed signature `emit_fast_entry` produced for this
+        // function shape.
+        unsafe {
+            let r = match arity {
+                0 => {
+                    let f: FastEntryFn0 = std::mem::transmute(ptr);
+                    f()
+                }
+                1 => {
+                    let f: FastEntryFn1 = std::mem::transmute(ptr);
+                    f(args[0])
+                }
+                2 => {
+                    let f: FastEntryFn2 = std::mem::transmute(ptr);
+                    f(args[0], args[1])
+                }
+                3 => {
+                    let f: FastEntryFn3 = std::mem::transmute(ptr);
+                    f(args[0], args[1], args[2])
+                }
+                4 => {
+                    let f: FastEntryFn4 = std::mem::transmute(ptr);
+                    f(args[0], args[1], args[2], args[3])
+                }
+                5 => {
+                    let f: FastEntryFn5 = std::mem::transmute(ptr);
+                    f(args[0], args[1], args[2], args[3], args[4])
+                }
+                6 => {
+                    let f: FastEntryFn6 = std::mem::transmute(ptr);
+                    f(args[0], args[1], args[2], args[3], args[4], args[5])
+                }
+                7 => {
+                    let f: FastEntryFn7 = std::mem::transmute(ptr);
+                    f(
+                        args[0], args[1], args[2], args[3], args[4], args[5], args[6],
+                    )
+                }
+                8 => {
+                    let f: FastEntryFn8 = std::mem::transmute(ptr);
+                    f(
+                        args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
+                    )
+                }
+                n => {
+                    return Err(RuntimeError::Unsupported {
+                        reason: format!("llvm-aot fast path: arity {n} > 8 dispatch cap"),
+                    });
+                }
+            };
+            Ok(r)
+        }
+    }
+
+    /// Try the fast path first: when the schema qualifies and every
+    /// supplied arg is `Int`, dispatch through the typed JIT entry
+    /// and wrap the i64 result. Returns `Ok(None)` when the fast
+    /// path isn't applicable for this call (caller falls back to the
+    /// buffer entry). `Ok(Some(v))` on a successful fast dispatch;
+    /// `Err` only when the dispatch itself failed.
+    fn try_run_main_fast(
+        &self,
+        args: &HashMap<String, Value>,
+    ) -> Result<Option<Value>, RuntimeError> {
+        if self.jit.fast_entry_ptr.is_none() {
+            return Ok(None);
+        }
+        let arity = self.fast_path_arity.unwrap_or(0);
+        if arity != self.param_names.len() {
+            // Schema arity mismatch — shouldn't happen if
+            // `build_fast_path_profile` agreed, but be defensive.
+            return Ok(None);
+        }
+        let mut argv = [0i64; 8];
+        for (i, name) in self.param_names.iter().enumerate() {
+            match args.get(name) {
+                Some(Value::Int(v)) => argv[i] = *v,
+                _ => return Ok(None), // missing or non-Int arg → fall back
+            }
+        }
+        let r = self.run_main_legacy_i64_fast(&argv[..arity])?;
+        Ok(Some(Value::Int(r)))
     }
 
     /// Buffer-protocol `run_main`: pack the HashMap-keyed args into
@@ -565,6 +779,13 @@ impl Evaluator for LlvmAotEvaluator {
     }
 
     fn run_main(&self, args: HashMap<String, Value>) -> Result<Value, RuntimeError> {
+        // Phase D.1 dispatch-boundary fast path: try the typed entry
+        // first. Falls through to the buffer-protocol path on
+        // mismatch (non-Int args, schema past the Int-only envelope,
+        // no fast entry emitted) — transparent to the host.
+        if let Some(v) = self.try_run_main_fast(&args)? {
+            return Ok(v);
+        }
         match self.entry_shape {
             EntryShape::Buffer => self.run_main_buffer(args),
             EntryShape::LegacyI64 => {
@@ -707,6 +928,59 @@ fn read_record_into_map(
         out.insert(f.name.clone(), v);
     }
     Ok(out)
+}
+
+/// Phase D.1: discover whether `schema` qualifies for the typed
+/// fast-path entry. Eligibility requires every declared `#main` arg
+/// to be `Int` (Inline scalar at 8 / 8) and the return to be the
+/// single-value-wrapper shape (`Ret { value: Int }`). Returns the
+/// `FastPathProfile` mapping param-declaration order to buffer
+/// offsets when eligible.
+fn build_fast_path_profile(schema: &BufferSchema) -> Result<FastPathProfile, ()> {
+    use relon_eval_api::schema_canonical::TypeRepr;
+    // Every declared #main arg must be `Int`. Pointer-indirect /
+    // floating-point / bool / null are out — those would require
+    // f64 / i32 fast-entry slots we don't enumerate.
+    for f in &schema.main_schema.fields {
+        if !matches!(f.ty, TypeRepr::Int) {
+            return Err(());
+        }
+    }
+    // Single-value-wrapper return only. Any other shape (multi-field
+    // record, branded sub-schema, tail-cursor String/List) escapes
+    // the typed-i64 envelope.
+    if !is_single_value_wrapper(&schema.return_schema) {
+        return Err(());
+    }
+    if !matches!(schema.return_schema.fields[0].ty, TypeRepr::Int) {
+        return Err(());
+    }
+    // Collect each arg's buffer offset from the layout — declaration
+    // order is what the JIT entry is parameterised by.
+    let mut arg_offsets: Vec<u32> = Vec::with_capacity(schema.main_layout.fields.len());
+    for (i, f) in schema.main_schema.fields.iter().enumerate() {
+        // Layout's `fields` mirrors `main_schema.fields` order; cross-
+        // check the names so a future schema reorder surfaces.
+        let lo = schema.main_layout.fields.get(i).ok_or(())?;
+        if lo.name != f.name {
+            return Err(());
+        }
+        arg_offsets.push(lo.offset as u32);
+    }
+    // Arity cap — matches `emit_fast_entry`'s `arity > 8` guard.
+    if arg_offsets.len() > 8 {
+        return Err(());
+    }
+    let ret_offset = schema
+        .return_layout
+        .fields
+        .first()
+        .map(|f| f.offset as u32)
+        .ok_or(())?;
+    Ok(FastPathProfile {
+        arg_offsets,
+        ret_offset,
+    })
 }
 
 fn align_up(value: u32, align: u32) -> u32 {

@@ -69,6 +69,42 @@ fn time_loop<F: FnMut()>(iters: usize, mut f: F) -> u128 {
 
 #[test]
 #[ignore]
+fn w1_llvm_fast_path_vs_native_perf() {
+    // Phase D.1 isolation: measure the typed legacy-i64 fast entry
+    // by-itself, bypassing the HashMap + arena boundary `run_main`
+    // pays even after the fast-path short-circuit fires. The
+    // expectation is that this path lands in the rust_native
+    // ballpark — the dispatch boundary collapses to a single C ABI
+    // call into the JIT-compiled kernel.
+    let ev = LlvmAotEvaluator::from_source(W1_SRC).expect("from_source");
+    assert!(
+        ev.has_fast_path(),
+        "W1 must qualify for Phase D.1 fast path"
+    );
+    eprintln!("--- W1 fast-path LLVM IR dump ---\n{}", ev.emit_ir_dump());
+
+    for _ in 0..16 {
+        let _ = black_box(ev.run_main_legacy_i64_fast(&[N]).unwrap());
+        let _ = black_box(native_w1(N));
+    }
+
+    let llvm_fast_ns = time_loop(ITERS, || {
+        let n = black_box(N);
+        black_box(ev.run_main_legacy_i64_fast(&[n]).unwrap());
+    });
+    let native_ns = time_loop(ITERS, || {
+        black_box(native_w1(black_box(N)));
+    });
+
+    eprintln!(
+        "[W1 N={N}] LLVM_fast_path={llvm_fast_ns} ns/call native={native_ns} ns/call \
+         ratio={:.2}x  (target: < 5×, ideally ≤ 30 ns / call absolute)",
+        llvm_fast_ns as f64 / native_ns.max(1) as f64
+    );
+}
+
+#[test]
+#[ignore]
 fn w1_llvm_vs_native_perf() {
     let ev = LlvmAotEvaluator::from_source(W1_SRC).expect("from_source");
     eprintln!("--- W1 LLVM IR dump ---\n{}", ev.emit_ir_dump());

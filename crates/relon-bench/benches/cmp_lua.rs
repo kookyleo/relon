@@ -4334,6 +4334,73 @@ fn bench_cmp_lua(c: &mut Criterion) {
                             })
                         });
                     });
+
+                    // Phase D.1 (2026-05-26): `relon_llvm_aot_fast`
+                    // row. When the source qualifies for the typed
+                    // legacy-i64 fast entry (Int-only `#main` params
+                    // returning Int), bypass the
+                    // `HashMap<String,Value>` pack + arena round-trip
+                    // by dispatching through
+                    // `LlvmAotEvaluator::run_main_legacy_i64_fast`.
+                    // The host caller still owns the args (here:
+                    // pulled out of `args_factory` once before the
+                    // timed loop), so this row models a hot
+                    // dispatch loop in production code.
+                    //
+                    // Equivalence with the `relon_llvm_aot` row is
+                    // checked by a one-shot consistency run that
+                    // walks both paths and asserts identical
+                    // `Value::Int` output.
+                    if ev.has_fast_path() {
+                        // Pull the i64 scalar arg out of
+                        // `args_factory` once. The canonical panel's
+                        // single-Int shape (W1/W2/W5/W6/W8/W9/W10/W12)
+                        // either keys on `n` or `x`; we extract here
+                        // outside the timed region just like the
+                        // `rust_native` row does.
+                        let args0 = args_factory();
+                        let scalar0 =
+                            args0
+                                .get("x")
+                                .or_else(|| args0.get("n"))
+                                .and_then(|v| match v {
+                                    Value::Int(n) => Some(*n),
+                                    _ => None,
+                                });
+                        if let Some(arg_i64) = scalar0 {
+                            // Equivalence cross-check: the fast path
+                            // must produce the same i64 as the
+                            // buffer-protocol `run_main`.
+                            let fast =
+                                ev.run_main_legacy_i64_fast(&[arg_i64]).unwrap_or_else(|e| {
+                                    panic!("[cmp_lua {label}] relon_llvm_aot_fast consistency: {e}")
+                                });
+                            let slow = match ev.run_main(args_factory()).unwrap() {
+                                Value::Int(n) => n,
+                                other => panic!(
+                                    "[cmp_lua {label}] relon_llvm_aot_fast cross-check: \
+                                     run_main returned {other:?}"
+                                ),
+                            };
+                            assert_eq!(
+                                fast, slow,
+                                "[cmp_lua {label}] fast/buffer disagree: \
+                                 fast={fast} buffer={slow}"
+                            );
+                            group.bench_function(
+                                BenchmarkId::new(*label, "relon_llvm_aot_fast"),
+                                |b| {
+                                    b.iter_custom(|iters| {
+                                        let a = black_box(arg_i64);
+                                        timed_with_warmup(iters, || {
+                                            let v = ev.run_main_legacy_i64_fast(&[a]).unwrap();
+                                            black_box(v);
+                                        })
+                                    });
+                                },
+                            );
+                        }
+                    }
                 }
             } else {
                 eprintln!(

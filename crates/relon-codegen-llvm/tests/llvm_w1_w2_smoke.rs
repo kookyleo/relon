@@ -79,6 +79,40 @@ fn w2_dot_product_thousand() {
 }
 
 #[test]
+fn w1_fast_path_emitted_and_consistent() {
+    // Phase D.1 smoke: a W1-shape source (`#main(Int n) -> Int`)
+    // must emit the typed fast entry alongside the buffer entry.
+    // The IR dump should reference both symbols, and `run_main` must
+    // return the same value as the canonical sum formula (which is
+    // what the buffer path also computes).
+    let ev = LlvmAotEvaluator::from_source(W1_SRC).expect("from_source");
+    assert!(ev.has_fast_path(), "W1 must qualify for the fast path");
+    assert_eq!(ev.fast_path_arity(), Some(1));
+    let dump = ev.emit_ir_dump();
+    assert!(
+        dump.contains("relon_llvm_entry_fast"),
+        "expected fast entry symbol in IR dump:\n{dump}"
+    );
+
+    // Cross-check the fast path against a direct legacy-i64 call —
+    // both should agree with `sum(0..n-1) = n*(n-1)/2`.
+    let n: i64 = 1000;
+    let direct = ev.run_main_legacy_i64_fast(&[n]).expect("fast dispatch");
+    let expected: i64 = (0..n).sum();
+    assert_eq!(
+        direct, expected,
+        "fast-path result must match closed-form sum"
+    );
+
+    // And `run_main` (which now transparently picks the fast path)
+    // must return the same Int value.
+    let mut args = HashMap::new();
+    args.insert("n".to_string(), Value::Int(n));
+    let via_run_main = ev.run_main(args).expect("run_main");
+    assert_eq!(via_run_main, Value::Int(expected));
+}
+
+#[test]
 fn llvm_ir_dump_has_entry_symbol() {
     // The Phase B emitter runs the `default<O3>` pipeline on the
     // module before snapshotting the IR dump — for W1's sum-of-

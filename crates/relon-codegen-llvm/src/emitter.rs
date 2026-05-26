@@ -68,6 +68,16 @@ use crate::state::ARENA_STATE_OFFSET_BASE;
 /// crates simultaneously.
 pub(crate) const ENTRY_SYMBOL: &str = "relon_llvm_entry";
 
+/// Phase D.1 dispatch-boundary fast path: a second exported entry
+/// emitted alongside the buffer-protocol entry whenever the source's
+/// `#main(Int...) -> Int` shape qualifies. Skips the HashMap pack +
+/// arena round-trip the buffer envelope incurs, dropping the per-call
+/// boundary cost from the ~650 ns band into the rust-native ballpark.
+///
+/// Only resolved when the evaluator's [`FastPathProfile`] is `Some`;
+/// the symbol is absent from the JIT module otherwise.
+pub(crate) const ENTRY_SYMBOL_FAST: &str = "relon_llvm_entry_fast";
+
 /// Which signature the LLVM emitter should generate. Mirrors the
 /// cranelift crate's `EntryShape` enum so a side-by-side comparison
 /// of the two backends shares the same vocabulary.
@@ -82,6 +92,30 @@ pub(crate) enum EntryShape {
     /// first parameter to match the cranelift backend's
     /// `BufferEntryFn` layout.
     Buffer,
+}
+
+/// Phase D.1 fast-path profile: describes a `#main(Int...) -> Int`
+/// source shape eligible for the typed legacy-i64 dispatch fast path.
+///
+/// The profile maps each declared `#main` Int parameter's buffer
+/// offset to the LLVM fast entry's i64 positional slot, and records
+/// the offset of the single Int return slot so the trailing
+/// `StoreField` can be rewritten into a `ret`. Used exclusively by
+/// [`emit_fast_entry`].
+#[derive(Debug, Clone)]
+pub(crate) struct FastPathProfile {
+    /// One entry per declared `#main` arg: the field's byte offset in
+    /// the input buffer (matches what `LoadField { offset }` carries
+    /// in the IR body) and the i64 slot index in the fast entry
+    /// signature. Vector order parallels schema declaration order.
+    pub(crate) arg_offsets: Vec<u32>,
+    /// Byte offset of the single `value` field in the return buffer.
+    /// The trailing `StoreField { offset, ty: I64 }` whose offset
+    /// matches this value gets rewritten into a `ret` on the value
+    /// (after popping the IR stack normally). Any other `StoreField`
+    /// surfaces as an emitter error — the fast path only handles
+    /// single-value-wrapper returns.
+    pub(crate) ret_offset: u32,
 }
 
 /// IR param signature that triggers [`EntryShape::Buffer`]. Mirrors
@@ -121,6 +155,103 @@ pub(crate) fn emit_function<'ctx>(
         let fv = emit_legacy_entry(ctx, module, func)?;
         Ok((fv, EntryShape::LegacyI64))
     }
+}
+
+/// Phase D.1: emit a typed `(i64, i64, ...) -> i64` fast entry
+/// alongside the buffer-protocol entry. Reuses the IR body's op
+/// stream but rewrites every buffer-protocol `LoadField` into a
+/// direct LLVM param read (via `profile.arg_offsets`) and every
+/// trailing `StoreField` at the return-value offset into a `ret`
+/// against the stashed value.
+///
+/// Returns `Err` when the IR contains ops outside the fast-path
+/// envelope (string ops, sandbox traps, pointer-indirect StoreField,
+/// stdlib calls — anything that escapes the simple Int-arithmetic
+/// loop). The evaluator side surfaces this as "fast path unavailable;
+/// fall back to the buffer entry" rather than a hard error so adding
+/// more workloads doesn't risk regressing the buffer path.
+pub(crate) fn emit_fast_entry<'ctx>(
+    ctx: &'ctx Context,
+    module: &LlvmModule<'ctx>,
+    func: &Func,
+    profile: &FastPathProfile,
+) -> Result<FunctionValue<'ctx>, LlvmError> {
+    if !is_buffer_protocol_signature(&func.params, func.ret) {
+        return Err(LlvmError::UnsupportedSignature(
+            "fast-path entry requires buffer-protocol IR".into(),
+        ));
+    }
+    let arity = profile.arg_offsets.len();
+    if arity > 8 {
+        // Cap at 8 to keep the typed dispatch table in evaluator.rs
+        // finite. Sources with arity > 8 stay on the buffer path —
+        // their boundary cost is amortised across more work anyway.
+        return Err(LlvmError::UnsupportedSignature(format!(
+            "fast-path entry: arity {arity} exceeds cap of 8"
+        )));
+    }
+
+    let i64_t = ctx.i64_type();
+    let param_types: Vec<BasicMetadataTypeEnum<'ctx>> = (0..arity).map(|_| i64_t.into()).collect();
+    let fn_type = i64_t.fn_type(&param_types, false);
+    let llvm_fn = module.add_function(ENTRY_SYMBOL_FAST, fn_type, None);
+
+    let entry_bb = ctx.append_basic_block(llvm_fn, "fast_entry");
+    let builder = ctx.create_builder();
+    builder.position_at_end(entry_bb);
+
+    // Reserve an alloca for the return value. The fast emitter
+    // rewrites the trailing `StoreField` (which under buffer protocol
+    // writes the i64 result into the arena) to a store into this
+    // slot; the implicit `Op::Return` at end-of-body loads from the
+    // slot and `ret`s it. Placing the alloca in the entry block lets
+    // LLVM's mem2reg promote it to SSA across the loop boundary.
+    let ret_slot = builder
+        .build_alloca(i64_t, "fast_ret_slot")
+        .map_err(|e| LlvmError::Codegen(format!("fast ret_slot alloca: {e}")))?;
+    // Initialise to 0 so any early `Op::Return` (no value path) still
+    // produces a defined value — matches the buffer entry's
+    // "ret root_size when no scalar stored" envelope.
+    builder
+        .build_store(ret_slot, i64_t.const_zero())
+        .map_err(|e| LlvmError::Codegen(format!("fast ret_slot init: {e}")))?;
+
+    let mut emit = Emit::new(
+        ctx,
+        &builder,
+        llvm_fn,
+        EntryShape::LegacyI64,
+        /*arena_base_ptr=*/ None,
+        /*buffer_return_size=*/ 0,
+    );
+    emit.fast_path = Some(FastEmit {
+        profile: profile.clone(),
+        ret_slot,
+    });
+    // LLVM param i corresponds to arg i — no implicit state slot for
+    // the fast entry. `LocalGet` should never appear in the body
+    // because the IR producer only emits LocalGet for the handshake
+    // params (which the fast path doesn't pass).
+    emit.param_base = 0;
+    emit.lower_body(&func.body)?;
+
+    // The buffer-protocol IR ends with `Op::Return` which the fast
+    // emitter rewrote into a load+ret. If the body fell through
+    // without an explicit Return (shouldn't happen for well-formed
+    // `#main` IR, but be defensive), seal it with a load+ret.
+    if let Some(cur) = builder.get_insert_block() {
+        if cur.get_terminator().is_none() {
+            let v = builder
+                .build_load(i64_t, ret_slot, "fast_ret_load")
+                .map_err(|e| LlvmError::Codegen(format!("fast trailing load: {e}")))?
+                .into_int_value();
+            builder
+                .build_return(Some(&v))
+                .map_err(|e| LlvmError::Codegen(format!("fast trailing ret: {e}")))?;
+        }
+    }
+
+    Ok(llvm_fn)
 }
 
 // ---------------------------------------------------------------------------
@@ -312,6 +443,22 @@ struct Emit<'ctx, 'b> {
     /// decode the output record. We hard-code this to the schema's
     /// `return_layout.root_size`, passed in at emit time.
     buffer_return_size: u32,
+    /// Phase D.1: set when emitting the fast-path entry. The
+    /// `Op::LoadField` / `Op::StoreField` / `Op::Return` lowering
+    /// branches consult this to rewrite the buffer-protocol IR
+    /// against the typed `(i64...) -> i64` LLVM signature.
+    fast_path: Option<FastEmit<'ctx>>,
+}
+
+/// Phase D.1 fast-path emission state. Carried inside [`Emit`] when
+/// lowering the typed fast entry.
+#[derive(Clone)]
+struct FastEmit<'ctx> {
+    profile: FastPathProfile,
+    /// Alloca holding the i64 return value. Trailing `StoreField`
+    /// at `profile.ret_offset` writes into this slot; `Op::Return`
+    /// loads from it.
+    ret_slot: PointerValue<'ctx>,
 }
 
 #[derive(Clone, Copy)]
@@ -369,6 +516,7 @@ impl<'ctx, 'b> Emit<'ctx, 'b> {
             label_stack: Vec::new(),
             name_seq: 0,
             buffer_return_size,
+            fast_path: None,
         }
     }
 
@@ -601,6 +749,33 @@ impl<'ctx, 'b> Emit<'ctx, 'b> {
     /// Mirrors the cranelift backend's `emit_return` for the same
     /// shapes.
     fn emit_return(&mut self, ip_hint: &str) -> Result<(), LlvmError> {
+        // Phase D.1 fast path: the trailing buffer-protocol `Op::Return`
+        // doesn't carry a value on the stack (the IR producer already
+        // emitted a `StoreField` into the output buffer that the fast
+        // emitter redirected into `ret_slot`). Load + `ret` from the
+        // slot to produce the typed i64 result.
+        if let Some(fast) = self.fast_path.as_ref() {
+            let i64_t = self.ctx.i64_type();
+            let v = self
+                .builder
+                .build_load(i64_t, fast.ret_slot, "fast_ret_load")
+                .map_err(|e| LlvmError::Codegen(format!("fast Return load: {e}")))?
+                .into_int_value();
+            self.builder
+                .build_return(Some(&v))
+                .map_err(|e| LlvmError::Codegen(format!("fast Return: {e}")))?;
+            // Open a dead continuation block so downstream ops have
+            // somewhere to land — matches the buffer/legacy branches
+            // below. The block stays dead; the verifier accepts it
+            // once we seal with `unreachable` in `lower_body`'s
+            // trailing branch.
+            let cont = self.ctx.append_basic_block(self.func, "after_return_cont");
+            self.builder.position_at_end(cont);
+            // Suppress the `_` warning on ip_hint when this branch
+            // runs.
+            let _ = ip_hint;
+            return Ok(());
+        }
         match self.shape {
             EntryShape::LegacyI64 => {
                 let v = self.pop_int(ip_hint)?;
@@ -716,8 +891,41 @@ impl<'ctx, 'b> Emit<'ctx, 'b> {
     }
 
     /// Emit a LoadField — buffer-protocol only. The LLVM IR loads
-    /// `arena_base + in_ptr + offset` for a value of `ty`.
+    /// `arena_base + in_ptr + offset` for a value of `ty`. Phase D.1
+    /// fast-path mode short-circuits this into a direct LLVM param
+    /// access against the matching arg slot.
     fn emit_load_field(&mut self, offset: u32, ty: IrType) -> Result<(), LlvmError> {
+        // Phase D.1 fast path: lift the buffer-protocol field load
+        // into a direct LLVM param read whenever the field's offset
+        // matches one of the profile's declared arg offsets.
+        if let Some(fast) = self.fast_path.as_ref() {
+            if ty != IrType::I64 {
+                return Err(LlvmError::Codegen(format!(
+                    "fast-path LoadField: only I64 args supported, got {ty:?}"
+                )));
+            }
+            let slot = fast
+                .profile
+                .arg_offsets
+                .iter()
+                .position(|&o| o == offset)
+                .ok_or_else(|| {
+                    LlvmError::Codegen(format!(
+                        "fast-path LoadField: offset {offset} not in profile.arg_offsets"
+                    ))
+                })?;
+            // LLVM param `slot` is the i64 arg directly under the
+            // fast-entry signature (no implicit state slot, no
+            // handshake i32 quartet).
+            let p = self.func.get_nth_param(slot as u32).ok_or_else(|| {
+                LlvmError::Codegen(format!(
+                    "fast-path LoadField: llvm param #{slot} missing on function"
+                ))
+            })?;
+            let v = p.into_int_value();
+            self.push(v, IrType::I64);
+            return Ok(());
+        }
         let arena_base_ptr = self.arena_base_ptr.ok_or_else(|| {
             LlvmError::Codegen("LoadField outside buffer-protocol entry shape".into())
         })?;
@@ -752,6 +960,29 @@ impl<'ctx, 'b> Emit<'ctx, 'b> {
         offset: u32,
         ty: IrType,
     ) -> Result<(), LlvmError> {
+        // Phase D.1 fast path: rewrite trailing StoreField into a
+        // store against the i64 ret_slot. Only the single Int return
+        // slot is supported — any other offset means the IR is past
+        // the fast-path envelope (multi-field record, tail-cursor
+        // payload) and we reject.
+        if let Some(fast) = self.fast_path.clone() {
+            if ty != IrType::I64 {
+                return Err(LlvmError::Codegen(format!(
+                    "fast-path StoreField: only I64 returns supported, got {ty:?}"
+                )));
+            }
+            if offset != fast.profile.ret_offset {
+                return Err(LlvmError::Codegen(format!(
+                    "fast-path StoreField: offset {offset} != profile.ret_offset {}",
+                    fast.profile.ret_offset
+                )));
+            }
+            let v = self.pop_int(ip_hint)?;
+            self.builder
+                .build_store(fast.ret_slot, v)
+                .map_err(|e| LlvmError::Codegen(format!("fast StoreField ret_slot: {e}")))?;
+            return Ok(());
+        }
         let arena_base_ptr = self.arena_base_ptr.ok_or_else(|| {
             LlvmError::Codegen("StoreField outside buffer-protocol entry shape".into())
         })?;
