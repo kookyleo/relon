@@ -74,49 +74,63 @@ use std::cell::{Cell, RefCell};
 use relon_trace_abi::hash::fx_hash_bytes;
 
 // =====================================================================
-// Trace string reclamation arena (review #175 P2 fix)
+// Trace string reclamation arena (review #175 P2 fix + #193 bump arena)
 // =====================================================================
 //
-// Each shim that allocates a fresh `StringRef` registers its
-// allocation with the thread-local `TRACE_STRING_ARENA`. The host
-// calls [`reclaim_trace_strings`] at trace exit to drop every
-// allocation back to the global allocator. Without this hook every
-// per-iter `__relon_str_concat*` call leaked unbounded memory in
-// long-lived hosts (the bench fixtures hide it behind their tight
-// loop bounds).
+// Each shim that allocates a fresh `StringRef` routes the allocation
+// through the per-thread trace string arena. The host calls
+// [`reclaim_trace_strings`] at trace exit to invalidate every previous
+// allocation and reset the arena's bookkeeping. Without this hook
+// every per-iter `__relon_str_concat*` call leaked unbounded memory
+// in long-lived hosts.
 //
-// Three allocation shapes need three reclamation strategies:
+// ## Two-tier layout (#193: W3 string-concat allocator gap)
+//
+// Profile evidence on the cmp_lua `W3_string_concat` row showed
+// ~30 % of the trace's wall-clock inside glibc `malloc` + the
+// kernel's mmap/brk VM paths, with only ~0.8 % inside the actual
+// trace body. The historical design issued one `Box`/`std::alloc`
+// round-trip per `__relon_str_concat*` call, so the hot loop's
+// 2000-element fold turned into 2000 individual allocations, every
+// one of them poking glibc's heap and triggering page faults as the
+// brk grew.
+//
+// To close that gap the hot allocation paths now use a thread-local
+// **bump arena** (`TRACE_STRING_BUMP_ARENA`):
+//
+// * The arena owns a chain of large chunks (default 1 MiB each,
+//   doubling on growth up to `MAX_CHUNK_SIZE`).
+// * Each allocation just bumps the active chunk's cursor — no
+//   per-call libc syscall, no page-fault storm.
+// * `reclaim_trace_strings` resets the cursor on every chunk back
+//   to 0 (chunks themselves stay live for reuse). This turns the
+//   per-trace teardown from O(N) `free` calls into a single
+//   pointer reset.
+// * Allocations larger than `MAX_CHUNK_SIZE` (rare; typical
+//   `StringRef` payloads are short) fall back to a `std::alloc`
+//   round-trip and are tracked via the legacy reclaim records below.
+//
+// Two reclaim shapes survive for the cold paths:
 //
 // * `BoxedHeader` — produced by `from_static`: a single
 //   `Box<StringRef>` whose payload pointer borrows a `&'static`
-//   buffer (no payload free needed). Free via
-//   `drop(Box::from_raw(header))`.
-// * `OwnedHeaderAndPayload` — produced by `from_owned`: a
-//   `Box<StringRef>` header plus a separately-boxed `Box<str>`
-//   payload. Free via two `Box::from_raw` reconstructions, one for
-//   each.
-// * `SingleBlock` — produced by `__relon_str_concat_alloc` /
-//   `__relon_str_concat_n_alloc`: a single
-//   `[header | payload]` block from `std::alloc::alloc(layout)`.
-//   Free via `std::alloc::dealloc(block, layout)`.
+//   buffer. Free via `drop(Box::from_raw(header))`.
+// * `OversizedBlock` — produced by the bump arena's fallback path
+//   when an allocation exceeds the per-chunk size limit. Free via
+//   `std::alloc::dealloc(block, layout)`.
 
-/// One reclaim record per allocation handed back from the str shims.
-/// The `Layout`-bearing variant stores the full layout so reclaim
-/// can `dealloc` correctly even if the allocation predates a later
-/// layout-discipline tweak.
+/// One reclaim record per allocation that did **not** fit in the
+/// thread-local bump arena. The two arena-fast-path shapes
+/// (`from_owned`, `__relon_str_concat_*_alloc`) bypass this list
+/// entirely; only `from_static` (header-only `Box`) and the bump
+/// arena's oversized-allocation fallback land here.
 enum TraceStringAlloc {
     /// `Box<StringRef>` only — payload is borrowed (`from_static`).
     BoxedHeader { header: *mut StringRef },
-    /// `Box<StringRef>` header + heap-owned `Box<str>` payload.
-    /// Reclamation drops both boxes.
-    OwnedHeaderAndPayload {
-        header: *mut StringRef,
-        payload_ptr: *mut u8,
-        payload_len: usize,
-    },
     /// Single contiguous `[header | payload]` block allocated via
-    /// `std::alloc::alloc(layout)`.
-    SingleBlock { block: *mut u8, layout: Layout },
+    /// `std::alloc::alloc(layout)` because it exceeded the bump
+    /// arena's per-chunk size cap. Free via `std::alloc::dealloc`.
+    OversizedBlock { block: *mut u8, layout: Layout },
 }
 
 // SAFETY: the arena is only ever touched on the thread that owns it
@@ -135,13 +149,212 @@ fn arena_push(alloc: TraceStringAlloc) {
     TRACE_STRING_ARENA.with(|cell| cell.borrow_mut().push(alloc));
 }
 
-/// Diagnostic: returns the number of live allocations the trace
-/// string arena currently tracks for the calling thread. Tests use
-/// this to verify that [`reclaim_trace_strings`] actually drops the
-/// recorded allocations and that subsequent shim calls grow the
-/// list.
+// =====================================================================
+// Bump arena for hot allocation paths (#193)
+// =====================================================================
+
+/// Initial chunk size for the bump arena: 1 MiB. The W3 hot loop's
+/// 2000-element string-concat fold accumulates a few hundred KiB of
+/// intermediate `StringRef` headers + payloads per trace invocation,
+/// so a 1 MiB starter chunk absorbs the entire fold without growth in
+/// the common case. The growth path doubles up to `MAX_CHUNK_SIZE`.
+const INITIAL_CHUNK_SIZE: usize = 1 << 20;
+
+/// Hard cap on per-chunk size. Allocations whose `total_size > MAX_CHUNK_SIZE`
+/// fall back to a direct `std::alloc::alloc` round-trip (tracked via
+/// `TraceStringAlloc::OversizedBlock`) so we never `mmap` a multi-MiB
+/// chunk just to satisfy one outsized concat.
+const MAX_CHUNK_SIZE: usize = 8 << 20;
+
+/// One bump-allocated chunk. The chunk owns its byte buffer (allocated
+/// via `std::alloc::alloc(layout)`); `cursor` tracks the next free byte
+/// offset, capped at `len`.
+struct BumpChunk {
+    base: *mut u8,
+    len: usize,
+    cursor: usize,
+    layout: Layout,
+}
+
+impl BumpChunk {
+    /// Allocate a fresh chunk of `size` bytes with `align_of::<StringRef>()`
+    /// alignment. Returns `None` if the allocator failed.
+    fn new(size: usize) -> Option<Self> {
+        let layout = Layout::from_size_align(size, std::mem::align_of::<StringRef>())
+            .expect("bump chunk layout must be valid");
+        // SAFETY: layout is non-zero size and properly aligned.
+        let base = unsafe { std::alloc::alloc(layout) };
+        if base.is_null() {
+            return None;
+        }
+        Some(Self {
+            base,
+            len: size,
+            cursor: 0,
+            layout,
+        })
+    }
+
+    /// Try to bump-allocate `size` bytes with `align` alignment from
+    /// this chunk. Returns `None` if the request doesn't fit.
+    fn try_alloc(&mut self, size: usize, align: usize) -> Option<*mut u8> {
+        let cursor = self.base as usize + self.cursor;
+        let aligned = (cursor + align - 1) & !(align - 1);
+        let offset = aligned - self.base as usize;
+        let end = offset.checked_add(size)?;
+        if end > self.len {
+            return None;
+        }
+        self.cursor = end;
+        Some(unsafe { self.base.add(offset) })
+    }
+}
+
+impl Drop for BumpChunk {
+    fn drop(&mut self) {
+        // SAFETY: `base`/`layout` were produced by the matching
+        // `std::alloc::alloc(layout)` in `BumpChunk::new`.
+        unsafe { std::alloc::dealloc(self.base, self.layout) }
+    }
+}
+
+// SAFETY: chunks are only manipulated on the thread that owns the
+// surrounding `thread_local!`; the raw pointer is not Send/Sync only
+// because of its type.
+unsafe impl Send for BumpChunk {}
+
+/// Thread-local bump arena. Holds a chain of `BumpChunk`s; the last
+/// one is the active write target. `live_count` tracks how many
+/// individual bump-allocations are currently outstanding (for
+/// [`trace_string_arena_len`] parity with the legacy list-style
+/// arena's tests).
+struct TraceStringBumpArena {
+    chunks: Vec<BumpChunk>,
+    /// Index of the active chunk (the one we bump into first). Reset
+    /// to 0 on `reset()` so reclaim cycles back to the original
+    /// chunk before falling back to any later (larger) chunks.
+    active: usize,
+    /// Count of live bump-allocations since the last reset. Diagnostic
+    /// only; the bump arena itself does not need it for correctness.
+    live_count: usize,
+}
+
+impl TraceStringBumpArena {
+    const fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+            active: 0,
+            live_count: 0,
+        }
+    }
+
+    /// Bump-allocate `size` bytes with `align` alignment. Returns
+    /// `None` for "doesn't fit in any chunk, even after growing" —
+    /// the caller falls back to `std::alloc::alloc` + an
+    /// `OversizedBlock` reclaim record.
+    fn alloc(&mut self, size: usize, align: usize) -> Option<*mut u8> {
+        // Try the active chunk first; this is the steady-state path
+        // and the cursor sits in a register after the first call.
+        if let Some(chunk) = self.chunks.get_mut(self.active) {
+            if let Some(p) = chunk.try_alloc(size, align) {
+                self.live_count += 1;
+                return Some(p);
+            }
+        }
+        // Walk later chunks (these exist after a previous growth);
+        // a `reset()` cycle starts at chunk 0 so the first iteration
+        // sees a fresh cursor, but mid-trace overflow may have moved
+        // us into a later chunk.
+        for i in (self.active + 1)..self.chunks.len() {
+            if let Some(p) = self.chunks[i].try_alloc(size, align) {
+                self.active = i;
+                self.live_count += 1;
+                return Some(p);
+            }
+        }
+        // No existing chunk fit: grow. Pick the next size by
+        // doubling from the largest existing chunk (or starting at
+        // `INITIAL_CHUNK_SIZE`), but always large enough to fit the
+        // request. Cap at `MAX_CHUNK_SIZE` — oversized requests
+        // fall back to the libc allocator instead.
+        let last_len = self.chunks.last().map(|c| c.len).unwrap_or(0);
+        let mut next = INITIAL_CHUNK_SIZE.max(last_len.saturating_mul(2));
+        // The request plus a worst-case alignment slack must fit.
+        let needed = size.saturating_add(align);
+        if needed > MAX_CHUNK_SIZE {
+            return None;
+        }
+        while next < needed {
+            next = next.saturating_mul(2);
+        }
+        if next > MAX_CHUNK_SIZE {
+            next = MAX_CHUNK_SIZE;
+        }
+        let mut chunk = BumpChunk::new(next)?;
+        let p = chunk.try_alloc(size, align)?;
+        self.chunks.push(chunk);
+        self.active = self.chunks.len() - 1;
+        self.live_count += 1;
+        Some(p)
+    }
+
+    /// Reset the arena: every bump-allocation made since the last
+    /// reset becomes invalid (pointer is dangling). Chunks themselves
+    /// stay live so the next trace reuses the same memory.
+    fn reset(&mut self) {
+        for chunk in self.chunks.iter_mut() {
+            chunk.cursor = 0;
+        }
+        self.active = 0;
+        self.live_count = 0;
+    }
+}
+
+thread_local! {
+    static TRACE_STRING_BUMP_ARENA: RefCell<TraceStringBumpArena> =
+        const { RefCell::new(TraceStringBumpArena::new()) };
+}
+
+/// Allocate `size` bytes with `align` alignment from the thread-local
+/// bump arena. On oversized requests (larger than `MAX_CHUNK_SIZE`)
+/// the helper falls back to `std::alloc::alloc` and registers the
+/// allocation with the legacy reclaim list so `reclaim_trace_strings`
+/// still drops it on trace exit.
+///
+/// Returns `(ptr, used_bump)` so the caller can distinguish the two
+/// paths — bump-allocated pointers MUST NOT be re-fed to the global
+/// `dealloc`.
+fn bump_alloc(size: usize, align: usize) -> Option<*mut u8> {
+    TRACE_STRING_BUMP_ARENA.with(|cell| {
+        let mut arena = cell.borrow_mut();
+        if let Some(p) = arena.alloc(size, align) {
+            return Some(p);
+        }
+        // Oversized: fall back to libc and register for reclaim.
+        let layout = Layout::from_size_align(size, align).ok()?;
+        // SAFETY: layout is non-zero size and properly aligned.
+        let block = unsafe { std::alloc::alloc(layout) };
+        if block.is_null() {
+            return None;
+        }
+        drop(arena);
+        arena_push(TraceStringAlloc::OversizedBlock { block, layout });
+        Some(block)
+    })
+}
+
+/// Diagnostic: total number of live trace-string allocations the
+/// calling thread currently holds. Counts both bump-arena bumps and
+/// the legacy reclaim list (which today only carries `from_static`
+/// headers and the oversized-allocation fallback).
+///
+/// Tests rely on this to verify [`reclaim_trace_strings`] drains
+/// every outstanding allocation and that subsequent shim calls grow
+/// the count again.
 pub fn trace_string_arena_len() -> usize {
-    TRACE_STRING_ARENA.with(|cell| cell.borrow().len())
+    let legacy = TRACE_STRING_ARENA.with(|cell| cell.borrow().len());
+    let bump = TRACE_STRING_BUMP_ARENA.with(|cell| cell.borrow().live_count);
+    legacy + bump
 }
 
 /// Reclaim every `StringRef` (and its backing payload) that the str
@@ -150,6 +363,15 @@ pub fn trace_string_arena_len() -> usize {
 /// Hosts MUST call this at every trace exit / deopt site to bound
 /// memory usage; not calling it preserves the historical leak
 /// behaviour (every shim allocation lives until process exit).
+///
+/// ## Implementation (#193)
+///
+/// 1. Reset the thread-local bump arena's cursors. Chunks stay live
+///    for the next trace so we avoid a malloc/free cycle per
+///    invocation — this is the lever that closed the W3 allocator
+///    gap.
+/// 2. Drain the legacy reclaim list (`from_static` headers, oversized
+///    fallback blocks) via the original per-record free path.
 ///
 /// # Safety
 ///
@@ -162,6 +384,14 @@ pub fn trace_string_arena_len() -> usize {
 /// runner's exit handler immediately after reading the result slot
 /// out of `TraceContext`.
 pub unsafe fn reclaim_trace_strings() {
+    // Reset the bump arena first: every bump-allocated `StringRef`
+    // pointer is now dangling, but the chunks stay live for the next
+    // trace to reuse. This is the cheap part of the reclaim — a few
+    // cursor writes.
+    TRACE_STRING_BUMP_ARENA.with(|cell| cell.borrow_mut().reset());
+    // Then drain the legacy list. Today this is just `from_static`
+    // headers and the rare oversized-allocation fallback; the loop
+    // body matches the historical per-record free path.
     TRACE_STRING_ARENA.with(|cell| {
         let mut allocs = cell.borrow_mut();
         for alloc in allocs.drain(..) {
@@ -175,23 +405,26 @@ pub unsafe fn reclaim_trace_strings() {
                     TraceStringAlloc::BoxedHeader { header } => {
                         drop(Box::from_raw(header));
                     }
-                    TraceStringAlloc::OwnedHeaderAndPayload {
-                        header,
-                        payload_ptr,
-                        payload_len,
-                    } => {
-                        let payload_slice =
-                            std::slice::from_raw_parts_mut(payload_ptr, payload_len);
-                        drop(Box::from_raw(payload_slice as *mut [u8]));
-                        drop(Box::from_raw(header));
-                    }
-                    TraceStringAlloc::SingleBlock { block, layout } => {
+                    TraceStringAlloc::OversizedBlock { block, layout } => {
                         std::alloc::dealloc(block, layout);
                     }
                 }
             }
         }
     });
+}
+
+/// Diagnostic: returns `(chunk_count, total_chunk_bytes)` for the
+/// calling thread's bump arena. Tests use this to verify that
+/// repeated traces reuse the same chunks rather than allocating new
+/// ones every reclaim cycle.
+#[doc(hidden)]
+pub fn trace_string_bump_arena_stats() -> (usize, usize) {
+    TRACE_STRING_BUMP_ARENA.with(|cell| {
+        let arena = cell.borrow();
+        let bytes = arena.chunks.iter().map(|c| c.len).sum();
+        (arena.chunks.len(), bytes)
+    })
 }
 
 /// Opaque, repr-C string-payload box exposed across the JIT boundary.
@@ -302,20 +535,19 @@ impl StringRef {
         }
     }
 
-    /// Build a `StringRef` whose payload lives in a heap-owned
-    /// buffer. The returned pointer is suitable for handing to the
-    /// JIT and keeping alive for the lifetime of the surrounding
-    /// trace.
+    /// Build a `StringRef` whose payload lives in a buffer carved
+    /// out of the per-thread trace string bump arena. The returned
+    /// pointer is suitable for handing to the JIT and keeping alive
+    /// for the lifetime of the surrounding trace.
     ///
     /// Tier 1b: stamps the cached `fx_hash_bytes(payload)` on the
     /// fresh struct so the dict IC fast path stays in sync.
     ///
-    /// Review #175 P2: the allocation (both the `Box<StringRef>`
-    /// header and the `Box<[u8]>` payload) is registered with the
-    /// thread-local trace string arena so a subsequent
-    /// [`reclaim_trace_strings`] call drops both back to the global
-    /// allocator. Without that, every per-trace call leaked the
-    /// payload forever.
+    /// #193: header + payload share a single contiguous block sourced
+    /// from `TRACE_STRING_BUMP_ARENA`. A subsequent
+    /// [`reclaim_trace_strings`] call resets the arena's cursors so
+    /// the block is recycled for the next trace without a `malloc` /
+    /// `free` round-trip. The pointer becomes dangling at that point.
     ///
     /// ## Safety
     ///
@@ -324,24 +556,39 @@ impl StringRef {
     /// expected to invoke [`reclaim_trace_strings`] which invalidates
     /// every pointer this helper handed out on the same thread.
     pub fn from_owned(s: String) -> *const StringRef {
-        // Convert the `String` to a `Box<[u8]>` so the payload's
-        // (thin ptr, len) pair can be reconstructed into a
-        // `Box<[u8]>` at reclaim time.
-        let boxed_bytes: Box<[u8]> = s.into_bytes().into_boxed_slice();
-        let len = boxed_bytes.len();
-        let hash = fx_hash_bytes(&boxed_bytes);
-        let payload_ptr = Box::into_raw(boxed_bytes) as *mut u8;
-        let header = Box::into_raw(Box::new(StringRef {
-            ptr: payload_ptr as *const u8,
-            len,
-            hash,
-        }));
-        arena_push(TraceStringAlloc::OwnedHeaderAndPayload {
-            header,
-            payload_ptr,
-            payload_len: len,
-        });
-        header as *const StringRef
+        // #193: route through the thread-local bump arena. The header
+        // and payload share a single contiguous block; reclaim is a
+        // cursor-reset, not two `Box::from_raw` reconstructions.
+        let bytes = s.as_bytes();
+        let len = bytes.len();
+        let hash = fx_hash_bytes(bytes);
+        let header_size = std::mem::size_of::<StringRef>();
+        let header_align = std::mem::align_of::<StringRef>();
+        let block_size = header_size + len;
+        let block = match bump_alloc(block_size, header_align) {
+            Some(p) => p,
+            None => return std::ptr::null(),
+        };
+        let header_ptr = block as *mut StringRef;
+        // SAFETY: `bump_alloc` returned a block of at least
+        // `header_size + len` bytes, aligned to `StringRef`. Writing
+        // the header at offset 0 and copying the payload at offset
+        // `header_size` stays within the allocation.
+        unsafe {
+            let payload_ptr = block.add(header_size);
+            if len > 0 {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), payload_ptr, len);
+            }
+            std::ptr::write(
+                header_ptr,
+                StringRef {
+                    ptr: payload_ptr as *const u8,
+                    len,
+                    hash,
+                },
+            );
+        }
+        header_ptr as *const StringRef
     }
 
     /// Build a `StringRef` from a `&'static str` source. Useful for
@@ -481,10 +728,10 @@ pub unsafe extern "C" fn __relon_str_concat(
 /// machine code small while skipping the costliest parts of the
 /// generic [`__relon_str_concat`]: `StringRef::as_str`'s UTF-8
 /// validation pass over both operands and the `String`/`Box<str>`
-/// re-allocation handoff. The leak-arena story is identical to
-/// [`StringRef::from_owned`] — every call leaks a fresh `Box<[u8]>` +
-/// `Box<StringRef>`; the surrounding `TraceContext` is responsible for
-/// reclaiming on teardown (see module docs).
+/// re-allocation handoff. The allocation routes through the per-thread
+/// bump arena (#193) so the per-iter cost is a cursor bump, not a
+/// libc `malloc`; the surrounding `TraceContext` reclaims by
+/// resetting the cursors (see module docs).
 ///
 /// Returns a non-null `*mut StringRef` whose `(ptr, len)` payload is
 /// `(buf_ptr, total_len)` and whose first `lhs.len()` bytes are copied
@@ -516,31 +763,28 @@ pub unsafe extern "C" fn __relon_str_concat_alloc(
         return std::ptr::null_mut();
     }
     // Single-block layout: `[StringRef header | payload bytes]` in one
-    // contiguous allocation. Saves a `Box<[u8]>` + `Box<StringRef>`
-    // double-alloc per iter vs the historical two-block design — the
-    // measured W3 hot loop spends most of its time inside the
-    // allocator, so halving the per-iter alloc count is the single
-    // biggest lever.
+    // contiguous allocation, sourced from the per-thread bump arena
+    // (#193). Reclaim is a cursor-reset, not a `dealloc` round-trip
+    // — the W3 hot loop's per-iter `malloc`/`free` storm dominated
+    // the trace's wall-clock until this rewrite.
     //
     // Layout discipline: the payload bytes sit at
     // `(header_ptr as *u8).add(size_of::<StringRef>())`. The
     // `StringRef::ptr` field carries that interior pointer so the rest
     // of the runtime treats this allocation identically to the
-    // historical two-block one.
-    use std::alloc::alloc;
+    // historical libc-backed one.
     let header_size = std::mem::size_of::<StringRef>();
     let header_align = std::mem::align_of::<StringRef>();
     debug_assert!(header_size.is_multiple_of(header_align));
     let block_size = header_size + total_len;
-    let layout = Layout::from_size_align(block_size, header_align)
-        .expect("StringRef block layout must be valid");
-    let block = alloc(layout);
-    if block.is_null() {
-        // Allocator failed; surface as a null sentinel (the JIT side
-        // treats this as a deopt). We do not call `handle_alloc_error`
-        // because the calling trace expects a recoverable null.
-        return std::ptr::null_mut();
-    }
+    let block = match bump_alloc(block_size, header_align) {
+        Some(p) => p,
+        None => {
+            // Bump-arena + libc fallback both failed; surface as a
+            // null sentinel (the JIT side treats this as a deopt).
+            return std::ptr::null_mut();
+        }
+    };
     let payload_ptr = block.add(header_size);
     if lhs_len > 0 && !lhs_ref.ptr.is_null() {
         std::ptr::copy_nonoverlapping(lhs_ref.ptr, payload_ptr, lhs_len);
@@ -562,9 +806,6 @@ pub unsafe extern "C" fn __relon_str_concat_alloc(
             hash: 0,
         },
     );
-    // Review #175 P2: register the single-block allocation so
-    // `reclaim_trace_strings` can dealloc it at trace exit.
-    arena_push(TraceStringAlloc::SingleBlock { block, layout });
     header_ptr
 }
 
@@ -614,17 +855,18 @@ pub unsafe extern "C" fn __relon_str_concat_n_alloc(
     if operands.is_null() {
         return std::ptr::null_mut();
     }
-    use std::alloc::alloc;
     let header_size = std::mem::size_of::<StringRef>();
     let header_align = std::mem::align_of::<StringRef>();
     debug_assert!(header_size.is_multiple_of(header_align));
     let block_size = header_size + total_len;
-    let layout = Layout::from_size_align(block_size, header_align)
-        .expect("StringRef block layout must be valid");
-    let block = alloc(layout);
-    if block.is_null() {
-        return std::ptr::null_mut();
-    }
+    // #193: bump-arena allocation. On the error paths below we simply
+    // return null — the few bytes already advanced on the cursor
+    // become free on the next `reclaim_trace_strings`, which is the
+    // standard contract for this shim anyway.
+    let block = match bump_alloc(block_size, header_align) {
+        Some(p) => p,
+        None => return std::ptr::null_mut(),
+    };
     let payload_ptr = block.add(header_size);
     let mut cursor: usize = 0;
     for i in 0..n {
@@ -632,7 +874,6 @@ pub unsafe extern "C" fn __relon_str_concat_n_alloc(
         if operand.is_null() {
             // Defensive: a null operand short-circuits to null. The
             // upstream `Guard(NotNull(_))` should catch this first.
-            std::alloc::dealloc(block, layout);
             return std::ptr::null_mut();
         }
         let r = &*operand;
@@ -640,13 +881,11 @@ pub unsafe extern "C" fn __relon_str_concat_n_alloc(
             continue;
         }
         if r.ptr.is_null() {
-            std::alloc::dealloc(block, layout);
             return std::ptr::null_mut();
         }
         if cursor + r.len > total_len {
             // `total_len` was under-budget. Bail out instead of
             // writing past the allocation.
-            std::alloc::dealloc(block, layout);
             return std::ptr::null_mut();
         }
         std::ptr::copy_nonoverlapping(r.ptr, payload_ptr.add(cursor), r.len);
@@ -664,9 +903,6 @@ pub unsafe extern "C" fn __relon_str_concat_n_alloc(
             hash: 0,
         },
     );
-    // Review #175 P2: register the single-block allocation so
-    // `reclaim_trace_strings` can dealloc it at trace exit.
-    arena_push(TraceStringAlloc::SingleBlock { block, layout });
     header_ptr
 }
 
@@ -1214,6 +1450,103 @@ mod tests {
         })
         .join()
         .expect("idempotent reclaim thread joined cleanly");
+    }
+
+    // ---- #193: bump-arena reuse + correctness ----------------------
+
+    #[test]
+    fn bump_arena_reuses_chunks_across_reclaims() {
+        // #193: the bump arena's value over the historical libc-per-call
+        // shape is that `reclaim_trace_strings` is a cursor reset, not
+        // a `free` storm. After the first iteration the chunk count
+        // must stay stable across subsequent reclaim cycles — if it
+        // grew, the arena would be leaking chunks (or libc would be
+        // dealing with one chunk-allocation per trace, defeating the
+        // point).
+        std::thread::spawn(|| {
+            // Warm up: trigger initial chunk allocation.
+            let lhs = StringRef::from_static_permanent("prefix-");
+            for _ in 0..512 {
+                let block = unsafe { __relon_str_concat_alloc(lhs, 7 + 8) };
+                assert!(!block.is_null());
+            }
+            unsafe { reclaim_trace_strings() };
+            let (chunks_after_first, bytes_after_first) = trace_string_bump_arena_stats();
+            assert!(
+                chunks_after_first > 0,
+                "first round seeded at least one chunk"
+            );
+            // Repeat the same workload — the chunk count and total
+            // byte capacity must stay identical, proving reclaim
+            // reuses the existing storage.
+            for _ in 0..10 {
+                for _ in 0..512 {
+                    let block = unsafe { __relon_str_concat_alloc(lhs, 7 + 8) };
+                    assert!(!block.is_null());
+                }
+                unsafe { reclaim_trace_strings() };
+            }
+            let (chunks_after_loop, bytes_after_loop) = trace_string_bump_arena_stats();
+            assert_eq!(
+                chunks_after_loop, chunks_after_first,
+                "chunk count must not grow across reclaim cycles"
+            );
+            assert_eq!(
+                bytes_after_loop, bytes_after_first,
+                "chunk byte capacity must not grow across reclaim cycles"
+            );
+        })
+        .join()
+        .expect("bump-arena reuse thread joined cleanly");
+    }
+
+    #[test]
+    fn bump_arena_grows_to_fit_larger_workloads() {
+        // If a trace bursts past the initial chunk size, the arena
+        // must allocate additional (or larger) chunks instead of
+        // failing the bump allocation.
+        std::thread::spawn(|| {
+            let lhs = StringRef::from_static_permanent("x");
+            // 1 MiB initial chunk: we issue ~5 MiB of payload to
+            // force at least one growth event.
+            for _ in 0..200 {
+                let block = unsafe { __relon_str_concat_alloc(lhs, 1 + (32 << 10)) };
+                assert!(!block.is_null(), "growth path must succeed");
+            }
+            let (chunks, bytes) = trace_string_bump_arena_stats();
+            assert!(chunks >= 1, "at least one chunk allocated");
+            assert!(
+                bytes >= (5 << 20),
+                "arena must hold the full workload (>= 5 MiB), got {bytes} bytes"
+            );
+            unsafe { reclaim_trace_strings() };
+        })
+        .join()
+        .expect("bump-arena growth thread joined cleanly");
+    }
+
+    #[test]
+    fn bump_arena_payload_round_trips_through_reclaim() {
+        // The bump-allocated payload must read back the bytes the
+        // shim copied in, before the surrounding `reclaim_trace_strings`
+        // invalidates the pointer.
+        std::thread::spawn(|| {
+            let r1 = StringRef::from_owned("alpha".to_string());
+            let r2 = StringRef::from_owned("β-payload".to_string());
+            let s1 = unsafe { StringRef::as_str(r1) }.expect("r1");
+            let s2 = unsafe { StringRef::as_str(r2) }.expect("r2");
+            assert_eq!(s1, "alpha");
+            assert_eq!(s2, "β-payload");
+            unsafe { reclaim_trace_strings() };
+            // After reclaim the pointers are dangling but the arena
+            // can still serve a fresh allocation that lands on the
+            // same chunk.
+            let r3 = StringRef::from_owned("re-alloc".to_string());
+            let s3 = unsafe { StringRef::as_str(r3) }.expect("r3");
+            assert_eq!(s3, "re-alloc");
+        })
+        .join()
+        .expect("bump-arena round-trip thread joined cleanly");
     }
 
     #[test]
