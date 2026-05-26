@@ -102,3 +102,43 @@ Panel verdict:
 - W5/W7/W8/W9/W10 jit/aot/bytecode 仍 n/a（Dict + closure scope-out, per #264 design doc）
 
 剩 #266 W5 RCA 仍跑（699KB transcript, no commits）。等。
+
+### Iteration 13 (2026-05-26 ~13:15)
+
+#266 transcript 713KB (+13KB)，无 commits。等。
+
+### Iteration 14 (2026-05-26 ~13:25)
+
+#266 transcript 723KB (+10KB)，无 commits。增长慢，可能在跑 perf stat 等。再给 1 iter，无进展则 SendMessage 询问。
+
+### Iteration 15 (2026-05-26 ~13:35)
+
+#266 transcript 745KB (+22KB)，仍无 commits。SendMessage 工具在本会话不可用，无法直接 ping。报状态给用户决定 (continue / inspect / stop)。
+
+### Iteration 16 (2026-05-26 ~13:45)
+
+#266 transcript 786KB (+41KB)，仍 alive。增长加速可能是分析阶段 → 写 doc 阶段过渡。等。
+
+### Iteration 17 (2026-05-26 ~13:55)
+
+#266 transcript 797KB (+11KB)。增长又放缓。等。
+
+### Iteration 18 (2026-05-26 ~14:05)
+
+#266 transcript 807KB (+10KB)。等。
+
+### Iteration 19 (2026-05-26 ~14:15)
+
+#266 transcript 843KB (+35KB)。仍 alive，无 commits。可能在跑大量 bench 收 variance 数据。
+
+### Iteration 20 (2026-05-26 ~14:25)
+
+#266 transcript 851KB (+8KB)。等。
+
+### Iteration 21 (2026-05-26 ~14:35)
+
+#266 transcript 894KB (+43KB)。增长加速，可能在 final 写 doc。
+
+### Iteration 22 (2026-05-26 ~14:45)
+
+#266 transcript 921KB (+27KB)。**`docs/internal/w5-variance-rca.md` 文件在 worktree 出现**！doc 写中，未 commit。
