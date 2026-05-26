@@ -1074,6 +1074,42 @@ impl TraceJitState {
         }
     }
 
+    /// Safe-slice convenience wrapper around
+    /// [`Self::invoke_with_existing_ctx`]. Takes the trace args as a
+    /// borrowed `&[u64]`; the closure receives the same slice
+    /// rematerialised from the raw pointer. See
+    /// [`Self::invoke_with_existing_ctx`]'s doc-comment for the
+    /// per-call reset semantics + the rationale behind caching the
+    /// [`TraceContext`] across calls.
+    pub fn invoke_with_existing_ctx_slice<F>(
+        &self,
+        fn_id: u32,
+        ctx: &mut TraceContext,
+        args: &[u64],
+        fallback: F,
+    ) -> u64
+    where
+        F: FnOnce(&[u64]) -> u64,
+    {
+        let args_len = args.len();
+        let args_ptr = args.as_ptr();
+        // SAFETY:
+        // * `args_ptr` points to `args_len` valid `u64`s for the call's
+        //   duration (borrowed slice).
+        // * The caller-owned `ctx` was sized at install time to match
+        //   the trace's expected `ssa_slots` width (the fixture install
+        //   pipeline drives `TraceContext::with_hooks(slot_count, ..)`
+        //   where `slot_count` mirrors the trace's high-water).
+        // * The rematerialised slice inside the fallback never extends
+        //   past `args_len`.
+        unsafe {
+            self.invoke_with_existing_ctx(fn_id, ctx, args_ptr, |raw_ptr| {
+                let s = std::slice::from_raw_parts(raw_ptr, args_len);
+                fallback(s)
+            })
+        }
+    }
+
     /// Drive the full pipeline `recorder → optimizer → emitter →
     /// cranelift JIT` for a single fn_id and return the installable
     /// trace fn. The caller decides whether to install it via

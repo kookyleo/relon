@@ -230,12 +230,13 @@ fn try_build_jit_with_fixture(
                 param_tys: vec![IrType::I64],
                 slot_count: 64,
                 warmup_args: vec![W1_N as u64],
-                pack: std::sync::Arc::new(|args| {
+                pack: std::sync::Arc::new(|args, buf| {
                     let n = match args.get("n") {
                         Some(Value::Int(v)) => *v,
                         other => panic!("W1 fixture: expected Int arg `n`, got {other:?}"),
                     };
-                    vec![n as u64]
+                    buf.clear();
+                    buf.push(n as u64);
                 }),
                 fallback: std::sync::Arc::new(|args| {
                     let n = args[0] as i64;
@@ -249,12 +250,13 @@ fn try_build_jit_with_fixture(
             param_tys: vec![IrType::I64],
             slot_count: 64,
             warmup_args: vec![W2_N as u64],
-            pack: std::sync::Arc::new(|args| {
+            pack: std::sync::Arc::new(|args, buf| {
                 let n = match args.get("n") {
                     Some(Value::Int(v)) => *v,
                     other => panic!("W2 fixture: expected Int arg `n`, got {other:?}"),
                 };
-                vec![n as u64]
+                buf.clear();
+                buf.push(n as u64);
             }),
             fallback: std::sync::Arc::new(|args| {
                 let n = args[0] as i64;
@@ -280,12 +282,13 @@ fn try_build_jit_with_fixture(
                 // time; cap n=4 so the warm walk stays bounded
                 // (matching the bench's W3 trace_jit setup).
                 warmup_args: vec![4, lit_a, lit_empty],
-                pack: std::sync::Arc::new(move |args| {
+                pack: std::sync::Arc::new(move |args, buf| {
                     let n = match args.get("n") {
                         Some(Value::Int(v)) => *v,
                         other => panic!("W3 fixture: expected Int arg `n`, got {other:?}"),
                     };
-                    vec![n as u64, lit_a, lit_empty]
+                    buf.clear();
+                    buf.extend_from_slice(&[n as u64, lit_a, lit_empty]);
                 }),
                 fallback: std::sync::Arc::new(|args| {
                     // Analytic answer == n (matches the
@@ -313,12 +316,13 @@ fn try_build_jit_with_fixture(
                 param_tys: vec![IrType::I64, IrType::String, IrType::String],
                 slot_count: 64,
                 warmup_args: vec![4, lit_axb, lit_x],
-                pack: std::sync::Arc::new(move |args| {
+                pack: std::sync::Arc::new(move |args, buf| {
                     let n = match args.get("n") {
                         Some(Value::Int(v)) => *v,
                         other => panic!("W4 fixture: expected Int arg `n`, got {other:?}"),
                     };
-                    vec![n as u64, lit_axb, lit_x]
+                    buf.clear();
+                    buf.extend_from_slice(&[n as u64, lit_axb, lit_x]);
                 }),
                 fallback: std::sync::Arc::new(|args| {
                     // Every "axb" haystack contains "x" → count == n.
@@ -335,12 +339,13 @@ fn try_build_jit_with_fixture(
                 param_tys: vec![IrType::I64, IrType::String, IrType::String],
                 slot_count: 64,
                 warmup_args: vec![4, lit_long, lit_x],
-                pack: std::sync::Arc::new(move |args| {
+                pack: std::sync::Arc::new(move |args, buf| {
                     let n = match args.get("n") {
                         Some(Value::Int(v)) => *v,
                         other => panic!("W4_long fixture: expected Int arg `n`, got {other:?}"),
                     };
-                    vec![n as u64, lit_long, lit_x]
+                    buf.clear();
+                    buf.extend_from_slice(&[n as u64, lit_long, lit_x]);
                 }),
                 fallback: std::sync::Arc::new(|args| {
                     // 256-byte haystack ends with 'x' → every iter hits → count == n.

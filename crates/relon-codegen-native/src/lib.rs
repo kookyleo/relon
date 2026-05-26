@@ -119,4 +119,5 @@ pub use trace_install::{
     RecordingRegistration, TraceEntryFn, TraceJitError, TraceJitState, HOT_COUNTERS_SYMBOL,
     MAX_FN_ID, RELON_HOT_THRESHOLD, TINY_TRACE_OP_THRESHOLD,
 };
+pub use relon_trace_abi::TraceContext;
 pub use trace_recording::{RecordingOutcome, StackCell, TraceRecordingEvaluator};

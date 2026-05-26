@@ -71,11 +71,13 @@
 //! through tiers as the workload turns out to be hot."
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
 use relon_evaluator::TreeWalkEvaluator;
 use relon_parser::Node;
+#[cfg(feature = "cranelift-aot")]
+use relon_codegen_native::TraceContext;
 
 use crate::BackendError;
 
@@ -215,10 +217,14 @@ pub struct JitEvaluator {
 }
 
 /// Trace-fixture pack closure type alias. Projects the host's
-/// `HashMap<String, Value>` into the packed `Vec<u64>` the trace
-/// consumes (one slot per declared `param_tys` entry).
+/// `HashMap<String, Value>` into a caller-owned `Vec<u64>` (the trace's
+/// packed slot vector, one slot per declared `param_tys` entry). The
+/// closure clears the buffer before writing so the [`TraceFixtureInstalled`]
+/// cache can reuse the same `Vec` across `run_main` calls without
+/// reallocating per invocation.
 #[cfg(feature = "cranelift-aot")]
-pub type TraceFixturePackFn = Arc<dyn Fn(&HashMap<String, Value>) -> Vec<u64> + Send + Sync>;
+pub type TraceFixturePackFn =
+    Arc<dyn Fn(&HashMap<String, Value>, &mut Vec<u64>) + Send + Sync>;
 /// Trace-fixture fallback closure type alias. Invoked when the
 /// installed trace deopts (loop-exit guard, type-check failure,
 /// etc.) — returns the analytic answer for the input arg slice.
@@ -300,9 +306,29 @@ pub struct TraceFixture {
 struct TraceFixtureInstalled {
     fn_id: u32,
     slot_count: usize,
+    /// Caller-owned `TraceContext` reused across `run_main` calls. Built
+    /// once at install time so the per-call dispatch avoids both the
+    /// `ssa_slots: Box<[u64]>` heap round-trip and the 256-slot
+    /// `dict_lookup_ic` array zero-init each invocation. Wrapped in
+    /// `Mutex` because `Evaluator::run_main(&self, ..)` is shared-borrow
+    /// while `TraceContext::invoke` needs `&mut`; uncontended lock is
+    /// one CAS so it stays dwarfed by the trace's own per-iter cost.
+    /// Bundles the packed-args buffer alongside the context so the same
+    /// lock acquire covers both the `pack` writeback and the trace
+    /// invoke — host-side glue stays one CAS per `run_main`.
+    state: Mutex<TraceFixtureCallState>,
     pack: TraceFixturePackFn,
     fallback: TraceFixtureFallbackFn,
     decode: TraceFixtureDecodeFn,
+}
+
+/// Mutex-guarded per-call scratch reused across `run_main` invocations.
+#[cfg(feature = "cranelift-aot")]
+struct TraceFixtureCallState {
+    ctx: TraceContext,
+    /// Packed arg vector reused across `run_main` calls. The `pack`
+    /// closure clears + writes; the trace entry consumes the slice.
+    packed: Vec<u64>,
 }
 
 impl JitEvaluator {
@@ -407,6 +433,7 @@ impl JitEvaluator {
         // `state.lookup_trace(fn_id)` returns a freshly-compiled
         // trace fn (validated inside the helper). On failure the
         // helper returns an `Err(reason)` we surface verbatim.
+        let param_count = fixture.param_tys.len();
         if let Err(reason) = relon_codegen_native::install_recorder_trace_warmup(
             fn_id,
             fixture.body,
@@ -423,9 +450,15 @@ impl JitEvaluator {
 
         // Sanity: trace is now in the registry. Stash the dispatch
         // closures so `run_main` can route through it on every call.
+        let ctx = TraceContext::with_hooks(
+            fixture.slot_count,
+            relon_codegen_native::default_host_hooks(),
+        );
+        let packed = Vec::with_capacity(param_count);
         self.fixture = Some(TraceFixtureInstalled {
             fn_id,
             slot_count: fixture.slot_count,
+            state: Mutex::new(TraceFixtureCallState { ctx, packed }),
             pack: fixture.pack,
             fallback: fixture.fallback,
             decode: fixture.decode,
@@ -820,20 +853,39 @@ impl Evaluator for JitEvaluator {
         //      the source's shape.
         #[cfg(feature = "cranelift-aot")]
         if let Some(installed) = &self.fixture {
-            // The fixture's pack closure projects the host args into
-            // the trace's packed slot vector. The dispatcher then
-            // invokes the installed trace; on deopt (loop-exit guard,
-            // type mismatch, etc.) the fallback returns the analytic
-            // answer for the recorded input shape.
-            let packed = (installed.pack)(&args);
-            let state = relon_codegen_native::global_trace_jit_state();
-            let fallback = Arc::clone(&installed.fallback);
-            let raw = state.invoke_with_fallback_slice(
-                installed.fn_id,
-                &packed,
-                installed.slot_count,
-                |args_slice| (fallback)(args_slice),
-            );
+            // Fixture path: project the host args into the cached
+            // packed buffer (`pack` clears + writes), invoke the
+            // installed trace through the cached `TraceContext`, and
+            // decode the returned scalar. Both buffers live in the
+            // same `Mutex` so one CAS covers the whole `run_main` —
+            // host-side glue stays minimal. `invoke_with_existing_ctx`
+            // short-circuits the GuardFailed branch to a plain
+            // `fallback(args)` (no `value_stack_copy` rendering), so
+            // bench rows where the trace exits via a guard every call
+            // (e.g. cmp_lua W3 string concat) avoid the per-call Vec
+            // allocation `invoke_with_resume` performs.
+            let trace_state = relon_codegen_native::global_trace_jit_state();
+            let raw = {
+                let mut guard = installed
+                    .state
+                    .lock()
+                    .expect("trace fixture state mutex poisoned");
+                let state_ref = &mut *guard;
+                (installed.pack)(&args, &mut state_ref.packed);
+                assert!(
+                    installed.slot_count >= state_ref.packed.len(),
+                    "trace fixture ctx slot_count ({}) must be >= packed args ({})",
+                    installed.slot_count,
+                    state_ref.packed.len()
+                );
+                let fallback = Arc::clone(&installed.fallback);
+                trace_state.invoke_with_existing_ctx_slice(
+                    installed.fn_id,
+                    &mut state_ref.ctx,
+                    &state_ref.packed,
+                    |args_slice| (fallback)(args_slice),
+                )
+            };
             return Ok((installed.decode)(raw));
         }
 
@@ -1195,12 +1247,13 @@ mod tests {
             param_tys: vec![IrType::I64],
             slot_count: 64,
             warmup_args: vec![16],
-            pack: Arc::new(|args: &HashMap<String, Value>| {
+            pack: Arc::new(|args: &HashMap<String, Value>, buf: &mut Vec<u64>| {
                 let n = match args.get("n") {
                     Some(Value::Int(v)) => *v,
                     other => panic!("expected Int n, got {other:?}"),
                 };
-                vec![n as u64]
+                buf.clear();
+                buf.push(n as u64);
             }),
             fallback: Arc::new(|args: &[u64]| {
                 let n = args[0] as i64;
