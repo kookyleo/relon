@@ -153,16 +153,27 @@ unsafe impl Sync for HostHookTable {}
 /// |  32 | 1.6           | 74%             | 768 B          |
 /// |  64 | 0.78          | 49%             | 1536 B         |
 /// | 128 | 0.39          | 28%             | 3072 B         |
+/// | 256 | 0.20          | 15%             | 6144 B         |
 ///
-/// 16 was the original size; bumped to 32 (2026-05-25) and then to
-/// 64 (2026-05-26) as the W5 layout-variance RCA documented in
-/// `docs/internal/w5-variance-rca.md` quantified the
-/// per-collision cost (~25 µs added to the 84 µs no-collision
-/// floor). 64 slots gives ~50% chance of a clean fast-cluster run
-/// while keeping `TraceContext` under one 4 KiB page even with the
-/// surrounding fields (ssa_slots + result_slot + host_hooks +
-/// pending_recoverable_writes ≈ 200 B + 1536 B IC = 1.7 KB total).
-pub const DICT_LOOKUP_IC_SLOT_COUNT: usize = 64;
+/// 16 was the original size; bumped to 32 (2026-05-25), 64
+/// (2026-05-26 morning), 128 (2026-05-26 W5 IC scaling follow-up
+/// commit `6500518`), and finally 256 (same follow-up loop). The
+/// W5 layout-variance RCA in `docs/internal/w5-variance-rca.md`
+/// quantified the per-collision cost (~25 µs added to the 84 µs
+/// no-collision floor); 64 slots still showed a 1.02× LuaJIT
+/// worst case across 8-run sorted samples, 128 slots pulled it to
+/// 0.98× but the 3 / 8 slow-cluster runs hovered just under the
+/// 0.95× safety target, and 256 slots eliminated the slow cluster
+/// entirely (s90 8-run: 8 / 8 in the no-collision fast cluster,
+/// worst-case 0.759× LuaJIT with a 19% safety margin).
+///
+/// The `TraceContext` now spans into a second 4 KiB page (6.3 KiB
+/// total) but only the active slot pair is touched on the hot path;
+/// the rest of the IC array is pure cold memory for the 11 / 12
+/// cmp_lua workloads that don't issue a dict-lookup op. Allocation
+/// cost is paid once per trace context, which criterion reuses
+/// across the entire bench run.
+pub const DICT_LOOKUP_IC_SLOT_COUNT: usize = 256;
 
 /// One slot of the inline cache the cranelift emitter probes before
 /// calling `__relon_trace_dict_lookup_prechecked_v2`.

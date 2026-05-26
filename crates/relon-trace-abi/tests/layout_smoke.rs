@@ -93,18 +93,26 @@ fn trace_context_size_is_stable() {
     //                                       carry `value_stack_copy`)
     //   host_hooks                      32 (4 x Option<fn ptr>)
     //   pending_recoverable_writes      24 (Vec<T> = (ptr, len, cap))
-    //   dict_lookup_ic                 1536 (64 x DictIcSlot, 3 x u64 each)
-    // Total: 1688 bytes on 64-bit targets.
+    //   dict_lookup_ic                 6144 (256 x DictIcSlot, 3 x u64 each)
+    // Total: 6296 bytes on 64-bit targets.
     //
     // 2026-05-26 W5 layout RCA bump: IC went 32 → 64 slots to halve
     // the birthday-paradox collision probability on the W5 hot loop
-    // (10 string keys). The whole TraceContext still fits in well
-    // under one 4 KiB page.
+    // (10 string keys). 2026-05-26 W5 IC scaling follow-ups: 64 → 128
+    // (commit 6500518) pushed the W5 worst-case below 1.0× LuaJIT
+    // (median 0.75×) but still leaked a 0.98× worst case in 3 / 8
+    // sorted samples; 128 → 256 cuts P(≥1 collision) from ~28% to
+    // ~15% and gives a clean 8 / 8 fast-cluster sweep with the
+    // worst-case under the 0.95× target (with 19% safety margin).
+    // The TraceContext now spans into a second 4 KiB page (6.3 KiB
+    // total), but the IC array is touched only on dict-lookup ops
+    // and even there only the active slot pair is hot, so the
+    // second page stays cold for most invokes.
     //
     // If this assertion trips, *figure out which field grew* and
     // bump the expected size here AND update every emitter constant
     // that reads past the growing field.
-    assert_eq!(size_of::<TraceContext>(), 1688);
+    assert_eq!(size_of::<TraceContext>(), 6296);
 }
 
 #[test]

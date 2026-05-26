@@ -1111,12 +1111,13 @@ fn build_w5_fixture() -> W5Fixture {
         eprintln!("[cmp_lua W5] keys (dict=0x{dict_addr:016x}):");
         for (i, kr) in key_records.iter().enumerate() {
             let ka = kr.as_ptr() as usize;
-            // The inline IC probe uses (dict ^ key) >> 4 & 31 to pick
-            // the slot. Dump that index so we can see whether the 10
-            // hot keys cluster on a few cache lines or spread across
-            // the whole 768B IC array.
-            // Mirrors the cranelift emitter's IC probe formula
-            // (SplitMix64-class multiplier, top log2(N) bits).
+            // Dump the slot index each hot key hashes to so we can see
+            // whether the 10 keys cluster on a few cache lines or
+            // spread across the whole IC array. Mirrors the cranelift
+            // emitter's IC probe formula (SplitMix64-class multiplier,
+            // top log2(N) bits). Slot count is sourced from
+            // `DICT_LOOKUP_IC_SLOT_COUNT` so this stays accurate when
+            // the IC is rescaled (16 → 32 → 64 → 128 history).
             let n_slots = relon_trace_abi::DICT_LOOKUP_IC_SLOT_COUNT;
             let log2_slots = n_slots.trailing_zeros();
             let mixed = ((dict_addr ^ ka) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15u64);
