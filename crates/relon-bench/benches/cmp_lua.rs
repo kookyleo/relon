@@ -2306,10 +2306,37 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
-        // M2-B phase 4d bytecode row — W3's `range(n).map(...).reduce(...)`
-        // is closure + stdlib; the M2-A scalar envelope rejects it.
-        // String-return + closure surface lands with phase 4c-cont.
-        let _ = try_build_bytecode(w3_relon_src(), "W3");
+        // Open follow-up #2: the range-pipeline peephole now lowers
+        // `range(n).map(...).reduce("", (acc, s) => acc + s)` into a
+        // pure string-accumulator loop the bytecode VM accepts. The
+        // row matches what the W2 ladder above does — assert
+        // correctness, then time the closed-form runtime.
+        if let Some(ev) = try_build_bytecode(w3_relon_src(), "W3") {
+            let v = ev
+                .run_main(args_w_n(STRING_CONCAT_N as i64))
+                .expect("W3 bytecode run_main");
+            // Match the tree-walker shape: a `String` of length
+            // STRING_CONCAT_N. The bench compares against
+            // `w3_expected_relon_len()` (the byte length) so unpack
+            // the String and check its `.len()`.
+            match v {
+                Value::String(s) => assert_eq!(
+                    s.len() as i64,
+                    w3_expected_relon_len(),
+                    "W3 bytecode string length must match analytic"
+                ),
+                other => panic!("W3 bytecode non-string result: {other:?}"),
+            }
+            group.bench_function(BenchmarkId::new("W3_string_concat", "relon_bytecode"), |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(STRING_CONCAT_N as i64);
+                    timed_with_warmup(iters, || {
+                        let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            });
+        }
     }
 
     // ----- W4 -----
@@ -2427,9 +2454,29 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
-        // M2-B phase 4d bytecode row — W4 source uses `.filter(...).len()`
-        // (closure + list ctor) so it bounces on the M2-A envelope.
-        let _ = try_build_bytecode(w4_relon_src(), "W4");
+        // Open follow-up #2: the range-pipeline peephole desugars
+        // `range(n).map(...).filter(...).len()` into a pure i64
+        // count accumulator the bytecode VM accepts. Bench row
+        // follows the W2 ladder.
+        if let Some(ev) = try_build_bytecode(w4_relon_src(), "W4") {
+            let v = ev
+                .run_main(args_w_n(TREE_WALK_N as i64))
+                .expect("W4 bytecode run_main");
+            assert_eq!(
+                relon_int_result("W4", v),
+                w4_expected(),
+                "W4 bytecode result must match analytic answer"
+            );
+            group.bench_function(BenchmarkId::new("W4_string_contains", "relon_bytecode"), |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(TREE_WALK_N as i64);
+                    timed_with_warmup(iters, || {
+                        let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            });
+        }
     }
 
     // ----- W4_long_haystack -----
@@ -2791,9 +2838,28 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
-        // M2-B phase 4d bytecode row — W6 uses `list.sum(range(n).map(...))`,
-        // closure + stdlib; same bounce shape as W1 / W2.
-        let _ = try_build_bytecode(w6_relon_src(), "W6");
+        // Open follow-up #2: same range-pipeline peephole as W2 — the
+        // `list.sum(range(n).map(...))` chain inlines into a pure
+        // i64 accumulator loop the bytecode VM accepts.
+        if let Some(ev) = try_build_bytecode(w6_relon_src(), "W6") {
+            let v = ev
+                .run_main(args_w_n(TREE_WALK_N as i64))
+                .expect("W6 bytecode run_main");
+            assert_eq!(
+                relon_int_result("W6", v),
+                w6_expected(),
+                "W6 bytecode result must match analytic answer"
+            );
+            group.bench_function(BenchmarkId::new("W6_dict_num_key", "relon_bytecode"), |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(TREE_WALK_N as i64);
+                    timed_with_warmup(iters, || {
+                        let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            });
+        }
     }
 
     // ----- W7 fib -----
