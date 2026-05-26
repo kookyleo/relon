@@ -1319,12 +1319,12 @@ impl<'a, 'b> Codegen<'a, 'b> {
         let var = if let Some(v) = self.let_locals.get(&idx).copied() {
             v
         } else {
-            let cr_ty = match ty {
-                IrType::I64 => I64,
-                IrType::I32 | IrType::Bool | IrType::Null => I32,
-                _ => I64, // pointers (String/List/...) map to i64 on x86_64; v5-beta-1
-                          // only ever hits this with I64 in practice.
-            };
+            // Use the same IR -> Cranelift type map the rest of codegen
+            // uses (string/list/closure are i32 arena offsets, not i64
+            // pointers). Falling back to I64 here previously panicked
+            // `FunctionBuilder::def_var` when a `LetSet` carrying a
+            // String slot landed in the AOT path (W4 pipeline).
+            let cr_ty = ir_ty_to_cl(ty).unwrap_or(I64);
             let v = self.builder.declare_var(cr_ty);
             self.let_locals.insert(idx, v);
             v
