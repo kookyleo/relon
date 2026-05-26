@@ -268,6 +268,18 @@ impl EvaluatorBuilder {
                     .map_err(|e| BackendError::Bytecode(e.to_string()))?;
                 Ok(Box::new(bc))
             }
+            // Phase A LLVM-AOT does not yet ingest `from_source`
+            // because `lower_workspace_single` emits buffer-protocol
+            // IR which the Phase A emitter rejects. Surface a clear
+            // not-implemented so hosts know to fall back to the
+            // cranelift backend until Phase B.
+            Backend::LlvmAot => Err(BackendError::LlvmAot(
+                "Phase A bootstrap: `from_source` not wired yet — \
+                 use `Backend::CraneliftAot` for source-driven AOT or \
+                 construct an `LlvmAotEvaluator::from_ir_direct` against \
+                 a pre-lowered IR module for the bootstrap envelope"
+                    .to_string(),
+            )),
         }
     }
 }

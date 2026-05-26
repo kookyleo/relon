@@ -632,6 +632,17 @@ pub enum Backend {
     /// to exercise the resume-from-deopt path without paying the
     /// cranelift cold-start cost.
     Bytecode,
+    /// Phase A LLVM-AOT backend bootstrap. Lowers a pre-lowered IR
+    /// module through the inkwell-backed emitter into native machine
+    /// code via LLVM 18's MCJIT engine. The Phase A envelope is the
+    /// cranelift crate's legacy-i64 shape (`(I64...) -> I64`); any
+    /// `from_source` path that produces buffer-protocol IR is
+    /// rejected with `BackendError::LlvmAot`. Phase B widens the
+    /// emitter past this envelope and adds `from_source` parity.
+    /// Gated on the `llvm-aot` cargo feature (off by default) so
+    /// hosts that do not have LLVM 18 dev headers on the build box
+    /// do not regress the workspace `cargo build`.
+    LlvmAot,
 }
 
 /// Errors specific to the backend factory. Distinct from
@@ -655,6 +666,13 @@ pub enum BackendError {
     /// decoupled from the bytecode crate's enum.
     #[error("bytecode VM backend setup failed: {0}")]
     Bytecode(String),
+    /// Phase A LLVM-AOT pipeline failed. Either the build dropped the
+    /// `llvm-aot` cargo feature (so the LLVM crate is not linked) or
+    /// the IR shape is outside the Phase A envelope. Wraps the
+    /// `relon_codegen_llvm::LlvmError` stringified so this crate
+    /// stays decoupled from the LLVM crate's surface.
+    #[error("llvm-aot backend setup failed: {0}")]
+    LlvmAot(String),
     /// Builder requested a feature the selected backend cannot
     /// honour. Today the canonical cause is host-native-fn
     /// registration under [`Backend::CraneliftAot`] /
@@ -702,6 +720,20 @@ pub fn new_evaluator(
                 .map_err(|e| BackendError::Bytecode(e.to_string()))?;
             Ok(Box::new(ev))
         }
+        // Phase A LLVM-AOT: from_source through
+        // `lower_workspace_single` produces buffer-protocol IR which
+        // the Phase A emitter rejects. Surface a clear "not yet"
+        // message so the host knows to either drop back to
+        // `Backend::CraneliftAot` or wait for Phase B; the LLVM
+        // crate's `from_ir_direct` path is reachable for the
+        // bootstrap test alone.
+        Backend::LlvmAot => Err(BackendError::LlvmAot(
+            "Phase A bootstrap: `from_source` not wired yet — \
+             use `Backend::CraneliftAot` for source-driven AOT or \
+             construct an `LlvmAotEvaluator::from_ir_direct` against \
+             a pre-lowered IR module for the bootstrap envelope"
+                .to_string(),
+        )),
     }
 }
 

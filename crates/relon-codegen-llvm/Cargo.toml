@@ -1,0 +1,46 @@
+[package]
+name = "relon-codegen-llvm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "LLVM-backed AOT evaluator for Relon (Phase A bootstrap)"
+keywords = ["relon", "llvm", "codegen", "compiler", "aot"]
+categories = ["compilers"]
+
+# Phase A bootstrap: keep the dep surface narrow on purpose. We mirror
+# the IR shape `relon-codegen-native` consumes so a side-by-side
+# comparison of the two AOT backends shares the same IR contract.
+# Schema layout / sandbox vtable / object cache wiring stay in the
+# cranelift crate for now — they'll move down once Phase B widens the
+# LLVM emitter past the legacy-i64 envelope.
+[dependencies]
+# IR input
+relon-ir = { workspace = true }
+# Trait Evaluator + shared value types + RuntimeError surface
+relon-eval-api = { workspace = true }
+# Source positions for diagnostics
+relon-parser = { workspace = true }
+# `from_source` runs the per-file analyzer before lowering so the
+# codegen path matches what the tree-walker does. Mirrors how
+# `relon-codegen-native` wires the analyzer at its `from_source` site.
+relon-analyzer = { workspace = true }
+
+thiserror = { workspace = true }
+
+# Phase A.1 decision: inkwell 0.9.0 with `llvm18-1` feature.
+# - llvm-sys 181.3.0 pulled in transitively; pinned by inkwell's
+#   feature flag so the workspace lock stays deterministic.
+# - Matches the system-installed LLVM 18.1.3 (`/usr/lib/llvm-18`).
+# - `default-features = false` drops the `target-all` umbrella (all
+#   18 architectures) so cold builds don't link every backend; we
+#   reinstate just the host x86 backend below.
+inkwell = { version = "=0.9.0", default-features = false, features = ["llvm18-1", "target-x86"] }
+
+[dev-dependencies]
+# Phase A.4 perf smoke needs a side-by-side cranelift evaluator built
+# from the same hand-built IR fixture. The dep is dev-only so the
+# crate's production build does not pull in the cranelift backend.
+relon-codegen-native = { workspace = true }
