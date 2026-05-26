@@ -39,7 +39,7 @@ use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
 use relon_parser::Node;
 
 use crate::emitter::{
-    emit_fast_entry, emit_function, is_buffer_protocol_signature, EntryShape, FastPathProfile,
+    emit_fast_entry, emit_module_funcs, is_buffer_protocol_signature, EntryShape, FastPathProfile,
     ENTRY_SYMBOL, ENTRY_SYMBOL_FAST,
 };
 use crate::error::LlvmError;
@@ -302,8 +302,32 @@ impl LlvmAotEvaluator {
             .as_ref()
             .map(|s| s.return_layout.root_size as u32)
             .unwrap_or(0);
-        let (_llvm_fn, entry_shape) =
-            emit_function(ctx_static, &module, entry, buffer_return_size)?;
+        // Phase E.2: collect every IR sibling function (non-entry)
+        // so the LLVM emit pass can lower them alongside the entry.
+        // The entry's `Op::Call` lowering resolves user-defined
+        // sibling calls through the returned helper table.
+        let helpers: Vec<&relon_ir::ir::Func> = ir
+            .funcs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != entry_idx)
+            .map(|(_, f)| f)
+            .collect();
+        let helper_ir_indices: Vec<u32> = ir
+            .funcs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != entry_idx)
+            .map(|(i, _)| i as u32)
+            .collect();
+        let (_llvm_fn, entry_shape, _helper_table) = emit_module_funcs(
+            ctx_static,
+            &module,
+            entry,
+            buffer_return_size,
+            &helpers,
+            Some(&helper_ir_indices),
+        )?;
 
         // Phase D.1: attempt to emit the typed fast-path entry
         // alongside the buffer entry whenever the schema qualifies.

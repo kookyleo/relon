@@ -50,11 +50,15 @@
 //! lets us drop unconsumed stack slots silently — LLVM's verifier
 //! catches missing terminators if we forget to seal a block.
 
+use std::collections::HashMap;
+
 use inkwell::builder::Builder;
 use inkwell::context::Context;
-use inkwell::module::Module as LlvmModule;
-use inkwell::types::BasicMetadataTypeEnum;
-use inkwell::values::{BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue};
+use inkwell::module::{Linkage, Module as LlvmModule};
+use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum};
+use inkwell::values::{
+    BasicMetadataValueEnum, BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue,
+};
 use inkwell::{AddressSpace, IntPredicate};
 
 use relon_ir::ir::{Func, IrType, Op, TaggedOp};
@@ -133,28 +137,228 @@ pub(crate) fn is_buffer_protocol_signature(params: &[IrType], ret: IrType) -> bo
     ) && matches!(ret, IrType::I32)
 }
 
-/// Emit the entry function for `func` into `module`. The shape is
-/// chosen automatically by inspecting `func.params` / `func.ret`.
-/// Returns the resulting LLVM `FunctionValue` so the JIT layer can
-/// resolve it through `ExecutionEngine::get_function_address`.
+/// Phase E.2 multi-function emit: lower every reachable IR function
+/// into LLVM. The entry function `entry` is emitted under either the
+/// legacy-i64 or buffer-protocol shape; each entry in `helpers` is
+/// emitted as a sibling helper function with a plain typed
+/// `(params...) -> ret` signature so the entry's `Op::Call` lowering
+/// can route to it through a direct LLVM `call` instruction.
 ///
-/// `buffer_return_size` is the schema's `return_layout.root_size`
-/// — used as the i32 `bytes_written` the buffer-protocol entry
-/// returns from `Op::Return`. The legacy-i64 path ignores this
-/// value.
-pub(crate) fn emit_function<'ctx>(
+/// `helper_ir_indices` parallels `helpers`: entry `i` carries the
+/// IR-side `funcs` index for the matching helper. Used by the
+/// `Op::Call` lowering to resolve `fn_index - stdlib_count` back to the
+/// matching `FunctionValue`.
+///
+/// Returns the entry `FunctionValue`, the detected entry shape, and the
+/// helper lookup table the `Emit` driver hands off to the per-function
+/// lowering so sibling calls can find their callee.
+pub(crate) fn emit_module_funcs<'ctx>(
+    ctx: &'ctx Context,
+    module: &LlvmModule<'ctx>,
+    entry: &Func,
+    buffer_return_size: u32,
+    helpers: &[&Func],
+    helper_ir_indices: Option<&[u32]>,
+) -> Result<
+    (
+        FunctionValue<'ctx>,
+        EntryShape,
+        HashMap<u32, FunctionValue<'ctx>>,
+    ),
+    LlvmError,
+> {
+    // Step 0: declare module-level intrinsics. `llvm.trap` is shared
+    // by every Div / Mod sandbox guard so a single declaration covers
+    // every per-op guard across every emitted function.
+    declare_llvm_trap(ctx, module);
+
+    // Step 1: declare every helper up-front so the entry / sibling
+    // bodies can resolve forward references (mutual recursion, the
+    // `fib(n - 1) + fib(n - 2)` self-call). LLVM is happy to issue
+    // `call @foo` against a declared-only function; the body is
+    // attached on the second pass.
+    let mut helper_table: HashMap<u32, FunctionValue<'ctx>> = HashMap::new();
+    if let Some(ir_indices) = helper_ir_indices {
+        if ir_indices.len() != helpers.len() {
+            return Err(LlvmError::Codegen(format!(
+                "emit_module_funcs: helpers.len()={} but helper_ir_indices.len()={}",
+                helpers.len(),
+                ir_indices.len()
+            )));
+        }
+    }
+    for (i, helper) in helpers.iter().enumerate() {
+        let fv = declare_helper_function(ctx, module, helper, i)?;
+        let ir_idx = helper_ir_indices.map(|v| v[i]).unwrap_or(i as u32);
+        helper_table.insert(ir_idx, fv);
+    }
+
+    // Step 2: emit the entry function body.
+    let (entry_fn, shape) = if is_buffer_protocol_signature(&entry.params, entry.ret) {
+        let fv =
+            emit_buffer_entry_with_helpers(ctx, module, entry, buffer_return_size, &helper_table)?;
+        (fv, EntryShape::Buffer)
+    } else {
+        let fv = emit_legacy_entry_with_helpers(ctx, module, entry, &helper_table)?;
+        (fv, EntryShape::LegacyI64)
+    };
+
+    // Step 3: emit each helper body now that every callee is declared.
+    for helper in helpers.iter() {
+        let helper_fn = helper_table
+            .values()
+            .find(|fv| {
+                // Locate the FunctionValue by name; cheap enough — the
+                // helper table is tiny and the find runs once per
+                // helper.
+                let expected = format!("relon_helper_{}", helper.name);
+                fv.get_name().to_string_lossy() == expected
+            })
+            .copied()
+            .ok_or_else(|| {
+                LlvmError::Codegen(format!(
+                    "emit_module_funcs: helper `{}` declared but FunctionValue missing",
+                    helper.name
+                ))
+            })?;
+        emit_helper_body(ctx, module, helper, helper_fn, &helper_table)?;
+    }
+
+    Ok((entry_fn, shape, helper_table))
+}
+
+/// Declare a sibling helper function's LLVM signature without emitting
+/// its body. Used to seat every helper into the module so the entry's
+/// `Op::Call` lowering can resolve forward references (recursion,
+/// mutual recursion). Sibling helpers use a plain typed
+/// `(params...) -> ret` shape — no `*state` pointer, no buffer
+/// protocol; the test harness drives recursive Int-only functions
+/// directly. When the IR layer grows first-class closure values
+/// (Phase F), this signature widens to carry `(*state, captures, ...)`.
+fn declare_helper_function<'ctx>(
     ctx: &'ctx Context,
     module: &LlvmModule<'ctx>,
     func: &Func,
-    buffer_return_size: u32,
-) -> Result<(FunctionValue<'ctx>, EntryShape), LlvmError> {
-    if is_buffer_protocol_signature(&func.params, func.ret) {
-        let fv = emit_buffer_entry(ctx, module, func, buffer_return_size)?;
-        Ok((fv, EntryShape::Buffer))
-    } else {
-        let fv = emit_legacy_entry(ctx, module, func)?;
-        Ok((fv, EntryShape::LegacyI64))
+    slot: usize,
+) -> Result<FunctionValue<'ctx>, LlvmError> {
+    let mut param_types: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::with_capacity(func.params.len());
+    for (i, p) in func.params.iter().enumerate() {
+        let bt = ir_ty_to_llvm_basic(ctx, *p).ok_or_else(|| {
+            LlvmError::UnsupportedSignature(format!(
+                "llvm-aot: helper `{}` param #{i} type {p:?} unsupported",
+                func.name
+            ))
+        })?;
+        param_types.push(basic_to_metadata(bt));
     }
+    let ret_bt = ir_ty_to_llvm_basic(ctx, func.ret).ok_or_else(|| {
+        LlvmError::UnsupportedSignature(format!(
+            "llvm-aot: helper `{}` return type {:?} unsupported",
+            func.name, func.ret
+        ))
+    })?;
+    let fn_type = match ret_bt {
+        BasicTypeEnum::IntType(t) => t.fn_type(&param_types, false),
+        BasicTypeEnum::FloatType(t) => t.fn_type(&param_types, false),
+        BasicTypeEnum::PointerType(t) => t.fn_type(&param_types, false),
+        other => {
+            return Err(LlvmError::Codegen(format!(
+                "llvm-aot: helper `{}` ret BasicType {other:?} unsupported",
+                func.name
+            )));
+        }
+    };
+    // Use a deterministic LLVM symbol so the entry's call site can be
+    // pretty-printed in the IR dump. The slot keeps multiple helpers
+    // with the same source name (shouldn't happen, but cheap) from
+    // colliding.
+    let _ = slot;
+    let llvm_name = format!("relon_helper_{}", func.name);
+    let fv = module.add_function(&llvm_name, fn_type, Some(Linkage::Internal));
+    Ok(fv)
+}
+
+/// Phase E.2: declare the `llvm.trap` intrinsic on `module` if it is
+/// not already present. The intrinsic has signature `void @llvm.trap()`
+/// — calling it raises a target-specific trap (a `ud2` on x86-64) that
+/// the host's `panic` handler can catch when paired with an
+/// `unreachable`. Cheap to call on every emit pass; we keep the lookup
+/// idempotent so test fixtures that re-enter the emitter don't end up
+/// with duplicate declarations.
+fn declare_llvm_trap<'ctx>(ctx: &'ctx Context, module: &LlvmModule<'ctx>) -> FunctionValue<'ctx> {
+    if let Some(f) = module.get_function("llvm.trap") {
+        return f;
+    }
+    let void_t = ctx.void_type();
+    let fn_ty = void_t.fn_type(&[], false);
+    module.add_function("llvm.trap", fn_ty, None)
+}
+
+fn ir_ty_to_llvm_basic<'ctx>(ctx: &'ctx Context, ty: IrType) -> Option<BasicTypeEnum<'ctx>> {
+    match ty {
+        IrType::I64 => Some(ctx.i64_type().into()),
+        IrType::I32 | IrType::Bool | IrType::Null => Some(ctx.i32_type().into()),
+        IrType::F64 => Some(ctx.f64_type().into()),
+        // Pointer-indirect leaves carry an i32 buffer-relative offset
+        // (matches the cranelift `ir_ty_to_cl` widening). The IR-side
+        // tag is preserved; the LLVM slot is plain i32.
+        IrType::String
+        | IrType::ListInt
+        | IrType::ListFloat
+        | IrType::ListBool
+        | IrType::ListString
+        | IrType::ListSchema
+        | IrType::Closure => Some(ctx.i32_type().into()),
+    }
+}
+
+fn basic_to_metadata(bt: BasicTypeEnum<'_>) -> BasicMetadataTypeEnum<'_> {
+    match bt {
+        BasicTypeEnum::IntType(t) => t.into(),
+        BasicTypeEnum::FloatType(t) => t.into(),
+        BasicTypeEnum::PointerType(t) => t.into(),
+        BasicTypeEnum::ArrayType(t) => t.into(),
+        BasicTypeEnum::StructType(t) => t.into(),
+        BasicTypeEnum::VectorType(t) => t.into(),
+        BasicTypeEnum::ScalableVectorType(t) => t.into(),
+    }
+}
+
+/// Lower a sibling helper's body against its declared LLVM
+/// `FunctionValue`. Mirrors [`emit_legacy_entry`] but without enforcing
+/// the legacy-i64 envelope — helpers may carry any
+/// [`IrType`]-shaped param / return mix that `ir_ty_to_llvm_basic`
+/// accepts.
+fn emit_helper_body<'ctx>(
+    ctx: &'ctx Context,
+    module: &LlvmModule<'ctx>,
+    func: &Func,
+    llvm_fn: FunctionValue<'ctx>,
+    helper_table: &HashMap<u32, FunctionValue<'ctx>>,
+) -> Result<(), LlvmError> {
+    let entry_bb = ctx.append_basic_block(llvm_fn, "entry");
+    let builder = ctx.create_builder();
+    builder.position_at_end(entry_bb);
+
+    let mut emit = Emit::new(
+        ctx,
+        &builder,
+        llvm_fn,
+        EntryShape::LegacyI64,
+        None,
+        /*buffer_return_size=*/ 0,
+    );
+    // Helper functions have no implicit state slot; `LocalGet(0)` maps
+    // straight to LLVM param 0.
+    emit.param_base = 0;
+    emit.helper_table = Some(helper_table.clone());
+    // Record the IR-declared return type so `Op::Return` knows what to
+    // widen / truncate to when the operand stack value's width differs
+    // from the LLVM signature's return slot.
+    emit.helper_ret_ty = Some(func.ret);
+    emit.llvm_trap_fn = Some(declare_llvm_trap(ctx, module));
+    emit.lower_body(&func.body)?;
+    Ok(())
 }
 
 /// Phase D.1: emit a typed `(i64, i64, ...) -> i64` fast entry
@@ -233,6 +437,7 @@ pub(crate) fn emit_fast_entry<'ctx>(
     // because the IR producer only emits LocalGet for the handshake
     // params (which the fast path doesn't pass).
     emit.param_base = 0;
+    emit.llvm_trap_fn = Some(declare_llvm_trap(ctx, module));
     emit.lower_body(&func.body)?;
 
     // The buffer-protocol IR ends with `Op::Return` which the fast
@@ -258,13 +463,23 @@ pub(crate) fn emit_fast_entry<'ctx>(
 // Legacy-i64 entry (Phase A bootstrap envelope, retained for tests)
 // ---------------------------------------------------------------------------
 
-/// Emit a Phase-A `(I64...) -> I64` function. Used by tests + the
-/// Phase A bootstrap benchmarks that exercise the hand-built IR
-/// fixtures directly (no buffer-protocol wrapping).
-fn emit_legacy_entry<'ctx>(
+fn emit_legacy_entry_with_helpers<'ctx>(
     ctx: &'ctx Context,
     module: &LlvmModule<'ctx>,
     func: &Func,
+    helper_table: &HashMap<u32, FunctionValue<'ctx>>,
+) -> Result<FunctionValue<'ctx>, LlvmError> {
+    emit_legacy_entry_impl(ctx, module, func, Some(helper_table))
+}
+
+/// Emit a Phase-A `(I64...) -> I64` function. Used by tests + the
+/// Phase A bootstrap benchmarks that exercise the hand-built IR
+/// fixtures directly (no buffer-protocol wrapping).
+fn emit_legacy_entry_impl<'ctx>(
+    ctx: &'ctx Context,
+    module: &LlvmModule<'ctx>,
+    func: &Func,
+    helper_table: Option<&HashMap<u32, FunctionValue<'ctx>>>,
 ) -> Result<FunctionValue<'ctx>, LlvmError> {
     for (i, p) in func.params.iter().enumerate() {
         if *p != IrType::I64 {
@@ -301,6 +516,10 @@ fn emit_legacy_entry<'ctx>(
     // Param order under the legacy envelope: every IR LocalGet(i)
     // maps to llvm_fn.param(i) — no implicit state slot.
     emit.param_base = 0;
+    if let Some(table) = helper_table {
+        emit.helper_table = Some(table.clone());
+    }
+    emit.llvm_trap_fn = Some(declare_llvm_trap(ctx, module));
     emit.lower_body(&func.body)?;
 
     Ok(llvm_fn)
@@ -310,15 +529,26 @@ fn emit_legacy_entry<'ctx>(
 // Buffer-protocol entry (Phase B production envelope)
 // ---------------------------------------------------------------------------
 
-/// Emit the buffer-protocol entry function. The cranelift backend's
-/// equivalent lives in `relon-codegen-native::codegen::mod.rs` —
-/// signature mirrored here so a host that holds either evaluator
-/// can dispatch through the same `(state, in_ptr, …)` argv shape.
-fn emit_buffer_entry<'ctx>(
+fn emit_buffer_entry_with_helpers<'ctx>(
     ctx: &'ctx Context,
     module: &LlvmModule<'ctx>,
     func: &Func,
     buffer_return_size: u32,
+    helper_table: &HashMap<u32, FunctionValue<'ctx>>,
+) -> Result<FunctionValue<'ctx>, LlvmError> {
+    emit_buffer_entry_impl(ctx, module, func, buffer_return_size, Some(helper_table))
+}
+
+/// Emit the buffer-protocol entry function. The cranelift backend's
+/// equivalent lives in `relon-codegen-native::codegen::mod.rs` —
+/// signature mirrored here so a host that holds either evaluator
+/// can dispatch through the same `(state, in_ptr, …)` argv shape.
+fn emit_buffer_entry_impl<'ctx>(
+    ctx: &'ctx Context,
+    module: &LlvmModule<'ctx>,
+    func: &Func,
+    buffer_return_size: u32,
+    helper_table: Option<&HashMap<u32, FunctionValue<'ctx>>>,
 ) -> Result<FunctionValue<'ctx>, LlvmError> {
     let i32_t = ctx.i32_type();
     let i64_t = ctx.i64_type();
@@ -389,6 +619,10 @@ fn emit_buffer_entry<'ctx>(
     // pointer occupies slot 0 in the LLVM function — IR locals
     // start at +1 from there.
     emit.param_base = 1;
+    if let Some(table) = helper_table {
+        emit.helper_table = Some(table.clone());
+    }
+    emit.llvm_trap_fn = Some(declare_llvm_trap(ctx, module));
     emit.lower_body(&func.body)?;
 
     Ok(llvm_fn)
@@ -448,6 +682,24 @@ struct Emit<'ctx, 'b> {
     /// branches consult this to rewrite the buffer-protocol IR
     /// against the typed `(i64...) -> i64` LLVM signature.
     fast_path: Option<FastEmit<'ctx>>,
+    /// Phase E.2 multi-function lookup: when populated, `Op::Call`
+    /// with `fn_index >= stdlib_function_count()` resolves to the
+    /// matching sibling `FunctionValue` and emits a direct LLVM
+    /// `call`. The map is keyed by IR-side `funcs` index (i.e.
+    /// `fn_index - stdlib_count`). Empty for hand-built fixtures that
+    /// never reference user-defined functions.
+    helper_table: Option<HashMap<u32, FunctionValue<'ctx>>>,
+    /// Phase E.2: when emitting a helper body (not the entry), this
+    /// carries the IR-declared return type so `Op::Return` can pick
+    /// the right LLVM `ret` shape. `None` while lowering the entry
+    /// body — the entry's return shape is dictated by `EntryShape`.
+    helper_ret_ty: Option<IrType>,
+    /// Phase E.2: cached `llvm.trap` intrinsic `FunctionValue`. The
+    /// intrinsic is declared once per module (in
+    /// [`emit_module_funcs`]); each `Emit` snapshots the pointer so
+    /// per-op `Div(I64)` / `Mod(I64)` guards can call it without
+    /// re-querying the module.
+    llvm_trap_fn: Option<FunctionValue<'ctx>>,
 }
 
 /// Phase D.1 fast-path emission state. Carried inside [`Emit`] when
@@ -517,6 +769,9 @@ impl<'ctx, 'b> Emit<'ctx, 'b> {
             name_seq: 0,
             buffer_return_size,
             fast_path: None,
+            helper_table: None,
+            helper_ret_ty: None,
+            llvm_trap_fn: None,
         }
     }
 
@@ -729,6 +984,14 @@ impl<'ctx, 'b> Emit<'ctx, 'b> {
             // ---- return ----
             Op::Return => self.emit_return(&ip_hint)?,
 
+            // ---- multi-function dispatch ----
+            Op::Call {
+                fn_index,
+                arg_count,
+                param_tys,
+                ret_ty,
+            } => self.emit_call(&ip_hint, *fn_index, *arg_count, param_tys, *ret_ty)?,
+
             other => {
                 return Err(LlvmError::Codegen(format!(
                     "unsupported op (Phase B envelope): {other:?} at ip={ip}"
@@ -776,6 +1039,60 @@ impl<'ctx, 'b> Emit<'ctx, 'b> {
             let _ = ip_hint;
             return Ok(());
         }
+        // Phase E.2 helper-body return: when lowering a sibling
+        // function rather than the entry, pop the operand and emit a
+        // typed return matching the helper's declared IR return type.
+        // Widens / truncates the popped i32 / i64 to the declared LLVM
+        // ret slot when the two widths disagree.
+        if let Some(ret_ty) = self.helper_ret_ty {
+            let v = self.pop_int(ip_hint)?;
+            let want_width = match ret_ty {
+                IrType::I64 => 64,
+                IrType::I32
+                | IrType::Bool
+                | IrType::Null
+                | IrType::String
+                | IrType::ListInt
+                | IrType::ListFloat
+                | IrType::ListBool
+                | IrType::ListString
+                | IrType::ListSchema
+                | IrType::Closure => 32,
+                IrType::F64 => {
+                    return Err(LlvmError::Codegen(
+                        "helper Return: F64 not yet supported in Phase E.2".into(),
+                    ));
+                }
+            };
+            let have_width = v.get_type().get_bit_width();
+            let final_v = if have_width == want_width {
+                v
+            } else if have_width < want_width {
+                let target_ty = if want_width == 64 {
+                    self.ctx.i64_type()
+                } else {
+                    self.ctx.i32_type()
+                };
+                self.builder
+                    .build_int_z_extend(v, target_ty, "helper_ret_zext")
+                    .map_err(|e| LlvmError::Codegen(format!("helper Return zext: {e}")))?
+            } else {
+                let target_ty = if want_width == 64 {
+                    self.ctx.i64_type()
+                } else {
+                    self.ctx.i32_type()
+                };
+                self.builder
+                    .build_int_truncate(v, target_ty, "helper_ret_trunc")
+                    .map_err(|e| LlvmError::Codegen(format!("helper Return trunc: {e}")))?
+            };
+            self.builder
+                .build_return(Some(&final_v))
+                .map_err(|e| LlvmError::Codegen(format!("helper Return: {e}")))?;
+            let cont = self.ctx.append_basic_block(self.func, "after_return_cont");
+            self.builder.position_at_end(cont);
+            return Ok(());
+        }
         match self.shape {
             EntryShape::LegacyI64 => {
                 let v = self.pop_int(ip_hint)?;
@@ -800,6 +1117,139 @@ impl<'ctx, 'b> Emit<'ctx, 'b> {
         // the next terminator-emitting op needs to bind it.
         let cont = self.ctx.append_basic_block(self.func, "after_return_cont");
         self.builder.position_at_end(cont);
+        Ok(())
+    }
+
+    /// Phase E.2 multi-function dispatch: lower `Op::Call`.
+    ///
+    /// The IR's `fn_index` is split as `[0..stdlib_count) = bundled
+    /// stdlib body` / `[stdlib_count..) = user-defined sibling`. The
+    /// LLVM emitter currently only routes the sibling slice — stdlib
+    /// inlining stays parked on the cranelift backend. A stdlib call
+    /// surfaces `LlvmError::Codegen` so the host can fall back.
+    fn emit_call(
+        &mut self,
+        ip_hint: &str,
+        fn_index: u32,
+        arg_count: u32,
+        param_tys: &[IrType],
+        ret_ty: IrType,
+    ) -> Result<(), LlvmError> {
+        let stdlib_count = relon_ir::stdlib::stdlib_function_count();
+        if fn_index < stdlib_count {
+            return Err(LlvmError::Codegen(format!(
+                "Op::Call to stdlib fn_index={fn_index} not yet supported in LLVM AOT \
+                 (cranelift inlines bundled stdlib bodies; LLVM path widens with #278)"
+            )));
+        }
+        let helper_idx = fn_index - stdlib_count;
+        let callee = match self.helper_table.as_ref().and_then(|t| t.get(&helper_idx)) {
+            Some(fv) => *fv,
+            None => {
+                return Err(LlvmError::Codegen(format!(
+                    "Op::Call helper_idx={helper_idx} (fn_index={fn_index}, stdlib_count={stdlib_count}) \
+                     not in helper_table — module may be missing the function"
+                )));
+            }
+        };
+
+        // Sanity check arity against the declared signature.
+        if callee.count_params() as usize != param_tys.len() {
+            return Err(LlvmError::Codegen(format!(
+                "Op::Call helper_idx={helper_idx}: callee has {} LLVM params, IR declares {}",
+                callee.count_params(),
+                param_tys.len()
+            )));
+        }
+        if arg_count as usize != param_tys.len() {
+            return Err(LlvmError::Codegen(format!(
+                "Op::Call helper_idx={helper_idx}: arg_count={arg_count} != param_tys.len()={}",
+                param_tys.len()
+            )));
+        }
+
+        // Pop the arguments off the operand stack — last-pushed value
+        // is the last param.
+        let mut args: Vec<BasicMetadataValueEnum<'ctx>> = Vec::with_capacity(arg_count as usize);
+        for _ in 0..arg_count {
+            args.push(self.pop_int(ip_hint)?.into());
+        }
+        args.reverse();
+
+        // Adjust each arg's LLVM type to match the callee's declared
+        // param: widen / truncate i32 <-> i64 as needed. The IR's
+        // stack-machine semantics keep types tagged but the wasm slot
+        // widening can leave a Bool-as-i32 in front of an I64 callee
+        // param. We re-coerce here to match the helper's signature.
+        for (i, (slot, want_ty)) in args.iter_mut().zip(param_tys.iter()).enumerate() {
+            let arg_val = match slot {
+                BasicMetadataValueEnum::IntValue(v) => *v,
+                other => {
+                    return Err(LlvmError::Codegen(format!(
+                        "Op::Call arg #{i}: expected IntValue, got {other:?}"
+                    )));
+                }
+            };
+            let want_width = match *want_ty {
+                IrType::I64 => 64,
+                IrType::I32
+                | IrType::Bool
+                | IrType::Null
+                | IrType::String
+                | IrType::ListInt
+                | IrType::ListFloat
+                | IrType::ListBool
+                | IrType::ListString
+                | IrType::ListSchema
+                | IrType::Closure => 32,
+                IrType::F64 => {
+                    return Err(LlvmError::Codegen(format!(
+                        "Op::Call arg #{i}: F64 param not yet supported in Phase E.2"
+                    )));
+                }
+            };
+            let have_width = arg_val.get_type().get_bit_width();
+            if have_width != want_width {
+                let target_ty = if want_width == 64 {
+                    self.ctx.i64_type()
+                } else {
+                    self.ctx.i32_type()
+                };
+                let coerced = if have_width < want_width {
+                    self.builder
+                        .build_int_z_extend(arg_val, target_ty, "call_arg_zext")
+                        .map_err(|e| LlvmError::Codegen(format!("call arg zext: {e}")))?
+                } else {
+                    self.builder
+                        .build_int_truncate(arg_val, target_ty, "call_arg_trunc")
+                        .map_err(|e| LlvmError::Codegen(format!("call arg trunc: {e}")))?
+                };
+                *slot = coerced.into();
+            }
+        }
+
+        let name = self.next_name("call_ret");
+        let call_site = self
+            .builder
+            .build_call(callee, &args, &name)
+            .map_err(|e| LlvmError::Codegen(format!("Op::Call build_call: {e}")))?;
+        let ret_val = match call_site.try_as_basic_value() {
+            inkwell::values::ValueKind::Basic(v) => v,
+            inkwell::values::ValueKind::Instruction(_) => {
+                return Err(LlvmError::Codegen(format!(
+                    "Op::Call helper_idx={helper_idx}: callee returned void; Phase E.2 envelope expects a typed return"
+                )));
+            }
+        };
+        let ret_int = match ret_val {
+            BasicValueEnum::IntValue(v) => v,
+            other => {
+                return Err(LlvmError::Codegen(format!(
+                    "Op::Call helper_idx={helper_idx}: callee returned {other:?}, expected IntValue"
+                )));
+            }
+        };
+        self.push(ret_int, ret_ty);
         Ok(())
     }
 
@@ -844,6 +1294,40 @@ impl<'ctx, 'b> Emit<'ctx, 'b> {
     fn emit_binop(&mut self, ip_hint: &str, ty: IrType, op: BinOp) -> Result<(), LlvmError> {
         let b = self.pop_int(ip_hint)?;
         let a = self.pop_int(ip_hint)?;
+
+        // Phase E.2 sandbox parity: guard Div / Mod against a zero RHS
+        // so the JIT raises a deterministic trap instead of leaving
+        // LLVM's `sdiv` / `srem` to invoke UB (which on x86 surfaces
+        // as a host-level SIGFPE that the host can't catch on stable
+        // Rust). Emit an `if rhs == 0 { llvm.trap; unreachable } else
+        // { ... }` skeleton and continue the division in the `else`
+        // arm. The `unreachable` after `llvm.trap` is what tells LLVM
+        // the trap path doesn't fall through.
+        if matches!(op, BinOp::Div | BinOp::Mod) {
+            let zero = b.get_type().const_zero();
+            let cmp_name = self.next_name("divz_cmp");
+            let is_zero = self
+                .builder
+                .build_int_compare(IntPredicate::EQ, b, zero, &cmp_name)
+                .map_err(|e| LlvmError::Codegen(format!("{} divz cmp: {e}", op.name())))?;
+            let trap_bb = self.ctx.append_basic_block(self.func, "div_by_zero_trap");
+            let cont_bb = self.ctx.append_basic_block(self.func, "div_by_zero_ok");
+            self.builder
+                .build_conditional_branch(is_zero, trap_bb, cont_bb)
+                .map_err(|e| LlvmError::Codegen(format!("{} divz branch: {e}", op.name())))?;
+            // Trap block: call `llvm.trap` then `unreachable`. The
+            // intrinsic is declared lazily; subsequent emits reuse the
+            // declaration so the module ends up with at most one
+            // `@llvm.trap` symbol regardless of how many guards fire.
+            self.builder.position_at_end(trap_bb);
+            self.emit_llvm_trap_call(op.name())?;
+            self.builder
+                .build_unreachable()
+                .map_err(|e| LlvmError::Codegen(format!("{} divz unreachable: {e}", op.name())))?;
+            // Continue normal codegen in the "ok" block.
+            self.builder.position_at_end(cont_bb);
+        }
+
         let name = self.next_name(op.name());
         let r = match op {
             BinOp::Add => self.builder.build_int_add(a, b, &name),
@@ -855,6 +1339,25 @@ impl<'ctx, 'b> Emit<'ctx, 'b> {
         }
         .map_err(|e| LlvmError::Codegen(format!("{} build failed: {e}", op.name())))?;
         self.push(r, ty);
+        Ok(())
+    }
+
+    /// Phase E.2: emit a call to the `llvm.trap` intrinsic. The
+    /// intrinsic must be pre-declared on the module via
+    /// [`declare_llvm_trap`] before the first guard fires; the
+    /// declaration is cached on the `Emit` so repeated div / mod
+    /// guards share one `FunctionValue`. The `op_hint` is used only
+    /// for diagnostic naming on the build_call site.
+    fn emit_llvm_trap_call(&mut self, op_hint: &str) -> Result<(), LlvmError> {
+        let trap_fn = self.llvm_trap_fn.ok_or_else(|| {
+            LlvmError::Codegen(format!(
+                "{op_hint}: llvm.trap intrinsic missing — emit_module_funcs forgot to declare it"
+            ))
+        })?;
+        let name = self.next_name("trap_call");
+        self.builder
+            .build_call(trap_fn, &[], &name)
+            .map_err(|e| LlvmError::Codegen(format!("{op_hint} llvm.trap build_call: {e}")))?;
         Ok(())
     }
 
