@@ -26,7 +26,7 @@ use relon_eval_api::{
     CapabilityGate, ClosureData, Evaluator, RuntimeError, Scope, SmolStr, Thunk, Value,
 };
 use relon_ir::ir::Module as IrModule;
-use relon_ir::IrType;
+use relon_ir::{IrType, TaggedOp};
 use relon_parser::{Node, TokenRange};
 use thiserror::Error;
 
@@ -66,6 +66,40 @@ pub enum BytecodeError {
         /// Human-readable description of the mismatch.
         reason: String,
     },
+}
+
+/// PC-alignment follow-up #3: bundle of IR data a host needs to drive
+/// the trace recorder against the **same** IR the bytecode compile
+/// pass consumed.
+///
+/// Returned by [`BytecodeEvaluator::recording_registration_data`].
+/// The `relon-codegen-native` crate translates this into its own
+/// `RecordingRegistration` shape (which the recorder dispatcher
+/// consumes); both views carry the same two fields, but the
+/// translation lives at the boundary so the bytecode crate stays
+/// dependency-free from cranelift.
+///
+/// ## Field semantics
+///
+/// - `body`: the entry function's `Vec<TaggedOp>`, exactly the slice
+///   the bytecode compiler called `compile_seq` against. Walking it
+///   through the recorder produces the same per-op `external_pc`
+///   increments the bytecode's `ir_pc_map` carries — guards stamped
+///   on `external_pc = N` then resume into bytecode index `N - 1`
+///   (the IR PC counter is 1-based; entry slot 0 is reserved).
+/// - `param_tys`: declared parameter types in declaration order.
+///   The recorder driver combines these with the bytecode VM's
+///   per-call packed-`u64` argument slots to seed the walker's
+///   `(value, IrType)` env before stepping the body.
+#[derive(Debug, Clone)]
+pub struct RecordingRegistrationData {
+    /// IR op stream the recorder must walk to keep its `external_pc`
+    /// in lock-step with the bytecode's `ir_pc_map`.
+    pub body: Vec<TaggedOp>,
+    /// Parameter IR types in declaration order — the recorder pairs
+    /// each with the matching slot from the bytecode VM's packed
+    /// `[u64]` arg array.
+    pub param_tys: Vec<IrType>,
 }
 
 /// Bytecode VM evaluator. Built from a Relon source string via
@@ -114,6 +148,29 @@ pub struct BytecodeEvaluator {
     /// field so the typed-i64 fast path can validate caller arity
     /// against a single field read.
     cached_param_count: usize,
+    /// PC-alignment follow-up #3: clone of the entry function's IR
+    /// `body` op stream, retained so the trace recorder can walk the
+    /// **same** IR the bytecode compile pass consumed.
+    ///
+    /// Why this lives on the evaluator: the recorder's `external_pc`
+    /// monotone counter is bumped once per `record_op` call; the
+    /// bytecode compiler's `ir_pc_next` is bumped once per
+    /// `compile_one` call. Both visit the same IR `Op` per increment,
+    /// so feeding the recorder a **different** body (e.g. a hand-built
+    /// fixture) makes the two counters diverge — the guard's
+    /// `external_pc` then routes resume to a bytecode index whose
+    /// operand-stack recipe expects a different type lane than the
+    /// snapshot's `ssa_slots_copy` carries (e.g. `String`-handle stack
+    /// vs `i64` SSA values for an integer-overflow trace shape).
+    ///
+    /// Hosts that orchestrate the recorder registration externally
+    /// (`relon_codegen_native::register_recording`) read this slot via
+    /// [`Self::recording_registration_data`] to keep the recorder body
+    /// and the bytecode body in lock-step. Empty when the evaluator
+    /// was built from a synthetic IR fixture that didn't surface its
+    /// body — the legacy `from_ir_legacy` path still populates the
+    /// slot, so the production path stays fully aligned.
+    entry_body: Vec<TaggedOp>,
 }
 
 /// M2-C lever 5: pre-computed return-shape classification used by the
@@ -245,6 +302,11 @@ impl BytecodeEvaluator {
         let func = &module.funcs[entry_idx];
         let entry_range = func.range;
         let param_tys = func.params.clone();
+        // PC-alignment follow-up #3: clone the body so the recorder
+        // registration path can walk the same IR the compile pass
+        // sees. See `entry_body` field docs for the alignment
+        // invariant.
+        let entry_body = func.body.clone();
         // Seed the input-offset map with one entry per declared param
         // so `compile_function`'s let-local base resolves past the
         // arg slots. The offset key is synthetic — the legacy IR
@@ -265,6 +327,7 @@ impl BytecodeEvaluator {
             return_shape: ReturnShape::LegacyI64,
             cached_return_field_count: 0,
             cached_param_count,
+            entry_body,
         })
     }
 
@@ -280,6 +343,11 @@ impl BytecodeEvaluator {
         let entry_idx = module.entry_func_index.ok_or(BytecodeError::NoEntry)?;
         let func = &module.funcs[entry_idx];
         let entry_range = func.range;
+        // PC-alignment follow-up #3: clone the body so the recorder
+        // registration path can walk the same IR the compile pass
+        // sees. See `entry_body` field docs for the alignment
+        // invariant.
+        let entry_body = func.body.clone();
         // v6-δ M2-B: thread the full `funcs` slice through so the
         // bytecode compile pass can inline simple callees
         // (`Op::Call`) the M2-A scaffold rejected.
@@ -301,6 +369,7 @@ impl BytecodeEvaluator {
             return_shape,
             cached_return_field_count,
             cached_param_count,
+            entry_body,
         })
     }
 
@@ -308,6 +377,37 @@ impl BytecodeEvaluator {
     /// harness to inspect the `ir_pc_map` invariants.
     pub fn function(&self) -> &BcFunction {
         &self.func
+    }
+
+    /// PC-alignment follow-up #3: surface the entry function's IR body
+    /// and declared parameter types so a host can drive the trace
+    /// recorder against the **same** IR the bytecode compile pass
+    /// consumed.
+    ///
+    /// Returns a [`RecordingRegistrationData`] view that the
+    /// `relon-codegen-native` crate consumes via its
+    /// `register_recording` API. Cloning the body is the slow path
+    /// — the host only registers once per `fn_id`, so the per-clone
+    /// cost is amortised across every subsequent trace invocation.
+    ///
+    /// ## Why bytecode hosts need this
+    ///
+    /// Without this accessor, hosts have to hand-roll the IR body
+    /// the recorder walks, which is almost always a different shape
+    /// than the bytecode-compiled body. The two PC counters then
+    /// diverge: a guard's `external_pc` routes resume to a bytecode
+    /// index whose operand-stack recipe expects a different value
+    /// lane than the snapshot carries (e.g. `String`-handle stack
+    /// vs `i64` SSA values for an integer-overflow trace shape).
+    ///
+    /// Tests that exercise the dispatcher / deopt path with string-
+    /// shape sources go through this accessor so the trace records
+    /// against the production-lowered IR and PC alignment holds.
+    pub fn recording_registration_data(&self) -> RecordingRegistrationData {
+        RecordingRegistrationData {
+            body: self.entry_body.clone(),
+            param_tys: self.param_tys.clone(),
+        }
     }
 
     /// Override the default VM config (max_steps / deadline / cap
@@ -1234,7 +1334,24 @@ impl BytecodeEvaluator {
         if let Some(err) = outcome.error {
             return Err(err.into_runtime_error(self.entry_range));
         }
-        Ok((self.unpack_return_slots(&outcome.final_locals), metrics))
+        // PC-alignment follow-up #3: route the unpack through the
+        // string-aware variant so `SingleScalarString` return shapes
+        // pick up their `final_strings` payload. The pre-fix variant
+        // called `unpack_return_slots` (which substitutes an empty
+        // `final_strings` map), so any string-shape deopt resume that
+        // reached the `Return` op produced an empty string regardless
+        // of the actual VM output. The legacy / non-string return
+        // shapes (`LegacyI64` / scalar-Int / scalar-Bool / …) ignore
+        // the `final_strings` map, so this is a strict generalisation
+        // without behaviour change for the integer benchmark fixtures.
+        Ok((
+            self.unpack_return_slots_with_strings(
+                &outcome.final_locals,
+                &outcome.final_strings,
+                outcome.value,
+            ),
+            metrics,
+        ))
     }
 
     /// Companion to [`Self::resume_from_snapshot_with_metrics`] that
@@ -1255,8 +1372,16 @@ impl BytecodeEvaluator {
                 if outcome.error.is_some() {
                     Ok((None, metrics))
                 } else {
+                    // PC-alignment follow-up #3: mirror the string-aware
+                    // unpack from `resume_from_snapshot_with_metrics` so
+                    // string-shape return slots picked up by the VM
+                    // make it back through the metrics-only entry too.
                     Ok((
-                        Some(self.unpack_return_slots(&outcome.final_locals)),
+                        Some(self.unpack_return_slots_with_strings(
+                            &outcome.final_locals,
+                            &outcome.final_strings,
+                            outcome.value,
+                        )),
                         metrics,
                     ))
                 }
@@ -1274,16 +1399,27 @@ impl BytecodeEvaluator {
             .func
             .bc_index_for_pc(snapshot.external_pc as ExternalPc)
             .unwrap_or(0);
-        // Pack args best-effort: the metrics-only variant supplies an
-        // empty map and we tolerate `MissingMainArg` by falling back
-        // to a zeroed `packed` vector (the trap is what we're after
-        // anyway, not the value). The full-resume variant goes
-        // through `pack_args` strictly.
-        let packed = match self.pack_args(args) {
+        // PC-alignment follow-up #3: pack via the string-aware path so
+        // `String`-typed arg slots receive their arena handle when the
+        // VM prologue runs. The pre-fix variant called `pack_args`,
+        // which planted a `0` placeholder into every `String` slot —
+        // downstream `BcOp::StrConcat` / `StrContains` / `StrSubstring`
+        // would then resolve handle `0` and either crash or return
+        // garbage. The string-aware path mirrors what `run_main` and
+        // `resume_from_pc` already do, so all three entry points read
+        // the same string handles. Metrics-only callers with no args
+        // still fall back to a zeroed packed vec — the trap is what
+        // they're after, not the resolved value.
+        let (packed, string_args) = match self.pack_args_with_strings(args) {
             Ok(p) => p,
-            Err(_) if args.is_empty() => vec![0u64; self.param_names.len()],
+            Err(_) if args.is_empty() => (vec![0u64; self.param_names.len()], Vec::new()),
             Err(e) => return Err(e),
         };
+        let string_arg_refs: Vec<(usize, &str)> = string_args
+            .iter()
+            .map(|(slot, payload)| (*slot, payload.as_str()))
+            .collect();
+        let string_return_slots = self.string_return_slots();
         let initial_stack = if start_bc_idx == 0 {
             Vec::new()
         } else {
@@ -1295,13 +1431,15 @@ impl BytecodeEvaluator {
             )
         };
         let vm = BytecodeVm::new(self.default_config.clone());
-        let outcome = vm.invoke_from_with_stack(
+        let outcome = vm.invoke_from_with_string_io(
             &self.func,
             &packed,
             start_bc_idx,
             &snapshot.ssa_slots_copy,
             self.cached_return_slot_count(),
             &initial_stack,
+            &string_arg_refs,
+            &string_return_slots,
         );
         let metrics = ResumeMetrics {
             steps: outcome.steps,

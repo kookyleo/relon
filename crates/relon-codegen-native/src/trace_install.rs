@@ -1389,6 +1389,25 @@ pub struct RecordingRegistration {
     pub param_tys: Vec<IrType>,
 }
 
+impl From<relon_bytecode::RecordingRegistrationData> for RecordingRegistration {
+    /// PC-alignment follow-up #3: bridge the bytecode evaluator's
+    /// IR-body view into the native registration shape so hosts that
+    /// drive a `BytecodeEvaluator` can register the recorder against
+    /// the **same** IR the bytecode compile pass walked.
+    ///
+    /// The bytecode crate is dependency-free from cranelift, so it
+    /// returns a parallel [`relon_bytecode::RecordingRegistrationData`]
+    /// shape rather than reach into this crate. The conversion is a
+    /// zero-cost field move; both shapes carry the same two
+    /// `(body, param_tys)` slots.
+    fn from(data: relon_bytecode::RecordingRegistrationData) -> Self {
+        Self {
+            body: data.body,
+            param_tys: data.param_tys,
+        }
+    }
+}
+
 thread_local! {
     /// Per-thread map `fn_id -> RecordingRegistration`. The
     /// cranelift evaluator installs an entry before calling its JIT

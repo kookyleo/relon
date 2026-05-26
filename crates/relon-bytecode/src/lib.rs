@@ -99,7 +99,7 @@ pub use arena::{
     ArenaError, ClosureArena, ClosureSlot, DictArena, Handle, ListArena, StringArena, VmMemory,
 };
 pub use compile::{compile_function, BcCompileError};
-pub use evaluator::{BytecodeError, BytecodeEvaluator, ResumeMetrics};
+pub use evaluator::{BytecodeError, BytecodeEvaluator, RecordingRegistrationData, ResumeMetrics};
 pub use hot_counter::{
     peek_hot, record_hot, reset_hot, reset_hot_all, HotCounter, HotCounterResult, HotTraceTrigger,
     HotTraceTriggerHandle, COUNTER_SATURATED, DEFAULT_HOT_THRESHOLD,
