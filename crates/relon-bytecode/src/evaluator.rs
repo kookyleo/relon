@@ -213,7 +213,27 @@ impl BytecodeEvaluator {
     pub fn from_source(src: &str) -> Result<Self, BytecodeError> {
         let ast =
             relon_parser::parse_document(src).map_err(|e| BytecodeError::Parse(e.to_string()))?;
-        let analyzed = relon_analyzer::analyze(&ast);
+        // Open follow-up #2: run the analyzer with `strict_mode: false`
+        // so the v1.5 / v1.6 type-surface bans (`ClosureParamTypeMissing`,
+        // `ClosureReturnTypeUnknown`, `ExpressionTypeUnknown`, untyped
+        // list element warnings, etc.) don't bail the bytecode build
+        // for sources the tree-walker accepts. The bans surface real
+        // user-facing diagnostics through the tree-walker entry point;
+        // bytecode is the deopt landing pad for trace_jit and an
+        // internal lowering tier, not a separate user-facing linter.
+        //
+        // Structural / lowering-relevant diagnostics (`UnknownTypeName`,
+        // `MainReturnTypeMismatch`, `FnCallArgTypeMismatch`, ...) still
+        // surface as errors under non-strict mode and still gate the
+        // build; this relaxation only drops the strict-mode-only soft
+        // checks that the tree-walker also tolerates.
+        let analyzed = relon_analyzer::analyze_with_options(
+            &ast,
+            &relon_analyzer::AnalyzeOptions {
+                strict_mode: false,
+                ..Default::default()
+            },
+        );
         if analyzed.has_errors() {
             let err_count = analyzed
                 .diagnostics
