@@ -52,9 +52,9 @@ pub use projector::{JsonProjector, Projector};
 // without a second crate dep. Mirrors the `JitEvaluator` re-export
 // above — the two together are the v1 of the naming-alignment split
 // (see `crates/relon/src/jit.rs` top-comment and the design note).
+pub use relon_analyzer;
 #[cfg(feature = "cranelift-aot")]
 pub use relon_codegen_native::AotEvaluator;
-pub use relon_analyzer;
 // Curated runtime surface. The wildcard re-exports of
 // `relon_evaluator` / `relon_eval_api` / `relon_parser` were dropped
 // in v0.2 — hosts that need a concrete `TreeWalkEvaluator` /

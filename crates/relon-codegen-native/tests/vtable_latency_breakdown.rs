@@ -20,8 +20,8 @@ fn cached_cold_start_phase_breakdown_prints() {
     let src = "#main(Int x, Int y) -> Int\nx + y";
 
     // Pre-warm. Not timed.
-    let warm = AotEvaluator::from_source_with_cache(src, cache.path())
-        .expect("from_source_with_cache");
+    let warm =
+        AotEvaluator::from_source_with_cache(src, cache.path()).expect("from_source_with_cache");
     drop(warm);
 
     // Phase 1: cache integrity validation. Reads ELF bytes + IR

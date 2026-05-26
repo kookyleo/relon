@@ -81,6 +81,7 @@ fn bytecode_hot_loop_drives_trace_install() {
         RecordingRegistration {
             body: build_add_body(),
             param_tys: vec![IrType::I32, IrType::I32],
+            ..Default::default()
         },
     );
 
@@ -166,6 +167,7 @@ fn bytecode_hot_loop_subsequent_invocations_skip_trigger() {
         RecordingRegistration {
             body: build_add_body(),
             param_tys: vec![IrType::I32, IrType::I32],
+            ..Default::default()
         },
     );
 

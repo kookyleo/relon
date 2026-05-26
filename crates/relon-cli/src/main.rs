@@ -771,8 +771,7 @@ fn cmd_run(
                     // a hard I/O failure surfaces as a
                     // logged warning and we fall back to
                     // the source path.
-                    let aot_opt = match AotEvaluator::from_cache_dir(&content, &cache_dir)
-                    {
+                    let aot_opt = match AotEvaluator::from_cache_dir(&content, &cache_dir) {
                         Ok(opt) => opt,
                         Err(e) => {
                             // Cache infrastructure problem

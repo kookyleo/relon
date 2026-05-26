@@ -128,8 +128,7 @@ fn closure_module_compiles_without_codegen_error() {
         entry_func_index: Some(0),
         closure_table: vec![1],
     };
-    let result =
-        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
+    let result = AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
     assert!(result.is_ok(), "compile failed: {:?}", result.err());
 }
 
@@ -188,8 +187,7 @@ fn closure_with_capture_compiles_cleanly() {
         entry_func_index: Some(0),
         closure_table: vec![1],
     };
-    let result =
-        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
+    let result = AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
     assert!(result.is_ok(), "compile failed: {:?}", result.err());
 }
 
@@ -234,8 +232,7 @@ fn closure_call_with_two_args_compiles() {
         entry_func_index: Some(0),
         closure_table: vec![1],
     };
-    let result =
-        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
+    let result = AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
     assert!(result.is_ok(), "compile failed: {:?}", result.err());
 }
 
@@ -290,7 +287,6 @@ fn multiple_lambdas_compile_into_distinct_closure_table_slots() {
         entry_func_index: Some(0),
         closure_table: vec![1, 2],
     };
-    let result =
-        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
+    let result = AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
     assert!(result.is_ok(), "compile failed: {:?}", result.err());
 }

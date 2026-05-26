@@ -34,8 +34,7 @@ const PROGRAM: &str = "#main(Int a, Int b) -> Int\na * 31 + b";
 
 #[test]
 fn run_main_does_not_race_across_threads_on_shared_evaluator() {
-    let eval =
-        Arc::new(AotEvaluator::from_source(PROGRAM).expect("compile #main(a, b) -> Int"));
+    let eval = Arc::new(AotEvaluator::from_source(PROGRAM).expect("compile #main(a, b) -> Int"));
 
     // Four threads, each running 256 dispatches. Thread count exceeds
     // the typical hyper-thread multiplier so any data race surfaces
@@ -87,8 +86,7 @@ fn run_main_does_not_race_across_threads_on_shared_evaluator() {
 #[test]
 fn run_main_single_arg_no_race_under_contention() {
     const PROGRAM: &str = "#main(Int x) -> Int\nx * 2 + 7";
-    let eval =
-        Arc::new(AotEvaluator::from_source(PROGRAM).expect("compile #main(x) -> Int"));
+    let eval = Arc::new(AotEvaluator::from_source(PROGRAM).expect("compile #main(x) -> Int"));
 
     const THREADS: usize = 4;
     const ITERS_PER_THREAD: usize = 256;

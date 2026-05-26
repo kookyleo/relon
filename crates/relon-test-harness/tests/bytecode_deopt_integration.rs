@@ -80,6 +80,7 @@ fn bytecode_resume_from_trace_jit_deopt_overflow() {
                 t(Op::Return),
             ],
             param_tys: vec![IrType::I32, IrType::I32],
+            ..Default::default()
         },
     );
 

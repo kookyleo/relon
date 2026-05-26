@@ -100,6 +100,19 @@ pub struct RecordingRegistrationData {
     /// each with the matching slot from the bytecode VM's packed
     /// `[u64]` arg array.
     pub param_tys: Vec<IrType>,
+    /// PC-alignment Layer 1: schema-driven `field_offset → arg_slot`
+    /// map matching the bytecode VM's `field_offset_to_local` table.
+    ///
+    /// The production-lowered body reads / writes input args through
+    /// `Op::LoadField { offset, ty }` / `Op::LoadStringPtr { offset }`
+    /// (without an explicit base pointer on the operand stack), so the
+    /// recorder walker needs the same offset→slot mapping the bytecode
+    /// compile pass uses to emit `BcOp::LocalGet(slot)`. Carries
+    /// `BTreeMap<u32, u32>` entries from `build_offset_to_local`
+    /// applied to the main schema layout; empty when the evaluator was
+    /// built via the legacy `from_ir_legacy` path (which uses synthetic
+    /// `LocalGet(idx)` ops).
+    pub field_offset_to_local: std::collections::BTreeMap<u32, u32>,
 }
 
 /// Bytecode VM evaluator. Built from a Relon source string via
@@ -171,6 +184,16 @@ pub struct BytecodeEvaluator {
     /// body — the legacy `from_ir_legacy` path still populates the
     /// slot, so the production path stays fully aligned.
     entry_body: Vec<TaggedOp>,
+    /// PC-alignment Layer 1: cached `field_offset → arg_slot` map
+    /// (mirror of the bytecode compile pass's `field_offset_to_local`).
+    ///
+    /// Surfaced via [`Self::recording_registration_data`] so the trace
+    /// recorder walker can resolve no-base `Op::LoadField` /
+    /// `Op::LoadStringPtr` / `Op::StoreField` ops against the same arg
+    /// slot layout the bytecode VM populates. Empty when the evaluator
+    /// was built via the legacy `from_ir_legacy` path (where the IR
+    /// uses synthetic `Op::LocalGet(idx)` directly).
+    field_offset_to_local: std::collections::BTreeMap<u32, u32>,
 }
 
 /// M2-C lever 5: pre-computed return-shape classification used by the
@@ -348,6 +371,9 @@ impl BytecodeEvaluator {
             cached_return_field_count: 0,
             cached_param_count,
             entry_body,
+            // Legacy IR uses `Op::LocalGet(idx)` directly, so the
+            // recorder walker doesn't need an offset→slot rewrite.
+            field_offset_to_local: std::collections::BTreeMap::new(),
         })
     }
 
@@ -390,6 +416,7 @@ impl BytecodeEvaluator {
             cached_return_field_count,
             cached_param_count,
             entry_body,
+            field_offset_to_local: in_map.clone(),
         })
     }
 
@@ -427,6 +454,7 @@ impl BytecodeEvaluator {
         RecordingRegistrationData {
             body: self.entry_body.clone(),
             param_tys: self.param_tys.clone(),
+            field_offset_to_local: self.field_offset_to_local.clone(),
         }
     }
 

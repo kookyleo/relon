@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use relon_codegen_native::{CapabilityVtable, AotEvaluator, HostFnPtr, SandboxConfig};
+use relon_codegen_native::{AotEvaluator, CapabilityVtable, HostFnPtr, SandboxConfig};
 use relon_eval_api::{Evaluator, RuntimeError, Value};
 use relon_ir::ir::{Func, IrType, Module as IrModule, Op, TaggedOp};
 use relon_parser::TokenRange;

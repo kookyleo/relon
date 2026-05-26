@@ -127,6 +127,7 @@ fn bytecode_dispatch_bypasses_after_trace_install() {
         RecordingRegistration {
             body: build_add_body(),
             param_tys: vec![IrType::I32, IrType::I32],
+            ..Default::default()
         },
     );
 
@@ -219,6 +220,7 @@ fn bytecode_repeat_invocations_all_use_trace_bypass() {
         RecordingRegistration {
             body: build_add_body(),
             param_tys: vec![IrType::I32, IrType::I32],
+            ..Default::default()
         },
     );
 

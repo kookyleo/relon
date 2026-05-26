@@ -51,7 +51,7 @@
 //! pulling the whole `relon-evaluator` crate into a layer that is
 //! supposed to feed off the cranelift IR.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use relon_ir::{IrType, Op, TaggedOp};
 use relon_trace_abi::ObservedType;
@@ -130,18 +130,50 @@ pub struct TraceRecordingEvaluator<'a> {
     /// `let`-bound locals. Filled in by `Op::LetSet`, read by
     /// `Op::LetGet`. Keyed on the let-index.
     let_slots: HashMap<u32, StackCell>,
+    /// PC-alignment Layer 1: `field_offset → arg_slot` map mirroring
+    /// the bytecode VM's `field_offset_to_local`. When the walker
+    /// encounters a no-base [`Op::LoadField`] / [`Op::LoadStringPtr`]
+    /// / [`Op::StoreField`] (the shape the production lowering emits
+    /// for buffer-protocol entries), it consults this map to resolve
+    /// the offset into the matching arg slot index, then rewrites the
+    /// op to a synthetic [`Op::LocalGet`] (or equivalent) before
+    /// driving the recorder. Empty when the caller registered a
+    /// hand-built body that already uses `Op::LocalGet(idx)` directly
+    /// (`build_add_body` fixtures / the F-D7-D bench shapes); the
+    /// walker then bypasses the rewrite path.
+    arg_offset_to_slot: BTreeMap<u32, u32>,
 }
 
 impl<'a> TraceRecordingEvaluator<'a> {
     /// Construct a walker bound to `recorder` and the supplied
-    /// argument slots.
+    /// argument slots. PC-alignment Layer 1: hosts that drive a
+    /// production-lowered body whose IR uses `Op::LoadField` /
+    /// `Op::LoadStringPtr` / `Op::StoreField` (no explicit base on
+    /// the operand stack) need to pass the matching schema-driven
+    /// `field_offset → arg_slot` map via
+    /// [`Self::with_arg_offset_map`]; the default constructor leaves
+    /// the map empty for hand-built fixtures that use `Op::LocalGet`
+    /// directly.
     pub fn new(recorder: &'a mut RecorderState, args: &'a [(u64, IrType)]) -> Self {
         Self {
             recorder,
             operand_stack: Vec::with_capacity(32),
             args,
             let_slots: HashMap::new(),
+            arg_offset_to_slot: BTreeMap::new(),
         }
+    }
+
+    /// PC-alignment Layer 1: builder method that installs the
+    /// `field_offset → arg_slot` map the walker consults when it
+    /// encounters no-base [`Op::LoadField`] / [`Op::LoadStringPtr`] /
+    /// [`Op::StoreField`] ops. Pass `BTreeMap::new()` (or omit the
+    /// call) when the registered body uses `Op::LocalGet(idx)` shapes
+    /// directly — the walker's `step_load_field` then falls back to
+    /// the base-pop legacy path the F-D7-D bench fixtures exercise.
+    pub fn with_arg_offset_map(mut self, map: BTreeMap<u32, u32>) -> Self {
+        self.arg_offset_to_slot = map;
+        self
     }
 
     /// Walk `body` op-by-op, recording each op into the recorder
@@ -197,7 +229,23 @@ impl<'a> TraceRecordingEvaluator<'a> {
         args: &[(u64, IrType)],
         body: &[TaggedOp],
     ) -> RecordingOutcome {
-        let walker = TraceRecordingEvaluator::new(recorder, args);
+        Self::record_and_run_with_offset_map(recorder, args, body, BTreeMap::new())
+    }
+
+    /// PC-alignment Layer 1: same as [`Self::record_and_run`] but seeds
+    /// the walker's `arg_offset_to_slot` map so production-lowered
+    /// bodies (which read args through `Op::LoadField` /
+    /// `Op::LoadStringPtr` rather than `Op::LocalGet(idx)`) can be
+    /// recorded against the same offset→slot layout the bytecode VM
+    /// uses for its arg slots.
+    pub fn record_and_run_with_offset_map(
+        recorder: &mut RecorderState,
+        args: &[(u64, IrType)],
+        body: &[TaggedOp],
+        arg_offset_to_slot: BTreeMap<u32, u32>,
+    ) -> RecordingOutcome {
+        let walker =
+            TraceRecordingEvaluator::new(recorder, args).with_arg_offset_map(arg_offset_to_slot);
         let result = walker.run(body);
         if let Some(reason) = recorder.abort_reason() {
             return RecordingOutcome::Aborted {
@@ -421,6 +469,43 @@ impl<'a> TraceRecordingEvaluator<'a> {
             // pointer at trace-tail; the trace then stores the loaded
             // length into `TraceContext::result_slot` via `Op::Return`.
             Op::LoadField { offset, ty } => self.step_load_field(op, *offset, *ty),
+
+            // PC-alignment Layer 1: production-lowered buffer-protocol
+            // entries read `String`-typed args through
+            // `Op::LoadStringPtr { offset }` (a wasm `local.get $in_ptr;
+            // i32.load offset=N` against the implicit input buffer).
+            // The walker rewrites the offset into the matching arg
+            // slot via `arg_offset_to_slot` and forwards a synthetic
+            // `Op::LocalGet(slot)` to the recorder so the trace ends
+            // up emitting a `TraceOp::LocalGet { dst, slot_idx }`
+            // against the entry helper's packed-arg pointer. PC
+            // alignment with the bytecode's `ir_pc_map` holds because
+            // each IR op still maps to exactly one `record_op` call.
+            Op::LoadStringPtr { offset } => self.step_load_string_ptr(*offset),
+
+            // PC-alignment Layer 1: inline string literals lower to
+            // `Op::ConstString { idx, value }` (data-section absolute
+            // address push). The walker leaks a fresh `StringRef`
+            // sourced from the literal bytes, then drives the recorder
+            // with an `Op::ConstI64(ptr_as_i64)` so the resulting
+            // trace ends up with a `TraceOp::ConstI64` whose value is
+            // the static `*const StringRef`. The leak is one-shot per
+            // distinct literal observed during recording; the
+            // production path doesn't see this trace fragment unless a
+            // matching warm input keeps the trace installed.
+            Op::ConstString { idx, value } => self.step_const_string(*idx, value),
+
+            // PC-alignment Layer 1: production-lowered buffer-protocol
+            // bodies stash the return value into the output buffer via
+            // `Op::StoreField { offset, ty }`. The trace's equivalent
+            // surface is `TraceContext::result_slot`, stamped by the
+            // closing `Op::Return`. The walker leaves the operand
+            // stack untouched and feeds an empty input window to
+            // `record_op` so the lowering rule's `SideEffectOnly`
+            // branch fires (PC bump, no `TraceOp::Store` emit, no
+            // pop). The immediately-following `Op::Return` then peeks
+            // the would-be-stored value as its return SSA.
+            Op::StoreField { offset, ty } => self.step_store_field(op, *offset, *ty),
 
             // Everything outside the Phase-1 subset bounces off the
             // recorder. The recorder's lowering rule will Abort with
@@ -880,15 +965,46 @@ impl<'a> TraceRecordingEvaluator<'a> {
     ///
     /// Only `IrType::I64` is wired today; the F-D7-D bench fixture
     /// uses this to read `StringRef::len`, a `usize == u64` value.
+    ///
+    /// PC-alignment Layer 1: when the operand stack is empty AND
+    /// `arg_offset_to_slot` carries an entry for `offset`, the op is
+    /// a no-base buffer-protocol arg read (the production lowering
+    /// shape — wasm `local.get $in_ptr; i64.load offset=N` against
+    /// the implicit input buffer). We rewrite it to a synthetic
+    /// `Op::LocalGet(slot)` and dispatch through the existing
+    /// `step_local_get` so the trace ends up emitting a
+    /// `TraceOp::LocalGet { dst, slot_idx }` instead of a `Load`
+    /// with a `SsaVar::NONE` base (which the emitter would reject at
+    /// install time). One `record_op` call per IR op keeps the
+    /// recorder's `external_pc` counter in lock-step with the
+    /// bytecode compile pass's `ir_pc_next`.
     fn step_load_field(&mut self, op: &Op, offset: u32, ty: IrType) -> StepOutcome {
-        let base = match self.operand_stack.pop() {
-            Some(c) => c,
-            None => {
-                self.recorder
-                    .abort(AbortReason::UnsupportedOp("LoadFieldUnderflow"));
-                return StepOutcome::Abort;
-            }
-        };
+        // PC-alignment Layer 1: the production buffer-protocol body
+        // emits every input-buffer read as a no-base `LoadField`
+        // (against the implicit `$in_ptr`). The walker recognises that
+        // shape when **all** of these hold:
+        //   1. the recorder caller populated `arg_offset_to_slot` (via
+        //      `record_and_run_with_offset_map` / `with_arg_offset_map`);
+        //   2. the offset matches a declared arg slot.
+        // We do **not** condition on operand-stack depth: the
+        // production body reads multiple args back-to-back, so the
+        // second arg load arrives with the first arg's cell still on
+        // the stack. The legacy `LetGet`+`LoadField` shape (e.g. the
+        // F-D7-D bench reading `StringRef::len`) registers an empty
+        // offset map, so this branch never short-circuits its
+        // base-on-stack semantics.
+        if let Some(slot) = self.arg_offset_to_slot.get(&offset).copied() {
+            let synthetic = Op::LocalGet(slot);
+            let _ = op;
+            let _ = ty;
+            return self.step_local_get(slot, &synthetic);
+        }
+        if self.operand_stack.is_empty() {
+            self.recorder
+                .abort(AbortReason::UnsupportedOp("LoadFieldUnderflow"));
+            return StepOutcome::Abort;
+        }
+        let base = self.operand_stack.pop().expect("checked above");
         // Compute the recording-time value via a host-side load. Only
         // I64 is in scope today; widening to other slot widths is a
         // future-phase concern.
@@ -914,6 +1030,90 @@ impl<'a> TraceRecordingEvaluator<'a> {
                     .push(StackCell::new(loaded, ssa, observed));
                 StepOutcome::Continue
             }
+            _ => StepOutcome::Abort,
+        }
+    }
+
+    /// PC-alignment Layer 1: walker side of `Op::LoadStringPtr { offset }`.
+    /// The production lowering emits this for `String`-typed buffer-
+    /// protocol arg reads; the bytecode VM lowers it to
+    /// `BcOp::LocalGet(slot)` where `slot` is the arena handle stash
+    /// the prologue's `string_arg_slots` lift populates. We mirror
+    /// that move here: resolve the offset to the matching arg slot
+    /// via `arg_offset_to_slot`, then dispatch through `step_local_get`
+    /// with a synthetic `Op::LocalGet(slot)`. The resulting trace
+    /// reads the arg as a `TraceOp::LocalGet`, keeping `external_pc`
+    /// aligned with the bytecode's per-op `ir_pc_map` counter (one
+    /// `record_op` per IR op).
+    fn step_load_string_ptr(&mut self, offset: u32) -> StepOutcome {
+        let slot = match self.arg_offset_to_slot.get(&offset).copied() {
+            Some(s) => s,
+            None => {
+                self.recorder
+                    .abort(AbortReason::UnsupportedOp("LoadStringPtrUnknownOffset"));
+                return StepOutcome::Abort;
+            }
+        };
+        let synthetic = Op::LocalGet(slot);
+        self.step_local_get(slot, &synthetic)
+    }
+
+    /// PC-alignment Layer 1: walker side of
+    /// `Op::ConstString { idx, value }`. The production cranelift
+    /// lowering emits this as a data-section absolute address push;
+    /// the bytecode VM interns the literal into the per-invoke
+    /// `StringArena` via `BcOp::StrConst { idx }`. The recorder has no
+    /// equivalent `TraceOp::ConstString` variant today, so we leak the
+    /// literal's bytes as a `&'static str` and mint a permanent
+    /// `*const StringRef` through
+    /// [`relon_trace_jit::runtime::StringRef::from_static_permanent`].
+    /// The walker pushes the pointer as an `ObservedType::Ptr` cell
+    /// and drives the recorder with a synthetic
+    /// `Op::ConstI64(ptr_as_i64)` so the trace emits the matching
+    /// `TraceOp::ConstI64` carrying the static pointer. PC alignment
+    /// holds because each IR op surfaces exactly one `record_op` call.
+    ///
+    /// The leak is one-shot per distinct literal observed during
+    /// recording (typically a handful of compile-time constants in the
+    /// source body); the resulting pointer is reused across every
+    /// subsequent invocation of the trace.
+    fn step_const_string(&mut self, _idx: u32, value: &str) -> StepOutcome {
+        let leaked: &'static str = Box::leak(value.to_owned().into_boxed_str());
+        let ptr = relon_trace_jit::runtime::StringRef::from_static_permanent(leaked);
+        let raw = ptr as u64;
+        let synthetic = Op::ConstI64(raw as i64);
+        match self
+            .recorder
+            .record_op(&synthetic, &[], Some(ObservedType::Ptr))
+        {
+            RecordResult::Ok { value: Some(ssa) }
+            | RecordResult::NeedsGuard {
+                value: Some(ssa), ..
+            } => {
+                self.operand_stack
+                    .push(StackCell::new(raw, ssa, ObservedType::Ptr));
+                StepOutcome::Continue
+            }
+            _ => StepOutcome::Abort,
+        }
+    }
+
+    /// PC-alignment Layer 1: walker side of
+    /// `Op::StoreField { offset, ty }`. The production buffer-protocol
+    /// body emits this to write the return value into the output
+    /// buffer via `$out_ptr + offset`. The trace surface
+    /// (`TraceContext::result_slot`) is stamped by the closing
+    /// `Op::Return`, so this walker arm intentionally **does not pop**
+    /// the operand stack — the next op (`Op::Return`) peeks the
+    /// would-be-stored value as its return SSA. We still call
+    /// `record_op` with an empty inputs window so the recorder bumps
+    /// `external_pc` and the lowering rule's no-base
+    /// `SideEffectOnly` branch fires (no `TraceOp::Store` emit). PC
+    /// alignment with the bytecode's per-op `ir_pc_map` counter
+    /// holds: one `record_op` per IR op.
+    fn step_store_field(&mut self, op: &Op, _offset: u32, _ty: IrType) -> StepOutcome {
+        match self.recorder.record_op(op, &[], None) {
+            RecordResult::Ok { .. } | RecordResult::NeedsGuard { .. } => StepOutcome::Continue,
             _ => StepOutcome::Abort,
         }
     }

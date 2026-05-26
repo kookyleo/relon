@@ -193,6 +193,7 @@ fn install_w5_trace(fn_id: u32, n: u64) -> (Arc<JITedTraceFn>, Vec<u8>, Vec<u8>)
         RecordingRegistration {
             body,
             param_tys: vec![IrType::I64, IrType::I64, IrType::I64],
+            ..Default::default()
         },
     );
     let warm: [u64; 3] = [

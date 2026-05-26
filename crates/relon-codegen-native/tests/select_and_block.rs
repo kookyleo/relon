@@ -218,8 +218,7 @@ fn i32_arith_round_trips_through_widening() {
     let ir = build_module(vec![IrType::I64], body);
     // Compile must succeed (Return only consumes one value off the
     // stack; the leftover i32 stays).
-    let result =
-        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
+    let result = AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
     // Cranelift verifier may reject the leftover; we just assert
     // the codegen-pass surface accepts the new ops.
     let _ = result;

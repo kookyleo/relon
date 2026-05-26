@@ -107,6 +107,7 @@ fn w6_recorder_trace_runs_actual_iterations() {
         RecordingRegistration {
             body: build_w6_body(),
             param_tys: vec![IrType::I64, IrType::I64],
+            ..Default::default()
         },
     );
     let warm: [u64; 2] = [n, list_bytes.as_ptr() as u64];
@@ -275,6 +276,7 @@ fn w5_recorder_trace_runs_actual_iterations() {
         RecordingRegistration {
             body,
             param_tys: vec![IrType::I64, IrType::I64, IrType::I64],
+            ..Default::default()
         },
     );
     let warm: [u64; 3] = [

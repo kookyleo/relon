@@ -929,7 +929,14 @@ fn run_recipe(recipe: SynthRecipe, args: &HashMap<String, Value>) -> Result<Valu
 
     let fn_id = next_synthetic_fn_id();
     let _ = clear_recording(fn_id);
-    register_recording(fn_id, RecordingRegistration { body, param_tys });
+    register_recording(
+        fn_id,
+        RecordingRegistration {
+            body,
+            param_tys,
+            ..Default::default()
+        },
+    );
 
     // SAFETY: the helper interprets `args_ptr` as a packed u64 array
     // with `param_tys.len()` entries. `raw_args` is sized to match.

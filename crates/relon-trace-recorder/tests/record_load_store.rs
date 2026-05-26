@@ -109,10 +109,17 @@ fn store_field_marks_recoverable_write() {
 }
 
 #[test]
-fn missing_base_uses_sentinel_and_skips_guard() {
-    // LoadField with no inputs uses SsaVar::NONE as base; the recorder
-    // suppresses the NotNull guard in that case (no valid SSA id to
-    // gate against).
+fn load_field_without_base_aborts() {
+    // PC-alignment Layer 1: `Op::LoadField` with no `inputs` on the
+    // operand stack is the no-base buffer-protocol arg-read shape the
+    // production lowering emits. The host walker
+    // (`TraceRecordingEvaluator::step_load_field`) is responsible for
+    // rewriting the offset into a synthetic `Op::LocalGet(slot)` via
+    // its `arg_offset_to_slot` map before the op reaches the recorder
+    // — feeding the raw `LoadField` in here signals a missing rewrite
+    // path. The lowering rule aborts with `LoadFieldNoBase` rather
+    // than silently mint a `TraceOp::Load { base: SsaVar::NONE, .. }`
+    // that the emitter would reject at install time.
     let mut r = RecorderState::new();
     let _ = r.record_op(
         &Op::LoadField {
@@ -122,21 +129,11 @@ fn missing_base_uses_sentinel_and_skips_guard() {
         &[],
         None,
     );
-    let buf = r.finalize().unwrap();
-    let not_null = buf
-        .ops
-        .iter()
-        .filter(|o| {
-            matches!(
-                o,
-                TraceOp::Guard {
-                    kind: relon_trace_jit::GuardKind::NotNull(_),
-                    check: _
-                }
-            )
-        })
-        .count();
-    assert_eq!(not_null, 0);
+    assert!(r.is_aborted());
+    assert!(matches!(
+        r.finalize().err().unwrap(),
+        relon_trace_recorder::AbortReason::UnsupportedOp("LoadFieldNoBase")
+    ));
 }
 
 #[test]
@@ -200,12 +197,43 @@ fn load_then_store_chains_two_memory_ops() {
 }
 
 #[test]
-fn unsupported_list_load_aborts() {
+fn raw_load_string_ptr_aborts() {
+    // PC-alignment Layer 1: `Op::LoadStringPtr { offset }` reaches the
+    // recorder only after the host walker has rewritten it into a
+    // synthetic `Op::LocalGet(slot)` (see
+    // `TraceRecordingEvaluator::step_load_string_ptr`). The lowering
+    // rule guards against a bypass — surfacing
+    // `UnsupportedOp("LoadStringPtrRaw")` so the walker bug, not a
+    // silent unbound-SSA at emit time, is what tests catch.
     let mut r = RecorderState::new();
     let _ = r.record_op(&Op::LoadStringPtr { offset: 0 }, &[SsaVar(0)], None);
     assert!(r.is_aborted());
     assert!(matches!(
         r.finalize().err().unwrap(),
-        relon_trace_recorder::AbortReason::UnsupportedOp("LoadStringPtr")
+        relon_trace_recorder::AbortReason::UnsupportedOp("LoadStringPtrRaw")
+    ));
+}
+
+#[test]
+fn raw_const_string_aborts() {
+    // PC-alignment Layer 1: `Op::ConstString` shares the same contract
+    // as `Op::LoadStringPtr` — the host walker
+    // (`TraceRecordingEvaluator::step_const_string`) rewrites it into a
+    // synthetic `Op::ConstI64(ptr)` before invoking the recorder. The
+    // lowering rule aborts on raw arrivals so the walker bug is the
+    // first failure mode tests see.
+    let mut r = RecorderState::new();
+    let _ = r.record_op(
+        &Op::ConstString {
+            idx: 0,
+            value: "x".to_string(),
+        },
+        &[],
+        None,
+    );
+    assert!(r.is_aborted());
+    assert!(matches!(
+        r.finalize().err().unwrap(),
+        relon_trace_recorder::AbortReason::UnsupportedOp("ConstStringRaw")
     ));
 }

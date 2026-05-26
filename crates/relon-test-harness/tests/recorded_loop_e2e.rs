@@ -180,6 +180,7 @@ fn loop_records_and_installs() {
             // The fn signature `(Int n) -> Int` produces one I32 slot
             // on the wasm-handshake side.
             param_tys: vec![IrType::I32],
+            ..Default::default()
         },
     );
 
@@ -297,6 +298,7 @@ fn loop_trace_invokes_without_panic() {
         RecordingRegistration {
             body: build_sum_loop_body(),
             param_tys: vec![IrType::I32],
+            ..Default::default()
         },
     );
 
@@ -337,6 +339,7 @@ fn loop_trace_invoke_with_one_million_iters_reaches_defined_status() {
         RecordingRegistration {
             body: build_sum_loop_body(),
             param_tys: vec![IrType::I32],
+            ..Default::default()
         },
     );
 
@@ -396,6 +399,7 @@ fn loop_trace_runs_n_iters_before_deopt() {
         RecordingRegistration {
             body: build_sum_loop_body(),
             param_tys: vec![IrType::I32],
+            ..Default::default()
         },
     );
 
@@ -491,6 +495,7 @@ fn loop_trace_full_pipeline_returns_correct_sum() {
         RecordingRegistration {
             body: build_sum_loop_body(),
             param_tys: vec![IrType::I32],
+            ..Default::default()
         },
     );
 
@@ -518,12 +523,9 @@ fn loop_trace_full_pipeline_returns_correct_sum() {
         entry_func_index: Some(0),
         closure_table: vec![],
     };
-    let aot = AotEvaluator::from_ir_direct(
-        aot_module,
-        SandboxConfig::default(),
-        vec!["n".to_string()],
-    )
-    .expect("cranelift-aot compile");
+    let aot =
+        AotEvaluator::from_ir_direct(aot_module, SandboxConfig::default(), vec!["n".to_string()])
+            .expect("cranelift-aot compile");
 
     let n: i64 = 1_000_000;
     let expected: i64 = n * (n + 1) / 2; // 500_000_500_000

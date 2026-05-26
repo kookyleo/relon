@@ -189,14 +189,12 @@ fn bench_cached_cold_start(c: &mut Criterion) {
     // Pre-warm: drive `from_source_with_cache` once to populate
     // the cache pair. The first call's time is *not* measured —
     // this bench is about the *cached* cold-start path.
-    let warm =
-        AotEvaluator::from_source_with_cache(src, cache_root.path()).expect("pre-warm");
+    let warm = AotEvaluator::from_source_with_cache(src, cache_root.path()).expect("pre-warm");
     drop(warm);
 
     group.bench_function(BenchmarkId::new("cranelift_cached", "cold"), |b| {
         b.iter(|| {
-            let opt = AotEvaluator::from_cache_dir(src, cache_root.path())
-                .expect("from_cache_dir");
+            let opt = AotEvaluator::from_cache_dir(src, cache_root.path()).expect("from_cache_dir");
             // Force evaluator materialisation so the bench measures
             // dlopen + dlsym + vtable populate, not just the option-
             // discrimination cost.
@@ -218,14 +216,12 @@ fn bench_cached_cold_start_full(c: &mut Criterion) {
     let cache_root = tempfile::tempdir().expect("tempdir for cache");
     let src = tree_walk_src();
 
-    let warm =
-        AotEvaluator::from_source_with_cache(src, cache_root.path()).expect("pre-warm");
+    let warm = AotEvaluator::from_source_with_cache(src, cache_root.path()).expect("pre-warm");
     drop(warm);
 
     group.bench_function(BenchmarkId::new("cranelift_cached", "cold_full"), |b| {
         b.iter(|| {
-            let opt = AotEvaluator::from_cache_dir(src, cache_root.path())
-                .expect("from_cache_dir");
+            let opt = AotEvaluator::from_cache_dir(src, cache_root.path()).expect("from_cache_dir");
             let ev = opt.expect("cache hit");
             let out = ev.run_main(args_with(3, 4)).expect("run_main");
             black_box(out);

@@ -2154,9 +2154,7 @@ fn match_range_chain(expr: &Expr) -> Option<RangeChain<'_>> {
         // keyword args; the parent `try_lower_list_sum_range` does the
         // same for the 0-stage form, but we repeat the check here so
         // a multi-stage chain bottoms out cleanly.
-        if path.len() == 1
-            && matches!(&path[0], TokenKey::String(s, _, _) if s == "range")
-        {
+        if path.len() == 1 && matches!(&path[0], TokenKey::String(s, _, _) if s == "range") {
             if args.is_empty() || args.len() > 2 {
                 return None;
             }
@@ -2432,15 +2430,17 @@ fn emit_range_pipeline_loop(
         });
         let body_node = stage.closure_body;
         lower_expr(&body_node.expr, body_node.range, ctx)?;
-        let produced_ty = ctx.tstack.last().copied().ok_or_else(|| {
-            LoweringError::UnsupportedExpr {
-                kind: format!(
-                    "range-chain {}: closure body produced no value",
-                    stage.method
-                ),
-                range: body_node.range,
-            }
-        })?;
+        let produced_ty =
+            ctx.tstack
+                .last()
+                .copied()
+                .ok_or_else(|| LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "range-chain {}: closure body produced no value",
+                        stage.method
+                    ),
+                    range: body_node.range,
+                })?;
         ctx.lets.pop();
         match stage.method {
             "map" => {
@@ -2661,12 +2661,14 @@ fn emit_range_pipeline_loop(
             // Lower the closure body — leaves the new acc value on
             // top of the vstack.
             lower_expr(&body.expr, body.range, ctx)?;
-            let produced = ctx.tstack.last().copied().ok_or_else(|| {
-                LoweringError::UnsupportedExpr {
-                    kind: "range-chain reduce: body produced no value".to_string(),
-                    range: body.range,
-                }
-            })?;
+            let produced =
+                ctx.tstack
+                    .last()
+                    .copied()
+                    .ok_or_else(|| LoweringError::UnsupportedExpr {
+                        kind: "range-chain reduce: body produced no value".to_string(),
+                        range: body.range,
+                    })?;
             if produced.wasm_slot() != acc_ty.wasm_slot() {
                 let _ = std::mem::take(&mut ctx.out);
                 ctx.out = saved_iter;
@@ -3182,7 +3184,10 @@ fn lower_binary(
     // comparison paths below.
     if matches!(op, Operator::And | Operator::Or) {
         lower_expr(&lhs.expr, lhs.range, ctx)?;
-        let lhs_ty = ctx.tstack.pop().ok_or(LoweringError::UnsupportedOperator { op, range })?;
+        let lhs_ty = ctx
+            .tstack
+            .pop()
+            .ok_or(LoweringError::UnsupportedOperator { op, range })?;
         if lhs_ty != IrType::Bool {
             return Err(LoweringError::UnsupportedOperator { op, range });
         }
@@ -3193,7 +3198,10 @@ fn lower_binary(
             // a || b: then-branch is `true`, else-branch is `b`.
             let saved_out = std::mem::take(&mut ctx.out);
             let saved_stack = std::mem::take(&mut ctx.tstack);
-            ctx.out.push(TaggedOp { op: Op::ConstBool(true), range });
+            ctx.out.push(TaggedOp {
+                op: Op::ConstBool(true),
+                range,
+            });
             ctx.tstack.push(IrType::Bool);
             let body = std::mem::replace(&mut ctx.out, saved_out);
             let stack = std::mem::replace(&mut ctx.tstack, saved_stack);
@@ -3203,7 +3211,10 @@ fn lower_binary(
             // a && b: else-branch is `false`.
             let saved_out = std::mem::take(&mut ctx.out);
             let saved_stack = std::mem::take(&mut ctx.tstack);
-            ctx.out.push(TaggedOp { op: Op::ConstBool(false), range });
+            ctx.out.push(TaggedOp {
+                op: Op::ConstBool(false),
+                range,
+            });
             ctx.tstack.push(IrType::Bool);
             let body = std::mem::replace(&mut ctx.out, saved_out);
             let stack = std::mem::replace(&mut ctx.tstack, saved_stack);

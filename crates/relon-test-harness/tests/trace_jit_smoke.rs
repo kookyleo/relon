@@ -41,8 +41,8 @@ use std::collections::HashMap;
 
 use relon_codegen_native::{
     global_trace_jit_state, hot_counter_peek, hot_counter_reset, jump_helper_call_count,
-    reset_jump_helper_call_count, AotEvaluator, SandboxConfig, TraceJitError,
-    TraceJitState, MAX_FN_ID, RELON_HOT_THRESHOLD,
+    reset_jump_helper_call_count, AotEvaluator, SandboxConfig, TraceJitError, TraceJitState,
+    MAX_FN_ID, RELON_HOT_THRESHOLD,
 };
 use relon_eval_api::{Evaluator, Value};
 use relon_ir::ir::{Func, IrType, Module as IrModule, Op, TaggedOp};
@@ -96,8 +96,7 @@ fn build_traced_evaluator(ir: IrModule, fn_id: u32) -> AotEvaluator {
         trace_jit_fn_id: Some(fn_id),
         ..SandboxConfig::default()
     };
-    AotEvaluator::from_ir_direct(ir, cfg, vec!["x".to_string(), "y".to_string()])
-        .expect("compile")
+    AotEvaluator::from_ir_direct(ir, cfg, vec!["x".to_string(), "y".to_string()]).expect("compile")
 }
 
 fn make_args(x: i64, y: i64) -> HashMap<String, Value> {
@@ -551,6 +550,7 @@ fn jump_helper_installs_const_trace_from_registry() {
                 },
             ],
             param_tys: vec![],
+            ..Default::default()
         },
     );
     reset_jump_helper_call_count();
@@ -596,6 +596,7 @@ fn recording_registry_round_trip() {
         RecordingRegistration {
             body: vec![],
             param_tys: vec![IrType::I64],
+            ..Default::default()
         },
     );
     assert!(prev.is_none(), "fresh fn_id had no prior registration");
@@ -788,6 +789,7 @@ fn let_with_arg_use_installs_via_local_get_lowering() {
             // declare the params accordingly so the TypeCheck guard
             // policy does not flip the recording into an abort.
             param_tys: vec![IrType::I32, IrType::I32],
+            ..Default::default()
         },
     );
     // The trace body reads two args; pass non-overflowing values
@@ -852,6 +854,7 @@ fn arith_overflow_guard_uses_real_carry_bit() {
                 },
             ],
             param_tys: vec![IrType::I32, IrType::I32],
+            ..Default::default()
         },
     );
     // Warm up with non-overflowing values.
@@ -945,6 +948,7 @@ fn invoke_with_resume_exposes_deopt_snapshot_to_fallback() {
                 },
             ],
             param_tys: vec![IrType::I32, IrType::I32],
+            ..Default::default()
         },
     );
     let warm_args: [u64; 2] = [1u64, 2u64];
@@ -1048,6 +1052,7 @@ fn save_deopt_dispatches_through_host_hooks_table() {
                 },
             ],
             param_tys: vec![IrType::I32, IrType::I32],
+            ..Default::default()
         },
     );
     let warm: [u64; 2] = [1, 2];
@@ -1213,6 +1218,7 @@ fn jump_helper_aborts_recording_for_unsupported_op() {
                 },
             ],
             param_tys: vec![],
+            ..Default::default()
         },
     );
     unsafe {

@@ -412,7 +412,11 @@ fn wire_trace_tier(
     // process-global `DashMap` keyed by `(thread_id, fn_id)`.
     let prior = relon_codegen_native::register_recording(
         fn_id,
-        relon_codegen_native::RecordingRegistration { body, param_tys },
+        relon_codegen_native::RecordingRegistration {
+            body,
+            param_tys,
+            ..Default::default()
+        },
     );
     if prior.is_some() {
         // Sanity: a pool-allocated id should never already be in the

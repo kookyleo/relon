@@ -694,6 +694,7 @@ fn install_recorded_loop_trace() -> u32 {
             // let-slot variant from the e2e test harness instead.
             body: sum_loop_let_slot_body(),
             param_tys: vec![IrType::I32],
+            ..Default::default()
         },
     );
     let state = global_trace_jit_state();
@@ -789,6 +790,7 @@ fn install_trace_for_step() -> u32 {
         RecordingRegistration {
             body: step_body_trace_real(),
             param_tys: vec![IrType::I32, IrType::I32],
+            ..Default::default()
         },
     );
     let state = global_trace_jit_state();

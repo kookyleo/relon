@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use relon_codegen_native::{
-    deserialize_cache, serialize_cache, CacheEntry, AotEvaluator, SandboxConfig,
+    deserialize_cache, serialize_cache, AotEvaluator, CacheEntry, SandboxConfig,
 };
 use relon_eval_api::{Evaluator, Value};
 use relon_ir::ir::{Func, IrType, Module as IrModule, Op, TaggedOp};

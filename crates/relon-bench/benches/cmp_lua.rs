@@ -1051,7 +1051,14 @@ fn install_recorder_trace(
             );
         }
     }
-    relon_codegen_native::register_recording(fn_id, RecordingRegistration { body, param_tys, ..Default::default() });
+    relon_codegen_native::register_recording(
+        fn_id,
+        RecordingRegistration {
+            body,
+            param_tys,
+            ..Default::default()
+        },
+    );
     unsafe {
         __relon_jump_to_recorder(fn_id, warmup_args.as_ptr());
     }
@@ -2408,15 +2415,18 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 ),
                 other => panic!("W3 bytecode non-string result: {other:?}"),
             }
-            group.bench_function(BenchmarkId::new("W3_string_concat", "relon_bytecode"), |b| {
-                b.iter_custom(|iters| {
-                    let n_in = black_box(STRING_CONCAT_N as i64);
-                    timed_with_warmup(iters, || {
-                        let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
-                        black_box(v);
-                    })
-                });
-            });
+            group.bench_function(
+                BenchmarkId::new("W3_string_concat", "relon_bytecode"),
+                |b| {
+                    b.iter_custom(|iters| {
+                        let n_in = black_box(STRING_CONCAT_N as i64);
+                        timed_with_warmup(iters, || {
+                            let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
+                            black_box(v);
+                        })
+                    });
+                },
+            );
         }
     }
 
@@ -2548,15 +2558,18 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 w4_expected(),
                 "W4 bytecode result must match analytic answer"
             );
-            group.bench_function(BenchmarkId::new("W4_string_contains", "relon_bytecode"), |b| {
-                b.iter_custom(|iters| {
-                    let n_in = black_box(TREE_WALK_N as i64);
-                    timed_with_warmup(iters, || {
-                        let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
-                        black_box(v);
-                    })
-                });
-            });
+            group.bench_function(
+                BenchmarkId::new("W4_string_contains", "relon_bytecode"),
+                |b| {
+                    b.iter_custom(|iters| {
+                        let n_in = black_box(TREE_WALK_N as i64);
+                        timed_with_warmup(iters, || {
+                            let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
+                            black_box(v);
+                        })
+                    });
+                },
+            );
         }
     }
 
@@ -2863,7 +2876,8 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // the production source while staying inside the IR-lowering
         // envelope (no dict / list literals, no bare `Dict` return).
         if let Some(ev) = try_build_bytecode(w5_relon_src_bytecode(), "W5") {
-            let v = ev.run_main(args_w_n(TREE_WALK_N as i64))
+            let v = ev
+                .run_main(args_w_n(TREE_WALK_N as i64))
                 .expect("W5 bytecode run_main");
             let got = match v {
                 Value::Int(n) => n,
@@ -2874,18 +2888,15 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 w5_expected(),
                 "W5 bytecode result must match analytic dict-lookup sum"
             );
-            group.bench_function(
-                BenchmarkId::new("W5_dict_strkey", "relon_bytecode"),
-                |b| {
-                    b.iter_custom(|iters| {
-                        let n_in = black_box(TREE_WALK_N as i64);
-                        timed_with_warmup(iters, || {
-                            let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
-                            black_box(v);
-                        })
-                    });
-                },
-            );
+            group.bench_function(BenchmarkId::new("W5_dict_strkey", "relon_bytecode"), |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(TREE_WALK_N as i64);
+                    timed_with_warmup(iters, || {
+                        let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            });
         }
     }
 
@@ -3146,7 +3157,8 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // identical to the production source while staying inside the
         // IR-lowering envelope (no first-class closure, no bare `Dict`).
         if let Some(ev) = try_build_bytecode(w8_relon_src_bytecode(), "W8") {
-            let v = ev.run_main(args_w_n(TREE_WALK_N as i64))
+            let v = ev
+                .run_main(args_w_n(TREE_WALK_N as i64))
                 .expect("W8 bytecode run_main");
             let got = match v {
                 Value::Int(n) => n,
@@ -3382,7 +3394,8 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // boolean composition inside the IR envelope without needing
         // first-class closure values.
         if let Some(ev) = try_build_bytecode(w10_relon_src_bytecode(), "W10") {
-            let v = ev.run_main(args_w_n(CONFIG_QUERIES_N as i64))
+            let v = ev
+                .run_main(args_w_n(CONFIG_QUERIES_N as i64))
                 .expect("W10 bytecode run_main");
             let got = match v {
                 Value::Int(n) => n,
@@ -3393,18 +3406,15 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 w10_expected(),
                 "W10 bytecode result must match analytic access-control count"
             );
-            group.bench_function(
-                BenchmarkId::new("W10_config_eval", "relon_bytecode"),
-                |b| {
-                    b.iter_custom(|iters| {
-                        let n_in = black_box(CONFIG_QUERIES_N as i64);
-                        timed_with_warmup(iters, || {
-                            let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
-                            black_box(v);
-                        })
-                    });
-                },
-            );
+            group.bench_function(BenchmarkId::new("W10_config_eval", "relon_bytecode"), |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(CONFIG_QUERIES_N as i64);
+                    timed_with_warmup(iters, || {
+                        let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            });
         }
     }
 

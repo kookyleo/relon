@@ -383,14 +383,22 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
 
         // ---- Field load / store -----------------------------------------
         Op::LoadField { offset, ty } => {
-            let base = cx
-                .inputs
-                .first()
-                .copied()
-                // No-input loads use SsaVar::NONE as a sentinel base;
-                // the codegen pass will compute the actual base from
-                // `$in_ptr` at emit time.
-                .unwrap_or(SsaVar::NONE);
+            // PC-alignment Layer 1: the production buffer-protocol body
+            // emits `Op::LoadField { offset, ty }` against the implicit
+            // wasm `$in_ptr` (no base on the operand stack). The walker
+            // (`TraceRecordingEvaluator`) rewrites that shape into a
+            // synthetic `Op::LocalGet(slot)` before invoking
+            // `record_op`, so this arm only ever sees a base-on-stack
+            // form (the F-D7-D bench fixtures that read
+            // `StringRef::len` off an acc pointer). An empty `inputs`
+            // window therefore signals a host bug — the walker should
+            // have rewritten the op — so we abort cleanly rather than
+            // mint a `TraceOp::Load` against `SsaVar::NONE` (which the
+            // emitter would later trip on at install time).
+            if cx.inputs.is_empty() {
+                return LowerOutcome::Abort(AbortReason::UnsupportedOp("LoadFieldNoBase"));
+            }
+            let base = cx.inputs[0];
             LowerOutcome::Emit {
                 op: TraceOp::Load {
                     dst: cx.fresh_dst,
@@ -407,7 +415,23 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
             }
         }
         Op::StoreField { offset, .. } => {
-            let value = cx.inputs.first().copied().unwrap_or(SsaVar::NONE);
+            // PC-alignment Layer 1: the production buffer-protocol body
+            // emits `Op::StoreField { offset, ty }` to write a value
+            // into the output buffer via implicit `$out_ptr`. The
+            // trace's equivalent surface is `TraceContext::result_slot`,
+            // stamped by the closing `Op::Return`. Surface no TraceOp
+            // when the caller (`TraceRecordingEvaluator::step_store_field`)
+            // signals the no-base shape via an empty `inputs` window —
+            // the recorder still bumps `external_pc` per call so the
+            // counter stays in lock-step with the bytecode compile
+            // pass's `ir_pc_next`. Leaving the operand stack untouched
+            // (no pop) lets the immediately-following `Op::Return`
+            // pick up the would-be-stored value as its return SSA.
+            if cx.inputs.is_empty() {
+                let _ = offset;
+                return LowerOutcome::SideEffectOnly { rebind: None };
+            }
+            let value = cx.inputs[0];
             let base = cx.inputs.get(1).copied().unwrap_or(SsaVar::NONE);
             LowerOutcome::Emit {
                 op: TraceOp::Store {
@@ -423,6 +447,19 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
                 effect: TraceEffect::RecoverableWrite,
             }
         }
+        // PC-alignment Layer 1: production-lowered `String`-typed arg
+        // reads (`Op::LoadStringPtr { offset }`) and inline string
+        // literals (`Op::ConstString { idx, value }`) arrive at the
+        // recorder via [`TraceRecordingEvaluator::step_load_string_ptr`]
+        // / [`TraceRecordingEvaluator::step_const_string`], which have
+        // already rewritten the IR shape into [`Op::LocalGet`] /
+        // [`Op::ConstI64`] before calling `record_op`. If the walker
+        // ever forwards the raw IR variant here we surface a clean
+        // abort rather than silently dropping the op.
+        Op::LoadStringPtr { .. } => {
+            LowerOutcome::Abort(AbortReason::UnsupportedOp("LoadStringPtrRaw"))
+        }
+        Op::ConstString { .. } => LowerOutcome::Abort(AbortReason::UnsupportedOp("ConstStringRaw")),
 
         // ---- Control flow -----------------------------------------------
         Op::Br { .. } => LowerOutcome::SideEffectOnly { rebind: None },
@@ -533,12 +570,10 @@ pub fn lower_op(op: &Op, cx: OpLoweringContext<'_>) -> LowerOutcome {
 /// the catch-all in `lower_op` doesn't grow a giant match per call.
 fn unsupported_op_name(op: &Op) -> &'static str {
     match op {
-        Op::ConstString { .. } => "ConstString",
         Op::ConstListInt { .. } => "ConstListInt",
         Op::ConstListFloat { .. } => "ConstListFloat",
         Op::ConstListBool { .. } => "ConstListBool",
         Op::ConstListString { .. } => "ConstListString",
-        Op::LoadStringPtr { .. } => "LoadStringPtr",
         Op::LoadListIntPtr { .. } => "LoadListIntPtr",
         Op::LoadListFloatPtr { .. } => "LoadListFloatPtr",
         Op::LoadListBoolPtr { .. } => "LoadListBoolPtr",

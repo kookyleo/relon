@@ -244,6 +244,7 @@ mod tests {
             RecordingRegistration {
                 body: body_const_one(),
                 param_tys: vec![],
+                ..Default::default()
             },
         );
         let state = global_trace_jit_state();

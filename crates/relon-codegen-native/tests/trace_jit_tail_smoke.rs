@@ -179,6 +179,7 @@ fn tail_conv_guard_failure_unwinds_through_deopt_block() {
         RecordingRegistration {
             body,
             param_tys: vec![IrType::I32, IrType::I32],
+            ..Default::default()
         },
     );
 

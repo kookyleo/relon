@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
-use relon_codegen_native::{CapabilityVtable, AotEvaluator, HostFnPtr, SandboxConfig};
+use relon_codegen_native::{AotEvaluator, CapabilityVtable, HostFnPtr, SandboxConfig};
 use relon_eval_api::{Evaluator, RuntimeError, Value};
 use relon_ir::ir::{Func, IrType, Module as IrModule, NativeImport, Op, TaggedOp};
 use relon_parser::TokenRange;
@@ -85,8 +85,8 @@ fn call_native_nullary_returns_host_fn_result() {
         t(Op::Return),
     ];
     let ir = legacy_module(imports, body, vec![]);
-    let mut evaluator = AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec![])
-        .expect("compile");
+    let mut evaluator =
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec![]).expect("compile");
     let mut vt = CapabilityVtable::with_capacity(64);
     // SAFETY: the lifetime-erased cast matches the actual host fn
     // signature; the IR-declared shape matches the host fn shape.
@@ -259,7 +259,6 @@ fn call_native_with_param_shape_mismatch_surfaces_codegen_error() {
         t(Op::Return),
     ];
     let ir = legacy_module(imports, body, vec![IrType::I64]);
-    let result =
-        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
+    let result = AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["x".to_string()]);
     assert!(result.is_err(), "expected Codegen mismatch");
 }

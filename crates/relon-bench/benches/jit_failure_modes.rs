@@ -528,7 +528,14 @@ fn try_install_recorder_trace(
     let _ = clear_recording(fn_id);
     let state = global_trace_jit_state();
     state.invalidate_trace(fn_id);
-    register_recording(fn_id, RecordingRegistration { body, param_tys, ..Default::default() });
+    register_recording(
+        fn_id,
+        RecordingRegistration {
+            body,
+            param_tys,
+            ..Default::default()
+        },
+    );
     unsafe {
         relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, warmup_args.as_ptr());
     }

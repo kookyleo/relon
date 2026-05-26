@@ -1393,7 +1393,7 @@ pub fn global_trace_jit_state() -> &'static TraceJitState {
 /// installs one of these per fn_id before invoking the entry
 /// function so the recording driver can find the IR body + arg
 /// layout it needs to drive a real trace recording.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RecordingRegistration {
     /// Cloned IR op stream for the function. Cheaper to clone than
     /// to thread an Arc through the recording driver — the body is
@@ -1405,6 +1405,15 @@ pub struct RecordingRegistration {
     /// the `(u64, IrType)` pairs the [`TraceRecordingEvaluator`]
     /// expects.
     pub param_tys: Vec<IrType>,
+    /// PC-alignment Layer 1: schema-driven `field_offset → arg_slot`
+    /// map mirroring the bytecode VM's `field_offset_to_local`. The
+    /// recorder walker uses it to resolve no-base `Op::LoadField` /
+    /// `Op::LoadStringPtr` / `Op::StoreField` ops (which the
+    /// production lowering emits in place of `Op::LocalGet(idx)`) by
+    /// rewriting the offset into the matching arg-slot index. Empty
+    /// for hand-built fixtures whose body uses `Op::LocalGet(idx)`
+    /// directly — the walker then bypasses the rewrite path.
+    pub field_offset_to_local: std::collections::BTreeMap<u32, u32>,
 }
 
 impl From<relon_bytecode::RecordingRegistrationData> for RecordingRegistration {
@@ -1416,12 +1425,13 @@ impl From<relon_bytecode::RecordingRegistrationData> for RecordingRegistration {
     /// The bytecode crate is dependency-free from cranelift, so it
     /// returns a parallel [`relon_bytecode::RecordingRegistrationData`]
     /// shape rather than reach into this crate. The conversion is a
-    /// zero-cost field move; both shapes carry the same two
-    /// `(body, param_tys)` slots.
+    /// zero-cost field move; both shapes carry the same
+    /// `(body, param_tys, field_offset_to_local)` slots.
     fn from(data: relon_bytecode::RecordingRegistrationData) -> Self {
         Self {
             body: data.body,
             param_tys: data.param_tys,
+            field_offset_to_local: data.field_offset_to_local,
         }
     }
 }
@@ -1558,7 +1568,12 @@ pub unsafe extern "C" fn __relon_jump_to_recorder(fn_id: u32, args_ptr: *const u
     };
 
     let mut recorder = RecorderState::new();
-    let outcome = TraceRecordingEvaluator::record_and_run(&mut recorder, &args, &registration.body);
+    let outcome = TraceRecordingEvaluator::record_and_run_with_offset_map(
+        &mut recorder,
+        &args,
+        &registration.body,
+        registration.field_offset_to_local.clone(),
+    );
 
     match outcome {
         RecordingOutcome::Recorded {

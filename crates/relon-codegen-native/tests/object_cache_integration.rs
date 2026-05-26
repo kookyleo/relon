@@ -16,9 +16,7 @@
 
 use std::collections::HashMap;
 
-use relon_codegen_native::{
-    compute_source_hash, ir_cache_path_for, AotEvaluator, SandboxConfig,
-};
+use relon_codegen_native::{compute_source_hash, ir_cache_path_for, AotEvaluator, SandboxConfig};
 use relon_eval_api::{Evaluator, Value};
 
 /// Source kept simple enough that the lowering pipeline always
@@ -50,8 +48,8 @@ fn from_source_with_cache_writes_pair_on_first_call() {
         "object-cache should be absent initially"
     );
 
-    let aot = AotEvaluator::from_source_with_cache(src, dir.path())
-        .expect("from_source_with_cache");
+    let aot =
+        AotEvaluator::from_source_with_cache(src, dir.path()).expect("from_source_with_cache");
     // Live invocation works.
     let r = aot.run_main(args(40, 2)).expect("run_main");
     assert_eq!(r, Value::Int(42));
@@ -77,8 +75,7 @@ fn from_cache_dir_hits_after_from_source_with_cache() {
     let src = corpus_add_source();
 
     // First call: populate cache.
-    let _ = AotEvaluator::from_source_with_cache(src, dir.path())
-        .expect("from_source_with_cache");
+    let _ = AotEvaluator::from_source_with_cache(src, dir.path()).expect("from_source_with_cache");
 
     // Second call: from_cache_dir should restore from the IR-cache
     // half. Only the IR-cache half is required for the fast restore
@@ -95,9 +92,7 @@ fn from_cache_dir_hits_after_from_source_with_cache() {
         return;
     }
 
-    let aot = match AotEvaluator::from_cache_dir(src, dir.path())
-        .expect("from_cache_dir result")
-    {
+    let aot = match AotEvaluator::from_cache_dir(src, dir.path()).expect("from_cache_dir result") {
         Some(c) => c,
         None => {
             eprintln!(
@@ -117,8 +112,7 @@ fn cache_hit_produces_same_result_as_fresh_build() {
     let src = corpus_add_source();
 
     // Fresh build via from_source_with_cache (cache miss path).
-    let fresh =
-        AotEvaluator::from_source_with_cache(src, dir.path()).expect("fresh build");
+    let fresh = AotEvaluator::from_source_with_cache(src, dir.path()).expect("fresh build");
     let fresh_result = fresh.run_main(args(100, 23)).expect("fresh run_main");
     drop(fresh);
 
@@ -129,17 +123,16 @@ fn cache_hit_produces_same_result_as_fresh_build() {
         return;
     }
 
-    let cached =
-        match AotEvaluator::from_cache_dir(src, dir.path()).expect("from_cache_dir") {
-            Some(c) => c,
-            None => {
-                eprintln!(
-                    "skipping cache-hit parity assertion: from_cache_dir returned None \
+    let cached = match AotEvaluator::from_cache_dir(src, dir.path()).expect("from_cache_dir") {
+        Some(c) => c,
+        None => {
+            eprintln!(
+                "skipping cache-hit parity assertion: from_cache_dir returned None \
                 (likely host dlopen / schema-cache round-trip not supported here)"
-                );
-                return;
-            }
-        };
+            );
+            return;
+        }
+    };
     let cached_result = cached.run_main(args(100, 23)).expect("cached run_main");
     assert_eq!(
         fresh_result, cached_result,
@@ -153,8 +146,7 @@ fn corrupted_object_cache_invalidates_pair() {
     let dir = tempfile::tempdir().expect("tempdir");
     let src = corpus_add_source();
 
-    let _ = AotEvaluator::from_source_with_cache(src, dir.path())
-        .expect("from_source_with_cache");
+    let _ = AotEvaluator::from_source_with_cache(src, dir.path()).expect("from_source_with_cache");
     let hash = compute_source_hash(src, &SandboxConfig::default());
     let obj_path = relon_object_cache::storage::cache_path_for(dir.path(), hash);
     if !obj_path.exists() {
@@ -184,8 +176,7 @@ fn corrupted_ir_cache_invalidates_pair() {
     let dir = tempfile::tempdir().expect("tempdir");
     let src = corpus_add_source();
 
-    let _ = AotEvaluator::from_source_with_cache(src, dir.path())
-        .expect("from_source_with_cache");
+    let _ = AotEvaluator::from_source_with_cache(src, dir.path()).expect("from_source_with_cache");
     let hash = compute_source_hash(src, &SandboxConfig::default());
     let ir_path = ir_cache_path_for(dir.path(), hash);
     // The IR cache is only written when the object cache lands — which
@@ -214,8 +205,7 @@ fn missing_ir_cache_invalidates_pair() {
     let dir = tempfile::tempdir().expect("tempdir");
     let src = corpus_add_source();
 
-    let _ = AotEvaluator::from_source_with_cache(src, dir.path())
-        .expect("from_source_with_cache");
+    let _ = AotEvaluator::from_source_with_cache(src, dir.path()).expect("from_source_with_cache");
     let hash = compute_source_hash(src, &SandboxConfig::default());
     let ir_path = ir_cache_path_for(dir.path(), hash);
     let obj_path = relon_object_cache::storage::cache_path_for(dir.path(), hash);
@@ -244,8 +234,8 @@ fn different_source_does_not_hit_existing_cache() {
     let src_a = corpus_add_source();
     let src_b = "#main(Int x, Int y) -> Int\nx * y"; // different body
 
-    let _ = AotEvaluator::from_source_with_cache(src_a, dir.path())
-        .expect("from_source_with_cache a");
+    let _ =
+        AotEvaluator::from_source_with_cache(src_a, dir.path()).expect("from_source_with_cache a");
 
     let opt_b = AotEvaluator::from_cache_dir(src_b, dir.path()).expect("from_cache_dir b");
     assert!(opt_b.is_none(), "different source should miss the cache");
@@ -259,8 +249,7 @@ fn cache_hits_are_concurrency_safe() {
     let src = corpus_add_source();
 
     // Populate cache once on the main thread.
-    let _ = AotEvaluator::from_source_with_cache(src, dir.path())
-        .expect("from_source_with_cache");
+    let _ = AotEvaluator::from_source_with_cache(src, dir.path()).expect("from_source_with_cache");
 
     let hash = compute_source_hash(src, &SandboxConfig::default());
     let obj_path = relon_object_cache::storage::cache_path_for(dir.path(), hash);
@@ -274,8 +263,7 @@ fn cache_hits_are_concurrency_safe() {
     // hosts where dlopen / schema-cache round-trip doesn't work),
     // skip the concurrency assertion rather than panic in a worker
     // thread.
-    let probe =
-        AotEvaluator::from_cache_dir(src, dir.path()).expect("from_cache_dir probe");
+    let probe = AotEvaluator::from_cache_dir(src, dir.path()).expect("from_cache_dir probe");
     if probe.is_none() {
         eprintln!(
             "skipping cache-hit concurrency assertion: from_cache_dir returned None \
@@ -293,8 +281,7 @@ fn cache_hits_are_concurrency_safe() {
         let path = dir.path().to_path_buf();
         let src_owned = src.to_string();
         handles.push(thread::spawn(move || {
-            let opt =
-                AotEvaluator::from_cache_dir(&src_owned, &path).expect("from_cache_dir");
+            let opt = AotEvaluator::from_cache_dir(&src_owned, &path).expect("from_cache_dir");
             let aot = opt.expect("cache hit");
             aot.run_main(args(7, 8)).expect("run_main")
         }));
@@ -315,8 +302,7 @@ fn tampered_schema_sidecar_invalidates_triple() {
     let dir = tempfile::tempdir().expect("tempdir");
     let src = corpus_add_source();
 
-    let _ = AotEvaluator::from_source_with_cache(src, dir.path())
-        .expect("from_source_with_cache");
+    let _ = AotEvaluator::from_source_with_cache(src, dir.path()).expect("from_source_with_cache");
     let hash = compute_source_hash(src, &SandboxConfig::default());
     let schema_path = relon_codegen_native::schema_cache::schema_cache_path_for(dir.path(), hash);
     let obj_path = relon_object_cache::storage::cache_path_for(dir.path(), hash);

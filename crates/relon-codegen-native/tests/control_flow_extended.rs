@@ -454,12 +454,9 @@ fn loop_one_hundred_thousand_iters_does_not_trap_under_normal_deadline() {
         t(Op::Return),
     ];
     let ir = legacy_module(body, vec![IrType::I64]);
-    let evaluator = AotEvaluator::from_ir_direct(
-        ir,
-        SandboxConfig::default(),
-        vec!["unused".to_string()],
-    )
-    .expect("compile");
+    let evaluator =
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["unused".to_string()])
+            .expect("compile");
     // Generous deadline so the cadence guard never fires.
     evaluator.set_deadline(Duration::from_secs(60));
 
@@ -516,12 +513,9 @@ fn loop_traps_when_deadline_elapses_during_iteration() {
         t(Op::Return),
     ];
     let ir = legacy_module(body, vec![IrType::I64]);
-    let evaluator = AotEvaluator::from_ir_direct(
-        ir,
-        SandboxConfig::default(),
-        vec!["unused".to_string()],
-    )
-    .expect("compile");
+    let evaluator =
+        AotEvaluator::from_ir_direct(ir, SandboxConfig::default(), vec!["unused".to_string()])
+            .expect("compile");
     evaluator.set_deadline(Duration::from_nanos(0));
     std::thread::yield_now();
 

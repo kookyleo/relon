@@ -54,8 +54,8 @@ fn cached_cold_start_dispatches_now_helper_through_vtable() {
     let cache = tempdir().expect("tempdir");
     let src = "#main(Int x, Int y) -> Int\nx + y";
 
-    let warm = AotEvaluator::from_source_with_cache(src, cache.path())
-        .expect("from_source_with_cache");
+    let warm =
+        AotEvaluator::from_source_with_cache(src, cache.path()).expect("from_source_with_cache");
     // Sanity: the warm evaluator answers correctly.
     let mut args = HashMap::new();
     args.insert("x".to_string(), Value::Int(7));
@@ -65,8 +65,7 @@ fn cached_cold_start_dispatches_now_helper_through_vtable() {
     drop(warm);
 
     // Cache hit -> dlopen-exec path.
-    let opt =
-        AotEvaluator::from_cache_dir(src, cache.path()).expect("from_cache_dir result");
+    let opt = AotEvaluator::from_cache_dir(src, cache.path()).expect("from_cache_dir result");
     let cached = opt.expect("cache hit");
     let cached_out = cached.run_main(args).expect("cached run_main");
     assert_eq!(cached_out, Value::Int(12));

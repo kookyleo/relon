@@ -19,9 +19,7 @@
 
 use std::os::unix::fs::PermissionsExt;
 
-use relon_codegen_native::{
-    object_cache_integration as cache_int, AotEvaluator, SandboxConfig,
-};
+use relon_codegen_native::{object_cache_integration as cache_int, AotEvaluator, SandboxConfig};
 
 fn corpus_source() -> &'static str {
     "#main(Int x, Int y) -> Int\nx + y"
