@@ -632,16 +632,19 @@ pub enum Backend {
     /// to exercise the resume-from-deopt path without paying the
     /// cranelift cold-start cost.
     Bytecode,
-    /// Phase A LLVM-AOT backend bootstrap. Lowers a pre-lowered IR
-    /// module through the inkwell-backed emitter into native machine
-    /// code via LLVM 18's MCJIT engine. The Phase A envelope is the
-    /// cranelift crate's legacy-i64 shape (`(I64...) -> I64`); any
-    /// `from_source` path that produces buffer-protocol IR is
-    /// rejected with `BackendError::LlvmAot`. Phase B widens the
-    /// emitter past this envelope and adds `from_source` parity.
-    /// Gated on the `llvm-aot` cargo feature (off by default) so
-    /// hosts that do not have LLVM 18 dev headers on the build box
-    /// do not regress the workspace `cargo build`.
+    /// Phase B LLVM-AOT backend. Lowers `.relon` source through the
+    /// inkwell-backed emitter into native machine code via LLVM 18's
+    /// MCJIT engine. Accepts both the legacy-i64 hand-built IR
+    /// shape (used by direct-IR tests) and the buffer-protocol
+    /// shape `lower_workspace_single` emits for every user source —
+    /// the cmp_lua W1 / W2 production envelope (`list.sum(range(n))`,
+    /// `list.sum(range(n).map(...))`) round-trips through this path.
+    /// Sources past Phase B's op coverage (stdlib calls beyond
+    /// peephole-inlined shapes, schema-method dispatch, closures past
+    /// peephole) surface as `BackendError::LlvmAot`. Gated on the
+    /// `llvm-aot` cargo feature (off by default) so hosts that do
+    /// not have LLVM 18 dev headers on the build box do not regress
+    /// the workspace `cargo build`.
     LlvmAot,
 }
 
@@ -720,18 +723,25 @@ pub fn new_evaluator(
                 .map_err(|e| BackendError::Bytecode(e.to_string()))?;
             Ok(Box::new(ev))
         }
-        // Phase A LLVM-AOT: from_source through
-        // `lower_workspace_single` produces buffer-protocol IR which
-        // the Phase A emitter rejects. Surface a clear "not yet"
-        // message so the host knows to either drop back to
-        // `Backend::CraneliftAot` or wait for Phase B; the LLVM
-        // crate's `from_ir_direct` path is reachable for the
-        // bootstrap test alone.
+        // Phase B LLVM-AOT: `from_source` wired up through the
+        // buffer-protocol emitter. Sources outside the W1 / W2
+        // production envelope (closures past peephole, schema-
+        // method dispatch, stdlib calls beyond inlined ones) surface
+        // as `BackendError::LlvmAot` with the underlying
+        // `LlvmError::Codegen` reason — the host can fall back to
+        // `Backend::CraneliftAot` for those.
+        #[cfg(feature = "llvm-aot")]
+        Backend::LlvmAot => {
+            let ev = relon_codegen_llvm::LlvmAotEvaluator::from_source(source)
+                .map_err(|e| BackendError::LlvmAot(e.to_string()))?;
+            Ok(Box::new(ev))
+        }
+        #[cfg(not(feature = "llvm-aot"))]
         Backend::LlvmAot => Err(BackendError::LlvmAot(
-            "Phase A bootstrap: `from_source` not wired yet — \
-             use `Backend::CraneliftAot` for source-driven AOT or \
-             construct an `LlvmAotEvaluator::from_ir_direct` against \
-             a pre-lowered IR module for the bootstrap envelope"
+            "this build was compiled without the `llvm-aot` feature; \
+             rebuild with `--features llvm-aot` (requires LLVM 18 \
+             dev headers and the `LLVM_SYS_181_PREFIX` env var) to \
+             enable the backend"
                 .to_string(),
         )),
     }

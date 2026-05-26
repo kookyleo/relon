@@ -1,42 +1,63 @@
-//! LLVM-backed AOT evaluator for Relon. **Phase A bootstrap.**
+//! LLVM-backed AOT evaluator for Relon. **Phase B production envelope.**
 //!
-//! This crate is the first slice of the dual-backend strategy
+//! This crate is the second slice of the dual-backend strategy
 //! decided in Phase A: cranelift keeps the trace-JIT throne
-//! (`relon-codegen-native`) and a new LLVM AOT pipeline starts here
-//! aimed at chasing Rust-native peak performance.
+//! (`relon-codegen-native`) and the LLVM AOT pipeline here chases
+//! Rust-native peak performance for the `#main` entry path.
 //!
-//! ## Scope (Phase A)
+//! ## Scope (Phase B)
 //!
-//! - Single `#main(Int...) -> Int` entry shape (the legacy-i64
-//!   envelope the cranelift crate's `from_ir_direct` path consumes).
-//! - Ops: `ConstI64` / `ConstI32` / `ConstBool` literals, `LocalGet`
-//!   for parameter access, binary arithmetic
-//!   (`Add` / `Sub` / `Mul`) on `I64`, and `Return`.
-//! - Drives LLVM's MCJIT engine in-process so the bootstrap test can
-//!   round-trip an IR module → emitted LLVM IR → native code →
-//!   typed return value without leaving the test binary.
+//! - Two entry shapes accepted:
+//!   - **Legacy-i64** (`(I64...) -> I64`) for `from_ir_direct`
+//!     callers (tests, bench fixtures) — the Phase A bootstrap
+//!     envelope, retained for cross-backend comparison.
+//!   - **Buffer-protocol** (`(*state, i32, i32, i32, i32, i64) -> i32`)
+//!     for `from_source` callers. Matches the cranelift backend's
+//!     `EntryShape::BufferProtocol` so the runtime envelopes line up.
+//! - Source-driven pipeline (`from_source`): parse + analyze +
+//!   lower (`relon_ir::lower_workspace_single`) + LLVM emit + JIT
+//!   compile + per-call arena dispatch. The cmp_lua W1 / W2
+//!   workloads (list.sum(range(n)) / list.sum(range(n).map(...))) go
+//!   end-to-end through this path.
+//! - Op set covers what `lower_workspace_single` synthesises for
+//!   the W1 / W2 shape after the IR's `range_pipeline` peephole has
+//!   collapsed `range.map.sum` into a single accumulator loop:
+//!   `LocalGet`, `ConstI64` / `ConstI32` / `ConstBool`, `LetGet` /
+//!   `LetSet`, `LoadField` / `StoreField` (scalar slots),
+//!   `Add` / `Sub` / `Mul` / `Div` / `Mod` / `BitAnd` (I32 + I64),
+//!   `Eq` / `Ne` / `Lt` / `Le` / `Gt` / `Ge`, structured control flow
+//!   (`Block` / `Loop` / `Br` / `BrIf` / `If`), and `Return`. The IR's
+//!   peephole turns `list.sum` / `list.map` / `iter.len` into the
+//!   above op set directly — no stdlib call indirection needed.
 //!
-//! Everything past the Phase A envelope (LetSet / Block / Loop /
-//! Call / closures / stdlib / sandbox vtable / object cache) is
-//! deferred to Phase B/C. The cranelift crate covers those today;
-//! the LLVM emitter widens behind feature work tracked in the
-//! design notes.
+//! Everything past the Phase B envelope (sandbox traps, pointer-
+//! indirect StoreField, MakeClosure / CallClosure, schema-method
+//! dispatch, stdlib call surfaces beyond peephole-inlined shapes)
+//! stays parked on the cranelift backend. Phase C widens the emitter
+//! when the cmp_lua W3..W12 work calls for it.
 //!
 //! ## What this crate deliberately does **not** do today
 //!
-//! - **Sandbox / capability vtable** — the cranelift crate's
-//!   `SandboxState` / `__relon_capability_vtable` integration stays
-//!   put. Phase B introduces the equivalent helper-call surface
-//!   through inkwell's `add_function` + `ExecutionEngine::add_global_mapping`.
-//! - **`.o` / `.so` emit + dlopen** — the Phase A bootstrap uses
-//!   the in-process MCJIT engine. Phase A.4 keeps the surface
-//!   single-knob so we can swap MCJIT for ORC + write-to-file
-//!   without breaking the [`LlvmAotEvaluator`] API.
-//! - **Buffer-protocol entry** — `lower_workspace_single` always
-//!   emits buffer-protocol IR (`[I32, I32, I32, I32, I64] -> I32`).
-//!   The cranelift crate handles that envelope today; the LLVM
-//!   crate's `from_source` path is therefore stubbed until Phase B
-//!   adds the matching emitter.
+//! - **Sandbox traps / capability vtable** — Phase B does not emit
+//!   `__relon_raise_trap` / capability-bit checks. `Div(I64)` /
+//!   `Mod(I64)` lower to LLVM's `sdiv` / `srem`, which are UB on
+//!   div-by-zero and produce host-level signals. Bounds checks on
+//!   `LoadField` / `StoreField` are also omitted (the host owns the
+//!   arena and the IR's static offsets fit). Phase C wires the
+//!   helper-call surface for sandbox parity.
+//! - **`.o` / `.so` emit + dlopen** — Phase B still uses the
+//!   in-process MCJIT engine. The single-knob `OptimizationLevel`
+//!   API hides the engine choice so Phase C / ORC migration is a
+//!   localised diff.
+//! - **Pointer-indirect StoreField** — Phase B accepts only scalar
+//!   `LoadField` / `StoreField` (I32 / I64 / F64 / Bool / Null). The
+//!   IR's tail-cursor protocol for String / ListInt returns stays on
+//!   the cranelift backend. W1 / W2 only emit scalar Int returns,
+//!   so this is sufficient for the Phase B target workloads.
+//! - **MakeClosure / CallClosure** — the IR's `range.map(...).sum`
+//!   peephole inlines the closure body directly into the loop, so
+//!   no first-class closure surface is needed. Closures past the
+//!   peephole (W3 / W4 / W9) move with Phase C.
 //!
 //! ## Decision log (Phase A.1)
 //!
@@ -58,6 +79,7 @@
 mod emitter;
 mod error;
 mod evaluator;
+mod state;
 
 pub use error::LlvmError;
 pub use evaluator::LlvmAotEvaluator;

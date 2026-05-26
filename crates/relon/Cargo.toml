@@ -19,6 +19,12 @@ categories = ["config", "parsing", "compilers"]
 # dependency tree.
 default = ["cranelift-aot"]
 cranelift-aot = ["dep:relon-codegen-native"]
+# Phase B LLVM-AOT backend. Off by default because the build requires
+# LLVM 18 dev headers on the host (env `LLVM_SYS_181_PREFIX`). Hosts
+# that have the toolchain on the box opt in with
+# `--features llvm-aot`; CI dispatches build-conditional on the
+# matching machine.
+llvm-aot = ["dep:relon-codegen-llvm"]
 
 [dependencies]
 relon-evaluator = { workspace = true }
@@ -30,6 +36,10 @@ relon-analyzer = { workspace = true }
 # backend retired in stage 4 this is the only AOT path; default-on
 # above means native hosts get it without opting in.
 relon-codegen-native = { workspace = true, optional = true }
+# Phase B LLVM-AOT backend (off-by-default, gated by the `llvm-aot`
+# feature). Pulled in only when the host has LLVM 18 dev headers on
+# the build box — see the feature comment above.
+relon-codegen-llvm = { workspace = true, optional = true }
 # v6-δ M2-A: stack-based bytecode VM as a third evaluator backend.
 # Always-on (no feature gate) because the crate has no native-only
 # dependencies and the wasm32 build needs it for `Backend::Bytecode`
