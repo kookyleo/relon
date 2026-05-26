@@ -68,3 +68,14 @@ Task #265 → completed。剩 #263/#264/#266 in_progress。
 - Honest scope-out: 真 perf lift 等 #264 surface 扩到位
 
 Task #263 → completed。剩 #264/#266 in_progress。Bench 留 #264 完工后一次性回归。
+
+### Iteration 9 (2026-05-26 ~12:30, #264 完工)
+
+**#264 (IR lowering surface) 完工** + cherry-pick 5 commits (`3a72486..8d457f6`)。
+- W2/W3/W4/W6 source 从 n/a → OK (peephole + reduce + strict-mode drop)
+- W5/W7/W8/W9/W10 scope-out (Dict return + user closures = multi-week)
+- 三关 clean
+
+Task #264 → completed。剩仅 #266 W5 RCA。
+
+Release bench `cmp_lua-7cf7725a808de0d5` 编出，md5 `8b70640796d9fac1d4fc33f6f664f494`。**scp 到 s90 失败：host key changed** —— 等用户确认绕过。Bench 回归测试暂搁。
