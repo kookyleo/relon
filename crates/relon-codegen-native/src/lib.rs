@@ -105,6 +105,7 @@ pub use object_cache_integration::{
     compute_source_hash, default_cache_dir, emit_module_object_bytes, host_target_triple,
     ir_cache_path_for, LoadedCache, GENERATOR_VERSION,
 };
+pub use relon_trace_abi::TraceContext;
 pub use sandbox::{
     CapabilityVtable, HostFnPtr, SandboxConfig, SandboxState, TrapKind, STATE_OFFSET_ARENA_BASE,
     STATE_OFFSET_ARENA_LEN, STATE_OFFSET_DEADLINE_NS, STATE_OFFSET_TAIL_CURSOR,
@@ -114,10 +115,9 @@ pub use trace_inline::{compile_inline_host_fn, InlineHostFn, InlineHostFnError};
 pub use trace_install::{
     clear_recording, default_host_hooks, global_trace_jit_state, hot_counter_peek,
     hot_counter_reset, hot_counter_reset_all, hot_counters_base, install_recorder_trace_warmup,
-    jump_helper_call_count, recording_registration_count, register_recording,
-    register_trace_runtime_symbols, reset_jump_helper_call_count, JITedTraceFn,
-    RecordingRegistration, TraceEntryFn, TraceJitError, TraceJitState, HOT_COUNTERS_SYMBOL,
-    MAX_FN_ID, RELON_HOT_THRESHOLD, TINY_TRACE_OP_THRESHOLD,
+    install_recorder_trace_warmup_with_offset_map, jump_helper_call_count,
+    recording_registration_count, register_recording, register_trace_runtime_symbols,
+    reset_jump_helper_call_count, JITedTraceFn, RecordingRegistration, TraceEntryFn, TraceJitError,
+    TraceJitState, HOT_COUNTERS_SYMBOL, MAX_FN_ID, RELON_HOT_THRESHOLD, TINY_TRACE_OP_THRESHOLD,
 };
-pub use relon_trace_abi::TraceContext;
 pub use trace_recording::{RecordingOutcome, StackCell, TraceRecordingEvaluator};

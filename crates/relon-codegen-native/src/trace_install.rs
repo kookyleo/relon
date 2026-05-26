@@ -1591,6 +1591,33 @@ pub fn install_recorder_trace_warmup(
     param_tys: Vec<relon_ir::IrType>,
     warmup_args: &[u64],
 ) -> Result<std::sync::Arc<JITedTraceFn>, String> {
+    install_recorder_trace_warmup_with_offset_map(
+        fn_id,
+        body,
+        param_tys,
+        std::collections::BTreeMap::new(),
+        warmup_args,
+    )
+}
+
+/// Same as [`install_recorder_trace_warmup`] but takes the
+/// production-lowered `field_offset_to_local` map.
+///
+/// Hosts that drive the recorder against a production-lowered IR
+/// body (where `Op::LoadField` / `Op::LoadStringPtr` reads use
+/// schema-driven byte offsets instead of synthetic `Op::LocalGet`
+/// slots) need the offset map so the recorder walker's
+/// `step_load_field` resolves each no-base read to the matching
+/// `LocalGet(slot)` instead of underflowing the operand stack.
+/// Hand-built fixtures whose body uses `Op::LocalGet(idx)` directly
+/// pass an empty map (or call the offset-less wrapper above).
+pub fn install_recorder_trace_warmup_with_offset_map(
+    fn_id: u32,
+    body: Vec<relon_ir::TaggedOp>,
+    param_tys: Vec<relon_ir::IrType>,
+    field_offset_to_local: std::collections::BTreeMap<u32, u32>,
+    warmup_args: &[u64],
+) -> Result<std::sync::Arc<JITedTraceFn>, String> {
     if warmup_args.len() != param_tys.len() {
         return Err(format!(
             "warmup_args.len() = {} must match param_tys.len() = {}",
@@ -1614,7 +1641,12 @@ pub fn install_recorder_trace_warmup(
             .map(|(i, ty)| (warmup_args[i], *ty))
             .collect();
         let mut recorder = relon_trace_recorder::RecorderState::new();
-        let outcome = crate::TraceRecordingEvaluator::record_and_run(&mut recorder, &args, &body);
+        let outcome = crate::TraceRecordingEvaluator::record_and_run_with_offset_map(
+            &mut recorder,
+            &args,
+            &body,
+            field_offset_to_local.clone(),
+        );
         if let crate::RecordingOutcome::Aborted { reason, .. } = outcome {
             return Err(format!(
                 "recorder aborted while walking IR fixture for fn_id {fn_id}: {reason:?}"
@@ -1627,7 +1659,7 @@ pub fn install_recorder_trace_warmup(
         RecordingRegistration {
             body,
             param_tys,
-            ..Default::default()
+            field_offset_to_local,
         },
     );
     // SAFETY: `warmup_args.as_ptr()` is valid for `warmup_args.len()`

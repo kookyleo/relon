@@ -205,6 +205,72 @@ fn w9_nested_inline_runs_correctly() {
     assert_eq!(v, Value::Int(expected));
 }
 
+/// Run W1 / W2 / W3 / W4 production sources through the bytecode VM
+/// end-to-end and assert the answers match the cmp_lua bench's
+/// expected analytics. The bench harness's `try_build_bytecode` row
+/// fails closed on any `BackendError::Bytecode`, so each of these
+/// being `Ok` + producing the right answer is what unlocks the
+/// `relon_bytecode` panel row from `n/a (UnsupportedOp)` to a real
+/// number. The audit that drove this work-item assumed these were
+/// still rejected at the bytecode layer; in fact they accept already
+/// (the W1-W4 lowering pipeline runs them through `compile_inline_call`
+/// + the structured-control-flow lowering for `range`/`map`/`sum`/
+///   `reduce`/`filter`/`len`/`contains`/`str_concat`).
+#[test]
+fn w1_production_source_runs_through_bytecode() {
+    let src = "#import list from \"std/list\"\n#main(Int n) -> Int\nlist.sum(range(n))";
+    let ev = BytecodeEvaluator::from_source(src).expect("compile W1");
+    let n: i64 = 1_000;
+    let mut args = HashMap::new();
+    args.insert("n".to_string(), Value::Int(n));
+    let v = ev.run_main(args).expect("run W1");
+    assert_eq!(v, Value::Int(n * (n - 1) / 2));
+}
+
+#[test]
+fn w2_production_source_runs_through_bytecode() {
+    let src = "#import list from \"std/list\"\n\
+               #main(Int n) -> Int\n\
+               list.sum(range(n).map((i) => (i + 1) * (i + 2)))";
+    let ev = BytecodeEvaluator::from_source(src).expect("compile W2");
+    let n: i64 = 1_000;
+    let mut args = HashMap::new();
+    args.insert("n".to_string(), Value::Int(n));
+    let v = ev.run_main(args).expect("run W2");
+    let expected: i64 = (0..n).map(|i| (i + 1) * (i + 2)).sum();
+    assert_eq!(v, Value::Int(expected));
+}
+
+#[test]
+fn w3_production_source_runs_through_bytecode() {
+    let src = "#import list from \"std/list\"\n\
+               #main(Int n) -> String\n\
+               range(n).map((i) => \"a\").reduce(\"\", (acc, s) => acc + s)";
+    let ev = BytecodeEvaluator::from_source(src).expect("compile W3");
+    let n: i64 = 64;
+    let mut args = HashMap::new();
+    args.insert("n".to_string(), Value::Int(n));
+    let v = ev.run_main(args).expect("run W3");
+    let expected = "a".repeat(n as usize);
+    assert_eq!(v, Value::String(expected.into()));
+}
+
+#[test]
+fn w4_production_source_runs_through_bytecode() {
+    let src = "#import list from \"std/list\"\n\
+               #main(Int n) -> Int\n\
+               range(n)\n\
+                 .map((i) => \"axb\")\n\
+                 .filter((s) => s.contains(\"x\"))\n\
+                 .len()";
+    let ev = BytecodeEvaluator::from_source(src).expect("compile W4");
+    let n: i64 = 256;
+    let mut args = HashMap::new();
+    args.insert("n".to_string(), Value::Int(n));
+    let v = ev.run_main(args).expect("run W4");
+    assert_eq!(v, Value::Int(n));
+}
+
 /// Verify the inline-rewritten W10 source returns the right value through
 /// the bytecode VM. Mirrors the cmp_lua bench's `w10_expected` analytic.
 #[test]

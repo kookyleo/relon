@@ -73,11 +73,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "cranelift-aot")]
+use relon_codegen_native::TraceContext;
 use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
 use relon_evaluator::TreeWalkEvaluator;
 use relon_parser::Node;
-#[cfg(feature = "cranelift-aot")]
-use relon_codegen_native::TraceContext;
 
 use crate::BackendError;
 
@@ -223,8 +223,7 @@ pub struct JitEvaluator {
 /// cache can reuse the same `Vec` across `run_main` calls without
 /// reallocating per invocation.
 #[cfg(feature = "cranelift-aot")]
-pub type TraceFixturePackFn =
-    Arc<dyn Fn(&HashMap<String, Value>, &mut Vec<u64>) + Send + Sync>;
+pub type TraceFixturePackFn = Arc<dyn Fn(&HashMap<String, Value>, &mut Vec<u64>) + Send + Sync>;
 /// Trace-fixture fallback closure type alias. Invoked when the
 /// installed trace deopts (loop-exit guard, type-check failure,
 /// etc.) — returns the analytic answer for the input arg slice.
@@ -571,33 +570,65 @@ fn wire_trace_tier(
         return (None, None);
     };
 
-    // Convert the bytecode VM's compiled op stream back into the
-    // recorder-friendly IR `TaggedOp` form. The lowered IR we'd get
-    // straight out of `lower_workspace_single` is wasm-handshake
-    // shaped (params `[i32, i32, i32, i32, i64]`, body uses
-    // `LoadField` against an `in_ptr` the wasm host materialises) —
-    // the bytecode VM's call ABI passes args as a packed `u64`
-    // slice instead, so the recorder body needs to read user args
-    // through `Op::LocalGet(slot_idx)`. The bytecode compile pass
-    // already did exactly that translation when it produced
-    // `BcOp::LocalGet(i)` / `BcOp::LocalSet(i)`; we just project the
-    // BcOp stream into the recorder's IR-Op vocabulary and re-use
-    // the recorder/emitter pipeline.
+    // Two recorder-body sources are wired through this seam:
     //
-    // The converter only handles the M2-A scalar straight-line
-    // envelope (arith / cmp / const / local / return). Anything
-    // with a jump or call bails out so the wrapper degrades to
-    // bytecode-only without installing a trace whose recorder walk
-    // would abort anyway.
-    let recorder_body = match bcops_to_recorder_body(&ev.function().ops) {
-        Some(b) => b,
-        None => {
-            tracing::debug!(
-                target: "relon::jit_evaluator",
-                "tier escalation: bytecode body contains ops outside the trace-recorder envelope (jumps / calls / etc); skipping trace install"
-            );
-            return (Some(Box::new(ev) as Box<dyn Evaluator>), None);
-        }
+    // * **IR path** — the production-lowered IR body the bytecode
+    //   compile pass walked, exposed verbatim via
+    //   `recording_registration_data()` (structured `Block` / `Loop` /
+    //   `BrIf` / `LoadField` / `Op::Call` form). The recorder's
+    //   `step_*` walker handles every op in this shape and PC alignment
+    //   with the bytecode's `ir_pc_map` holds by construction. Used
+    //   for any source whose body contains an `Op::Loop` and matches
+    //   the Int-return / no-`Op::If` envelope.
+    //
+    // * **BcOp legacy path** — projects the bytecode VM's compiled op
+    //   stream onto a flat recorder body. Kept in place for the
+    //   straight-line scalar shapes (`x + x + x + ... + x`-style
+    //   chains) the existing `hot_loop_escalates_to_trace_tier` pin
+    //   exercises; those bodies have no loop to expose to the IR path.
+    //
+    // Correctness gate: after the IR-path recorder is registered + the
+    // trace lands via [`install_recorder_trace_warmup`], the wrapper
+    // runs the trace once with a tiny synthetic arg and compares the
+    // result against the bytecode VM's answer. Any mismatch — for
+    // bodies where the trace recorder + emitter pipeline hits a
+    // post-loop SSA propagation gap not currently caught by the
+    // pre-install structural predicates — invalidates the trace,
+    // releases the `fn_id`, and falls back to the bytecode-only tier.
+    // This keeps the auto-escalation honest: `JitTier::Trace` is only
+    // reported when a future `run_main` would observe a result
+    // equivalent to the bytecode tier's.
+    let registration_data = ev.recording_registration_data();
+    let use_ir_path = ir_body_is_recorder_safe(&registration_data.body);
+
+    let (recorder_body, param_tys, field_offset_to_local) = if use_ir_path {
+        (
+            registration_data.body.clone(),
+            registration_data.param_tys.clone(),
+            registration_data.field_offset_to_local.clone(),
+        )
+    } else {
+        let body = match bcops_to_recorder_body(&ev.function().ops) {
+            Some(b) => b,
+            None => {
+                tracing::debug!(
+                    target: "relon::jit_evaluator",
+                    "tier escalation: bytecode body contains ops outside the trace-recorder envelope (jumps / calls / etc) and the IR-path predicate did not match; skipping trace install"
+                );
+                return (Some(Box::new(ev) as Box<dyn Evaluator>), None);
+            }
+        };
+        let tys = match user_param_tys_from_source(source) {
+            Some(tys) => tys,
+            None => {
+                tracing::debug!(
+                    target: "relon::jit_evaluator",
+                    "tier escalation: user-param type recovery failed; skipping trace install"
+                );
+                return (Some(Box::new(ev) as Box<dyn Evaluator>), None);
+            }
+        };
+        (body, tys, std::collections::BTreeMap::new())
     };
 
     // Sympathetic-gate against the runtime trace dispatcher's
@@ -612,11 +643,12 @@ fn wire_trace_tier(
     // for trivial bodies keeps those rows at bytecode-equivalent
     // speed instead of paying for a trace that never dispatches.
     //
-    // Loops + multi-statement bodies clear the gate easily once
-    // recorder support widens past straight-line; until then the
-    // gate makes the JIT escalation a pure win (no slowdown on
-    // bodies it can't help) at the cost of leaving W12-shape
-    // single-expression mains on the bytecode tier.
+    // For the IR-path branch this counts top-level IR ops (a single
+    // `Op::Block` wraps a loop, so the count stays modest); for the
+    // legacy BcOp branch it counts post-lowering bytecode ops. Both
+    // are >= 8 for the workloads we want to escalate; trivial bodies
+    // (`x + 1`-shape) lower to fewer ops on either branch and stay on
+    // the bytecode tier.
     if recorder_body.len() < relon_codegen_native::TINY_TRACE_OP_THRESHOLD {
         tracing::debug!(
             target: "relon::jit_evaluator",
@@ -627,16 +659,6 @@ fn wire_trace_tier(
         return (Some(Box::new(ev) as Box<dyn Evaluator>), None);
     }
 
-    let param_tys = match user_param_tys_from_source(source) {
-        Some(tys) => tys,
-        None => {
-            tracing::debug!(
-                target: "relon::jit_evaluator",
-                "tier escalation: user-param type recovery failed; skipping trace install"
-            );
-            return (Some(Box::new(ev) as Box<dyn Evaluator>), None);
-        }
-    };
     let body = recorder_body;
 
     let Some(fn_id) = alloc_jit_fn_id() else {
@@ -666,9 +688,9 @@ fn wire_trace_tier(
     let prior = relon_codegen_native::register_recording(
         fn_id,
         relon_codegen_native::RecordingRegistration {
-            body,
-            param_tys,
-            ..Default::default()
+            body: body.clone(),
+            param_tys: param_tys.clone(),
+            field_offset_to_local,
         },
     );
     if prior.is_some() {
@@ -684,6 +706,90 @@ fn wire_trace_tier(
         );
     }
 
+    // Install-time correctness verification — only for the IR path.
+    //
+    // Drive [`install_recorder_trace_warmup`] once with a small Int
+    // arg, then invoke the freshly-installed trace and compare its
+    // result against the bytecode VM's answer for the same arg. If
+    // the trace mis-computes (e.g. the recorder/emitter pipeline
+    // exhibits a post-loop SSA propagation gap for this body shape),
+    // invalidate the trace + clear the registration + release the
+    // `fn_id` and return without wiring the trace hooks. The bytecode
+    // tier stays live so the host still gets a correct `run_main`.
+    //
+    // The verification arg is `n = 0` for Int-only `#main(Int n)`
+    // sources: that hits the zero-iteration boundary the recorder
+    // walks during its synchronous warmup pre-flight, then probes
+    // whether the installed trace's `result_slot` matches the
+    // bytecode VM's `unpack_return_slots` answer. For W2-shape
+    // bodies the analytic answer is `0` and the trace returns `0`
+    // → verification passes. For W1-shape bodies the trace incorrectly
+    // returns the recorder's intermediate value rather than the
+    // analytic answer; verification trips and the wrapper falls back
+    // to bytecode-only.
+    //
+    // We only run this on single-Int-arg sources (W1 / W2 / W4
+    // shape) — multi-arg or non-Int-arg sources skip the gate
+    // and just trust the IR-path wiring (matches the conservative
+    // posture from before the gate landed, with the caveat that
+    // correctness on those shapes still depends on the recorder/emit
+    // pipeline's own envelope checks).
+    if use_ir_path && param_tys.len() == 1 && matches!(param_tys[0], relon_ir::IrType::I64) {
+        // Probe with a small but >0 n so the recorded trace observes
+        // one or more loop iterations; using `n=0` would give the
+        // recorder a zero-iteration walk and leave the post-loop SSA
+        // propagation case untested. `n=32` matches the workload's
+        // hot-loop scale without paying many cycles for the
+        // verification itself.
+        let probe_n: i64 = 32;
+        let warmup_args = vec![probe_n as u64];
+
+        // Re-pull the offset map from the registration we just made —
+        // the warmup helper re-registers, so we hand it the map to
+        // carry forward.
+        let offset_map = registration_data.field_offset_to_local.clone();
+        match relon_codegen_native::install_recorder_trace_warmup_with_offset_map(
+            fn_id,
+            body.clone(),
+            param_tys.clone(),
+            offset_map,
+            &warmup_args,
+        ) {
+            Ok(_) => {
+                // Trace installed — verify its result matches the
+                // bytecode VM's analytic answer. Any mismatch
+                // invalidates the trace and falls the wrapper back to
+                // bytecode-only so users never observe a wrong-answer
+                // Trace tier.
+                let trace_result_ok =
+                    verify_installed_trace_against_bytecode(source, fn_id, &warmup_args, probe_n);
+                if !trace_result_ok {
+                    tracing::warn!(
+                        target: "relon::jit_evaluator",
+                        fn_id,
+                        "tier escalation: IR-path trace install verification failed; invalidating trace and falling back to bytecode-only"
+                    );
+                    let state = relon_codegen_native::global_trace_jit_state();
+                    let _ = state.invalidate_trace(fn_id);
+                    let _ = relon_codegen_native::clear_recording(fn_id);
+                    release_jit_fn_id(fn_id);
+                    return (Some(Box::new(ev) as Box<dyn Evaluator>), None);
+                }
+            }
+            Err(reason) => {
+                tracing::debug!(
+                    target: "relon::jit_evaluator",
+                    fn_id,
+                    reason = %reason,
+                    "tier escalation: IR-path warmup install failed; falling back to bytecode-only"
+                );
+                let _ = relon_codegen_native::clear_recording(fn_id);
+                release_jit_fn_id(fn_id);
+                return (Some(Box::new(ev) as Box<dyn Evaluator>), None);
+            }
+        }
+    }
+
     let trigger: relon_bytecode::HotTraceTriggerHandle =
         Arc::new(relon_codegen_native::CraneliftHotTrigger);
     let lookup: relon_bytecode::InstalledTraceLookupHandle =
@@ -694,6 +800,130 @@ fn wire_trace_tier(
         .with_trace_lookup(lookup);
 
     (Some(Box::new(ev_wired) as Box<dyn Evaluator>), Some(fn_id))
+}
+
+/// Compare the installed trace fn's answer against the bytecode VM's
+/// for `probe_n`. Returns `true` iff both produce the same Int value.
+///
+/// The bytecode side runs a fresh `BytecodeEvaluator::from_source` —
+/// it doesn't share the per-instance trace hooks the wrapper is about
+/// to wire (no `with_trace_lookup`), so it stays on the bytecode
+/// dispatch loop and returns the analytic answer. The trace side
+/// invokes the installed JIT'd trace via the cranelift lookup adapter
+/// and lifts its `result_slot` via `try_invoke`.
+#[cfg(feature = "cranelift-aot")]
+fn verify_installed_trace_against_bytecode(
+    source: &str,
+    fn_id: u32,
+    warmup_args: &[u64],
+    probe_n: i64,
+) -> bool {
+    let _ = warmup_args;
+
+    // Bytecode reference run — a fresh `BytecodeEvaluator` with NO
+    // trace_lookup wired stays on the bytecode dispatch loop and
+    // computes the analytic answer directly.
+    let bytecode_answer = match relon_bytecode::BytecodeEvaluator::from_source(source) {
+        Ok(ev) => {
+            let mut args = HashMap::new();
+            args.insert("n".to_string(), Value::Int(probe_n));
+            match Evaluator::run_main(&ev, args) {
+                Ok(Value::Int(v)) => v,
+                _ => return false,
+            }
+        }
+        Err(_) => return false,
+    };
+
+    // Traced run — same source through a `BytecodeEvaluator` that
+    // carries the trace_lookup. Its `run_main` routes through
+    // `lookup.try_invoke(fn_id, &packed)` and, on Success, returns
+    // `pack_trace_result(result)` directly; on Deopt, it calls
+    // `resume_from_deopt(args, &snapshot)` which steps the bytecode
+    // VM from the snapshot's `bc_idx`. This exactly mirrors what
+    // the user-facing `run_main` will observe once the wrapper wires
+    // the trace tier, so a mismatch here is a real user-visible
+    // correctness gap.
+    let mut user_facing_args = HashMap::new();
+    user_facing_args.insert("n".to_string(), Value::Int(probe_n));
+    let traced_answer = match relon_bytecode::BytecodeEvaluator::from_source(source) {
+        Ok(ev_with_hooks) => {
+            let lookup_handle: relon_bytecode::InstalledTraceLookupHandle =
+                Arc::new(relon_codegen_native::CraneliftTraceLookup);
+            let ev_hooked = ev_with_hooks
+                .with_fn_id(fn_id)
+                .with_trace_lookup(lookup_handle);
+            match Evaluator::run_main(&ev_hooked, user_facing_args) {
+                Ok(Value::Int(v)) => v,
+                _ => return false,
+            }
+        }
+        Err(_) => return false,
+    };
+    traced_answer == bytecode_answer
+}
+
+/// Pre-install gate: returns `true` when the production-lowered IR
+/// `body` is one the trace recorder can walk end-to-end without
+/// hitting an `Unsupported`-class abort. Pairs with the post-install
+/// verification in [`wire_trace_tier`] — the predicate keeps the
+/// install path off shapes the recorder cannot start walking, the
+/// verifier covers shapes the recorder accepts but where the
+/// emit-side trace fn produces the wrong answer (e.g. post-loop
+/// SSA propagation gaps).
+///
+/// Accept rules:
+///
+/// * Body must contain an `Op::Loop` somewhere. The IR path's
+///   load-bearing affordance is the structured loop shape that
+///   production lowering produces for `range(...).fold(...)` /
+///   `map(...).filter(...).len()` etc.; bodies without a loop sit on
+///   the legacy BcOp path (which the existing
+///   `hot_loop_escalates_to_trace_tier` test pins for unrolled
+///   straight-line shapes).
+/// * No `Op::If` anywhere — the recorder lowering aborts on it
+///   (`UnsupportedOp("If")`).
+/// * No non-Int `StoreField` — the BcOp resume path for non-Int return
+///   shapes is still maturing; sources that need a String / Float /
+///   Bool / Null return install a recorder fixture explicitly via
+///   `install_trace_fixture`.
+#[cfg(feature = "cranelift-aot")]
+fn ir_body_is_recorder_safe(body: &[relon_ir::TaggedOp]) -> bool {
+    use relon_ir::{IrType, Op};
+
+    fn walk(ops: &[relon_ir::TaggedOp], saw_loop: &mut bool, bad: &mut bool) {
+        for tagged in ops {
+            if *bad {
+                return;
+            }
+            match &tagged.op {
+                Op::If { .. } => {
+                    *bad = true;
+                    return;
+                }
+                Op::StoreField { ty, .. } if !matches!(ty, IrType::I64) => {
+                    *bad = true;
+                    return;
+                }
+                Op::Loop { body, .. } => {
+                    *saw_loop = true;
+                    walk(body, saw_loop, bad);
+                }
+                Op::Block { body, .. } => {
+                    walk(body, saw_loop, bad);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut saw_loop = false;
+    let mut bad = false;
+    walk(body, &mut saw_loop, &mut bad);
+    if bad {
+        return false;
+    }
+    saw_loop
 }
 
 /// Recover the user-declared `#main` parameter IR types from a
@@ -1042,6 +1272,206 @@ mod tests {
             jit.active_tier(),
             JitTier::Trace,
             "after 2x DEFAULT_HOT_THRESHOLD invocations the trace must install and dispatcher must report Trace tier"
+        );
+    }
+
+    /// cmp_lua-W2-shape production source auto-escalation pin.
+    ///
+    /// Walks the W2 `list.sum(range(n).map((i) => (i+1)*(i+2)))`
+    /// **production source string** (no hand-built fixture) through
+    /// the auto-escalation path: the bytecode tier accepts the
+    /// stdlib-fold shape, the production-lowered IR body matches
+    /// `ir_body_is_recorder_safe`, the install-time correctness
+    /// verification confirms the trace's answer matches the bytecode
+    /// VM's for the probe arg, and the wrapper wires the trace hooks.
+    /// After the hot counter saturates, `active_tier()` reports
+    /// `JitTier::Trace` and `run_main` keeps returning the analytic
+    /// answer (`sum((i+1)*(i+2) for i in 0..n)`) across the
+    /// transition.
+    ///
+    /// Pins the end-to-end IR-path auto-escalation: a production loop
+    /// body (no hand-built fixture handoff) drives the recorder +
+    /// emitter + cranelift install pipeline + verification gate off
+    /// the source string. The accompanying W1 / W3 / W4 tests pin the
+    /// other branches of the wiring contract (verification rejects /
+    /// predicate rejects).
+    ///
+    /// Skipped when the `cranelift-aot` feature is off — there's no
+    /// trace install path without it.
+    #[cfg(feature = "cranelift-aot")]
+    #[test]
+    fn cmp_lua_w2_production_source_auto_escalates_to_trace() {
+        let src = "#import list from \"std/list\"\n\
+                   #main(Int n) -> Int\n\
+                   list.sum(range(n).map((i) => (i + 1) * (i + 2)))";
+        let jit = JitEvaluator::new(src).expect("build jit");
+        assert!(
+            jit.has_bytecode_tier(),
+            "W2 production source must accept the bytecode envelope"
+        );
+
+        let n: i64 = 32;
+        let target_iters = (relon_bytecode::DEFAULT_HOT_THRESHOLD as usize) * 2;
+        let mut last = Value::Null;
+        for _ in 0..target_iters {
+            let mut args = HashMap::new();
+            args.insert("n".to_string(), Value::Int(n));
+            last = jit.run_main(args).expect("run_main");
+        }
+        let expected: i64 = (0..n).map(|i| (i + 1) * (i + 2)).sum();
+        assert_eq!(last, Value::Int(expected));
+        assert_eq!(
+            jit.active_tier(),
+            JitTier::Trace,
+            "W2 must auto-escalate to Trace tier after 2x DEFAULT_HOT_THRESHOLD invocations"
+        );
+
+        // Vary n after escalation to prove the trace is computing the
+        // analytic answer (not just echoing the recorder's snapshot).
+        for &probe_n in &[1i64, 4, 16, 64] {
+            let mut args = HashMap::new();
+            args.insert("n".to_string(), Value::Int(probe_n));
+            let v = jit.run_main(args).expect("run_main");
+            let expected: i64 = (0..probe_n).map(|i| (i + 1) * (i + 2)).sum();
+            assert_eq!(
+                v,
+                Value::Int(expected),
+                "W2 trace must compute the analytic answer for n={probe_n}"
+            );
+        }
+    }
+
+    /// cmp_lua-W1-shape production source: the install-time
+    /// correctness verification gate catches that the trace fn's
+    /// `result_slot` for the production-lowered
+    /// `list.sum(range(n))` body returns 0 instead of the analytic
+    /// `n * (n - 1) / 2` (a post-loop SSA propagation gap inside the
+    /// recorder / emitter pipeline). The wrapper invalidates the
+    /// trace + clears the registration + releases the `fn_id` and
+    /// falls back to bytecode-only, so the user keeps observing the
+    /// correct answer for every `run_main` and `active_tier()` stays
+    /// at `Bytecode` even past the hot counter threshold.
+    ///
+    /// Pins the verification-gate fallback path: shapes the recorder
+    /// accepts (the pre-install predicate clears) but the emit-side
+    /// trace fn mis-computes must NOT advertise a Trace tier. Once
+    /// the underlying recorder/emitter gap closes, the verification
+    /// will pass and this test should flip to the
+    /// `cmp_lua_w2_production_source_auto_escalates_to_trace` shape
+    /// (Trace tier + correct value).
+    #[cfg(feature = "cranelift-aot")]
+    #[test]
+    fn cmp_lua_w1_production_source_correctness_gate_keeps_bytecode_tier() {
+        let src = "#import list from \"std/list\"\n#main(Int n) -> Int\nlist.sum(range(n))";
+        let jit = JitEvaluator::new(src).expect("build jit");
+        assert!(
+            jit.has_bytecode_tier(),
+            "W1 production source must accept the bytecode envelope"
+        );
+
+        let n: i64 = 32;
+        for _ in 0..3 {
+            let mut args = HashMap::new();
+            args.insert("n".to_string(), Value::Int(n));
+            let v = jit.run_main(args).expect("run_main");
+            assert_eq!(v, Value::Int(n * (n - 1) / 2));
+        }
+
+        let target_iters = (relon_bytecode::DEFAULT_HOT_THRESHOLD as usize) * 2;
+        let mut last = Value::Null;
+        for _ in 0..target_iters {
+            let mut args = HashMap::new();
+            args.insert("n".to_string(), Value::Int(n));
+            last = jit.run_main(args).expect("run_main");
+        }
+        // Verification gate invalidated the trace; user-observable
+        // answer stays correct, tier stays at Bytecode.
+        assert_eq!(last, Value::Int(n * (n - 1) / 2));
+        assert_ne!(
+            jit.active_tier(),
+            JitTier::Trace,
+            "W1 must NOT auto-escalate to Trace tier until the recorder/emitter post-loop SSA gap closes; the verification gate catches the wrong-answer trace"
+        );
+    }
+
+    /// cmp_lua-W4-shape production source: same correctness-gate
+    /// rejection as W1. The recorder lands a trace whose `result_slot`
+    /// surfaces the single-iteration filter count (1) instead of the
+    /// analytic `n`; the verification gate catches the mismatch and
+    /// falls back to bytecode-only.
+    #[cfg(feature = "cranelift-aot")]
+    #[test]
+    fn cmp_lua_w4_production_source_correctness_gate_keeps_bytecode_tier() {
+        let src = "#import list from \"std/list\"\n\
+                   #main(Int n) -> Int\n\
+                   range(n)\n\
+                     .map((i) => \"axb\")\n\
+                     .filter((s) => s.contains(\"x\"))\n\
+                     .len()";
+        let jit = JitEvaluator::new(src).expect("build jit");
+        assert!(
+            jit.has_bytecode_tier(),
+            "W4 production source must accept the bytecode envelope"
+        );
+
+        let n: i64 = 32;
+        for _ in 0..3 {
+            let mut args = HashMap::new();
+            args.insert("n".to_string(), Value::Int(n));
+            let v = jit.run_main(args).expect("run_main");
+            assert_eq!(v, Value::Int(n));
+        }
+
+        let target_iters = (relon_bytecode::DEFAULT_HOT_THRESHOLD as usize) * 2;
+        let mut last = Value::Null;
+        for _ in 0..target_iters {
+            let mut args = HashMap::new();
+            args.insert("n".to_string(), Value::Int(n));
+            last = jit.run_main(args).expect("run_main");
+        }
+        assert_eq!(last, Value::Int(n));
+        assert_ne!(
+            jit.active_tier(),
+            JitTier::Trace,
+            "W4 must NOT auto-escalate to Trace tier until the post-loop SSA gap closes"
+        );
+    }
+
+    /// cmp_lua-W3-shape **String-return** sources stay on the
+    /// bytecode tier even after the hot counter saturates.
+    ///
+    /// `ir_body_is_recorder_safe` rejects bodies whose final
+    /// `StoreField` carries a non-Int type, and the legacy BcOp path
+    /// bails on the body's `StrConcat` / `StrContains` ops. Neither
+    /// path wires a trace, so `active_tier()` stays at `Bytecode`.
+    ///
+    /// Hosts that need a Trace tier on a String-return shape today
+    /// install a recorder fixture via `install_trace_fixture`; the
+    /// bench panel's `relon_jit` W3 / W4_long_haystack rows use that
+    /// path.
+    #[cfg(feature = "cranelift-aot")]
+    #[test]
+    fn cmp_lua_w3_string_return_stays_on_bytecode_tier_pending_resume_widening() {
+        let src = "#import list from \"std/list\"\n\
+                   #main(Int n) -> String\n\
+                   range(n).map((i) => \"a\").reduce(\"\", (acc, s) => acc + s)";
+        let jit = JitEvaluator::new(src).expect("build jit");
+        assert!(
+            jit.has_bytecode_tier(),
+            "W3 production source must accept the bytecode envelope"
+        );
+
+        let target_iters = (relon_bytecode::DEFAULT_HOT_THRESHOLD as usize) * 2;
+        let n: i64 = 8;
+        for _ in 0..target_iters {
+            let mut args = HashMap::new();
+            args.insert("n".to_string(), Value::Int(n));
+            let _ = jit.run_main(args).expect("run_main");
+        }
+        assert_ne!(
+            jit.active_tier(),
+            JitTier::Trace,
+            "W3 (String return) must NOT auto-escalate to Trace tier; the recorder safety predicate rejects non-Int return shapes pending resume-rehydration widening"
         );
     }
 
