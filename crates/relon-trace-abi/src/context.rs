@@ -139,22 +139,30 @@ unsafe impl Sync for HostHookTable {}
 
 /// Slot count of the trace-local dict-lookup inline cache embedded
 /// in [`TraceContext::dict_lookup_ic`]. Power-of-two so cranelift
-/// can mask the slot index with a single `band` instead of a `urem`.
+/// can derive the slot index by taking the top `log2(N)` bits of a
+/// multiplicative-hash mix on `(dict_ptr ^ key_ptr)`.
 ///
 /// **Sizing rationale**: under the birthday-paradox bound the
 /// expected number of key-on-key collisions for `k` live keys in
 /// `N` slots is roughly `k² / (2N)`. With 10 hot keys (the W5 hot
-/// path) at `N = 16` that's ~3 expected collisions and a ~95%
-/// chance of at least one — manifesting as bimodal bench variance
-/// (some process invocations get clean key layouts, others
-/// thrash). At `N = 32` the expected collisions drop to ~1.6 and
-/// the at-least-one probability drops to ~74%; at `N = 64` it
-/// drops to ~50% and ~54% respectively. We pick 32 as the
-/// inflection where the variance reduction outweighs the
-/// per-context residency cost (32 × 24B = 768B per
-/// `TraceContext`, still well under one 4 KiB page even with the
-/// surrounding fields).
-pub const DICT_LOOKUP_IC_SLOT_COUNT: usize = 32;
+/// path):
+///
+/// | N   | E[collisions] | P[≥1 collision] | per-context IC |
+/// |-----|---------------|-----------------|----------------|
+/// |  16 | 3.1           | 95%             | 384 B          |
+/// |  32 | 1.6           | 74%             | 768 B          |
+/// |  64 | 0.78          | 49%             | 1536 B         |
+/// | 128 | 0.39          | 28%             | 3072 B         |
+///
+/// 16 was the original size; bumped to 32 (2026-05-25) and then to
+/// 64 (2026-05-26) as the W5 layout-variance RCA documented in
+/// `docs/internal/w5-variance-rca.md` quantified the
+/// per-collision cost (~25 µs added to the 84 µs no-collision
+/// floor). 64 slots gives ~50% chance of a clean fast-cluster run
+/// while keeping `TraceContext` under one 4 KiB page even with the
+/// surrounding fields (ssa_slots + result_slot + host_hooks +
+/// pending_recoverable_writes ≈ 200 B + 1536 B IC = 1.7 KB total).
+pub const DICT_LOOKUP_IC_SLOT_COUNT: usize = 64;
 
 /// One slot of the inline cache the cranelift emitter probes before
 /// calling `__relon_trace_dict_lookup_prechecked_v2`.

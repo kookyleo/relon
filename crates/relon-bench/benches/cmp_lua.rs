@@ -1106,6 +1106,28 @@ fn build_w5_fixture() -> W5Fixture {
     let dict_bytes = build_dict_record_v2(shape_hash, &entries);
     let key_record_ptrs: Vec<i64> = key_records.iter().map(|kr| kr.as_ptr() as i64).collect();
     let keys_list_bytes = build_flat_list_record(&key_record_ptrs);
+    if std::env::var_os("RELON_W5_KEYS_DUMP").is_some() {
+        let dict_addr = dict_bytes.as_ptr() as usize;
+        eprintln!("[cmp_lua W5] keys (dict=0x{dict_addr:016x}):");
+        for (i, kr) in key_records.iter().enumerate() {
+            let ka = kr.as_ptr() as usize;
+            // The inline IC probe uses (dict ^ key) >> 4 & 31 to pick
+            // the slot. Dump that index so we can see whether the 10
+            // hot keys cluster on a few cache lines or spread across
+            // the whole 768B IC array.
+            // Mirrors the cranelift emitter's IC probe formula
+            // (SplitMix64-class multiplier, top log2(N) bits).
+            let n_slots = relon_trace_abi::DICT_LOOKUP_IC_SLOT_COUNT;
+            let log2_slots = n_slots.trailing_zeros();
+            let mixed = ((dict_addr ^ ka) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15u64);
+            let slot = (mixed >> (64 - log2_slots)) as u32;
+            eprintln!(
+                "  key[{i}] ({}) addr=0x{ka:016x} ic_slot={slot:2} slot_off={}",
+                labels[i],
+                slot * 24,
+            );
+        }
+    }
     W5Fixture {
         dict_bytes,
         keys_list_bytes,
@@ -2650,6 +2672,20 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // criterion per-element cost still reflects the trace's
         // per-iter work, not the fallback's `O(1)` shortcut.
         let w5_fixture = build_w5_fixture();
+        // 2026-05-26 W5 layout RCA: dump fixture addresses up-front so
+        // we can correlate dict/key heap placement with cross-process
+        // timing variance.
+        if std::env::var_os("RELON_W5_FIXTURE_DUMP").is_some() {
+            let da = w5_fixture.dict_bytes.as_ptr() as usize;
+            let ka = w5_fixture.keys_list_bytes.as_ptr() as usize;
+            eprintln!(
+                "[cmp_lua W5] fixture dict=0x{da:016x} mod64={} mod4096={} keys=0x{ka:016x} mod64={} mod4096={}",
+                da % 64,
+                da % 4096,
+                ka % 64,
+                ka % 4096,
+            );
+        }
         // fn_id chosen outside the ranges other benches in the same
         // process use (cmp_lua and trace_jit_hot_loop both touch
         // `global_trace_jit_state`; W5 / W6 carve their own slots).
@@ -2714,6 +2750,28 @@ fn bench_cmp_lua(c: &mut Criterion) {
                     // priming it. Mirrors the W3 / W4 pattern that's
                     // been there since their recorder-driven rewrite.
                     let mut tctx = TraceContext::with_hooks(64, default_host_hooks());
+                    // 2026-05-26 W5 layout RCA: dump tctx + IC + ssa_slots
+                    // heap addresses once per iter_custom call so we can
+                    // correlate per-process layout with the cross-run
+                    // timing variance. The bench process re-enters this
+                    // closure on every criterion sample; the addresses
+                    // are stable across samples within one process so
+                    // dumping once via OnceLock is enough.
+                    if std::env::var_os("RELON_W5_TCTX_DUMP").is_some() {
+                        use std::sync::OnceLock;
+                        static DUMPED: OnceLock<()> = OnceLock::new();
+                        let _ = DUMPED.get_or_init(|| {
+                            let tctx_addr = &tctx as *const _ as usize;
+                            let ic_addr = tctx.dict_lookup_ic.as_ptr() as usize;
+                            let ssa_addr = tctx.ssa_slots.as_ptr() as usize;
+                            eprintln!(
+                                "[cmp_lua W5] tctx=0x{tctx_addr:016x} mod64={} ic=0x{ic_addr:016x} mod64={} ssa=0x{ssa_addr:016x} mod64={}",
+                                tctx_addr % 64,
+                                ic_addr % 64,
+                                ssa_addr % 64,
+                            );
+                        });
+                    }
                     let args: [u64; 3] = warm_args_w5;
                     let args_ptr = args.as_ptr();
                     let expected = w5_expected() as u64;
@@ -3337,55 +3395,34 @@ fn bench_cmp_lua(c: &mut Criterion) {
     let canonical_panel: &[(&str, &str, u64, ArgsFactory)] = &[
         ("W1_int_sum", w1_relon_src(), W1_N as u64, || args_w_n(W1_N)),
         ("W2_f64_dot", w2_relon_src(), W2_N as u64, || args_w_n(W2_N)),
-        (
-            "W3_string_concat",
-            w3_relon_src(),
-            STRING_CONCAT_N,
-            || args_w_n(STRING_CONCAT_N as i64),
-        ),
-        (
-            "W4_string_contains",
-            w4_relon_src(),
-            TREE_WALK_N,
-            || args_w_n(TREE_WALK_N as i64),
-        ),
-        (
-            "W4_long_haystack",
-            w4_relon_src(),
-            TREE_WALK_N,
-            || args_w_n(TREE_WALK_N as i64),
-        ),
-        (
-            "W5_dict_str_key",
-            w5_relon_src(),
-            TREE_WALK_N,
-            || args_w_n(TREE_WALK_N as i64),
-        ),
-        (
-            "W6_dict_num_key",
-            w6_relon_src(),
-            TREE_WALK_N,
-            || args_w_n(TREE_WALK_N as i64),
-        ),
+        ("W3_string_concat", w3_relon_src(), STRING_CONCAT_N, || {
+            args_w_n(STRING_CONCAT_N as i64)
+        }),
+        ("W4_string_contains", w4_relon_src(), TREE_WALK_N, || {
+            args_w_n(TREE_WALK_N as i64)
+        }),
+        ("W4_long_haystack", w4_relon_src(), TREE_WALK_N, || {
+            args_w_n(TREE_WALK_N as i64)
+        }),
+        ("W5_dict_str_key", w5_relon_src(), TREE_WALK_N, || {
+            args_w_n(TREE_WALK_N as i64)
+        }),
+        ("W6_dict_num_key", w6_relon_src(), TREE_WALK_N, || {
+            args_w_n(TREE_WALK_N as i64)
+        }),
         ("W7_fib", w7_relon_src(), FIB_N, || args_w_n(FIB_N as i64)),
-        (
-            "W8_poly_callsite",
-            w8_relon_src(),
-            TREE_WALK_N,
-            || args_w_n(TREE_WALK_N as i64),
-        ),
+        ("W8_poly_callsite", w8_relon_src(), TREE_WALK_N, || {
+            args_w_n(TREE_WALK_N as i64)
+        }),
         (
             "W9_nested_matrix",
             w9_relon_src(),
             W9_N as u64,
             w9_relon_n_arg,
         ),
-        (
-            "W10_config_eval",
-            w10_relon_src(),
-            CONFIG_QUERIES_N,
-            || args_w_n(CONFIG_QUERIES_N as i64),
-        ),
+        ("W10_config_eval", w10_relon_src(), CONFIG_QUERIES_N, || {
+            args_w_n(CONFIG_QUERIES_N as i64)
+        }),
         ("W12_p99_tail", w12_relon_src(), 1, || w12_relon_args(7)),
     ];
 

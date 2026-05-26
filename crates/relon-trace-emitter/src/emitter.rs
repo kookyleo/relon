@@ -1591,19 +1591,52 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
             .iconst(self.pointer_ty, i64::from(record_len));
 
         // --- IC probe ---------------------------------------------
-        // Slot index: mix the two pointers, discard the 4 low bits
-        // (both StringRef and dict records are at least 16-byte
-        // aligned, so the low nibble carries no entropy), mask down
-        // to the IC slot count.
+        // Slot index: mix the two pointers, then derive the slot
+        // index from the *top* bits of a multiplicative-hash mix.
+        //
+        // 2026-05-26 W5 layout RCA fix: the prior shape
+        // `(dict ^ key) >> 4 & (N - 1)` derived the slot purely from
+        // bits 4..(4 + log2(N)) of `dict ^ key`. For W5 the 10 hot
+        // string-record `key_ptr`s and the single `dict_ptr` all live
+        // in the same heap allocator region, so the XOR cancels the
+        // shared high bits and the surviving low bits carry the small
+        // intra-region offsets — bits with limited entropy. Different
+        // process restarts hit different (still-low-entropy)
+        // sub-patterns, producing a bimodal collision distribution
+        // (0..4 collisions across runs, 17..85% probability of any
+        // collision per launch). The collision count maps directly
+        // onto the bench's per-process timing cluster (0 collisions →
+        // 84 µs fast, 4 collisions → 192 µs slow).
+        //
+        // Switching to a Fibonacci-multiply mix (Knuth's golden-ratio
+        // constant `0x9E3779B97F4A7C15`, the standard SplitMix64-class
+        // multiplier) and picking the *top* `log2(N)` bits routes the
+        // full address entropy through the slot index. Birthday-style
+        // variance is then governed by the slot count alone, not the
+        // surviving-bit residual the XOR-shift mix leaked.
         let slot_count = crate::abi::dict_ic_slot_count();
         debug_assert!(
             slot_count.is_power_of_two(),
             "dict-lookup IC slot count must be a power of two"
         );
-        let mask = (slot_count - 1) as i64;
+        let log2_slots = slot_count.trailing_zeros();
+        debug_assert!(
+            log2_slots > 0 && log2_slots < 32,
+            "slot_count must satisfy 2 <= N <= 2^31; got {slot_count}"
+        );
+        let shift = (64 - log2_slots) as i64;
         let mix = self.builder.ins().bxor(dict_v, key_v);
-        let shifted = self.builder.ins().ushr_imm(mix, 4);
-        let masked = self.builder.ins().band_imm(shifted, mask);
+        // SplitMix64-style multiplier (Knuth's golden ratio in u64).
+        // Cranelift lowers a 64-bit `imul_imm` to a single `imul64`
+        // on x86_64 / AArch64 — no extra register pressure vs the
+        // prior `ushr_imm` + `band_imm` pair.
+        let mixed = self
+            .builder
+            .ins()
+            .imul_imm(mix, 0x9E37_79B9_7F4A_7C15u64 as i64);
+        // Top `log2_slots` bits — cranelift's `ushr_imm` accepts any
+        // positive shift amount up to the type width.
+        let masked = self.builder.ins().ushr_imm(mixed, shift);
         let slot_size = i64::from(crate::abi::dict_ic_slot_size());
         let scaled = self.builder.ins().imul_imm(masked, slot_size);
         let ic_base_off = i64::from(crate::abi::dict_lookup_ic_offset());
@@ -1638,10 +1671,10 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         // --- Hit: load cached value, jump to merge ----------------
         self.builder.switch_to_block(hit_block);
         self.builder.seal_block(hit_block);
-        let cached_val =
-            self.builder
-                .ins()
-                .load(I64, MemFlags::trusted(), slot_addr, cached_v_off);
+        let cached_val = self
+            .builder
+            .ins()
+            .load(I64, MemFlags::trusted(), slot_addr, cached_v_off);
         self.builder
             .ins()
             .jump(merge_block, &[BlockArg::Value(cached_val)]);

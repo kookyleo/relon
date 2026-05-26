@@ -1313,6 +1313,24 @@ impl TraceJitState {
             .map_err(|e| TraceJitError::Module(format!("finalize: {e}")))?;
         let fn_ptr = module.get_finalized_function(func_id);
 
+        // 2026-05-26 W5 layout RCA diagnostic: dump the finalised
+        // function entry address so we can correlate trace-JIT timings
+        // with low-bit alignment patterns. Gated on
+        // `RELON_TRACE_FN_ADDR_DUMP=1` so the production hot path
+        // remains print-free.
+        if std::env::var_os("RELON_TRACE_FN_ADDR_DUMP").is_some() {
+            let addr = fn_ptr as usize;
+            let op_count = optimized.ops.len();
+            eprintln!(
+                "[relon::trace_install] fn_id={fn_id} addr=0x{addr:016x} ops={op_count} mod16={} mod32={} mod64={} mod128={} mod4096={}",
+                addr % 16,
+                addr % 32,
+                addr % 64,
+                addr % 128,
+                addr % 4096,
+            );
+        }
+
         Ok(JITedTraceFn {
             fn_id,
             fn_ptr,
@@ -1635,6 +1653,25 @@ pub fn build_trace_jit_module() -> Result<JITModule, TraceJitError> {
     // approach the LuaJIT trace-tier range.
     let _ = flag_builder.set("enable_probestack", "false");
     let _ = flag_builder.set("preserve_frame_pointers", "false");
+    // 2026-05-26 W5 layout RCA: optional env-var override for trace
+    // function alignment. Default is 0 (cranelift x86_64 minimum = 1
+    // byte), which lets the OS allocator hand back arbitrary mod-64
+    // addresses across runs. Setting `RELON_TRACE_FN_ALIGN_LOG2=N`
+    // forces `2^N`-byte alignment on every JIT-installed trace entry
+    // (e.g. `6` -> 64-byte cache-line alignment, `5` -> 32-byte
+    // matching the cranelift x86_64 *preferred* alignment, `12` ->
+    // 4KB page alignment for the experiment loop).
+    //
+    // Honored by cranelift via `MachBuffer::set_log2_min_function_alignment`,
+    // which raises `min_alignment` to `max(2^N, existing)`. The JIT
+    // memory allocator then bumps `position` to the requested align
+    // before placing the function blob; subsequent installs share the
+    // same code page so each new trace lands at an aligned offset.
+    if let Ok(v) = std::env::var("RELON_TRACE_FN_ALIGN_LOG2") {
+        if !v.is_empty() {
+            let _ = flag_builder.set("log2_min_function_alignment", v.trim());
+        }
+    }
     let flags = settings::Flags::new(flag_builder);
 
     let isa_builder = cranelift_native::builder()

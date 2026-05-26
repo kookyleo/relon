@@ -221,3 +221,13 @@ path = "benches/string_stdlib.rs"
 [[bin]]
 name = "bench_stats"
 path = "src/bin/bench_stats.rs"
+
+# 2026-05-26 W5 layout RCA probe: drives the W5 recorder body through
+# the trace-install pipeline once, then runs the installed entry in
+# tight 10_000-iter batches. Prints per-batch wall-time + trace-fn /
+# tctx / IC / dict addresses so we can correlate the W5 fast-/slow-
+# cluster timings with low-bit alignment patterns. Run via
+# `cargo run -p relon-bench --bin w5_variance_probe --release`.
+[[bin]]
+name = "w5_variance_probe"
+path = "src/bin/w5_variance_probe.rs"
