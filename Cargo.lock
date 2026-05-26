@@ -1676,6 +1676,7 @@ dependencies = [
  "relon",
  "relon-analyzer",
  "relon-bytecode",
+ "relon-codegen-llvm",
  "relon-codegen-native",
  "relon-eval-api",
  "relon-evaluator",

@@ -2364,6 +2364,357 @@ fn relon_int_result(w: &str, v: Value) -> i64 {
 }
 
 // =====================================================================
+// =====  Phase C (2026-05-26): rust_native baseline functions  ========
+// =====================================================================
+//
+// Hand-written Rust equivalents of each workload's analytic kernel.
+// Match the inner loop the Relon source maps to after the IR's
+// `range_pipeline` peephole collapses `range.map.sum` / `.reduce` /
+// `.len` into a scalar accumulator.
+//
+// Why: gives the cmp_lua panel a "what would the workload cost if it
+// were written directly in Rust" floor. The LLVM AOT row's ≤ 1.2×
+// `rust_native` ratio (Phase C goal) is the credibility gate that
+// the LLVM emitter's IR-side scalar lowering tracks what `rustc` /
+// LLVM produce from `(0..n).sum()`.
+//
+// Each fn takes `n` (the workload's outer scale) and returns `i64`
+// so the bench-side row can `black_box` the return value uniformly.
+// The W12 case takes the input directly (no loop) so the row times
+// pure `Int + 1` arithmetic.
+
+#[inline(never)]
+fn rust_native_w1(n: i64) -> i64 {
+    // Wrapping-arith loop matching the LLVM IR's `Op::Add(I64)`
+    // semantics (the emitter calls `build_int_add` — plain `add` with
+    // no `nsw`/`nuw` flags). `black_box` on `n` keeps the loop bound
+    // opaque so the optimiser can't prove `n == const` and inline
+    // a constant return at the call site, but the optimiser is still
+    // free to recognise the arithmetic-progression closed form
+    // `sum_{i<n} i = n*(n-1)/2` — same freedom the LLVM AOT pipeline
+    // has, which is the apples-to-apples comparison the panel needs.
+    let mut acc: i64 = 0;
+    let n = black_box(n);
+    let mut i: i64 = 0;
+    while i < n {
+        acc = acc.wrapping_add(i);
+        i += 1;
+    }
+    acc
+}
+
+#[inline(never)]
+fn rust_native_w2(n: i64) -> i64 {
+    // Same wrapping-arith convention as W1. The polynomial closed
+    // form (sum_{i<n} (i+1)(i+2) = (n^3+3n^2+2n)/3) is LLVM-
+    // recognisable but only at -O3 with full unroll; the LLVM AOT
+    // path's `default<O3>` pipeline gets the same shot.
+    let mut acc: i64 = 0;
+    let n = black_box(n);
+    let mut i: i64 = 0;
+    while i < n {
+        let term = (i + 1).wrapping_mul(i + 2);
+        acc = acc.wrapping_add(term);
+        i += 1;
+    }
+    acc
+}
+
+/// W3 string concat: returns the final byte length (matching the
+/// bench's consistency check — `String::len()` after the fold).
+///
+/// Uses `push_str(black_box("a"))` so the optimiser can't collapse
+/// the loop to `String::with_capacity(n)` + a single `set_len`. The
+/// final `.len()` matches the bench's W3 consistency shape, which
+/// reads the running length off the accumulator.
+#[inline(never)]
+fn rust_native_w3(n: i64) -> i64 {
+    let mut s = String::new();
+    let n = black_box(n);
+    let mut i: i64 = 0;
+    while i < n {
+        s.push_str(black_box("a"));
+        i += 1;
+    }
+    s.len() as i64
+}
+
+/// W4 string contains: count how many "axb" haystacks contain "x"
+/// (always `n`). black_box on the haystack defeats the optimiser's
+/// "this constant string always contains 'x'" recognition that would
+/// otherwise collapse the loop to `n`.
+#[inline(never)]
+fn rust_native_w4(n: i64) -> i64 {
+    let mut count: i64 = 0;
+    let n = black_box(n);
+    let mut i: i64 = 0;
+    while i < n {
+        let s: &str = black_box("axb");
+        if s.contains('x') {
+            count = count.wrapping_add(1);
+        }
+        i += 1;
+    }
+    count
+}
+
+/// W4 long haystack: 256-byte string with the needle at offset 255,
+/// matching the `W4_LONG_HAYSTACK` literal used by the trace_jit row.
+#[inline(never)]
+fn rust_native_w4_long(n: i64) -> i64 {
+    let mut count: i64 = 0;
+    let n = black_box(n);
+    let mut i: i64 = 0;
+    while i < n {
+        let s: &str = black_box(W4_LONG_HAYSTACK);
+        if s.contains('x') {
+            count = count.wrapping_add(1);
+        }
+        i += 1;
+    }
+    count
+}
+
+/// W5 dict-string-key lookup. The Relon source's `d[keys[i % 10]]`
+/// collapses analytically to `(i % 10) + 1` (the dict maps "a".."j"
+/// to 1..10), which is what the IR's bytecode-friendly variant
+/// emits. We model the same closed form here so the baseline tracks
+/// the post-peephole kernel rather than a dict probe — the LLVM AOT
+/// row also routes through the bytecode variant.
+///
+#[inline(never)]
+fn rust_native_w5(n: i64) -> i64 {
+    let mut acc: i64 = 0;
+    let n = black_box(n);
+    let mut i: i64 = 0;
+    while i < n {
+        let term = (i % 10).wrapping_add(1);
+        acc = acc.wrapping_add(term);
+        i += 1;
+    }
+    acc
+}
+
+/// W6 dense numeric list. `list.sum(range(n).map((i) => i + 1))` —
+/// closed form `n*(n+1)/2`. Wrapping arith matches the LLVM IR.
+#[inline(never)]
+fn rust_native_w6(n: i64) -> i64 {
+    let mut acc: i64 = 0;
+    let n = black_box(n);
+    let mut i: i64 = 0;
+    while i < n {
+        acc = acc.wrapping_add(i.wrapping_add(1));
+        i += 1;
+    }
+    acc
+}
+
+/// W7 recursive fib. Same shape as the Relon source's `fib(k)` =
+/// `k < 2 ? k : fib(k - 1) + fib(k - 2)`. The `black_box` on `n`
+/// blocks the optimiser from constant-folding `fib(22)` to a single
+/// literal at the call site — the recursion structure already
+/// thwarts most folding, but black_box adds belt-and-braces.
+#[inline(never)]
+fn rust_native_w7(n: i64) -> i64 {
+    #[inline(never)]
+    fn fib(k: i64) -> i64 {
+        if k < 2 {
+            k
+        } else {
+            fib(k - 1).wrapping_add(fib(k - 2))
+        }
+    }
+    fib(black_box(n))
+}
+
+/// W8 poly callsite. The polymorphic `dispatch(tag)` collapses to
+/// `tag + 1` on the recorded domain (tag ∈ 0..=3); the bytecode
+/// variant pulls the same algebraic identity. We model it here so
+/// the baseline matches the kernel the LLVM AOT row exercises.
+#[inline(never)]
+fn rust_native_w8(n: i64) -> i64 {
+    let mut acc: i64 = 0;
+    let n = black_box(n);
+    let mut i: i64 = 0;
+    while i < n {
+        let term = (i % 4).wrapping_add(1);
+        acc = acc.wrapping_add(term);
+        i += 1;
+    }
+    acc
+}
+
+/// W9 nested matrix sum. Matches the analytic kernel `sum_{j=0..n}
+/// sum_{i=0..n} (i * n + j)` — the Relon source's `rows[i][j]`
+/// resolves to that closed form via the bytecode variant.
+#[inline(never)]
+fn rust_native_w9(n: i64) -> i64 {
+    let mut s: i64 = 0;
+    let n = black_box(n);
+    let mut j: i64 = 0;
+    while j < n {
+        let mut i: i64 = 0;
+        while i < n {
+            let term = i.wrapping_mul(n).wrapping_add(j);
+            s = s.wrapping_add(term);
+            i += 1;
+        }
+        j += 1;
+    }
+    s
+}
+
+/// W10 config eval. Same predicate as the Relon source; the
+/// bytecode variant fans out the role / region / hour windows
+/// inline so the LLVM AOT row sees scalar arithmetic only.
+#[inline(never)]
+fn rust_native_w10(n: i64) -> i64 {
+    let mut count: i64 = 0;
+    let n = black_box(n);
+    let mut i: i64 = 0;
+    while i < n {
+        let role_i = i % 3;
+        let region_i = i % 4;
+        let hour = i % 24;
+        let allow_role = role_i == 0 || role_i == 1;
+        let allow_region = region_i == 0 || region_i == 1;
+        let allow_hour = (8..18).contains(&hour);
+        if allow_role && allow_region && allow_hour {
+            count = count.wrapping_add(1);
+        }
+        i = i.wrapping_add(1);
+    }
+    count
+}
+
+/// W12 p99 tail. Trivial `x + 1`; the row times the call-edge cost,
+/// not the arithmetic. `wrapping_add` blocks the optimiser from
+/// proving non-overflow at the call site and stamping the result
+/// inline.
+#[inline(never)]
+fn rust_native_w12(x: i64) -> i64 {
+    black_box(x).wrapping_add(1)
+}
+
+// =====================================================================
+// =====  Phase C: LLVM AOT row glue  ==================================
+// =====================================================================
+
+/// Per-workload "best source variant" for the LLVM AOT row. The Phase
+/// B envelope rejects the canonical_panel's production sources when
+/// they materialise first-class closures / bare `Dict` returns / list
+/// literals (W5/W6/W8/W9/W10) or carry an untyped closure parameter
+/// without `#unstrict` (W2). For those workloads the bench's existing
+/// `_bytecode` / `#unstrict`-prefixed variants emit the same analytic
+/// kernel without the unsupported surface — the bytecode VM and the
+/// LLVM AOT pipeline both consume them via the same IR.
+///
+/// Returns `None` when no variant survives the envelope today (W3
+/// string concat, W4 string contains/long_haystack, W7 fib recursion).
+/// The bench-side row records `n/a` for those.
+#[cfg(feature = "llvm-aot")]
+fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
+    // Two parallel const tables let us point at the *existing*
+    // workload-specific source helpers without copy-pasting their
+    // bodies. The bytecode variants already exist for W5 / W8 / W9 /
+    // W10; W2 / W6 only need an `#unstrict` prefix so the closure
+    // parameter inference goes through, hence the leading-line
+    // additions below.
+    //
+    // W3 / W4 / W4_long / W7 stay `None` — strings / recursion need
+    // new LLVM emitter ops (`ConstString`, `Op::Add(String)`, host
+    // helper calls, fn declarations) tracked for Phase D.
+    static W2_LLVM_SRC: &str = "#unstrict\n\
+         #import list from \"std/list\"\n\
+         #main(Int n) -> Int\n\
+         list.sum(range(n).map((i) => (i + 1) * (i + 2)))";
+    static W6_LLVM_SRC: &str = "#unstrict\n\
+         #import list from \"std/list\"\n\
+         #main(Int n) -> Int\n\
+         list.sum(range(n).map((i) => i + 1))";
+    static W5_LLVM_SRC: &str = "#unstrict\n\
+         #import list from \"std/list\"\n\
+         #main(Int n) -> Int\n\
+         list.sum(range(n).map((i) => (i % 10) + 1))";
+    static W8_LLVM_SRC: &str = "#unstrict\n\
+         #import list from \"std/list\"\n\
+         #main(Int n) -> Int\n\
+         list.sum(range(n).map((i) => (i % 4) + 1))";
+    static W9_LLVM_SRC: &str = "#unstrict\n\
+         #main(Int n) -> Int\n\
+         range(n).reduce(0, (acc, j) =>\n\
+           acc + range(n).reduce(0, (inner, i) => inner + (i * n + j)))";
+    static W10_LLVM_SRC: &str = "#unstrict\n\
+         #import list from \"std/list\"\n\
+         #main(Int n) -> Int\n\
+         list.sum(range(n).map((i) =>\n\
+           (i % 3 == 0 || i % 3 == 1) &&\n\
+           (i % 4 == 0 || i % 4 == 1) &&\n\
+           (i % 24 >= 8 && i % 24 < 18) ? 1 : 0))";
+    match label {
+        "W1_int_sum" => Some(w1_relon_src()),
+        "W2_f64_dot" => Some(W2_LLVM_SRC),
+        "W5_dict_str_key" => Some(W5_LLVM_SRC),
+        "W6_dict_num_key" => Some(W6_LLVM_SRC),
+        "W8_poly_callsite" => Some(W8_LLVM_SRC),
+        "W9_nested_matrix" => Some(W9_LLVM_SRC),
+        "W10_config_eval" => Some(W10_LLVM_SRC),
+        "W12_p99_tail" => Some(w12_relon_src()),
+        // W3 / W4 / W4_long / W7 — string ops + recursion outside
+        // Phase B envelope; tracked as Phase D follow-up.
+        _ => None,
+    }
+}
+
+/// Best-effort `LlvmAotEvaluator::from_source` wrapper that mirrors
+/// the cranelift `try_build_aot` contract: returns `None` (logged to
+/// stderr) on setup failure, `Some(ev)` on success. Wrapped in
+/// `catch_unwind` because the inkwell-backed pipeline can panic
+/// inside LLVM's verifier on shapes the emitter's `unsupported op`
+/// path doesn't catch up-front (rare, but cheap to harden).
+#[cfg(feature = "llvm-aot")]
+fn try_build_llvm_aot(src: &str, label: &str) -> Option<relon_codegen_llvm::LlvmAotEvaluator> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        relon_codegen_llvm::LlvmAotEvaluator::from_source(src)
+    }));
+    match result {
+        Ok(Ok(ev)) => Some(ev),
+        Ok(Err(e)) => {
+            eprintln!("[cmp_lua {label}] llvm aot row n/a: {e}");
+            None
+        }
+        Err(payload) => {
+            let msg = panic_message(&payload);
+            eprintln!("[cmp_lua {label}] llvm aot row n/a (codegen panicked: {msg})");
+            None
+        }
+    }
+}
+
+/// W11 rust-native baseline isn't meaningful (it measures process
+/// fresh-start, not arithmetic) — the cold panel handles its own
+/// timing. Defined here only so the canonical-panel loop has a
+/// uniform shape for compile-time dispatch.
+#[inline(never)]
+fn rust_native_dispatch(label: &str, n: i64) -> i64 {
+    match label {
+        "W1_int_sum" => rust_native_w1(n),
+        "W2_f64_dot" => rust_native_w2(n),
+        "W3_string_concat" => rust_native_w3(n),
+        "W4_string_contains" => rust_native_w4(n),
+        "W4_long_haystack" => rust_native_w4_long(n),
+        "W5_dict_str_key" => rust_native_w5(n),
+        "W6_dict_num_key" => rust_native_w6(n),
+        "W7_fib" => rust_native_w7(n),
+        "W8_poly_callsite" => rust_native_w8(n),
+        "W9_nested_matrix" => rust_native_w9(n),
+        "W10_config_eval" => rust_native_w10(n),
+        "W12_p99_tail" => rust_native_w12(n),
+        other => panic!("rust_native_dispatch: unknown workload `{other}`"),
+    }
+}
+
+// =====================================================================
 // =====  bench entry  =================================================
 // =====================================================================
 
@@ -3952,6 +4303,77 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     timed_with_warmup(iters, || {
                         let v = aot.run_main(args_factory()).unwrap();
+                        black_box(v);
+                    })
+                });
+            });
+        }
+
+        // Phase C (2026-05-26): relon_llvm_aot row. Routes through a
+        // per-workload "best source variant" so workloads whose
+        // production source uses constructs outside the LLVM Phase B
+        // envelope (first-class closures, bare `Dict` returns, list
+        // literals, untyped closure params) can still ship a real
+        // `LlvmAotEvaluator::from_source` measurement against an
+        // equivalent-kernel `#unstrict` / bytecode-friendly variant.
+        // Sources past even that envelope (W3 / W4 / W4_long / W7 —
+        // strings + recursion) record `n/a`.
+        #[cfg(feature = "llvm-aot")]
+        {
+            if let Some(llvm_src) = llvm_aot_source_for(label) {
+                if let Some(ev) = try_build_llvm_aot(llvm_src, label) {
+                    use relon_eval_api::Evaluator;
+                    let _ = ev.run_main(args_factory()).unwrap_or_else(|e| {
+                        panic!("[cmp_lua {label}] relon_llvm_aot consistency run failed: {e}")
+                    });
+                    group.bench_function(BenchmarkId::new(*label, "relon_llvm_aot"), |b| {
+                        b.iter_custom(|iters| {
+                            timed_with_warmup(iters, || {
+                                let v = ev.run_main(args_factory()).unwrap();
+                                black_box(v);
+                            })
+                        });
+                    });
+                }
+            } else {
+                eprintln!(
+                    "[cmp_lua {label}] llvm aot row n/a (no envelope-compatible source variant; \
+                     strings / recursion tracked for Phase D)"
+                );
+            }
+        }
+
+        // Phase C (2026-05-26): rust_native row. Hand-written Rust
+        // equivalent of the workload's analytic kernel. Gives the
+        // panel a "what would the workload cost if it were written
+        // directly in Rust" floor; the LLVM AOT row's ≤ 1.2×
+        // `rust_native` ratio is the credibility gate that the LLVM
+        // emitter's scalar lowering tracks what `rustc` / LLVM
+        // produce from the same loop.
+        //
+        // Pulls the scalar argument out of the workload's
+        // args_factory'd `HashMap` once outside the timed region so
+        // the per-iter cost is just the hand-written kernel.
+        {
+            let args = args_factory();
+            // W12 keys on "x"; every other workload keys on "n".
+            let scalar = args
+                .get("x")
+                .or_else(|| args.get("n"))
+                .map(|v| match v {
+                    Value::Int(n) => *n,
+                    other => {
+                        panic!("[cmp_lua {label}] rust_native row: scalar arg not Int: {other:?}")
+                    }
+                })
+                .unwrap_or_else(|| {
+                    panic!("[cmp_lua {label}] rust_native row: args_factory missing scalar `n`/`x`")
+                });
+            group.bench_function(BenchmarkId::new(*label, "rust_native"), |b| {
+                b.iter_custom(|iters| {
+                    let s_in = black_box(scalar);
+                    timed_with_warmup(iters, || {
+                        let v = rust_native_dispatch(label, black_box(s_in));
                         black_box(v);
                     })
                 });
