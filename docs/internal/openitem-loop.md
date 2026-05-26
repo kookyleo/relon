@@ -13,3 +13,24 @@
 ### Iteration 0 (2026-05-26 ~01:55, 起点)
 
 4 subagents spawned, all in_progress。Mapping 在 `docs/internal/.openitem-subagent-map`。等 task-notification 或 cron fire。
+
+### Iteration 1 (2026-05-26 ~02:05)
+
+4 subagents transcript: #263=335KB / #264=386KB / #265=421KB / #266=222KB。全在探索阶段，无 commits。等。
+
+### Iteration 2 (2026-05-26 ~02:15)
+
+Transcripts: #263=579KB (+244KB) / #264=640KB (+254KB) / #265=745KB (+324KB) / #266=273KB (+51KB)。无 commits 落地，全在 active 工作。#266 最慢（RCA 性质，预期）。
+
+### Iteration 3 (2026-05-26 ~02:25)
+
+Transcripts: #263=676KB / #264=820KB / #265=923KB / #266=293KB。**#264 第一个 commit landed**: `3a72486 feat(ir): peephole-inline list.sum(range(...).map(...)) chain`。其他仍在做。
+
+### Iteration 4 (2026-05-26 ~11:35, #265 完工)
+
+**#265 (Deopt PC alignment fix) 完工** + cherry-pick `1992b56` (fix) + `90e9a9d` (test/docs)。
+- Layer 2 (resume_via_vm string-aware) + Layer 3 (RecordingRegistrationData accessor) 落地
+- Layer 1 (recorder walker schema-aware string handlers) scope-out 到 follow-up
+- 3 新 e2e tests 全过；三关 clean
+
+Task #265 → completed。剩 #263/#264/#266 in_progress。
