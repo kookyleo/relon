@@ -481,17 +481,51 @@ pub enum TraceOp {
 /// `phi` SSA id. On the first entry, `init` (a value defined before
 /// the loop) flows into `phi`; on each back-edge, the matching slot
 /// in [`TraceOp::MarkLoopBack::next_values`] flows into `phi`.
+///
+/// Phase J.2: when the recorder knows the φ corresponds to a source-side
+/// `Op::LetSet { idx }` slot, the matching `let_slot` is stamped here.
+/// The emitter then spills the current φ value into
+/// `TraceContext::ssa_slots[let_slot]` on every loop-header entry so a
+/// downstream deopt snapshot carries the live loop-carried value (and
+/// the bytecode-VM resume path lands the correct let-local without any
+/// extra mapping side-table, because `extra_locals[i]` overlays into
+/// `locals[input_args + return_slots + i]` and `LetSet(i)` lowers to
+/// `BcOp::LocalSet(input_args + return_slots + i)`). `None` for
+/// synthetic / hand-built fixtures whose φs don't correspond to any
+/// source-side slot — those skip the spill (no per-iter cost, no
+/// recovery on deopt either).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LoopPhi {
     /// Pre-loop seed value visible at the loop header entry edge.
     pub init: SsaVar,
     /// φ SSA id visible inside the loop body.
     pub phi: SsaVar,
+    /// Source-side let-slot the φ mirrors, when known. See type-level
+    /// docs for the bytecode-VM resume contract this enables.
+    pub let_slot: Option<u32>,
 }
 
 impl LoopPhi {
+    /// Construct a φ pair with no let-slot mapping. Synthetic fixtures
+    /// and optimiser-rewritten φs use this — they emit the φ block-
+    /// param but skip the deopt-recovery spill.
     pub fn new(init: SsaVar, phi: SsaVar) -> Self {
-        Self { init, phi }
+        Self {
+            init,
+            phi,
+            let_slot: None,
+        }
+    }
+
+    /// Phase J.2: construct a φ pair stamped with the let-slot it
+    /// mirrors. The emitter spills the current φ value into
+    /// `TraceContext::ssa_slots[let_slot]` at every loop-header entry.
+    pub fn with_let_slot(init: SsaVar, phi: SsaVar, let_slot: u32) -> Self {
+        Self {
+            init,
+            phi,
+            let_slot: Some(let_slot),
+        }
     }
 }
 

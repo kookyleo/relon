@@ -659,7 +659,28 @@ impl RecorderState {
                 // φ would carry the seed's type-guard suppression.
                 self.guarded_vars.remove(&phi);
             }
-            phis.push(LoopPhi::new(c.init, phi));
+            // Phase J.2: when the carry corresponds to a source-side
+            // `Op::LetSet { idx }` slot, stamp the let-slot onto the
+            // φ so the emitter can spill the live φ value into
+            // `TraceContext::ssa_slots[idx]` on every loop-header
+            // entry. The bytecode-VM resume path then reads each
+            // snapshot slot as `extra_locals[idx]`, which overlays at
+            // exactly the local `LetSet(idx)` writes — so deopt
+            // recovery lands the correct loop-carried `acc` / `i` /
+            // `count` / ... values into the resume frame with **no**
+            // additional dense-index → let-slot mapping table on the
+            // dispatcher side. `Local`-keyed carries (rare — only
+            // shows up for fn-arg slots re-assigned mid-loop) and
+            // un-keyed carries (synthetic seeds) skip the spill.
+            let let_slot = match c.key {
+                Some(crate::lowering::LookupKind::Let(idx)) => Some(idx),
+                _ => None,
+            };
+            let phi_entry = match let_slot {
+                Some(slot) => LoopPhi::with_let_slot(c.init, phi, slot),
+                None => LoopPhi::new(c.init, phi),
+            };
+            phis.push(phi_entry);
             phi_ssas.push(phi);
         }
 

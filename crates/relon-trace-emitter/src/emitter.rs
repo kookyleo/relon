@@ -1800,10 +1800,18 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         }
 
         // Append one block-param per phi (all I64) and bind the phi
-        // SSA to the cranelift block-param.
+        // SSA to the cranelift block-param. We also collect the
+        // (block_param, let_slot) pairs so the per-iter spill that
+        // follows can read each phi's current value straight from the
+        // cranelift SSA without re-looking-it-up through the
+        // ssa_to_value map (avoids an extra hash-table probe on every
+        // loop iter — the spill is the only new per-iter cost the J.2
+        // deopt-recovery fix introduces, so we keep it tight).
+        let mut phi_block_params: Vec<(ir::Value, Option<u32>)> = Vec::with_capacity(phis.len());
         for phi in phis {
             let bp = self.builder.append_block_param(header, I64);
             self.bind(phi.phi, bp);
+            phi_block_params.push((bp, phi.let_slot));
         }
 
         let init_args: Vec<ir::BlockArg> =
@@ -1811,6 +1819,60 @@ impl<'a, 'b> TraceEmitterState<'a, 'b> {
         self.builder.ins().jump(header, &init_args);
         self.builder.switch_to_block(header);
         // Don't seal: the matching MarkLoopBack will add the back edge.
+
+        // Phase J.2: spill each let-slot-mapped phi value into the
+        // shared `TraceContext::ssa_slots` payload. Executes on every
+        // loop-header entry — both the initial forward edge from the
+        // preheader (`init_vals` flows in as the block-params) and
+        // every back-edge from `MarkLoopBack` (`next_values` flows
+        // in). The deopt path then captures the current iteration's
+        // phi values via the standard `__relon_trace_save_deopt` snap
+        // (which clones `ctx.ssa_slots` wholesale), and the bytecode-
+        // VM resume reads the same slot indices as `extra_locals[i]`
+        // — which overlay into the local `LetSet(i)` writes to.
+        //
+        // Cost: one `load.i64` (cached payload base) + one
+        // `store.i64` per φ, per iter. Cranelift's GVN folds the
+        // payload-base load across iterations once the back-edge is
+        // sealed (`ctx_ptr` is loop-invariant), so the steady-state
+        // per-iter cost collapses to the store. The store address
+        // is `payload_base + let_slot * 8`, a single-cycle `mov`
+        // on x86_64.
+        //
+        // We only emit the spill for phis with `let_slot = Some(_)` —
+        // synthetic / optimiser-rewritten phis without a source-side
+        // let-slot anchor (e.g. iv_overflow_elim's bound-count phi)
+        // skip the store entirely. That keeps existing optimiser
+        // tests byte-identical and avoids polluting `ssa_slots` with
+        // values whose dispatcher-side mapping would be undefined.
+        let has_spill_targets = phi_block_params.iter().any(|(_, ls)| ls.is_some());
+        if has_spill_targets {
+            // Load the `Box<[u64]>` data pointer from offset 0 of the
+            // context. `Box<[u64]>` is a (data_ptr, len) fat pointer
+            // and `ssa_slots` is the first field of `TraceContext`,
+            // so the data pointer sits at byte offset 0 — same
+            // contract the `abi` module's `result_slot_offset`
+            // comments call out under the "ssa_slots first" layout
+            // invariant.
+            let payload_base = self.builder.ins().load(
+                self.pointer_ty,
+                ir::MemFlags::trusted(),
+                self.trace_ctx_ptr,
+                0,
+            );
+            for (bp, slot) in &phi_block_params {
+                if let Some(let_slot) = *slot {
+                    let off = (let_slot as i64) * 8;
+                    self.builder.ins().store(
+                        ir::MemFlags::trusted(),
+                        *bp,
+                        payload_base,
+                        off as i32,
+                    );
+                }
+            }
+        }
+
         self.loop_head_blocks.insert(loop_id, header);
         self.active_loops.push(loop_id);
         Ok(())
