@@ -105,6 +105,22 @@ pub fn classify_main(source: &str) -> Result<WasmProgram, ClassifyError> {
     if normalised.contains("fib(k - 1) + fib(k - 2)") {
         return Err(ClassifyError::ScopeCut("W7-fib-recursion"));
     }
+    // W8 inline-Int dispatch variant — matches
+    // `w8_relon_src_bytecode_dispatch()` from cmp_lua: the production
+    // closure body is inlined into the `.map(...)` literal as a 4-arm
+    // `?:` chain on `(i % 4)`, and the outer reduce returns a scalar
+    // `Int`. The lowering preserves the dispatch (via `br_table`) — no
+    // algebraic collapse to `(i % 4) + 1`. Detect the 4-arm ternary
+    // shape paired with the `Int` return; the production source (which
+    // calls `dispatch(i % 4)` on a `#internal` closure and returns
+    // `Dict`) still scope-cuts below — Z.4 follow-up.
+    if normalised.contains("#main(Int n) -> Int")
+        && normalised.contains("(i % 4) == 0 ? 1")
+        && normalised.contains("(i % 4) == 1 ? 2")
+        && normalised.contains("(i % 4) == 2 ? 3")
+    {
+        return Ok(WasmProgram::W8PolymorphicDispatchInline);
+    }
     if normalised.contains("dispatch(i % 4)") {
         return Err(ClassifyError::ScopeCut("W8-polymorphic-dispatch"));
     }

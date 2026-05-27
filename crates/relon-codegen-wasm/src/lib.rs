@@ -133,6 +133,15 @@ mod tests {
     }
 
     #[test]
+    fn lower_w8_inline_round_trips() {
+        let bytes =
+            lower(&WasmProgram::W8PolymorphicDispatchInline).expect("emit W8 inline dispatch");
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .expect("wasmparser validates W8 inline dispatch");
+    }
+
+    #[test]
     fn lower_w10_inline_round_trips() {
         let bytes = lower(&WasmProgram::W10ConfigEvalInline).expect("emit W10 inline");
         wasmparser::Validator::new()

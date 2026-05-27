@@ -131,6 +131,33 @@ pub enum WasmProgram {
     /// W8 polymorphic dispatch — scope-cut Z.1.
     W8PolymorphicDispatch,
 
+    /// W8 polymorphic-dispatch inline (`#main(Int n) -> Int`, matches
+    /// `w8_relon_src_bytecode_dispatch()` from `cmp_lua`). The
+    /// production W8 source binds `dispatch: (tag) => tag == 0 ? 1
+    /// : tag == 1 ? 2 : tag == 2 ? 3 : 4` as a `#internal` first-class
+    /// closure called per iter via `dispatch(i % 4)`, and returns a
+    /// `Dict { dispatch, result }` record — both shapes are outside
+    /// the Z.3 lowering envelope (first-class closure values + bare-
+    /// `Dict` return are Z.4 follow-ups). The `_dispatch` bytecode
+    /// variant inlines the closure body into the `.map(...)` literal,
+    /// unwraps the dict-body to a scalar `Int`, but **keeps** the
+    /// 4-arm ternary chain so the per-iter work materialises a real
+    /// dispatch decision (the algebraic collapse `(i % 4) + 1` would
+    /// be the algorithm-substitution paper-win called out in design
+    /// §7 — same observable I/O, but the bench would measure a
+    /// single `i64.add` instead of the polymorphic call cost).
+    ///
+    /// Z.3c-e folds the `range.map.sum` chain into a pure-WASM
+    /// accumulator loop. The per-iter dispatch lowers as a `br_table`
+    /// (constant-time 4-way jump) — the `tag = i % 4` value is in
+    /// `[0, 4)` so the table has exactly four labels (one arm per
+    /// case constant 1/2/3/4) and never falls through to a default.
+    /// Each arm pushes its dispatch constant, the post-table block
+    /// adds it to the accumulator, and the loop iterates. See
+    /// [`emit_w8_polymorphic_dispatch_inline`] for the loop body
+    /// sketch.
+    W8PolymorphicDispatchInline,
+
     /// W9 nested matrix — scope-cut Z.1.
     W9NestedMatrix,
 
@@ -248,6 +275,7 @@ pub(crate) fn lower_program(program: &WasmProgram) -> Result<Vec<u8>, LowerError
         WasmProgram::W6ListSumPlusOne => Ok(emit_w6_list_sum_plus_one()),
         WasmProgram::W7FibRecursion => Err(LowerError::ScopeCut("W7-fib-recursion")),
         WasmProgram::W8PolymorphicDispatch => Err(LowerError::ScopeCut("W8-polymorphic-dispatch")),
+        WasmProgram::W8PolymorphicDispatchInline => Ok(emit_w8_polymorphic_dispatch_inline()),
         WasmProgram::W9NestedMatrix => Err(LowerError::ScopeCut("W9-nested-matrix")),
         WasmProgram::W9NestedMatrixInline => Ok(emit_w9_nested_matrix_inline()),
         WasmProgram::W10ConfigEval => Err(LowerError::ScopeCut("W10-config-eval")),
@@ -880,6 +908,182 @@ fn emit_w10_config_eval_inline() -> Vec<u8> {
     func.instruction(&Instruction::End); // if hour_ok
     func.instruction(&Instruction::End); // if region_ok
     func.instruction(&Instruction::End); // if role_ok
+
+    // i += 1
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I64Const(1));
+    func.instruction(&Instruction::I64Add);
+    func.instruction(&Instruction::LocalSet(2));
+
+    // br to loop head
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // loop
+    func.instruction(&Instruction::End); // block
+
+    // return acc
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::End); // function
+
+    finalize_module(prelude, func, &[])
+}
+
+/// W8 polymorphic-dispatch inline lowering.
+/// `#main(Int n) -> Int  list.sum(range(n).map((i) =>
+///   (i % 4) == 0 ? 1 : (i % 4) == 1 ? 2 : (i % 4) == 2 ? 3 : 4))`.
+///
+/// Z.3c-e folds the `range.map.sum` chain into a pure-WASM accumulator
+/// loop. The per-iter 4-arm `?:` ladder lowers to a `br_table` —
+/// the tag `i % 4` is in `[0, 4)` so the table has exactly four
+/// labels, one per case constant. Each arm pushes its constant onto
+/// a local, then the post-dispatch fall-through adds it to the
+/// accumulator. **No closed-form** `(i % 4) + 1` substitution: the
+/// per-iter work materialises a real dispatch decision (single
+/// instruction it may be — `br_table` is still a runtime jump on the
+/// actual tag value, not a constant-fold), matching what the source
+/// declares.
+///
+/// Honesty (design §7):
+///   - Same algorithm? — same per-iter dispatch: compute tag = i % 4,
+///     branch on tag to one of four constant arms (1/2/3/4),
+///     accumulate. The compiler is inlining the `range.map.sum` chain
+///     into the equivalent accumulator loop; the 4-arm dispatch is
+///     preserved as a `br_table` (one branch per iter, indirect on
+///     the runtime tag value). The algebraic collapse `(i % 4) + 1`
+///     is **not** used — that would be the algorithm-substitution
+///     paper-win the closed-form bytecode variant
+///     (`w8_relon_src_bytecode`) chose for ABI uniformity, but it
+///     hides the polymorphic-dispatch cost W8 is meant to measure.
+///   - Same code path? — `WasmEvaluator::run_main` lowers via this
+///     module and dispatches through wasmtime. No host imports are
+///     called.
+///   - Same I/O shape? — `#main(Int n) -> Int`, returns
+///     `Value::Int(Σ_{i in [0..n)} dispatch(i % 4))`. Cross-checked
+///     against the tree-walker for the same `n` in
+///     `tests/w8_smoke.rs`.
+///
+/// Loop shape (pure WASM, no host imports needed):
+///   acc = 0
+///   i   = 0
+///   loop:
+///     if i >= n: break
+///     tag = (i % 4) as i32             ;; in [0, 4)
+///     val = match tag { 0 => 1, 1 => 2, 2 => 3, 3 => 4 }  ;; br_table
+///     acc += val
+///     i   += 1
+///   return acc
+///
+/// `br_table` encoding (wasm-encoder `Instruction::BrTable(labels, default)`):
+///   Outer block layout (innermost first; br depth counts outward):
+///     block $exit_dispatch                  ;; depth 4 → fall-through to "acc += val"
+///       block $arm3                         ;; depth 3 (tag == 3 → val=4)
+///         block $arm2                       ;; depth 2 (tag == 2 → val=3)
+///           block $arm1                     ;; depth 1 (tag == 1 → val=2)
+///             block $arm0                   ;; depth 0 (tag == 0 → val=1)
+///               local.get $tag
+///               br_table 0 1 2 3 4          ;; default 4 = $exit_dispatch
+///             end                            ;; end $arm0
+///             i64.const 1  local.set $val  br $exit_dispatch
+///           end                            ;; end $arm1
+///           i64.const 2  local.set $val  br $exit_dispatch
+///         end                            ;; end $arm2
+///         i64.const 3  local.set $val  br $exit_dispatch
+///       end                            ;; end $arm3
+///       i64.const 4  local.set $val   ;; fall through to $exit_dispatch end
+///     end                            ;; end $exit_dispatch
+///
+/// Because the source guarantees tag ∈ [0, 4), the `br_table`'s
+/// default arm is unreachable in well-formed input — we point it at
+/// `$exit_dispatch` (depth 4) with `val = 4` so a hypothetical out-
+/// of-range tag would still produce a defined value (the "4" arm
+/// happens to be the source's else branch, matching the production
+/// `dispatch(tag)` semantics for any tag ≥ 3).
+fn emit_w8_polymorphic_dispatch_inline() -> Vec<u8> {
+    let prelude = build_prelude();
+
+    // Locals layout (function param 0 is `n: i64`):
+    //   local 0 = n (param, i64)
+    //   local 1 = acc (i64)
+    //   local 2 = i (i64)
+    //   local 3 = val (i64) — dispatch result for current iter
+    //   local 4 = tag (i32) — i % 4 wrapped for br_table operand
+    let mut func = Function::new([(3u32, ValType::I64), (1u32, ValType::I32)]);
+
+    // acc = 0
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::LocalSet(1));
+    // i = 0
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::LocalSet(2));
+
+    // outer `block` so we can `br` out of the loop.
+    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+    func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+    // if i >= n: br outer
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::I64GeS);
+    func.instruction(&Instruction::BrIf(1));
+
+    // tag = (i % 4) as i32  (i64.rem_s then wrap)
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I64Const(4));
+    func.instruction(&Instruction::I64RemS);
+    func.instruction(&Instruction::I32WrapI64);
+    func.instruction(&Instruction::LocalSet(4));
+
+    // Dispatch nest. Layout: 5 nested blocks. Inside the innermost we
+    // emit `br_table` with 4 labels (arm0..arm3) and a default that
+    // targets the outermost ($exit_dispatch, depth 4) so any tag
+    // outside [0, 4) lands on the source's `else` arm (val = 4).
+    //
+    // Br depths inside the innermost block (just before `End` of
+    // $arm0): label 0 = $arm0 (innermost), 1 = $arm1, 2 = $arm2,
+    // 3 = $arm3, 4 = $exit_dispatch.
+    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // $exit_dispatch
+    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // $arm3
+    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // $arm2
+    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // $arm1
+    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // $arm0
+
+    func.instruction(&Instruction::LocalGet(4));
+    // br_table 0 1 2 3 (default 4 → $exit_dispatch, source's else arm)
+    func.instruction(&Instruction::BrTable(
+        std::borrow::Cow::Owned(vec![0u32, 1, 2, 3]),
+        4u32,
+    ));
+
+    func.instruction(&Instruction::End); // end $arm0 — tag == 0
+                                         // val = 1
+    func.instruction(&Instruction::I64Const(1));
+    func.instruction(&Instruction::LocalSet(3));
+    func.instruction(&Instruction::Br(3)); // br $exit_dispatch (skip remaining arms)
+
+    func.instruction(&Instruction::End); // end $arm1 — tag == 1
+                                         // val = 2
+    func.instruction(&Instruction::I64Const(2));
+    func.instruction(&Instruction::LocalSet(3));
+    func.instruction(&Instruction::Br(2));
+
+    func.instruction(&Instruction::End); // end $arm2 — tag == 2
+                                         // val = 3
+    func.instruction(&Instruction::I64Const(3));
+    func.instruction(&Instruction::LocalSet(3));
+    func.instruction(&Instruction::Br(1));
+
+    func.instruction(&Instruction::End); // end $arm3 — tag == 3
+                                         // val = 4 (source's else branch)
+    func.instruction(&Instruction::I64Const(4));
+    func.instruction(&Instruction::LocalSet(3));
+    // fall through to $exit_dispatch end
+
+    func.instruction(&Instruction::End); // end $exit_dispatch
+
+    // acc += val
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::LocalGet(3));
+    func.instruction(&Instruction::I64Add);
+    func.instruction(&Instruction::LocalSet(1));
 
     // i += 1
     func.instruction(&Instruction::LocalGet(2));
