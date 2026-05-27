@@ -44,6 +44,9 @@ use crate::emitter::{
 };
 use crate::error::LlvmError;
 use crate::state::ArenaState;
+use inkwell::module::Linkage;
+use inkwell::targets::FileType;
+use std::path::Path;
 
 /// Maximum positional arity supported by the Phase A legacy-i64
 /// entry. Mirrors the cranelift crate's `MAX_LEGACY_ARITY`; the four
@@ -1173,6 +1176,169 @@ fn align_up(value: u32, align: u32) -> u32 {
 /// first time it is called — required by `Target::from_triple` /
 /// `create_target_machine`. Subsequent calls re-use the initialised
 /// target state.
+/// Metadata returned by [`LlvmAotEvaluator::emit_object`] so the
+/// build.rs caller can stamp matching `extern "C"` declarations into
+/// the generated Rust shim.
+///
+/// Phase 1 (Int-only `#main(Int...) -> Int`): one exported symbol per
+/// source, signature `(i64, ...) -> i64`. The `entry_arity` field
+/// reports how many `i64` parameters the symbol takes — equal to the
+/// declared `#main` arity.
+#[derive(Debug, Clone)]
+pub struct EmitObjectInfo {
+    /// Exported C ABI symbol name (chosen by the caller; the emitter
+    /// renames the JIT-side `relon_llvm_entry_fast` to this).
+    pub entry_symbol: String,
+    /// Number of `i64` parameters the entry takes.
+    pub entry_arity: usize,
+    /// Declared parameter names in `#main(...)` declaration order.
+    /// Build.rs uses these to name the Rust shim's args.
+    pub param_names: Vec<String>,
+}
+
+impl LlvmAotEvaluator {
+    /// AOT entry: compile `src` into a relocatable ELF object file
+    /// suitable for linker consumption (build.rs path).
+    ///
+    /// Phase 1 envelope: every declared `#main` parameter must be
+    /// `Int`; the return must be `Int`. The emitted object exposes a
+    /// single external function `extern "C" fn <entry_symbol>(i64,
+    /// ...) -> i64` — exactly the shape Rust `extern "C"` declarations
+    /// can name. No `SandboxState` is touched on this path: the body
+    /// is a leaf arithmetic function with no arena dependency.
+    ///
+    /// Sources past the Int-only envelope (String args, List return,
+    /// stdlib calls that reference host shim symbols, …) surface as
+    /// [`LlvmError::UnsupportedSignature`] — Phase 2/3 widen the
+    /// surface once the matching shim ABI lands in `relon-rs-shims`.
+    pub fn emit_object(
+        src: &str,
+        entry_symbol: &str,
+        out_path: &Path,
+    ) -> Result<EmitObjectInfo, LlvmError> {
+        let (ir, main_schema, return_schema) = Self::lower_source(src)?;
+        let main_layout = relon_eval_api::layout::SchemaLayout::offsets_for(&main_schema)
+            .map_err(|e| LlvmError::Codegen(format!("main schema layout: {e}")))?;
+        let return_layout = relon_eval_api::layout::SchemaLayout::offsets_for(&return_schema)
+            .map_err(|e| LlvmError::Codegen(format!("return schema layout: {e}")))?;
+        let param_names: Vec<String> = main_schema.fields.iter().map(|f| f.name.clone()).collect();
+        let schema = BufferSchema {
+            main_schema,
+            return_schema,
+            main_layout,
+            return_layout,
+        };
+
+        // Phase 1 gate: the source must qualify for the fast-path
+        // typed-i64 entry. Sources that don't (non-Int args / return,
+        // pointer-indirect returns, multi-field return wrappers,
+        // arity > 8) escape via the `Err(())` from
+        // `build_fast_path_profile` — surface that as a clear
+        // `UnsupportedSignature` so build.rs can present an
+        // actionable error.
+        let profile = build_fast_path_profile(&schema).map_err(|_| {
+            LlvmError::UnsupportedSignature(
+                "relon-rs build (Phase 1): only Int-only `#main(Int...) -> Int` is supported"
+                    .into(),
+            )
+        })?;
+
+        let entry_idx = ir
+            .entry_func_index
+            .ok_or_else(|| LlvmError::Codegen("IR module has no entry function".into()))?;
+        let entry = &ir.funcs[entry_idx];
+
+        // Verify the IR matches the buffer-protocol envelope —
+        // `emit_fast_entry` rejects anything else and we'd rather
+        // surface a clear error here than inside the emitter.
+        if !crate::emitter::is_buffer_protocol_signature(&entry.params, entry.ret) {
+            return Err(LlvmError::UnsupportedSignature(
+                "relon-rs build: lowering produced a non-buffer entry shape".into(),
+            ));
+        }
+
+        // Fresh LLVM context for this object emit. Once `write_to_file`
+        // returns the module is dropped; nothing JIT-resident survives
+        // across the call.
+        let ctx = Context::create();
+        let module = ctx.create_module("relon_rs_object");
+
+        // Phase 1 trivial path: only emit the fast entry. The buffer
+        // entry would reference shim symbols (`relon_llvm_str_contains_arena`
+        // etc.) that aren't part of the Phase 1 shim surface and
+        // would force the build to depend on a wider runtime ABI than
+        // the trivial Int demo needs.
+        //
+        // `emit_fast_entry` accepts the buffer-protocol IR `entry`
+        // and uses `FastEmit` to rewrite `LoadField`/`StoreField` ops
+        // into direct param reads / ret_slot stores — no arena
+        // dependency, no `*state` parameter, no shim calls.
+        let llvm_fn = emit_fast_entry(&ctx, &module, entry, &profile)?;
+
+        // Rename the function from the JIT-side default
+        // (`relon_llvm_entry_fast`) to the build.rs-supplied symbol so
+        // each `.relon` source contributes a uniquely-named C ABI
+        // function. Force `External` linkage so the linker can see it
+        // from the consuming Rust crate.
+        llvm_fn.as_global_value().set_name(entry_symbol);
+        llvm_fn.set_linkage(Linkage::External);
+
+        module.verify().map_err(|e| {
+            LlvmError::Codegen(format!("LLVM verifier rejected object module: {e}"))
+        })?;
+
+        // Lay down O3 IR-level passes before backend codegen. Same
+        // pipeline as the JIT path uses, so the AOT and JIT
+        // performance profiles stay comparable.
+        run_default_o3_pipeline(&module)?;
+
+        // Write a relocatable ELF object. The target machine's
+        // `RelocMode::PIC` produces position-independent code so the
+        // linker can fold this into either a `staticlib` or a final
+        // executable without relocation drama.
+        Target::initialize_native(&InitializationConfig::default())
+            .map_err(|e| LlvmError::Codegen(format!("initialize_native: {e}")))?;
+        let triple_str = TargetMachine::get_default_triple();
+        let target = Target::from_triple(&triple_str)
+            .map_err(|e| LlvmError::Codegen(format!("target from_triple: {e}")))?;
+        let cpu = TargetMachine::get_host_cpu_name();
+        let features = TargetMachine::get_host_cpu_features();
+        let triple = TargetTriple::create(
+            triple_str
+                .as_str()
+                .to_str()
+                .map_err(|e| LlvmError::Codegen(format!("triple utf8: {e}")))?,
+        );
+        let machine = target
+            .create_target_machine(
+                &triple,
+                cpu.to_str().unwrap_or(""),
+                features.to_str().unwrap_or(""),
+                OptimizationLevel::Aggressive,
+                RelocMode::PIC,
+                CodeModel::Default,
+            )
+            .ok_or_else(|| LlvmError::Codegen("create_target_machine returned null".into()))?;
+
+        if let Some(parent) = out_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| LlvmError::Codegen(format!("create out dir `{parent:?}`: {e}")))?;
+            }
+        }
+        machine
+            .write_to_file(&module, FileType::Object, out_path)
+            .map_err(|e| LlvmError::Codegen(format!("write object `{out_path:?}`: {e}")))?;
+
+        let entry_arity = profile.arg_offsets.len();
+        Ok(EmitObjectInfo {
+            entry_symbol: entry_symbol.to_string(),
+            entry_arity,
+            param_names,
+        })
+    }
+}
+
 fn run_default_o3_pipeline(module: &inkwell::module::Module<'_>) -> Result<(), LlvmError> {
     Target::initialize_native(&InitializationConfig::default())
         .map_err(|e| LlvmError::Codegen(format!("initialize_native: {e}")))?;

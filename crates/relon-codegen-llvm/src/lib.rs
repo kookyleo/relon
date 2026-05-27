@@ -83,4 +83,4 @@ mod state;
 mod str_helpers;
 
 pub use error::LlvmError;
-pub use evaluator::LlvmAotEvaluator;
+pub use evaluator::{EmitObjectInfo, LlvmAotEvaluator};
