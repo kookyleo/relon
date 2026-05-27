@@ -1997,6 +1997,42 @@ fn bench_cmp_lua(c: &mut Criterion) {
                     })
                 });
             });
+
+            // Phase Z.3a (2026-05-28): `relon_wasm_wasmtime_fast` row.
+            // Drives `WasmEvaluator::run_main_legacy_i64_fast(&[n])`
+            // — bypasses the `HashMap<String, Value>` pack +
+            // `extract_named_int` walk + `Value::Int(out)` wrap on
+            // the slow path. Cross-checks against the buffer path
+            // (`run_main`) for byte-equivalence so the row can't
+            // silently drift from the `relon_wasm_wasmtime`
+            // measurement above.
+            if wasm.has_fast_path() {
+                let fast_out = wasm
+                    .run_main_legacy_i64_fast(&[W1_N])
+                    .expect("W1 wasm fast path consistency");
+                let slow_out = match wasm.run_main(args_w_n(W1_N)).unwrap() {
+                    Value::Int(n) => n,
+                    other => panic!("W1 wasm fast cross-check: slow path returned {other:?}"),
+                };
+                assert_eq!(
+                    fast_out, slow_out,
+                    "W1 fast/buffer disagree: fast={fast_out} buffer={slow_out}"
+                );
+                group.bench_function(
+                    BenchmarkId::new("W1_int_sum", "relon_wasm_wasmtime_fast"),
+                    |b| {
+                        b.iter_custom(|iters| {
+                            let n_in = black_box(W1_N);
+                            timed_with_warmup(iters, || {
+                                let v = wasm
+                                    .run_main_legacy_i64_fast(&[black_box(n_in)])
+                                    .unwrap();
+                                black_box(v);
+                            })
+                        });
+                    },
+                );
+            }
         }
     }
 
@@ -3393,6 +3429,59 @@ fn bench_cmp_lua(c: &mut Criterion) {
                         })
                     });
                 });
+
+                // Phase Z.3a (2026-05-28): `relon_wasm_wasmtime_fast`
+                // for W6/W12. Same shape as the W1 fast row above —
+                // gates on `has_fast_path()`, cross-checks the i64
+                // result against the buffer path. The scalar arg is
+                // pulled out of `args_factory()` once (W12 keys on
+                // "x", others on "n") before the timed loop.
+                if wasm.has_fast_path() {
+                    let args0 = args_factory();
+                    let scalar0 = args0
+                        .get("x")
+                        .or_else(|| args0.get("n"))
+                        .and_then(|v| match v {
+                            Value::Int(n) => Some(*n),
+                            _ => None,
+                        });
+                    if let Some(arg_i64) = scalar0 {
+                        let fast_out = wasm
+                            .run_main_legacy_i64_fast(&[arg_i64])
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "[cmp_lua {label}] relon_wasm_wasmtime_fast \
+                                     consistency: {e}"
+                                )
+                            });
+                        let slow_out = match wasm.run_main(args_factory()).unwrap() {
+                            Value::Int(n) => n,
+                            other => panic!(
+                                "[cmp_lua {label}] relon_wasm_wasmtime_fast \
+                                 cross-check: slow path returned {other:?}"
+                            ),
+                        };
+                        assert_eq!(
+                            fast_out, slow_out,
+                            "[cmp_lua {label}] fast/buffer disagree: \
+                             fast={fast_out} buffer={slow_out}"
+                        );
+                        group.bench_function(
+                            BenchmarkId::new(*label, "relon_wasm_wasmtime_fast"),
+                            |b| {
+                                b.iter_custom(|iters| {
+                                    let a = black_box(arg_i64);
+                                    timed_with_warmup(iters, || {
+                                        let v = wasm
+                                            .run_main_legacy_i64_fast(&[a])
+                                            .unwrap();
+                                        black_box(v);
+                                    })
+                                });
+                            },
+                        );
+                    }
+                }
             }
         }
     }

@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
 use relon_parser::Node;
 use relon_parser::TokenRange;
-use wasmtime::{Config, Engine, Instance, Linker, Module, Store};
+use wasmtime::{Config, Engine, Instance, Linker, Module, Store, TypedFunc};
 
 use relon_codegen_wasm::{lower, WasmProgram};
 
@@ -51,8 +51,19 @@ struct WasmRuntime {
     /// Lock-protected so the trait-object `&self`-shaped `run_main`
     /// can still call into wasmtime, which needs `&mut Store`.
     store: Mutex<Store<HostState>>,
+    #[allow(dead_code)]
     instance: Instance,
     program: WasmProgram,
+    /// Phase Z.3a: cache the resolved `TypedFunc<i64, i64>` for
+    /// `__main`. `Instance::get_typed_func` does signature lookup +
+    /// validation against the wasmtime export table (string compare on
+    /// the symbol name + funcref unwrap + `WasmTy::matches` walk).
+    /// That cost is ~100-200 ns per call when re-resolved inside a
+    /// hot loop. The Z.1 programs (W1/W6/W12) all share the
+    /// `(i64) -> i64` signature, so we resolve once at construction
+    /// time and reuse the typed handle for both the slow (`run_main`)
+    /// and fast (`run_main_legacy_i64_fast`) entries.
+    main_typed: TypedFunc<i64, i64>,
 }
 
 /// Public construction errors. Distinct from `LowerError` because the
@@ -139,6 +150,14 @@ impl WasmEvaluator {
             .ok_or_else(|| WasmEvalError::Wasmtime("module missing exported `memory`".into()))?;
         store.data_mut().bind_memory(memory);
 
+        // Phase Z.3a: resolve `__main` as `TypedFunc<i64, i64>` once
+        // and cache it. All Z.1 programs (W1/W6/W12) match this
+        // signature; a future Z.3 widening that adds Float/String
+        // returns will need a per-program typed handle variant.
+        let main_typed = instance
+            .get_typed_func::<i64, i64>(&mut store, "__main")
+            .map_err(|e| WasmEvalError::Wasmtime(format!("get __main typed func: {e}")))?;
+
         Ok(Self {
             tree_walk: Box::new(tree_walk),
             source: source.to_string(),
@@ -146,6 +165,7 @@ impl WasmEvaluator {
                 store: Mutex::new(store),
                 instance,
                 program,
+                main_typed,
             }),
         })
     }
@@ -159,6 +179,65 @@ impl WasmEvaluator {
             Some(rt) => {
                 let store = rt.store.lock().expect("WasmEvaluator store mutex poisoned");
                 store.data().tier()
+            }
+        }
+    }
+
+    /// Phase Z.3a: is the cached `(i64) -> i64` fast-entry handle
+    /// available for this evaluator? Returns `true` when the source
+    /// classified into a Z.1 program (W1/W6/W12) and the typed-func
+    /// resolve at construction succeeded; `false` when the source
+    /// fell through to the tree-walker tier.
+    ///
+    /// The cmp_lua bench's `relon_wasm_wasmtime_fast` row gates on
+    /// this so a scope-cut source never books fast-path numbers —
+    /// matches the `LlvmAotEvaluator::has_fast_path` contract.
+    pub fn has_fast_path(&self) -> bool {
+        self.wasm.is_some()
+    }
+
+    /// Phase Z.3a dispatch-boundary fast path: invoke the cached
+    /// `(i64) -> i64` `__main` typed-func directly with the supplied
+    /// positional `i64` arg. Bypasses the `HashMap<String, Value>`
+    /// pack + per-arg `extract_named_int` walk + the
+    /// `Value::Int(out)` wrap on the return.
+    ///
+    /// The remaining boundary cost on this path is:
+    ///   - one `Mutex::lock` on the store (uncontested in steady-
+    ///     state — single-threaded driver)
+    ///   - one `HostState::reset` (arena cursor write)
+    ///   - one `TypedFunc::call` (~150-250 ns on x86_64; this is the
+    ///     wasmtime ABI floor, see comment on `main_typed`)
+    ///   - `mark_compiled` / `mark_deopt` tier write
+    ///
+    /// Returns `Err(Unsupported)` when the source fell through to
+    /// the tree-walker tier (`wasm: None`).
+    pub fn run_main_legacy_i64_fast(&self, args: &[i64]) -> Result<i64, RuntimeError> {
+        let rt = self.wasm.as_ref().ok_or_else(|| RuntimeError::Unsupported {
+            reason: "wasm-eval: fast path unavailable (source on tree-walker fallback)".into(),
+        })?;
+        if args.len() != 1 {
+            return Err(RuntimeError::Unsupported {
+                reason: format!(
+                    "wasm-eval fast path: Z.1 programs take 1 arg, got {}",
+                    args.len()
+                ),
+            });
+        }
+        let arg = args[0];
+        let mut store = rt
+            .store
+            .lock()
+            .map_err(|_| io_err("wasm-eval store mutex poisoned"))?;
+        store.data_mut().reset();
+        match rt.main_typed.call(&mut *store, arg) {
+            Ok(out) => {
+                store.data_mut().mark_compiled();
+                Ok(out)
+            }
+            Err(e) => {
+                store.data_mut().mark_deopt();
+                Err(io_err(format!("wasm-eval: __main trapped: {e}")))
             }
         }
     }
@@ -217,11 +296,11 @@ impl Evaluator for WasmEvaluator {
             .lock()
             .map_err(|_| io_err("wasm-eval store mutex poisoned"))?;
         store.data_mut().reset();
-        let main = rt
-            .instance
-            .get_typed_func::<i64, i64>(&mut *store, "__main")
-            .map_err(|e| io_err(format!("wasm-eval: get __main: {e}")))?;
-        match main.call(&mut *store, arg_i64) {
+        // Phase Z.3a: typed-func is cached on `rt.main_typed`, no
+        // per-call `get_typed_func` resolve. The buffer-protocol
+        // path (this method) only carries the HashMap pack +
+        // `Value::Int` wrap overhead vs `run_main_legacy_i64_fast`.
+        match rt.main_typed.call(&mut *store, arg_i64) {
             Ok(out) => {
                 store.data_mut().mark_compiled();
                 Ok(Value::Int(out))

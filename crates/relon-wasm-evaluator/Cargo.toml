@@ -11,6 +11,11 @@ keywords = ["wasm", "runtime", "relon"]
 categories = ["compilers", "wasm"]
 publish = false
 
+[[bench]]
+name = "dispatch_breakdown"
+harness = false
+path = "benches/dispatch_breakdown.rs"
+
 [dependencies]
 relon-codegen-wasm = { workspace = true }
 relon-eval-api = { workspace = true }
