@@ -110,6 +110,17 @@ struct LowerCtx<'a> {
     /// across nested closure sites so the table assignment stays
     /// stable.
     lambda_funcs: Vec<Func>,
+    /// Phase F.2 (W7 anon-Dict-return): per-let-idx signature for
+    /// closure-typed let-bindings. Populated when the W7 anon-Dict
+    /// return path binds a closure-typed dict field as an internal
+    /// let; consulted by [`lower_fn_call`] when a free-call's head
+    /// resolves to a `Closure`-typed let so it can emit a
+    /// [`Op::CallClosure { param_tys, ret_ty }`] with the matching
+    /// signature.
+    ///
+    /// The signature is the **user-visible** surface (no implicit
+    /// captures_ptr) — same convention as `Op::CallClosure`.
+    closure_let_signatures: HashMap<u32, (Vec<IrType>, IrType)>,
 }
 
 /// Information the lowering walker needs when handling `self`-prefixed
@@ -260,6 +271,7 @@ impl<'a> LowerCtx<'a> {
             self_binding: None,
             method_params: Vec::new(),
             lambda_funcs: Vec::new(),
+            closure_let_signatures: HashMap::new(),
         }
     }
 
@@ -288,6 +300,7 @@ impl<'a> LowerCtx<'a> {
             self_binding: Some(self_binding),
             method_params,
             lambda_funcs: Vec::new(),
+            closure_let_signatures: HashMap::new(),
         }
     }
 
@@ -619,6 +632,19 @@ fn lower_entry_with_resolver<'a>(
     // resolver before delegating.
     let user_return_schema = resolve_return_user_schema(sig.return_type.as_ref(), &resolver)?;
 
+    // Phase F.2 (W7 anon-Dict-return): `#main(...) -> Dict { ... }`
+    // synthesises an anonymous return schema by per-field inference
+    // over the dict literal. Closure-typed fields are lifted to
+    // internal let-bindings (they don't appear in the host-visible
+    // schema — `SchemaLayout` rejects them by Phase B's guard), so
+    // the synthesised schema only carries the scalar fields that
+    // survive the boundary.
+    let anon_dict_plan = if user_return_schema.is_none() {
+        anon_dict_return_plan(sig, root)?
+    } else {
+        None
+    };
+
     // Build the canonical-form schemas for in_buf and out_buf, then
     // compute the offset table for the param schema so each
     // `Variable(x)` reference can be lowered to a typed LoadField.
@@ -629,6 +655,8 @@ fn lower_entry_with_resolver<'a>(
         // `BufferReader::new(...)` it would use for a hand-built dict
         // input. No `value` wrapping.
         user_schema.clone()
+    } else if let Some(ref plan) = anon_dict_plan {
+        plan.schema.clone()
     } else {
         build_main_return_schema(sig)?
     };
@@ -696,6 +724,33 @@ fn lower_entry_with_resolver<'a>(
             record_local,
             &mut ctx,
         )?;
+    } else if let Some(plan) = anon_dict_plan {
+        // Phase F.2 (W7): anon-Dict-return path. Walk the dict
+        // literal in declaration order — closure fields become
+        // internal let-bindings (with their signatures memoised in
+        // `closure_let_signatures` so a recursive self-call inside
+        // the closure body resolves through `Op::CallClosure`); the
+        // surviving scalar fields are stored into the root record.
+        let dict_pairs = match &*root.expr {
+            Expr::Dict(pairs) => pairs.as_slice(),
+            _ => {
+                return Err(LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "Body-of-anon-Dict-#main must be a dict literal, got `{}`",
+                        root.expr.kind()
+                    ),
+                    range: root.range,
+                });
+            }
+        };
+        let record_local = ctx.alloc_record_local();
+        ctx.out.push(TaggedOp {
+            op: Op::AllocRootRecord {
+                record_local_idx: record_local,
+            },
+            range: root.range,
+        });
+        lower_anon_dict_body(&plan, &return_layout, dict_pairs, record_local, &mut ctx)?;
     } else {
         // Scalar-return path: existing v1 shape.
         lower_expr(&root.expr, root.range, &mut ctx)?;
@@ -906,6 +961,448 @@ fn build_main_return_schema(sig: &MainSignature) -> Result<Schema, LoweringError
             default: None,
         }],
     })
+}
+
+/// Phase F.2 (W7 anon-Dict-return): plan emitted by
+/// [`anon_dict_return_plan`] when `#main(...) -> Dict { ... }` is
+/// being lifted from "rejected as UnsupportedTypeInMain" to "lower as
+/// an anonymous schema with closure-typed fields lifted to internal
+/// let-bindings".
+#[derive(Debug, Clone)]
+struct AnonDictPlan {
+    /// Synthesised return schema. Only carries the **scalar** fields
+    /// — closure-typed source-level fields are lifted to internal
+    /// let-bindings and do not appear here (they would be rejected
+    /// by [`SchemaLayout::offsets_for`] anyway per the Phase B guard).
+    schema: Schema,
+    /// Per-source-field classification in declaration order. The body
+    /// walker iterates these to decide whether to emit a closure
+    /// let-binding (no host-visible field) or a normal record store.
+    fields: Vec<AnonDictField>,
+}
+
+/// One classified entry from [`AnonDictPlan::fields`]. The walker
+/// pairs the source-level `name` with either a closure signature (to
+/// emit `MakeClosure` + `LetSet`) or the canonical scalar type the
+/// matching schema field will store.
+#[derive(Debug, Clone)]
+enum AnonDictField {
+    /// Source-level field whose value is an `Expr::Closure` literal.
+    /// Lifted to an internal let-binding; its surface signature is
+    /// memoised in `LowerCtx::closure_let_signatures` so a recursive
+    /// self-call inside the body resolves to `Op::CallClosure`.
+    Closure {
+        name: String,
+        param_tys: Vec<IrType>,
+        ret_ty: IrType,
+    },
+    /// Source-level field whose value is a normal expression (the
+    /// "host-visible" surface). Stored into the root record at the
+    /// matching offset.
+    Scalar { name: String, ty: TypeRepr },
+}
+
+/// Try to build an [`AnonDictPlan`] for the entry's body when the
+/// return type is a bare `Dict` and the body is a dict literal.
+/// Returns `Ok(None)` when the source does not match the anon-Dict
+/// surface (preserving the existing
+/// `build_main_return_schema → UnsupportedTypeInMain` path), and
+/// `Ok(Some(_))` once the surface is recognised.
+///
+/// Per-field type classification today is **heuristic**: a closure
+/// literal lifts to a `[I64] → I64` (or user-annotated) signature
+/// matching the W7 production source shape (`fib: (k) => ...`); a
+/// scalar field's type is taken from a small set of statically
+/// derivable expressions (literal, arithmetic between literals,
+/// `Variable(name)` against a `#main` Int param, and free-call
+/// against a previously-classified closure field). Anything else
+/// surfaces as a `LoweringError::UnsupportedExpr` — the broader
+/// inference work stays Phase D scope. The shape is deliberately
+/// minimal so the W7 cmp_lua workload passes the IR pass without
+/// dragging analyzer-side per-field Dict inference into the picture.
+fn anon_dict_return_plan(
+    sig: &MainSignature,
+    root: &Node,
+) -> Result<Option<AnonDictPlan>, LoweringError> {
+    let Some(rt) = sig.return_type.as_ref() else {
+        return Ok(None);
+    };
+    if !type_node_is_bare_dict(rt) {
+        return Ok(None);
+    }
+    let Expr::Dict(pairs) = &*root.expr else {
+        return Ok(None);
+    };
+
+    // Build a quick scalar-type index for the `#main` parameters so
+    // a `Variable(n)` on the RHS of a scalar field classifies cleanly.
+    let mut param_tys: HashMap<&str, IrType> = HashMap::new();
+    for p in &sig.params {
+        if let Some(canonical) = type_node_to_canonical(&p.type_node) {
+            if let Ok(irt) = type_repr_to_ir_type(&canonical) {
+                param_tys.insert(p.name.as_str(), irt);
+            }
+        }
+    }
+
+    let mut fields: Vec<AnonDictField> = Vec::with_capacity(pairs.len());
+    let mut closure_field_sigs: HashMap<&str, (Vec<IrType>, IrType)> = HashMap::new();
+
+    for (key, value) in pairs {
+        let TokenKey::String(name, _, _) = key else {
+            return Err(LoweringError::UnsupportedExpr {
+                kind: "Dict(non-string-key in anon-Dict-return body)".to_string(),
+                range: root.range,
+            });
+        };
+        match &*value.expr {
+            Expr::Closure { params, .. } => {
+                // Default each unannotated param to I64; honor a
+                // `(k: Bool) =>` style annotation when the user
+                // supplied one.
+                let mut param_irts: Vec<IrType> = Vec::with_capacity(params.len());
+                for p in params {
+                    let irt = p
+                        .type_hint
+                        .as_ref()
+                        .and_then(type_node_to_canonical)
+                        .and_then(|r| type_repr_to_ir_type(&r).ok())
+                        .unwrap_or(IrType::I64);
+                    param_irts.push(irt);
+                }
+                // Ret type today defaults to I64 (W7 fib returns Int).
+                // Future Phase D scope: derive from body inference or
+                // user annotation. Acceptable for the production W7
+                // surface (`(k) => k < 2 ? k : fib(k-1) + fib(k-2)`).
+                let ret_ty = IrType::I64;
+                closure_field_sigs.insert(name.as_str(), (param_irts.clone(), ret_ty));
+                fields.push(AnonDictField::Closure {
+                    name: name.clone(),
+                    param_tys: param_irts,
+                    ret_ty,
+                });
+            }
+            _ => {
+                let ty = classify_anon_dict_scalar_field(
+                    &value.expr,
+                    value.range,
+                    &param_tys,
+                    &closure_field_sigs,
+                    name,
+                )?;
+                fields.push(AnonDictField::Scalar {
+                    name: name.clone(),
+                    ty,
+                });
+            }
+        }
+    }
+
+    // Build the host-visible schema from the scalar entries only.
+    let schema_fields: Vec<Field> = fields
+        .iter()
+        .filter_map(|f| match f {
+            AnonDictField::Scalar { name, ty } => Some(Field {
+                name: name.clone(),
+                ty: ty.clone(),
+                default: None,
+            }),
+            AnonDictField::Closure { .. } => None,
+        })
+        .collect();
+    let schema = Schema {
+        name: MAIN_RETURN_SCHEMA_NAME.to_string(),
+        generics: vec![],
+        fields: schema_fields,
+    };
+    Ok(Some(AnonDictPlan { schema, fields }))
+}
+
+/// True when `t` is a single-segment `Dict` with no generic
+/// arguments — the surface [`anon_dict_return_plan`] hangs the W7
+/// anon-Dict-return lifting off. Multi-segment paths (`pkg.Dict`),
+/// `Dict<K, V>` with explicit generics, and variant-style nodes are
+/// out of scope.
+fn type_node_is_bare_dict(t: &TypeNode) -> bool {
+    t.path.len() == 1 && t.path[0] == "Dict" && t.generics.is_empty() && t.variant_fields.is_none()
+}
+
+/// Statically derive a [`TypeRepr`] for a scalar dict field in the
+/// W7 anon-Dict-return path. Today's surface intentionally stays
+/// minimal — anything beyond the supported shapes surfaces as
+/// `UnsupportedExpr` so the future inference work has a clear edge
+/// rather than a half-implemented fallback.
+///
+/// Supported value shapes:
+/// * `Expr::Int` / `Expr::Float` / `Expr::Bool` / `Expr::String`.
+/// * `Expr::Variable([name])` where `name` resolves to a `#main`
+///   parameter with a known scalar IR type.
+/// * `Expr::FnCall { path: [name], args }` where `name` was already
+///   classified as a closure field — the field type is the closure's
+///   declared return type.
+/// * `Expr::Binary(Add|Sub|Mul|Div|Mod, lhs, rhs)` over integers /
+///   floats — propagates the operand type (Int + Int → Int).
+fn classify_anon_dict_scalar_field(
+    expr: &Expr,
+    range: TokenRange,
+    main_param_tys: &HashMap<&str, IrType>,
+    closure_field_sigs: &HashMap<&str, (Vec<IrType>, IrType)>,
+    field_name: &str,
+) -> Result<TypeRepr, LoweringError> {
+    let irt = classify_anon_dict_scalar_field_irt(
+        expr,
+        range,
+        main_param_tys,
+        closure_field_sigs,
+        field_name,
+    )?;
+    ir_type_to_type_repr(irt).ok_or_else(|| LoweringError::UnsupportedExpr {
+        kind: format!(
+            "AnonDictReturn(field `{}`: non-scalar inferred IR type {:?})",
+            field_name, irt,
+        ),
+        range,
+    })
+}
+
+fn classify_anon_dict_scalar_field_irt(
+    expr: &Expr,
+    range: TokenRange,
+    main_param_tys: &HashMap<&str, IrType>,
+    closure_field_sigs: &HashMap<&str, (Vec<IrType>, IrType)>,
+    field_name: &str,
+) -> Result<IrType, LoweringError> {
+    match expr {
+        Expr::Int(_) => Ok(IrType::I64),
+        Expr::Float(_) => Ok(IrType::F64),
+        Expr::Bool(_) => Ok(IrType::Bool),
+        Expr::String(_) => Ok(IrType::String),
+        Expr::Variable(path) => {
+            if let [TokenKey::String(name, _, _)] = path.as_slice() {
+                if let Some(t) = main_param_tys.get(name.as_str()) {
+                    return Ok(*t);
+                }
+            }
+            Err(LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "AnonDictReturn(field `{}`: cannot classify Variable({:?}))",
+                    field_name, path
+                ),
+                range,
+            })
+        }
+        Expr::FnCall { path, .. } => {
+            if let [TokenKey::String(name, _, _)] = path.as_slice() {
+                if let Some((_, ret_ty)) = closure_field_sigs.get(name.as_str()) {
+                    return Ok(*ret_ty);
+                }
+            }
+            Err(LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "AnonDictReturn(field `{}`: cannot classify FnCall({:?}) — \
+                     only calls into previously-classified closure fields are \
+                     supported at this surface)",
+                    field_name, path
+                ),
+                range,
+            })
+        }
+        Expr::Binary(_, lhs, rhs) => {
+            // Conservative arithmetic propagation: both sides must
+            // resolve to the same scalar IR type. Mixed Int/Float
+            // promotes to Float (mirroring the runtime). String
+            // concat (`+`) is recognised when both sides are String.
+            let lt = classify_anon_dict_scalar_field_irt(
+                &lhs.expr,
+                lhs.range,
+                main_param_tys,
+                closure_field_sigs,
+                field_name,
+            )?;
+            let rt = classify_anon_dict_scalar_field_irt(
+                &rhs.expr,
+                rhs.range,
+                main_param_tys,
+                closure_field_sigs,
+                field_name,
+            )?;
+            match (lt, rt) {
+                (IrType::I64, IrType::I64) => Ok(IrType::I64),
+                (IrType::F64, IrType::F64)
+                | (IrType::F64, IrType::I64)
+                | (IrType::I64, IrType::F64) => Ok(IrType::F64),
+                (IrType::Bool, IrType::Bool) => Ok(IrType::Bool),
+                (IrType::String, IrType::String) => Ok(IrType::String),
+                _ => Err(LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "AnonDictReturn(field `{}`: binary with mixed scalar types {:?} / {:?})",
+                        field_name, lt, rt
+                    ),
+                    range,
+                }),
+            }
+        }
+        _ => Err(LoweringError::UnsupportedExpr {
+            kind: format!(
+                "AnonDictReturn(field `{}`: unsupported value shape `{}`)",
+                field_name,
+                expr.kind()
+            ),
+            range,
+        }),
+    }
+}
+
+/// Reverse of `type_repr_to_ir_type` for the scalar / String cases
+/// needed by [`anon_dict_return_plan`]. Returns `None` for IR types
+/// that have no anon-Dict-return canonical form (lists, schemas,
+/// null, closure).
+fn ir_type_to_type_repr(t: IrType) -> Option<TypeRepr> {
+    match t {
+        IrType::I64 => Some(TypeRepr::Int),
+        IrType::F64 => Some(TypeRepr::Float),
+        IrType::Bool => Some(TypeRepr::Bool),
+        IrType::String => Some(TypeRepr::String),
+        IrType::Null => Some(TypeRepr::Null),
+        _ => None,
+    }
+}
+
+/// Phase F.2 (W7): body walker for the anon-Dict-return path. Walks
+/// the dict literal in declaration order; each entry is either a
+/// closure-field let-binding (no host-visible store) or a scalar
+/// field store into the root record.
+///
+/// Closure fields are pre-registered as `IrType::Closure` let-locals
+/// **before** their body lowers — this gives recursive self-calls
+/// (W7's `fib(k - 1)` inside `fib`'s body) a stable let slot to
+/// `LetGet` off and consume via `Op::CallClosure`.
+fn lower_anon_dict_body(
+    plan: &AnonDictPlan,
+    layout: &OffsetTable,
+    dict_pairs: &[(TokenKey, Node)],
+    record_local: u32,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    // Build a name → user-supplied Node map so we can pull each
+    // classified plan field's value back out of the source dict.
+    let mut user_values: HashMap<&str, &Node> = HashMap::new();
+    for (key, value) in dict_pairs {
+        if let TokenKey::String(name, _, _) = key {
+            user_values.insert(name.as_str(), value);
+        }
+    }
+
+    // Index plan-scalar fields against the layout (which only sees
+    // those scalar entries). Layout walks `schema.fields` in
+    // declaration order so the i-th scalar plan field maps to the
+    // i-th layout field.
+    let mut scalar_layout_idx: usize = 0;
+
+    for plan_field in &plan.fields {
+        match plan_field {
+            AnonDictField::Closure {
+                name,
+                param_tys,
+                ret_ty,
+            } => {
+                let value = user_values.get(name.as_str()).copied().ok_or_else(|| {
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "AnonDictReturn(missing source value for closure field `{}`)",
+                            name
+                        ),
+                        range: TokenRange::default(),
+                    }
+                })?;
+                // Pre-allocate the let-idx the closure handle will
+                // land in. Registered before the body lowers so a
+                // recursive `Variable(name)` inside the body resolves
+                // to `LetGet { idx, Closure }`.
+                let let_idx = ctx.next_let_idx;
+                ctx.next_let_idx += 1;
+                ctx.lets.push(LetBinding {
+                    name: name.clone(),
+                    idx: let_idx,
+                    ty: IrType::Closure,
+                    schema_brand: None,
+                });
+                ctx.closure_let_signatures
+                    .insert(let_idx, (param_tys.clone(), *ret_ty));
+
+                // Lower the closure body — pushes `IrType::Closure` on
+                // top of the vstack and appends the lambda to
+                // `ctx.lambda_funcs`.
+                lower_closure_as_value(&value.expr, value.range, param_tys, *ret_ty, ctx)?;
+
+                // Stash the handle into the pre-allocated let-local.
+                let popped = ctx
+                    .tstack
+                    .pop()
+                    .ok_or_else(|| LoweringError::UnsupportedExpr {
+                        kind: format!("AnonDictReturn(closure field `{}` produced no value)", name),
+                        range: value.range,
+                    })?;
+                debug_assert_eq!(popped, IrType::Closure);
+                ctx.out.push(TaggedOp {
+                    op: Op::LetSet {
+                        idx: let_idx,
+                        ty: IrType::Closure,
+                    },
+                    range: value.range,
+                });
+            }
+            AnonDictField::Scalar { name, ty } => {
+                let value = user_values.get(name.as_str()).copied().ok_or_else(|| {
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "AnonDictReturn(missing source value for scalar field `{}`)",
+                            name
+                        ),
+                        range: TokenRange::default(),
+                    }
+                })?;
+                lower_expr(&value.expr, value.range, ctx)?;
+                let expected_ir = type_repr_to_ir_type(ty)?;
+                let top = ctx
+                    .tstack
+                    .pop()
+                    .ok_or_else(|| LoweringError::UnsupportedExpr {
+                        kind: format!("AnonDictReturn(scalar field `{}` produced no value)", name),
+                        range: value.range,
+                    })?;
+                if top.wasm_slot() != expected_ir.wasm_slot() {
+                    return Err(LoweringError::UnsupportedFieldType {
+                        schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+                        field: name.clone(),
+                        ty: format!("expected {:?}, got {:?}", expected_ir, top),
+                        range: value.range,
+                    });
+                }
+                let layout_field = layout.fields.get(scalar_layout_idx).ok_or_else(|| {
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "AnonDictReturn(scalar field `{}`: layout index out of range)",
+                            name
+                        ),
+                        range: value.range,
+                    }
+                })?;
+                debug_assert_eq!(&layout_field.name, name);
+                ctx.out.push(TaggedOp {
+                    op: Op::StoreFieldAtRecord {
+                        record_local_idx: record_local,
+                        offset: layout_field.offset as u32,
+                        ty: expected_ir,
+                    },
+                    range: value.range,
+                });
+                scalar_layout_idx += 1;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Map a parser [`TypeNode`] to a canonical [`TypeRepr`].
@@ -1316,12 +1813,16 @@ fn collect_free_vars(expr: &Expr, lambda_params: &[ClosureParam]) -> Vec<String>
             }
             Expr::FnCall { path, args } => {
                 // Method-call form (`xs.length()`) carries the
-                // receiver in the path's leading segments; treat the
-                // head segment as a potential free var.
+                // receiver in the path's leading segments — visit the
+                // head as a potential free var. Free-call form
+                // (`fib(n)`) also visits the head: in the Phase F.2
+                // anon-Dict-return path the head may resolve to a
+                // closure-typed let-binding (the lifted dict field);
+                // `resolve_capture` filters non-binding names out
+                // (stdlib free calls like `range(...)` return
+                // `Ok(None)` and never become captures).
                 if let Some(TokenKey::String(name, _, _)) = path.first() {
-                    if path.len() > 1 {
-                        visit(name);
-                    }
+                    visit(name);
                 }
                 for a in args {
                     walk_expr(&a.value.expr, lambda_params, visit);
@@ -1560,7 +2061,7 @@ fn lower_closure_as_value(
 
     // Prologue: load each capture into a fresh inner let-local.
     let mut inner_let_idx: u32 = 0;
-    for ((name, ty, _outer_idx), offset) in resolved.iter().zip(offsets.iter()) {
+    for ((name, ty, outer_idx), offset) in resolved.iter().zip(offsets.iter()) {
         // Push captures_ptr (local 0), then emit the type-driven load
         // followed by a LetSet under the source-level name.
         inner.out.push(TaggedOp {
@@ -1606,6 +2107,18 @@ fn lower_closure_as_value(
             ty: *ty,
             schema_brand: None,
         });
+        // Phase F.2 (W7 anon-Dict-return): when a captured value is
+        // a closure handle, propagate its signature into the inner
+        // ctx's side-table so a recursive self-call inside the body
+        // (which sees the capture at `inner_let_idx`) resolves
+        // through `try_lower_local_closure_call`. Without this hop
+        // the inner ctx would see an `IrType::Closure` let but no
+        // signature, leading to a missing-side-table error.
+        if matches!(*ty, IrType::Closure) {
+            if let Some(sig) = ctx.closure_let_signatures.get(outer_idx).cloned() {
+                inner.closure_let_signatures.insert(inner_let_idx, sig);
+            }
+        }
         inner_let_idx += 1;
     }
     // Lambda's own params: stash each wasm local into a let-local
@@ -1696,6 +2209,105 @@ fn lower_closure_as_value(
     Ok(())
 }
 
+/// Phase F.2 (W7 anon-Dict-return): when a free-call's head names a
+/// closure-typed let-binding (a `(name) => ...` value lifted into an
+/// internal let by [`lower_anon_dict_body`]), emit the call as
+/// `LetGet { idx, Closure }` + per-arg lowering + `Op::CallClosure`.
+///
+/// Returns `Ok(Some(()))` when the call was lowered, `Ok(None)` when
+/// the head doesn't match a closure let (so the caller falls back to
+/// the stdlib dispatch / schema-method path). Errors propagate when
+/// the arg arity / types don't match the recorded signature.
+fn try_lower_local_closure_call(
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    let [TokenKey::String(name, _, _)] = path else {
+        return Ok(None);
+    };
+    let Some(binding) = ctx.lets.iter().rev().find(|b| b.name == *name).cloned() else {
+        return Ok(None);
+    };
+    if binding.ty != IrType::Closure {
+        return Ok(None);
+    }
+    let (param_tys, ret_ty) = ctx
+        .closure_let_signatures
+        .get(&binding.idx)
+        .cloned()
+        .ok_or_else(|| LoweringError::UnsupportedExpr {
+            kind: format!(
+                "FnCall(local-closure `{}`: signature side-table missing for let_idx {})",
+                name, binding.idx,
+            ),
+            range,
+        })?;
+    if args.len() != param_tys.len() {
+        return Err(LoweringError::UnknownStdlibMethod {
+            name: name.clone(),
+            arity: args.len() as u32,
+            range,
+        });
+    }
+    // Push the closure handle first; `Op::CallClosure` consumes
+    // `[handle, arg0, arg1, ...]`.
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: binding.idx,
+            ty: IrType::Closure,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::Closure);
+    for (i, call_arg) in args.iter().enumerate() {
+        if call_arg.name.is_some() {
+            return Err(LoweringError::UnsupportedExpr {
+                kind: format!("FnCall(local-closure `{}`: named-arg unsupported)", name),
+                range,
+            });
+        }
+        lower_expr(&call_arg.value.expr, call_arg.value.range, ctx)?;
+        let expected = param_tys[i];
+        let got = ctx
+            .tstack
+            .pop()
+            .ok_or_else(|| LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "FnCall(local-closure `{}`: arg {} produced no value)",
+                    name, i
+                ),
+                range,
+            })?;
+        if got.wasm_slot() != expected.wasm_slot() {
+            return Err(LoweringError::StdlibArgTypeMismatch {
+                name: name.clone(),
+                arg_idx: i as u32,
+                got,
+                expected,
+                range,
+            });
+        }
+        ctx.tstack.push(got);
+    }
+    // Pop args + handle from the virtual stack to match the op's
+    // stack effect.
+    for _ in 0..param_tys.len() {
+        ctx.tstack.pop();
+    }
+    ctx.tstack.pop(); // the handle
+    ctx.out.push(TaggedOp {
+        op: Op::CallClosure {
+            param_tys: param_tys.clone(),
+            ret_ty,
+        },
+        range,
+    });
+    ctx.tstack.push(ret_ty);
+    Ok(Some(()))
+}
+
 /// Phase 4.a: lower an [`Expr::FnCall`] into a stdlib dispatch.
 ///
 /// Accepts two forms:
@@ -1725,6 +2337,15 @@ fn lower_fn_call(
             kind: "FnCall(empty-path)".to_string(),
             range,
         });
+    }
+    // Phase F.2 (W7 anon-Dict-return): a free-call whose head is a
+    // single-segment identifier may resolve to a closure-typed
+    // let-binding (the anon-Dict-return path stashes each closure
+    // field there). When it does, emit `LetGet { idx, Closure }` +
+    // typed arg loads + `Op::CallClosure`. Falls through to the
+    // stdlib dispatch when the head doesn't match a let.
+    if let Some(()) = try_lower_local_closure_call(path, args, range, ctx)? {
+        return Ok(());
     }
     // review-improvement-160 bytecode M3 phase 2: peephole-desugar
     // `list.sum(range(end))` / `list.sum(range(start, end))` into an
@@ -5291,36 +5912,68 @@ mod w7_closure_boundary_tests {
         lower_workspace_single(&analyzed, &ast).map(|l| l.module)
     }
 
-    /// The W7 production source surface — verbatim copy of
-    /// `crates/relon-bench/benches/cmp_lua.rs::w7_relon_src`. Phase A
-    /// pins the current diagnostic: `-> Dict` is the first reject site,
-    /// so `UnsupportedTypeInMain { type_name: "Dict" }` is what users
-    /// (and the bytecode bounce path) see today.
+    /// Phase C verification: the W7 production source — verbatim copy
+    /// of `crates/relon-bench/benches/cmp_lua.rs::w7_relon_src` —
+    /// now lowers cleanly through `lower_workspace_single`. The body
+    /// produces an anon-Dict-return record with the `result` scalar
+    /// field while `fib` is lifted to an internal let-bound closure
+    /// handle (it does not appear in the host-visible schema).
+    ///
+    /// Pre-Phase-C this rejected at the return-schema build step with
+    /// `UnsupportedTypeInMain { type_name: "Dict" }`; Phase C lifts
+    /// that gap via [`anon_dict_return_plan`] +
+    /// [`lower_anon_dict_body`]. Future Phase D scope: backend tier
+    /// wiring (`Op::MakeClosure` / `Op::CallClosure`) for bytecode /
+    /// trace_jit / LLVM emitters that still reject those ops.
     #[test]
-    fn w7_production_source_pins_unsupported_dict_return() {
+    fn w7_production_source_lowers_via_anon_dict_return_plan() {
         let src = "#main(Int n) -> Dict\n\
                    {\n\
                      #private\n\
                      fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
                      result: fib(n)\n\
                    }";
-        let err = try_lower(src).expect_err(
-            "Phase B keeps the current rejection — flip to Ok(_) once Phase C \
-             lifts the anon-Dict-with-closure-field gap",
+        let module = try_lower(src).expect("Phase C lowers W7 anon-Dict-return source");
+
+        // The synthesised return schema only carries the `result`
+        // scalar — `fib` is internal.
+        let entry_idx = module
+            .entry_func_index
+            .expect("Phase C builds an entry func");
+        let entry = &module.funcs[entry_idx];
+        // Closure table populated with the W7 `fib` lambda.
+        assert_eq!(
+            module.closure_table.len(),
+            1,
+            "expected one entry in closure_table for the `fib` lambda"
         );
-        match err {
-            LoweringError::UnsupportedTypeInMain { type_name, .. } => {
-                assert_eq!(
-                    type_name, "Dict",
-                    "expected `-> Dict` to surface as UnsupportedTypeInMain(\"Dict\"), got {type_name:?}"
-                );
-            }
-            other => panic!(
-                "expected UnsupportedTypeInMain(\"Dict\"), got {other:?} — \
-                 likely Phase C partially landed; update this test to track \
-                 the next-most-upstream rejection site"
-            ),
-        }
+        // The lambda Func body exists right after the entry func.
+        assert!(
+            module.funcs.len() >= 2,
+            "expected entry + at least one lambda func, got {} funcs",
+            module.funcs.len()
+        );
+        // Entry body emits `MakeClosure` exactly once (for `fib`).
+        let make_count = entry
+            .body
+            .iter()
+            .filter(|t| matches!(t.op, Op::MakeClosure { .. }))
+            .count();
+        assert_eq!(
+            make_count, 1,
+            "expected the entry to emit MakeClosure once for the `fib` let, got {make_count}"
+        );
+        // The `result` field's `fib(n)` lowers to `LetGet { Closure
+        // } + CallClosure`.
+        let call_count = entry
+            .body
+            .iter()
+            .filter(|t| matches!(t.op, Op::CallClosure { .. }))
+            .count();
+        assert_eq!(
+            call_count, 1,
+            "expected the entry to emit CallClosure once for `result: fib(n)`, got {call_count}"
+        );
     }
 
     /// Phase B foundation check: the canonical schema digest treats
