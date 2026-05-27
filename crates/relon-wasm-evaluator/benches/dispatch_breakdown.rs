@@ -6,22 +6,33 @@
 //! Run with:
 //!     cargo bench -p relon-wasm-evaluator --bench dispatch_breakdown
 //!
-//! Each row prints a mean ns/iter. Rows are layered so subtraction
-//! gives a per-stage estimate:
+//! Two rows are measured (W12 `x + 1`, 1_000_000 iters each):
 //!
-//!     L0_typed_call_only       — `TypedFunc::call` only, all args
-//!                                pre-resolved, no HostState touched.
-//!     L1_with_arena_reset      — L0 + `HostState::reset` on entry.
-//!     L2_fast_full             — `run_main_legacy_i64_fast`
-//!                                (L1 + mutex lock + tier markers).
-//!     L3_resolve_typed_func    — `Instance::get_typed_func` on every
-//!                                iter (pre-Z.3a slow-path shape).
-//!     L4_run_main_buffer       — `Evaluator::run_main`
-//!                                (HashMap pack + Value enum decode).
+//!     L2_fast_full            — `run_main_legacy_i64_fast`
+//!                               (mutex lock + arena reset + cached
+//!                               `TypedFunc<i64,i64>::call` + tier write)
+//!     L4_run_main_buffer      — `Evaluator::run_main`
+//!                               (L2 + `HashMap<String,Value>` get +
+//!                               `extract_named_int` + `Value::Int` wrap)
 //!
-//! The bench is W12-only (`x + 1`) because the inner kernel is ~20 ns
-//! so the boundary overhead dominates each row's mean — that's the
-//! whole point.
+//! `L4 - L2` is the HashMap/Value boundary tax this Phase Z.3a fast
+//! path bypasses. Reference numbers from the worktree dev host
+//! (release profile, `lto=fat`, opt-level=3):
+//!
+//!     L2_fast_full            ~ 82.9 ns/iter
+//!     L4_run_main_buffer      ~278.5 ns/iter
+//!     delta (HashMap+Value)   ~195.6 ns/iter
+//!
+//! For the wasmtime side the remaining ~82 ns are: `Mutex::lock`
+//! (~5 ns uncontended), `HostState::reset` (single u32 write),
+//! `validate_sync_call` + `vm_func_ref` (~10-20 ns each), and the
+//! `invoke_wasm_and_catch_traps` / array_call C++ shim that wraps the
+//! actual JIT body — the bulk of the floor for any wasmtime call.
+//! W12's wasm body itself is ~5 ns (`i64.const 1; i64.add`).
+//!
+//! The bench is W12-only because the inner kernel is ~5 ns so the
+//! boundary overhead dominates each row's mean — that's the whole
+//! point of profiling Z.3a.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -60,7 +71,8 @@ fn main() {
 
     // ----- L2 fast path (production hot loop shape) -----
     bench("L2_fast_full", MEASURE_ITERS, || {
-        let v = ev.run_main_legacy_i64_fast(&[std::hint::black_box(41i64)])
+        let v = ev
+            .run_main_legacy_i64_fast(&[std::hint::black_box(41i64)])
             .unwrap();
         std::hint::black_box(v);
     });

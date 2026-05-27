@@ -213,9 +213,12 @@ impl WasmEvaluator {
     /// Returns `Err(Unsupported)` when the source fell through to
     /// the tree-walker tier (`wasm: None`).
     pub fn run_main_legacy_i64_fast(&self, args: &[i64]) -> Result<i64, RuntimeError> {
-        let rt = self.wasm.as_ref().ok_or_else(|| RuntimeError::Unsupported {
-            reason: "wasm-eval: fast path unavailable (source on tree-walker fallback)".into(),
-        })?;
+        let rt = self
+            .wasm
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Unsupported {
+                reason: "wasm-eval: fast path unavailable (source on tree-walker fallback)".into(),
+            })?;
         if args.len() != 1 {
             return Err(RuntimeError::Unsupported {
                 reason: format!(

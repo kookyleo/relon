@@ -2024,9 +2024,7 @@ fn bench_cmp_lua(c: &mut Criterion) {
                         b.iter_custom(|iters| {
                             let n_in = black_box(W1_N);
                             timed_with_warmup(iters, || {
-                                let v = wasm
-                                    .run_main_legacy_i64_fast(&[black_box(n_in)])
-                                    .unwrap();
+                                let v = wasm.run_main_legacy_i64_fast(&[black_box(n_in)]).unwrap();
                                 black_box(v);
                             })
                         });
@@ -3446,14 +3444,14 @@ fn bench_cmp_lua(c: &mut Criterion) {
                             _ => None,
                         });
                     if let Some(arg_i64) = scalar0 {
-                        let fast_out = wasm
-                            .run_main_legacy_i64_fast(&[arg_i64])
-                            .unwrap_or_else(|e| {
-                                panic!(
-                                    "[cmp_lua {label}] relon_wasm_wasmtime_fast \
+                        let fast_out =
+                            wasm.run_main_legacy_i64_fast(&[arg_i64])
+                                .unwrap_or_else(|e| {
+                                    panic!(
+                                        "[cmp_lua {label}] relon_wasm_wasmtime_fast \
                                      consistency: {e}"
-                                )
-                            });
+                                    )
+                                });
                         let slow_out = match wasm.run_main(args_factory()).unwrap() {
                             Value::Int(n) => n,
                             other => panic!(
@@ -3472,9 +3470,7 @@ fn bench_cmp_lua(c: &mut Criterion) {
                                 b.iter_custom(|iters| {
                                     let a = black_box(arg_i64);
                                     timed_with_warmup(iters, || {
-                                        let v = wasm
-                                            .run_main_legacy_i64_fast(&[a])
-                                            .unwrap();
+                                        let v = wasm.run_main_legacy_i64_fast(&[a]).unwrap();
                                         black_box(v);
                                     })
                                 });
