@@ -438,12 +438,12 @@ fn basic_to_metadata(bt: BasicTypeEnum<'_>) -> BasicMetadataTypeEnum<'_> {
 /// the legacy-i64 envelope — helpers may carry any
 /// [`IrType`]-shaped param / return mix that `ir_ty_to_llvm_basic`
 /// accepts.
-fn emit_helper_body<'ctx, 'cp>(
+fn emit_helper_body<'ctx>(
     ctx: &'ctx Context,
     module: &LlvmModule<'ctx>,
     func: &Func,
     llvm_fn: FunctionValue<'ctx>,
-    const_pool: &'cp ConstPool,
+    const_pool: &ConstPool,
     helper_table: &HashMap<u32, FunctionValue<'ctx>>,
 ) -> Result<(), LlvmError> {
     let entry_bb = ctx.append_basic_block(llvm_fn, "entry");
