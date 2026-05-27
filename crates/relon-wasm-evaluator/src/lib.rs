@@ -284,7 +284,8 @@ impl Evaluator for WasmEvaluator {
         let arg_i64 = match rt.program {
             WasmProgram::W1IntSumRange
             | WasmProgram::W2DotProduct
-            | WasmProgram::W6ListSumPlusOne => extract_named_int(&args, "n")?,
+            | WasmProgram::W6ListSumPlusOne
+            | WasmProgram::W10ConfigEvalInline => extract_named_int(&args, "n")?,
             WasmProgram::W12IncrementInt => extract_named_int(&args, "x")?,
             other => {
                 return Err(io_err(format!(

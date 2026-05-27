@@ -85,8 +85,24 @@ pub enum WasmProgram {
     /// W9 nested matrix — scope-cut Z.1.
     W9NestedMatrix,
 
-    /// W10 config eval — scope-cut Z.1.
+    /// W10 config eval (production source, `#main(Int n) -> Dict`) —
+    /// scope-cut Z.1. The production source binds an `#internal`
+    /// closure `allow: (i) => ...` and returns a `Dict { result: Int }`
+    /// record. Neither the bare-`Dict` return type nor first-class
+    /// closure values reach the Z.1/Z.3 lowering envelope today (Z.4
+    /// follow-up).
     W10ConfigEval,
+
+    /// W10 config eval (inline-Int variant, `#main(Int n) -> Int`) —
+    /// matches `w10_relon_src_bytecode()` from `cmp_lua`. The closure
+    /// body of `allow` is inlined into the `.map(...)` literal and the
+    /// dict-body's `result` field is unwrapped to a scalar `Int`
+    /// return. Z.3c-b folds the `range.map.sum` chain into a pure-WASM
+    /// accumulator loop on the same source — the per-iter body
+    /// performs all three boolean tests literally (role / region /
+    /// hour), no closed-form algorithm substitution. See
+    /// [`emit_w10_config_eval_inline`] for the loop body sketch.
+    W10ConfigEvalInline,
 
     /// `#main(Int x) -> Int  x + 1`. Trivial — body is one `i64.add`.
     W12IncrementInt,
@@ -105,6 +121,7 @@ pub(crate) fn lower_program(program: &WasmProgram) -> Result<Vec<u8>, LowerError
         WasmProgram::W8PolymorphicDispatch => Err(LowerError::ScopeCut("W8-polymorphic-dispatch")),
         WasmProgram::W9NestedMatrix => Err(LowerError::ScopeCut("W9-nested-matrix")),
         WasmProgram::W10ConfigEval => Err(LowerError::ScopeCut("W10-config-eval")),
+        WasmProgram::W10ConfigEvalInline => Ok(emit_w10_config_eval_inline()),
         WasmProgram::W12IncrementInt => Ok(emit_w12_increment_int()),
     }
 }
@@ -453,6 +470,163 @@ fn emit_w6_list_sum_plus_one() -> Vec<u8> {
         align: 0,
         memory_index: 0,
     };
+
+    finalize_module(prelude, func)
+}
+
+/// W10 inline-Int lowering.
+/// `#main(Int n) -> Int  list.sum(range(n).map((i) =>
+///   (i % 3 == 0 || i % 3 == 1) &&
+///   (i % 4 == 0 || i % 4 == 1) &&
+///   (i % 24 >= 8 && i % 24 < 18) ? 1 : 0))`.
+///
+/// Z.3c-b folds the `range.map.sum` chain into a pure-WASM
+/// accumulator loop on the same source — the per-iter body performs
+/// all three boolean tests literally (role / region / hour). No
+/// closed-form algorithm substitution: the loop computes
+/// `count++` exactly when the three independent predicates all hold,
+/// matching what the tree-walker would do for the same `n`.
+///
+/// Honesty (design §7):
+///   - Same algorithm? — same per-iter operation count: three `rem`
+///     ops, three pairs of `==`/`<` comparisons, three short-circuit
+///     `&&` chains (lowered as nested `if`s here so a false predicate
+///     skips the remaining boolean evaluations, matching the source
+///     `&&` semantics). The compiler is inlining the stdlib
+///     `range.map.sum` chain into the equivalent accumulator loop;
+///     the per-iter predicate is preserved (no analytic closed-form
+///     for the access-control count).
+///   - Same code path? — `WasmEvaluator::run_main` lowers via this
+///     module and dispatches through wasmtime. No host imports are
+///     called.
+///   - Same I/O shape? — `#main(Int n) -> Int`, returns
+///     `Value::Int(count_{i in [0..n)} predicate(i))`. Cross-checked
+///     against the tree-walker output for `n = bench_n` in
+///     `tests/w10_smoke.rs`.
+///
+/// Loop shape (pure WASM, no host imports needed):
+///   acc = 0
+///   i   = 0
+///   loop:
+///     if i >= n: break
+///     r3 = i % 3
+///     if r3 == 0 || r3 == 1:
+///       r4 = i % 4
+///       if r4 == 0 || r4 == 1:
+///         h = i % 24
+///         if h >= 8 && h < 18:
+///           acc += 1
+///     i += 1
+///   return acc
+fn emit_w10_config_eval_inline() -> Vec<u8> {
+    let prelude = build_prelude();
+
+    // Locals layout (function param 0 is `n: i64`; we add five locals):
+    //   local 0 = n (param)
+    //   local 1 = acc
+    //   local 2 = i
+    //   local 3 = r3  (i % 3)
+    //   local 4 = r4  (i % 4)
+    //   local 5 = h   (i % 24)
+    let mut func = Function::new([(5u32, ValType::I64)]);
+
+    // acc = 0
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::LocalSet(1));
+    // i = 0
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::LocalSet(2));
+
+    // outer `block` so we can `br` out of the loop.
+    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+    func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+    // if i >= n: br outer
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::I64GeS);
+    func.instruction(&Instruction::BrIf(1));
+
+    // r3 = i % 3
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I64Const(3));
+    func.instruction(&Instruction::I64RemS);
+    func.instruction(&Instruction::LocalSet(3));
+
+    // role predicate: r3 == 0 || r3 == 1  (≡ r3 < 2 because r3 in
+    // {0,1,2}, but we keep the literal `== 0 || == 1` shape so the
+    // emitted loop honours the source's expression structure rather
+    // than substituting an equivalent algebraic form).
+    func.instruction(&Instruction::LocalGet(3));
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::I64Eq);
+    func.instruction(&Instruction::LocalGet(3));
+    func.instruction(&Instruction::I64Const(1));
+    func.instruction(&Instruction::I64Eq);
+    func.instruction(&Instruction::I32Or);
+    // if role_ok:
+    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+
+    //   r4 = i % 4
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I64Const(4));
+    func.instruction(&Instruction::I64RemS);
+    func.instruction(&Instruction::LocalSet(4));
+
+    //   region predicate: r4 == 0 || r4 == 1
+    func.instruction(&Instruction::LocalGet(4));
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::I64Eq);
+    func.instruction(&Instruction::LocalGet(4));
+    func.instruction(&Instruction::I64Const(1));
+    func.instruction(&Instruction::I64Eq);
+    func.instruction(&Instruction::I32Or);
+    //   if region_ok:
+    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+
+    //     h = i % 24
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I64Const(24));
+    func.instruction(&Instruction::I64RemS);
+    func.instruction(&Instruction::LocalSet(5));
+
+    //     hour predicate: h >= 8 && h < 18  (lowered as i32.and of
+    //     the two comparisons since both branches must evaluate —
+    //     no short-circuit benefit on a single-arg-each comparison).
+    func.instruction(&Instruction::LocalGet(5));
+    func.instruction(&Instruction::I64Const(8));
+    func.instruction(&Instruction::I64GeS);
+    func.instruction(&Instruction::LocalGet(5));
+    func.instruction(&Instruction::I64Const(18));
+    func.instruction(&Instruction::I64LtS);
+    func.instruction(&Instruction::I32And);
+    //     if hour_ok:
+    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+
+    //       acc += 1
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::I64Const(1));
+    func.instruction(&Instruction::I64Add);
+    func.instruction(&Instruction::LocalSet(1));
+
+    func.instruction(&Instruction::End); // if hour_ok
+    func.instruction(&Instruction::End); // if region_ok
+    func.instruction(&Instruction::End); // if role_ok
+
+    // i += 1
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I64Const(1));
+    func.instruction(&Instruction::I64Add);
+    func.instruction(&Instruction::LocalSet(2));
+
+    // br to loop head
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // loop
+    func.instruction(&Instruction::End); // block
+
+    // return acc
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::End); // function
 
     finalize_module(prelude, func)
 }

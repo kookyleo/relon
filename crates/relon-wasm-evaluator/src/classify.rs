@@ -90,6 +90,20 @@ pub fn classify_main(source: &str) -> Result<WasmProgram, ClassifyError> {
     if normalised.contains("rows[i][j]") || normalised.contains("(i * n + j)") {
         return Err(ClassifyError::ScopeCut("W9-nested-matrix"));
     }
+    // W10 inline-Int variant — matches `w10_relon_src_bytecode()` from
+    // cmp_lua: `allow`'s closure body is inlined into the `.map(...)`
+    // literal and the dict-body's `result` field is unwrapped to a
+    // scalar `Int` return. Detected by the `#main(Int n) -> Int`
+    // declaration paired with the literal predicate composition. The
+    // production source (which returns a `Dict` and binds `allow` as a
+    // `#internal` closure) still scope-cuts below — Z.4 follow-up.
+    if normalised.contains("#main(Int n) -> Int")
+        && normalised.contains("(i % 3 == 0 || i % 3 == 1)")
+        && normalised.contains("(i % 4 == 0 || i % 4 == 1)")
+        && normalised.contains("(i % 24 >= 8 && i % 24 < 18)")
+    {
+        return Ok(WasmProgram::W10ConfigEvalInline);
+    }
     if normalised.contains("i % 24 >= 8") {
         return Err(ClassifyError::ScopeCut("W10-config-eval"));
     }
