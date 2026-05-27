@@ -10,12 +10,15 @@ description = "Runtime ABI shims for Relon AOT-compiled functions linked into Ru
 keywords = ["relon", "aot", "shim", "abi"]
 categories = ["compilers"]
 
-# Phase 1 envelope:
-# The Int-only `#main(Int...) -> Int` shape that `relon-rs-build` accepts
-# in Phase 1 has no arena dependency — every parameter is an i64 passed
-# by value, the body is a leaf arithmetic function, and the return value
-# rides home in `rax`. `SandboxState` is exposed today as a forward-
-# compatible placeholder so Phase 2's pointer-indirect surfaces (String
-# args / List returns / stdlib calls) can land without changing the
-# consuming-crate's API surface.
+# Phase 2 envelope:
+# Buffer-protocol entries need (a) a `SandboxState` whose `#[repr(C)]`
+# layout matches the LLVM crate's `ArenaState` so the JIT body can read
+# `arena_base` / `tail_cursor` / `scratch_cursor` / `scratch_base` at the
+# byte offsets it was emitted against, and (b) a marshalling helper
+# (`call_buffer_entry`) that packs typed Rust args into the arena and
+# decodes the return record. The `relon-eval-api` dep brings the
+# canonical `BufferBuilder` / `BufferReader` / `Schema` / `OffsetTable`
+# types so the generated binding and the in-process LLVM evaluator
+# share one writer/reader implementation.
 [dependencies]
+relon-eval-api = { workspace = true }

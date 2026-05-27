@@ -1920,6 +1920,9 @@ dependencies = [
 [[package]]
 name = "relon-rs-shims"
 version = "0.1.0"
+dependencies = [
+ "relon-eval-api",
+]
 
 [[package]]
 name = "relon-test-harness"

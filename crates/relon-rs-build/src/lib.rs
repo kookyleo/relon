@@ -52,7 +52,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use relon_codegen_llvm::LlvmAotEvaluator;
+use relon_codegen_llvm::{EmittedEntryShape, EmittedField, EmittedFieldType, LlvmAotEvaluator};
 
 /// Optimisation level requested from the LLVM backend. Phase 1 always
 /// runs the same `-O3` middle-end pipeline regardless of this value
@@ -241,12 +241,35 @@ impl Compiler {
             // program LTO if the consuming crate enabled it.
             println!("cargo:rustc-link-arg={}", object_path.to_string_lossy());
 
+            // Phase 2: when the emitted body references the host
+            // `relon_llvm_str_contains_arena` shim, force the linker
+            // to keep the matching symbol from `relon-rs-shims`. The
+            // shim lives in an `.rlib` (Rust dep), and without an
+            // explicit `--undefined` flag the linker may drop the
+            // symbol before the AOT-`.o` reference resolves —
+            // depending on the consuming binary's
+            // `--gc-sections` / LTO posture. `-Wl,-u,<sym>` mirrors
+            // what `extern "C" { fn <sym>(...) }` would do from a
+            // Rust source — only force-keep when the symbol is
+            // actually referenced so a no-string-contains build
+            // doesn't pay the dead-shim cost.
+            if info.references_str_contains_shim {
+                println!("cargo:rustc-link-arg=-Wl,-u,relon_llvm_str_contains_arena");
+            }
+
             objects.push(object_path);
             binding_modules.push(BindingModule {
                 alias,
                 symbol: info.entry_symbol,
                 param_names: info.param_names,
                 arity: info.entry_arity,
+                shape: info.shape,
+                main_fields: info.main_fields,
+                return_fields: info.return_fields,
+                main_root_size: info.main_root_size,
+                return_root_size: info.return_root_size,
+                return_has_tail: info.return_has_tail,
+                const_data: info.const_data,
                 source_path: canonical_path,
                 aliased: entry.alias.is_some(),
             });
@@ -290,6 +313,30 @@ struct BindingModule {
     symbol: String,
     param_names: Vec<String>,
     arity: usize,
+    /// Which extern signature the emitted symbol carries — drives the
+    /// binding's outer dispatch shape (typed `extern "C"` invocation
+    /// for `FastInt`, marshalled `call_buffer_entry` for `Buffer`).
+    shape: EmittedEntryShape,
+    /// Declared `#main` parameters with byte-offsets + type tags, in
+    /// declaration order. Empty for `FastInt` (the binding reads its
+    /// args from positional registers).
+    main_fields: Vec<EmittedField>,
+    /// Return record fields. Always one entry under the Phase 2
+    /// envelope (`#main` returns wrap in a single-field `Ret { value }`).
+    /// Empty for `FastInt`.
+    return_fields: Vec<EmittedField>,
+    /// Fixed-area size of the input record. Zero for `FastInt`.
+    main_root_size: u32,
+    /// Fixed-area size of the return record. Zero for `FastInt`.
+    return_root_size: u32,
+    /// Whether the return schema includes pointer-indirect leaves.
+    /// Drives the binding's tail-cap sizing.
+    return_has_tail: bool,
+    /// Const-pool blob the JIT body references through arena-relative
+    /// i32 offsets. The binding ships this as a `const &[u8]` and
+    /// hands it to `call_buffer_entry` on every dispatch. Empty for
+    /// `FastInt`.
+    const_data: Vec<u8>,
     source_path: PathBuf,
     /// `true` when the caller used `source_as` (or the macro form
     /// `include_relon!("foo.relon" as bar)`); the binding generator
@@ -360,10 +407,19 @@ fn render_one(out: &mut String, m: &BindingModule) {
     // binary lists `__relon_*_main` in its symbol table the bindings
     // file gives a 1-step trace back to the originating `.relon`.
     out.push_str(&format!("// From: {}\n", m.source_path.to_string_lossy()));
+    match m.shape {
+        EmittedEntryShape::FastInt => render_one_fast_int(out, m),
+        EmittedEntryShape::Buffer => render_one_buffer(out, m),
+    }
+}
 
-    // Param list for the Rust shim. Phase 1 is Int-only so every arg
-    // is `i64`; we name each param after the corresponding `#main`
-    // declaration so the consumer's call site stays readable.
+/// Render the `FastInt` shape: an `extern "C" fn(i64...) -> i64`
+/// declaration and a thin Rust wrapper. Same code path the Phase 1
+/// trivial demo used.
+fn render_one_fast_int(out: &mut String, m: &BindingModule) {
+    // Param list for the Rust shim. Fast path is Int-only so every
+    // arg is `i64`; we name each param after the corresponding
+    // `#main` declaration so the consumer's call site stays readable.
     let rust_params: Vec<String> = m
         .param_names
         .iter()
@@ -379,8 +435,6 @@ fn render_one(out: &mut String, m: &BindingModule) {
     debug_assert_eq!(rust_params.len(), m.arity);
 
     if m.aliased {
-        // Flat top-level function. The user supplied an explicit
-        // alias via `.source_as` / `include_relon!("..." as bar)`.
         out.push_str(&format!(
             "extern \"C\" {{\n    fn {sym}({eparams}) -> i64;\n}}\n",
             sym = m.symbol,
@@ -389,9 +443,9 @@ fn render_one(out: &mut String, m: &BindingModule) {
         out.push_str(&format!(
             "/// Safe shim for the AOT-compiled Relon `#main` defined in this source.\n\
              pub fn {fn_name}(_state: &::relon_rs_shims::SandboxState, {rparams}) -> i64 {{\n\
-                 // SAFETY: the AOT body is a leaf arithmetic function under the Phase 1\n\
-                 // Int-only envelope; no arena / shim dependencies. `_state` is threaded\n\
-                 // through for forward-compat with Phase 2 (pointer-indirect args).\n\
+                 // SAFETY: the AOT body qualified for the fast-path entry — pure i64\n\
+                 // arithmetic, no arena / shim dependencies. `_state` is threaded\n\
+                 // through verbatim for forward-compat with the buffer-protocol path.\n\
                  unsafe {{ {sym}({eargs}) }}\n\
              }}\n\n",
             fn_name = m.alias,
@@ -400,8 +454,6 @@ fn render_one(out: &mut String, m: &BindingModule) {
             eargs = extern_args.join(", "),
         ));
     } else {
-        // Module-scoped — `mod foo { fn main(...) }`. Matches the
-        // default `include_relon!("src/foo.relon")` shape.
         out.push_str(&format!(
             "pub mod {alias} {{\n\
                  use ::relon_rs_shims::SandboxState;\n\
@@ -410,7 +462,6 @@ fn render_one(out: &mut String, m: &BindingModule) {
                  }}\n\
                  /// Safe shim for the AOT-compiled Relon `#main` defined in this source.\n\
                  pub fn main(_state: &SandboxState, {rparams}) -> i64 {{\n\
-                     // SAFETY: see crate-level comment in `relon-rs-build`.\n\
                      unsafe {{ {sym}({eargs}) }}\n\
                  }}\n\
              }}\n\n",
@@ -421,6 +472,183 @@ fn render_one(out: &mut String, m: &BindingModule) {
             eargs = extern_args.join(", "),
         ));
     }
+}
+
+/// Render the `Buffer` shape: the binding declares an extern with the
+/// canonical buffer-protocol signature, embeds the const-pool blob +
+/// per-field metadata as `const` data, and routes typed Rust args
+/// through `relon_rs_shims::call_buffer_entry`.
+fn render_one_buffer(out: &mut String, m: &BindingModule) {
+    let sym = &m.symbol;
+    let alias = &m.alias;
+
+    // Stash references_str_contains_shim through a forced-keep
+    // attribute on the binding side too — having the binding _name_
+    // the shim function adds a Rust-level reference the linker can
+    // see, defending against future build configs where the
+    // cargo:rustc-link-arg approach gets stripped by section GC. We
+    // emit a `use` to drag the symbol in; the underlying `#[no_mangle]`
+    // exported function is named the same and lives in `relon-rs-shims`.
+
+    // Render the per-arg signature + dispatch glue. Each `#main` param
+    // declares the Rust-side type the user calls with, and the body
+    // packs it into an `ArgValue` for the marshaller.
+    let mut rust_params: Vec<String> = Vec::with_capacity(m.main_fields.len());
+    let mut arg_value_exprs: Vec<String> = Vec::with_capacity(m.main_fields.len());
+    for f in &m.main_fields {
+        let pname = sanitize_param(&f.name);
+        let (rust_ty, arg_expr) = match f.ty {
+            EmittedFieldType::Int => ("i64", format!("ArgValue::Int({pname})")),
+            EmittedFieldType::Bool => ("bool", format!("ArgValue::Bool({pname})")),
+            EmittedFieldType::Null => ("()", "ArgValue::Null".to_string()),
+            EmittedFieldType::String => ("&str", format!("ArgValue::String({pname})")),
+        };
+        rust_params.push(format!("{pname}: {rust_ty}"));
+        arg_value_exprs.push(arg_expr);
+    }
+
+    // Return type: under Phase 2 the buffer wrapper always boxes the
+    // return into a single-field `Ret { value: T }`. We surface T
+    // directly to the caller.
+    let return_field = m.return_fields.first();
+    let (rust_ret_ty, ret_match_arm) = match return_field.map(|f| f.ty) {
+        Some(EmittedFieldType::Int) => ("i64", "RetValue::Int(v) => v"),
+        Some(EmittedFieldType::Bool) => ("bool", "RetValue::Bool(v) => v"),
+        Some(EmittedFieldType::Null) => ("()", "RetValue::Null => ()"),
+        Some(EmittedFieldType::String) => ("String", "RetValue::String(v) => v"),
+        None => ("()", "RetValue::Null => ()"),
+    };
+
+    let main_fields_lit = render_field_slice(&m.main_fields);
+    let return_fields_lit = render_field_slice(&m.return_fields);
+    let const_data_lit = render_byte_slice(&m.const_data);
+
+    // Common body — shared between the `aliased` (flat fn) and
+    // `mod`-scoped emission paths.
+    let body = format!(
+        "    use ::relon_rs_shims::{{ArgValue, RetValue, EmittedField, EmittedFieldType, call_buffer_entry, BufferEntryFn}};\n\
+         \n\
+         extern \"C\" {{\n\
+             fn {sym}(\n\
+                 state: *const ::std::ffi::c_void,\n\
+                 in_ptr: i32,\n\
+                 in_len: i32,\n\
+                 out_ptr: i32,\n\
+                 out_cap: i32,\n\
+                 caps: i64,\n\
+             ) -> i32;\n\
+         }}\n\
+         \n\
+         static MAIN_FIELDS: &[EmittedField] = &{main_fields};\n\
+         static RETURN_FIELDS: &[EmittedField] = &{return_fields};\n\
+         static CONST_DATA: &[u8] = &{const_data};\n\
+         const MAIN_ROOT_SIZE: u32 = {main_root_size};\n\
+         const RETURN_ROOT_SIZE: u32 = {return_root_size};\n\
+         const RETURN_HAS_TAIL: bool = {return_has_tail};\n\
+         \n\
+         // SAFETY: the AOT-emitted body carries the canonical buffer-\n\
+         // protocol signature; the cast erases the `ArenaState` pointer\n\
+         // type (kept opaque on the binding side so the consuming crate\n\
+         // doesn't take a direct dep on `relon-rs-shims`'s internal\n\
+         // sandbox-state representation).\n\
+         let entry_fn: BufferEntryFn = unsafe {{\n\
+             ::std::mem::transmute({sym} as *const ())\n\
+         }};\n\
+         let args = [{arg_values}];\n\
+         let mut ret = call_buffer_entry(\n\
+             entry_fn,\n\
+             CONST_DATA,\n\
+             MAIN_FIELDS,\n\
+             MAIN_ROOT_SIZE,\n\
+             RETURN_FIELDS,\n\
+             RETURN_ROOT_SIZE,\n\
+             RETURN_HAS_TAIL,\n\
+             _state,\n\
+             &args,\n\
+         ).expect(\"relon AOT body trapped\");\n\
+         match ret.pop().expect(\"return record empty\") {{\n\
+             {ret_arm},\n\
+             other => panic!(\"binding type mismatch on return: {{other:?}}\"),\n\
+         }}\n",
+        sym = sym,
+        main_fields = main_fields_lit,
+        return_fields = return_fields_lit,
+        const_data = const_data_lit,
+        main_root_size = m.main_root_size,
+        return_root_size = m.return_root_size,
+        return_has_tail = m.return_has_tail,
+        arg_values = arg_value_exprs.join(", "),
+        ret_arm = ret_match_arm,
+    );
+
+    if m.aliased {
+        out.push_str(&format!(
+            "/// Safe shim for the AOT-compiled Relon `#main` defined in this source.\n\
+             pub fn {fn_name}(_state: &::relon_rs_shims::SandboxState, {rparams}) -> {ret_ty} {{\n\
+             {body}\
+             }}\n\n",
+            fn_name = alias,
+            rparams = rust_params.join(", "),
+            ret_ty = rust_ret_ty,
+            body = body,
+        ));
+    } else {
+        out.push_str(&format!(
+            "pub mod {alias} {{\n\
+                 use ::relon_rs_shims::SandboxState;\n\
+                 /// Safe shim for the AOT-compiled Relon `#main` defined in this source.\n\
+                 pub fn main(_state: &SandboxState, {rparams}) -> {ret_ty} {{\n\
+                 {body}\
+                 }}\n\
+             }}\n\n",
+            alias = alias,
+            rparams = rust_params.join(", "),
+            ret_ty = rust_ret_ty,
+            body = body,
+        ));
+    }
+}
+
+/// Render a `&[EmittedField]` constant initializer mirroring the
+/// `EmittedField` definition in `relon-rs-shims`.
+fn render_field_slice(fields: &[EmittedField]) -> String {
+    let mut out = String::from("[\n");
+    for f in fields {
+        let ty = match f.ty {
+            EmittedFieldType::Int => "EmittedFieldType::Int",
+            EmittedFieldType::Bool => "EmittedFieldType::Bool",
+            EmittedFieldType::Null => "EmittedFieldType::Null",
+            EmittedFieldType::String => "EmittedFieldType::String",
+        };
+        out.push_str(&format!(
+            "        EmittedField {{ name: {name:?}, offset: {offset}, ty: {ty} }},\n",
+            name = f.name,
+            offset = f.offset,
+            ty = ty,
+        ));
+    }
+    out.push_str("    ]");
+    out
+}
+
+/// Render a `&[u8]` literal for the const-pool blob. Uses a hex-escape
+/// form (`b"\\xAB..."`) so the resulting source stays compact for
+/// large blobs while round-tripping through `rustc`'s string-literal
+/// parser without UTF-8 validation issues.
+fn render_byte_slice(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "[]".to_string();
+    }
+    let mut out = String::with_capacity(bytes.len() * 4 + 16);
+    out.push('[');
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("0x{b:02x}"));
+    }
+    out.push(']');
+    out
 }
 
 /// Sanitise a `#main` parameter name into a safe Rust identifier.
