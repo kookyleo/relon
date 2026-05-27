@@ -193,6 +193,50 @@ fn build_jit(src: &str, label: &str) -> relon::JitEvaluator {
         .unwrap_or_else(|e| panic!("[cmp_lua {label}] JitEvaluator setup failed: {e}"))
 }
 
+/// Phase J.2 (post-fix audit, 2026-05-27): the panel's dedicated
+/// `relon_trace_jit` row only opts in for workloads whose production
+/// source actually auto-escalates to the Trace tier under the user-
+/// facing `JitEvaluator::run_main` path. The eligibility gate is a
+/// label allow-list rather than a runtime tier check at row-build
+/// time because criterion's bench setup happens once per process and
+/// would otherwise blot the panel with rows whose `active_tier` is
+/// silently `Bytecode` (anti-pattern called out in the spec's
+/// honesty rules — a row named `relon_trace_jit` MUST measure the
+/// trace tier).
+///
+/// Current allow-list:
+///
+/// * **W1_int_sum** — list.sum(range(n)) — int-only reduce, single
+///   accumulator phi, escalates via the J.2 spill fix.
+/// * **W2_f64_dot** — list.sum(range(n).map(i => (i+1)*(i+2))) —
+///   already auto-escalated pre-J.2; the spill fix just makes the
+///   snapshot semantically correct without changing the timing.
+///
+/// Notably absent (per /perf Honesty Rules):
+///
+/// * W3 (String return) — recorder predicate rejects non-Int return
+///   shapes; relies on a hand-built fixture, no production trace
+///   path.
+/// * W4 / W4_long — install-time verify gate rejects because the
+///   inner-loop-exit deopt PC re-runs the final count++; tracked as
+///   J.3 follow-up.
+/// * W5 (closure abort) — recorder UnrecoverableEffect on the dict
+///   lookup closure; J.3 / J.4 scope.
+/// * W6 — same envelope check as W5; revisit once closure abort
+///   widens (deferred to J.3 / J.4).
+/// * W7 (recursion) — recorder envelope.
+/// * W8 / W9 (closures / nested matrix) — closure abort.
+/// * W10 (Op::If) — recorder safety predicate rejects.
+/// * W12 — body is below `TINY_TRACE_OP_THRESHOLD` so no trace ever
+///   installs; the relon_jit row already measures the bytecode tier.
+///
+/// When a workload's underlying gap closes, flip its label into the
+/// match arm below and the panel picks up the new row at the next
+/// rebuild.
+fn trace_jit_production_label_eligible(label: &str) -> bool {
+    matches!(label, "W1_int_sum" | "W2_f64_dot")
+}
+
 /// Task #270: build a [`relon::JitEvaluator`] for the labels W1-W4
 /// with a hand-crafted recorder fixture pre-installed. The fixture
 /// short-circuits `run_main` through `invoke_with_fallback_slice` so
@@ -3396,6 +3440,54 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
+
+        // Phase J.2: dedicated `relon_trace_jit` row (no `_fixture`
+        // suffix) that drives the canonical production source through
+        // `JitEvaluator::run_main` without the hand-built recorder
+        // fixture. The constructor warms the hot counter past the
+        // escalation threshold and asserts `active_tier() == Trace`
+        // before timing starts — so a row that lands in the panel
+        // is provably running through the trace tier on every iter,
+        // not silently degraded to bytecode dispatch. This is the
+        // /perf Honesty Rules answer for "Same code path?": the row
+        // measures exactly what `relon_jit` would observe after the
+        // hot counter saturates, with no recorder fixture and no
+        // pre-computed fallback closure.
+        //
+        // Only labels that survive the install-time correctness
+        // verify gate after the J.2 phi-spill fix appear here.
+        // Labels that still fail (W4 / W4_long pending PC alignment;
+        // W10 pending Op::If recorder envelope; W3 pending String-
+        // return resume rehydration) are intentionally omitted —
+        // adding them would either expose a wrong-answer trace
+        // (rejected by the user-facing wrapper's verify gate, so the
+        // row would actually time the bytecode tier despite the
+        // name) or fall back to a closure that recomputes the
+        // analytic answer (the W2-style "fake Trace" anti-pattern).
+        if trace_jit_production_label_eligible(label) {
+            let trace_jit = build_jit(src, label);
+            let probe_iters = (relon_bytecode::DEFAULT_HOT_THRESHOLD as usize) * 2;
+            for _ in 0..probe_iters {
+                let v = trace_jit.run_main(args_factory()).unwrap_or_else(|e| {
+                    panic!("[cmp_lua {label}] relon_trace_jit warmup run failed: {e}")
+                });
+                black_box(v);
+            }
+            assert_eq!(
+                trace_jit.active_tier(),
+                relon::JitTier::Trace,
+                "[cmp_lua {label}] relon_trace_jit row requires post-warmup active_tier == Trace; tier is {:?}",
+                trace_jit.active_tier(),
+            );
+            group.bench_function(BenchmarkId::new(*label, "relon_trace_jit"), |b| {
+                b.iter_custom(|iters| {
+                    timed_with_warmup(iters, || {
+                        let v = trace_jit.run_main(args_factory()).unwrap();
+                        black_box(v);
+                    })
+                });
+            });
+        }
 
         // relon_aot row — n/a when the cranelift codegen rejects.
         if let Some(aot) = try_build_aot(src, label) {
