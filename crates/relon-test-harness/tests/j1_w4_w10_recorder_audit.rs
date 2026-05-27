@@ -22,8 +22,7 @@
 //!
 //! ## Phase 1 finding summary (per the J.1 spec deliverable)
 //!
-//! See the commit message accompanying this test for the full table.
-//! Short version:
+//! Pre-J.2 baseline (commit 7df7551, the audit baseline):
 //!
 //! | Workload     | Recorder | JIT install | Predicate | Verify | Active tier |
 //! |--------------|----------|-------------|-----------|--------|-------------|
@@ -33,22 +32,35 @@
 //! | W4_long      | OK       | OK          | accepts   | FAIL (1 vs 32)  | Bytecode |
 //! | W10          | OK       | OK          | rejects (`Op::If`) | FAIL (0 vs 4) | Bytecode |
 //!
-//! Across every failing row the deopt snapshot's `ssa_slots_copy` is
-//! all-zeros — i.e. the trace runtime never writes the loop-completed
-//! `acc` / `i` into the deopt snapshot, so the bytecode VM's
-//! `resume_from_deopt` restarts with empty state and (for non-W2
-//! shapes) cannot recover the analytic answer. **The blocker is the
-//! trace runtime's deopt-snapshot population, not the recorder
-//! lowering.** Phase J.1's stated unlock work (stdlib chain `range /
-//! .map / .filter / .reduce / .len / .sum / .count / .contains`) is
-//! already covered by the existing recorder envelope — every workload
-//! records + JIT-compiles cleanly. The widening that gets these rows
-//! to Trace tier lives in `relon-trace-emitter` / `relon-trace-jit`'s
-//! deopt-emit path and is out of scope here.
+//! Across every failing row the deopt snapshot's `ssa_slots_copy` was
+//! all-zeros — the trace runtime never wrote the loop-completed
+//! `acc` / `i` into the deopt snapshot.
+//!
+//! ## Phase J.2 post-fix snapshot
+//!
+//! The fix wires a per-loop-iteration spill that stores each loop-
+//! carried phi value into `TraceContext::ssa_slots[let_slot]` at
+//! every `MarkLoopHead` re-entry. The post-fix audit produces:
+//!
+//! | Workload     | Verify          | Active tier | Notes |
+//! |--------------|-----------------|-------------|-------|
+//! | W1           | OK (496 vs 496) | **Trace**   | acc + i recovered |
+//! | W2           | OK              | **Trace**   | unchanged, was already passing |
+//! | W4           | FAIL (33 vs 32) | Bytecode    | snapshot OK but resume PC drifts (J.3) |
+//! | W4_long      | FAIL (33 vs 32) | Bytecode    | same as W4 |
+//! | W10          | FAIL (0 vs 4)   | Bytecode    | predicate still rejects `Op::If` (J.3) |
+//!
+//! W4 / W4_long still surface the wrong value because the deopt's
+//! `external_pc` for the loop-exit BrIf maps to a bytecode index
+//! that re-runs the final iteration's `count++`. The J.2 fix lands
+//! the correct loop-carried state in the snapshot (`ssa_slots_copy[2]`
+//! = `n` for both), but the resume-PC alignment for inner-loop-exit
+//! guards under nested Block / Loop scopes still needs widening —
+//! tracked as a Phase J.3 follow-up.
 //!
 //! This test never fails — it prints diagnostics and asserts only
-//! that the audit ran. The Phase 1 deliverable is the captured stdout
-//! + this header summary.
+//! that the audit ran. The post-J.2 deliverable is the captured
+//! stdout + this header summary.
 
 use std::collections::BTreeMap;
 

@@ -1341,27 +1341,23 @@ mod tests {
         }
     }
 
-    /// cmp_lua-W1-shape production source: the install-time
-    /// correctness verification gate catches that the trace fn's
-    /// `result_slot` for the production-lowered
-    /// `list.sum(range(n))` body returns 0 instead of the analytic
-    /// `n * (n - 1) / 2` (a post-loop SSA propagation gap inside the
-    /// recorder / emitter pipeline). The wrapper invalidates the
-    /// trace + clears the registration + releases the `fn_id` and
-    /// falls back to bytecode-only, so the user keeps observing the
-    /// correct answer for every `run_main` and `active_tier()` stays
-    /// at `Bytecode` even past the hot counter threshold.
+    /// cmp_lua-W1-shape production source: after the Phase J.2 trace
+    /// runtime fix the emit-side trace fn writes loop-carried phi
+    /// values back into `TraceContext::ssa_slots` at every loop-header
+    /// entry, so the bytecode-VM resume can reconstruct the live
+    /// `acc` / `i` from the deopt snapshot and surface the analytic
+    /// `n * (n - 1) / 2` answer. The wrapper's install-time
+    /// verification gate then accepts the trace and `active_tier()`
+    /// flips to `Trace` once the hot counter saturates — same shape
+    /// as the W2 source.
     ///
-    /// Pins the verification-gate fallback path: shapes the recorder
-    /// accepts (the pre-install predicate clears) but the emit-side
-    /// trace fn mis-computes must NOT advertise a Trace tier. Once
-    /// the underlying recorder/emitter gap closes, the verification
-    /// will pass and this test should flip to the
-    /// `cmp_lua_w2_production_source_auto_escalates_to_trace` shape
-    /// (Trace tier + correct value).
+    /// Pins the post-J.2 success path: the recorder accepts the
+    /// production body, the emit pipeline produces a correct trace
+    /// fn, and the verification gate clears so the user observes a
+    /// real Trace-tier acceleration.
     #[cfg(feature = "cranelift-aot")]
     #[test]
-    fn cmp_lua_w1_production_source_correctness_gate_keeps_bytecode_tier() {
+    fn cmp_lua_w1_production_source_auto_escalates_to_trace() {
         let src = "#import list from \"std/list\"\n#main(Int n) -> Int\nlist.sum(range(n))";
         let jit = JitEvaluator::new(src).expect("build jit");
         assert!(
@@ -1384,21 +1380,37 @@ mod tests {
             args.insert("n".to_string(), Value::Int(n));
             last = jit.run_main(args).expect("run_main");
         }
-        // Verification gate invalidated the trace; user-observable
-        // answer stays correct, tier stays at Bytecode.
         assert_eq!(last, Value::Int(n * (n - 1) / 2));
-        assert_ne!(
+        assert_eq!(
             jit.active_tier(),
             JitTier::Trace,
-            "W1 must NOT auto-escalate to Trace tier until the recorder/emitter post-loop SSA gap closes; the verification gate catches the wrong-answer trace"
+            "W1 must auto-escalate to Trace tier after 2x DEFAULT_HOT_THRESHOLD invocations (post-J.2 spill of loop-carried phis)"
         );
+
+        // Vary n after escalation to prove the trace re-runs the loop
+        // each call (not just echoing the recorder's snapshot).
+        for &probe_n in &[1i64, 4, 16, 64] {
+            let mut args = HashMap::new();
+            args.insert("n".to_string(), Value::Int(probe_n));
+            let v = jit.run_main(args).expect("run_main");
+            assert_eq!(
+                v,
+                Value::Int(probe_n * (probe_n - 1) / 2),
+                "W1 trace must compute the analytic answer for n={probe_n}"
+            );
+        }
     }
 
-    /// cmp_lua-W4-shape production source: same correctness-gate
-    /// rejection as W1. The recorder lands a trace whose `result_slot`
-    /// surfaces the single-iteration filter count (1) instead of the
-    /// analytic `n`; the verification gate catches the mismatch and
-    /// falls back to bytecode-only.
+    /// cmp_lua-W4-shape production source: the correctness-gate
+    /// still rejects the trace post-J.2. The deopt path's
+    /// `external_pc` for the loop-exit BrIf lands on a bytecode
+    /// index that re-executes the final iteration's count-increment
+    /// during resume, so the trace surfaces `n + 1` instead of the
+    /// analytic `n`. The recovery widening for this (PC alignment of
+    /// inner-loop-exit guards across nested Block / Loop scopes) is
+    /// tracked as a Phase J.3 follow-up — separate from the J.2
+    /// phi-spill that already lands the correct loop-carried state in
+    /// the deopt snapshot (`ssa_slots_copy[count_let_slot]` = n).
     #[cfg(feature = "cranelift-aot")]
     #[test]
     fn cmp_lua_w4_production_source_correctness_gate_keeps_bytecode_tier() {
@@ -1596,14 +1608,27 @@ mod tests {
         use relon_ir::{IrType, Op, TaggedOp};
         use relon_parser::TokenRange;
 
-        // Source uses stdlib + closure so the auto path's
-        // `bcops_to_recorder_body` bails (the BcOp stream contains
-        // jumps + calls + list ops outside the recorder envelope),
-        // but the bytecode `from_source` itself can accept the shape
-        // post-bytecode-coverage-expansion. Either way, pre-install
-        // `active_tier` is non-Trace; the fixture install must
-        // promote it to `Trace`.
-        let src = "#import list from \"std/list\"\n#main(Int n) -> Int\nlist.sum(range(n))";
+        // Source uses a String-return shape so the auto path's
+        // `ir_body_is_recorder_safe` predicate rejects it (non-Int
+        // return + StringRef-typed StoreField), keeping the auto
+        // wrapper out of the way. The bytecode tier still accepts the
+        // shape, so pre-install `active_tier` is Bytecode; the
+        // fixture install must promote it to `Trace`.
+        //
+        // Phase J.2 historical note: the pre-J.2 incarnation of this
+        // test used `list.sum(range(n))` (a W1-shape Int-return body)
+        // and relied on the recorder/emitter's post-loop SSA gap to
+        // keep the auto wrapper from escalating. Once the J.2 spill
+        // landed, the W1 auto path escalates to Trace immediately,
+        // so the pre-install assertion would observe `Trace` instead
+        // of `Bytecode` and the "fixture install promotes" intent
+        // would no longer be testable on that source. Switching to
+        // the W3-shape String body keeps the auto path on Bytecode
+        // for the duration of this test without weakening any other
+        // pinned invariant.
+        let src = "#import list from \"std/list\"\n\
+                   #main(Int n) -> String\n\
+                   range(n).map((i) => \"a\").reduce(\"\", (acc, s) => acc + s)";
         let mut jit = JitEvaluator::new(src).expect("build jit");
         assert_ne!(jit.active_tier(), JitTier::Trace);
 
