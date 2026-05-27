@@ -1824,6 +1824,41 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             Op::LoadField { offset, ty } => self.emit_load_field(*offset, *ty)?,
             Op::StoreField { offset, ty } => self.emit_store_field(&ip_hint, *offset, *ty)?,
 
+            // ---- pointer-indirect param loads (Phase 2 relon-rs surface) ----
+            // String / List* `#main` parameters arrive in the input
+            // buffer as a 4-byte buffer-relative offset to a tail
+            // record. The IR's lowering pass emits `Op::LoadStringPtr`
+            // (and its List* siblings) instead of `Op::LoadField {
+            // ty: String }` so the dispatch stays unambiguous; we
+            // share the same `emit_load_pointer_indirect_param` impl
+            // for all variants.
+            Op::LoadStringPtr { offset } => {
+                self.emit_load_pointer_indirect_param(*offset, IrType::String)?
+            }
+            Op::LoadListIntPtr { offset } => {
+                self.emit_load_pointer_indirect_param(*offset, IrType::ListInt)?
+            }
+            Op::LoadListFloatPtr { offset } => {
+                self.emit_load_pointer_indirect_param(*offset, IrType::ListFloat)?
+            }
+            Op::LoadListBoolPtr { offset } => {
+                self.emit_load_pointer_indirect_param(*offset, IrType::ListBool)?
+            }
+            Op::LoadListStringPtr { offset } => {
+                self.emit_load_pointer_indirect_param(*offset, IrType::ListString)?
+            }
+            Op::LoadListSchemaPtr { offset } => {
+                self.emit_load_pointer_indirect_param(*offset, IrType::ListSchema)?
+            }
+
+            // ---- ReadStringLen (Phase 2 — backs `length(s)` / `len(xs)`) ----
+            // Pop arena-relative i32 record pointer, load the leading
+            // 4-byte length prefix, zext to i64 and push. Used by the
+            // bundled stdlib `length` (String) / `list_*_length` bodies
+            // — every list record shares the `[len: u32 LE]` prefix
+            // with String, so a single lowering covers both.
+            Op::ReadStringLen => self.emit_read_string_len(&ip_hint)?,
+
             // ---- control flow ----
             Op::Block { result_ty, body } => self.emit_block(*result_ty, body)?,
             Op::Loop { result_ty, body } => self.emit_loop(*result_ty, body)?,
@@ -2954,6 +2989,71 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             }
         };
         Ok(pair)
+    }
+
+    /// Phase 2 surface-widening: lower `Op::ReadStringLen` — pop an
+    /// arena-relative i32 record pointer (String or List* header),
+    /// load the leading 4-byte length prefix, zext to i64, push.
+    /// Mirrors `relon-codegen-native::codegen::field::emit_read_string_len`.
+    ///
+    /// No bounds check today (Phase B/C/D LLVM emitter doesn't emit
+    /// `cond_trap`; Phase 3 wires the trap-propagation work).
+    fn emit_read_string_len(&mut self, ip_hint: &str) -> Result<(), LlvmError> {
+        let ptr_i32 = self.pop_int(ip_hint)?;
+        let addr = self.arena_addr_i32(ptr_i32)?;
+        let name = self.next_name("rs_len");
+        let len_i32 = self
+            .builder
+            .build_load(self.ctx.i32_type(), addr, &name)
+            .map_err(|e| LlvmError::Codegen(format!("ReadStringLen load: {e}")))?
+            .into_int_value();
+        let name = self.next_name("rs_len64");
+        let len_i64 = self
+            .builder
+            .build_int_z_extend(len_i32, self.ctx.i64_type(), &name)
+            .map_err(|e| LlvmError::Codegen(format!("ReadStringLen zext: {e}")))?;
+        self.push(len_i64, IrType::I64);
+        Ok(())
+    }
+
+    /// Phase 2 surface-widening: lower `Op::LoadStringPtr` (and its
+    /// List* siblings) — `#main`-side String / List parameter loads.
+    ///
+    /// The IR's lowering pass emits this op whenever a `#main(String s)`
+    /// (or List-typed) parameter is referenced; the buffer-protocol
+    /// trampoline laid the matching record pointer (a 4-byte
+    /// buffer-relative offset) at `offset` bytes inside the input
+    /// record. We materialise the offset on the operand stack as an
+    /// `IrType::String` (or matching List type) so downstream ops
+    /// (`ReadStringLen`, `Op::Call { contains }`, list-method
+    /// dispatch) see the same shape they would inside a freshly-
+    /// produced literal.
+    ///
+    /// `IR LocalGet(0)` reads the buffer-protocol entry's `in_ptr`
+    /// param (slot 1 on LLVM under `param_base = 1`); the pointer-
+    /// indirect slot lives at that address plus `offset`. The
+    /// resulting load is a plain i32, so we don't go through
+    /// `field_load_kind`'s zext / type-tagging logic.
+    fn emit_load_pointer_indirect_param(
+        &mut self,
+        offset: u32,
+        ty: IrType,
+    ) -> Result<(), LlvmError> {
+        let arena_base_ptr = self.arena_base_ptr.ok_or_else(|| {
+            LlvmError::Codegen(format!(
+                "Op::Load*Ptr({ty:?}) outside buffer-protocol entry shape"
+            ))
+        })?;
+        let in_ptr_i32 = self.lookup_param(0)?; // IR LocalGet(0) == in_ptr
+        let addr = self.compute_buffer_addr(arena_base_ptr, in_ptr_i32, offset)?;
+        let name = self.next_name("loadptr");
+        let raw = self
+            .builder
+            .build_load(self.ctx.i32_type(), addr, &name)
+            .map_err(|e| LlvmError::Codegen(format!("Load*Ptr load: {e}")))?
+            .into_int_value();
+        self.push(raw, ty);
+        Ok(())
     }
 }
 

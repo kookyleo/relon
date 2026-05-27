@@ -83,4 +83,6 @@ mod state;
 mod str_helpers;
 
 pub use error::LlvmError;
-pub use evaluator::{EmitObjectInfo, LlvmAotEvaluator};
+pub use evaluator::{
+    EmitObjectInfo, EmittedEntryShape, EmittedField, EmittedFieldType, LlvmAotEvaluator,
+};

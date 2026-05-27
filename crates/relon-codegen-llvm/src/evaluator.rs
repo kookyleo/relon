@@ -44,6 +44,7 @@ use crate::emitter::{
 };
 use crate::error::LlvmError;
 use crate::state::ArenaState;
+use crate::str_helpers::RELON_LLVM_STR_CONTAINS_ARENA_SYMBOL;
 use inkwell::module::Linkage;
 use inkwell::targets::FileType;
 use std::path::Path;
@@ -1176,41 +1177,151 @@ fn align_up(value: u32, align: u32) -> u32 {
 /// first time it is called — required by `Target::from_triple` /
 /// `create_target_machine`. Subsequent calls re-use the initialised
 /// target state.
-/// Metadata returned by [`LlvmAotEvaluator::emit_object`] so the
-/// build.rs caller can stamp matching `extern "C"` declarations into
-/// the generated Rust shim.
+/// Which ABI shape the emitted entry symbol exposes. Drives the
+/// build.rs binding-generator's choice between a typed `(i64...) -> i64`
+/// extern declaration (fast path) and a buffer-protocol call through
+/// `relon-rs-shims::call_buffer_entry`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmittedEntryShape {
+    /// `extern "C" fn(i64, ...) -> i64`. Source qualified for the
+    /// dispatch-boundary fast path (Int-only `#main(Int...) -> Int`,
+    /// arity <= 8, no string/list/closure). The binding wraps the
+    /// extern with a thin Rust shim.
+    FastInt,
+    /// Full buffer-protocol entry:
+    /// `extern "C" fn(*const ArenaState, i32, i32, i32, i32, i64) -> i32`.
+    /// Source has string/list arguments or returns, calls into
+    /// stdlib helpers, or uses helper functions. The binding marshals
+    /// typed Rust args into / out of an arena buffer through
+    /// `relon-rs-shims::call_buffer_entry`.
+    Buffer,
+}
+
+/// One declared `#main` parameter (or `value` field on the return
+/// schema), in declaration order. Tells the build.rs binding generator
+/// what Rust type to expose for each slot and at what byte offset the
+/// buffer-protocol arena writer / reader should access it.
+#[derive(Debug, Clone)]
+pub struct EmittedField {
+    /// Field name as declared in source.
+    pub name: String,
+    /// Pre-computed byte offset of the slot inside its enclosing
+    /// fixed area (main_params record for args, return record for
+    /// the return slot).
+    pub offset: u32,
+    /// Erased canonical type tag. Build.rs maps each to the matching
+    /// Rust type for the binding signature.
+    pub ty: EmittedFieldType,
+}
+
+/// Erased canonical type tag the build.rs binding generator uses to
+/// pick the Rust type for each `#main` parameter / return slot.
 ///
-/// Phase 1 (Int-only `#main(Int...) -> Int`): one exported symbol per
-/// source, signature `(i64, ...) -> i64`. The `entry_arity` field
-/// reports how many `i64` parameters the symbol takes — equal to the
-/// declared `#main` arity.
+/// Phase 2 covers `Int` / `Bool` / `String` / `Null`. Float, Lists,
+/// nested schemas, and closure-valued returns surface as
+/// `UnsupportedSignature` at emit-object time so the binding never
+/// sees a type tag it can't handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmittedFieldType {
+    /// `i64`. Inline slot at offset, 8/8.
+    Int,
+    /// `bool`. Inline slot at offset, 1/1.
+    Bool,
+    /// `()`. Inline slot at offset, 1/1 (always reads as zero).
+    Null,
+    /// `&str` / `String`. Pointer-indirect: fixed slot is a 4-byte
+    /// buffer-relative offset to a `[len: u32 LE][utf8 bytes]` tail
+    /// record. Build.rs uses `BufferBuilder::write_string` to pack
+    /// inputs and `BufferReader::read_string` to decode outputs.
+    String,
+}
+
+/// Metadata returned by [`LlvmAotEvaluator::emit_object`] so the
+/// build.rs caller can stamp matching `extern "C"` declarations and
+/// marshalling code into the generated Rust shim.
+///
+/// The shape carried by [`Self::shape`] decides the binding shape:
+/// fast-path entries get a thin `extern "C" fn(i64, ...) -> i64`
+/// wrapper; buffer-protocol entries route through
+/// `relon-rs-shims::call_buffer_entry` with typed Rust args.
 #[derive(Debug, Clone)]
 pub struct EmitObjectInfo {
     /// Exported C ABI symbol name (chosen by the caller; the emitter
-    /// renames the JIT-side `relon_llvm_entry_fast` to this).
+    /// renames the JIT-side default to this).
     pub entry_symbol: String,
-    /// Number of `i64` parameters the entry takes.
+    /// Number of declared `#main` parameters. For fast-path entries
+    /// this equals the C ABI arity; for buffer-protocol entries the C
+    /// ABI arity is always 6, while this field reports the
+    /// user-visible `#main` arity.
     pub entry_arity: usize,
     /// Declared parameter names in `#main(...)` declaration order.
     /// Build.rs uses these to name the Rust shim's args.
     pub param_names: Vec<String>,
+    /// Which extern signature the emitted symbol carries. Drives the
+    /// binding generator's dispatch shape.
+    pub shape: EmittedEntryShape,
+    /// Declared `#main` parameters with byte-offsets and type tags.
+    /// Used by the buffer-protocol binding to pack input args into
+    /// the arena. Empty under [`EmittedEntryShape::FastInt`] (the
+    /// fast path reads args from positional registers, not the
+    /// buffer).
+    pub main_fields: Vec<EmittedField>,
+    /// Return record fields. Phase 2 lowering always wraps the
+    /// `#main` return in a single-field schema `Ret { value: T }`,
+    /// so this vector has exactly one entry. Empty under
+    /// [`EmittedEntryShape::FastInt`].
+    pub return_fields: Vec<EmittedField>,
+    /// Fixed-area byte size of the input record. The buffer-protocol
+    /// binding allocates `in_len = main_root_size + tail_len_for_strings`
+    /// bytes. Zero under [`EmittedEntryShape::FastInt`].
+    pub main_root_size: u32,
+    /// Fixed-area byte size of the return record. The buffer-protocol
+    /// binding reserves at least this much in the output region.
+    /// Zero under [`EmittedEntryShape::FastInt`].
+    pub return_root_size: u32,
+    /// Whether the return schema contains pointer-indirect leaves
+    /// (`String` / `List*`) — drives the binding's tail-cap sizing.
+    pub return_has_tail: bool,
+    /// Const-pool blob the JIT body references through arena-relative
+    /// i32 offsets (`Op::ConstString` records). The binding copies
+    /// this verbatim to `arena[..const_data.len()]` before every
+    /// dispatch. Empty under [`EmittedEntryShape::FastInt`] (the fast
+    /// path doesn't touch the const pool).
+    pub const_data: Vec<u8>,
+    /// `true` when the emitted body references the
+    /// `relon_llvm_str_contains_arena` host shim. Build.rs uses this
+    /// to decide whether to add the `relon-rs-shims` staticlib to
+    /// the linker invocation.
+    pub references_str_contains_shim: bool,
 }
 
 impl LlvmAotEvaluator {
     /// AOT entry: compile `src` into a relocatable ELF object file
     /// suitable for linker consumption (build.rs path).
     ///
-    /// Phase 1 envelope: every declared `#main` parameter must be
-    /// `Int`; the return must be `Int`. The emitted object exposes a
-    /// single external function `extern "C" fn <entry_symbol>(i64,
-    /// ...) -> i64` — exactly the shape Rust `extern "C"` declarations
-    /// can name. No `SandboxState` is touched on this path: the body
-    /// is a leaf arithmetic function with no arena dependency.
+    /// Phase 2 envelope:
     ///
-    /// Sources past the Int-only envelope (String args, List return,
-    /// stdlib calls that reference host shim symbols, …) surface as
-    /// [`LlvmError::UnsupportedSignature`] — Phase 2/3 widen the
-    /// surface once the matching shim ABI lands in `relon-rs-shims`.
+    /// - When the source qualifies for the dispatch-boundary fast
+    ///   path (Int-only `#main(Int...) -> Int`, arity <= 8, no
+    ///   pointer-indirect leaves, no stdlib call overhead), the
+    ///   emitted symbol carries the typed
+    ///   `extern "C" fn(i64, ...) -> i64` shape — the Phase 1 trivial
+    ///   path. No `SandboxState`, no const-pool, no shim
+    ///   dependency.
+    /// - Otherwise the symbol carries the full buffer-protocol entry
+    ///   shape `extern "C" fn(*const ArenaState, i32, i32, i32, i32,
+    ///   i64) -> i32`. The build.rs binding generator routes typed
+    ///   Rust args through `relon-rs-shims::call_buffer_entry` to
+    ///   marshal them into / out of the arena.
+    ///
+    /// In both modes the emitter returns an [`EmitObjectInfo`] that
+    /// carries the metadata the binding generator needs (entry shape,
+    /// schema field offsets, const-pool blob, shim reference flag).
+    ///
+    /// Returns [`LlvmError::UnsupportedSignature`] when the declared
+    /// `#main` signature mixes types Phase 2 hasn't wired marshalling
+    /// for yet (`Float`, `List*`, nested schemas as args, closure
+    /// returns) — Phase 3 widens the surface.
     pub fn emit_object(
         src: &str,
         entry_symbol: &str,
@@ -1229,67 +1340,119 @@ impl LlvmAotEvaluator {
             return_layout,
         };
 
-        // Phase 1 gate: the source must qualify for the fast-path
-        // typed-i64 entry. Sources that don't (non-Int args / return,
-        // pointer-indirect returns, multi-field return wrappers,
-        // arity > 8) escape via the `Err(())` from
-        // `build_fast_path_profile` — surface that as a clear
-        // `UnsupportedSignature` so build.rs can present an
-        // actionable error.
-        let profile = build_fast_path_profile(&schema).map_err(|_| {
-            LlvmError::UnsupportedSignature(
-                "relon-rs build (Phase 1): only Int-only `#main(Int...) -> Int` is supported"
-                    .into(),
-            )
-        })?;
+        // Materialise the per-field metadata up-front so we can hand
+        // it back regardless of whether we end up on the fast or
+        // buffer-protocol path. Surfaces an `UnsupportedSignature`
+        // for type tags Phase 2 hasn't wired marshalling for yet —
+        // the build.rs binding side can't generate a Rust wrapper
+        // for an unknown leaf type.
+        let main_fields = lower_field_descriptors(&schema.main_schema, &schema.main_layout)?;
+        let return_fields = lower_field_descriptors(&schema.return_schema, &schema.return_layout)?;
 
         let entry_idx = ir
             .entry_func_index
             .ok_or_else(|| LlvmError::Codegen("IR module has no entry function".into()))?;
         let entry = &ir.funcs[entry_idx];
 
-        // Verify the IR matches the buffer-protocol envelope —
-        // `emit_fast_entry` rejects anything else and we'd rather
-        // surface a clear error here than inside the emitter.
+        // Verify the IR carries the canonical buffer-protocol entry
+        // signature. `lower_workspace_single` always produces this
+        // shape today; failing the check means an IR-layer change
+        // slipped past the test gates.
         if !crate::emitter::is_buffer_protocol_signature(&entry.params, entry.ret) {
             return Err(LlvmError::UnsupportedSignature(
                 "relon-rs build: lowering produced a non-buffer entry shape".into(),
             ));
         }
 
-        // Fresh LLVM context for this object emit. Once `write_to_file`
-        // returns the module is dropped; nothing JIT-resident survives
-        // across the call.
+        // Fast-path eligibility — Int-only schema, arity <= 8, no
+        // pointer-indirect leaves. Sources that don't qualify drop to
+        // the buffer-protocol path below.
+        let fast_profile = build_fast_path_profile(&schema).ok();
+
         let ctx = Context::create();
         let module = ctx.create_module("relon_rs_object");
 
-        // Phase 1 trivial path: only emit the fast entry. The buffer
-        // entry would reference shim symbols (`relon_llvm_str_contains_arena`
-        // etc.) that aren't part of the Phase 1 shim surface and
-        // would force the build to depend on a wider runtime ABI than
-        // the trivial Int demo needs.
-        //
-        // `emit_fast_entry` accepts the buffer-protocol IR `entry`
-        // and uses `FastEmit` to rewrite `LoadField`/`StoreField` ops
-        // into direct param reads / ret_slot stores — no arena
-        // dependency, no `*state` parameter, no shim calls.
-        let llvm_fn = emit_fast_entry(&ctx, &module, entry, &profile)?;
+        // Phase E.1 const-pool blob; needed by buffer-protocol bodies
+        // for `Op::ConstString { idx }` resolution. The fast path
+        // doesn't reference the pool (Int-only bodies have no
+        // ConstString ops) so the blob ends up empty in that branch.
+        let const_pool = ConstPool::from_module(&ir)?;
 
-        // Rename the function from the JIT-side default
-        // (`relon_llvm_entry_fast`) to the build.rs-supplied symbol so
-        // each `.relon` source contributes a uniquely-named C ABI
-        // function. Force `External` linkage so the linker can see it
-        // from the consuming Rust crate.
-        llvm_fn.as_global_value().set_name(entry_symbol);
-        llvm_fn.set_linkage(Linkage::External);
+        let (shape, references_str_contains_shim) = match fast_profile {
+            Some(ref profile) => {
+                // Fast-path entry only. Same shape the Phase 1 trivial
+                // demo path emitted — pure i64 in / i64 out, no
+                // SandboxState pointer, no const-pool copy.
+                let llvm_fn = emit_fast_entry(&ctx, &module, entry, profile)?;
+                llvm_fn.as_global_value().set_name(entry_symbol);
+                llvm_fn.set_linkage(Linkage::External);
+                (EmittedEntryShape::FastInt, false)
+            }
+            None => {
+                // Buffer-protocol entry. Routes through
+                // `emit_module_funcs` so user-defined helper functions
+                // and bundled-stdlib bodies (Phase 2 P1 surface) lower
+                // alongside the entry.
+                let buffer_return_size = schema.return_layout.root_size as u32;
+                let lambda_ir_idx_set: std::collections::HashSet<u32> =
+                    ir.closure_table.iter().copied().collect();
+                let helpers: Vec<&relon_ir::ir::Func> = ir
+                    .funcs
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != entry_idx && !lambda_ir_idx_set.contains(&(*i as u32)))
+                    .map(|(_, f)| f)
+                    .collect();
+                let helper_ir_indices: Vec<u32> = ir
+                    .funcs
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != entry_idx && !lambda_ir_idx_set.contains(&(*i as u32)))
+                    .map(|(i, _)| i as u32)
+                    .collect();
+                let lambdas: Vec<&relon_ir::ir::Func> = ir
+                    .closure_table
+                    .iter()
+                    .map(|&ir_idx| &ir.funcs[ir_idx as usize])
+                    .collect();
+                let (llvm_fn, _entry_shape, _helper_table, _closure_fn_table) = emit_module_funcs(
+                    &ctx,
+                    &module,
+                    entry,
+                    buffer_return_size,
+                    &const_pool,
+                    &helpers,
+                    Some(&helper_ir_indices),
+                    &lambdas,
+                    &ir.closure_table,
+                )?;
+                // Rename the canonical buffer entry to the build.rs-
+                // supplied symbol and force external linkage so the
+                // consuming binary's linker can resolve it.
+                llvm_fn.as_global_value().set_name(entry_symbol);
+                llvm_fn.set_linkage(Linkage::External);
+
+                // Detect whether the emitted module references the
+                // `relon_llvm_str_contains_arena` host shim — drives
+                // build.rs's decision to add the `relon-rs-shims`
+                // staticlib to the linker invocation. We check by
+                // name lookup against the LLVM module since the emit
+                // pass declares the extern lazily on first
+                // `Op::Call { contains }` site.
+                let needs_shim = module
+                    .get_function(RELON_LLVM_STR_CONTAINS_ARENA_SYMBOL)
+                    .is_some();
+                (EmittedEntryShape::Buffer, needs_shim)
+            }
+        };
 
         module.verify().map_err(|e| {
             LlvmError::Codegen(format!("LLVM verifier rejected object module: {e}"))
         })?;
 
         // Lay down O3 IR-level passes before backend codegen. Same
-        // pipeline as the JIT path uses, so the AOT and JIT
-        // performance profiles stay comparable.
+        // pipeline the JIT path uses, so the AOT and JIT performance
+        // profiles stay comparable.
         run_default_o3_pipeline(&module)?;
 
         // Write a relocatable ELF object. The target machine's
@@ -1330,13 +1493,87 @@ impl LlvmAotEvaluator {
             .write_to_file(&module, FileType::Object, out_path)
             .map_err(|e| LlvmError::Codegen(format!("write object `{out_path:?}`: {e}")))?;
 
-        let entry_arity = profile.arg_offsets.len();
+        // For the fast path the binding's arity matches the LLVM
+        // entry signature's i64-slot count. For the buffer path
+        // there's no per-Rust-arg correspondence with the LLVM
+        // signature (which is always 6 slots), so we report the
+        // user-visible `#main` arity instead.
+        let entry_arity = main_fields.len();
+        let main_root_size = schema.main_layout.root_size as u32;
+        let return_root_size = schema.return_layout.root_size as u32;
+        let return_has_tail = return_needs_tail_region(&schema.return_schema);
+        let const_data = match shape {
+            EmittedEntryShape::FastInt => Vec::new(),
+            EmittedEntryShape::Buffer => const_pool.bytes,
+        };
+        let (main_fields_out, return_fields_out, main_root_size_out, return_root_size_out) =
+            match shape {
+                EmittedEntryShape::FastInt => (Vec::new(), Vec::new(), 0, 0),
+                EmittedEntryShape::Buffer => {
+                    (main_fields, return_fields, main_root_size, return_root_size)
+                }
+            };
+
         Ok(EmitObjectInfo {
             entry_symbol: entry_symbol.to_string(),
             entry_arity,
             param_names,
+            shape,
+            main_fields: main_fields_out,
+            return_fields: return_fields_out,
+            main_root_size: main_root_size_out,
+            return_root_size: return_root_size_out,
+            return_has_tail: matches!(shape, EmittedEntryShape::Buffer) && return_has_tail,
+            const_data,
+            references_str_contains_shim,
         })
     }
+}
+
+/// Walk a `(Schema, OffsetTable)` pair and project the per-field
+/// declaration into the build.rs-visible [`EmittedField`] shape. The
+/// type tag is erased into [`EmittedFieldType`] for the Phase 2
+/// supported leaf set; any unsupported leaf surfaces as
+/// [`LlvmError::UnsupportedSignature`] so build.rs never generates a
+/// binding it can't compile.
+fn lower_field_descriptors(
+    schema: &relon_eval_api::schema_canonical::Schema,
+    layout: &relon_eval_api::layout::OffsetTable,
+) -> Result<Vec<EmittedField>, LlvmError> {
+    use relon_eval_api::schema_canonical::TypeRepr;
+    let mut out = Vec::with_capacity(schema.fields.len());
+    for (i, f) in schema.fields.iter().enumerate() {
+        let lo = layout.fields.get(i).ok_or_else(|| {
+            LlvmError::Codegen(format!(
+                "lower_field_descriptors: layout missing slot for field `{}`",
+                f.name
+            ))
+        })?;
+        if lo.name != f.name {
+            return Err(LlvmError::Codegen(format!(
+                "lower_field_descriptors: schema/layout name mismatch at slot {i}: schema=`{}`, layout=`{}`",
+                f.name, lo.name
+            )));
+        }
+        let ty = match &f.ty {
+            TypeRepr::Int => EmittedFieldType::Int,
+            TypeRepr::Bool => EmittedFieldType::Bool,
+            TypeRepr::Null => EmittedFieldType::Null,
+            TypeRepr::String => EmittedFieldType::String,
+            other => {
+                return Err(LlvmError::UnsupportedSignature(format!(
+                    "relon-rs build (Phase 2): field `{}` type {other:?} not yet wired for marshalling",
+                    f.name
+                )));
+            }
+        };
+        out.push(EmittedField {
+            name: f.name.clone(),
+            offset: lo.offset as u32,
+            ty,
+        });
+    }
+    Ok(out)
 }
 
 fn run_default_o3_pipeline(module: &inkwell::module::Module<'_>) -> Result<(), LlvmError> {
