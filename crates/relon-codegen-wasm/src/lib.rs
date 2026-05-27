@@ -125,6 +125,14 @@ mod tests {
     }
 
     #[test]
+    fn lower_w9_inline_round_trips() {
+        let bytes = lower(&WasmProgram::W9NestedMatrixInline).expect("emit W9 inline");
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .expect("wasmparser validates W9 inline");
+    }
+
+    #[test]
     fn lower_w10_inline_round_trips() {
         let bytes = lower(&WasmProgram::W10ConfigEvalInline).expect("emit W10 inline");
         wasmparser::Validator::new()

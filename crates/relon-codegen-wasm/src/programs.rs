@@ -134,6 +134,28 @@ pub enum WasmProgram {
     /// W9 nested matrix — scope-cut Z.1.
     W9NestedMatrix,
 
+    /// W9 nested-matrix inline (`#main(Int n) -> Int`, matches
+    /// `w9_relon_src_bytecode()` from `cmp_lua`). The production W9
+    /// source materialises a `rows: range(n).map((i) => range(n).map(
+    /// (j) => i * n + j))` `#internal` list and returns a `Dict { rows,
+    /// result }` record, both of which are outside the Z.3 lowering
+    /// envelope (bare-`Dict` return + list-of-list materialisation are
+    /// Z.4 follow-ups). The `_bytecode` variant inlines the
+    /// `rows[i][j]` lookup to the closed-form `i * n + j` (the same
+    /// analytic value the slot would carry) and unwraps the dict-body
+    /// to a scalar `Int` so the source stays inside the IR envelope.
+    ///
+    /// Z.3c-d folds the outer `range(n).reduce(0, (acc, j) =>
+    /// acc + range(n).reduce(0, (inner, i) => inner + (i * n + j)))`
+    /// chain into a pure-WASM nested accumulator loop on the same
+    /// inlined source — the per-iter body still performs the literal
+    /// `i * n + j` arithmetic (one `mul` + two `add`s per inner iter).
+    /// **No closed-form** `n²(n²-1)/2` substitution: the analytic
+    /// answer is available but using it would be the algorithm-
+    /// substitution red flag called out in design §7. See
+    /// [`emit_w9_nested_matrix_inline`] for the nested-loop body sketch.
+    W9NestedMatrixInline,
+
     /// W10 config eval (production source, `#main(Int n) -> Dict`) —
     /// scope-cut Z.1. The production source binds an `#internal`
     /// closure `allow: (i) => ...` and returns a `Dict { result: Int }`
@@ -227,6 +249,7 @@ pub(crate) fn lower_program(program: &WasmProgram) -> Result<Vec<u8>, LowerError
         WasmProgram::W7FibRecursion => Err(LowerError::ScopeCut("W7-fib-recursion")),
         WasmProgram::W8PolymorphicDispatch => Err(LowerError::ScopeCut("W8-polymorphic-dispatch")),
         WasmProgram::W9NestedMatrix => Err(LowerError::ScopeCut("W9-nested-matrix")),
+        WasmProgram::W9NestedMatrixInline => Ok(emit_w9_nested_matrix_inline()),
         WasmProgram::W10ConfigEval => Err(LowerError::ScopeCut("W10-config-eval")),
         WasmProgram::W10ConfigEvalInline => Ok(emit_w10_config_eval_inline()),
         WasmProgram::W12IncrementInt => Ok(emit_w12_increment_int()),
@@ -870,6 +893,141 @@ fn emit_w10_config_eval_inline() -> Vec<u8> {
     func.instruction(&Instruction::End); // block
 
     // return acc
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::End); // function
+
+    finalize_module(prelude, func, &[])
+}
+
+/// W9 nested-matrix inline lowering.
+/// `#main(Int n) -> Int  range(n).reduce(0, (acc, j) =>
+///   acc + range(n).reduce(0, (inner, i) => inner + (i * n + j)))`.
+///
+/// Z.3c-d folds the nested `range.reduce` chain into a pure-WASM
+/// nested accumulator loop on the same inlined source — the per-iter
+/// inner body performs the literal `i * n + j` arithmetic (one
+/// `i64.mul` + two `i64.add`s) and adds it to the inner accumulator;
+/// the outer iteration then folds each inner sum into the outer
+/// accumulator. **No closed-form** `n²(n²-1)/2` substitution — the
+/// nested O(n²) work is preserved so the bench measures what the
+/// source declares it should measure.
+///
+/// Honesty (design §7):
+///   - Same algorithm? — same nested O(n²) reduce over `(j, i) in
+///     [0..n)²`. The compiler is inlining the stdlib
+///     `range.reduce(range.reduce(...))` chain into the equivalent
+///     nested accumulator loop; the per-iter operation count is
+///     preserved (no analytic closed-form). Note: this matches the
+///     `w9_relon_src_bytecode()` variant which already inlines
+///     `rows[i][j]` to `i * n + j`. The production `w9_relon_src()`
+///     additionally materialises a `rows: range(n).map(...)` list —
+///     that path (bare-`Dict` return + list-of-list materialisation)
+///     still scope-cuts; Z.4 follow-up.
+///   - Same code path? — `WasmEvaluator::run_main` lowers via this
+///     module and dispatches through wasmtime. No host imports are
+///     called.
+///   - Same I/O shape? — `#main(Int n) -> Int`, returns
+///     `Value::Int(Σ_j Σ_i (i*n + j))`. Cross-checked against the
+///     tree-walker for the same `n` in `tests/w9_smoke.rs`.
+///
+/// Loop shape (pure WASM, no host imports needed):
+///   outer_acc = 0
+///   j         = 0
+///   loop outer:
+///     if j >= n: break
+///     inner_acc = 0
+///     i         = 0
+///     loop inner:
+///       if i >= n: break inner
+///       inner_acc += i * n + j
+///       i         += 1
+///     outer_acc += inner_acc
+///     j         += 1
+///   return outer_acc
+fn emit_w9_nested_matrix_inline() -> Vec<u8> {
+    let prelude = build_prelude();
+
+    // Locals layout (function param 0 is `n: i64`; we add four locals):
+    //   local 0 = n (param)
+    //   local 1 = outer_acc (Σ over j)
+    //   local 2 = j         (outer cursor)
+    //   local 3 = inner_acc (Σ over i for fixed j)
+    //   local 4 = i         (inner cursor)
+    let mut func = Function::new([(4u32, ValType::I64)]);
+
+    // outer_acc = 0
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::LocalSet(1));
+    // j = 0
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::LocalSet(2));
+
+    // outer `block` so we can `br` out of the outer loop.
+    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+    func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+    // if j >= n: br outer
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::I64GeS);
+    func.instruction(&Instruction::BrIf(1));
+
+    // inner_acc = 0
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::LocalSet(3));
+    // i = 0
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::LocalSet(4));
+
+    // inner `block` so we can `br` out of the inner loop.
+    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+    func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+    // if i >= n: br inner
+    func.instruction(&Instruction::LocalGet(4));
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::I64GeS);
+    func.instruction(&Instruction::BrIf(1));
+
+    // inner_acc += i * n + j
+    func.instruction(&Instruction::LocalGet(3)); // inner_acc
+    func.instruction(&Instruction::LocalGet(4)); // i
+    func.instruction(&Instruction::LocalGet(0)); // n
+    func.instruction(&Instruction::I64Mul); // i * n
+    func.instruction(&Instruction::LocalGet(2)); // j
+    func.instruction(&Instruction::I64Add); // (i*n) + j
+    func.instruction(&Instruction::I64Add); // inner_acc + (i*n + j)
+    func.instruction(&Instruction::LocalSet(3));
+
+    // i += 1
+    func.instruction(&Instruction::LocalGet(4));
+    func.instruction(&Instruction::I64Const(1));
+    func.instruction(&Instruction::I64Add);
+    func.instruction(&Instruction::LocalSet(4));
+
+    // br to inner loop head
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // inner loop
+    func.instruction(&Instruction::End); // inner block
+
+    // outer_acc += inner_acc
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::LocalGet(3));
+    func.instruction(&Instruction::I64Add);
+    func.instruction(&Instruction::LocalSet(1));
+
+    // j += 1
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I64Const(1));
+    func.instruction(&Instruction::I64Add);
+    func.instruction(&Instruction::LocalSet(2));
+
+    // br to outer loop head
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // outer loop
+    func.instruction(&Instruction::End); // outer block
+
+    // return outer_acc
     func.instruction(&Instruction::LocalGet(1));
     func.instruction(&Instruction::End); // function
 

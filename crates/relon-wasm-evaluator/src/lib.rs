@@ -287,6 +287,7 @@ fn program_returns_scalar_int(program: WasmProgram) -> bool {
         | WasmProgram::W2DotProduct
         | WasmProgram::W4StringContains { .. }
         | WasmProgram::W6ListSumPlusOne
+        | WasmProgram::W9NestedMatrixInline
         | WasmProgram::W10ConfigEvalInline
         | WasmProgram::W12IncrementInt => true,
         WasmProgram::W3StringConcatInline => false,
@@ -343,6 +344,7 @@ impl Evaluator for WasmEvaluator {
             | WasmProgram::W3StringConcatInline
             | WasmProgram::W4StringContains { .. }
             | WasmProgram::W6ListSumPlusOne
+            | WasmProgram::W9NestedMatrixInline
             | WasmProgram::W10ConfigEvalInline => extract_named_int(&args, "n")?,
             WasmProgram::W12IncrementInt => extract_named_int(&args, "x")?,
             other => {

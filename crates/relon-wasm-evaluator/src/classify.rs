@@ -108,6 +108,22 @@ pub fn classify_main(source: &str) -> Result<WasmProgram, ClassifyError> {
     if normalised.contains("dispatch(i % 4)") {
         return Err(ClassifyError::ScopeCut("W8-polymorphic-dispatch"));
     }
+    // W9 inline-Int variant — matches `w9_relon_src_bytecode()` from
+    // cmp_lua: the production source's `rows: range(n).map(...)` list
+    // and the dict-body return are both gone; `rows[i][j]` is inlined
+    // to `(i * n + j)` and the outer reduce returns a scalar `Int`.
+    // Detected by the `#main(Int n) -> Int` declaration paired with
+    // the nested-reduce shape and the `(i * n + j)` inlined index.
+    // The production source (which keeps `rows[i][j]` + Dict return)
+    // still scope-cuts below — Z.4 follow-up.
+    if normalised.contains("#main(Int n) -> Int")
+        && normalised.contains("range(n).reduce(0, (acc, j) =>")
+        && normalised.contains("range(n).reduce(0, (inner, i) =>")
+        && normalised.contains("(i * n + j)")
+        && !normalised.contains("rows[i][j]")
+    {
+        return Ok(WasmProgram::W9NestedMatrixInline);
+    }
     if normalised.contains("rows[i][j]") || normalised.contains("(i * n + j)") {
         return Err(ClassifyError::ScopeCut("W9-nested-matrix"));
     }
