@@ -33,7 +33,7 @@ use relon_analyzer::{
     analyze, analyze_entry, AnalyzedTree, Diagnostic, LoadError, LoadedModule, ModuleLoader,
     WorkspaceDiagnostic,
 };
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "remote-http"))]
 use relon_evaluator::module::RemoteHttpResolver;
 use relon_evaluator::module::{FilesystemModuleResolver, ModuleResolver, StdModuleResolver};
 use relon_evaluator::{Capabilities, Context, TreeWalkEvaluator};
@@ -324,7 +324,7 @@ impl ResolverChainLoader {
     /// `RemoteImportDenied` — the host is expected to pre-fetch and
     /// install a virtual resolver.
     pub fn trusted() -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), feature = "remote-http"))]
         {
             Self {
                 resolvers: vec![
@@ -335,7 +335,15 @@ impl ResolverChainLoader {
                 has_remote: true,
             }
         }
-        #[cfg(target_arch = "wasm32")]
+        // wasm32 — no remote resolver (no sockets / TLS).
+        // Phase G.W11 Phase 2: also enters this branch on native
+        // builds when `remote-http` is off — the resulting chain
+        // surfaces `https://` `#import` as `RemoteImportDenied`
+        // through the `has_remote = false` short-circuit in
+        // `ModuleLoader::load`, the same diagnostic a sandboxed
+        // build would emit. Operators that need remote fetch
+        // rebuild with `--features remote-http`.
+        #[cfg(any(target_arch = "wasm32", not(feature = "remote-http")))]
         {
             Self {
                 resolvers: vec![
@@ -544,8 +552,11 @@ fn evaluate_source(
             // evaluator side. The resolver only ships on native
             // targets; on `wasm32-unknown-unknown` the runtime
             // cannot fetch (no sockets / TLS) so we keep the
-            // browser playground free of the dependency.
-            #[cfg(not(target_arch = "wasm32"))]
+            // browser playground free of the dependency. Phase
+            // G.W11 Phase 2: also gated on the `remote-http`
+            // feature so the lean CLI build does not link ureq +
+            // rustls + ring.
+            #[cfg(all(not(target_arch = "wasm32"), feature = "remote-http"))]
             ctx.prepend_module_resolver(Arc::new(RemoteHttpResolver::new()));
         }
         Arc::new(ctx)

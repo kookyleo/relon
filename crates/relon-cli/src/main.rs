@@ -153,6 +153,15 @@ enum Commands {
     /// Run the Language Server (stdio transport). Equivalent to the
     /// standalone `relon-lsp` binary; editors that want a single
     /// `relon lsp` command can wire to this.
+    ///
+    /// Phase G.W11 Phase 2 cold-start: the subcommand only ships
+    /// when the `cli-lsp` cargo feature is enabled. The standalone
+    /// `relon-lsp` binary stays the canonical LSP entry; embedding
+    /// it here cost ~160 KB text on every CLI invocation, which the
+    /// W11 trivial-`#main` shape pays without ever entering. Editors
+    /// that want one-binary ergonomics rebuild with
+    /// `cargo build --features cli-lsp` (or `--features full`).
+    #[cfg(feature = "cli-lsp")]
     Lsp,
 }
 
@@ -281,6 +290,7 @@ fn main() -> miette::Result<()> {
         } => {
             run_fmt(check, stdout, files)?;
         }
+        #[cfg(feature = "cli-lsp")]
         Commands::Lsp => {
             relon_lsp::server::run_stdio()
                 .map_err(|e| miette::miette!("language server exited with error: {e}"))?;
@@ -631,6 +641,17 @@ fn cmd_run(
             // resolution. Resolver lives on native targets only;
             // the CLI never runs on wasm32 so an unconditional
             // mount is safe.
+            //
+            // Phase G.W11 Phase 2: the resolver is gated behind the
+            // `remote-http` cargo feature. Default CLI builds drop
+            // ureq + rustls + ring (~700 KB text) so the W11
+            // trivial-`#main` cold start stays lean. Operators that
+            // need remote `#import` rebuild with
+            // `cargo build --features cli-remote-http`. With the
+            // feature off, the `ResolverChainLoader` still emits
+            // `RemoteImportDenied` for `https://` paths so the
+            // failure mode is unchanged from a sandboxed run.
+            #[cfg(feature = "cli-remote-http")]
             ctx.prepend_module_resolver(Arc::new(
                 relon_evaluator::module::RemoteHttpResolver::new(),
             ));

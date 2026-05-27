@@ -5,6 +5,13 @@
 //! between sandbox / trust posture and the remote resolver mount
 //! stays observable. Network access is mocked through an in-process
 //! TCP listener — no external host is contacted.
+//!
+//! Phase G.W11 Phase 2: the whole file is gated on the
+//! `remote-http` cargo feature since the resolver and its `ureq`
+//! dep tree only build under that feature. `cargo test --features
+//! remote-http` is required to exercise this surface.
+
+#![cfg(feature = "remote-http")]
 
 use relon::ResolverChainLoader;
 use relon_analyzer::{LoadError, ModuleLoader};

@@ -38,7 +38,7 @@
 //! than silent.
 
 use relon_eval_api::{Evaluator, NativeFnGate, RelonFunction};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "remote-http"))]
 use relon_evaluator::module::RemoteHttpResolver;
 use relon_evaluator::module::{FilesystemModuleResolver, ModuleResolver};
 use relon_evaluator::{Capabilities, Context, TreeWalkEvaluator};
@@ -310,7 +310,7 @@ fn build_tree_walk(
         ctx.prepend_module_resolver(
             Arc::new(FilesystemModuleResolver::trusted()) as Arc<dyn ModuleResolver>
         );
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(not(target_arch = "wasm32"), feature = "remote-http"))]
         ctx.prepend_module_resolver(Arc::new(RemoteHttpResolver::new()) as Arc<dyn ModuleResolver>);
     }
 

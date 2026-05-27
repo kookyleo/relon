@@ -17,7 +17,12 @@
 
 pub use relon_eval_api::module::{ModuleResolver, ModuleSource};
 
-#[cfg(not(target_arch = "wasm32"))]
+// Phase G.W11 Phase 2: `RemoteHttpResolver` (along with its `ureq`
+// dep) only ships when the `remote-http` cargo feature is enabled.
+// The W11 trivial-`#main` CLI build keeps it off so ureq + rustls +
+// ring stay out of the binary (~700 KB savings). Hosts that need
+// `https://` `#import` fetch enable `--features remote-http`.
+#[cfg(all(not(target_arch = "wasm32"), feature = "remote-http"))]
 pub use remote_http::{RemoteHttpResolver, RemoteImportCache};
 
 use relon_eval_api::error::RuntimeError;
@@ -216,7 +221,7 @@ impl ModuleResolver for FilesystemModuleResolver {
 /// conditional `GET` and treats a `304 Not Modified` response as
 /// "reuse the cached body and bump TTL" — saving the entire body's
 /// bandwidth on the network round-trip.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "remote-http"))]
 mod remote_http {
 
     use super::{ModuleResolver, ModuleSource};

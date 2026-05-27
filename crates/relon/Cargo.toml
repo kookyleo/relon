@@ -25,6 +25,12 @@ cranelift-aot = ["dep:relon-codegen-native"]
 # `--features llvm-aot`; CI dispatches build-conditional on the
 # matching machine.
 llvm-aot = ["dep:relon-codegen-llvm"]
+# Phase G.W11 Phase 2 cold-start: surface the
+# `relon-evaluator/remote-http` feature so downstream consumers
+# (relon-cli, relon-bench, in-tree tests) can opt the
+# `RemoteHttpResolver` + `ureq` dep tree back on. Default-off so the
+# trivial-`#main` CLI binary keeps its ~700 KB savings.
+remote-http = ["relon-evaluator/remote-http"]
 
 [dependencies]
 relon-evaluator = { workspace = true }

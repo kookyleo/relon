@@ -37,7 +37,9 @@ pub use relon_eval_api::{
 };
 // Concrete backend-side helpers that are not part of `relon-eval-api`.
 pub use module::{FilesystemModuleResolver, StdModuleResolver};
-#[cfg(not(target_arch = "wasm32"))]
+// Phase G.W11 Phase 2: `RemoteHttpResolver` ships only when the
+// `remote-http` feature is enabled (it pulls `ureq` + rustls + ring).
+#[cfg(all(not(target_arch = "wasm32"), feature = "remote-http"))]
 pub use module::{RemoteHttpResolver, RemoteImportCache};
 pub use relon_analyzer::{MainParam, MainSignature, WorkspaceDiagnostic, WorkspaceTree};
 

@@ -9,6 +9,30 @@ description = "Command line interface for the Relon language"
 keywords = ["cli", "config", "dsl", "json", "sandboxed"]
 categories = ["command-line-utilities", "config"]
 
+[features]
+# Phase G.W11 Phase 2 cold-start. Default feature set is the
+# minimal-surface "lean" build: no LSP subcommand, no remote-HTTP
+# `#import` resolver. Both subsystems carry sizeable dep trees
+# (lsp-server + lsp-types pulls ~160 KB text; ureq + rustls + ring
+# pulls ~700 KB text) that never fire on the W11 trivial-`#main`
+# bench shape — keeping them opt-in shrinks the CLI binary roughly
+# 800 KB and shaves the loader's relocation tax accordingly.
+#
+# Standalone `relon-lsp` is still available as its own binary, which
+# is the recommended editor integration regardless of how the CLI is
+# built. The `relon lsp` subcommand stays around for hosts that want
+# a single `relon` install to cover everything — they opt in with
+# `cargo build --features cli-lsp`. Remote `#import "https://..."`
+# similarly opts in with `--features cli-remote-http` (the resolver
+# only fires under `--trust` + remote URL anyway; sandboxed and
+# trivial-`#main` invocations never reach it).
+#
+# `full` re-enables both for hosts that want the v6 surface unchanged.
+default = []
+cli-lsp = ["dep:relon-lsp"]
+cli-remote-http = ["relon/remote-http"]
+full = ["cli-lsp", "cli-remote-http"]
+
 [dependencies]
 # v5-β-2 stage 4: the CLI uses the cranelift-aot backend for
 # `--backend cranelift-aot` (and as the default `--backend auto`'s
@@ -22,7 +46,11 @@ relon-analyzer = { workspace = true }
 relon-codegen-native = { workspace = true }
 relon-bytecode = { workspace = true }
 relon-fmt = { workspace = true }
-relon-lsp = { workspace = true }
+# Phase G.W11 Phase 2: `relon-lsp` only links when the `cli-lsp`
+# feature is on. The standalone `relon-lsp` binary remains the
+# canonical LSP entry; embedding it in `relon` was an ergonomic
+# convenience that paid ~160 KB of text on every invocation.
+relon-lsp = { workspace = true, optional = true }
 # v6-fix-D2-J cold-start: disable the `default` feature on clap so we
 # opt out of `color` / `suggestions` / `wrap_help` for the CLI binary.
 # `derive` + `std` + `help` cover the parser surface we actually use

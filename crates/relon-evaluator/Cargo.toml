@@ -9,6 +9,21 @@ description = "The evaluation engine for the Relon language"
 keywords = ["evaluator", "interpreter", "sandboxed", "dsl", "config"]
 categories = ["compilers", "config"]
 
+[features]
+# Phase G.W11 Phase 2 cold-start: `remote-http` gates the
+# `RemoteHttpResolver` module along with its `ureq` (sync HTTPS GET +
+# rustls + ring) dependency tree. Default-off keeps the W11
+# trivial-`#main` cold-start binary lean — the resolver is only
+# constructed on the `--trust` path with a `https://` `#import`, which
+# the W11 shape never exercises. Hosts that need remote `#import`
+# (CI tools that pull from a registry, the `relon-cli` invocation
+# with `--trust` + remote URL) opt in via `--features remote-http`.
+# When the feature is off, the `RemoteHttpResolver` symbol stops
+# existing; downstream code that referenced it should also gate on
+# `cfg(feature = "remote-http")` via the facade re-export.
+default = []
+remote-http = ["dep:ureq"]
+
 [dependencies]
 relon-parser = { workspace = true }
 relon-analyzer = { workspace = true }
@@ -43,8 +58,11 @@ regex = { workspace = true }
 # Restricted to native hosts so the browser playground build of
 # `relon-wasm` (which depends on this crate) keeps compiling against
 # `wasm32-unknown-unknown` without dragging in native sockets / TLS.
+# Phase G.W11 Phase 2 cold-start: also gated behind the `remote-http`
+# cargo feature so the W11 trivial-`#main` CLI build (which does not
+# need https) can drop ureq + rustls + ring (~700 KB text).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-ureq = { workspace = true }
+ureq = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
