@@ -34,22 +34,30 @@
 //! 3. For each `LoopPhi { init, phi }`:
 //!    - `init` must be a `ConstI64(c0)` with `0 <= c0 <= MAX_SAFE`.
 //!    - The matching `next_values[k]` must be an in-body
-//!      `Add { phi, step }` where `step` is either a `ConstI64(c1)`
-//!      with `1 <= c1 <= MAX_STEP`, or a loop-invariant SSA whose
-//!      observed type is `Bool` (range `[0, 1]`).
+//!      `Add { phi, step }` where `step` is one of:
+//!        * a `ConstI64(c1)` with `1 <= c1 <= MAX_STEP`,
+//!        * a loop-invariant SSA whose observed type is `Bool`
+//!          (range `[0, 1]`), or
+//!        * the loop's exit induction variable itself — the
+//!          `acc += i` accumulator-on-IV shape (W1's
+//!          `list.sum(range(n))`). This case tightens the entry-guard
+//!          bound to `MAX_SAFE_QUADRATIC_LOOP_BOUND` so the worst-case
+//!          accumulator value `n*(n-1)/2` stays inside i64.
 //!    - The exit guard's `phi` is also bounded by `n`; the lemma extends
 //!      to every other phi only when ALL phis share the same exit
 //!      idiom (any single counterexample disqualifies the whole loop).
 //! 4. If every phi qualifies, mark every `Guard(ArithOverflow(next))`
 //!    in the body for removal.
 //! 5. Synthesise the entry guard:
-//!    `ConstI64 max = MAX_SAFE_LOOP_BOUND`
+//!    `ConstI64 max = <per-loop-tightened bound>`
 //!    `Cmp Gt cmp = n > max`
 //!    `Guard IsZero(cmp)`
-//!    and splice it immediately before the `MarkLoopHead`. The guard
-//!    fires when `n` is too large for the proof to hold; cranelift then
-//!    deopts and the generic backend keeps running with overflow guards
-//!    in place.
+//!    and splice it immediately before the `MarkLoopHead`. The bound
+//!    defaults to `MAX_SAFE_LOOP_BOUND`; if any phi in the loop relied
+//!    on the `acc += iv` quadratic proof we tighten it to
+//!    `MAX_SAFE_QUADRATIC_LOOP_BOUND`. The guard fires when `n` is too
+//!    large for the proof to hold; cranelift then deopts and the
+//!    generic backend keeps running with overflow guards in place.
 //! 6. Rebuild the op stream and rebind `GuardSite::trace_pc` entries.
 //!
 //! ## Ordering
@@ -91,6 +99,24 @@ use super::{OptimizerPass, PassReport};
 /// recorder emits is a Bool/i32 accumulator with step <= 1).
 pub const MAX_SAFE_LOOP_BOUND: i64 = i64::MAX / 4;
 
+/// Tighter loop bound for the `acc += iv` accumulator shape (e.g. W1's
+/// `list.sum(range(n))`). When the per-iter step IS the loop's exit
+/// induction variable (`acc_next = acc + i` with `i` bounded by `n`),
+/// the worst-case accumulator value is `sum(0..n-1) = n*(n-1)/2`. To
+/// keep that result inside i64 we require `n*(n-1)/2 + (n-1) < i64::MAX`,
+/// which is satisfied for any `n <= 2^31` (the result then stays well
+/// below `2^62`). A conservative `2^30` adds a 4x safety margin on top
+/// of the integer-overflow envelope and still covers every realistic
+/// hot-loop trip count (1B iters @ 1ns each is ~1s of wall time —
+/// orders of magnitude beyond a single trace-JIT invocation).
+///
+/// Used by the `step == exit_phi` branch in `analyse_loop` to elide the
+/// remaining `ArithOverflow` guard on the accumulator add. The matching
+/// per-loop entry guard is tightened to this value when ANY phi in the
+/// loop relies on the quadratic-bound proof; if every phi is happy with
+/// the looser linear bound the original `MAX_SAFE_LOOP_BOUND` is used.
+pub const MAX_SAFE_QUADRATIC_LOOP_BOUND: i64 = 1 << 30;
+
 /// Largest constant step we admit. Bounded so even a maximal-step iter
 /// sequence stays inside i64 after `MAX_SAFE_LOOP_BOUND` iterations.
 /// `2^32` is the design-document figure; with `n <= MAX_SAFE_LOOP_BOUND`
@@ -131,6 +157,7 @@ impl OptimizerPass for IvOverflowElim {
                 entries.push(EntryGuardInsertion {
                     before_pc: lp.head_pc,
                     n: rewrite.bound,
+                    max_value: rewrite.entry_bound_max,
                 });
             }
         }
@@ -252,6 +279,12 @@ struct LoopRewrite {
     bound: SsaVar,
     /// Trace pc indices of the `Guard(ArithOverflow(_))` ops we'll drop.
     dead_pcs: Vec<usize>,
+    /// Maximum acceptable runtime value of `n`. Set to
+    /// [`MAX_SAFE_LOOP_BOUND`] for the linear-bound proof, tightened to
+    /// [`MAX_SAFE_QUADRATIC_LOOP_BOUND`] when any phi in this loop relied
+    /// on the `acc += exit_phi` (quadratic) proof. Drives the entry
+    /// guard's constant.
+    entry_bound_max: i64,
 }
 
 struct EntryGuardInsertion {
@@ -262,6 +295,9 @@ struct EntryGuardInsertion {
     /// SSA carrying the bound `n` we'll compare against the entry-time
     /// safety bound.
     n: SsaVar,
+    /// Constant value to use as the upper bound in the inserted
+    /// `n > max -> deopt` guard. See [`LoopRewrite::entry_bound_max`].
+    max_value: i64,
 }
 
 /// Analyse a single loop. Returns `Some(LoopRewrite)` iff the IV-overflow
@@ -338,6 +374,11 @@ fn analyse_loop(trace: &TraceBuffer, lp: &LoopRange) -> Option<LoopRewrite> {
     // Pre-index the body ops by their defining SSA for O(1) lookup.
     let body_defs = index_body_defs(&trace.ops, body_start, body_end);
 
+    // Pull the exit phi's SSA out so the per-phi step check can match
+    // against it (covers the `acc += i` accumulator-on-IV shape — W1's
+    // `list.sum(range(n))`).
+    let exit_phi_var = phis[exit_phi_idx].phi;
+
     // Find every Add { phi_k, step_k } in the body keyed by phi_k →
     // the producing op. Per-phi: if any single phi fails its proof,
     // skip JUST that phi (don't taint the others — each proof is
@@ -348,6 +389,11 @@ fn analyse_loop(trace: &TraceBuffer, lp: &LoopRange) -> Option<LoopRewrite> {
     // failed its bound check. The bound-check failure is irrelevant to
     // the counter's safety.
     let mut dead_pcs: Vec<usize> = Vec::new();
+    // Per-loop entry-guard bound. Starts at the linear-proof default and
+    // tightens to `MAX_SAFE_QUADRATIC_LOOP_BOUND` only when we accept a
+    // phi via the `acc += exit_phi` shape (whose worst-case value is
+    // `n*(n-1)/2`).
+    let mut entry_bound_max: i64 = MAX_SAFE_LOOP_BOUND;
     for (k, p) in phis.iter().enumerate() {
         let next = next_values[k];
         // The increment op must be in the body, must be `Add`, and
@@ -381,16 +427,32 @@ fn analyse_loop(trace: &TraceBuffer, lp: &LoopRange) -> Option<LoopRewrite> {
             continue;
         }
 
-        // 4b. step must be a non-negative bounded constant OR a
-        //     loop-invariant Bool SSA.
-        let step_ok = match const_i64_anywhere(trace, step) {
-            Some(c) => (0..=MAX_STEP).contains(&c),
-            None => {
-                // Non-constant step: require loop-invariance + Bool type
-                // (range [0,1]) so the per-iter delta is at most 1.
-                let invariant = is_defined_outside_body(&trace.ops, step, body_start, body_end);
-                let bool_type = trace.type_info.get(&step).copied() == Some(ObservedType::Bool);
-                invariant && bool_type
+        // 4b. Classify the step shape. Three accepted forms:
+        //
+        //   * non-negative bounded constant `c in [0, MAX_STEP]`, OR
+        //   * loop-invariant SSA observed as `Bool` (range `[0, 1]`), OR
+        //   * the loop's exit induction variable itself — covers the
+        //     `acc += i` accumulator shape (W1's `list.sum(range(n))`).
+        //     Requires a tighter entry guard so `acc <= n*(n-1)/2` stays
+        //     inside i64.
+        //
+        // `step_is_exit_phi` flags the third form so the per-phi safety
+        // check below can apply the quadratic-bound logic.
+        let step_is_exit_phi = step == exit_phi_var && k != exit_phi_idx;
+        let step_ok = if step_is_exit_phi {
+            // Accumulator-on-IV shape — accept; the quadratic-bound
+            // check happens in step 4c.
+            true
+        } else {
+            match const_i64_anywhere(trace, step) {
+                Some(c) => (0..=MAX_STEP).contains(&c),
+                None => {
+                    // Non-constant step: require loop-invariance + Bool type
+                    // (range [0,1]) so the per-iter delta is at most 1.
+                    let invariant = is_defined_outside_body(&trace.ops, step, body_start, body_end);
+                    let bool_type = trace.type_info.get(&step).copied() == Some(ObservedType::Bool);
+                    invariant && bool_type
+                }
             }
         };
         if !step_ok {
@@ -398,21 +460,20 @@ fn analyse_loop(trace: &TraceBuffer, lp: &LoopRange) -> Option<LoopRewrite> {
         }
 
         // 4c. For non-exit phis, also confirm there's no per-iter
-        //     mechanism that could escape the bound. Both shapes we
-        //     accept (constant step, Bool step) are monotonically
-        //     non-decreasing under non-negative init, so the loop's
-        //     exit-on-`exit_phi >= n` guarantees `phi <= n` at the
-        //     `Add` point. For k == exit_phi_idx we're proving
-        //     `exit_phi + step < n + step` ≤ MAX_SAFE+step ≤ i64::MAX.
-        //     For k != exit_phi_idx we're using the same trip-count
-        //     bound: `phi_k <= init_k + step_k * iters_remaining <=
-        //     MAX_SAFE + MAX_STEP * MAX_SAFE`. Pick the conservative
-        //     accumulator headroom by capping `MAX_STEP * MAX_SAFE`
-        //     inside `i64::MAX`. With MAX_SAFE = i64::MAX/4 and
-        //     MAX_STEP = 2^32, MAX_STEP * MAX_SAFE = i64::MAX/4 * 2^32
-        //     overflows on paper, so the conservative real-world rule
-        //     is: a non-Bool, non-tiny step is only safe when this
-        //     phi IS the exit phi. Enforce here.
+        //     mechanism that could escape the bound. Three accepted
+        //     shapes; each carries its own headroom argument.
+        //
+        //     * Bool / unit-const step: per-iter delta is at most 1.
+        //       With `n <= MAX_SAFE_LOOP_BOUND` the accumulator stays
+        //       within `init + n` ≤ `2 * MAX_SAFE` < i64::MAX.
+        //
+        //     * Step == exit_phi (accumulator-on-IV): the worst-case
+        //       value of `acc` after `n` iters is `sum(0..n-1) =
+        //       n*(n-1)/2`. To keep `acc + i` inside i64 we need
+        //       `n*(n-1)/2 + (n-1) < i64::MAX`. Tighten the per-loop
+        //       entry-guard bound to `MAX_SAFE_QUADRATIC_LOOP_BOUND` so
+        //       the proof's runtime check stays sound. The same bound
+        //       applies to every phi that picked this shape.
         if k != exit_phi_idx {
             let is_bool_step = matches!(
                 trace.type_info.get(&step).copied(),
@@ -420,7 +481,11 @@ fn analyse_loop(trace: &TraceBuffer, lp: &LoopRange) -> Option<LoopRewrite> {
             );
             let is_unit_const =
                 matches!(const_i64_anywhere(trace, step), Some(c) if (0..=1).contains(&c));
-            if !is_bool_step && !is_unit_const {
+            if step_is_exit_phi {
+                // Quadratic-bound proof — tighten the entry guard so
+                // `n*(n-1)/2` plus one more step still fits in i64.
+                entry_bound_max = entry_bound_max.min(MAX_SAFE_QUADRATIC_LOOP_BOUND);
+            } else if !is_bool_step && !is_unit_const {
                 continue;
             }
         }
@@ -450,7 +515,11 @@ fn analyse_loop(trace: &TraceBuffer, lp: &LoopRange) -> Option<LoopRewrite> {
     dead_pcs.sort_unstable();
     dead_pcs.dedup();
 
-    Some(LoopRewrite { bound, dead_pcs })
+    Some(LoopRewrite {
+        bound,
+        dead_pcs,
+        entry_bound_max,
+    })
 }
 
 /// Returns `Some(c)` if `var` is defined by a `ConstI64 { dst: var, value: c }`
@@ -535,6 +604,7 @@ fn rebuild_with_entry_guards(
             .push(EntryGuardInsertion {
                 before_pc: e.before_pc,
                 n: e.n,
+                max_value: e.max_value,
             });
     }
     let mut new_ops: Vec<TraceOp> = Vec::with_capacity(old_ops.len() + entries.len() * 3);
@@ -544,14 +614,17 @@ fn rebuild_with_entry_guards(
     // the order we inserted them. The matching `GuardSite` is appended
     // below.
     let mut entry_guard_pcs: Vec<u32> = Vec::new();
-    // We need the SSA carrying `n` to materialise the entry guard.
+    // We need the SSA carrying `n` to materialise the entry guard. Each
+    // tuple carries `(insert_at, n_ssa, max_value)`; the max_value is
+    // the constant the runtime compares `n` against — tightened to
+    // `MAX_SAFE_QUADRATIC_LOOP_BOUND` for loops with `acc += iv` shape.
     // Defer fresh-SSA allocation until splice time so we don't touch
     // `trace` while it's split.
-    let mut entry_specs: Vec<(usize, SsaVar)> = Vec::new(); // (insert_at, n)
+    let mut entry_specs: Vec<(usize, SsaVar, i64)> = Vec::new();
     for (pc, op) in old_ops.into_iter().enumerate() {
         if let Some(group) = entries_at.remove(&pc) {
             for g in group {
-                entry_specs.push((new_ops.len(), g.n));
+                entry_specs.push((new_ops.len(), g.n, g.max_value));
                 // Placeholders: we replace these with real ops after the
                 // sweep finishes (so `fresh_ssa` can run on `trace`).
                 new_ops.push(TraceOp::ConstI64 {
@@ -578,12 +651,12 @@ fn rebuild_with_entry_guards(
     // Replace each entry-guard placeholder triple with real ops backed
     // by fresh SSAs. Allocate the SSAs here so the `next_ssa` counter
     // advances exactly once per entry guard.
-    for (insert_at, n) in entry_specs {
+    for (insert_at, n, max_value) in entry_specs {
         let max_ssa = trace.fresh_ssa();
         let cmp_ssa = trace.fresh_ssa();
         trace.ops[insert_at] = TraceOp::ConstI64 {
             dst: max_ssa,
-            value: MAX_SAFE_LOOP_BOUND,
+            value: max_value,
         };
         trace.ops[insert_at + 1] = TraceOp::Cmp {
             kind: CmpKind::Gt,
@@ -1074,5 +1147,189 @@ mod tests {
                 _ => panic!("trace_pc must point at a Guard op"),
             }
         }
+    }
+
+    /// W1-shape proof: `acc = 0; for i in 0..n { acc += i; i += 1 }`.
+    /// Both phis qualify — `i+=1` via the linear constant-step branch,
+    /// `acc += i` via the quadratic accumulator-on-IV branch. The
+    /// resulting trace has zero in-loop `ArithOverflow` guards and a
+    /// single entry guard at the tightened `MAX_SAFE_QUADRATIC_LOOP_BOUND`.
+    fn mk_w1_loop(n: SsaVar) -> TraceBuffer {
+        let mut b = TraceBuffer::new();
+        // i_seed = 0
+        let i_seed = b.fresh_ssa();
+        b.append(TraceOp::ConstI64 {
+            dst: i_seed,
+            value: 0,
+        });
+        b.record_const(i_seed, TraceConst::I64(0));
+        // acc_seed = 0
+        let acc_seed = b.fresh_ssa();
+        b.append(TraceOp::ConstI64 {
+            dst: acc_seed,
+            value: 0,
+        });
+        b.record_const(acc_seed, TraceConst::I64(0));
+        // n via LocalGet (the caller-supplied SSA).
+        b.append(TraceOp::LocalGet {
+            dst: n,
+            slot_idx: 0,
+        });
+        // step1 = 1
+        let step1 = b.fresh_ssa();
+        b.append(TraceOp::ConstI64 {
+            dst: step1,
+            value: 1,
+        });
+        b.record_const(step1, TraceConst::I64(1));
+        // Body. acc_phi first so it's the non-exit phi; i_phi second.
+        let acc_phi = b.fresh_ssa();
+        let i_phi = b.fresh_ssa();
+        b.append(TraceOp::MarkLoopHead {
+            loop_id: 0,
+            phis: vec![LoopPhi::new(acc_seed, acc_phi), LoopPhi::new(i_seed, i_phi)],
+        });
+        // cmp = i_phi >= n; guard IsZero(cmp).
+        let cmp = b.fresh_ssa();
+        b.append(TraceOp::Cmp {
+            kind: CmpKind::Ge,
+            dst: cmp,
+            lhs: i_phi,
+            rhs: n,
+        });
+        let isz_pc = b.append(TraceOp::Guard {
+            kind: GuardKind::IsZero(cmp),
+            check: cmp,
+        });
+        b.record_guard(GuardSite::new(
+            isz_pc,
+            ExternalPc(7),
+            GuardKind::IsZero(cmp),
+        ));
+        // acc_next = acc_phi + i_phi (step == exit_phi shape).
+        let acc_next = b.fresh_ssa();
+        b.append(TraceOp::Add {
+            dst: acc_next,
+            lhs: acc_phi,
+            rhs: i_phi,
+        });
+        let acc_of_pc = b.append(TraceOp::Guard {
+            kind: GuardKind::ArithOverflow(acc_next),
+            check: acc_next,
+        });
+        b.record_guard(GuardSite::new(
+            acc_of_pc,
+            ExternalPc(11),
+            GuardKind::ArithOverflow(acc_next),
+        ));
+        // i_next = i_phi + 1 (linear constant-step shape).
+        let i_next = b.fresh_ssa();
+        b.append(TraceOp::Add {
+            dst: i_next,
+            lhs: i_phi,
+            rhs: step1,
+        });
+        let i_of_pc = b.append(TraceOp::Guard {
+            kind: GuardKind::ArithOverflow(i_next),
+            check: i_next,
+        });
+        b.record_guard(GuardSite::new(
+            i_of_pc,
+            ExternalPc(13),
+            GuardKind::ArithOverflow(i_next),
+        ));
+        b.append(TraceOp::MarkLoopBack {
+            loop_id: 0,
+            next_values: vec![acc_next, i_next],
+        });
+        b.append(TraceOp::Return { value: acc_next });
+        b
+    }
+
+    #[test]
+    fn strip_accumulator_on_iv_overflow_guard() {
+        // W1 hot loop. Both ArithOverflow guards must go.
+        let n = SsaVar(2);
+        let mut b = mk_w1_loop(n);
+        let before_arith = b
+            .ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    TraceOp::Guard {
+                        kind: GuardKind::ArithOverflow(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(before_arith, 2, "test fixture must seed 2 overflow guards");
+
+        let report = IvOverflowElim.run(&mut b);
+        assert_eq!(report.ops_removed, 2, "both ArithOverflow guards must drop");
+
+        let after_arith = b
+            .ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    TraceOp::Guard {
+                        kind: GuardKind::ArithOverflow(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(after_arith, 0, "no ArithOverflow guard survives");
+
+        // Entry guard's const must be the tightened quadratic bound.
+        let const_n_bound = b
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                TraceOp::ConstI64 { value, .. } if *value == MAX_SAFE_QUADRATIC_LOOP_BOUND => {
+                    Some(*value)
+                }
+                _ => None,
+            })
+            .expect("entry guard constant must be present");
+        assert_eq!(const_n_bound, MAX_SAFE_QUADRATIC_LOOP_BOUND);
+
+        // The looser linear bound should NOT appear: a single insertion
+        // per loop, tightened to the strictest required value.
+        let has_loose_bound = b.ops.iter().any(
+            |op| matches!(op, TraceOp::ConstI64 { value, .. } if *value == MAX_SAFE_LOOP_BOUND),
+        );
+        assert!(
+            !has_loose_bound,
+            "loose linear bound must not coexist with the quadratic-tightened entry guard"
+        );
+    }
+
+    #[test]
+    fn w4_loop_keeps_linear_entry_bound() {
+        // Regression — the original W4 (Bool-step accumulator) shape
+        // must keep the looser `MAX_SAFE_LOOP_BOUND` constant; the
+        // tightened quadratic bound should only land when an actual
+        // `acc += iv` shape is present.
+        let n = SsaVar(2);
+        let mut b = mk_w4_loop(n);
+        IvOverflowElim.run(&mut b);
+        let has_linear = b.ops.iter().any(
+            |op| matches!(op, TraceOp::ConstI64 { value, .. } if *value == MAX_SAFE_LOOP_BOUND),
+        );
+        assert!(
+            has_linear,
+            "W4-shape rewrite must keep the linear-proof entry bound"
+        );
+        let has_quadratic = b.ops.iter().any(|op| {
+            matches!(op, TraceOp::ConstI64 { value, .. } if *value == MAX_SAFE_QUADRATIC_LOOP_BOUND)
+        });
+        assert!(
+            !has_quadratic,
+            "W4-shape rewrite must not insert the quadratic-proof bound"
+        );
     }
 }
