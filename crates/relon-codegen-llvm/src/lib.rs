@@ -79,6 +79,7 @@
 mod emitter;
 mod error;
 mod evaluator;
+mod mcjit_mm;
 mod state;
 mod str_helpers;
 

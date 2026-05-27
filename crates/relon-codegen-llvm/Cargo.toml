@@ -39,6 +39,18 @@ thiserror = { workspace = true }
 #   reinstate just the host x86 backend below.
 inkwell = { version = "=0.9.0", default-features = false, features = ["llvm18-1", "target-x86"] }
 
+# Phase L codegen-quality: MCJIT custom memory manager needs raw mmap
+# control so we can place code with `CodeModel::Small`. The default
+# MCJIT JIT compiler builder hard-wires `CodeModel::JITDefault`
+# (effectively Large), forcing every recursive call to indirect through
+# a `movabsq + callq *%reg` shape — a fixed per-call BTB+decoder hit
+# that visibly widens the W7 fib lambda's gap vs the equivalent rustc
+# LTO build. `libc::mmap` is the smallest cross-platform call that
+# exposes `MAP_FIXED` + `PROT_*` so we can land code in the lower 2 GB
+# (or just emit RWX pages without MAP_32BIT — internal-only modules
+# satisfy ±2 GB relocations as long as the section block is contiguous).
+libc = "0.2"
+
 [dev-dependencies]
 # Phase A.4 perf smoke needs a side-by-side cranelift evaluator built
 # from the same hand-built IR fixture. The dep is dev-only so the

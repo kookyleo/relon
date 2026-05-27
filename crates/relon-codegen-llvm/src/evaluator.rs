@@ -464,9 +464,130 @@ impl LlvmAotEvaluator {
             ir_dump = format!("; --- PRE-OPT IR ---\n{p}\n; --- POST-OPT IR ---\n{ir_dump}");
         }
 
-        let engine = module
-            .create_jit_execution_engine(OptimizationLevel::Aggressive)
-            .map_err(|e| LlvmError::Codegen(format!("create_jit_execution_engine: {e}")))?;
+        // Phase L profile-first: dump post-O3 IR + host-targeted ASM
+        // to `$RELON_LLVM_DUMP_DIR/` when the env var is set. The dump
+        // mirrors the actual MCJIT codegen path (same TargetMachine
+        // knobs as `run_default_o3_pipeline`) so the .s file matches
+        // what the JIT engine actually emits at JIT-resolve time.
+        if let Some(dir) = std::env::var_os("RELON_LLVM_DUMP_DIR") {
+            let dir = std::path::PathBuf::from(dir);
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join("module.post_o3.ll"), &ir_dump);
+            // Re-create a TargetMachine matching the JIT path so the
+            // dumped ASM is byte-equivalent to what MCJIT codegen
+            // hands to the loader. The codegen-side OptLevel for MCJIT
+            // is `Aggressive` (see `create_jit_execution_engine` call
+            // below); mirror that here.
+            if let Ok(()) = Target::initialize_native(&InitializationConfig::default()) {
+                let triple_str = TargetMachine::get_default_triple();
+                if let Ok(target) = Target::from_triple(&triple_str) {
+                    let cpu = TargetMachine::get_host_cpu_name();
+                    let features = TargetMachine::get_host_cpu_features();
+                    if let Ok(triple_utf8) = triple_str.as_str().to_str() {
+                        let triple = TargetTriple::create(triple_utf8);
+                        if let Some(machine) = target.create_target_machine(
+                            &triple,
+                            cpu.to_str().unwrap_or(""),
+                            features.to_str().unwrap_or(""),
+                            OptimizationLevel::Aggressive,
+                            RelocMode::Default,
+                            CodeModel::JITDefault,
+                        ) {
+                            let _ = machine.write_to_file(
+                                &module,
+                                FileType::Assembly,
+                                &dir.join("module.s"),
+                            );
+                            let _ = machine.write_to_file(
+                                &module,
+                                FileType::Object,
+                                &dir.join("module.o"),
+                            );
+                        }
+                        // Dump variant: CodeModel::Small + RelocMode::PIC
+                        // so we can A/B with `module.s` and see whether the
+                        // recursive call shrinks to a PC-rel `callq <sym>`.
+                        if let Some(machine) = target.create_target_machine(
+                            &triple,
+                            cpu.to_str().unwrap_or(""),
+                            features.to_str().unwrap_or(""),
+                            OptimizationLevel::Aggressive,
+                            RelocMode::PIC,
+                            CodeModel::Small,
+                        ) {
+                            let _ = machine.write_to_file(
+                                &module,
+                                FileType::Assembly,
+                                &dir.join("module.small_pic.s"),
+                            );
+                        }
+                        // Dump variant: CodeModel::Small + RelocMode::Static.
+                        if let Some(machine) = target.create_target_machine(
+                            &triple,
+                            cpu.to_str().unwrap_or(""),
+                            features.to_str().unwrap_or(""),
+                            OptimizationLevel::Aggressive,
+                            RelocMode::Static,
+                            CodeModel::Small,
+                        ) {
+                            let _ = machine.write_to_file(
+                                &module,
+                                FileType::Assembly,
+                                &dir.join("module.small_static.s"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase L codegen-quality: pick the MCJIT engine builder by
+        // whether the module references the host-side `contains` shim.
+        //
+        // - **No extern** -> use the custom memory manager + Small
+        //   CodeModel. All same-module calls collapse to direct
+        //   `callq <pcrel32>` instead of MCJIT's default
+        //   `movabsq + callq *%reg` (Large CodeModel). For tight
+        //   recursive bodies like W7 fib this saves ~0.2 ns / call
+        //   on Intel; multiplied by fib(22)'s ~35 k call tree it
+        //   closes ~10 µs of the gap vs the rustc LTO build.
+        //
+        // - **Extern present** -> stay on the default JIT builder
+        //   (Large CodeModel) because the host-side shim lives in
+        //   the executable's `.text` which is typically > 2 GB away
+        //   from the JIT's freshly-mmap'd code arena. A 32-bit
+        //   PC-relative relocation would fail to resolve; the Large
+        //   CodeModel's `movabsq + indirect` pattern handles it.
+        //
+        // Detection is purely structural — we look up the shim
+        // symbol on the module. The emitter declares it lazily, so
+        // its presence means "this module has at least one extern
+        // call site that needs `add_global_mapping` after engine
+        // creation".
+        let uses_extern_shim = module
+            .get_function(crate::str_helpers::RELON_LLVM_STR_CONTAINS_ARENA_SYMBOL)
+            .is_some();
+        let force_default_mcjit = std::env::var_os("RELON_LLVM_FORCE_DEFAULT_MCJIT").is_some();
+        let engine = if uses_extern_shim || force_default_mcjit {
+            module
+                .create_jit_execution_engine(OptimizationLevel::Aggressive)
+                .map_err(|e| LlvmError::Codegen(format!("create_jit_execution_engine: {e}")))?
+        } else {
+            let mm = crate::mcjit_mm::ContiguousCodeMemoryManager::new();
+            module
+                .create_mcjit_execution_engine_with_memory_manager(
+                    mm,
+                    OptimizationLevel::Aggressive,
+                    inkwell::targets::CodeModel::Small,
+                    /*no_frame_pointer_elim=*/ false,
+                    /*enable_fast_isel=*/ false,
+                )
+                .map_err(|e| {
+                    LlvmError::Codegen(format!(
+                        "create_mcjit_execution_engine_with_memory_manager (Small CodeModel): {e}"
+                    ))
+                })?
+        };
 
         // Phase F.1: wire the host shim that backs the LLVM AOT
         // `contains(haystack, needle) -> Bool` fast path. The emitter
@@ -615,6 +736,24 @@ impl LlvmAotEvaluator {
     /// when the source falls back to the buffer-only path.
     pub fn fast_path_arity(&self) -> Option<usize> {
         self.fast_path_arity
+    }
+
+    /// Phase L codegen-quality debug helper: raw address of the typed
+    /// fast-entry function in the JIT-allocated code arena. Returns
+    /// `None` if the source falls back to the buffer entry. Hosts use
+    /// this to disassemble the MCJIT-produced machine code at runtime
+    /// (`xxd` / `objdump --disassemble-all` on a byte slice) — useful
+    /// for confirming whether the engine emitted direct `callq <pcrel>`
+    /// vs the Large-CodeModel `movabsq + callq *%reg` shape.
+    pub fn fast_entry_runtime_addr(&self) -> Option<usize> {
+        self.jit.fast_entry_ptr
+    }
+
+    /// Phase L codegen-quality debug helper: raw address of the
+    /// buffer-protocol entry function in the JIT-allocated code arena.
+    /// Always populated for a successful `from_source` build.
+    pub fn entry_runtime_addr(&self) -> usize {
+        self.jit.entry_ptr
     }
 
     /// Phase D.1 dispatch-boundary fast path: invoke the typed fast
