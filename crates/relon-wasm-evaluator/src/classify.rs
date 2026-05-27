@@ -72,8 +72,15 @@ pub fn classify_main(source: &str) -> Result<WasmProgram, ClassifyError> {
     if normalised.contains("list.sum(range(n).map((i) => (i + 1) * (i + 2)))") {
         return Ok(WasmProgram::W2DotProduct);
     }
-    if normalised.contains("reduce(\"\", (acc, s) => acc + s)") {
-        return Err(ClassifyError::ScopeCut("W3-string-concat"));
+    // W3 — `range(n).map((i) => "a").reduce("", (acc, s) => acc + s)`.
+    // Z.3c-b promotes this from ScopeCut to a pure-WASM byte-fill loop
+    // emitted by `emit_w3_string_concat_inline`. Matches the production
+    // `w3_relon_src()` byte-identical. The lowering returns a
+    // (ptr<<32 | len) i64 the host unpacks back to `Value::String`.
+    if normalised.contains("range(n).map((i) => \"a\")")
+        && normalised.contains("reduce(\"\", (acc, s) => acc + s)")
+    {
+        return Ok(WasmProgram::W3StringConcatInline);
     }
     if normalised.contains(".contains(\"x\")") {
         return Err(ClassifyError::ScopeCut("W4-string-contains"));

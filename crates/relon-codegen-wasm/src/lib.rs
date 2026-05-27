@@ -132,6 +132,14 @@ mod tests {
             .expect("wasmparser validates W10 inline");
     }
 
+    #[test]
+    fn lower_w3_inline_round_trips() {
+        let bytes = lower(&WasmProgram::W3StringConcatInline).expect("emit W3 inline");
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .expect("wasmparser validates W3 inline");
+    }
+
     /// Sanity: every scope-cut workload returns the named cut.
     #[test]
     fn scope_cut_workloads_surface_explicitly() {

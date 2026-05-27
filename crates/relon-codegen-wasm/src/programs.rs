@@ -52,9 +52,27 @@ pub enum WasmProgram {
     /// [`emit_w2_dot_product`] for the loop body sketch.
     W2DotProduct,
 
-    /// W3 string concat — scope-cut Z.1 (string concat surface needs
-    /// the `__relon_str_concat_n` plumbing wired).
+    /// W3 string concat — scope-cut Z.1 placeholder for the production
+    /// closure-based path (`range(n).map((i) => "a").reduce("",
+    /// (acc, s) => acc + s)` lowered through `__relon_str_concat_n`
+    /// + first-class closure values). Z.4 follow-up.
     W3StringConcat,
+
+    /// W3 string concat inline — matches the production
+    /// `w3_relon_src()` source. Z.3c-b hand-emits a pure-WASM
+    /// accumulator loop that arena-allocs `n` bytes once and fills
+    /// them with `'a'` one byte at a time. Each per-iter store is
+    /// the per-step concat the source `reduce("", (acc, s) => acc + s)`
+    /// performs — no `"a".repeat(n)` closed-form substitution.
+    ///
+    /// Return ABI: the i64 return is packed as
+    /// `(ptr_u32 as i64) << 32 | (len_u32 as i64)`. The host
+    /// (`relon-wasm-evaluator`) unpacks the pair, copies the bytes out
+    /// of linear memory, and rebuilds `Value::String`. The fast-path
+    /// (`run_main_legacy_i64_fast`) is **disabled** for this variant
+    /// because the i64 return is a ptr/len pair, not a scalar Int —
+    /// `has_fast_path()` returns `false`.
+    W3StringConcatInline,
 
     /// W4 contains scan — scope-cut Z.1 (filter / list-len-of-filter
     /// composition needs IR walker).
@@ -114,6 +132,7 @@ pub(crate) fn lower_program(program: &WasmProgram) -> Result<Vec<u8>, LowerError
         WasmProgram::W1IntSumRange => Ok(emit_w1_int_sum_range()),
         WasmProgram::W2DotProduct => Ok(emit_w2_dot_product()),
         WasmProgram::W3StringConcat => Err(LowerError::ScopeCut("W3-string-concat")),
+        WasmProgram::W3StringConcatInline => Ok(emit_w3_string_concat_inline()),
         WasmProgram::W4StringContains { .. } => Err(LowerError::ScopeCut("W4-string-contains")),
         WasmProgram::W5DictAccess => Err(LowerError::ScopeCut("W5-dict-access")),
         WasmProgram::W6ListSumPlusOne => Ok(emit_w6_list_sum_plus_one()),
@@ -470,6 +489,120 @@ fn emit_w6_list_sum_plus_one() -> Vec<u8> {
         align: 0,
         memory_index: 0,
     };
+
+    finalize_module(prelude, func)
+}
+
+/// W3 string-concat inline lowering.
+/// `#main(Int n) -> String  range(n).map((i) => "a").reduce("", (acc, s) => acc + s)`.
+///
+/// Hand-emit a pure-WASM loop that performs the per-iter concat
+/// literally. Strategy:
+///   1. Call host import `__relon_arena_alloc(n, 1)` once to reserve
+///      `n` contiguous bytes in linear memory.
+///   2. Loop `i in [0..n)`: `memory[ptr + i] = 0x61` (byte 'a'). Each
+///      `i32.store8` is the per-step append `acc = acc + "a"`
+///      collapses to in the source — single-byte source string + bump-
+///      pointer destination.
+///   3. Pack `(ptr_u32 << 32) | len_u32` into the i64 return so the
+///      `(i64) -> i64` typed-func handle stays uniform; the host
+///      unpacks and copies the bytes out into `Value::String`.
+///
+/// Honesty (design §7):
+///   - Same algorithm? — the source reduces an n-element list of
+///     single-character strings into one string. We're still doing
+///     `n` per-step appends; the only delta is each append writes
+///     one byte to a contiguous buffer instead of recomputing a fresh
+///     concat. No closed-form `"a".repeat(n)` substitution — the
+///     loop body literally writes `'a'` at position `i` per
+///     iteration. The lowering matches the work the source does, not
+///     a faster equivalent.
+///   - Same code path? — `WasmEvaluator::run_main` lowers via this
+///     module and dispatches through wasmtime. One host call
+///     (`__relon_arena_alloc`) per invocation, then pure-WASM byte
+///     stores; no per-byte host crossing.
+///   - Same I/O shape? — `#main(Int n) -> String`, returns
+///     `Value::String("a" * n)`. Cross-checked against the tree-
+///     walker output for `n = bench_n` in `tests/w3_smoke.rs`.
+///
+/// Loop shape:
+///   ptr = __relon_arena_alloc(n, 1)
+///   i   = 0
+///   loop:
+///     if i >= n: break
+///     memory[ptr + i] = 0x61
+///     i += 1
+///   return ((ptr as u64) << 32) | (n as u64 & 0xffffffff)
+fn emit_w3_string_concat_inline() -> Vec<u8> {
+    let prelude = build_prelude();
+
+    // Locals layout (function param 0 is `n: i64`; we add two locals):
+    //   local 0 = n (param, i64)
+    //   local 1 = ptr (i32, returned by __relon_arena_alloc)
+    //   local 2 = i (i32, byte cursor)
+    let mut func = Function::new([(2u32, ValType::I32)]);
+
+    // ptr = __relon_arena_alloc((n as i32), 1)
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::I32WrapI64);
+    func.instruction(&Instruction::I32Const(1)); // align
+    let alloc_fn_idx = crate::host_abi::import_index(1); // __relon_arena_alloc
+    func.instruction(&Instruction::Call(alloc_fn_idx));
+    func.instruction(&Instruction::LocalSet(1)); // local 1 = ptr
+
+    // i = 0
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::LocalSet(2));
+
+    // outer `block` so we can `br` out of the loop.
+    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+    func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+    // if i >= (n as i32): br outer
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::I32WrapI64);
+    func.instruction(&Instruction::I32GeS);
+    func.instruction(&Instruction::BrIf(1));
+
+    // memory[ptr + i] = 0x61 ('a')
+    //   address = ptr + i
+    //   value   = 0x61
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::I32Const(0x61)); // 'a'
+    func.instruction(&Instruction::I32Store8(MemArg {
+        offset: 0,
+        align: 0, // 2^0 = 1-byte alignment
+        memory_index: 0,
+    }));
+
+    // i += 1
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalSet(2));
+
+    // br to loop head
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // loop
+    func.instruction(&Instruction::End); // block
+
+    // Pack return: ((ptr as u64) << 32) | (n as u32 as u64)
+    //
+    // Pack ptr (u32) into the high 32 bits and the original n (truncated
+    // to u32, no sign extension) into the low 32 bits. The host
+    // (`extract_packed_str_ptr_len` in the evaluator) reverses this.
+    func.instruction(&Instruction::LocalGet(1)); // ptr (i32)
+    func.instruction(&Instruction::I64ExtendI32U);
+    func.instruction(&Instruction::I64Const(32));
+    func.instruction(&Instruction::I64Shl);
+    func.instruction(&Instruction::LocalGet(0)); // n (i64)
+    func.instruction(&Instruction::I64Const(0xffff_ffff));
+    func.instruction(&Instruction::I64And);
+    func.instruction(&Instruction::I64Or);
+    func.instruction(&Instruction::End); // function
 
     finalize_module(prelude, func)
 }

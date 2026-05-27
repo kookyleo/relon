@@ -184,16 +184,29 @@ impl WasmEvaluator {
     }
 
     /// Phase Z.3a: is the cached `(i64) -> i64` fast-entry handle
-    /// available for this evaluator? Returns `true` when the source
-    /// classified into a Z.1 program (W1/W6/W12) and the typed-func
-    /// resolve at construction succeeded; `false` when the source
-    /// fell through to the tree-walker tier.
+    /// available **and** semantically meaningful for this evaluator?
+    /// Returns `true` when the source classified into a Z.1/Z.3
+    /// program whose i64 return value **is** the scalar Int result
+    /// the host would wrap in `Value::Int` (W1/W2/W6/W10-inline/W12);
+    /// `false` when:
+    ///
+    /// - the source fell through to the tree-walker tier (`wasm: None`), or
+    /// - the i64 return encodes a non-Int payload — e.g. W3 inline,
+    ///   where the i64 is the packed `(ptr<<32 | len)` of a String
+    ///   that needs a linear-memory copy before it can become a
+    ///   `Value::String`. The fast path bypasses that copy, so
+    ///   surfacing it as available would silently corrupt the row's
+    ///   measurement (it would book a meaningless raw i64 timing
+    ///   under the `wasmtime_fast` label).
     ///
     /// The cmp_lua bench's `relon_wasm_wasmtime_fast` row gates on
     /// this so a scope-cut source never books fast-path numbers —
     /// matches the `LlvmAotEvaluator::has_fast_path` contract.
     pub fn has_fast_path(&self) -> bool {
-        self.wasm.is_some()
+        match &self.wasm {
+            None => false,
+            Some(rt) => program_returns_scalar_int(rt.program),
+        }
     }
 
     /// Phase Z.3a dispatch-boundary fast path: invoke the cached
@@ -219,6 +232,15 @@ impl WasmEvaluator {
             .ok_or_else(|| RuntimeError::Unsupported {
                 reason: "wasm-eval: fast path unavailable (source on tree-walker fallback)".into(),
             })?;
+        if !program_returns_scalar_int(rt.program) {
+            return Err(RuntimeError::Unsupported {
+                reason: format!(
+                    "wasm-eval fast path: program {:?} returns a non-Int payload \
+                     (e.g. packed ptr/len); use run_main",
+                    rt.program
+                ),
+            });
+        }
         if args.len() != 1 {
             return Err(RuntimeError::Unsupported {
                 reason: format!(
@@ -243,6 +265,32 @@ impl WasmEvaluator {
                 Err(io_err(format!("wasm-eval: __main trapped: {e}")))
             }
         }
+    }
+}
+
+/// Does the program's `(i64) -> i64` typed-func return value carry a
+/// scalar Int (as opposed to a packed `(ptr<<32 | len)` String handle
+/// or some other Z.4 return shape)? Drives both `has_fast_path()` and
+/// the fast-path entry's eligibility check.
+fn program_returns_scalar_int(program: WasmProgram) -> bool {
+    match program {
+        WasmProgram::W1IntSumRange
+        | WasmProgram::W2DotProduct
+        | WasmProgram::W6ListSumPlusOne
+        | WasmProgram::W10ConfigEvalInline
+        | WasmProgram::W12IncrementInt => true,
+        WasmProgram::W3StringConcatInline => false,
+        // Scope-cut variants never instantiate a wasm runtime, so this
+        // arm is unreachable in practice — but a hard match keeps the
+        // check exhaustive so adding a future return shape forces a
+        // conscious decision.
+        WasmProgram::W3StringConcat
+        | WasmProgram::W4StringContains { .. }
+        | WasmProgram::W5DictAccess
+        | WasmProgram::W7FibRecursion
+        | WasmProgram::W8PolymorphicDispatch
+        | WasmProgram::W9NestedMatrix
+        | WasmProgram::W10ConfigEval => false,
     }
 }
 
@@ -278,12 +326,12 @@ impl Evaluator for WasmEvaluator {
             return Evaluator::run_main(self.tree_walk.as_ref(), args);
         };
 
-        // Pack args. Z.1 programs are all `#main(Int n) -> Int` or
-        // `#main(Int x) -> Int`, so we look up the single declared
-        // parameter and route it as `i64`.
+        // Pack args. All Z.1/Z.3 programs declare a single `#main(Int)`
+        // parameter; pick the canonical arg name based on the variant.
         let arg_i64 = match rt.program {
             WasmProgram::W1IntSumRange
             | WasmProgram::W2DotProduct
+            | WasmProgram::W3StringConcatInline
             | WasmProgram::W6ListSumPlusOne
             | WasmProgram::W10ConfigEvalInline => extract_named_int(&args, "n")?,
             WasmProgram::W12IncrementInt => extract_named_int(&args, "x")?,
@@ -302,17 +350,54 @@ impl Evaluator for WasmEvaluator {
         store.data_mut().reset();
         // Phase Z.3a: typed-func is cached on `rt.main_typed`, no
         // per-call `get_typed_func` resolve. The buffer-protocol
-        // path (this method) only carries the HashMap pack +
-        // `Value::Int` wrap overhead vs `run_main_legacy_i64_fast`.
-        match rt.main_typed.call(&mut *store, arg_i64) {
+        // path (this method) carries the HashMap pack + the per-
+        // variant return-shape unpack (Int wrap for the scalar
+        // returns, ptr/len -> String copy for W3 inline).
+        let out = match rt.main_typed.call(&mut *store, arg_i64) {
             Ok(out) => {
                 store.data_mut().mark_compiled();
-                Ok(Value::Int(out))
+                out
             }
             Err(e) => {
                 store.data_mut().mark_deopt();
-                Err(io_err(format!("wasm-eval: __main trapped: {e}")))
+                return Err(io_err(format!("wasm-eval: __main trapped: {e}")));
             }
+        };
+        match rt.program {
+            WasmProgram::W3StringConcatInline => {
+                // Unpack the (ptr<<32 | len) i64 produced by
+                // `emit_w3_string_concat_inline` and copy the bytes
+                // back into a `String`. The bytes live in the per-
+                // call arena slice and will be overwritten by the
+                // next `HostState::reset`; copy now while the slice
+                // is still valid.
+                let packed = out as u64;
+                let ptr = (packed >> 32) as u32;
+                let len = (packed & 0xffff_ffff) as u32;
+                let memory = rt
+                    .instance
+                    .get_memory(&mut *store, "memory")
+                    .ok_or_else(|| io_err("wasm-eval: instance missing `memory` export"))?;
+                let view = memory.data(&*store);
+                let start = ptr as usize;
+                let end = start.checked_add(len as usize).ok_or_else(|| {
+                    io_err(format!(
+                        "wasm-eval W3: ptr+len overflow (ptr={ptr}, len={len})"
+                    ))
+                })?;
+                if end > view.len() {
+                    return Err(io_err(format!(
+                        "wasm-eval W3: ptr+len out of bounds (ptr={ptr}, len={len}, mem={})",
+                        view.len()
+                    )));
+                }
+                let bytes = &view[start..end];
+                let s = std::str::from_utf8(bytes)
+                    .map_err(|e| io_err(format!("wasm-eval W3: invalid UTF-8: {e}")))?
+                    .to_string();
+                Ok(Value::String(s.into()))
+            }
+            _ => Ok(Value::Int(out)),
         }
     }
 

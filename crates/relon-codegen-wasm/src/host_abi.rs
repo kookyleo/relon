@@ -311,10 +311,9 @@ pub const HOST_IMPORTS: &[HostImport] = &[
 /// a `Call(import_idx)` operand; the index is the position in
 /// [`HOST_IMPORTS`], not the design-doc number.
 ///
-/// Z.3b currently has no live emit-site after W1 inlined the
-/// `range.sum` chain into a pure-WASM loop. Kept for Z.3c+ (W2 dot
-/// product / W7 fib will both need real host-call resolution again).
-#[allow(dead_code)]
+/// Live emit-sites today: W3 inline (`__relon_arena_alloc`, id 1).
+/// Future Z.4 workloads (W7 fib funcref table, etc.) will share
+/// the same lookup.
 pub(crate) fn import_index(id: u32) -> u32 {
     HOST_IMPORTS
         .iter()
