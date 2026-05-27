@@ -95,6 +95,33 @@ pub fn compile_function(
     )
 }
 
+/// Phase D entry point: compile an IR function plus its module's
+/// `closure_table` so any `Op::MakeClosure { fn_table_idx, .. }`
+/// observed inside the body can resolve the lambda's `Func` via
+/// `funcs[closure_table[fn_table_idx]]`, compile it as a sub-body,
+/// and stash the result in [`BcFunction::closure_bodies`].
+///
+/// `closure_table` parallels the wasm-side `funcref` table —
+/// the IR lowering pass populates it with one entry per emitted
+/// lambda, each pointing at the lambda's slot in `funcs`. Empty
+/// for sources that don't introduce lambdas — behaviour then
+/// matches `compile_function_in_module` exactly.
+pub fn compile_function_with_closures(
+    func: &Func,
+    funcs: &[Func],
+    closure_table: &[u32],
+    field_offset_to_local: &BTreeMap<u32, u32>,
+    return_field_offset_to_local: &BTreeMap<u32, u32>,
+) -> Result<BcFunction, BcCompileError> {
+    compile_function_impl(
+        func,
+        funcs,
+        closure_table,
+        field_offset_to_local,
+        return_field_offset_to_local,
+    )
+}
+
 /// v6-δ M2-B widening: compile a function with access to the full
 /// IR `funcs` slice so the bytecode compiler can inline simple
 /// callees (`Op::Call { fn_index, ... }`).
@@ -116,6 +143,22 @@ pub fn compile_function_in_module(
     field_offset_to_local: &BTreeMap<u32, u32>,
     return_field_offset_to_local: &BTreeMap<u32, u32>,
 ) -> Result<BcFunction, BcCompileError> {
+    compile_function_impl(
+        func,
+        funcs,
+        &[],
+        field_offset_to_local,
+        return_field_offset_to_local,
+    )
+}
+
+fn compile_function_impl(
+    func: &Func,
+    funcs: &[Func],
+    closure_table: &[u32],
+    field_offset_to_local: &BTreeMap<u32, u32>,
+    return_field_offset_to_local: &BTreeMap<u32, u32>,
+) -> Result<BcFunction, BcCompileError> {
     let mut state = CompileState {
         ops: Vec::new(),
         ir_pc_map: Vec::new(),
@@ -127,6 +170,8 @@ pub fn compile_function_in_module(
         current_stack: Vec::new(),
         next_snapshot_idx: 0,
         funcs,
+        closure_table,
+        closure_bodies: Vec::new(),
         scratch_local_top: func.params.len() as u32
             + field_offset_to_local.len() as u32
             + return_field_offset_to_local.len() as u32,
@@ -175,15 +220,224 @@ pub fn compile_function_in_module(
         // matching cranelift trace function share the same hot-counter
         // slot.
         fn_id: None,
-        // M3 closure bodies: empty by default. The IR-level
-        // `Op::MakeClosure` path remains gated on follow-up work that
-        // hoists the lambda body through the bytecode compile pipeline;
-        // hand-built `BcFunction` instances (tests / future direct-IR
-        // closure constructions) populate this slice via the public
-        // field.
-        closure_bodies: Vec::new(),
+        // M3 closure bodies populated by the `visit_make_closure`
+        // hop when `closure_table` is non-empty (Phase D). Each entry
+        // here corresponds to one IR `Op::MakeClosure` reached during
+        // body lowering — the `body_idx` carried by the emitted
+        // `BcOp::MakeClosure` indexes into this slice.
+        closure_bodies: state.closure_bodies,
         requires_cap_consult,
     })
+}
+
+/// Phase D: compile one IR lambda `Func` into a `BcFunction` suitable
+/// for use as a `closure_bodies` entry.
+///
+/// The wasm-shape lambda signature is
+/// `(captures_ptr: I32, ...user_param_tys) -> ret_ty` and the IR body
+/// opens with a deterministic prologue:
+///
+/// 1. **Capture loads**, one triplet per capture in declaration order:
+///    `LocalGet(0); LoadXxxAtAbsolute { offset }; LetSet { let_idx, ty }`.
+/// 2. **Param spills**, one pair per user-visible parameter
+///    (`i = 0..user_param_count`):
+///    `LocalGet(i + 1); LetSet { let_idx, ty }`.
+/// 3. **User body**: the rest of `func.body`.
+///
+/// Bytecode VM closures don't have a `captures_ptr` local — captures
+/// are read via `BcOp::CaptureGet { idx }` and the user-visible args
+/// occupy positional locals `[0..argc]`. This helper synthesises a
+/// bytecode-shape prologue (`CaptureGet { i }; LetSet { let_idx }` for
+/// each capture, `LocalGet(i); LetSet { let_idx }` for each param)
+/// and walks the rest of the body through the normal compile pass.
+fn compile_lambda_body(
+    func: &Func,
+    captures: &[ClosureCapture],
+    funcs: &[Func],
+    closure_table: &[u32],
+) -> Result<BcFunction, BcCompileError> {
+    // Signature shape: first param is the captures_ptr (I32); the
+    // remaining params are the user-visible args.
+    if func.params.is_empty() || func.params[0] != IrType::I32 {
+        return Err(BcCompileError::UnsupportedOp(format!(
+            "compile_lambda_body expects lambda Func with leading I32 captures_ptr, got {:?}",
+            func.params
+        )));
+    }
+    let user_param_count = func.params.len() - 1;
+    let prologue_len = 3 * captures.len() + 2 * user_param_count;
+    if func.body.len() < prologue_len {
+        return Err(BcCompileError::UnsupportedOp(format!(
+            "compile_lambda_body: body shorter ({}) than expected prologue ({}) for {} captures + {} params",
+            func.body.len(),
+            prologue_len,
+            captures.len(),
+            user_param_count
+        )));
+    }
+
+    // Validate + skip the capture-load triplets.
+    for (i, cap) in captures.iter().enumerate() {
+        let base = i * 3;
+        let load_kind = expected_capture_load_kind(cap.ty);
+        let expected_local_get = matches!(func.body[base].op, Op::LocalGet(0));
+        let expected_load = match (load_kind, &func.body[base + 1].op) {
+            (CaptureLoad::I32, Op::LoadI32AtAbsolute { offset }) => *offset == cap.offset,
+            (CaptureLoad::I64, Op::LoadI64AtAbsolute { offset }) => *offset == cap.offset,
+            (CaptureLoad::F64, Op::LoadF64AtAbsolute { offset }) => *offset == cap.offset,
+            (CaptureLoad::I8U, Op::LoadI8UAtAbsolute { offset }) => *offset == cap.offset,
+            _ => false,
+        };
+        let expected_let_set = matches!(
+            func.body[base + 2].op,
+            Op::LetSet { idx, ty } if idx == cap.let_idx && ty == cap.ty
+        );
+        if !(expected_local_get && expected_load && expected_let_set) {
+            return Err(BcCompileError::UnsupportedOp(format!(
+                "compile_lambda_body: capture-load triplet {} doesn't match prologue contract \
+                 (cap.offset={}, cap.let_idx={}, cap.ty={:?}); got {:?} / {:?} / {:?}",
+                i,
+                cap.offset,
+                cap.let_idx,
+                cap.ty,
+                func.body[base].op,
+                func.body[base + 1].op,
+                func.body[base + 2].op,
+            )));
+        }
+    }
+
+    // Validate + skip the param-spill pairs. The IR uses
+    // `LocalGet(i+1); LetSet { let_idx, ty }` per user param; we
+    // need the bytecode-side `let_idx` and `ty` to re-emit a
+    // matching `LocalGet(i); LetSet { let_idx, ty }`.
+    let mut param_let_bindings: Vec<(u32, IrType)> = Vec::with_capacity(user_param_count);
+    for i in 0..user_param_count {
+        let base = 3 * captures.len() + i * 2;
+        if !matches!(func.body[base].op, Op::LocalGet(idx) if idx as usize == i + 1) {
+            return Err(BcCompileError::UnsupportedOp(format!(
+                "compile_lambda_body: param-spill pair {} expected LocalGet({}), got {:?}",
+                i,
+                i + 1,
+                func.body[base].op
+            )));
+        }
+        let (let_idx, ty) = match func.body[base + 1].op {
+            Op::LetSet { idx, ty } => (idx, ty),
+            ref other => {
+                return Err(BcCompileError::UnsupportedOp(format!(
+                    "compile_lambda_body: param-spill pair {} expected LetSet, got {:?}",
+                    i, other
+                )));
+            }
+        };
+        param_let_bindings.push((let_idx, ty));
+    }
+
+    // Synthetic input-offset map: reserve `user_param_count` virtual
+    // local slots for the lambda's args so the normal `visit_let_get`
+    // / `visit_let_set` base calculation (input_arg_count +
+    // return_field_count + idx) parks let-locals past the arg slots.
+    // The offsets are throwaway keys — the lambda body never emits
+    // `LoadField` / `StoreField`, so they're never consulted.
+    let in_map: BTreeMap<u32, u32> = (0..user_param_count as u32).map(|i| (i, i)).collect();
+    let out_map: BTreeMap<u32, u32> = BTreeMap::new();
+
+    let mut state = CompileState {
+        ops: Vec::new(),
+        ir_pc_map: Vec::new(),
+        ir_pc_next: 0,
+        labels: Vec::new(),
+        field_offset_to_local: &in_map,
+        return_field_offset_to_local: &out_map,
+        stack_recipe: Vec::new(),
+        current_stack: Vec::new(),
+        next_snapshot_idx: 0,
+        funcs,
+        closure_table,
+        closure_bodies: Vec::new(),
+        scratch_local_top: user_param_count as u32,
+        inline_depth: 0,
+        current_pc: 0,
+        string_pool: Vec::new(),
+        inline_frame: None,
+    };
+
+    // Emit the bytecode-shape prologue. Each emit pumps the IR PC so
+    // the resulting `ir_pc_map` stays in lock-step with the lambda's
+    // operand sequence — guard-recovery readers don't observe gaps.
+    for (i, cap) in captures.iter().enumerate() {
+        let pc = state.next_pc();
+        state.emit_with_effect(BcOp::CaptureGet { idx: i as u32 }, pc);
+        let set_pc = state.next_pc();
+        state.emit_with_effect(BcOp::LocalSet(state.let_local_slot(cap.let_idx)), set_pc);
+    }
+    for (i, (let_idx, _ty)) in param_let_bindings.iter().enumerate() {
+        let pc = state.next_pc();
+        state.emit_with_effect(BcOp::LocalGet(i as u32), pc);
+        let set_pc = state.next_pc();
+        state.emit_with_effect(BcOp::LocalSet(state.let_local_slot(*let_idx)), set_pc);
+    }
+
+    // Walk the post-prologue body through the normal compile pass.
+    state.compile_seq(&func.body[prologue_len..], /*depth_base=*/ 0)?;
+    state.emit_ret_if_missing();
+
+    let max_local = state
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            BcOp::LocalGet(i) | BcOp::LocalSet(i) => Some(*i),
+            _ => None,
+        })
+        .max();
+    let locals_used = max_local.map(|m| m + 1).unwrap_or(0);
+    let locals = (user_param_count as u32).max(locals_used);
+
+    let requires_cap_consult = ops_contain_sensitive(&state.ops)
+        || state
+            .closure_bodies
+            .iter()
+            .any(|cb| cb.requires_cap_consult);
+
+    Ok(BcFunction {
+        ops: state.ops,
+        locals,
+        ir_pc_map: state.ir_pc_map,
+        stack_recipe: state.stack_recipe,
+        string_pool: state.string_pool,
+        fn_id: None,
+        closure_bodies: state.closure_bodies,
+        requires_cap_consult,
+    })
+}
+
+/// Classifier for the IR `LoadXxxAtAbsolute` shape the lambda prologue
+/// emits per capture type. Centralised so [`compile_lambda_body`]
+/// validates the prologue against the same matrix the IR lowering uses.
+#[derive(Clone, Copy)]
+enum CaptureLoad {
+    I32,
+    I64,
+    F64,
+    I8U,
+}
+
+fn expected_capture_load_kind(ty: IrType) -> CaptureLoad {
+    match ty {
+        IrType::I64 => CaptureLoad::I64,
+        IrType::F64 => CaptureLoad::F64,
+        IrType::Bool => CaptureLoad::I8U,
+        IrType::I32
+        | IrType::Null
+        | IrType::String
+        | IrType::ListInt
+        | IrType::ListFloat
+        | IrType::ListBool
+        | IrType::ListString
+        | IrType::ListSchema
+        | IrType::Closure => CaptureLoad::I32,
+    }
 }
 
 /// #166 M2-B from_source full cap-gate activation: scan a flat
@@ -329,6 +583,19 @@ struct CompileState<'a> {
     /// Empty for legacy-i64 callers; any `Op::Call` then surfaces as
     /// `UnsupportedOp` exactly as in M2-A.
     funcs: &'a [Func],
+    /// Phase D: `closure_table[fn_table_idx]` maps an
+    /// `Op::MakeClosure { fn_table_idx, .. }` to the index in
+    /// `funcs` that holds the lambda's `Func`. Mirrors the wasm-side
+    /// `funcref` table the codegen pass uses. Empty for non-W7 sources
+    /// — any `Op::MakeClosure` against an empty table surfaces as
+    /// `UnsupportedOp`.
+    closure_table: &'a [u32],
+    /// Phase D: accumulator for sub-compiled lambda bodies. Each entry
+    /// is the `BcFunction` for one lambda; the matching
+    /// `BcOp::MakeClosure { body_idx, .. }` indexes into this vector.
+    /// Drained into [`BcFunction::closure_bodies`] at the end of the
+    /// top-level compile.
+    closure_bodies: Vec<BcFunction>,
     /// Next free virtual-local slot for inline-scratch storage. Each
     /// nested `Op::Call` expansion claims a contiguous block of
     /// `arg_count` slots starting here for the callee's `LocalGet(N)`
@@ -787,6 +1054,18 @@ impl<'a> CompileState<'a> {
 
     fn return_field_count(&self) -> u32 {
         self.return_field_offset_to_local.len() as u32
+    }
+
+    /// Bytecode-local slot for IR let-local `idx`. Mirrors the base
+    /// calculation in `visit_let_get` / `visit_let_set` so callers
+    /// can compute the same slot without driving the visitor (used
+    /// by [`compile_lambda_body`]'s synthesised prologue).
+    fn let_local_slot(&self, idx: u32) -> u32 {
+        let base = match &self.inline_frame {
+            Some(frame) => frame.let_base,
+            None => self.input_arg_count() + self.return_field_count(),
+        };
+        base + idx
     }
 
     fn compile_if(
@@ -1653,19 +1932,86 @@ impl<'a> OpVisitor for CompileState<'a> {
 
     fn visit_make_closure(
         &mut self,
-        _fn_table_idx: u32,
-        _captures: &[ClosureCapture],
+        fn_table_idx: u32,
+        captures: &[ClosureCapture],
         _captures_size: u32,
     ) -> Result<(), BcCompileError> {
-        unsupported("MakeClosure")
+        // Phase D: resolve the lambda body via the module's
+        // `closure_table`, compile it into a sub-`BcFunction`, push
+        // each capture's value onto the operand stack (so the VM's
+        // `BcOp::MakeClosure` arm can pop them in declaration order
+        // into the closure slot), then emit the matching op.
+        if self.closure_table.is_empty() {
+            return Err(BcCompileError::UnsupportedOp(format!(
+                "MakeClosure {{ fn_table_idx: {fn_table_idx} }} against empty closure_table"
+            )));
+        }
+        let table_slot = self
+            .closure_table
+            .get(fn_table_idx as usize)
+            .ok_or_else(|| {
+                BcCompileError::UnsupportedOp(format!(
+                    "MakeClosure fn_table_idx {fn_table_idx} out of closure_table range"
+                ))
+            })?;
+        let lambda_func_idx = *table_slot as usize;
+        let lambda = self
+            .funcs
+            .get(lambda_func_idx)
+            .ok_or_else(|| {
+                BcCompileError::UnsupportedOp(format!(
+                    "MakeClosure resolves to funcs[{lambda_func_idx}] but module has {} funcs",
+                    self.funcs.len()
+                ))
+            })?
+            .clone();
+
+        // Compile the lambda body. The wasm-shape lambda signature is
+        // `(captures_ptr: I32, ...user_params) -> ret_ty`; the bytecode
+        // closure body uses positional locals `[user_params..]` and
+        // `BcOp::CaptureGet { idx }` for captures, so the inner compile
+        // pass strips the captures_ptr-driven prologue and rewrites
+        // wasm `LocalGet(i+1)` to bytecode `LocalGet(i)`.
+        let bc_body = compile_lambda_body(&lambda, captures, self.funcs, self.closure_table)?;
+        let body_idx = self.closure_bodies.len() as u32;
+        self.closure_bodies.push(bc_body);
+
+        // Push each capture's value via a `LetGet { let_idx, ty }` —
+        // matches the wasm-side codegen which reads the same let-locals
+        // before stashing them in the captures struct. The VM pops them
+        // in declaration order so the indices line up with the
+        // `BcOp::CaptureGet { idx }` reads inside the body.
+        let pc = self.current_pc;
+        for cap in captures {
+            self.visit_let_get(cap.let_idx, cap.ty)?;
+        }
+        self.emit_with_effect(
+            BcOp::MakeClosure {
+                body_idx,
+                capture_count: captures.len() as u32,
+            },
+            pc,
+        );
+        Ok(())
     }
 
     fn visit_call_closure(
         &mut self,
-        _param_tys: &[IrType],
+        param_tys: &[IrType],
         _ret_ty: IrType,
     ) -> Result<(), BcCompileError> {
-        unsupported("CallClosure")
+        // Phase D: the IR shape pushes `[handle, arg0, ..., argN]` onto
+        // the stack. `BcOp::CallClosure { argc }` matches that
+        // discipline verbatim — pop `argc` args then the handle, run
+        // the body, push the return value.
+        let pc = self.current_pc;
+        self.emit_with_effect(
+            BcOp::CallClosure {
+                argc: param_tys.len() as u32,
+            },
+            pc,
+        );
+        Ok(())
     }
 
     fn visit_alloc_scratch(&mut self, _size_bytes: u32) -> Result<(), BcCompileError> {

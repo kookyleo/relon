@@ -31,7 +31,7 @@ use relon_parser::{Node, TokenRange};
 use thiserror::Error;
 
 use crate::compile::{
-    build_offset_to_local, compile_function, compile_function_in_module, BcCompileError,
+    build_offset_to_local, compile_function, compile_function_with_closures, BcCompileError,
 };
 use crate::op::{BcFunction, ExternalPc, StackOrigin};
 use crate::vm::{BcVmConfig, BytecodeVm, VmValue};
@@ -396,8 +396,16 @@ impl BytecodeEvaluator {
         let entry_body = func.body.clone();
         // v6-δ M2-B: thread the full `funcs` slice through so the
         // bytecode compile pass can inline simple callees
-        // (`Op::Call`) the M2-A scaffold rejected.
-        let compiled = compile_function_in_module(func, &module.funcs, in_map, out_map)?;
+        // (`Op::Call`) the M2-A scaffold rejected. Phase D widens
+        // the entry shape with the module's `closure_table` so
+        // `Op::MakeClosure` resolves to the lambda's `Func` index.
+        let compiled = compile_function_with_closures(
+            func,
+            &module.funcs,
+            &module.closure_table,
+            in_map,
+            out_map,
+        )?;
         // M2-C lever 5: classify the return schema once so the hot
         // dispatch epilogue branches on a cheap copy-enum rather than
         // re-walking the field vector on every invoke.
