@@ -2244,6 +2244,62 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 },
             );
         }
+
+        // Phase Z.3c-b (2026-05-28): relon_wasm_wasmtime row for W3.
+        // Drives the production source through `WasmEvaluator::run_main`,
+        // which lowers via `relon-codegen-wasm` into a pure-WASM byte-
+        // fill loop (one `__relon_arena_alloc(n, 1)` call, then `n`
+        // `i32.store8` writes of `'a'` in pure wasm). The host unpacks
+        // the (ptr<<32 | len) i64 return into `Value::String`. No fast
+        // path is exposed for W3 — `has_fast_path()` returns false
+        // because the i64 return is a packed handle, not a scalar Int.
+        //
+        // We can't route W3 through `try_build_wasm_compiled` (which
+        // expects an i64-int answer); instead we inline the build +
+        // consistency-check + Compiled tier-gate so the row stays on
+        // the same honesty contract.
+        {
+            use relon_eval_api::Evaluator as _;
+            use relon_wasm_evaluator::{Tier, WasmEvalError, WasmEvaluator};
+            let ev_opt: Option<WasmEvaluator> = match WasmEvaluator::new(w3_relon_src()) {
+                Ok(ev) => Some(ev),
+                Err(WasmEvalError::Classify(_)) => None,
+                Err(other) => panic!("[cmp_lua W3] WasmEvaluator::new failed: {other}"),
+            };
+            if let Some(wasm) = ev_opt {
+                let v = wasm
+                    .run_main(args_w_n(STRING_CONCAT_N as i64))
+                    .expect("W3 wasm consistency run_main");
+                match v {
+                    Value::String(s) => assert_eq!(
+                        s.len() as i64,
+                        w3_expected_relon_len(),
+                        "W3 wasm string length must match analytic"
+                    ),
+                    other => panic!("W3 wasm non-string result: {other:?}"),
+                }
+                let tier = wasm.active_tier();
+                if tier != Tier::Compiled {
+                    eprintln!(
+                        "[cmp_lua W3] relon_wasm_wasmtime row n/a (active_tier={tier:?}); \
+                         classifier routed to tree-walker fallback"
+                    );
+                } else {
+                    group.bench_function(
+                        BenchmarkId::new("W3_string_concat", "relon_wasm_wasmtime"),
+                        |b| {
+                            b.iter_custom(|iters| {
+                                let n_in = black_box(STRING_CONCAT_N as i64);
+                                timed_with_warmup(iters, || {
+                                    let v = wasm.run_main(args_w_n(black_box(n_in))).unwrap();
+                                    black_box(v);
+                                })
+                            });
+                        },
+                    );
+                }
+            }
+        }
     }
 
     // ----- W4 -----
@@ -3089,9 +3145,7 @@ fn bench_cmp_lua(c: &mut Criterion) {
                         b.iter_custom(|iters| {
                             let n_in = black_box(CONFIG_QUERIES_N as i64);
                             timed_with_warmup(iters, || {
-                                let v = wasm
-                                    .run_main_legacy_i64_fast(&[black_box(n_in)])
-                                    .unwrap();
+                                let v = wasm.run_main_legacy_i64_fast(&[black_box(n_in)]).unwrap();
                                 black_box(v);
                             })
                         });
