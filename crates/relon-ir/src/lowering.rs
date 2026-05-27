@@ -874,6 +874,17 @@ fn type_node_to_canonical_with_schemas(
 /// record bytes into `out_buf` at a `$tail_cursor` past the fixed
 /// area; the fixed-area pointer slot stores a buffer-relative
 /// offset so the host's `BufferReader` can decode it uniformly.
+///
+/// Phase F.2 (W7 closure-as-value boundary, design doc
+/// `docs/internal/w7-closure-as-value-design.md`): an unbound `-> Dict`
+/// head (no named schema, no generics) reaches this helper today
+/// because no canonical schema exists. The diagnostic stays
+/// `UnsupportedTypeInMain { type_name: "Dict" }` so the two boundary
+/// tests (`run_main_w7_recursive_closure_dict_field` /
+/// `w7_production_source_pins_unsupported_dict_return`) continue to
+/// pin the failure shape — but the error string now points users at
+/// the Phase C lifting work so they don't grep blindly through the
+/// lowering pass when they meet it.
 fn build_main_return_schema(sig: &MainSignature) -> Result<Schema, LoweringError> {
     let rt = sig
         .return_type
@@ -1441,20 +1452,33 @@ fn layout_captures(captures: &[(String, IrType, u32)]) -> (Vec<u32>, u32) {
     (offsets, total)
 }
 
-/// Phase 10-a: lower one [`Expr::Closure`] argument and emit a
+/// Phase 10-a: lower one [`Expr::Closure`] literal and emit a
 /// `MakeClosure` op leaving an `IrType::Closure` value on top of the
 /// vstack. The lambda's body becomes a fresh `Func` appended to
 /// `ctx.lambda_funcs`; its wasm-side function index is communicated
 /// to `MakeClosure` via the closure-table slot `lambda_funcs.len() - 1`.
 ///
 /// `expected_param_tys` and `expected_ret_ty` describe the surface
-/// the higher-order caller (stdlib `list_int_map` / `filter` /
-/// `fold`) expects from the closure body. Mismatches between these
-/// and the inferred body type surface as
-/// [`LoweringError::UnsupportedExpr`] — the lambda surface in this
-/// phase is closed to user-defined higher-order shapes, so we keep
-/// the diagnostics terse.
-fn lower_closure_arg(
+/// the consumer requires from the closure body:
+///
+/// * **Higher-order stdlib arg** (Phase 10-a — the original entry
+///   point this helper served). The stdlib side-table
+///   ([`stdlib_closure_arg_signature`]) provides the expected
+///   signature for `list_int_map` / `filter` / `fold`. Reached from
+///   [`lower_stdlib_arg`].
+/// * **Closure-as-value at a dict-field / let-binding site**
+///   (Phase F.2 / Phase C scope, design doc
+///   `docs/internal/w7-closure-as-value-design.md`). The caller
+///   supplies the expected signature from the field's declared /
+///   inferred [`TypeRepr::Closure`] shape — see the W7 boundary tests
+///   in `w7_closure_boundary_tests` for the production source the
+///   future Phase C lowering must accept.
+///
+/// Mismatches between the expected signature and the inferred body
+/// type surface as [`LoweringError::StdlibArgTypeMismatch`] (the same
+/// diagnostic both surfaces share — the closure body is the "argument"
+/// of the consumer's typed slot).
+fn lower_closure_as_value(
     closure_expr: &Expr,
     closure_range: TokenRange,
     expected_param_tys: &[IrType],
@@ -1468,7 +1492,10 @@ fn lower_closure_arg(
     } = closure_expr
     else {
         return Err(LoweringError::UnsupportedExpr {
-            kind: format!("lower_closure_arg(non-closure `{}`)", closure_expr.kind()),
+            kind: format!(
+                "lower_closure_as_value(non-closure `{}`)",
+                closure_expr.kind()
+            ),
             range: closure_range,
         });
     };
@@ -2785,9 +2812,9 @@ fn expect_int_top(ctx: &mut LowerCtx<'_>, range: TokenRange) -> Result<(), Lower
 }
 
 /// Phase 10-a: lower one argument to a stdlib call, routing closure
-/// expressions through `lower_closure_arg` when the matching param
-/// slot is `IrType::Closure`. Validates the resulting IR slot against
-/// the callee's declared param type and surfaces a
+/// expressions through [`lower_closure_as_value`] when the matching
+/// param slot is `IrType::Closure`. Validates the resulting IR slot
+/// against the callee's declared param type and surfaces a
 /// `StdlibArgTypeMismatch` when the slots disagree.
 fn lower_stdlib_arg(
     name: &str,
@@ -2820,7 +2847,7 @@ fn lower_stdlib_arg(
                         range: call_range,
                     }
                 })?;
-            lower_closure_arg(&value.expr, value.range, &param_tys_c, ret_ty_c, ctx)?;
+            lower_closure_as_value(&value.expr, value.range, &param_tys_c, ret_ty_c, ctx)?;
         } else {
             return Err(LoweringError::UnsupportedExpr {
                 kind: format!(
@@ -5278,7 +5305,8 @@ mod w7_closure_boundary_tests {
                      result: fib(n)\n\
                    }";
         let err = try_lower(src).expect_err(
-            "Phase A pins the current rejection — flip to Ok(_) once Phase B lifts the gap",
+            "Phase B keeps the current rejection — flip to Ok(_) once Phase C \
+             lifts the anon-Dict-with-closure-field gap",
         );
         match err {
             LoweringError::UnsupportedTypeInMain { type_name, .. } => {
@@ -5289,8 +5317,112 @@ mod w7_closure_boundary_tests {
             }
             other => panic!(
                 "expected UnsupportedTypeInMain(\"Dict\"), got {other:?} — \
-                 likely Phase B partially landed; update this test to track \
+                 likely Phase C partially landed; update this test to track \
                  the next-most-upstream rejection site"
+            ),
+        }
+    }
+
+    /// Phase B foundation check: the canonical schema digest treats
+    /// the new [`TypeRepr::Closure`] variant as a structural shape.
+    ///
+    /// Two closure-typed fields with the same `(params, ret)` shape
+    /// must collapse to the same digest, and a shape difference (extra
+    /// param, different return) must invalidate the digest so a host
+    /// SDK refuses to load a module whose declared closure surface
+    /// drifted from its compile-time view.
+    ///
+    /// The test is gated on the digest plumbing alone — no lowering of
+    /// W7-shape user source. The closure-as-value lowering itself
+    /// stays Phase C scope; this test only confirms the type-system
+    /// hook the future implementation will hang behaviour off.
+    #[test]
+    fn typerepr_closure_digest_distinguishes_signature_shapes() {
+        use relon_eval_api::schema_canonical::{schema_hash, Field, Schema, TypeRepr};
+
+        let int_to_int = TypeRepr::Closure {
+            params: vec![TypeRepr::Int],
+            ret: Box::new(TypeRepr::Int),
+        };
+        // Same shape, different declaration — must collapse.
+        let int_to_int_clone = TypeRepr::Closure {
+            params: vec![TypeRepr::Int],
+            ret: Box::new(TypeRepr::Int),
+        };
+        // Extra param — must distinguish.
+        let int_int_to_int = TypeRepr::Closure {
+            params: vec![TypeRepr::Int, TypeRepr::Int],
+            ret: Box::new(TypeRepr::Int),
+        };
+        // Different return — must distinguish.
+        let int_to_float = TypeRepr::Closure {
+            params: vec![TypeRepr::Int],
+            ret: Box::new(TypeRepr::Float),
+        };
+
+        let wrap = |ty: TypeRepr| Schema {
+            name: "Probe".into(),
+            generics: vec![],
+            fields: vec![Field {
+                name: "f".into(),
+                ty,
+                default: None,
+            }],
+        };
+
+        // Structural equality.
+        assert_eq!(
+            schema_hash(&wrap(int_to_int.clone())),
+            schema_hash(&wrap(int_to_int_clone)),
+            "two structurally identical closure-typed fields must hash equal"
+        );
+        // Shape sensitivity.
+        assert_ne!(
+            schema_hash(&wrap(int_to_int.clone())),
+            schema_hash(&wrap(int_int_to_int)),
+            "param-arity change must invalidate the digest"
+        );
+        assert_ne!(
+            schema_hash(&wrap(int_to_int)),
+            schema_hash(&wrap(int_to_float)),
+            "return-type change must invalidate the digest"
+        );
+    }
+
+    /// Phase B layout-guard check: closure-typed fields must reject at
+    /// [`SchemaLayout::offsets_for`] so the binary-handshake builder
+    /// can't accidentally lay a non-portable scratch-heap pointer into
+    /// a host-visible record. The canonical schema digest already
+    /// distinguishes the shape (see the digest test above); the layout
+    /// pass is the second line of defence so a hand-built `Schema`
+    /// that bypasses the lowering pass still surfaces a typed error
+    /// rather than a silent dangle.
+    #[test]
+    fn closure_field_rejects_at_schema_layout() {
+        use relon_eval_api::layout::{LayoutError, SchemaLayout};
+        use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
+
+        let schema = Schema {
+            name: "ProbeWithClosure".into(),
+            generics: vec![],
+            fields: vec![Field {
+                name: "fib".into(),
+                ty: TypeRepr::Closure {
+                    params: vec![TypeRepr::Int],
+                    ret: Box::new(TypeRepr::Int),
+                },
+                default: None,
+            }],
+        };
+        let err = SchemaLayout::offsets_for(&schema)
+            .expect_err("closure fields must reject at layout time");
+        match err {
+            LayoutError::UnsupportedTypeInLayoutV1 { kind, field } => {
+                assert_eq!(kind, "Closure", "expected kind tag `Closure`, got {kind}");
+                assert_eq!(field, "fib");
+            }
+            other => panic!(
+                "expected LayoutError::UnsupportedTypeInLayoutV1 {{ kind: \"Closure\" }}, got {other:?}"
             ),
         }
     }
