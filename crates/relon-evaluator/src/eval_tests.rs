@@ -6045,3 +6045,59 @@ fn unprepared_shared_arc_panics_loudly() {
     // strong_count == 2, backend_prepared == false -> must panic.
     let _ = TreeWalkEvaluator::new(cloned);
 }
+
+/// Sanity guard for the W7 cmp_lua workload: a top-level dict whose
+/// `#private fib` field holds a recursive closure literal and whose
+/// `result` field calls that closure with the `#main` parameter. The
+/// tree-walker resolves the closure through the per-dict scope's name
+/// table; this test pins fib(13) = 233 so a future refactor of the
+/// dict-scope / closure-self-reference path surfaces a regression here
+/// rather than silently in the bench harness.
+///
+/// IR-driven tiers (bytecode VM, trace-JIT, cranelift / LLVM AOT) do
+/// **not** accept this source today — `relon_ir::lower_workspace_single`
+/// bails on `-> Dict` + `Expr::Closure` at a non-higher-order site. The
+/// Phase F.2 design doc (local-only) captures the lifting work; this
+/// test is the tree-walker oracle the future Phase B lowering will be
+/// validated against.
+#[test]
+fn run_main_w7_recursive_closure_dict_field() {
+    use std::collections::HashMap;
+    let source = "#main(Int n) -> Dict\n\
+                  {\n\
+                    #private\n\
+                    fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
+                    result: fib(n)\n\
+                  }";
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    assert!(
+        analyzed.main_signature.is_some(),
+        "W7 source must declare #main(Int n) -> Dict"
+    );
+
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert("n".to_string(), Value::Int(13));
+
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .expect("W7 recursive closure dict-field must evaluate cleanly");
+
+    // fib(13) = 233 (`0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233`).
+    let Value::Dict(d) = result else {
+        panic!("expected top-level Dict, got {result:?}");
+    };
+    assert_eq!(
+        d.map.get("result"),
+        Some(&Value::Int(233)),
+        "expected fib(13) = 233 on the `result` field, dict was {:?}",
+        d.map
+    );
+}
