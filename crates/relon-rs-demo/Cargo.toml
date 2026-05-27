@@ -1,0 +1,25 @@
+[package]
+name = "relon-rs-demo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "End-to-end demo: Relon source compiled at build time, linked into a Rust binary"
+publish = false
+
+[dependencies]
+# Shim ABI surface — the consuming code uses `SandboxState` exactly
+# the same way Phase 2 / Phase 3 will, so the demo locks in the API
+# shape the wider rollout depends on.
+relon-rs-shims = { workspace = true }
+# `include_relon!` splices the build.rs-generated bindings file in.
+relon-rs-macro = { workspace = true }
+
+[build-dependencies]
+# Drives the parse + analyze + lower + LLVM emit pipeline against
+# every registered `.relon` source. Pulls inkwell + llvm-sys
+# transitively — host must have LLVM 18 dev headers + the env
+# `LLVM_SYS_181_PREFIX` pointed at them.
+relon-rs-build = { workspace = true }
