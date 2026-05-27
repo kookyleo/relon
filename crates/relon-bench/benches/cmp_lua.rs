@@ -2688,12 +2688,18 @@ fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
         "W4_long_haystack" => Some(W4_LONG_LLVM_SRC),
         "W5_dict_str_key" => Some(W5_LLVM_SRC),
         "W6_dict_num_key" => Some(W6_LLVM_SRC),
+        // Phase F.W7 (2026-05-27): the W7 production-source recursive
+        // `fib` closure now lowers all the way through
+        // `LlvmAotEvaluator::from_source` — the emitter handles
+        // `Op::MakeClosure` (with self-capture late-patching),
+        // `Op::CallClosure` (indirect dispatch via a per-module
+        // closure FunctionValue switch), and the anon-Dict-return
+        // record ops (`AllocRootRecord` / `StoreFieldAtRecord`).
+        "W7_fib" => Some(w7_relon_src()),
         "W8_poly_callsite" => Some(W8_LLVM_SRC),
         "W9_nested_matrix" => Some(W9_LLVM_SRC),
         "W10_config_eval" => Some(W10_LLVM_SRC),
         "W12_p99_tail" => Some(w12_relon_src()),
-        // W7 — recursion outside the Phase E.1 envelope; tracked as
-        // Phase F follow-up.
         _ => None,
     }
 }
@@ -3762,6 +3768,18 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 });
             });
         }
+        // Phase F.W7 (2026-05-27): the LLVM-AOT W7 row lives in the
+        // canonical panel below (see `llvm_aot_source_for("W7_fib")`
+        // / the `relon_llvm_aot` cfg-llvm-aot dispatch loop). The W7
+        // production source now flows through
+        // `LlvmAotEvaluator::from_source` end-to-end:
+        // `Op::MakeClosure` (with self-capture late-patching),
+        // `Op::CallClosure` (indirect dispatch via a per-module
+        // function-pointer switch on `fn_table_idx`), and the
+        // anon-Dict-return ops (`AllocRootRecord` /
+        // `StoreFieldAtRecord`). The row is keyed `W7_fib` /
+        // `relon_llvm_aot`; the bespoke section above stops at the
+        // tree-walker / LuaJIT / bytecode breakdown rows.
     }
 
     // ----- W8 polymorphic -----
