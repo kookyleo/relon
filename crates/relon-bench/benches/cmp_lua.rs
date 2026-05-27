@@ -1235,6 +1235,29 @@ fn w8_relon_src_bytecode() -> &'static str {
      list.sum(range(n).map((i) => (i % 4) + 1))"
 }
 
+/// Phase Z.3c-e (2026-05-28): inline-Int W8 variant that retains the
+/// production source's 4-arm `dispatch(tag)` shape. The
+/// `w8_relon_src_bytecode()` form above collapses the closure body to
+/// the algebraic identity `tag + 1` — fine for the LLVM/bytecode rows
+/// (their codegen still sees four cases via the inlined `?:` chain
+/// after AST inlining), but feeding that closed-form to the WASM
+/// lowering would emit a single `i64.add` per iter and silently bypass
+/// the polymorphic-dispatch cost W8 is meant to measure (paper-win
+/// anti-pattern per design §7).
+///
+/// This variant inlines the closure body verbatim — the four-arm
+/// `(i % 4) == 0 ? 1 : (i % 4) == 1 ? 2 : (i % 4) == 2 ? 3 : 4`
+/// chain — so the lowering must materialise a real branch decision
+/// every iter. The Z.3c-e WASM lowering picks `br_table` for the
+/// dispatch (constant-time 4-way jump on the runtime tag operand);
+/// other backends are free to lower the chain however they like.
+fn w8_relon_src_bytecode_dispatch() -> &'static str {
+    "#import list from \"std/list\"\n\
+     #main(Int n) -> Int\n\
+     list.sum(range(n).map((i) =>\n\
+       (i % 4) == 0 ? 1 : (i % 4) == 1 ? 2 : (i % 4) == 2 ? 3 : 4))"
+}
+
 fn w8_lua_src() -> String {
     format!(
         r#"return function()
@@ -3018,6 +3041,80 @@ fn bench_cmp_lua(c: &mut Criterion) {
                     });
                 },
             );
+        }
+
+        // Phase Z.3c-e (2026-05-28): relon_wasm_wasmtime row for W8.
+        // Drives the dispatch-preserving inline variant
+        // (`w8_relon_src_bytecode_dispatch()`) through
+        // `WasmEvaluator::run_main`, which lowers via `relon-codegen-
+        // wasm` into a pure-WASM accumulator loop whose per-iter 4-arm
+        // `?:` ladder is emitted as a `br_table` (constant-time jump
+        // on the runtime tag value). The classifier routes the
+        // **production** `w8_relon_src()` (Dict return + `#internal
+        // dispatch` first-class closure called via `dispatch(i % 4)`)
+        // to the tree-walker fallback — `try_build_wasm_compiled`
+        // would then skip the row entirely rather than book a tree-
+        // walker number under the `wasmtime` label. Z.4 follow-up
+        // promotes the production-source path; until then this row
+        // honestly measures the inline-dispatch variant (same 4-arm
+        // dispatch decision per iter, same I/O shape modulo the Dict
+        // wrapper).
+        //
+        // The closed-form `w8_relon_src_bytecode()` variant
+        // (`(i % 4) + 1`) is deliberately NOT used here: feeding it
+        // to the WASM lowering would emit a single `i64.add` per iter
+        // and book the polymorphic-dispatch cost as scalar arith
+        // (paper-win anti-pattern per design §7). The bytecode row
+        // above keeps the closed-form for ABI-uniformity reasons that
+        // don't apply to wasmtime's typed-func surface.
+        if let Some(wasm) = try_build_wasm_compiled(
+            w8_relon_src_bytecode_dispatch(),
+            "W8",
+            w8_expected(),
+            args_w_n(TREE_WALK_N as i64),
+        ) {
+            use relon_eval_api::Evaluator as _;
+            group.bench_function(
+                BenchmarkId::new("W8_poly_callsite", "relon_wasm_wasmtime"),
+                |b| {
+                    b.iter_custom(|iters| {
+                        let n_in = black_box(TREE_WALK_N as i64);
+                        timed_with_warmup(iters, || {
+                            let v = wasm.run_main(args_w_n(black_box(n_in))).unwrap();
+                            black_box(v);
+                        })
+                    });
+                },
+            );
+
+            // Fast row — mirrors W1/W2/W9/W10 patterns. Bypasses the
+            // HashMap<String, Value> pack + Value::Int wrap. Cross-
+            // checked against the buffer path before the timed loop.
+            if wasm.has_fast_path() {
+                let fast_out = wasm
+                    .run_main_legacy_i64_fast(&[TREE_WALK_N as i64])
+                    .expect("W8 wasm fast path consistency");
+                let slow_out = match wasm.run_main(args_w_n(TREE_WALK_N as i64)).unwrap() {
+                    Value::Int(n) => n,
+                    other => panic!("W8 wasm fast cross-check: slow path returned {other:?}"),
+                };
+                assert_eq!(
+                    fast_out, slow_out,
+                    "W8 fast/buffer disagree: fast={fast_out} buffer={slow_out}"
+                );
+                group.bench_function(
+                    BenchmarkId::new("W8_poly_callsite", "relon_wasm_wasmtime_fast"),
+                    |b| {
+                        b.iter_custom(|iters| {
+                            let n_in = black_box(TREE_WALK_N as i64);
+                            timed_with_warmup(iters, || {
+                                let v = wasm.run_main_legacy_i64_fast(&[black_box(n_in)]).unwrap();
+                                black_box(v);
+                            })
+                        });
+                    },
+                );
+            }
         }
     }
 
