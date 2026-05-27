@@ -116,11 +116,18 @@ mod tests {
             .expect("wasmparser validates W12");
     }
 
+    #[test]
+    fn lower_w2_round_trips() {
+        let bytes = lower(&WasmProgram::W2DotProduct).expect("emit W2");
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .expect("wasmparser validates W2");
+    }
+
     /// Sanity: every scope-cut workload returns the named cut.
     #[test]
     fn scope_cut_workloads_surface_explicitly() {
         for (prog, tag) in [
-            (WasmProgram::W2DotProduct, "W2-dot-product"),
             (WasmProgram::W3StringConcat, "W3-string-concat"),
             (
                 WasmProgram::W4StringContains { long: false },

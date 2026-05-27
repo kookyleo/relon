@@ -2091,6 +2091,62 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 });
             });
         }
+
+        // Phase Z.3c-a (2026-05-28): relon_wasm_wasmtime row for W2.
+        // Drives the canonical `w2_relon_src()` through
+        // `WasmEvaluator::run_main`, which lowers via
+        // `relon-codegen-wasm` (Z.3c-a W2 program shape) and
+        // dispatches the `__main` export through wasmtime. The
+        // helper enforces the active_tier == Compiled gate so a
+        // future regression in the classifier (e.g. routing W2 back
+        // to tree-walker fallback) skips the row entirely rather
+        // than silently booking tree-walker numbers under the
+        // `wasmtime` label — that would be the paper-win anti-pattern
+        // called out in design §7.
+        if let Some(wasm) =
+            try_build_wasm_compiled(w2_relon_src(), "W2", w2_expected(), args_w_n(W2_N))
+        {
+            use relon_eval_api::Evaluator as _;
+            group.bench_function(BenchmarkId::new("W2_f64_dot", "relon_wasm_wasmtime"), |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(W2_N);
+                    timed_with_warmup(iters, || {
+                        let v = wasm.run_main(args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            });
+
+            // Phase Z.3c-a fast row — mirrors the W1 fast-path
+            // pattern. Bypasses the HashMap<String, Value> pack and
+            // the Value::Int wrap. Cross-checked against the buffer
+            // path before the timed loop.
+            if wasm.has_fast_path() {
+                let fast_out = wasm
+                    .run_main_legacy_i64_fast(&[W2_N])
+                    .expect("W2 wasm fast path consistency");
+                let slow_out = match wasm.run_main(args_w_n(W2_N)).unwrap() {
+                    Value::Int(n) => n,
+                    other => panic!("W2 wasm fast cross-check: slow path returned {other:?}"),
+                };
+                assert_eq!(
+                    fast_out, slow_out,
+                    "W2 fast/buffer disagree: fast={fast_out} buffer={slow_out}"
+                );
+                group.bench_function(
+                    BenchmarkId::new("W2_f64_dot", "relon_wasm_wasmtime_fast"),
+                    |b| {
+                        b.iter_custom(|iters| {
+                            let n_in = black_box(W2_N);
+                            timed_with_warmup(iters, || {
+                                let v = wasm.run_main_legacy_i64_fast(&[black_box(n_in)]).unwrap();
+                                black_box(v);
+                            })
+                        });
+                    },
+                );
+            }
+        }
     }
 
     // ----- W3 -----

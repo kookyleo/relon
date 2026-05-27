@@ -63,10 +63,14 @@ pub fn classify_main(source: &str) -> Result<WasmProgram, ClassifyError> {
         return Ok(WasmProgram::W6ListSumPlusOne);
     }
 
-    // Match the remaining cmp_lua sources to their scope-cut tags so
-    // the panel row prints a recognisable label.
-    if normalised.contains("(i + 1) * (i + 2)") {
-        return Err(ClassifyError::ScopeCut("W2-dot-product"));
+    // W2 — `list.sum(range(n).map((i) => (i + 1) * (i + 2)))`. Z.3c-a
+    // promotes this from ScopeCut to a pure-WASM accumulator loop
+    // emitted by `emit_w2_dot_product`. The match is anchored on the
+    // full chain (not just the per-iter expression) so a future
+    // workload that reuses the `(i+1)*(i+2)` arithmetic in a different
+    // shape doesn't accidentally pick up the W2 lowering.
+    if normalised.contains("list.sum(range(n).map((i) => (i + 1) * (i + 2)))") {
+        return Ok(WasmProgram::W2DotProduct);
     }
     if normalised.contains("reduce(\"\", (acc, s) => acc + s)") {
         return Err(ClassifyError::ScopeCut("W3-string-concat"));

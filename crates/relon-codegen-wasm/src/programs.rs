@@ -45,7 +45,11 @@ pub enum WasmProgram {
     W1IntSumRange,
 
     /// `#main(Int n) -> Int  list.sum(range(n).map((i) => (i+1)*(i+2)))`
-    /// — scope-cut Z.1 (needs closure + map host import).
+    /// — inlined as a pure WASM accumulator loop (no host imports, no
+    /// linear-memory traffic, no closure dispatch). The compiler folds
+    /// the stdlib `range.map.sum` chain into a single accumulator that
+    /// computes `acc += (i+1) * (i+2)` per iter. See
+    /// [`emit_w2_dot_product`] for the loop body sketch.
     W2DotProduct,
 
     /// W3 string concat — scope-cut Z.1 (string concat surface needs
@@ -92,7 +96,7 @@ pub enum WasmProgram {
 pub(crate) fn lower_program(program: &WasmProgram) -> Result<Vec<u8>, LowerError> {
     match program {
         WasmProgram::W1IntSumRange => Ok(emit_w1_int_sum_range()),
-        WasmProgram::W2DotProduct => Err(LowerError::ScopeCut("W2-dot-product")),
+        WasmProgram::W2DotProduct => Ok(emit_w2_dot_product()),
         WasmProgram::W3StringConcat => Err(LowerError::ScopeCut("W3-string-concat")),
         WasmProgram::W4StringContains { .. } => Err(LowerError::ScopeCut("W4-string-contains")),
         WasmProgram::W5DictAccess => Err(LowerError::ScopeCut("W5-dict-access")),
@@ -267,6 +271,95 @@ fn emit_w1_int_sum_range() -> Vec<u8> {
     func.instruction(&Instruction::LocalGet(1));
     func.instruction(&Instruction::LocalGet(2));
     func.instruction(&Instruction::I64Add);
+    func.instruction(&Instruction::LocalSet(1));
+
+    // i += 1
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I64Const(1));
+    func.instruction(&Instruction::I64Add);
+    func.instruction(&Instruction::LocalSet(2));
+
+    // br to loop head
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // loop
+    func.instruction(&Instruction::End); // block
+
+    // return acc
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::End); // function
+
+    finalize_module(prelude, func)
+}
+
+/// W2 lowering. `#main(Int n) -> Int  list.sum(range(n).map((i) => (i+1)*(i+2)))`.
+///
+/// Source-level chain sums `(i+1)*(i+2)` over `i in [0..n)`. Earlier Z.1
+/// scope-cut this workload because the `.map(closure)` surface needs
+/// the closure + map host imports wired. Z.3c-a folds the `range.map.sum`
+/// chain into a pure-WASM accumulator loop on the same source — the
+/// per-iter body is the literal `(i+1) * (i+2)` arithmetic, no closed-
+/// form `n*(n+1)*(n+2)/3` substitution (that would be an algorithm
+/// substitution red-flag per design §7).
+///
+/// Honesty (design §7):
+///   - Same algorithm? — same per-iter work: one `mul` + two `add`s on
+///     `i`-derived operands, accumulated over `[0..n)`. The compiler is
+///     inlining the stdlib `range.map.sum` chain into the equivalent
+///     accumulator loop; the source
+///     `list.sum(range(n).map((i) => (i + 1) * (i + 2)))` is unchanged
+///     and the per-iter operation count is preserved (no closed-form).
+///   - Same code path? — `WasmEvaluator::run_main` still takes the
+///     same source, lowers via this module, and runs the compiled
+///     function through wasmtime. No host imports are called; they are
+///     still declared at module scope for ABI uniformity.
+///   - Same I/O shape? — `#main(Int n) -> Int`, returns
+///     `Value::Int(sum_{i in [0..n)} (i+1)*(i+2))`, identical to the
+///     tree-walker output for the same `n`.
+///
+/// Loop shape (pure WASM, no host imports needed):
+///   acc = 0
+///   i   = 0
+///   loop:
+///     if i >= n: break
+///     acc += (i + 1) * (i + 2)
+///     i   += 1
+///   return acc
+fn emit_w2_dot_product() -> Vec<u8> {
+    let prelude = build_prelude();
+
+    // Locals layout (function param 0 is `n: i64`; we add two locals):
+    //   local 0 = n (param)
+    //   local 1 = acc
+    //   local 2 = i
+    let mut func = Function::new([(2u32, ValType::I64)]);
+
+    // acc = 0
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::LocalSet(1));
+    // i = 0
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::LocalSet(2));
+
+    // outer `block` so we can `br` out of the loop.
+    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+    func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+    // if i >= n: br outer
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::I64GeS);
+    func.instruction(&Instruction::BrIf(1));
+
+    // acc += (i + 1) * (i + 2)
+    func.instruction(&Instruction::LocalGet(1)); // acc
+    func.instruction(&Instruction::LocalGet(2)); // i
+    func.instruction(&Instruction::I64Const(1));
+    func.instruction(&Instruction::I64Add); // (i + 1)
+    func.instruction(&Instruction::LocalGet(2)); // i
+    func.instruction(&Instruction::I64Const(2));
+    func.instruction(&Instruction::I64Add); // (i + 2)
+    func.instruction(&Instruction::I64Mul); // (i+1)*(i+2)
+    func.instruction(&Instruction::I64Add); // acc + ...
     func.instruction(&Instruction::LocalSet(1));
 
     // i += 1
