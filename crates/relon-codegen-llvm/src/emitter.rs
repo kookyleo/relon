@@ -792,6 +792,8 @@ pub(crate) fn emit_fast_entry<'ctx>(
     module: &LlvmModule<'ctx>,
     func: &Func,
     profile: &FastPathProfile,
+    helper_table: &HashMap<u32, FunctionValue<'ctx>>,
+    closure_fn_table: &[FunctionValue<'ctx>],
 ) -> Result<FunctionValue<'ctx>, LlvmError> {
     if !is_buffer_protocol_signature(&func.params, func.ret) {
         return Err(LlvmError::UnsupportedSignature(
@@ -818,11 +820,12 @@ pub(crate) fn emit_fast_entry<'ctx>(
     builder.position_at_end(entry_bb);
 
     // Reserve an alloca for the return value. The fast emitter
-    // rewrites the trailing `StoreField` (which under buffer protocol
-    // writes the i64 result into the arena) to a store into this
-    // slot; the implicit `Op::Return` at end-of-body loads from the
-    // slot and `ret`s it. Placing the alloca in the entry block lets
-    // LLVM's mem2reg promote it to SSA across the loop boundary.
+    // rewrites the trailing `StoreField` / `StoreFieldAtRecord` at
+    // the return slot (which under buffer protocol writes the i64
+    // result into the arena) to a store into this slot; the implicit
+    // `Op::Return` at end-of-body loads from the slot and `ret`s it.
+    // Placing the alloca in the entry block lets LLVM's mem2reg
+    // promote it to SSA across the loop boundary.
     let ret_slot = builder
         .build_alloca(i64_t, "fast_ret_slot")
         .map_err(|e| LlvmError::Codegen(format!("fast ret_slot alloca: {e}")))?;
@@ -860,6 +863,14 @@ pub(crate) fn emit_fast_entry<'ctx>(
     // params (which the fast path doesn't pass).
     emit.param_base = 0;
     emit.llvm_trap_fn = Some(declare_llvm_trap(ctx, module));
+    // Phase D.2: plumb the module-wide helper and closure tables so
+    // an in-body `Op::Call` / `Op::MakeClosure` / `Op::CallClosure`
+    // can resolve sibling functions. The fast emitter's per-op rewrites
+    // (`MakeClosure` → virtualised closure, `CallClosure` → direct
+    // call with null state/captures) consult these tables to pick the
+    // matching `FunctionValue`.
+    emit.helper_table = Some(helper_table.clone());
+    emit.closure_fn_table = closure_fn_table.to_vec();
     emit.lower_body(&func.body)?;
 
     // The buffer-protocol IR ends with `Op::Return` which the fast
@@ -1291,6 +1302,14 @@ struct Emit<'ctx, 'b, 'cp> {
     /// entry / a helper (not a lambda body) — the self-recursion fast
     /// path is gated on this being `Some`.
     captures_ptr_param: Option<IntValue<'ctx>>,
+    /// Phase D.2 fast-path entry: let-slot indices holding a
+    /// virtualised closure stamped by an in-body `Op::MakeClosure`
+    /// (carries `Provenance::FastPathClosure`). The `LetSet` that
+    /// catches such a value stashes the `fn_table_idx` here so the
+    /// matching `LetGet` can re-emit the provenance, keeping the
+    /// `CallClosure` direct-call rewrite alive across the let chain.
+    /// Empty when not emitting the fast-path entry.
+    fast_path_closure_let_slots: std::collections::HashMap<u32, u32>,
 }
 
 /// Phase E.1: per-call inline-frame state. One entry per active
@@ -1390,6 +1409,19 @@ enum Provenance {
         offset: u32,
         self_fn_table_idx: u32,
     },
+    /// Phase D.2: closure handle materialised by a `MakeClosure` op
+    /// inside the fast-path entry. The fast entry has no arena/state,
+    /// so `MakeClosure` cannot bump-allocate the 8-byte handle record;
+    /// instead the value is virtualised — we remember the
+    /// `fn_table_idx` and rewrite the matching `CallClosure` into a
+    /// direct call against the lambda function. The lambda's
+    /// `(state, captures_ptr, args...)` signature is satisfied by
+    /// passing null / zero for state / captures, which is sound for
+    /// W7-style self-recursive closures whose post-O3 body drops
+    /// both args.
+    FastPathClosure {
+        fn_table_idx: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1453,6 +1485,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             self_capture_offsets: Vec::new(),
             self_capture_let_slots: std::collections::HashMap::new(),
             captures_ptr_param: None,
+            fast_path_closure_let_slots: std::collections::HashMap::new(),
         }
     }
 
@@ -1724,6 +1757,18 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                             .insert(mapped, (offset, self_fn_table_idx));
                     }
                 }
+                // Phase D.2 fast-path entry: when storing a virtualised
+                // closure produced by an in-body `MakeClosure` (no
+                // arena/state available), remember the `fn_table_idx`
+                // so the matching `LetGet` re-emits the provenance and
+                // the downstream `CallClosure` can rewrite into a
+                // direct call.
+                if let Provenance::FastPathClosure { fn_table_idx } = v.prov {
+                    if matches!(*ty, IrType::Closure) {
+                        self.fast_path_closure_let_slots
+                            .insert(mapped, fn_table_idx);
+                    }
+                }
             }
             Op::LetGet { idx, ty } => {
                 // Phase E.1: remap the callee's let-idx against the
@@ -1773,6 +1818,14 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                                 self_fn_table_idx,
                             },
                         );
+                    } else if let Some(&fn_table_idx) =
+                        self.fast_path_closure_let_slots.get(&mapped)
+                    {
+                        // Phase D.2 fast-path entry: re-stamp the
+                        // virtualised-closure tag so the matching
+                        // `CallClosure` keeps the direct-call rewrite
+                        // available.
+                        self.push_with_prov(v, *ty, Provenance::FastPathClosure { fn_table_idx });
                     } else {
                         self.push(v, *ty);
                     }
@@ -3357,6 +3410,15 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// compute `out_ptr + record_local + offset` from this slot.
     /// Mirrors cranelift's `emit_alloc_root_record`.
     fn emit_alloc_root_record(&mut self, idx: u32) -> Result<(), LlvmError> {
+        // Phase D.2: fast-path entry has no arena to write into — the
+        // matching `StoreFieldAtRecord` is rewritten to a store
+        // against the `fast_ret_slot` alloca, which doesn't need a
+        // record-local offset. Skip the alloca entirely so post-O3
+        // IR stays free of the dead bookkeeping store.
+        if self.fast_path.is_some() {
+            let _ = idx;
+            return Ok(());
+        }
         let slot = self.get_or_create_record_local(idx)?;
         let zero = self.ctx.i32_type().const_zero();
         self.builder
@@ -3377,6 +3439,33 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         offset: u32,
         ty: IrType,
     ) -> Result<(), LlvmError> {
+        // Phase D.2: fast-path entry rewrites the single-Int-field
+        // record store into the `fast_ret_slot` store. Mirrors the
+        // `Op::StoreField` rewrite — the profile gate guarantees the
+        // return record carries exactly one Int field, so the matching
+        // `StoreFieldAtRecord` at `profile.ret_offset` is the
+        // function's actual return value. Any other shape (multi-
+        // field record, branded sub-records) escapes the envelope
+        // and surfaces as an emitter error.
+        if let Some(fast) = self.fast_path.clone() {
+            let _ = idx;
+            if ty != IrType::I64 {
+                return Err(LlvmError::Codegen(format!(
+                    "fast-path StoreFieldAtRecord: only I64 returns supported, got {ty:?}"
+                )));
+            }
+            if offset != fast.profile.ret_offset {
+                return Err(LlvmError::Codegen(format!(
+                    "fast-path StoreFieldAtRecord: offset {offset} != profile.ret_offset {}",
+                    fast.profile.ret_offset
+                )));
+            }
+            let v = self.pop_int(ip_hint)?;
+            self.builder.build_store(fast.ret_slot, v).map_err(|e| {
+                LlvmError::Codegen(format!("fast StoreFieldAtRecord ret_slot: {e}"))
+            })?;
+            return Ok(());
+        }
         let arena_base_ptr = self.arena_base_ptr.ok_or_else(|| {
             LlvmError::Codegen("StoreFieldAtRecord outside buffer-protocol entry".into())
         })?;
@@ -3504,6 +3593,42 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 "MakeClosure fn_table_idx={fn_table_idx} out of range (closure_fn_table.len()={})",
                 self.closure_fn_table.len()
             )));
+        }
+        // Phase D.2: fast-path entry has no arena/state to bump the
+        // 8-byte handle / captures-struct into. Virtualise the closure
+        // — push a placeholder i32 tagged with `FastPathClosure` so the
+        // downstream `LetSet/LetGet` chain keeps the `fn_table_idx`
+        // available, and the matching `CallClosure` rewrites into a
+        // direct call against `closure_fn_table[fn_table_idx]`. Sound
+        // for the W7 anon-Dict shape because the lambda's post-O3
+        // body drops state / captures_ptr (the inner self-recursion
+        // fast path already side-stepped them); passing zero through
+        // the direct-call ABI lets LLVM strip the dead args entirely.
+        //
+        // Captures are skipped — the only legal capture in this
+        // shape is the self-handle (an `Op::LetSet { ty: Closure }`
+        // immediately follows the `MakeClosure`) which the fast-path
+        // closure tracker re-derives from `fn_table_idx`. Any other
+        // capture surfaces as an emitter error so future widenings
+        // (W3 fold, W11 multi-closure) explicitly opt in.
+        if self.fast_path.is_some() {
+            for cap in captures {
+                if !matches!(cap.ty, IrType::Closure) {
+                    return Err(LlvmError::Codegen(format!(
+                        "fast-path MakeClosure: non-Closure capture (let_idx={}, ty={:?}) \
+                         outside the W7 envelope",
+                        cap.let_idx, cap.ty
+                    )));
+                }
+            }
+            let _ = captures_size;
+            let placeholder = self.ctx.i32_type().const_zero();
+            self.push_with_prov(
+                placeholder,
+                IrType::Closure,
+                Provenance::FastPathClosure { fn_table_idx },
+            );
+            return Ok(());
         }
         // Step 1: alloc 8 bytes for the handle.
         let i32_t = self.ctx.i32_type();
@@ -3653,6 +3778,54 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             return Err(LlvmError::Codegen(
                 "Op::CallClosure but closure_fn_table is empty — module declared no lambdas".into(),
             ));
+        }
+        // Phase D.2: fast-path entry routes `CallClosure` through a
+        // direct call to `closure_fn_table[fn_table_idx]` when the
+        // popped handle was produced by an in-body `MakeClosure`
+        // (virtualised closure carrying `FastPathClosure` provenance).
+        // The lambda's `(state, captures_ptr, args...)` signature is
+        // satisfied with a null pointer + i32 zero — sound for the W7
+        // anon-Dict shape because the lambda's post-O3 body has
+        // already dropped both args (the inner self-recursion fast
+        // path side-stepped them). LLVM strips the dead loads when
+        // it inlines the call.
+        if self.fast_path.is_some() {
+            // Pop user args in reverse.
+            let mut user_args: Vec<IntValue<'ctx>> = Vec::with_capacity(param_tys.len());
+            for _ in 0..param_tys.len() {
+                user_args.push(self.pop_int(ip_hint)?);
+            }
+            user_args.reverse();
+            let handle_tv = self.pop(ip_hint)?;
+            let fn_table_idx = match handle_tv.prov {
+                Provenance::FastPathClosure { fn_table_idx } => fn_table_idx,
+                other => {
+                    return Err(LlvmError::Codegen(format!(
+                        "fast-path CallClosure: handle has provenance {other:?} (expected \
+                         FastPathClosure — the call site reads a closure not constructed \
+                         in this entry's body, outside the W7 envelope)"
+                    )));
+                }
+            };
+            let slot = fn_table_idx as usize;
+            if slot >= self.closure_fn_table.len() {
+                return Err(LlvmError::Codegen(format!(
+                    "fast-path CallClosure: fn_table_idx={fn_table_idx} out of range \
+                     (closure_fn_table.len()={})",
+                    self.closure_fn_table.len()
+                )));
+            }
+            let callee = self.closure_fn_table[slot];
+            let null_state = self.ctx.ptr_type(AddressSpace::default()).const_null();
+            let null_captures = self.ctx.i32_type().const_zero();
+            return self.emit_call_closure_direct(
+                callee,
+                null_state,
+                null_captures,
+                user_args,
+                param_tys,
+                ret_ty,
+            );
         }
         let state_ptr = self.state_ptr.ok_or_else(|| {
             LlvmError::Codegen("CallClosure outside buffer-protocol entry (no state)".into())

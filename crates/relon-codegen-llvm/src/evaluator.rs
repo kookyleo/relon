@@ -47,6 +47,7 @@ use crate::state::ArenaState;
 use crate::str_helpers::RELON_LLVM_STR_CONTAINS_ARENA_SYMBOL;
 use inkwell::module::Linkage;
 use inkwell::targets::FileType;
+use inkwell::values::FunctionValue;
 use std::path::Path;
 
 /// Maximum positional arity supported by the Phase A legacy-i64
@@ -371,7 +372,7 @@ impl LlvmAotEvaluator {
             .iter()
             .map(|&ir_idx| &ir.funcs[ir_idx as usize])
             .collect();
-        let (_llvm_fn, entry_shape, _helper_table, _closure_fn_table) = emit_module_funcs(
+        let (_llvm_fn, entry_shape, helper_table, closure_fn_table) = emit_module_funcs(
             ctx_static,
             &module,
             entry,
@@ -383,7 +384,7 @@ impl LlvmAotEvaluator {
             &ir.closure_table,
         )?;
 
-        // Phase D.1: attempt to emit the typed fast-path entry
+        // Phase D.1 / D.2: attempt to emit the typed fast-path entry
         // alongside the buffer entry whenever the schema qualifies.
         // Emission failure is treated as a "no fast path available"
         // condition rather than a hard error — the IR can stay on
@@ -392,15 +393,23 @@ impl LlvmAotEvaluator {
         // We discover eligibility from the `buffer_schema` (declared
         // `#main` params + return) and the IR body. Sources that
         // touch ops outside the fast envelope (strings, sandbox
-        // traps, MakeClosure, etc.) fail emission inside
-        // `emit_fast_entry`; we capture the error to the IR dump for
-        // post-mortem and continue with the buffer-only module.
+        // traps, non-self-recursive closures with non-virtualisable
+        // captures, etc.) fail emission inside `emit_fast_entry`; we
+        // capture the error to the IR dump for post-mortem and
+        // continue with the buffer-only module.
         let fast_profile = buffer_schema
             .as_ref()
             .and_then(|s| build_fast_path_profile(s).ok());
         let mut fast_emit_diagnostic: Option<String> = None;
         if let Some(profile) = fast_profile.as_ref() {
-            match emit_fast_entry(ctx_static, &module, entry, profile) {
+            match emit_fast_entry(
+                ctx_static,
+                &module,
+                entry,
+                profile,
+                &helper_table,
+                &closure_fn_table,
+            ) {
                 Ok(_) => {}
                 Err(e) => {
                     fast_emit_diagnostic = Some(format!("{e}"));
@@ -720,7 +729,31 @@ impl LlvmAotEvaluator {
             }
         }
         let r = self.run_main_legacy_i64_fast(&argv[..arity])?;
-        Ok(Some(Value::Int(r)))
+        // Phase D.2: re-wrap the i64 result to match the buffer
+        // path's `Value` shape. The fast-path profile gate accepts
+        // both the canonical `Ret { value: Int }` wrapper (Phase
+        // D.1 — surfaces as bare `Value::Int`) and any user-declared
+        // anon-record return collapsed to a single Int field (Phase
+        // D.2 — surfaces as `Value::Dict { <field_name>: Int }` to
+        // match `run_main_buffer`'s `read_record_into_map` decode).
+        // `is_single_value_wrapper` discriminates the two — strict
+        // canonical name match → bare scalar; otherwise → branded
+        // dict.
+        if let Some(schema) = self.buffer_schema.as_ref() {
+            if is_single_value_wrapper(&schema.return_schema) {
+                Ok(Some(Value::Int(r)))
+            } else {
+                let field_name = schema.return_schema.fields[0].name.clone();
+                let mut map: HashMap<String, Value> = HashMap::with_capacity(1);
+                map.insert(field_name, Value::Int(r));
+                Ok(Some(Value::branded_dict(
+                    map,
+                    Some(schema.return_schema.name.clone()),
+                )))
+            }
+        } else {
+            Ok(Some(Value::Int(r)))
+        }
     }
 
     /// Buffer-protocol `run_main`: pack the HashMap-keyed args into
@@ -1003,6 +1036,21 @@ fn is_single_value_wrapper(schema: &relon_eval_api::schema_canonical::Schema) ->
         && schema.fields[0].name == relon_ir::RETURN_VALUE_FIELD_NAME
 }
 
+/// Phase D.2: looser sibling of [`is_single_value_wrapper`] used to
+/// gate the typed-i64 fast-path. Accepts any single-field record whose
+/// sole field is `Int` — the canonical `Ret { value: Int }` wrapper
+/// **and** any user-declared `#main(...) -> Dict` whose anon-record
+/// lowering collapsed to one `Int` field (W7's `{ result: Int }` is
+/// the motivating case).
+///
+/// The strict [`is_single_value_wrapper`] check stays in place for the
+/// `run_main` buffer decoder — branded user dicts must still surface
+/// as `Value::Dict` for the host, not be unwrapped to a bare scalar.
+fn is_single_int_field_record(schema: &relon_eval_api::schema_canonical::Schema) -> bool {
+    use relon_eval_api::schema_canonical::TypeRepr;
+    schema.fields.len() == 1 && matches!(schema.fields[0].ty, TypeRepr::Int)
+}
+
 fn write_value_into_builder(
     builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
     field: &relon_eval_api::schema_canonical::Field,
@@ -1105,12 +1153,15 @@ fn read_record_into_map(
     Ok(out)
 }
 
-/// Phase D.1: discover whether `schema` qualifies for the typed
+/// Phase D.1 / D.2: discover whether `schema` qualifies for the typed
 /// fast-path entry. Eligibility requires every declared `#main` arg
-/// to be `Int` (Inline scalar at 8 / 8) and the return to be the
-/// single-value-wrapper shape (`Ret { value: Int }`). Returns the
-/// `FastPathProfile` mapping param-declaration order to buffer
-/// offsets when eligible.
+/// to be `Int` (Inline scalar at 8 / 8) and the return record to
+/// carry a single `Int` field — either the canonical
+/// `Ret { value: Int }` wrapper (Phase D.1) or any user-declared
+/// `#main(...) -> Dict` whose anon-record lowering collapsed to one
+/// `Int` field (Phase D.2 — W7's `{ result: Int }` is the motivating
+/// shape). Returns the `FastPathProfile` mapping param-declaration
+/// order to buffer offsets when eligible.
 fn build_fast_path_profile(schema: &BufferSchema) -> Result<FastPathProfile, ()> {
     use relon_eval_api::schema_canonical::TypeRepr;
     // Every declared #main arg must be `Int`. Pointer-indirect /
@@ -1121,13 +1172,10 @@ fn build_fast_path_profile(schema: &BufferSchema) -> Result<FastPathProfile, ()>
             return Err(());
         }
     }
-    // Single-value-wrapper return only. Any other shape (multi-field
-    // record, branded sub-schema, tail-cursor String/List) escapes
-    // the typed-i64 envelope.
-    if !is_single_value_wrapper(&schema.return_schema) {
-        return Err(());
-    }
-    if !matches!(schema.return_schema.fields[0].ty, TypeRepr::Int) {
+    // Single-Int-field record return only. Any other shape
+    // (multi-field record, branded sub-schema with non-Int leaves,
+    // tail-cursor String/List) escapes the typed-i64 envelope.
+    if !is_single_int_field_record(&schema.return_schema) {
         return Err(());
     }
     // Collect each arg's buffer offset from the layout — declaration
@@ -1383,7 +1431,23 @@ impl LlvmAotEvaluator {
                 // Fast-path entry only. Same shape the Phase 1 trivial
                 // demo path emitted — pure i64 in / i64 out, no
                 // SandboxState pointer, no const-pool copy.
-                let llvm_fn = emit_fast_entry(&ctx, &module, entry, profile)?;
+                //
+                // Phase D.2: the W7 anon-Dict-return shape needs the
+                // module-wide helper / closure tables so the fast entry
+                // can resolve in-body `Op::Call` / `Op::CallClosure`
+                // sites. Empty tables are fine for Phase D.1's pure
+                // Int-arithmetic bodies (W1) — the emitter just never
+                // looks them up.
+                let helper_table: HashMap<u32, FunctionValue<'_>> = HashMap::new();
+                let closure_fn_table: Vec<FunctionValue<'_>> = Vec::new();
+                let llvm_fn = emit_fast_entry(
+                    &ctx,
+                    &module,
+                    entry,
+                    profile,
+                    &helper_table,
+                    &closure_fn_table,
+                )?;
                 llvm_fn.as_global_value().set_name(entry_symbol);
                 llvm_fn.set_linkage(Linkage::External);
                 (EmittedEntryShape::FastInt, false)
