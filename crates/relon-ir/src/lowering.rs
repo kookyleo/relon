@@ -5227,3 +5227,71 @@ mod range_pipeline_tests {
         }
     }
 }
+
+// =====================================================================
+// Phase F.2 — first-class closure value boundary.
+//
+// The W7 cmp_lua workload (`#main(Int n) -> Dict { #private fib: (k) =>
+// ..., result: fib(n) }`) currently fails `lower_workspace_single` at
+// the return-type build step because `-> Dict` has no canonical
+// representation. The downstream `Expr::Closure` at a non-higher-order
+// site would also reject (see `lower_expr`'s explicit
+// `ClosureAcrossBoundary` arm), so even after Phase A's return-type
+// work the body would still bail.
+//
+// These tests pin the *current* diagnostic shape so the Phase B lifting
+// surfaces as a test failure (the assertions flip from `Err(...)` to
+// `Ok(...)`), giving the future implementer a clean checklist of which
+// rejection sites have been lifted. The design doc
+// `docs/internal/w7-closure-as-value-design.md` (local-only) captures
+// the full plan.
+// =====================================================================
+
+#[cfg(test)]
+mod w7_closure_boundary_tests {
+    use super::*;
+
+    /// Drive parse + analyze + `lower_workspace_single` without the
+    /// `.expect("lower")` the `intern_tests::lower_source` helper does
+    /// — Phase F.2 needs to observe the failure shape, not panic on it.
+    fn try_lower(src: &str) -> Result<Module, LoweringError> {
+        let ast = relon_parser::parse_document(src).expect("parse");
+        let analyzed = relon_analyzer::analyze(&ast);
+        // We intentionally don't `assert!(!analyzed.has_errors())`: the
+        // analyzer may surface a soft warning for the closure-typed
+        // dict field, but lowering still gets to run. Phase A only
+        // cares about the IR-side diagnostic.
+        lower_workspace_single(&analyzed, &ast).map(|l| l.module)
+    }
+
+    /// The W7 production source surface — verbatim copy of
+    /// `crates/relon-bench/benches/cmp_lua.rs::w7_relon_src`. Phase A
+    /// pins the current diagnostic: `-> Dict` is the first reject site,
+    /// so `UnsupportedTypeInMain { type_name: "Dict" }` is what users
+    /// (and the bytecode bounce path) see today.
+    #[test]
+    fn w7_production_source_pins_unsupported_dict_return() {
+        let src = "#main(Int n) -> Dict\n\
+                   {\n\
+                     #private\n\
+                     fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
+                     result: fib(n)\n\
+                   }";
+        let err = try_lower(src).expect_err(
+            "Phase A pins the current rejection — flip to Ok(_) once Phase B lifts the gap",
+        );
+        match err {
+            LoweringError::UnsupportedTypeInMain { type_name, .. } => {
+                assert_eq!(
+                    type_name, "Dict",
+                    "expected `-> Dict` to surface as UnsupportedTypeInMain(\"Dict\"), got {type_name:?}"
+                );
+            }
+            other => panic!(
+                "expected UnsupportedTypeInMain(\"Dict\"), got {other:?} — \
+                 likely Phase B partially landed; update this test to track \
+                 the next-most-upstream rejection site"
+            ),
+        }
+    }
+}
