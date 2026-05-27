@@ -1201,6 +1201,31 @@ fn w7_expected() -> i64 {
     fib(FIB_N as i64)
 }
 
+/// Phase Z.3c-g (2026-05-28): inline-Int W7 variant for the WASM row.
+/// The production `w7_relon_src()` form binds `fib: (k) => ...` as a
+/// `#internal` first-class recursive closure inside a Dict-body and
+/// returns `Dict { fib, result }` — both the bare-`Dict` return and
+/// first-class closure binding scope-cut at Phase Z.1's lowering
+/// envelope (Z.4 follow-up). The `where`-clause sibling moves the
+/// same doubly-recursive `fib` body into a top-level let-binding so
+/// the return type lands on `Int`, keeping the source inside the
+/// Z.3 wasm-lowering envelope.
+///
+/// Per-iter shape is preserved verbatim — `fib(n)` with the same
+/// `k < 2 ? k : fib(k - 1) + fib(k - 2)` body, materialising the
+/// same ~57k recursive calls for fib(22) the production source
+/// performs. **No** iterative `(a, b) := (b, a+b)` rewrite and
+/// **no** Binet's closed-form substitution — both are the canonical
+/// W7 algorithm-substitution traps (the iterative form is the user-
+/// flagged red line from the W7 trace_jit-fixture history); using
+/// either would book the doubly-recursive O(phi^n) work as
+/// linear or O(1) arithmetic and silently bypass what W7 is meant
+/// to measure (recursion + call-ABI overhead).
+fn w7_relon_src_bytecode() -> &'static str {
+    "#main(Int n) -> Int\n\
+     fib(n) where { fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2) }"
+}
+
 // =====================================================================
 // =====  W8 — polymorphic call site  ==================================
 // =====================================================================
@@ -3041,6 +3066,76 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // `StoreFieldAtRecord`). The row is keyed `W7_fib` /
         // `relon_llvm_aot`; the bespoke section above stops at the
         // tree-walker / LuaJIT / bytecode breakdown rows.
+
+        // Phase Z.3c-g (2026-05-28): relon_wasm_wasmtime row for W7.
+        // Drives the doubly-recursive `where`-clause sibling
+        // (`w7_relon_src_bytecode()`) through `WasmEvaluator::run_main`,
+        // which lowers via `relon-codegen-wasm` into a wasm module
+        // with two local functions (`$fib` + `$__main`); the recursive
+        // calls dispatch as direct `Call(fib_fn_idx)` and stay inside
+        // the wasm module (no host boundary per recursive step). The
+        // classifier routes the **production** `w7_relon_src()` (Dict
+        // return + `#internal fib` first-class recursive closure) to
+        // the tree-walker fallback — `try_build_wasm_compiled` then
+        // skips the row entirely rather than book a tree-walker number
+        // under the `wasmtime` label. Z.4 follow-up promotes the
+        // production-source path; until then this row honestly
+        // measures the `where`-form sibling (same doubly-recursive
+        // fib, same I/O shape modulo the Dict wrapper).
+        //
+        // No iterative `(a, b) := (b, a + b)` rewrite, no closed-form
+        // Binet's formula — both are the canonical W7 algorithm-
+        // substitution traps (the iterative form is the user-flagged
+        // red line from the trace_jit fixture history). Feeding either
+        // to the WASM lowering would emit linear or O(1) arithmetic
+        // and silently bypass the recursion + call-ABI cost W7 is
+        // meant to measure (paper-win anti-pattern per design §7).
+        if let Some(wasm) = try_build_wasm_compiled(
+            w7_relon_src_bytecode(),
+            "W7",
+            w7_expected(),
+            args_w_n(FIB_N as i64),
+        ) {
+            use relon_eval_api::Evaluator as _;
+            group.bench_function(BenchmarkId::new("W7_fib", "relon_wasm_wasmtime"), |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(FIB_N as i64);
+                    timed_with_warmup(iters, || {
+                        let v = wasm.run_main(args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            });
+
+            // Fast row — mirrors W1/W2/W8/W9/W10 patterns. Bypasses the
+            // HashMap<String, Value> pack + Value::Int wrap. Cross-
+            // checked against the buffer path before the timed loop.
+            if wasm.has_fast_path() {
+                let fast_out = wasm
+                    .run_main_legacy_i64_fast(&[FIB_N as i64])
+                    .expect("W7 wasm fast path consistency");
+                let slow_out = match wasm.run_main(args_w_n(FIB_N as i64)).unwrap() {
+                    Value::Int(n) => n,
+                    other => panic!("W7 wasm fast cross-check: slow path returned {other:?}"),
+                };
+                assert_eq!(
+                    fast_out, slow_out,
+                    "W7 fast/buffer disagree: fast={fast_out} buffer={slow_out}"
+                );
+                group.bench_function(
+                    BenchmarkId::new("W7_fib", "relon_wasm_wasmtime_fast"),
+                    |b| {
+                        b.iter_custom(|iters| {
+                            let n_in = black_box(FIB_N as i64);
+                            timed_with_warmup(iters, || {
+                                let v = wasm.run_main_legacy_i64_fast(&[black_box(n_in)]).unwrap();
+                                black_box(v);
+                            })
+                        });
+                    },
+                );
+            }
+        }
     }
 
     // ----- W8 polymorphic -----
