@@ -18,6 +18,12 @@ pub struct HostState {
     memory: Option<Memory>,
     /// Bump cursor for the per-call arena, in bytes.
     arena_cursor: u32,
+    /// Floor for `arena_cursor` after `reset()`. Z.3c-c W4 lowering
+    /// installs const data segments (haystack + needle records) at
+    /// fixed offsets in linear memory; bumping the floor past those
+    /// records prevents the per-call arena from clobbering them.
+    /// `0` for variants without const segments.
+    arena_floor: u32,
     /// Hard cap on the arena bump. Currently 1 MiB matching the
     /// initial-memory size; growth is `Z.3` work.
     arena_cap: u32,
@@ -44,6 +50,7 @@ impl HostState {
         Self {
             memory: None,
             arena_cursor: 0,
+            arena_floor: 0,
             arena_cap: 1024 * 1024,        // 1 MiB
             str_pool_top: 1024 * 1024 - 1, // grows downward from the top
             tier: Tier::Cold,
@@ -56,9 +63,23 @@ impl HostState {
         self.memory = Some(memory);
     }
 
-    /// Reset the per-call arena. The string pool is preserved.
+    /// Reserve the linear-memory range `[0..end)` for module-installed
+    /// const data segments. Bumps the arena floor so subsequent
+    /// `reset()` / `arena_alloc` calls land past the const region.
+    /// Safe to call multiple times — the floor only grows.
+    pub fn bind_const_segment_end(&mut self, end: u32) {
+        if end > self.arena_floor {
+            self.arena_floor = end;
+        }
+        if self.arena_cursor < self.arena_floor {
+            self.arena_cursor = self.arena_floor;
+        }
+    }
+
+    /// Reset the per-call arena. The string pool and const-segment
+    /// region (`[0..arena_floor)`) are preserved.
     pub fn reset(&mut self) {
-        self.arena_cursor = 0;
+        self.arena_cursor = self.arena_floor;
     }
 
     /// Snapshot of the current tier for the public `active_tier` API.

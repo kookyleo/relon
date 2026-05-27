@@ -104,8 +104,11 @@ pub(crate) fn register_host_imports(linker: &mut Linker<HostState>) -> anyhow::R
     linker.func_wrap(
         "relon",
         "__relon_str_contains",
-        |_caller: Caller<'_, HostState>, _a: i32, _b: i32| -> Result<i32, wasmtime::Error> {
-            Err(wasmtime::Error::msg("__relon_str_contains: Z.3 follow-up"))
+        |mut caller: Caller<'_, HostState>,
+         haystack_handle: i32,
+         needle_handle: i32|
+         -> Result<i32, wasmtime::Error> {
+            str_contains(&mut caller, haystack_handle, needle_handle)
         },
     )?;
     linker.func_wrap(
@@ -479,4 +482,85 @@ fn list_sum_i64(caller: &mut Caller<'_, HostState>, handle: i32) -> Result<i64, 
         })?;
     }
     Ok(acc)
+}
+
+// =====================================================================
+// =====   String host-import implementations  =========================
+// =====================================================================
+
+/// `__relon_str_contains(haystack_handle, needle_handle) -> i32` —
+/// 0 / 1 result mirroring the LLVM-side `relon_llvm_str_contains_arena`
+/// surface. Both handles point at `[u32 le len][payload]` records in
+/// linear memory; the W4 lowering installs the records as wasm data
+/// segments so each call only re-reads them, no allocation.
+///
+/// Z.3c-c: this shim is the only per-iter host-import call W4 makes.
+/// We deliberately leave the inline-cache path the LLVM AOT side
+/// carries off the table — the wasmtime call overhead dominates the
+/// byte-scan on the 3-byte short haystack, and adding an IC here
+/// would just push the dispatch cost back into the closure plumbing
+/// without buying anything. The Z.4 follow-up can revisit once we
+/// measure where this row actually lands vs LuaJIT.
+fn str_contains(
+    caller: &mut Caller<'_, HostState>,
+    haystack_handle: i32,
+    needle_handle: i32,
+) -> Result<i32, wasmtime::Error> {
+    let mem = caller
+        .data()
+        .memory()
+        .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+    let view = mem.data(caller);
+    let haystack = read_str_record(view, haystack_handle as u32)?;
+    let needle = read_str_record(view, needle_handle as u32)?;
+    Ok(compute_contains(haystack, needle))
+}
+
+/// Read a `[u32 le len][payload bytes]` record at `handle`. Mirrors
+/// the LLVM-side `read_record` contract: returns the payload slice
+/// (length-checked against linear memory) so the caller can byte-
+/// scan without an extra bounds check.
+fn read_str_record(view: &[u8], handle: u32) -> Result<&[u8], wasmtime::Error> {
+    let len = read_u32(view, handle).map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+    let payload_start = handle as usize + 4;
+    let payload_end = payload_start
+        .checked_add(len as usize)
+        .ok_or_else(|| wasmtime::Error::msg("str record: ptr+len overflow"))?;
+    if payload_end > view.len() {
+        return Err(wasmtime::Error::msg(format!(
+            "str record at {handle} extends past linear memory \
+             (payload_end={payload_end}, mem={})",
+            view.len()
+        )));
+    }
+    Ok(&view[payload_start..payload_end])
+}
+
+/// Byte-scan contains decision. Mirrors the LLVM-side
+/// `compute_contains` semantics: empty needle is always a hit,
+/// needle-longer-than-haystack is always a miss, single-byte needle
+/// goes through `slice::contains` (memchr / SIMD-backed), multi-byte
+/// goes through the Two-Way matcher in `str::contains` after a UTF-8
+/// validation pass.
+#[inline]
+fn compute_contains(haystack: &[u8], needle: &[u8]) -> i32 {
+    if needle.is_empty() {
+        return 1;
+    }
+    if needle.len() > haystack.len() {
+        return 0;
+    }
+    if needle.len() == 1 {
+        let b = needle[0];
+        return i32::from(haystack.contains(&b));
+    }
+    let h_str = match std::str::from_utf8(haystack) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let n_str = match std::str::from_utf8(needle) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    i32::from(h_str.contains(n_str))
 }

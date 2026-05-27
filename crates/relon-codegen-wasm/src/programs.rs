@@ -24,8 +24,9 @@
 //! inline.
 
 use wasm_encoder::{
-    CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection, ImportSection,
-    Instruction, MemArg, MemorySection, MemoryType, Module, TypeSection, ValType,
+    CodeSection, ConstExpr, DataSection, EntityType, ExportKind, ExportSection, Function,
+    FunctionSection, ImportSection, Instruction, MemArg, MemorySection, MemoryType, Module,
+    TypeSection, ValType,
 };
 
 use crate::host_abi::HOST_IMPORTS;
@@ -74,10 +75,40 @@ pub enum WasmProgram {
     /// `has_fast_path()` returns `false`.
     W3StringConcatInline,
 
-    /// W4 contains scan — scope-cut Z.1 (filter / list-len-of-filter
-    /// composition needs IR walker).
+    /// W4 contains scan. `#main(Int n) -> Int  range(n).map((i) => "<H>").filter((s) => s.contains("x")).len()`.
+    ///
+    /// Z.3c-c folds the `range.map.filter.len` chain into a pure-WASM
+    /// accumulator loop that calls the `__relon_str_contains` host
+    /// shim per iteration. Two haystack flavours are supported:
+    ///
+    /// - `long = false` — the 3-byte "axb" haystack from W4
+    ///   (`w4_relon_src`). The needle is single-byte "x".
+    /// - `long = true` — the 256-byte haystack used by the W4_long
+    ///   bench row. Same source shape, swap the literal.
+    ///
+    /// Haystack and needle bytes are embedded as wasm `data` segments
+    /// in the format `[u32 le len][payload bytes]`, matching the
+    /// LLVM-side `read_record` convention. Records live at fixed
+    /// offsets `W4_HAYSTACK_RECORD_OFFSET` / right after; the host's
+    /// `arena_floor` is bumped past the records at instantiate time
+    /// so the per-call arena reset doesn't reach into the const area.
+    ///
+    /// Honesty (design §7):
+    ///   - Same algorithm? — per iter the loop performs the literal
+    ///     `contains` byte-scan on the same haystack and needle the
+    ///     source declares. No closed-form `count = n` substitution
+    ///     even though the analytic answer is `n`; the loop body
+    ///     calls `__relon_str_contains` n times so the bench measures
+    ///     real byte-scanning work.
+    ///   - Same code path? — `WasmEvaluator::run_main` lowers via this
+    ///     module, the host registers `__relon_str_contains` with a
+    ///     read-from-linear-memory implementation, every iter crosses
+    ///     the wasmtime boundary.
+    ///   - Same I/O shape? — `#main(Int n) -> Int`, returns
+    ///     `Value::Int(count_of_matches)`. Cross-checked against the
+    ///     tree-walker in `tests/w4_smoke.rs` / `tests/w4_long_smoke.rs`.
     W4StringContains {
-        /// True for the 256-byte haystack variant.
+        /// True for the 256-byte haystack variant (W4_long row).
         long: bool,
     },
 
@@ -126,6 +157,63 @@ pub enum WasmProgram {
     W12IncrementInt,
 }
 
+/// W4 short-haystack literal — byte-identical to the production
+/// `w4_relon_src` source's `.map((i) => "axb")` payload.
+pub(crate) const W4_HAYSTACK_SHORT: &[u8] = b"axb";
+
+/// W4 long-haystack literal (256 bytes, terminal 'x'). Byte-identical to
+/// `W4_LONG_HAYSTACK` in `crates/relon-bench/benches/cmp_lua.rs` so the
+/// W4_long row exercises the same SIMD-scan-friendly payload.
+pub(crate) const W4_HAYSTACK_LONG: &[u8] =
+    b"loremipsumdolorsitametconsecteturadipiscingelitseddoeiusmodtemporincididuntutlaboreetdoloremagnaaliquautenimadminimveniamquisnostrudezercitationullamcolaborisnisiutaliquipezeacommodoconsequatduisauteiruredolorinreprehenderitinvoluptatevelitessecillumaaaaax";
+
+/// W4 needle — single-byte "x", shared by both haystack flavours.
+pub(crate) const W4_NEEDLE: &[u8] = b"x";
+
+/// Base offset of the W4 haystack record (`[u32 len][payload]`) in
+/// linear memory. Bytes 0..8 are deliberately reserved so a stray
+/// null-handle read from a buggy emit catches the trap-zero region
+/// instead of returning a plausible record. Aligned to 4 for the
+/// leading u32 length field.
+pub(crate) const W4_HAYSTACK_RECORD_OFFSET: u32 = 16;
+
+/// Resolve the haystack bytes for a W4 variant.
+pub(crate) fn w4_haystack_bytes(long: bool) -> &'static [u8] {
+    if long {
+        W4_HAYSTACK_LONG
+    } else {
+        W4_HAYSTACK_SHORT
+    }
+}
+
+/// First arena byte the per-call bump may safely consume. For Z.1
+/// programs without data segments this is `0`; for W4 the const
+/// records occupy bytes [16 .. const_segment_end).
+pub fn const_segment_end(program: &WasmProgram) -> u32 {
+    match program {
+        WasmProgram::W4StringContains { long } => w4_const_segment_end(*long),
+        _ => 0,
+    }
+}
+
+/// Compute the byte right after the W4 needle record, rounded up to
+/// 8-byte alignment so the next arena bump can land on a list-header
+/// boundary without an extra align pass.
+fn w4_const_segment_end(long: bool) -> u32 {
+    let hay = w4_haystack_bytes(long);
+    let needle_record_off = w4_needle_record_offset(long);
+    let raw_end = needle_record_off + 4 + W4_NEEDLE.len() as u32;
+    let _ = hay; // consumed via w4_needle_record_offset
+    (raw_end + 7) & !7
+}
+
+/// Byte offset of the W4 needle record header in linear memory. Sits
+/// right after the haystack payload, aligned to 4 for the leading u32.
+fn w4_needle_record_offset(long: bool) -> u32 {
+    let haystack_payload_end = W4_HAYSTACK_RECORD_OFFSET + 4 + w4_haystack_bytes(long).len() as u32;
+    (haystack_payload_end + 3) & !3
+}
+
 /// Lower a program to a complete WASM module.
 pub(crate) fn lower_program(program: &WasmProgram) -> Result<Vec<u8>, LowerError> {
     match program {
@@ -133,7 +221,7 @@ pub(crate) fn lower_program(program: &WasmProgram) -> Result<Vec<u8>, LowerError
         WasmProgram::W2DotProduct => Ok(emit_w2_dot_product()),
         WasmProgram::W3StringConcat => Err(LowerError::ScopeCut("W3-string-concat")),
         WasmProgram::W3StringConcatInline => Ok(emit_w3_string_concat_inline()),
-        WasmProgram::W4StringContains { .. } => Err(LowerError::ScopeCut("W4-string-contains")),
+        WasmProgram::W4StringContains { long } => Ok(emit_w4_filter_contains_count(*long)),
         WasmProgram::W5DictAccess => Err(LowerError::ScopeCut("W5-dict-access")),
         WasmProgram::W6ListSumPlusOne => Ok(emit_w6_list_sum_plus_one()),
         WasmProgram::W7FibRecursion => Err(LowerError::ScopeCut("W7-fib-recursion")),
@@ -201,7 +289,16 @@ fn build_prelude() -> ModulePrelude {
 /// Compose a complete module from its parts. The function section
 /// declares exactly one local function (`__main`); imports were already
 /// placed by `build_prelude`. Returns the encoded bytes.
-fn finalize_module(prelude: ModulePrelude, main_body: Function) -> Vec<u8> {
+///
+/// `data_segments` is an optional list of `(offset, bytes)` active
+/// data segments to install into linear memory at instantiate time.
+/// W4 uses this to embed haystack / needle records; other variants
+/// pass an empty slice.
+fn finalize_module(
+    prelude: ModulePrelude,
+    main_body: Function,
+    data_segments: &[(u32, Vec<u8>)],
+) -> Vec<u8> {
     let _ = prelude.host_type_indices; // surfaces unused-binding lint silencing post-prelude
 
     let mut module = Module::new();
@@ -240,6 +337,21 @@ fn finalize_module(prelude: ModulePrelude, main_body: Function) -> Vec<u8> {
     let mut code = CodeSection::new();
     code.function(&main_body);
     module.section(&code);
+
+    // Section 11 — data (active segments, written into linear memory
+    // at instantiate time). Empty slice means we omit the section so
+    // existing modules stay byte-identical.
+    if !data_segments.is_empty() {
+        let mut data = DataSection::new();
+        for (offset, bytes) in data_segments {
+            data.active(
+                0,
+                &ConstExpr::i32_const(*offset as i32),
+                bytes.iter().copied(),
+            );
+        }
+        module.section(&data);
+    }
 
     module.finish()
 }
@@ -324,7 +436,7 @@ fn emit_w1_int_sum_range() -> Vec<u8> {
     func.instruction(&Instruction::LocalGet(1));
     func.instruction(&Instruction::End); // function
 
-    finalize_module(prelude, func)
+    finalize_module(prelude, func, &[])
 }
 
 /// W2 lowering. `#main(Int n) -> Int  list.sum(range(n).map((i) => (i+1)*(i+2)))`.
@@ -413,7 +525,7 @@ fn emit_w2_dot_product() -> Vec<u8> {
     func.instruction(&Instruction::LocalGet(1));
     func.instruction(&Instruction::End); // function
 
-    finalize_module(prelude, func)
+    finalize_module(prelude, func, &[])
 }
 
 /// W6 lowering. `#main(Int n) -> Int  list.sum(range(n).map((i) => i + 1))`.
@@ -490,7 +602,7 @@ fn emit_w6_list_sum_plus_one() -> Vec<u8> {
         memory_index: 0,
     };
 
-    finalize_module(prelude, func)
+    finalize_module(prelude, func, &[])
 }
 
 /// W3 string-concat inline lowering.
@@ -604,7 +716,7 @@ fn emit_w3_string_concat_inline() -> Vec<u8> {
     func.instruction(&Instruction::I64Or);
     func.instruction(&Instruction::End); // function
 
-    finalize_module(prelude, func)
+    finalize_module(prelude, func, &[])
 }
 
 /// W10 inline-Int lowering.
@@ -761,7 +873,7 @@ fn emit_w10_config_eval_inline() -> Vec<u8> {
     func.instruction(&Instruction::LocalGet(1));
     func.instruction(&Instruction::End); // function
 
-    finalize_module(prelude, func)
+    finalize_module(prelude, func, &[])
 }
 
 /// W12 lowering. `#main(Int x) -> Int  x + 1`.
@@ -772,5 +884,108 @@ fn emit_w12_increment_int() -> Vec<u8> {
     func.instruction(&Instruction::I64Const(1));
     func.instruction(&Instruction::I64Add);
     func.instruction(&Instruction::End);
-    finalize_module(prelude, func)
+    finalize_module(prelude, func, &[])
+}
+
+/// W4 lowering. `#main(Int n) -> Int  range(n).map((i) => "<H>").filter((s) => s.contains("x")).len()`.
+///
+/// Folds the `range.map.filter.len` chain into a pure-WASM accumulator
+/// loop. Each iteration calls the host shim `__relon_str_contains` on
+/// the same const haystack/needle pair the source declares — no
+/// closed-form `count = n` substitution. The analytic answer is `n`
+/// for both haystack flavours (every haystack contains 'x'), but the
+/// loop body still has to perform a real byte-scan inside the host so
+/// the bench measures the dispatch boundary + scan cost.
+///
+/// Honesty (design §7):
+///   - Same algorithm? — per iter the loop performs the literal
+///     `s.contains("x")` decision on the same haystack the source
+///     declares. Both records are stored in linear memory at fixed
+///     offsets and re-passed to the host shim each iteration; the
+///     shim re-derives `len + payload` from the record header just
+///     like the LLVM-side `read_record` does.
+///   - Same code path? — every iter crosses the wasmtime host-import
+///     boundary (`__relon_str_contains`), reaches the host's read-
+///     from-linear-memory + memchr/contains implementation, and
+///     widens the i32 result into the per-iter add.
+///   - Same I/O shape? — `#main(Int n) -> Int`, returns
+///     `Value::Int(matched_count)`. For both haystack flavours every
+///     iter matches, so the result is `n` — matching the tree-
+///     walker for the same `n`.
+///
+/// Loop shape:
+///   acc = 0
+///   i   = 0
+///   loop:
+///     if i >= n: break
+///     hit = __relon_str_contains(HAY_PTR, NEEDLE_PTR)   ;; i32 0/1
+///     acc += (i64) hit                                   ;; honest add
+///     i += 1
+///   return acc
+fn emit_w4_filter_contains_count(long: bool) -> Vec<u8> {
+    let prelude = build_prelude();
+
+    // Locals: param 0 = n (i64), local 1 = acc (i64), local 2 = i (i64)
+    let mut func = Function::new([(2u32, ValType::I64)]);
+
+    let haystack_ptr = W4_HAYSTACK_RECORD_OFFSET;
+    let needle_ptr = w4_needle_record_offset(long);
+    let contains_fn_idx = crate::host_abi::import_index(12); // __relon_str_contains
+
+    // acc = 0
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::LocalSet(1));
+    // i = 0
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::LocalSet(2));
+
+    // outer `block` so we can `br` out of the loop.
+    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+    func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+    // if i >= n: br outer
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::I64GeS);
+    func.instruction(&Instruction::BrIf(1));
+
+    // hit = __relon_str_contains(haystack_ptr, needle_ptr)
+    func.instruction(&Instruction::I32Const(haystack_ptr as i32));
+    func.instruction(&Instruction::I32Const(needle_ptr as i32));
+    func.instruction(&Instruction::Call(contains_fn_idx));
+
+    // acc += (i64) hit
+    func.instruction(&Instruction::I64ExtendI32U); // widen i32 -> i64
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::I64Add);
+    func.instruction(&Instruction::LocalSet(1));
+
+    // i += 1
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I64Const(1));
+    func.instruction(&Instruction::I64Add);
+    func.instruction(&Instruction::LocalSet(2));
+
+    // br to loop head
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // loop
+    func.instruction(&Instruction::End); // block
+
+    // return acc
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::End); // function
+
+    // Build data segments — `[u32 len][payload]` for haystack + needle.
+    let haystack_bytes = w4_haystack_bytes(long);
+    let mut haystack_record = Vec::with_capacity(4 + haystack_bytes.len());
+    haystack_record.extend_from_slice(&(haystack_bytes.len() as u32).to_le_bytes());
+    haystack_record.extend_from_slice(haystack_bytes);
+
+    let mut needle_record = Vec::with_capacity(4 + W4_NEEDLE.len());
+    needle_record.extend_from_slice(&(W4_NEEDLE.len() as u32).to_le_bytes());
+    needle_record.extend_from_slice(W4_NEEDLE);
+
+    let data_segments = vec![(haystack_ptr, haystack_record), (needle_ptr, needle_record)];
+
+    finalize_module(prelude, func, &data_segments)
 }

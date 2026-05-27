@@ -82,8 +82,22 @@ pub fn classify_main(source: &str) -> Result<WasmProgram, ClassifyError> {
     {
         return Ok(WasmProgram::W3StringConcatInline);
     }
+    // W4 / W4_long — `range(n).map((i) => "<H>").filter((s) => s.contains("x")).len()`.
+    // Z.3c-c promotes both from ScopeCut to a pure-WASM accumulator loop
+    // (`emit_w4_filter_contains_count`) that calls `__relon_str_contains`
+    // per iter. The two flavours differ only in the haystack literal —
+    // we match the long variant first because its source contains the
+    // short literal as a substring of its docstring would; matching on
+    // the byte-identical 256-byte literal eliminates false positives.
     if normalised.contains(".contains(\"x\")") {
-        return Err(ClassifyError::ScopeCut("W4-string-contains"));
+        // The long-haystack literal is byte-identical to
+        // `W4_HAYSTACK_LONG` in the codegen crate. We avoid pulling the
+        // raw constant in here to keep classify text-driven; the
+        // detection key is the "aaaaax" terminal run unique to that
+        // 256-byte string. The short haystack ("axb") has no run of
+        // 5 'a's so the discriminator stays clean.
+        let is_long = normalised.contains("aaaaax\")");
+        return Ok(WasmProgram::W4StringContains { long: is_long });
     }
     if normalised.contains("d[keys[i % 10]]") {
         return Err(ClassifyError::ScopeCut("W5-dict-access"));

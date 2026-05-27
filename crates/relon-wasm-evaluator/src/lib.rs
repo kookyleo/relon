@@ -22,7 +22,7 @@ use relon_parser::Node;
 use relon_parser::TokenRange;
 use wasmtime::{Config, Engine, Instance, Linker, Module, Store, TypedFunc};
 
-use relon_codegen_wasm::{lower, WasmProgram};
+use relon_codegen_wasm::{const_segment_end, lower, WasmProgram};
 
 /// Phase Z evaluator. Each instance owns one compiled `Module` + a
 /// reusable `Store<HostState>`. `run_main` resets the arena between
@@ -150,6 +150,15 @@ impl WasmEvaluator {
             .ok_or_else(|| WasmEvalError::Wasmtime("module missing exported `memory`".into()))?;
         store.data_mut().bind_memory(memory);
 
+        // Reserve the const-segment region so per-call `reset()` doesn't
+        // clobber haystack/needle records the W4 lowering installed.
+        // Programs without data segments report `0` here, leaving the
+        // arena floor untouched.
+        let const_end = const_segment_end(&program);
+        if const_end > 0 {
+            store.data_mut().bind_const_segment_end(const_end);
+        }
+
         // Phase Z.3a: resolve `__main` as `TypedFunc<i64, i64>` once
         // and cache it. All Z.1 programs (W1/W6/W12) match this
         // signature; a future Z.3 widening that adds Float/String
@@ -276,6 +285,7 @@ fn program_returns_scalar_int(program: WasmProgram) -> bool {
     match program {
         WasmProgram::W1IntSumRange
         | WasmProgram::W2DotProduct
+        | WasmProgram::W4StringContains { .. }
         | WasmProgram::W6ListSumPlusOne
         | WasmProgram::W10ConfigEvalInline
         | WasmProgram::W12IncrementInt => true,
@@ -285,7 +295,6 @@ fn program_returns_scalar_int(program: WasmProgram) -> bool {
         // check exhaustive so adding a future return shape forces a
         // conscious decision.
         WasmProgram::W3StringConcat
-        | WasmProgram::W4StringContains { .. }
         | WasmProgram::W5DictAccess
         | WasmProgram::W7FibRecursion
         | WasmProgram::W8PolymorphicDispatch
@@ -332,6 +341,7 @@ impl Evaluator for WasmEvaluator {
             WasmProgram::W1IntSumRange
             | WasmProgram::W2DotProduct
             | WasmProgram::W3StringConcatInline
+            | WasmProgram::W4StringContains { .. }
             | WasmProgram::W6ListSumPlusOne
             | WasmProgram::W10ConfigEvalInline => extract_named_int(&args, "n")?,
             WasmProgram::W12IncrementInt => extract_named_int(&args, "x")?,

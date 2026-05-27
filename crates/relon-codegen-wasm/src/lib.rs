@@ -42,7 +42,7 @@ mod programs;
 use thiserror::Error;
 
 pub use host_abi::{HostImport, HOST_IMPORTS};
-pub use programs::WasmProgram;
+pub use programs::{const_segment_end, WasmProgram};
 
 /// Lowering error surface. Each variant carries enough context for the
 /// caller (typically `relon-wasm-evaluator::WasmEvaluator::new`) to
@@ -140,19 +140,49 @@ mod tests {
             .expect("wasmparser validates W3 inline");
     }
 
+    #[test]
+    fn lower_w4_round_trips() {
+        let bytes = lower(&WasmProgram::W4StringContains { long: false }).expect("emit W4");
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .expect("wasmparser validates W4");
+    }
+
+    #[test]
+    fn lower_w4_long_round_trips() {
+        let bytes = lower(&WasmProgram::W4StringContains { long: true }).expect("emit W4_long");
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .expect("wasmparser validates W4_long");
+    }
+
+    #[test]
+    fn w4_const_segment_end_covers_both_records() {
+        // Short haystack: header(4) + payload(3) = 7. Needle pads
+        // to align-4 = offset 16 + 8 = 24, then header(4) + payload(1)
+        // = 28, rounded to 32.
+        let short_end = const_segment_end(&WasmProgram::W4StringContains { long: false });
+        assert!(
+            short_end > 16 + 4 + 3 + 4,
+            "W4 short const segment must cover both records (got {short_end})"
+        );
+        // Long haystack: header(4) + payload(256) = 260, needle at
+        // offset 16+260 = 276 (already aligned), header(4) + payload(1)
+        // = 281, rounded to 288.
+        let long_end = const_segment_end(&WasmProgram::W4StringContains { long: true });
+        assert!(
+            long_end > 16 + 4 + 256 + 4,
+            "W4_long const segment must cover both records (got {long_end})"
+        );
+        // Non-W4 programs report zero (no const segment).
+        assert_eq!(const_segment_end(&WasmProgram::W1IntSumRange), 0);
+    }
+
     /// Sanity: every scope-cut workload returns the named cut.
     #[test]
     fn scope_cut_workloads_surface_explicitly() {
         for (prog, tag) in [
             (WasmProgram::W3StringConcat, "W3-string-concat"),
-            (
-                WasmProgram::W4StringContains { long: false },
-                "W4-string-contains",
-            ),
-            (
-                WasmProgram::W4StringContains { long: true },
-                "W4-string-contains",
-            ),
             (WasmProgram::W5DictAccess, "W5-dict-access"),
             (WasmProgram::W7FibRecursion, "W7-fib-recursion"),
             (
