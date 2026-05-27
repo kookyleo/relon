@@ -241,16 +241,31 @@ pub(crate) fn is_buffer_protocol_signature(params: &[IrType], ret: IrType) -> bo
 /// `Op::Call` lowering to resolve `fn_index - stdlib_count` back to the
 /// matching `FunctionValue`.
 ///
+/// Phase F.W7 widens the surface to closures-as-values:
+///
+/// - `lambdas` carries the IR funcs the lowering pass appended to the
+///   module's closure table (`#main`-side `fib: (k) => ...` lifts to a
+///   lambda Func). Each lambda is declared / emitted with the
+///   signature `(state, captures_ptr, ...lambda.params[1..]) -> ret`
+///   so the body's `LocalGet(0)` reads the captures_ptr arg, and so
+///   `Op::AllocScratch` / `*AtAbsolute` ops inside the body can reach
+///   the per-call arena state.
+/// - `closure_table` mirrors the IR's `Module::closure_table` so the
+///   emitter knows which `fn_table_idx` resolves to which lambda
+///   `FunctionValue`. Returned alongside `helper_table` so the
+///   `Op::MakeClosure` / `Op::CallClosure` lowering can refer to it.
+///
 /// `const_pool` ships the per-module ConstString blob the entry +
 /// helper bodies index into via `Op::ConstString { idx }`. The host
 /// copies `const_pool.bytes` to the arena prefix before every
 /// dispatch so the materialised `iconst(I32, offset)` resolves to a
 /// stable address.
 ///
-/// Returns the entry `FunctionValue`, the detected entry shape, and the
+/// Returns the entry `FunctionValue`, the detected entry shape, the
 /// helper lookup table the `Emit` driver hands off to the per-function
-/// lowering so sibling calls can find their callee.
-#[allow(clippy::too_many_arguments)]
+/// lowering so sibling calls can find their callee, and the closure
+/// table (one entry per `fn_table_idx`, in source order).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) fn emit_module_funcs<'ctx>(
     ctx: &'ctx Context,
     module: &LlvmModule<'ctx>,
@@ -259,11 +274,14 @@ pub(crate) fn emit_module_funcs<'ctx>(
     const_pool: &ConstPool,
     helpers: &[&Func],
     helper_ir_indices: Option<&[u32]>,
+    lambdas: &[&Func],
+    closure_table: &[u32],
 ) -> Result<
     (
         FunctionValue<'ctx>,
         EntryShape,
         HashMap<u32, FunctionValue<'ctx>>,
+        Vec<FunctionValue<'ctx>>,
     ),
     LlvmError,
 > {
@@ -293,15 +311,37 @@ pub(crate) fn emit_module_funcs<'ctx>(
         helper_table.insert(ir_idx, fv);
     }
 
+    // Phase F.W7: declare every lambda function up-front. Lambdas use
+    // a widened signature `(state, ...lambda.params) -> ret` — the
+    // first IR param (already `IrType::I32`, the captures_ptr the IR
+    // lowering pass prepended in `lower_closure_as_value`) becomes
+    // LLVM param 1 (just past the implicit `*state`). Subsequent
+    // user params shift to LLVM param indices 2.. so the body's
+    // `LocalGet(idx)` resolves to LLVM param `idx + 1`
+    // (`param_base = 1`).
+    let mut closure_fn_table: Vec<FunctionValue<'ctx>> = Vec::with_capacity(closure_table.len());
+    if lambdas.len() != closure_table.len() {
+        return Err(LlvmError::Codegen(format!(
+            "emit_module_funcs: lambdas.len()={} but closure_table.len()={}",
+            lambdas.len(),
+            closure_table.len()
+        )));
+    }
+    for (slot, lambda) in lambdas.iter().enumerate() {
+        let fv = declare_lambda_function(ctx, module, lambda, slot)?;
+        closure_fn_table.push(fv);
+    }
+
     // Step 2: emit the entry function body.
     let (entry_fn, shape) = if is_buffer_protocol_signature(&entry.params, entry.ret) {
-        let fv = emit_buffer_entry_with_helpers(
+        let fv = emit_buffer_entry_with_helpers_and_closures(
             ctx,
             module,
             entry,
             buffer_return_size,
             const_pool,
             &helper_table,
+            &closure_fn_table,
         )?;
         (fv, EntryShape::Buffer)
     } else {
@@ -333,7 +373,25 @@ pub(crate) fn emit_module_funcs<'ctx>(
         emit_helper_body(ctx, module, helper, helper_fn, const_pool, &helper_table)?;
     }
 
-    Ok((entry_fn, shape, helper_table))
+    // Step 4 (Phase F.W7): emit each lambda body. Lambdas share the
+    // `helper_table` so the body can route an inner `Op::Call` to a
+    // sibling helper (Phase E.2 cross-call). They also share the
+    // `closure_fn_table` so a nested `Op::MakeClosure` resolves the
+    // matching lambda FunctionValue from its `fn_table_idx`.
+    for (slot, lambda) in lambdas.iter().enumerate() {
+        let lambda_fn = closure_fn_table[slot];
+        emit_lambda_body(
+            ctx,
+            module,
+            lambda,
+            lambda_fn,
+            const_pool,
+            &helper_table,
+            &closure_fn_table,
+        )?;
+    }
+
+    Ok((entry_fn, shape, helper_table, closure_fn_table))
 }
 
 /// Declare a sibling helper function's LLVM signature without emitting
@@ -383,6 +441,61 @@ fn declare_helper_function<'ctx>(
     // colliding.
     let _ = slot;
     let llvm_name = format!("relon_helper_{}", func.name);
+    let fv = module.add_function(&llvm_name, fn_type, Some(Linkage::Internal));
+    Ok(fv)
+}
+
+/// Phase F.W7: declare a lambda function's LLVM signature without
+/// emitting its body. Lambdas always carry the
+/// `(state: ptr, ...lambda.params) -> ret` signature — the first IR
+/// param is the captures_ptr the IR lowering pass prepended in
+/// `lower_closure_as_value`, surfaced through LLVM param 1. Subsequent
+/// LLVM params correspond to the lambda's user-visible args.
+///
+/// The implicit `*state` pointer at LLVM param 0 mirrors the
+/// buffer-protocol entry's leading state slot so the lambda body's
+/// `Op::AllocScratch{,Dyn}` / `Op::*AtAbsolute` ops can resolve
+/// `arena_base` + scratch cursors through the same helper paths the
+/// entry uses.
+fn declare_lambda_function<'ctx>(
+    ctx: &'ctx Context,
+    module: &LlvmModule<'ctx>,
+    func: &Func,
+    slot: usize,
+) -> Result<FunctionValue<'ctx>, LlvmError> {
+    let ptr_t = ctx.ptr_type(AddressSpace::default());
+    let mut param_types: Vec<BasicMetadataTypeEnum<'ctx>> =
+        Vec::with_capacity(1 + func.params.len());
+    param_types.push(ptr_t.into());
+    for (i, p) in func.params.iter().enumerate() {
+        let bt = ir_ty_to_llvm_basic(ctx, *p).ok_or_else(|| {
+            LlvmError::UnsupportedSignature(format!(
+                "llvm-aot: lambda `{}` param #{i} type {p:?} unsupported",
+                func.name
+            ))
+        })?;
+        param_types.push(basic_to_metadata(bt));
+    }
+    let ret_bt = ir_ty_to_llvm_basic(ctx, func.ret).ok_or_else(|| {
+        LlvmError::UnsupportedSignature(format!(
+            "llvm-aot: lambda `{}` return type {:?} unsupported",
+            func.name, func.ret
+        ))
+    })?;
+    let fn_type = match ret_bt {
+        BasicTypeEnum::IntType(t) => t.fn_type(&param_types, false),
+        BasicTypeEnum::FloatType(t) => t.fn_type(&param_types, false),
+        BasicTypeEnum::PointerType(t) => t.fn_type(&param_types, false),
+        other => {
+            return Err(LlvmError::Codegen(format!(
+                "llvm-aot: lambda `{}` ret BasicType {other:?} unsupported",
+                func.name
+            )));
+        }
+    };
+    // `relon_lambda_<slot>_<name>` so the emitted IR dump is greppable
+    // when debugging which `fn_table_idx` mapped to which body.
+    let llvm_name = format!("relon_lambda_{}_{}", slot, func.name);
     let fv = module.add_function(&llvm_name, fn_type, Some(Linkage::Internal));
     Ok(fv)
 }
@@ -468,6 +581,90 @@ fn emit_helper_body<'ctx>(
     // Record the IR-declared return type so `Op::Return` knows what to
     // widen / truncate to when the operand stack value's width differs
     // from the LLVM signature's return slot.
+    emit.helper_ret_ty = Some(func.ret);
+    emit.llvm_trap_fn = Some(declare_llvm_trap(ctx, module));
+    emit.lower_body(&func.body)?;
+    Ok(())
+}
+
+/// Phase F.W7: emit a lambda body. Mirrors [`emit_helper_body`] but:
+///
+/// - The first LLVM param (`*state`) is materialised into
+///   `arena_base_ptr` + `state_ptr` so the body's
+///   `Op::AllocScratch{,Dyn}` / `Op::*AtAbsolute` ops resolve against
+///   the per-call arena state. Required because lambdas read captures
+///   via `LocalGet(0); LoadI32AtAbsolute { offset }` against the
+///   captures struct in scratch.
+/// - `param_base = 1` so the IR's `LocalGet(idx)` skips the implicit
+///   state slot — `LocalGet(0)` therefore reads the captures_ptr at
+///   LLVM param 1, matching what the IR lowering pass laid out in
+///   `lower_closure_as_value`.
+/// - The closure table is threaded through so nested
+///   `Op::MakeClosure` / `Op::CallClosure` ops inside the lambda body
+///   keep resolving against the same module-wide lambda set the entry
+///   uses.
+fn emit_lambda_body<'ctx>(
+    ctx: &'ctx Context,
+    module: &LlvmModule<'ctx>,
+    func: &Func,
+    llvm_fn: FunctionValue<'ctx>,
+    const_pool: &ConstPool,
+    helper_table: &HashMap<u32, FunctionValue<'ctx>>,
+    closure_fn_table: &[FunctionValue<'ctx>],
+) -> Result<(), LlvmError> {
+    let entry_bb = ctx.append_basic_block(llvm_fn, "entry");
+    let builder = ctx.create_builder();
+    builder.position_at_end(entry_bb);
+
+    // Materialise `state_ptr` + `arena_base_ptr` at function entry.
+    // Same pointer-arithmetic shape the buffer entry uses — the lambda
+    // shares the per-call `ArenaState` layout because the host (the
+    // entry function or another lambda) passes its own state pointer
+    // through to the call indirect site verbatim.
+    let i32_t = ctx.i32_type();
+    let i64_t = ctx.i64_type();
+    let i8_t = ctx.i8_type();
+    let ptr_t = ctx.ptr_type(AddressSpace::default());
+    let state_param = llvm_fn
+        .get_nth_param(0)
+        .ok_or_else(|| LlvmError::Codegen(format!("lambda `{}` missing state param", func.name)))?
+        .into_pointer_value();
+    let arena_base_gep = unsafe {
+        builder
+            .build_in_bounds_gep(
+                i8_t,
+                state_param,
+                &[i32_t.const_int(ARENA_STATE_OFFSET_BASE as u64, false)],
+                "lambda_arena_base_gep",
+            )
+            .map_err(|e| LlvmError::Codegen(format!("lambda arena_base GEP: {e}")))?
+    };
+    let arena_base_int = builder
+        .build_load(i64_t, arena_base_gep, "lambda_arena_base")
+        .map_err(|e| LlvmError::Codegen(format!("lambda arena_base load: {e}")))?
+        .into_int_value();
+    let arena_base_ptr = builder
+        .build_int_to_ptr(arena_base_int, ptr_t, "lambda_arena_base_ptr")
+        .map_err(|e| LlvmError::Codegen(format!("lambda arena_base inttoptr: {e}")))?;
+
+    let mut emit = Emit::new(
+        ctx,
+        &builder,
+        module,
+        llvm_fn,
+        EntryShape::LegacyI64,
+        Some(arena_base_ptr),
+        Some(state_param),
+        /*buffer_return_size=*/ 0,
+        const_pool,
+    );
+    // LLVM param 0 is `*state`; the IR's params (including the
+    // implicit captures_ptr at IR index 0) start at LLVM param 1.
+    emit.param_base = 1;
+    emit.helper_table = Some(helper_table.clone());
+    emit.closure_fn_table = closure_fn_table.to_vec();
+    // The lambda body's `Op::Return` carries the IR-declared return
+    // type so the dispatcher knows what LLVM `ret` shape to emit.
     emit.helper_ret_ty = Some(func.ret);
     emit.llvm_trap_fn = Some(declare_llvm_trap(ctx, module));
     emit.lower_body(&func.body)?;
@@ -658,6 +855,13 @@ fn emit_legacy_entry_impl<'ctx>(
 // Buffer-protocol entry (Phase B production envelope)
 // ---------------------------------------------------------------------------
 
+// Retained for symmetry with `emit_legacy_entry_with_helpers`; the
+// Phase F.W7 emit path always routes through
+// `emit_buffer_entry_with_helpers_and_closures` so a closure-free
+// module still gets the new entry shape (with an empty closure
+// table). Marked `#[allow(dead_code)]` to keep the symmetric pair
+// visible without firing the unused-function lint.
+#[allow(dead_code)]
 fn emit_buffer_entry_with_helpers<'ctx>(
     ctx: &'ctx Context,
     module: &LlvmModule<'ctx>,
@@ -673,6 +877,31 @@ fn emit_buffer_entry_with_helpers<'ctx>(
         buffer_return_size,
         const_pool,
         Some(helper_table),
+        &[],
+    )
+}
+
+/// Phase F.W7 variant: same as [`emit_buffer_entry_with_helpers`] but
+/// also threads the closure function-pointer table into the entry's
+/// `Emit` so the body's `Op::MakeClosure` lowering can stamp the
+/// matching `fn_table_idx` into the closure handle.
+fn emit_buffer_entry_with_helpers_and_closures<'ctx>(
+    ctx: &'ctx Context,
+    module: &LlvmModule<'ctx>,
+    func: &Func,
+    buffer_return_size: u32,
+    const_pool: &ConstPool,
+    helper_table: &HashMap<u32, FunctionValue<'ctx>>,
+    closure_fn_table: &[FunctionValue<'ctx>],
+) -> Result<FunctionValue<'ctx>, LlvmError> {
+    emit_buffer_entry_impl(
+        ctx,
+        module,
+        func,
+        buffer_return_size,
+        const_pool,
+        Some(helper_table),
+        closure_fn_table,
     )
 }
 
@@ -687,6 +916,7 @@ fn emit_buffer_entry_impl<'ctx>(
     buffer_return_size: u32,
     const_pool: &ConstPool,
     helper_table: Option<&HashMap<u32, FunctionValue<'ctx>>>,
+    closure_fn_table: &[FunctionValue<'ctx>],
 ) -> Result<FunctionValue<'ctx>, LlvmError> {
     let i32_t = ctx.i32_type();
     let i64_t = ctx.i64_type();
@@ -783,6 +1013,7 @@ fn emit_buffer_entry_impl<'ctx>(
     if let Some(table) = helper_table {
         emit.helper_table = Some(table.clone());
     }
+    emit.closure_fn_table = closure_fn_table.to_vec();
     emit.llvm_trap_fn = Some(declare_llvm_trap(ctx, module));
     emit.lower_body(&func.body)?;
 
@@ -891,6 +1122,22 @@ struct Emit<'ctx, 'b, 'cp> {
     /// statically-known `buffer_return_size`. Mirrors cranelift's
     /// `needs_tail_cursor` flag.
     needs_tail_cursor: bool,
+    /// Phase F.W7: ordered list of lambda `FunctionValue`s, indexed by
+    /// `fn_table_idx`. `Op::MakeClosure { fn_table_idx }` stamps the
+    /// matching index into the closure handle's `fn_table_idx` slot
+    /// and uses the same lookup to resolve the function pointer to
+    /// stash. `Op::CallClosure` reads the handle's `fn_table_idx`
+    /// slot and dispatches indirectly through a private global table
+    /// of function pointers seeded from this list. Empty when the
+    /// module contains no lambdas.
+    closure_fn_table: Vec<FunctionValue<'ctx>>,
+    /// Phase F.W7: per-IR-`record_local_idx` allocas backing
+    /// `Op::AllocRootRecord` / `Op::StoreFieldAtRecord`. The slot
+    /// holds an i32 out_ptr-relative offset; `AllocRootRecord` writes
+    /// `0` there (root sits at `out_ptr + 0`), `StoreFieldAtRecord`
+    /// reads it back to compute the destination address. Mirrors
+    /// cranelift's `record_locals` map.
+    record_locals: std::collections::HashMap<u32, PointerValue<'ctx>>,
     /// Phase H: bytes literal pushed by the *immediately preceding*
     /// `Op::ConstString` op (i.e. still the top-of-stack at the start
     /// of the next `lower_op` call). Cleared at the start of every
@@ -1017,6 +1264,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             inline_frames: Vec::new(),
             needs_tail_cursor: false,
             last_const_string: None,
+            closure_fn_table: Vec::new(),
+            record_locals: std::collections::HashMap::new(),
         }
     }
 
@@ -1093,13 +1342,20 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             // Phase E.1: String / List* arena offsets ride on an i32
             // slot — matches the cranelift backend's pointer-as-i32
             // wire representation.
+            //
+            // Phase F.W7: `Closure` joins the i32-wide variants
+            // (closure handle is an arena-relative i32 pointer at
+            // the IR / cranelift / LLVM boundary alike).
             IrType::I32
             | IrType::Bool
             | IrType::Null
             | IrType::String
             | IrType::ListInt
             | IrType::ListFloat
-            | IrType::ListBool => self.ctx.i32_type().into(),
+            | IrType::ListBool
+            | IrType::ListString
+            | IrType::ListSchema
+            | IrType::Closure => self.ctx.i32_type().into(),
             other => {
                 return Err(LlvmError::Codegen(format!(
                     "let-slot {idx}: unsupported type {other:?}"
@@ -1223,7 +1479,10 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                     | IrType::String
                     | IrType::ListInt
                     | IrType::ListFloat
-                    | IrType::ListBool => self.ctx.i32_type().into(),
+                    | IrType::ListBool
+                    | IrType::ListString
+                    | IrType::ListSchema
+                    | IrType::Closure => self.ctx.i32_type().into(),
                     other => {
                         return Err(LlvmError::Codegen(format!(
                             "LetGet({idx}): unsupported type {other:?}"
@@ -1399,6 +1658,31 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 } else {
                     self.emit_call(&ip_hint, *fn_index, *arg_count, param_tys, *ret_ty)?
                 }
+            }
+
+            // ---- Phase F.W7: anon-Dict-return record ops ----
+            // The IR lowering pass uses `AllocRootRecord` to bind a
+            // per-record-local i32 alloca to `0` (the root sits at
+            // `out_ptr + 0`); subsequent `StoreFieldAtRecord` ops use
+            // the alloca-resident offset to compute the destination
+            // address in the output buffer's fixed area.
+            Op::AllocRootRecord { record_local_idx } => {
+                self.emit_alloc_root_record(*record_local_idx)?
+            }
+            Op::StoreFieldAtRecord {
+                record_local_idx,
+                offset,
+                ty,
+            } => self.emit_store_field_at_record(&ip_hint, *record_local_idx, *offset, *ty)?,
+
+            // ---- Phase F.W7: closure-as-value primitives ----
+            Op::MakeClosure {
+                fn_table_idx,
+                captures,
+                captures_size,
+            } => self.emit_make_closure(&ip_hint, *fn_table_idx, captures, *captures_size)?,
+            Op::CallClosure { param_tys, ret_ty } => {
+                self.emit_call_closure(&ip_hint, param_tys, *ret_ty)?
             }
 
             other => {
@@ -1750,7 +2034,10 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             | IrType::String
             | IrType::ListInt
             | IrType::ListFloat
-            | IrType::ListBool => 32,
+            | IrType::ListBool
+            | IrType::ListString
+            | IrType::ListSchema
+            | IrType::Closure => 32,
             other => {
                 return Err(LlvmError::Codegen(format!(
                     "let-slot coerce: unsupported target type {other:?}"
@@ -2637,6 +2924,553 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     fn emit_alloc_scratch_dyn(&mut self, ip_hint: &str) -> Result<(), LlvmError> {
         let size = self.pop_int(ip_hint)?;
         self.emit_alloc_scratch_common(size)
+    }
+
+    /// Resolve / create the i32 alloca backing an
+    /// `Op::AllocRootRecord` / `Op::AllocSubRecord` record-local
+    /// index. Each variable holds an out_ptr-relative i32 offset.
+    /// Mirrors cranelift's `get_or_create_record_local`.
+    fn get_or_create_record_local(&mut self, idx: u32) -> Result<PointerValue<'ctx>, LlvmError> {
+        if let Some(p) = self.record_locals.get(&idx).copied() {
+            return Ok(p);
+        }
+        let i32_t = self.ctx.i32_type();
+        let name = self.next_name("record_local");
+        let slot = self
+            .builder
+            .build_alloca(i32_t, &name)
+            .map_err(|e| LlvmError::Codegen(format!("record_local alloca: {e}")))?;
+        self.record_locals.insert(idx, slot);
+        Ok(slot)
+    }
+
+    /// Lower `Op::AllocRootRecord { record_local_idx }`. The root
+    /// record sits at `out_ptr + 0`; bind the record-local to constant
+    /// `i32 0`. Subsequent `Op::StoreFieldAtRecord` ops uniformly
+    /// compute `out_ptr + record_local + offset` from this slot.
+    /// Mirrors cranelift's `emit_alloc_root_record`.
+    fn emit_alloc_root_record(&mut self, idx: u32) -> Result<(), LlvmError> {
+        let slot = self.get_or_create_record_local(idx)?;
+        let zero = self.ctx.i32_type().const_zero();
+        self.builder
+            .build_store(slot, zero)
+            .map_err(|e| LlvmError::Codegen(format!("AllocRootRecord store: {e}")))?;
+        Ok(())
+    }
+
+    /// Lower `Op::StoreFieldAtRecord { record_local_idx, offset, ty }`.
+    /// Pops the top of the operand stack and writes it into
+    /// `out_ptr + record_local + offset`. Mirrors cranelift's
+    /// `emit_store_field_at_record` but without the explicit bounds
+    /// check (LLVM AOT relies on the host's arena sizing).
+    fn emit_store_field_at_record(
+        &mut self,
+        ip_hint: &str,
+        idx: u32,
+        offset: u32,
+        ty: IrType,
+    ) -> Result<(), LlvmError> {
+        let arena_base_ptr = self.arena_base_ptr.ok_or_else(|| {
+            LlvmError::Codegen("StoreFieldAtRecord outside buffer-protocol entry".into())
+        })?;
+        let value = self.pop_int(ip_hint)?;
+        let slot = self.record_locals.get(&idx).copied().ok_or_else(|| {
+            LlvmError::Codegen(format!(
+                "StoreFieldAtRecord({idx}) before matching AllocRootRecord"
+            ))
+        })?;
+        let i32_t = self.ctx.i32_type();
+        let i64_t = self.ctx.i64_type();
+        let i8_t = self.ctx.i8_type();
+        // Read the record-local offset, add `offset`, add `out_ptr`,
+        // then z-extend the sum into the i64 arena GEP index.
+        let record_base = self
+            .builder
+            .build_load(i32_t, slot, "record_base")
+            .map_err(|e| LlvmError::Codegen(format!("record_base load: {e}")))?
+            .into_int_value();
+        let off_const = i32_t.const_int(u64::from(offset), false);
+        let slot_off = self
+            .builder
+            .build_int_add(record_base, off_const, "record_slot_off")
+            .map_err(|e| LlvmError::Codegen(format!("record_slot_off: {e}")))?;
+        let out_ptr_i32 = self.lookup_param(2)?; // IR LocalGet(2) == out_ptr under buffer protocol
+        let total_off = self
+            .builder
+            .build_int_add(out_ptr_i32, slot_off, "record_total_off")
+            .map_err(|e| LlvmError::Codegen(format!("record_total_off: {e}")))?;
+        let total_off64 = self
+            .builder
+            .build_int_z_extend(total_off, i64_t, "record_total_off_zext")
+            .map_err(|e| LlvmError::Codegen(format!("record_total_off zext: {e}")))?;
+        let addr = unsafe {
+            self.builder
+                .build_in_bounds_gep(i8_t, arena_base_ptr, &[total_off64], "record_dst")
+                .map_err(|e| LlvmError::Codegen(format!("record_dst GEP: {e}")))?
+        };
+        // Emit the typed store. For `Bool` / `Null`, narrow the i32
+        // stack slot to i8 before writing — matches the on-wire
+        // record layout. For pointer-indirect types (`String`,
+        // `List*`) the slot stores the i32 buffer-relative offset
+        // verbatim.
+        match ty {
+            IrType::I64 => {
+                self.builder
+                    .build_store(addr, value)
+                    .map_err(|e| LlvmError::Codegen(format!("StoreFieldAtRecord I64: {e}")))?;
+            }
+            IrType::F64 => {
+                // Stack carries f64 as bit-cast i64; restore the f64
+                // payload for the store so the destination bytes
+                // match the IEEE-754 wire layout.
+                let f = self
+                    .builder
+                    .build_bit_cast(value, self.ctx.f64_type(), "record_f64_bitcast")
+                    .map_err(|e| LlvmError::Codegen(format!("F64 bitcast: {e}")))?;
+                self.builder
+                    .build_store(addr, f)
+                    .map_err(|e| LlvmError::Codegen(format!("StoreFieldAtRecord F64: {e}")))?;
+            }
+            IrType::I32
+            | IrType::String
+            | IrType::ListInt
+            | IrType::ListFloat
+            | IrType::ListBool
+            | IrType::ListString
+            | IrType::ListSchema
+            | IrType::Closure => {
+                self.builder
+                    .build_store(addr, value)
+                    .map_err(|e| LlvmError::Codegen(format!("StoreFieldAtRecord I32: {e}")))?;
+            }
+            IrType::Bool | IrType::Null => {
+                let v8 = self
+                    .builder
+                    .build_int_truncate(value, i8_t, "record_bool_trunc")
+                    .map_err(|e| {
+                        LlvmError::Codegen(format!("StoreFieldAtRecord Bool trunc: {e}"))
+                    })?;
+                self.builder
+                    .build_store(addr, v8)
+                    .map_err(|e| LlvmError::Codegen(format!("StoreFieldAtRecord Bool: {e}")))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Phase F.W7: lower `Op::MakeClosure { fn_table_idx, captures,
+    /// captures_size }`. Closure handle layout (8 bytes total):
+    ///   `[fn_table_idx: u32 LE][captures_ptr: u32 LE]`
+    ///
+    /// Steps:
+    ///   1. Alloc 8 bytes for the handle (arena-relative ptr ->
+    ///      `handle_ptr`).
+    ///   2. If `captures_size > 0`: alloc `captures_size` bytes for
+    ///      the captures struct (-> `captures_ptr`). For each
+    ///      capture, write the matching let-local value into the
+    ///      struct at the declared offset. **Self-recursion** is
+    ///      detected by a missing let_slot at MakeClosure time — the
+    ///      lowering pass places the self-binding's `LetSet` *after*
+    ///      MakeClosure, so the about-to-be-stored handle is the only
+    ///      value the captured slot could hold. We seed it with
+    ///      `handle_ptr` (the value the upcoming `LetSet` will stash)
+    ///      so the recursive call site reads back a live handle
+    ///      instead of zero (which would crash `CallClosure`'s
+    ///      indirect dispatch).
+    ///   3. Store `fn_table_idx` at `handle_ptr + 0`.
+    ///   4. Store `captures_ptr` (or 0) at `handle_ptr + 4`.
+    ///   5. Push `handle_ptr` as the i32 Closure handle.
+    fn emit_make_closure(
+        &mut self,
+        ip_hint: &str,
+        fn_table_idx: u32,
+        captures: &[relon_ir::ir::ClosureCapture],
+        captures_size: u32,
+    ) -> Result<(), LlvmError> {
+        let _ = ip_hint;
+        // Validate fn_table_idx against the closure table the emit
+        // pass seeded. The IR lowering numbers slots in source order;
+        // a slot >= table length means the lowering pass and emit
+        // pass disagree on closure count.
+        if (fn_table_idx as usize) >= self.closure_fn_table.len() {
+            return Err(LlvmError::Codegen(format!(
+                "MakeClosure fn_table_idx={fn_table_idx} out of range (closure_fn_table.len()={})",
+                self.closure_fn_table.len()
+            )));
+        }
+        // Step 1: alloc 8 bytes for the handle.
+        let i32_t = self.ctx.i32_type();
+        let eight = i32_t.const_int(8, false);
+        self.emit_alloc_scratch_common(eight)?;
+        let handle_ptr = self.pop_int("MakeClosure handle alloc")?;
+
+        // Step 2: alloc + populate the captures struct.
+        let captures_ptr = if captures_size > 0 {
+            let cs = i32_t.const_int(u64::from(captures_size), false);
+            self.emit_alloc_scratch_common(cs)?;
+            self.pop_int("MakeClosure captures alloc")?
+        } else {
+            i32_t.const_zero()
+        };
+
+        // Step 3: store fn_table_idx at handle_ptr + 0.
+        let fn_idx_v = i32_t.const_int(u64::from(fn_table_idx), false);
+        let handle_addr = self.arena_addr_i32(handle_ptr)?;
+        self.builder
+            .build_store(handle_addr, fn_idx_v)
+            .map_err(|e| LlvmError::Codegen(format!("MakeClosure fn_idx store: {e}")))?;
+
+        // Step 4: store captures_ptr at handle_ptr + 4.
+        let four = self.ctx.i32_type().const_int(4, false);
+        let handle_plus_4 = self
+            .builder
+            .build_int_add(handle_ptr, four, "handle_plus_4")
+            .map_err(|e| LlvmError::Codegen(format!("MakeClosure handle+4: {e}")))?;
+        let captures_slot_addr = self.arena_addr_i32(handle_plus_4)?;
+        self.builder
+            .build_store(captures_slot_addr, captures_ptr)
+            .map_err(|e| LlvmError::Codegen(format!("MakeClosure captures store: {e}")))?;
+
+        // Step 5: write each capture into the captures struct.
+        if captures_size > 0 {
+            for cap in captures {
+                // Determine the value to stash. If a let-slot exists
+                // for `cap.let_idx`, read it. Otherwise treat it as a
+                // self-recursive capture and use the handle_ptr we
+                // just allocated (matches what the immediately-
+                // following `LetSet { idx: cap.let_idx, ty: Closure }`
+                // will store).
+                let mapped_idx = self.remap_let_idx(cap.let_idx);
+                let cap_offset = self.ctx.i32_type().const_int(u64::from(cap.offset), false);
+                let cap_addr_i32 = self
+                    .builder
+                    .build_int_add(captures_ptr, cap_offset, "cap_off")
+                    .map_err(|e| LlvmError::Codegen(format!("MakeClosure cap off: {e}")))?;
+                let cap_addr = self.arena_addr_i32(cap_addr_i32)?;
+                let value: BasicValueEnum<'ctx> = if let Some((slot, slot_ty)) =
+                    self.let_slots.get(&mapped_idx).copied()
+                {
+                    let load_name = self.next_name("cap_load");
+                    let raw = self
+                        .builder
+                        .build_load(self.ir_ty_to_llvm_int(slot_ty)?, slot, &load_name)
+                        .map_err(|e| LlvmError::Codegen(format!("MakeClosure cap let load: {e}")))?
+                        .into_int_value();
+                    // Coerce to the capture's declared IR type
+                    // width — the let-slot may have stored a
+                    // wider value (e.g. i32 Closure stashed as
+                    // i32 already matches; widen-and-truncate is
+                    // a no-op).
+                    match cap.ty {
+                        IrType::I64 => {
+                            if raw.get_type().get_bit_width() < 64 {
+                                self.builder
+                                    .build_int_z_extend(raw, self.ctx.i64_type(), "cap_zext")
+                                    .map_err(|e| {
+                                        LlvmError::Codegen(format!("MakeClosure cap zext: {e}"))
+                                    })?
+                                    .into()
+                            } else {
+                                raw.into()
+                            }
+                        }
+                        IrType::F64 => {
+                            // Stack carries f64 bit-cast to i64;
+                            // store the bit pattern verbatim
+                            // (the load on the read side bit-
+                            // casts back).
+                            raw.into()
+                        }
+                        _ => {
+                            // Narrow to i32 if the let-slot
+                            // carries i64; cap.ty is one of the
+                            // 4-byte-wide variants.
+                            if raw.get_type().get_bit_width() > 32 {
+                                self.builder
+                                    .build_int_truncate(raw, self.ctx.i32_type(), "cap_trunc")
+                                    .map_err(|e| {
+                                        LlvmError::Codegen(format!("MakeClosure cap trunc: {e}"))
+                                    })?
+                                    .into()
+                            } else {
+                                raw.into()
+                            }
+                        }
+                    }
+                } else {
+                    // Self-recursive capture: the let-slot for
+                    // `mapped_idx` isn't initialised yet because
+                    // the lowering pass emits MakeClosure before
+                    // the matching `LetSet`. The captured value
+                    // is the closure handle itself — the same
+                    // value the upcoming `LetSet` will store —
+                    // so we stamp `handle_ptr` here. Only legal
+                    // when the capture's IR type is `Closure`
+                    // (anything else can't refer to a
+                    // not-yet-bound let-local in source).
+                    if cap.ty != IrType::Closure {
+                        return Err(LlvmError::Codegen(format!(
+                                "MakeClosure capture `let_idx={mapped_idx}` not yet bound but ty={:?} (expected Closure for self-recursion)",
+                                cap.ty
+                            )));
+                    }
+                    handle_ptr.into()
+                };
+                self.builder
+                    .build_store(cap_addr, value)
+                    .map_err(|e| LlvmError::Codegen(format!("MakeClosure cap store: {e}")))?;
+            }
+        }
+
+        // Step 6: push the handle_ptr.
+        self.push(handle_ptr, IrType::Closure);
+        Ok(())
+    }
+
+    /// Phase F.W7: lower `Op::CallClosure { param_tys, ret_ty }`.
+    /// Stack discipline: `[Closure, arg0, arg1, ...] -> [ret_ty]`.
+    ///
+    /// Pops user args (in reverse), pops the closure handle,
+    /// materialises `fn_table_idx` + `captures_ptr` from the handle,
+    /// looks up the matching `FunctionValue` through
+    /// `closure_fn_table[fn_table_idx]` via a switch, and invokes
+    /// the resolved function indirectly with
+    /// `(state, captures_ptr, args...)`.
+    fn emit_call_closure(
+        &mut self,
+        ip_hint: &str,
+        param_tys: &[IrType],
+        ret_ty: IrType,
+    ) -> Result<(), LlvmError> {
+        if self.closure_fn_table.is_empty() {
+            return Err(LlvmError::Codegen(
+                "Op::CallClosure but closure_fn_table is empty — module declared no lambdas".into(),
+            ));
+        }
+        let state_ptr = self.state_ptr.ok_or_else(|| {
+            LlvmError::Codegen("CallClosure outside buffer-protocol entry (no state)".into())
+        })?;
+        // Pop user args in reverse.
+        let mut user_args: Vec<IntValue<'ctx>> = Vec::with_capacity(param_tys.len());
+        for _ in 0..param_tys.len() {
+            user_args.push(self.pop_int(ip_hint)?);
+        }
+        user_args.reverse();
+
+        // Pop closure handle (i32 arena-relative offset).
+        let handle_ptr = self.pop_int(ip_hint)?;
+
+        // Load fn_table_idx (handle+0) and captures_ptr (handle+4).
+        let handle_addr = self.arena_addr_i32(handle_ptr)?;
+        let i32_t = self.ctx.i32_type();
+        let fn_idx_name = self.next_name("cc_fn_idx");
+        let fn_idx = self
+            .builder
+            .build_load(i32_t, handle_addr, &fn_idx_name)
+            .map_err(|e| LlvmError::Codegen(format!("CallClosure fn_idx load: {e}")))?
+            .into_int_value();
+        let four = i32_t.const_int(4, false);
+        let handle_plus_4 = self
+            .builder
+            .build_int_add(handle_ptr, four, "cc_handle_plus_4")
+            .map_err(|e| LlvmError::Codegen(format!("CallClosure handle+4: {e}")))?;
+        let cap_ptr_addr = self.arena_addr_i32(handle_plus_4)?;
+        let captures_ptr_name = self.next_name("cc_captures_ptr");
+        let captures_ptr = self
+            .builder
+            .build_load(i32_t, cap_ptr_addr, &captures_ptr_name)
+            .map_err(|e| LlvmError::Codegen(format!("CallClosure captures load: {e}")))?
+            .into_int_value();
+
+        // Coerce each user arg's LLVM type to the callee's expected
+        // shape (mirrors `emit_call`'s width-coercion path).
+        for (i, (slot, want_ty)) in user_args.iter_mut().zip(param_tys.iter()).enumerate() {
+            let want_width = match *want_ty {
+                IrType::I64 => 64,
+                IrType::I32
+                | IrType::Bool
+                | IrType::Null
+                | IrType::String
+                | IrType::ListInt
+                | IrType::ListFloat
+                | IrType::ListBool
+                | IrType::ListString
+                | IrType::ListSchema
+                | IrType::Closure => 32,
+                IrType::F64 => 64,
+            };
+            let have_width = slot.get_type().get_bit_width();
+            if have_width != want_width {
+                let target_ty = if want_width == 64 {
+                    self.ctx.i64_type()
+                } else {
+                    self.ctx.i32_type()
+                };
+                let coerced = if have_width < want_width {
+                    self.builder
+                        .build_int_z_extend(*slot, target_ty, "cc_arg_zext")
+                        .map_err(|e| {
+                            LlvmError::Codegen(format!("CallClosure arg #{i} zext: {e}"))
+                        })?
+                } else {
+                    self.builder
+                        .build_int_truncate(*slot, target_ty, "cc_arg_trunc")
+                        .map_err(|e| {
+                            LlvmError::Codegen(format!("CallClosure arg #{i} trunc: {e}"))
+                        })?
+                };
+                *slot = coerced;
+            }
+        }
+
+        // Dispatch through a switch over fn_table_idx → one direct
+        // call per lambda. This avoids needing a runtime function-
+        // pointer table at module scope (LLVM 18 + opaque pointers
+        // makes that doable but adds the burden of seeding the
+        // global at JIT-resolve time). The switch IR is tiny and
+        // LLVM's selectoptimize pass collapses it to a jump table /
+        // computed call when profitable.
+        let cur_bb = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| LlvmError::Codegen("CallClosure: builder has no insert block".into()))?;
+        let post_bb = self.ctx.append_basic_block(self.func, "cc_post");
+        // Pre-allocate the ret slot in the entry block so mem2reg can
+        // promote it across the switch joins.
+        let ret_slot = if !matches!(ret_ty, IrType::Null) {
+            let ret_llvm_ty = self.ir_ty_to_llvm_int(ret_ty)?;
+            let cur = self.builder.get_insert_block();
+            // Position at entry block start to place the alloca
+            // there; restore afterwards.
+            let entry_first = self.func.get_first_basic_block().ok_or_else(|| {
+                LlvmError::Codegen("CallClosure: function missing entry block".into())
+            })?;
+            // Insert before the first non-alloca instr — close enough
+            // for mem2reg.
+            if let Some(first) = entry_first.get_first_instruction() {
+                self.builder.position_before(&first);
+            } else {
+                self.builder.position_at_end(entry_first);
+            }
+            let slot = self
+                .builder
+                .build_alloca(ret_llvm_ty, "cc_ret_slot")
+                .map_err(|e| LlvmError::Codegen(format!("CallClosure ret_slot alloca: {e}")))?;
+            // Restore builder position.
+            if let Some(bb) = cur {
+                self.builder.position_at_end(bb);
+            }
+            Some(slot)
+        } else {
+            None
+        };
+
+        // Build cases: one BB per lambda.
+        let mut case_bbs: Vec<inkwell::basic_block::BasicBlock<'ctx>> =
+            Vec::with_capacity(self.closure_fn_table.len());
+        for slot in 0..self.closure_fn_table.len() {
+            let bb = self
+                .ctx
+                .append_basic_block(self.func, &format!("cc_case_{slot}"));
+            case_bbs.push(bb);
+        }
+        // Default trap block — execution reaches it only if the
+        // handle's fn_table_idx is out of range, which would mean
+        // memory corruption.
+        let default_bb = self.ctx.append_basic_block(self.func, "cc_default_trap");
+
+        // Position at the switch's current block and emit it.
+        self.builder.position_at_end(cur_bb);
+        let cases: Vec<(IntValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> = case_bbs
+            .iter()
+            .enumerate()
+            .map(|(i, bb)| (i32_t.const_int(i as u64, false), *bb))
+            .collect();
+        self.builder
+            .build_switch(fn_idx, default_bb, &cases)
+            .map_err(|e| LlvmError::Codegen(format!("CallClosure switch: {e}")))?;
+
+        // Per-case body: direct call to the matching lambda fn.
+        for (slot, case_bb) in case_bbs.iter().enumerate() {
+            self.builder.position_at_end(*case_bb);
+            let callee = self.closure_fn_table[slot];
+            // Build args: (state, captures_ptr, user_args...).
+            let mut call_args: Vec<BasicMetadataValueEnum<'ctx>> =
+                Vec::with_capacity(2 + user_args.len());
+            call_args.push(state_ptr.into());
+            call_args.push(captures_ptr.into());
+            for v in &user_args {
+                call_args.push((*v).into());
+            }
+            let name = self.next_name("cc_call");
+            let call_site = self
+                .builder
+                .build_call(callee, &call_args, &name)
+                .map_err(|e| LlvmError::Codegen(format!("CallClosure call: {e}")))?;
+            if let Some(slot) = ret_slot {
+                let v = match call_site.try_as_basic_value() {
+                    inkwell::values::ValueKind::Basic(v) => v,
+                    inkwell::values::ValueKind::Instruction(_) => {
+                        return Err(LlvmError::Codegen(
+                            "CallClosure: callee returned void but ret_ty != Null".into(),
+                        ));
+                    }
+                };
+                self.builder
+                    .build_store(slot, v)
+                    .map_err(|e| LlvmError::Codegen(format!("CallClosure ret store: {e}")))?;
+            }
+            self.builder
+                .build_unconditional_branch(post_bb)
+                .map_err(|e| LlvmError::Codegen(format!("CallClosure case br: {e}")))?;
+        }
+
+        // Default block: invoke llvm.trap and fall through to an
+        // `unreachable` so the verifier accepts the terminator.
+        self.builder.position_at_end(default_bb);
+        let trap = self.llvm_trap_fn.ok_or_else(|| {
+            LlvmError::Codegen("CallClosure default trap: llvm.trap not declared".into())
+        })?;
+        self.builder
+            .build_call(trap, &[], "cc_trap")
+            .map_err(|e| LlvmError::Codegen(format!("CallClosure trap call: {e}")))?;
+        self.builder
+            .build_unreachable()
+            .map_err(|e| LlvmError::Codegen(format!("CallClosure unreachable: {e}")))?;
+
+        // Continue with the post block; pop the result slot into the
+        // operand stack.
+        self.builder.position_at_end(post_bb);
+        if let Some(slot) = ret_slot {
+            let llvm_ty = self.ir_ty_to_llvm_int(ret_ty)?;
+            let name = self.next_name("cc_ret_load");
+            let v = self
+                .builder
+                .build_load(llvm_ty, slot, &name)
+                .map_err(|e| LlvmError::Codegen(format!("CallClosure ret load: {e}")))?
+                .into_int_value();
+            self.push(v, ret_ty);
+        }
+        Ok(())
+    }
+
+    /// Map an `IrType` to the LLVM int type used for the operand stack
+    /// representation. Used by `Op::MakeClosure` capture reads and
+    /// `Op::CallClosure` return loads.
+    fn ir_ty_to_llvm_int(&self, ty: IrType) -> Result<inkwell::types::IntType<'ctx>, LlvmError> {
+        match ty {
+            IrType::I64 | IrType::F64 => Ok(self.ctx.i64_type()),
+            IrType::I32
+            | IrType::Bool
+            | IrType::Null
+            | IrType::String
+            | IrType::ListInt
+            | IrType::ListFloat
+            | IrType::ListBool
+            | IrType::ListString
+            | IrType::ListSchema
+            | IrType::Closure => Ok(self.ctx.i32_type()),
+        }
     }
 
     /// Lower `Op::StrConcatN { operand_count }`. Pops N i32 arena

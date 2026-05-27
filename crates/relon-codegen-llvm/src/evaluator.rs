@@ -228,7 +228,25 @@ impl LlvmAotEvaluator {
         LlvmError,
     > {
         let ast = relon_parser::parse_document(src).map_err(|e| LlvmError::Parse(e.to_string()))?;
-        let analyzed = relon_analyzer::analyze(&ast);
+        // W7 closure-as-value (Phase F.W7): the production source
+        // `#main(Int n) -> Dict { #private fib: (k) => ..., result: fib(n) }`
+        // trips the v1.5 / v1.6 strict-mode type-surface diagnostics
+        // (`ClosureParamTypeMissing`, `ClosureReturnTypeUnknown`,
+        // `ExpressionTypeUnknown`) even though IR lowering accepts the
+        // shape via `lower_anon_dict_body`. Mirror the bytecode tier
+        // (`relon-bytecode::evaluator::from_source`): run the analyzer
+        // with `strict_mode: false` so the soft bans don't gate LLVM
+        // codegen. Hard structural errors (`UnknownTypeName`,
+        // `MainReturnTypeMismatch`, etc.) still surface as `Error`-
+        // severity diagnostics under non-strict mode and still gate the
+        // build below.
+        let analyzed = relon_analyzer::analyze_with_options(
+            &ast,
+            &relon_analyzer::AnalyzeOptions {
+                strict_mode: false,
+                ..Default::default()
+            },
+        );
         if analyzed.has_errors() {
             let err_count = analyzed
                 .diagnostics
@@ -314,25 +332,42 @@ impl LlvmAotEvaluator {
         // every dispatch so `Op::ConstString { idx }` resolves to a
         // stable arena-relative offset.
         let const_pool = ConstPool::from_module(&ir)?;
-        // Phase E.2: collect every IR sibling function (non-entry)
-        // so the LLVM emit pass can lower them alongside the entry.
-        // The entry's `Op::Call` lowering resolves user-defined
-        // sibling calls through the returned helper table.
+        // Phase E.2: collect every IR sibling function (non-entry,
+        // non-lambda) so the LLVM emit pass can lower them alongside
+        // the entry. The entry's `Op::Call` lowering resolves
+        // user-defined sibling calls through the returned helper
+        // table.
+        //
+        // Phase F.W7: collect the lambdas (funcs registered in
+        // `closure_table`) separately so the emit pass can apply the
+        // widened `(state, captures_ptr, ...params) -> ret` signature
+        // and seed the closure function-pointer table. The IR's
+        // `closure_table` maps a `fn_table_idx` to an `ir.funcs`
+        // index; we mirror that order so the emit pass's
+        // `closure_fn_table[fn_table_idx]` matches what `MakeClosure`
+        // references.
+        let lambda_ir_idx_set: std::collections::HashSet<u32> =
+            ir.closure_table.iter().copied().collect();
         let helpers: Vec<&relon_ir::ir::Func> = ir
             .funcs
             .iter()
             .enumerate()
-            .filter(|(i, _)| *i != entry_idx)
+            .filter(|(i, _)| *i != entry_idx && !lambda_ir_idx_set.contains(&(*i as u32)))
             .map(|(_, f)| f)
             .collect();
         let helper_ir_indices: Vec<u32> = ir
             .funcs
             .iter()
             .enumerate()
-            .filter(|(i, _)| *i != entry_idx)
+            .filter(|(i, _)| *i != entry_idx && !lambda_ir_idx_set.contains(&(*i as u32)))
             .map(|(i, _)| i as u32)
             .collect();
-        let (_llvm_fn, entry_shape, _helper_table) = emit_module_funcs(
+        let lambdas: Vec<&relon_ir::ir::Func> = ir
+            .closure_table
+            .iter()
+            .map(|&ir_idx| &ir.funcs[ir_idx as usize])
+            .collect();
+        let (_llvm_fn, entry_shape, _helper_table, _closure_fn_table) = emit_module_funcs(
             ctx_static,
             &module,
             entry,
@@ -340,6 +375,8 @@ impl LlvmAotEvaluator {
             &const_pool,
             &helpers,
             Some(&helper_ir_indices),
+            &lambdas,
+            &ir.closure_table,
         )?;
 
         // Phase D.1: attempt to emit the typed fast-path entry
