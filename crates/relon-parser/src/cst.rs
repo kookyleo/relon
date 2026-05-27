@@ -400,7 +400,7 @@ impl<'a> Parser<'a> {
             .unwrap_or(crate::DirectiveShape::Value);
         match shape {
             crate::DirectiveShape::Bare => {
-                // No body. `#private`, `#relaxed`, `#unstrict`, `#native`.
+                // No body. `#internal`, `#relaxed`, `#unstrict`, `#native`.
             }
             crate::DirectiveShape::Value => {
                 if self.is_attribute_body_start() {
@@ -483,7 +483,7 @@ impl<'a> Parser<'a> {
         // Optional `with { ... }` block — a structured method list.
         // The legacy `opt_parse_with_block` (`directive.rs`) drives the
         // shape: leading pragma stack (`#derive` / `#native` /
-        // `#private` / `#no_auto_derive`), then a `name<T>?(p: T,
+        // `#internal` / `#no_auto_derive`), then a `name<T>?(p: T,
         // ...) -> Ret (: body)?` declaration. We emit each method as
         // a SCHEMA_METHOD node so the typed-AST layer can read the
         // structure cheaply.
@@ -552,7 +552,7 @@ impl<'a> Parser<'a> {
         self.bump(); // {
         while !self.at(SyntaxKind::R_BRACE) && !self.at_end() {
             // Method declarations are introduced by either a pragma
-            // (`#derive` / `#native` / `#private` / `#no_auto_derive`)
+            // (`#derive` / `#native` / `#internal` / `#no_auto_derive`)
             // or directly by a method name. We greedily group leading
             // pragmas with the next method into one SCHEMA_METHOD node
             // — if no method follows (e.g. trailing schema-level
@@ -565,7 +565,7 @@ impl<'a> Parser<'a> {
                     let name = self.directive_name_after_hash();
                     if matches!(
                         name.as_deref(),
-                        Some("derive") | Some("native") | Some("private")
+                        Some("derive") | Some("native") | Some("internal")
                     ) {
                         had_method_pragma = true;
                     }
@@ -580,7 +580,7 @@ impl<'a> Parser<'a> {
                     // error to mirror the legacy "stray method pragma"
                     // diagnostic but keep parsing.
                     self.error(
-                        "expected method declaration after `#derive` / `#native` / `#private`",
+                        "expected method declaration after `#derive` / `#native` / `#internal`",
                     );
                 }
                 continue;
@@ -2093,7 +2093,7 @@ impl<'a> Parser<'a> {
 
     fn parse_dict_field(&mut self) {
         self.open(SyntaxKind::DICT_FIELD);
-        // Leading attributes (e.g. `#private` / `#expect "msg"` /
+        // Leading attributes (e.g. `#internal` / `#expect "msg"` /
         // `@currency("USD")`) stack above the pair's key. Same
         // shape the file root permits.
         while self.at(SyntaxKind::HASH) || self.at(SyntaxKind::AT) {
@@ -2815,9 +2815,9 @@ mod tests {
 
     #[test]
     fn bare_directive_does_not_consume_next_field() {
-        // `#private` is a bare directive; the IDENT after it must
+        // `#internal` is a bare directive; the IDENT after it must
         // belong to the next dict field, not to the directive body.
-        let src = "{ #private\n  field(s): s, next: 1 }";
+        let src = "{ #internal\n  field(s): s, next: 1 }";
         let parsed = parse_round_trip(src);
         assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
     }

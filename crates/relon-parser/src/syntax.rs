@@ -221,7 +221,7 @@ pub enum SyntaxKind {
     SCHEMA_WITH,
     /// One method declaration inside a [`SyntaxKind::SCHEMA_WITH`] block.
     /// Children: optional pragma directives (`#derive`, `#native`,
-    /// `#private`), an IDENT method name, optional `<T>` generics,
+    /// `#internal`), an IDENT method name, optional `<T>` generics,
     /// `CLOSURE_PARAM` list, a TYPE_NODE return type, and an
     /// expression body (omitted when `#native` is set).
     SCHEMA_METHOD,

@@ -117,7 +117,7 @@ pub struct Decorator {
 /// drives parser dispatch + analyzer / evaluator interpretation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectiveShape {
-    /// `#name` — no body. Example: `#private`.
+    /// `#name` — no body. Example: `#internal`.
     Bare,
     /// `#name <expr>` — single value. Example: `#default 0`,
     /// `#expect "msg"`, `#brand Color`.
@@ -314,7 +314,7 @@ pub struct SchemaMethod {
     /// the body lives in host Rust (registered via the schema-method
     /// host API). The parser leaves `body` `None` in this case.
     pub is_native: bool,
-    /// True when a `#private` pragma precedes this method. Private
+    /// True when a `#internal` pragma precedes this method. Internal
     /// methods are visible only from other method bodies on the same
     /// schema; script-level `value.method()` calls fail with
     /// `MethodNotFound` at the analyzer stage.

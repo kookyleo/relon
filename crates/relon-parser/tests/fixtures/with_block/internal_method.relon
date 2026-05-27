@@ -1,8 +1,8 @@
-// Phase A.1: #private 方法标记（决策 16）。schema-internal 可见。
+// Phase A.1: #internal 方法标记（决策 16）。schema-internal 可见。
 #schema Money { Int cents: * } with {
     format() -> String: self.amount_string()
 
-    #private
+    #internal
     amount_string() -> String: f"${self.cents}"
 }
 

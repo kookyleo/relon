@@ -114,7 +114,7 @@ impl Drop for RecoveringScope {
 // `prim::number::parse_number`, or `prim::string::parse_string` for
 // any production. The directive shape lookup
 // (`directive::directive_shape`) and the directive name constants
-// (`DERIVE` / `NATIVE` / `PRIVATE` / `NO_AUTO_DERIVE`) are still
+// (`DERIVE` / `NATIVE` / `INTERNAL` / `NO_AUTO_DERIVE`) are still
 // imported because they're stable lookup tables used by both the
 // CST builder and the lowering walker; they sit in `directive.rs`
 // purely for backwards-compat re-export to downstream crates
@@ -1446,7 +1446,7 @@ fn lower_schema_method(
             },
             rowan::NodeOrToken::Node(n) => match n.kind() {
                 SyntaxKind::DIRECTIVE => {
-                    // Pragma: `#derive C`, `#native`, `#private`, or
+                    // Pragma: `#derive C`, `#native`, `#internal`, or
                     // `#no_auto_derive C` (which is schema-level).
                     let dname = n
                         .children_with_tokens()
@@ -1458,7 +1458,7 @@ fn lower_schema_method(
                             derives.push(directive_constraint_name(&n)?);
                         }
                         Some(crate::directive::NATIVE) => is_native = true,
-                        Some(crate::directive::PRIVATE) => is_private = true,
+                        Some(crate::directive::INTERNAL) => is_private = true,
                         Some(crate::directive::NO_AUTO_DERIVE) => {
                             schema_no_auto_derives.push(directive_constraint_name(&n)?);
                         }
@@ -1522,7 +1522,7 @@ fn lower_schema_method(
 
 /// Locate the byte offset of the method-name IDENT inside a
 /// SCHEMA_METHOD node. Mirrors the legacy parser's `method_start`:
-/// skip leading pragma directives (`#derive` / `#native` / `#private`)
+/// skip leading pragma directives (`#derive` / `#native` / `#internal`)
 /// and their surrounding trivia, then return the first IDENT's start.
 /// Falls back to the SCHEMA_METHOD node's own start for shapes that
 /// don't carry an IDENT (parser-recovery cases).

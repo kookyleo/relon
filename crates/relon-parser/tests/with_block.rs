@@ -235,7 +235,7 @@ fn multi_param_method_parses() {
 }
 
 // -------------------------------------------------------------------
-// Phase A.1 fixtures — body-less #schema, #extend, #private.
+// Phase A.1 fixtures — body-less #schema, #extend, #internal.
 
 #[test]
 fn bodyless_primitive_schema_parses() {
@@ -309,8 +309,8 @@ fn extend_with_derive_parses() {
 }
 
 #[test]
-fn private_method_parses() {
-    let root = parse_or_panic("private_method");
+fn internal_method_parses() {
+    let root = parse_or_panic("internal_method");
     let body = first_schema_namebody(&root);
     let DirectiveBody::NameBody { methods, .. } = body else {
         panic!("expected NameBody");

@@ -2,7 +2,7 @@
 //!
 //! `#name` directives are the structural / declarative attributes of
 //! the language (imports, schemas, defaults, error messages, brand,
-//! privacy, the `#main(...)` entry signature). Host-registered only;
+//! internal-binding markers, the `#main(...)` entry signature). Host-registered only;
 //! no user-definable `#`. Each name dispatches to one of five fixed
 //! [`DirectiveShape`] forms — the CST parser uses
 //! [`directive_shape`] to choose its production path, and the typed
@@ -21,7 +21,7 @@ use crate::DirectiveShape;
 /// Canonical directive names. Centralizing the strings here lets
 /// downstream crates (`relon-analyzer`, `relon-evaluator`) refer to the
 /// same identifiers without maintaining their own private mirrors.
-pub const PRIVATE: &str = "private";
+pub const INTERNAL: &str = "internal";
 pub const DEFAULT: &str = "default";
 pub const EXPECT: &str = "expect";
 pub const MSG: &str = "msg";
@@ -70,9 +70,10 @@ pub const NATIVE: &str = "native";
 /// directive name. Visibility is tied to the file's `#import` chain
 /// (decision 9). Cannot re-declare X — only extend its method table.
 ///
-/// Note: method-level `#private` is the existing [`PRIVATE`] directive
-/// reused — `#private` was already a field-level visibility marker for
-/// schema bodies. In a `with { ... }` block, the same `#private`
+/// Note: method-level `#internal` is the existing [`INTERNAL`] directive
+/// reused — `#internal` already serves as a field-level marker that
+/// keeps a dict-body binding visible to siblings but hidden from the
+/// outer projection. In a `with { ... }` block, the same `#internal`
 /// directive marks a method as schema-internal (only callable from
 /// other method bodies on the same schema).
 pub const EXTEND: &str = "extend";
@@ -80,7 +81,7 @@ pub const EXTEND: &str = "extend";
 /// Directive name → expected shape. Dispatch happens by name; unknown
 /// `#name` produces a parse error.
 pub const DIRECTIVE_SHAPES: &[(&str, DirectiveShape)] = &[
-    (PRIVATE, DirectiveShape::Bare),
+    (INTERNAL, DirectiveShape::Bare),
     (DEFAULT, DirectiveShape::Value),
     (EXPECT, DirectiveShape::Value),
     (MSG, DirectiveShape::Value),
