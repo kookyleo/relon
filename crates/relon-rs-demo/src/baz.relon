@@ -1,0 +1,2 @@
+#main(String s) -> Bool
+s.contains("x")

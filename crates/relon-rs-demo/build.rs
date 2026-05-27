@@ -10,9 +10,11 @@ fn main() {
     let out_dir = std::env::var_os("OUT_DIR").expect("OUT_DIR must be set by cargo during build");
     relon_rs_build::Compiler::new()
         .source("src/foo.relon")
+        .source("src/bar.relon")
+        .source("src/baz.relon")
         .opt_level(3)
         .emit_all(&out_dir)
-        .expect("relon-rs-build: compile foo.relon");
+        .expect("relon-rs-build: compile demo sources");
 
     // The build script itself only needs to re-run when our own
     // source changes. Per-`.relon` rerun hooks are emitted by
