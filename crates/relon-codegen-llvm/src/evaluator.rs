@@ -405,6 +405,23 @@ impl LlvmAotEvaluator {
             .create_jit_execution_engine(OptimizationLevel::Aggressive)
             .map_err(|e| LlvmError::Codegen(format!("create_jit_execution_engine: {e}")))?;
 
+        // Phase F.1: wire the host shim that backs the LLVM AOT
+        // `contains(haystack, needle) -> Bool` fast path. The emitter
+        // declares this symbol with `Linkage::External` whenever a
+        // module references it; MCJIT needs an explicit address
+        // mapping because the default resolver (`dlsym`) cannot see
+        // statics from inside the current dylib's strip-able section
+        // layout. We register unconditionally — if the module never
+        // referenced the symbol the mapping is a no-op.
+        if let Some(shim_fn) =
+            module.get_function(crate::str_helpers::RELON_LLVM_STR_CONTAINS_ARENA_SYMBOL)
+        {
+            engine.add_global_mapping(
+                &shim_fn,
+                crate::str_helpers::relon_llvm_str_contains_arena_addr(),
+            );
+        }
+
         let entry_ptr = engine.get_function_address(ENTRY_SYMBOL).map_err(|e| {
             LlvmError::Codegen(format!(
                 "ExecutionEngine could not resolve `{ENTRY_SYMBOL}`: {e}"

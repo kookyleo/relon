@@ -453,6 +453,7 @@ fn emit_helper_body<'ctx>(
     let mut emit = Emit::new(
         ctx,
         &builder,
+        module,
         llvm_fn,
         EntryShape::LegacyI64,
         /*arena_base_ptr=*/ None,
@@ -541,6 +542,7 @@ pub(crate) fn emit_fast_entry<'ctx>(
     let mut emit = Emit::new(
         ctx,
         &builder,
+        module,
         llvm_fn,
         EntryShape::LegacyI64,
         /*arena_base_ptr=*/ None,
@@ -632,6 +634,7 @@ fn emit_legacy_entry_impl<'ctx>(
     let mut emit = Emit::new(
         ctx,
         &builder,
+        module,
         llvm_fn,
         EntryShape::LegacyI64,
         None,
@@ -764,6 +767,7 @@ fn emit_buffer_entry_impl<'ctx>(
     let mut emit = Emit::new(
         ctx,
         &builder,
+        module,
         llvm_fn,
         EntryShape::Buffer,
         Some(arena_base_ptr),
@@ -801,6 +805,14 @@ struct Emit<'ctx, 'b, 'cp> {
     ctx: &'ctx Context,
     builder: &'b Builder<'ctx>,
     func: FunctionValue<'ctx>,
+    /// Phase F.1: cached module reference so per-op lowering can
+    /// declare extern symbols (the F.1 `str.contains` host shim) on
+    /// demand without threading the module through every helper. The
+    /// reference is borrowed for the emit pass only; `inkwell` keeps
+    /// `Module` and `FunctionValue` lifetimes orthogonal so a borrow
+    /// here doesn't conflict with the surrounding `add_function`
+    /// calls in the entry/helper emit paths.
+    module: &'b LlvmModule<'ctx>,
     shape: EntryShape,
     /// Cached `arena_base` pointer for the buffer-protocol entry.
     /// `None` for the legacy entry shape — `LoadField` / `StoreField`
@@ -960,6 +972,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     fn new(
         ctx: &'ctx Context,
         builder: &'b Builder<'ctx>,
+        module: &'b LlvmModule<'ctx>,
         func: FunctionValue<'ctx>,
         shape: EntryShape,
         arena_base_ptr: Option<PointerValue<'ctx>>,
@@ -971,6 +984,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             ctx,
             builder,
             func,
+            module,
             shape,
             arena_base_ptr,
             state_ptr,
@@ -1309,7 +1323,27 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 ret_ty,
             } => {
                 let stdlib_count = relon_ir::stdlib::stdlib_function_count();
-                if *fn_index < stdlib_count {
+                // Phase F.1: `contains(haystack, needle) -> Bool` short-
+                // circuit. The bundled stdlib body is a hand-transcribed
+                // O(s_len * p_len) byte scan that defeats LLVM's auto-
+                // vectoriser on the inner compare loop (every iter
+                // reloads the needle bytes through a let-slot). On the
+                // W4 / W4_long cmp_lua rows that turns into a 3.4× /
+                // 256× gap vs LuaJIT (which uses SIMD-accelerated
+                // `string.find`). Route the call through the host shim
+                // `relon_llvm_str_contains_arena` which defers to
+                // `core::str::contains` — std's substring search backs
+                // single-byte needles with SIMD `memchr` and uses a
+                // Two-Way matcher for longer needles, closing the gap
+                // without inventing a Relon-specific SIMD path.
+                if *fn_index < stdlib_count
+                    && relon_ir::stdlib::stdlib_function_index("contains") == Some(*fn_index)
+                    && *arg_count == 2
+                    && param_tys == &[IrType::String, IrType::String]
+                    && *ret_ty == IrType::Bool
+                {
+                    self.emit_str_contains_extern(&ip_hint)?;
+                } else if *fn_index < stdlib_count {
                     self.emit_call_stdlib(&ip_hint, *fn_index, *arg_count, param_tys, *ret_ty)?
                 } else {
                     self.emit_call(&ip_hint, *fn_index, *arg_count, param_tys, *ret_ty)?
@@ -2919,5 +2953,91 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .into_int_value();
         self.push(v, ret_ty);
         Ok(())
+    }
+
+    /// Phase F.1: lower `contains(haystack: String, needle: String) ->
+    /// Bool` by emitting a direct extern call to
+    /// `relon_llvm_str_contains_arena` instead of inlining the bundled
+    /// stdlib body. See the `str_helpers` module docs for the ABI and
+    /// the rationale (W4 / W4_long gap vs LuaJIT closed by std's
+    /// SIMD-backed `str::contains`).
+    ///
+    /// Operand stack contract: pops `needle_off` (top), then
+    /// `haystack_off`. Pushes the i32 0/1 result tagged as
+    /// [`IrType::Bool`] so downstream `If` / `BrIf` ops see the same
+    /// width the inlined body would have produced.
+    fn emit_str_contains_extern(&mut self, ip_hint: &str) -> Result<(), LlvmError> {
+        // Pop in reverse order: IR pushes `[haystack, needle]`, so the
+        // top-of-stack is the needle. We need to materialise the
+        // pointers in declaration order (haystack first) for the call,
+        // so collect the offsets first and resolve to pointers below.
+        let needle_off = self.pop_int(ip_hint)?;
+        let haystack_off = self.pop_int(ip_hint)?;
+
+        // GEP into the cached arena base. Mirrors `emit_load_at_absolute`
+        // / `emit_str_concat_n` — both produce `arena_base + off_i32`
+        // pointers the inner ops then read through. The shim consumes
+        // raw `*const u8` headers, so we hand the GEP result directly.
+        let haystack_ptr = self.arena_addr_i32(haystack_off)?;
+        let needle_ptr = self.arena_addr_i32(needle_off)?;
+
+        // Declare (or look up) the extern shim. Idempotent so multiple
+        // `contains` call sites in the same module share a single
+        // declaration — LLVM's verifier rejects duplicate function
+        // definitions but happily reuses an existing extern.
+        let shim = self.declare_str_contains_extern();
+
+        let call_name = self.next_name("str_contains_extern");
+        let call_site = self
+            .builder
+            .build_call(
+                shim,
+                &[
+                    BasicMetadataValueEnum::PointerValue(haystack_ptr),
+                    BasicMetadataValueEnum::PointerValue(needle_ptr),
+                ],
+                &call_name,
+            )
+            .map_err(|e| LlvmError::Codegen(format!("str_contains call: {e}")))?;
+
+        let ret_val = match call_site.try_as_basic_value() {
+            inkwell::values::ValueKind::Basic(v) => v,
+            inkwell::values::ValueKind::Instruction(_) => {
+                return Err(LlvmError::Codegen(
+                    "relon_llvm_str_contains_arena returned void; expected i32".into(),
+                ));
+            }
+        };
+        let ret_i32 = match ret_val {
+            BasicValueEnum::IntValue(v) => v,
+            other => {
+                return Err(LlvmError::Codegen(format!(
+                    "relon_llvm_str_contains_arena returned non-int {other:?}"
+                )));
+            }
+        };
+        // Bool is encoded as i32 (0 / 1) across the LLVM AOT envelope,
+        // matching what the inlined `contains_string_body` would have
+        // produced through `Op::Ne(I32)` against `0`. No truncation /
+        // sign-extension needed — the shim returns the same 0/1 i32
+        // shape downstream `BrIf` / `Eq(Bool)` consumers expect.
+        self.push(ret_i32, IrType::Bool);
+        Ok(())
+    }
+
+    /// Idempotent declaration of the
+    /// [`crate::str_helpers::relon_llvm_str_contains_arena`] extern.
+    /// Returns the cached `FunctionValue` so callers can issue
+    /// `build_call` without re-parsing the signature on every call site.
+    fn declare_str_contains_extern(&self) -> FunctionValue<'ctx> {
+        let sym = crate::str_helpers::RELON_LLVM_STR_CONTAINS_ARENA_SYMBOL;
+        if let Some(f) = self.module.get_function(sym) {
+            return f;
+        }
+        let i32_t = self.ctx.i32_type();
+        let ptr_t = self.ctx.ptr_type(AddressSpace::default());
+        let fn_ty = i32_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
+        self.module
+            .add_function(sym, fn_ty, Some(Linkage::External))
     }
 }

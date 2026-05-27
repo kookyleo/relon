@@ -67,3 +67,34 @@ fn w4_string_contains_ten() {
 fn w4_string_contains_thousand() {
     assert_eq!(run_int(W4_SRC, 1000), Value::Int(1000));
 }
+
+/// Phase F.1 guard: the W4 module must lower `s.contains(needle)` to a
+/// direct call into the host SIMD-backed shim. The bundled stdlib body
+/// is a naive O(s_len * p_len) byte scan — if the emitter regresses to
+/// inlining it, the W4 / W4_long cmp_lua rows blow back out to the
+/// pre-Phase-F.1 gap vs LuaJIT. Asserting on the IR dump keeps the
+/// regression observable without depending on a wall-clock measurement.
+#[test]
+fn w4_ir_dumps_str_contains_extern_call() {
+    let ev =
+        relon_codegen_llvm::LlvmAotEvaluator::from_source(W4_SRC).expect("LLVM AOT from_source");
+    let dump = ev.emit_ir_dump();
+    assert!(
+        dump.contains("relon_llvm_str_contains_arena"),
+        "W4 IR dump must mention the F.1 host shim; got:\n{dump}"
+    );
+    // The naive byte-scan inlining produces a tight inner loop of
+    // `load i8` ops — when the emitter routes through the extern it
+    // emits a single `call i32 @relon_llvm_str_contains_arena` instead.
+    // We check for the `call` form rather than the absence of `load i8`
+    // because the surrounding range/filter loop body still issues plain
+    // i8 loads through other ops (the const-pool layout).
+    let call_count = dump
+        .matches("call i32 @relon_llvm_str_contains_arena")
+        .count();
+    assert!(
+        call_count >= 1,
+        "expected at least one direct call to the str_contains extern; \
+         got dump:\n{dump}"
+    );
+}

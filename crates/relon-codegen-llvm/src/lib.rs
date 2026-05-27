@@ -80,6 +80,7 @@ mod emitter;
 mod error;
 mod evaluator;
 mod state;
+mod str_helpers;
 
 pub use error::LlvmError;
 pub use evaluator::LlvmAotEvaluator;
