@@ -2902,24 +2902,27 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // ops match the production stdlib chain but skip the
         // BcOp -> IR Op converter, so the timing is a lower-bound floor
         // on what the auto path will deliver once it lands.
-        group.bench_function(BenchmarkId::new("W2_f64_dot", "relon_trace_jit_fixture"), |b| {
-            b.iter_custom(|iters| {
-                let args: [u64; 1] = warm_args_w2;
-                let args_ptr = args.as_ptr();
-                let expected = w2_expected() as u64;
-                timed_with_warmup(iters, || {
-                    let v = unsafe {
-                        w2_jit_state.invoke_with_fallback(
-                            W2_REC_FN_ID,
-                            black_box(args_ptr),
-                            64,
-                            |_args| expected,
-                        )
-                    };
-                    black_box(v);
-                })
-            });
-        });
+        group.bench_function(
+            BenchmarkId::new("W2_f64_dot", "relon_trace_jit_fixture"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let args: [u64; 1] = warm_args_w2;
+                    let args_ptr = args.as_ptr();
+                    let expected = w2_expected() as u64;
+                    timed_with_warmup(iters, || {
+                        let v = unsafe {
+                            w2_jit_state.invoke_with_fallback(
+                                W2_REC_FN_ID,
+                                black_box(args_ptr),
+                                64,
+                                |_args| expected,
+                            )
+                        };
+                        black_box(v);
+                    })
+                });
+            },
+        );
         group.bench_function(BenchmarkId::new("W2_f64_dot", "luajit"), |b| {
             b.iter_custom(|iters| {
                 timed_with_warmup(iters, || {
@@ -4180,27 +4183,30 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // auto recorder. Per-iter ops match the production source
         // (`#main(Int x) -> Int\nx + 1`) byte-for-byte but the install
         // route skips the BcOp -> IR Op converter.
-        group.bench_function(BenchmarkId::new("W12_p99_tail", "relon_trace_jit_fixture"), |b| {
-            // Hoist the args slot out of the inner closure so the
-            // per-iter cost is just `invoke_with_fallback` dispatch
-            // + the 4-op trace body. Mirrors the W5 / W6 trace_jit
-            // rows. We pass `7` through `black_box` to defeat
-            // constant-fold + match the host-observable timing of
-            // an opaque `x = 7` invoke.
-            let args: [u64; 1] = [7];
-            let args_ptr = args.as_ptr();
-            b.iter(|| {
-                let v = unsafe {
-                    w12_jit_state.invoke_with_fallback(
-                        W12_REC_FN_ID,
-                        black_box(args_ptr),
-                        64,
-                        |a| *a + 1,
-                    )
-                };
-                black_box(v);
-            });
-        });
+        group.bench_function(
+            BenchmarkId::new("W12_p99_tail", "relon_trace_jit_fixture"),
+            |b| {
+                // Hoist the args slot out of the inner closure so the
+                // per-iter cost is just `invoke_with_fallback` dispatch
+                // + the 4-op trace body. Mirrors the W5 / W6 trace_jit
+                // rows. We pass `7` through `black_box` to defeat
+                // constant-fold + match the host-observable timing of
+                // an opaque `x = 7` invoke.
+                let args: [u64; 1] = [7];
+                let args_ptr = args.as_ptr();
+                b.iter(|| {
+                    let v = unsafe {
+                        w12_jit_state.invoke_with_fallback(
+                            W12_REC_FN_ID,
+                            black_box(args_ptr),
+                            64,
+                            |a| *a + 1,
+                        )
+                    };
+                    black_box(v);
+                });
+            },
+        );
         group.bench_function(BenchmarkId::new("W12_p99_tail", "luajit"), |b| {
             b.iter(|| {
                 let r: i64 = lua_fn_w12.call(black_box(7i64)).unwrap();
@@ -4430,7 +4436,12 @@ fn bench_cmp_lua(c: &mut Criterion) {
                     // Equivalence with the `relon_llvm_aot` row is
                     // checked by a one-shot consistency run that
                     // walks both paths and asserts identical
-                    // `Value::Int` output.
+                    // i64 output. Phase D.2 (2026-05-27) widens the
+                    // fast envelope to single-Int-field anon-Dict
+                    // returns (W7's `{ result: Int }`); the cross-
+                    // check unwraps the `Value::Dict` to the same
+                    // scalar so the assertion still gates on the
+                    // observable scalar match.
                     if ev.has_fast_path() {
                         // Pull the i64 scalar arg out of
                         // `args_factory` once. The canonical panel's
@@ -4457,6 +4468,17 @@ fn bench_cmp_lua(c: &mut Criterion) {
                                 });
                             let slow = match ev.run_main(args_factory()).unwrap() {
                                 Value::Int(n) => n,
+                                // Phase D.2: single-Int-field anon-Dict
+                                // return (W7). Unwrap to the same i64
+                                // the fast path produces so the
+                                // cross-check stays a scalar equality.
+                                Value::Dict(d) if d.map.len() == 1 => match d.map.values().next() {
+                                    Some(Value::Int(n)) => *n,
+                                    other => panic!(
+                                        "[cmp_lua {label}] relon_llvm_aot_fast cross-check: \
+                                             single-field dict has non-Int value {other:?}"
+                                    ),
+                                },
                                 other => panic!(
                                     "[cmp_lua {label}] relon_llvm_aot_fast cross-check: \
                                      run_main returned {other:?}"
