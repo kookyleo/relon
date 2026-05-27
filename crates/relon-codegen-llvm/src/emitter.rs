@@ -378,8 +378,23 @@ pub(crate) fn emit_module_funcs<'ctx>(
     // sibling helper (Phase E.2 cross-call). They also share the
     // `closure_fn_table` so a nested `Op::MakeClosure` resolves the
     // matching lambda FunctionValue from its `fn_table_idx`.
+    //
+    // Build the module-wide self-capture table once before emitting
+    // lambda bodies. The table maps each lambda's `fn_table_idx` to
+    // the captures-struct offsets that hold self-recursive handles
+    // (i.e. handles whose `captures_ptr` field equals the lambda's
+    // own captures_ptr arg). The lambda-body emit uses this table to
+    // stamp [`Provenance::OwnCaptureHandle`] on the matching capture
+    // loads so the recursive call site can pick the direct-call fast
+    // path. Empty for modules that have no self-recursive closures.
+    let self_capture_table = build_self_capture_table(entry, helpers, lambdas);
     for (slot, lambda) in lambdas.iter().enumerate() {
         let lambda_fn = closure_fn_table[slot];
+        let slot_u32 = slot as u32;
+        let offsets = self_capture_table
+            .get(&slot_u32)
+            .cloned()
+            .unwrap_or_default();
         emit_lambda_body(
             ctx,
             module,
@@ -388,10 +403,82 @@ pub(crate) fn emit_module_funcs<'ctx>(
             const_pool,
             &helper_table,
             &closure_fn_table,
+            &offsets,
         )?;
     }
 
     Ok((entry_fn, shape, helper_table, closure_fn_table))
+}
+
+/// Phase F.W7 self-recursion fast path: scan every IR function body
+/// (entry + helpers + lambdas) for the canonical
+/// `Op::MakeClosure { fn_table_idx, captures } ; Op::LetSet { idx, ty:
+/// Closure }` pair and collect the captures whose `let_idx` matches the
+/// `LetSet`'s `idx` — those are the self-recursive captures stamped by
+/// `lower_closure_as_value`'s "let-slot not yet bound" branch.
+///
+/// Returns `fn_table_idx -> [(capture_offset, self_fn_table_idx)]` so
+/// the lambda body emitter can stamp the matching
+/// [`Provenance::OwnCaptureHandle`] on each capture load.
+///
+/// The scan tolerates intervening ops between `MakeClosure` and
+/// `LetSet` (none are emitted today; future lowering passes that
+/// interleave additional setup ops would still be matched). It bails
+/// silently on patterns it can't recognise — the fast path stays
+/// opt-in and the slow-path `emit_call_closure` keeps working
+/// regardless.
+fn build_self_capture_table(
+    entry: &Func,
+    helpers: &[&Func],
+    lambdas: &[&Func],
+) -> HashMap<u32, Vec<(u32, u32)>> {
+    let mut table: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+
+    let scan = |func: &Func, table: &mut HashMap<u32, Vec<(u32, u32)>>| {
+        let ops = &func.body;
+        for (i, tagged) in ops.iter().enumerate() {
+            // Find a MakeClosure immediately followed by a matching
+            // `LetSet { ty: Closure }`. The IR lowering pass emits
+            // these adjacently (see `lower_anon_dict_body` /
+            // `lower_closure_as_value`); intervening ops break the
+            // simple match and the slow-path dispatch keeps working.
+            let Op::MakeClosure {
+                fn_table_idx,
+                ref captures,
+                ..
+            } = tagged.op
+            else {
+                continue;
+            };
+            let Some(next) = ops.get(i + 1) else {
+                continue;
+            };
+            let Op::LetSet {
+                idx,
+                ty: relon_ir::ir::IrType::Closure,
+            } = next.op
+            else {
+                continue;
+            };
+            for cap in captures {
+                if cap.let_idx == idx && matches!(cap.ty, relon_ir::ir::IrType::Closure) {
+                    table
+                        .entry(fn_table_idx)
+                        .or_default()
+                        .push((cap.offset, fn_table_idx));
+                }
+            }
+        }
+    };
+
+    scan(entry, &mut table);
+    for h in helpers {
+        scan(h, &mut table);
+    }
+    for l in lambdas {
+        scan(l, &mut table);
+    }
+    table
 }
 
 /// Declare a sibling helper function's LLVM signature without emitting
@@ -603,6 +690,7 @@ fn emit_helper_body<'ctx>(
 ///   `Op::MakeClosure` / `Op::CallClosure` ops inside the lambda body
 ///   keep resolving against the same module-wide lambda set the entry
 ///   uses.
+#[allow(clippy::too_many_arguments)]
 fn emit_lambda_body<'ctx>(
     ctx: &'ctx Context,
     module: &LlvmModule<'ctx>,
@@ -611,6 +699,7 @@ fn emit_lambda_body<'ctx>(
     const_pool: &ConstPool,
     helper_table: &HashMap<u32, FunctionValue<'ctx>>,
     closure_fn_table: &[FunctionValue<'ctx>],
+    self_capture_offsets: &[(u32, u32)],
 ) -> Result<(), LlvmError> {
     let entry_bb = ctx.append_basic_block(llvm_fn, "entry");
     let builder = ctx.create_builder();
@@ -647,6 +736,18 @@ fn emit_lambda_body<'ctx>(
         .build_int_to_ptr(arena_base_int, ptr_t, "lambda_arena_base_ptr")
         .map_err(|e| LlvmError::Codegen(format!("lambda arena_base inttoptr: {e}")))?;
 
+    // Stash the captures_ptr LLVM param (param 1) so the self-recursion
+    // fast path in `emit_call_closure` can reuse it directly instead
+    // of round-tripping through a `captures_ptr` field load on every
+    // recursion. The lambda signature pins this to LLVM param 1 (param
+    // 0 is `*state`) — see `declare_lambda_function`.
+    let captures_ptr_param = llvm_fn
+        .get_nth_param(1)
+        .ok_or_else(|| {
+            LlvmError::Codegen(format!("lambda `{}` missing captures_ptr param", func.name))
+        })?
+        .into_int_value();
+
     let mut emit = Emit::new(
         ctx,
         &builder,
@@ -667,6 +768,8 @@ fn emit_lambda_body<'ctx>(
     // type so the dispatcher knows what LLVM `ret` shape to emit.
     emit.helper_ret_ty = Some(func.ret);
     emit.llvm_trap_fn = Some(declare_llvm_trap(ctx, module));
+    emit.self_capture_offsets = self_capture_offsets.to_vec();
+    emit.captures_ptr_param = Some(captures_ptr_param);
     emit.lower_body(&func.body)?;
     Ok(())
 }
@@ -1153,6 +1256,41 @@ struct Emit<'ctx, 'b, 'cp> {
     /// `LocalGet` / `LetGet` / any non-`ConstString` producer — those
     /// fall through to the existing extern path.
     last_const_string: Option<Vec<u8>>,
+    /// Phase F.W7 self-recursion fast path: per-lambda map of captures
+    /// struct offsets that hold a self-recursive closure handle, keyed
+    /// by the `fn_table_idx` of the enclosing lambda. Populated only
+    /// for lambda bodies (the entry / helpers leave it empty); the
+    /// scanner in `build_self_capture_table` correlates each
+    /// `Op::MakeClosure` in the entry with the immediately following
+    /// `LetSet { idx, ty: Closure }` to identify captures whose
+    /// `cap.let_idx == idx` (i.e. the binding being assigned right
+    /// after MakeClosure — the canonical IR shape for a self-recursive
+    /// closure-as-value let). The value `Vec<(offset,
+    /// self_fn_table_idx)>` lets the lambda-prologue `Op::LocalGet(0);
+    /// Op::LoadI32AtAbsolute { offset }` chain stamp the matching
+    /// [`Provenance::OwnCaptureHandle`] on the produced handle so the
+    /// downstream `Op::CallClosure` can pick the direct-call fast path
+    /// (skip handle deref, skip switch, reuse the lambda's own
+    /// captures_ptr LLVM param 1). Empty when the lambda has no
+    /// self-recursive captures or when self-recursion detection is
+    /// unavailable (legacy / fixture entries that bypass the
+    /// MakeClosure → LetSet pattern).
+    self_capture_offsets: Vec<(u32, u32)>,
+    /// Phase F.W7 self-recursion fast path: let-slot indices that hold
+    /// a self-recursive closure handle along with the enclosing
+    /// lambda's `fn_table_idx`. Populated by `Op::LetSet` when the
+    /// stored value carries [`Provenance::OwnCaptureHandle`] so the
+    /// matching `Op::LetGet` can re-emit the provenance — this is what
+    /// lets the recursive `fib(k - 1)` call site (which always goes
+    /// through `LetGet`) keep the self-recursion fast path intact.
+    self_capture_let_slots: std::collections::HashMap<u32, (u32, u32)>,
+    /// Phase F.W7 self-recursion fast path: captures_ptr LLVM param
+    /// (param 1) of the enclosing lambda. Cached so the closure-call
+    /// emitter can pass it straight into the recursive call without
+    /// re-loading from the closure handle. `None` when emitting the
+    /// entry / a helper (not a lambda body) — the self-recursion fast
+    /// path is gated on this being `Some`.
+    captures_ptr_param: Option<IntValue<'ctx>>,
 }
 
 /// Phase E.1: per-call inline-frame state. One entry per active
@@ -1206,6 +1344,52 @@ struct TypedValue<'ctx> {
     /// support.
     #[allow(dead_code)]
     ty: IrType,
+    /// Provenance hint used by [`Emit::emit_call_closure`] to detect
+    /// self-recursive closure calls. Defaults to [`Provenance::None`]
+    /// for every push that doesn't go through the lambda-prologue
+    /// capture path; the closure-self-call fast path only fires when
+    /// the consumed handle's provenance points at one of the lambda's
+    /// own self-capture offsets.
+    prov: Provenance,
+}
+
+/// Tracks where an [`IntValue`] on the operand stack came from so the
+/// closure-call emitter can detect self-recursion without re-loading
+/// the handle's captures pointer through arena indirection.
+///
+/// The W7 production source's `fib` closure captures itself, so every
+/// recursive `fib(k - 1)` call site walks
+/// `captures_ptr -> self_handle -> captures_ptr_field -> direct call`.
+/// LLVM cannot fold the `captures_ptr_field` load back to the input
+/// `captures_ptr` because the chain crosses `MakeClosure` in another
+/// function (no IPA reach), so a pure post-O3 IR ends up with three
+/// arena loads per recursion (`~10 ns/call ≈ +170 µs` over `fib(22)`).
+///
+/// The provenance bits below are enough to short-circuit:
+///
+/// * `OwnCapturesPtr` — the value is the lambda's own captures_ptr arg
+///   (LLVM param 1). Produced by `Op::LocalGet(0)` inside a lambda.
+/// * `OwnCaptureHandle { offset, self_fn_table_idx }` — the value is a
+///   closure handle loaded from `captures_ptr + offset` and the
+///   matching `MakeClosure` capture is self-recursive (handle points
+///   back at the enclosing lambda whose `fn_table_idx ==
+///   self_fn_table_idx`). Lets `Op::CallClosure` emit a direct call to
+///   `closure_fn_table[self_fn_table_idx]` with the current
+///   `captures_ptr` arg — no handle deref, no switch, no trap branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Provenance {
+    None,
+    /// LLVM param 1 of the enclosing lambda — the captures_ptr arg.
+    OwnCapturesPtr,
+    /// Closure handle loaded from `captures_ptr + offset`; the matching
+    /// MakeClosure capture is self-recursive, so the handle's
+    /// `captures_ptr` field equals `OwnCapturesPtr` and the handle's
+    /// `fn_table_idx` equals `self_fn_table_idx`.
+    OwnCaptureHandle {
+        #[allow(dead_code)]
+        offset: u32,
+        self_fn_table_idx: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1266,6 +1450,9 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             last_const_string: None,
             closure_fn_table: Vec::new(),
             record_locals: std::collections::HashMap::new(),
+            self_capture_offsets: Vec::new(),
+            self_capture_let_slots: std::collections::HashMap::new(),
+            captures_ptr_param: None,
         }
     }
 
@@ -1277,7 +1464,48 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     // -- stack helpers --------------------------------------------------
 
     fn push(&mut self, v: IntValue<'ctx>, ty: IrType) {
-        self.stack.push(TypedValue { val: v, ty });
+        self.stack.push(TypedValue {
+            val: v,
+            ty,
+            prov: Provenance::None,
+        });
+    }
+
+    /// Push a value while attaching a [`Provenance`] tag. Currently
+    /// only emitted by the lambda-prologue capture path
+    /// (`LocalGet(0)` → `LoadI32AtAbsolute` → `LetSet/LetGet`) so
+    /// `emit_call_closure` can short-circuit self-recursive calls.
+    fn push_with_prov(&mut self, v: IntValue<'ctx>, ty: IrType, prov: Provenance) {
+        self.stack.push(TypedValue { val: v, ty, prov });
+    }
+
+    /// Phase F.W7 self-recursion fast path: peek the operand stack's
+    /// top-of-stack provenance without consuming it and return the
+    /// matching [`Provenance::OwnCaptureHandle`] when the top is the
+    /// lambda's captures_ptr and `offset` matches a recorded self-
+    /// recursive capture offset. Returns `None` otherwise — the
+    /// caller then leaves the produced value's provenance at
+    /// [`Provenance::None`] and the closure-call emitter falls back
+    /// to the slow-path switch dispatch.
+    ///
+    /// Caller uses this **after** `emit_load_at_absolute` pops the
+    /// base; we read the stack top here before that pop runs, so
+    /// the lookup remains correct (the base is still on top when
+    /// the dispatcher arm fires).
+    fn peek_self_capture_provenance(&self, offset: u32) -> Option<Provenance> {
+        let top = self.stack.last()?;
+        if !matches!(top.prov, Provenance::OwnCapturesPtr) {
+            return None;
+        }
+        for (cap_offset, self_fn_table_idx) in &self.self_capture_offsets {
+            if *cap_offset == offset {
+                return Some(Provenance::OwnCaptureHandle {
+                    offset,
+                    self_fn_table_idx: *self_fn_table_idx,
+                });
+            }
+        }
+        None
     }
 
     fn pop(&mut self, ip_hint: &str) -> Result<TypedValue<'ctx>, LlvmError> {
@@ -1450,7 +1678,21 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                     } else {
                         IrType::I64
                     };
-                    self.push(p, ty);
+                    // Phase F.W7 self-recursion fast path: tag
+                    // `LocalGet(0)` inside a lambda body with
+                    // [`Provenance::OwnCapturesPtr`] so the prologue
+                    // capture-load chain can stamp
+                    // [`Provenance::OwnCaptureHandle`] on self-
+                    // recursive handles. Only fires inside a lambda
+                    // (param_base == 1 means the LLVM param 0 is
+                    // `*state` and param 1 is the captures_ptr arg);
+                    // the entry / helpers leave provenance at
+                    // `None`.
+                    if *idx == 0 && self.captures_ptr_param.is_some() {
+                        self.push_with_prov(p, ty, Provenance::OwnCapturesPtr);
+                    } else {
+                        self.push(p, ty);
+                    }
                 }
             }
             Op::LetSet { idx, ty } => {
@@ -1464,6 +1706,24 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 self.builder
                     .build_store(slot, stored)
                     .map_err(|e| LlvmError::Codegen(format!("LetSet store: {e}")))?;
+                // Phase F.W7 self-recursion fast path: when storing a
+                // closure handle whose provenance points back at the
+                // enclosing lambda, remember the let-slot so a later
+                // `LetGet` resurrects the same provenance. This is
+                // what bridges the prologue's capture-load chain
+                // (`LocalGet(0); LoadI32AtAbsolute { offset }; LetSet
+                // { idx, Closure }`) and the recursive call site
+                // (`LetGet { idx, Closure }; ...; CallClosure`).
+                if let Provenance::OwnCaptureHandle {
+                    offset,
+                    self_fn_table_idx,
+                } = v.prov
+                {
+                    if matches!(*ty, IrType::Closure) {
+                        self.self_capture_let_slots
+                            .insert(mapped, (offset, self_fn_table_idx));
+                    }
+                }
             }
             Op::LetGet { idx, ty } => {
                 // Phase E.1: remap the callee's let-idx against the
@@ -1495,7 +1755,30 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                     .build_load(llvm_ty, slot, &name)
                     .map_err(|e| LlvmError::Codegen(format!("LetGet load: {e}")))?
                     .into_int_value();
-                self.push(v, *ty);
+                // Phase F.W7 self-recursion fast path: when the let-slot
+                // was populated by the lambda prologue's self-capture
+                // load chain, re-stamp the matching
+                // [`Provenance::OwnCaptureHandle`] so the recursive
+                // call site (which reads the closure handle via
+                // `LetGet`) keeps the fast-path tag alive.
+                if matches!(*ty, IrType::Closure) {
+                    if let Some(&(offset, self_fn_table_idx)) =
+                        self.self_capture_let_slots.get(&mapped)
+                    {
+                        self.push_with_prov(
+                            v,
+                            *ty,
+                            Provenance::OwnCaptureHandle {
+                                offset,
+                                self_fn_table_idx,
+                            },
+                        );
+                    } else {
+                        self.push(v, *ty);
+                    }
+                } else {
+                    self.push(v, *ty);
+                }
             }
 
             // ---- arithmetic ----
@@ -1583,7 +1866,25 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
 
             // ---- Phase E.1: raw-memory primitives ----
             Op::LoadI32AtAbsolute { offset } => {
-                self.emit_load_at_absolute(&ip_hint, *offset, AbsLoad::I32)?
+                // Phase F.W7 self-recursion fast path: when the base
+                // (top-of-stack at this point) is the lambda's own
+                // captures_ptr arg and the offset matches a recorded
+                // self-recursive capture slot, the result is a
+                // closure handle whose backing struct points back at
+                // the enclosing lambda. Stash the provenance hint
+                // so the downstream `LetSet/LetGet/CallClosure` chain
+                // can short-circuit the indirect dispatch. The
+                // sniff peeks at the stack-top without mutating it;
+                // the actual load still flows through
+                // `emit_load_at_absolute` so we don't fork the
+                // raw-memory primitive's lowering.
+                let prov_hint = self.peek_self_capture_provenance(*offset);
+                self.emit_load_at_absolute(&ip_hint, *offset, AbsLoad::I32)?;
+                if let Some(prov) = prov_hint {
+                    if let Some(top) = self.stack.last_mut() {
+                        top.prov = prov;
+                    }
+                }
             }
             Op::LoadI64AtAbsolute { offset } => {
                 self.emit_load_at_absolute(&ip_hint, *offset, AbsLoad::I64)?
@@ -3263,8 +3564,45 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         }
         user_args.reverse();
 
-        // Pop closure handle (i32 arena-relative offset).
-        let handle_ptr = self.pop_int(ip_hint)?;
+        // Pop closure handle (i32 arena-relative offset). Capture
+        // provenance up-front so the self-recursion fast path can
+        // route around the handle deref / switch entirely.
+        let handle_tv = self.pop(ip_hint)?;
+        let handle_ptr = handle_tv.val;
+        let handle_prov = handle_tv.prov;
+
+        // Phase F.W7 self-recursion fast path: when the handle came
+        // from the lambda's own self-capture chain we know
+        //  * `handle.fn_table_idx == self_fn_table_idx` (stamped by
+        //    the outer `MakeClosure`); and
+        //  * `handle.captures_ptr == captures_ptr_arg` (the lambda's
+        //    LLVM param 1 — same value `MakeClosure` stashed into the
+        //    handle's `+4` slot because the captured pointer is the
+        //    captures struct the host built for this very lambda).
+        // Skip the handle deref + switch dispatch and emit a direct
+        // call to the matching `FunctionValue`. Cuts ~3 loads + a
+        // conditional branch off every recursion, closing the gap
+        // versus the equivalent Rust direct-recursive call on W7
+        // (recursive `fib(k - 1) + fib(k - 2)`).
+        if let (
+            Provenance::OwnCaptureHandle {
+                self_fn_table_idx, ..
+            },
+            Some(captures_ptr_arg),
+        ) = (handle_prov, self.captures_ptr_param)
+        {
+            let slot = self_fn_table_idx as usize;
+            if slot < self.closure_fn_table.len() {
+                return self.emit_call_closure_direct(
+                    self.closure_fn_table[slot],
+                    state_ptr,
+                    captures_ptr_arg,
+                    user_args,
+                    param_tys,
+                    ret_ty,
+                );
+            }
+        }
 
         // Load fn_table_idx (handle+0) and captures_ptr (handle+4).
         let handle_addr = self.arena_addr_i32(handle_ptr)?;
@@ -3456,6 +3794,111 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 .map_err(|e| LlvmError::Codegen(format!("CallClosure ret load: {e}")))?
                 .into_int_value();
             self.push(v, ret_ty);
+        }
+        Ok(())
+    }
+
+    /// Phase F.W7 self-recursion fast path companion to
+    /// [`Self::emit_call_closure`]. Emits a single `call` instruction
+    /// straight against `callee` with `(state, captures_ptr_arg,
+    /// args...)` — no handle deref, no switch, no trap branch. The
+    /// caller has already proven (via [`Provenance::OwnCaptureHandle`])
+    /// that the runtime handle's fields satisfy the call ABI.
+    ///
+    /// Width-coerces each user arg the same way the slow-path
+    /// dispatcher does, then pushes the call result back onto the
+    /// operand stack (when the callee's return type isn't `Null`).
+    #[allow(clippy::too_many_arguments)]
+    fn emit_call_closure_direct(
+        &mut self,
+        callee: FunctionValue<'ctx>,
+        state_ptr: PointerValue<'ctx>,
+        captures_ptr: IntValue<'ctx>,
+        mut user_args: Vec<IntValue<'ctx>>,
+        param_tys: &[IrType],
+        ret_ty: IrType,
+    ) -> Result<(), LlvmError> {
+        // Width-coerce each user arg to the callee's declared shape
+        // (mirrors the slow-path dispatcher's `cc_arg_zext` /
+        // `cc_arg_trunc` pass).
+        for (i, (slot, want_ty)) in user_args.iter_mut().zip(param_tys.iter()).enumerate() {
+            let want_width = match *want_ty {
+                IrType::I64 => 64,
+                IrType::I32
+                | IrType::Bool
+                | IrType::Null
+                | IrType::String
+                | IrType::ListInt
+                | IrType::ListFloat
+                | IrType::ListBool
+                | IrType::ListString
+                | IrType::ListSchema
+                | IrType::Closure => 32,
+                IrType::F64 => 64,
+            };
+            let have_width = slot.get_type().get_bit_width();
+            if have_width != want_width {
+                let target_ty = if want_width == 64 {
+                    self.ctx.i64_type()
+                } else {
+                    self.ctx.i32_type()
+                };
+                let coerced = if have_width < want_width {
+                    self.builder
+                        .build_int_z_extend(*slot, target_ty, "ccd_arg_zext")
+                        .map_err(|e| {
+                            LlvmError::Codegen(format!("CallClosure(direct) arg #{i} zext: {e}"))
+                        })?
+                } else {
+                    self.builder
+                        .build_int_truncate(*slot, target_ty, "ccd_arg_trunc")
+                        .map_err(|e| {
+                            LlvmError::Codegen(format!("CallClosure(direct) arg #{i} trunc: {e}"))
+                        })?
+                };
+                *slot = coerced;
+            }
+        }
+
+        // Build the LLVM call arg list `(state, captures_ptr_arg,
+        // user_args...)` matching `declare_lambda_function`'s signature.
+        let mut call_args: Vec<BasicMetadataValueEnum<'ctx>> =
+            Vec::with_capacity(2 + user_args.len());
+        call_args.push(state_ptr.into());
+        call_args.push(captures_ptr.into());
+        for v in &user_args {
+            call_args.push((*v).into());
+        }
+        let name = self.next_name("ccd_call");
+        let call_site = self
+            .builder
+            .build_call(callee, &call_args, &name)
+            .map_err(|e| LlvmError::Codegen(format!("CallClosure(direct) call: {e}")))?;
+        if !matches!(ret_ty, IrType::Null) {
+            let v = match call_site.try_as_basic_value() {
+                inkwell::values::ValueKind::Basic(v) => v,
+                inkwell::values::ValueKind::Instruction(_) => {
+                    return Err(LlvmError::Codegen(
+                        "CallClosure(direct): callee returned void but ret_ty != Null".into(),
+                    ));
+                }
+            };
+            let v_int = match v {
+                BasicValueEnum::IntValue(i) => i,
+                BasicValueEnum::FloatValue(f) => self
+                    .builder
+                    .build_bit_cast(f, self.ctx.i64_type(), "ccd_ret_bitcast")
+                    .map_err(|e| {
+                        LlvmError::Codegen(format!("CallClosure(direct) ret bitcast: {e}"))
+                    })?
+                    .into_int_value(),
+                other => {
+                    return Err(LlvmError::Codegen(format!(
+                        "CallClosure(direct): callee returned unsupported BasicValue {other:?}"
+                    )));
+                }
+            };
+            self.push(v_int, ret_ty);
         }
         Ok(())
     }
