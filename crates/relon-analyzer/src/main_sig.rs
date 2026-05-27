@@ -17,7 +17,7 @@
 use crate::diagnostic::{span_of, Diagnostic};
 use crate::directive_names::MAIN;
 use crate::tree::AnalyzedTree;
-use relon_parser::{is_builtin_type_name, DirectiveBody, Node, TokenRange, TypeNode};
+use relon_parser::{is_builtin_type_name, DirectiveBody, Expr, Node, TokenRange, TypeNode};
 
 /// One `<type> <ident>` parameter declared on `#main(...)`.
 #[derive(Debug, Clone)]
@@ -95,14 +95,26 @@ pub fn collect_main(root: &Node, tree: &mut AnalyzedTree) {
     // Ban `Any` (and any nested `Any` inside generics) in every
     // `#main(...)` parameter type and in the return-type annotation.
     // `Any` is not part of the user-facing surface regardless of mode.
-    check_ban_any_main_signature(tree);
+    check_ban_any_main_signature(root, tree);
 }
 
 /// v1.6: scan every `#main(...)` parameter type and the optional
 /// return type for `Any` and push [`Diagnostic::ExplicitAnyForbidden`]
 /// on each occurrence. The walk is recursive so `List<Any>` /
 /// `Dict<String, Any>` / `Result<Any, Err>` are all caught.
-fn check_ban_any_main_signature(tree: &mut AnalyzedTree) {
+///
+/// Phase D exception (W7 anon-Dict-return): when the `#main(...)`
+/// return type is a bare `Dict` *and* the entry body is itself a
+/// `Dict` literal, the bare-generic ban for the return-type slot is
+/// suppressed. This is the surface the IR lowering's
+/// `anon_dict_return_plan` recognises (see
+/// `relon-ir::lowering::type_node_is_bare_dict`) — the synthesised
+/// return schema is well-defined per-field, so the back-door of
+/// "Dict<Any, Any>" the v1.7 ban targets does not apply. The ban
+/// for parameter types and nested generics still fires unchanged,
+/// and `BareGenericContainer { type_name: "Dict" }` is still emitted
+/// when the body shape is anything other than a dict literal.
+fn check_ban_any_main_signature(root: &Node, tree: &mut AnalyzedTree) {
     let Some(sig) = tree.main_signature.as_ref() else {
         return;
     };
@@ -115,7 +127,23 @@ fn check_ban_any_main_signature(tree: &mut AnalyzedTree) {
         );
     }
     if let Some(rt) = sig.return_type.as_ref() {
-        crate::ban_unsafe_types::scan_typenode_for_any(rt, "#main return type", &mut to_emit);
+        let mut return_scan: Vec<Diagnostic> = Vec::new();
+        crate::ban_unsafe_types::scan_typenode_for_any(rt, "#main return type", &mut return_scan);
+        let body_is_dict = matches!(root.expr.as_ref(), Expr::Dict(_));
+        if body_is_dict {
+            // Drop the bare-`Dict` return-type diagnostic only when
+            // it pairs with a dict-literal body. Every other bare-
+            // generic / `Any` diagnostic raised by the walk still
+            // propagates.
+            return_scan.retain(|d| {
+                !matches!(
+                    d,
+                    Diagnostic::BareGenericContainer { type_name, .. }
+                        if type_name == "Dict"
+                )
+            });
+        }
+        to_emit.extend(return_scan);
     }
     tree.diagnostics.extend(to_emit);
 }
