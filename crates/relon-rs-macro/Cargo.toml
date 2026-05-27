@@ -1,0 +1,23 @@
+[package]
+name = "relon-rs-macro"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "include_relon! procedural macro for AOT-compiled Relon sources"
+keywords = ["relon", "macro", "aot", "include"]
+categories = ["compilers", "development-tools::procedural-macro-helpers"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+# Phase 1 keeps the proc-macro surface minimal: parse `LitStr` (path)
+# plus optional `as Ident` alias, then emit a single `include!` that
+# pulls the build.rs-generated bindings file in. No `syn` AST walking
+# beyond that.
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

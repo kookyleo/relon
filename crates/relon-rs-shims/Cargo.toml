@@ -1,0 +1,21 @@
+[package]
+name = "relon-rs-shims"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Runtime ABI shims for Relon AOT-compiled functions linked into Rust binaries"
+keywords = ["relon", "aot", "shim", "abi"]
+categories = ["compilers"]
+
+# Phase 1 envelope:
+# The Int-only `#main(Int...) -> Int` shape that `relon-rs-build` accepts
+# in Phase 1 has no arena dependency — every parameter is an i64 passed
+# by value, the body is a leaf arithmetic function, and the return value
+# rides home in `rax`. `SandboxState` is exposed today as a forward-
+# compatible placeholder so Phase 2's pointer-indirect surfaces (String
+# args / List returns / stdlib calls) can land without changing the
+# consuming-crate's API surface.
+[dependencies]

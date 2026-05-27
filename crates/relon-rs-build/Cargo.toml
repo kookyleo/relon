@@ -1,0 +1,20 @@
+[package]
+name = "relon-rs-build"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "build.rs API to compile Relon sources to relocatable object files"
+keywords = ["relon", "build", "aot", "llvm"]
+categories = ["compilers", "development-tools::build-utils"]
+
+[dependencies]
+# AOT object emit drives the full parse + analyze + lower + LLVM
+# pipeline. The dep pulls inkwell + llvm-sys transitively; build.rs
+# callers must have LLVM 18 dev headers on the host (env
+# `LLVM_SYS_181_PREFIX`).
+relon-codegen-llvm = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

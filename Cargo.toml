@@ -96,6 +96,18 @@ relon-trace-emitter = { path = "crates/relon-trace-emitter", version = "0.1.0" }
 relon-lsp = { path = "crates/relon-lsp", version = "0.1.0" }
 relon-wasm = { path = "crates/relon-wasm", version = "0.1.0" }
 relon-test-harness = { path = "crates/relon-test-harness", version = "0.1.0" }
+# Phase 1 relon-as-Rust-library bridge: three new crates split along
+# the build.rs / runtime / proc-macro boundary so each side can
+# evolve independently.
+#   * `relon-rs-shims`: link-time C ABI helpers + `SandboxState`
+#     forward-compat shape.
+#   * `relon-rs-build`: build.rs API that compiles `.relon` to `.o`
+#     plus matching Rust binding files.
+#   * `relon-rs-macro`: `include_relon!` proc-macro that splices the
+#     build.rs-generated bindings into the consuming source.
+relon-rs-shims = { path = "crates/relon-rs-shims", version = "0.1.0" }
+relon-rs-build = { path = "crates/relon-rs-build", version = "0.1.0" }
+relon-rs-macro = { path = "crates/relon-rs-macro", version = "0.1.0" }
 
 # Default release profile — throughput-tuned. Fat LTO + single
 # codegen unit so the optimizer sees the whole program; downstream
