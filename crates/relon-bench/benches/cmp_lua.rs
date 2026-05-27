@@ -3731,9 +3731,37 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
-        // M2-B phase 4d bytecode row — W7's recursive fib closure is
-        // dict-bodied + first-class; bounces in the analyzer pass.
-        let _ = try_build_bytecode(w7_relon_src(), "W7");
+        // Phase D bytecode row — W7's recursive `fib` closure now
+        // lowers all the way through `BytecodeEvaluator::from_source`:
+        //
+        // * Analyzer-side anon-Dict-return exception lets the bare
+        //   `Dict` return type pair with a dict-literal body
+        //   (see `relon-analyzer::main_sig::check_ban_any_main_signature`).
+        // * Bytecode compile pass emits `BcOp::MakeClosure` /
+        //   `BcOp::CallClosure` against the IR's closure-as-value
+        //   surface (Phase C lowering output).
+        // * VM dispatch resolves the recursive self-call through the
+        //   shared closure-body pool (Phase D VM widening).
+        if let Some(ev) = try_build_bytecode(w7_relon_src(), "W7") {
+            // Consistency check before timing.
+            let v = ev
+                .run_main(args_w_n(FIB_N as i64))
+                .expect("W7 bytecode run_main");
+            assert_eq!(
+                relon_int_result("W7", v),
+                w7_expected(),
+                "W7 bytecode result must match analytic fib(n)"
+            );
+            group.bench_function(BenchmarkId::new("W7_fib", "relon_bytecode"), |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(FIB_N as i64);
+                    timed_with_warmup(iters, || {
+                        let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            });
+        }
     }
 
     // ----- W8 polymorphic -----
