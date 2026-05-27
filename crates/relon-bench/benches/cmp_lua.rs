@@ -2621,13 +2621,42 @@ fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
     // parameter inference goes through, hence the leading-line
     // additions below.
     //
-    // W3 / W4 / W4_long / W7 stay `None` — strings / recursion need
-    // new LLVM emitter ops (`ConstString`, `Op::Add(String)`, host
-    // helper calls, fn declarations) tracked for Phase D.
+    // Phase E.1 (2026-05-27): W3 / W4 / W4_long now go through the
+    // widened LLVM emitter (`Op::ConstString`, `Op::Add(IrType::String)`
+    // routed through inlined stdlib `concat`, `Op::Call` to inline
+    // `contains`, pointer-indirect String StoreField, `AllocScratchDyn`
+    // + `MemcpyAtAbsolute` + the `*AtAbsolute` family). The W3 source
+    // needs `#unstrict` because `(acc, s) => acc + s` carries an
+    // untyped closure param — mirrors what cranelift's W2 / W6 do.
+    // W7 stays `None` (recursion path tracked for Phase F).
     static W2_LLVM_SRC: &str = "#unstrict\n\
          #import list from \"std/list\"\n\
          #main(Int n) -> Int\n\
          list.sum(range(n).map((i) => (i + 1) * (i + 2)))";
+    static W3_LLVM_SRC: &str = "#unstrict\n\
+         #import list from \"std/list\"\n\
+         #main(Int n) -> String\n\
+         range(n).map((i) => \"a\").reduce(\"\", (acc, s) => acc + s)";
+    static W4_LLVM_SRC: &str = "#import list from \"std/list\"\n\
+         #main(Int n) -> Int\n\
+         range(n)\n\
+           .map((i) => \"axb\")\n\
+           .filter((s) => s.contains(\"x\"))\n\
+           .len()";
+    // W4_long uses the 256-byte haystack literal so the bench's row
+    // exercises the SIMD substring scan path the trace-JIT side
+    // measures. The needle 'x' sits at the last byte (offset 255) so
+    // every `contains` call walks the full string before reporting hit.
+    static W4_LONG_LLVM_SRC: &str = concat!(
+        "#import list from \"std/list\"\n",
+        "#main(Int n) -> Int\n",
+        "range(n)\n",
+        "  .map((i) => \"",
+        "loremipsumdolorsitametconsecteturadipiscingelitseddoeiusmodtemporincididuntutlaboreetdoloremagnaaliquautenimadminimveniamquisnostrudezercitationullamcolaborisnisiutaliquipezeacommodoconsequatduisauteiruredolorinreprehenderitinvoluptatevelitessecillumaaaaax",
+        "\")\n",
+        "  .filter((s) => s.contains(\"x\"))\n",
+        "  .len()",
+    );
     static W6_LLVM_SRC: &str = "#unstrict\n\
          #import list from \"std/list\"\n\
          #main(Int n) -> Int\n\
@@ -2654,14 +2683,17 @@ fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
     match label {
         "W1_int_sum" => Some(w1_relon_src()),
         "W2_f64_dot" => Some(W2_LLVM_SRC),
+        "W3_string_concat" => Some(W3_LLVM_SRC),
+        "W4_string_contains" => Some(W4_LLVM_SRC),
+        "W4_long_haystack" => Some(W4_LONG_LLVM_SRC),
         "W5_dict_str_key" => Some(W5_LLVM_SRC),
         "W6_dict_num_key" => Some(W6_LLVM_SRC),
         "W8_poly_callsite" => Some(W8_LLVM_SRC),
         "W9_nested_matrix" => Some(W9_LLVM_SRC),
         "W10_config_eval" => Some(W10_LLVM_SRC),
         "W12_p99_tail" => Some(w12_relon_src()),
-        // W3 / W4 / W4_long / W7 — string ops + recursion outside
-        // Phase B envelope; tracked as Phase D follow-up.
+        // W7 — recursion outside the Phase E.1 envelope; tracked as
+        // Phase F follow-up.
         _ => None,
     }
 }
@@ -4316,8 +4348,12 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // literals, untyped closure params) can still ship a real
         // `LlvmAotEvaluator::from_source` measurement against an
         // equivalent-kernel `#unstrict` / bytecode-friendly variant.
-        // Sources past even that envelope (W3 / W4 / W4_long / W7 —
-        // strings + recursion) record `n/a`.
+        //
+        // Phase E.1 (2026-05-27) widens the envelope to W3 / W4 /
+        // W4_long via String ops (`Op::ConstString`, inlined
+        // `concat` / `contains`, pointer-indirect StoreField, scratch
+        // bump allocator). W7 still records `n/a` (recursion path
+        // tracked for Phase F).
         #[cfg(feature = "llvm-aot")]
         {
             if let Some(llvm_src) = llvm_aot_source_for(label) {
