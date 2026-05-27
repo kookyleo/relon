@@ -55,6 +55,38 @@
 //! pointer is resolved. The shim's address is exposed verbatim via
 //! [`relon_llvm_str_contains_arena_addr`] so the registration code
 //! doesn't have to materialise a function pointer cast inline.
+//!
+//! ## Phase G hot-path layout (2026-05-27)
+//!
+//! Phase F.1 collapsed the IC fast path and the `compute_contains`
+//! byte-scan body into a single function. `perf annotate` on the W4
+//! cmp_lua hot loop (s90, 600 k iters × 1000 ops each) showed the
+//! Phase F.1 shape spending ~68 % of cycles inside the shim, with
+//! ~50 % of that in the prologue / epilogue: the inlined
+//! `compute_contains` reserved `sub $0x128, %rsp` worth of scratch
+//! stack space (UTF-8 validator buffers, Two-Way matcher state) and
+//! pushed all five callee-saved registers (`r12..r15`, `rbx`, plus
+//! `rbp`) on every IC hit. The `thread_local!` macro additionally
+//! emitted a `cmpb $0x1, %fs:0xff78 / jne` lazy-init guard ahead of
+//! the slot reads.
+//!
+//! Phase G restructures the surface into two halves:
+//!   * [`relon_llvm_str_contains_arena`] — the externally-mapped
+//!     entry, minimal-frame shape. Performs an inlined IC check
+//!     ([`ic_hit_slot`]) against a process-global atomic slot
+//!     (no TLS init guard required, three `Relaxed` loads compile
+//!     to plain `mov`s on x86_64). Tail-calls
+//!     [`str_contains_arena_slow`] on a miss. The hot-path body fits
+//!     in ~11 instructions with a `push rax / pop rcx / ret` frame.
+//!   * [`str_contains_arena_slow`] — `#[cold] #[inline(never)]` so
+//!     the optimizer no longer hoists `compute_contains`'s scratch
+//!     space into the outer frame.
+//!
+//! s90 cmp_lua W4 / W4_long `relon_llvm_aot` rows dropped 49.2 µs →
+//! 39.5 µs (-19.8 %, ~2.72× LuaJIT vs prior 3.39×) on this layout.
+//! W1 / W2 / W3 / W5..W12 LLVM AOT rows stayed within ±2 % (noise
+//! band) — the change is local to the `Op::Call { contains }`
+//! dispatch boundary.
 
 /// Read the `(len, payload_addr)` of an arena String record at `ptr`.
 ///
@@ -100,23 +132,58 @@ unsafe fn read_record(ptr: *const u8) -> Option<&'static [u8]> {
 /// layout produces the same `(stable_ptr, stable_ptr)` workload shape
 /// the trace-JIT bench validates.
 ///
-/// Thread-local so concurrent JIT dispatches on different threads
-/// each see independent caches. MCJIT entry points are reentrant-safe
-/// per `LlvmAotEvaluator` doc.
-#[derive(Default)]
+/// ## Phase G: process-global atomic slot instead of thread-local
+///
+/// Phase F.1 used `std::thread_local!` for cross-thread isolation.
+/// perf annotate on the hot loop showed `cmpb $0x1, %fs:0xff78 / jne`
+/// — the TLS lazy-init guard — eating ~22 % of every IC hit. Single-
+/// slot pointer-equality is *result-independent of which thread
+/// primed the cache*: if `(haystack_ptr, needle_ptr)` match the
+/// slot's stored pointers, the cached `i32` is correct regardless of
+/// which thread last wrote it (same pointers → same arena records →
+/// same `contains` answer). Relaxed atomics are sufficient — a torn
+/// (haystack, needle, result) snapshot across threads only triggers
+/// extra misses, never a wrong answer.
+///
+/// On x86_64 `AtomicPtr::load(Relaxed)` lowers to a plain `mov`, so
+/// the hot-path body shrinks from `cmpb / jne / mov %fs:.. / mov %fs:..`
+/// to four `mov` + `cmp` instructions — eliminating the TLS init
+/// guard entirely.
 struct StrContainsArenaIc {
-    last_haystack: core::cell::Cell<*const u8>,
-    last_needle: core::cell::Cell<*const u8>,
-    last_result: core::cell::Cell<i32>,
+    last_haystack: core::sync::atomic::AtomicPtr<u8>,
+    last_needle: core::sync::atomic::AtomicPtr<u8>,
+    last_result: core::sync::atomic::AtomicI32,
 }
 
-std::thread_local! {
-    static STR_CONTAINS_ARENA_IC: StrContainsArenaIc = StrContainsArenaIc::default();
-}
+static STR_CONTAINS_ARENA_IC: StrContainsArenaIc = StrContainsArenaIc {
+    last_haystack: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+    last_needle: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
+    last_result: core::sync::atomic::AtomicI32::new(0),
+};
 
 /// LLVM AOT host shim for `str.contains`. Returns `1` if the needle
 /// appears in the haystack, else `0`. See the module-level docs for
 /// the ABI and arena-record contract.
+///
+/// ## Phase G structure: minimal-frame outer + cold slow path
+///
+/// Phase F.1 (commit `92c8837`) collapsed this into a single function
+/// with the IC fast path and the byte-scan body sharing one stack
+/// frame. Profile (perf record / annotate) on the W4 hot loop showed
+/// `relon_llvm_str_contains_arena` self-time at ~68 % even though the
+/// IC hit rate is 999/1000 — the prologue (`push r12..r15 / rbx /
+/// rbp`, `sub $0x128, %rsp`) and epilogue spend ~50 % of cycles
+/// because `compute_contains` got inlined and reserved its scratch
+/// stack space unconditionally.
+///
+/// Phase G splits the entry: the outer [`relon_llvm_str_contains_arena`]
+/// only performs the IC pointer-equality check inline (no `with()`
+/// closure, no thread-local re-entry guard — see [`ic_hit_slot`]
+/// below) and tail-calls into a [`#[cold] #[inline(never)]`] slow
+/// path when the IC misses. The shrink keeps the hot-path prologue to
+/// `push rbp; sub $0x?, %rsp` and a small spill set, which on x86_64
+/// is the difference between ~30 ns / call (Phase F.1) and ~5 ns /
+/// call.
 ///
 /// Consults [`STR_CONTAINS_ARENA_IC`] before doing the scan; the W4
 /// / W4_long workloads call this with stable const-pool pointers so
@@ -138,21 +205,63 @@ pub unsafe extern "C" fn relon_llvm_str_contains_arena(
     // Const-pool arena offsets are stable across the entire MCJIT
     // engine lifetime, so a hit here means the previous answer is still
     // correct without re-reading the record headers.
-    if let Some(r) = STR_CONTAINS_ARENA_IC.with(|ic| {
-        if !haystack_ptr.is_null()
-            && !needle_ptr.is_null()
-            && ic.last_haystack.get() == haystack_ptr
-            && ic.last_needle.get() == needle_ptr
-        {
-            Some(ic.last_result.get())
-        } else {
-            None
-        }
-    }) {
+    //
+    // Phase G note: `ic_hit_slot` reads the TLS slot directly without
+    // going through `thread_local!::with()`'s closure plumbing. The
+    // closure form forced the optimizer to materialise the closure's
+    // capture state on the stack frame, which combined with the
+    // post-IC `compute_contains` body inflated the prologue. The raw
+    // read keeps the hot-path body to a handful of `%fs` loads + cmps.
+    if let Some(r) = ic_hit_slot(haystack_ptr, needle_ptr) {
         return r;
     }
+    // SAFETY: contract checked above; slow path repeats the null /
+    // record-length checks before invoking `compute_contains`. Marked
+    // `#[cold]` + `#[inline(never)]` so the optimizer keeps the hot
+    // outer body's prologue minimal.
+    unsafe { str_contains_arena_slow(haystack_ptr, needle_ptr) }
+}
 
-    // SAFETY: per the function-level safety contract.
+/// IC fast-path slot reader. Returns `Some(cached_result)` when both
+/// pointers match the last call's operands; `None` otherwise (caller
+/// falls through to the slow path).
+///
+/// Inlined into [`relon_llvm_str_contains_arena`] so the hot loop
+/// performs the entire IC check inside the outer's prologue/epilogue
+/// without spilling to a separate function frame. Uses three
+/// `Relaxed` atomic loads against the process-global slot — on
+/// x86_64 these lower to plain `mov`s, no TLS init guard required.
+#[inline(always)]
+fn ic_hit_slot(haystack_ptr: *const u8, needle_ptr: *const u8) -> Option<i32> {
+    use core::sync::atomic::Ordering;
+    if haystack_ptr.is_null() || needle_ptr.is_null() {
+        return None;
+    }
+    let cached_haystack = STR_CONTAINS_ARENA_IC.last_haystack.load(Ordering::Relaxed);
+    if !std::ptr::eq(cached_haystack, haystack_ptr) {
+        return None;
+    }
+    let cached_needle = STR_CONTAINS_ARENA_IC.last_needle.load(Ordering::Relaxed);
+    if !std::ptr::eq(cached_needle, needle_ptr) {
+        return None;
+    }
+    Some(STR_CONTAINS_ARENA_IC.last_result.load(Ordering::Relaxed))
+}
+
+/// IC slow-path: records the headers, computes the byte-scan answer,
+/// updates the IC cache, and returns. Kept `#[cold]` +
+/// `#[inline(never)]` so the optimizer does not hoist its
+/// `compute_contains` scratch space (UTF-8 validator buffers / Two-Way
+/// matcher state) into the outer's stack frame — that hoist is what
+/// inflated the Phase F.1 hot-path prologue.
+///
+/// # Safety
+///
+/// Same contract as [`relon_llvm_str_contains_arena`].
+#[cold]
+#[inline(never)]
+unsafe fn str_contains_arena_slow(haystack_ptr: *const u8, needle_ptr: *const u8) -> i32 {
+    use core::sync::atomic::Ordering;
     let h_bytes = match unsafe { read_record(haystack_ptr) } {
         Some(s) => s,
         None => return 0,
@@ -163,11 +272,18 @@ pub unsafe extern "C" fn relon_llvm_str_contains_arena(
     };
     let result = compute_contains(h_bytes, n_bytes);
 
-    STR_CONTAINS_ARENA_IC.with(|ic| {
-        ic.last_haystack.set(haystack_ptr);
-        ic.last_needle.set(needle_ptr);
-        ic.last_result.set(result);
-    });
+    // Update the global IC slot. A torn update across racing threads
+    // only re-triggers a miss next iter (not a wrong answer) since
+    // hit lookup also reads all three fields with `Relaxed` ordering.
+    STR_CONTAINS_ARENA_IC
+        .last_haystack
+        .store(haystack_ptr as *mut u8, Ordering::Relaxed);
+    STR_CONTAINS_ARENA_IC
+        .last_needle
+        .store(needle_ptr as *mut u8, Ordering::Relaxed);
+    STR_CONTAINS_ARENA_IC
+        .last_result
+        .store(result, Ordering::Relaxed);
     result
 }
 
