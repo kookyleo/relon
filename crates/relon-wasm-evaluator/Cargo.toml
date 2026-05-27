@@ -1,0 +1,29 @@
+[package]
+name = "relon-wasm-evaluator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Phase Z runtime: wasmtime-backed Evaluator that drives Relon WASM modules."
+keywords = ["wasm", "runtime", "relon"]
+categories = ["compilers", "wasm"]
+publish = false
+
+[dependencies]
+relon-codegen-wasm = { workspace = true }
+relon-eval-api = { workspace = true }
+relon-ir = { workspace = true }
+relon-parser = { workspace = true }
+relon-analyzer = { workspace = true }
+relon-evaluator = { workspace = true }
+# wasmtime 45 is the workspace baseline; tail-call proposal is on by
+# default in this version. Use the default feature bundle so the
+# embedder doesn't have to opt into runtime/cranelift/gc separately;
+# downstream binary size will be revisited in Phase Z.5 when we drop
+# `relon-codegen-llvm`.
+wasmtime = "45"
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = "0.1"
