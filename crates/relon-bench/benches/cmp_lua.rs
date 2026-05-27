@@ -198,10 +198,13 @@ fn build_jit(src: &str, label: &str) -> relon::JitEvaluator {
 /// Task #270: build a [`relon::JitEvaluator`] for the labels W1-W4
 /// with a hand-crafted recorder fixture pre-installed. The fixture
 /// short-circuits `run_main` through `invoke_with_fallback_slice` so
-/// the `relon_jit` panel row tracks the `relon_trace_jit` row on hot
-/// loop workloads (instead of decaying to tree-walker speed because
-/// the auto BcOp→IR Op converter inside `relon::jit::wire_trace_tier`
-/// rejects the source's stdlib + closure surface).
+/// the `relon_jit` panel row tracks the `relon_trace_jit_fixture`
+/// row on hot loop workloads (instead of decaying to tree-walker
+/// speed because the auto BcOp→IR Op converter inside
+/// `relon::jit::wire_trace_tier` rejects the source's stdlib +
+/// closure surface). Note the `_fixture` suffix — per /perf Honesty
+/// Rules, both rows are driven by the same hand-built IR body, not
+/// the production auto recorder.
 ///
 /// Returns `None` for labels that don't have a hand-built fixture
 /// (W5-W12 plus the AOT panel — they either already escalate via the
@@ -380,9 +383,10 @@ fn try_build_aot(src: &str, label: &str) -> Option<Box<dyn RelonEvaluator>> {
     // chain — currently panic inside `FunctionBuilder::def_var` with
     // a type-mismatch assert rather than returning a typed Err)
     // downgrades to an `aot row n/a` log and the panel keeps running.
-    // The bench's `relon_jit` / `relon_tree_walk` / `relon_trace_jit`
-    // rows for the same workload are already collected by this
-    // point, so the n/a row is the right outcome.
+    // The bench's `relon_jit` / `relon_tree_walk` /
+    // `relon_trace_jit_fixture` rows for the same workload are
+    // already collected by this point, so the n/a row is the right
+    // outcome.
     //
     // Pre-task-#270 the panel survived the W4 row only because the
     // `relon_jit` row ran a tree-walker `run_main` that took ms-scale
@@ -506,7 +510,11 @@ fn lua_fn(lua: &mlua::Lua, src: &str) -> mlua::Function {
 /// outside the ranges used by the W5 / W6 cmp_lua hand-built rows
 /// (`MAX_FN_ID - 5..MAX_FN_ID - 2` reserved here; the
 /// `trace_jit_hot_loop` bench uses `MAX_FN_ID - 4` and `MAX_FN_ID - 2`).
-const W3_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 10) as u32;
+// W3_REC_FN_ID was reserved here for the W3 recorder-route trace row;
+// the row was deleted (2026-05-26 honesty fix audit #298) because the
+// fixture returned analytic byte length instead of reconstructing the
+// String, so the constant is no longer needed. Slot MAX_FN_ID - 10
+// stays unused.
 const W4_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 11) as u32;
 /// F-D7-H: separate fn_id slot for the long-haystack variant so it
 /// coexists with the short-haystack W4 row in the same bench process
@@ -2888,7 +2896,13 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
-        group.bench_function(BenchmarkId::new("W2_f64_dot", "relon_trace_jit"), |b| {
+        // Honesty fix (/perf Honesty Rules): row name suffixed
+        // `_fixture` because the trace body comes from `w2_recorder_body`
+        // (hand-built IR), not the production auto recorder. Per-iter
+        // ops match the production stdlib chain but skip the
+        // BcOp -> IR Op converter, so the timing is a lower-bound floor
+        // on what the auto path will deliver once it lands.
+        group.bench_function(BenchmarkId::new("W2_f64_dot", "relon_trace_jit_fixture"), |b| {
             b.iter_custom(|iters| {
                 let args: [u64; 1] = warm_args_w2;
                 let args_ptr = args.as_ptr();
@@ -2952,63 +2966,22 @@ fn bench_cmp_lua(c: &mut Criterion) {
         let lua_v: i64 = lua_fn_w3.call(()).unwrap();
         assert_relon_lua_consistent("W3", relon_v, lua_v, w3_expected_relon_len());
 
-        // F-D7-D recorder-route trace row. Routes through
-        // `register_recording` + `__relon_jump_to_recorder` so the
-        // measured cost reflects the production install pipeline
-        // (recorder lowering → optimiser → emitter → JIT cache) rather
-        // than the hand-built cranelift entry the earlier F-D9 pass
-        // used. The IR body in `w3_recorder_body` emits
-        // `Op::Add(IrType::String)` for the inner concat — the same
-        // shape the source-level `acc + s` will produce once the IR
-        // emits a String + String through `lower_binary`.
-        let w3_str_lits = build_str_literals();
-        // Warmup: small n so the recording walk stays bounded; the
-        // recorder records one iteration anyway.
-        let w3_warmup_args: [u64; 3] = [4, w3_str_lits.lit_a as u64, w3_str_lits.lit_empty as u64];
-        let w3_trace = install_recorder_trace(
-            W3_REC_FN_ID,
-            w3_recorder_body(),
-            vec![IrType::I64, IrType::String, IrType::String],
-            &w3_warmup_args,
-        );
-        // The recorder-installed trace exits the loop via a deopt
-        // guard (the `i >= n` BrIf-falsy guard observes `0` at
-        // recording time, so any iteration where the cmp flips to
-        // `1` deopts). The trace still executes all N concat
-        // operations in the body before deopting — the final
-        // `LoadField+Return` tail just doesn't run. We use
-        // `invoke_with_fallback` and synthesise the analytic length
-        // (`STRING_CONCAT_N` byte string) so the per-iter timing
-        // captures the hot-loop concat cost.
-        let w3_state = relon_codegen_native::global_trace_jit_state();
-        let _ = w3_trace; // keep the Arc alive via state.lookup_trace
-        {
-            let args: [u64; 3] = [
-                STRING_CONCAT_N,
-                w3_str_lits.lit_a as u64,
-                w3_str_lits.lit_empty as u64,
-            ];
-            let v = unsafe {
-                w3_state.invoke_with_fallback(
-                    W3_REC_FN_ID,
-                    args.as_ptr(),
-                    /* slot_count = */ 64,
-                    |args| {
-                        // Fallback only fires when the loop-exit guard
-                        // deopts; by that point the trace has already
-                        // run `n` concat iterations. Return the
-                        // analytic length so the sanity-check matches
-                        // the Lua / tree-walker reference.
-                        *args
-                    },
-                )
-            };
-            assert_eq!(
-                v as i64,
-                w3_expected_relon_len(),
-                "W3 recorder trace + fallback must return analytic length"
-            );
-        }
+        // Honesty fix (/perf Honesty Rules, 2026-05-26 audit #298):
+        // the W3 `relon_trace_jit` row used to live here, driven by a
+        // hand-built `w3_recorder_body` fixture that returned the
+        // byte length (`Value::Int(n)`) instead of reconstructing the
+        // concatenated String the production source builds. That
+        // skipped the dominant work of the workload (String
+        // reconstruction over N iterations), so the measurement no
+        // longer represented the production trace_jit path — even a
+        // rename to `_fixture` would be misleading. Row deleted; W3
+        // keeps its tree_walk / bytecode / luajit (and downstream
+        // canonical-panel relon_jit + aot) rows, all of which honour
+        // the production schema.
+        //
+        // Recoverable from git history (commit before this honesty
+        // fix) if a future audit revisits W3 with a String-returning
+        // fixture.
 
         group.throughput(Throughput::Elements(STRING_CONCAT_N));
         group.bench_function(
@@ -3019,48 +2992,6 @@ fn bench_cmp_lua(c: &mut Criterion) {
                     timed_with_warmup(iters, || {
                         let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
                         black_box(v);
-                    })
-                });
-            },
-        );
-        group.bench_function(
-            BenchmarkId::new("W3_string_concat", "relon_trace_jit"),
-            |b| {
-                // Look up the trace fn once outside the timed region so
-                // the per-iter cost is just `entry(ctx, args)` + the
-                // deopt write into `result_slot` — matches what
-                // `invoke_with_fallback` would do but without the
-                // per-call `TraceContext::with_hooks` allocation.
-                let trace_fn = w3_state
-                    .lookup_trace(W3_REC_FN_ID)
-                    .expect("W3 recorder trace installed");
-                b.iter_custom(|iters| {
-                    let mut tctx = TraceContext::with_capacity(64);
-                    let args: [u64; 3] = [
-                        STRING_CONCAT_N,
-                        w3_str_lits.lit_a as u64,
-                        w3_str_lits.lit_empty as u64,
-                    ];
-                    let args_ptr = args.as_ptr();
-                    timed_with_warmup(iters, || {
-                        let s = unsafe {
-                            trace_fn.invoke_raw(&mut tctx as *mut TraceContext, black_box(args_ptr))
-                        };
-                        black_box(s);
-                        // SIGSEGV repro 2026-05-25: the W3 trace
-                        // allocates ~2 MB of intermediate `StringRef`
-                        // blocks per invocation (left-fold over 2000
-                        // chars). Without per-iter reclaim the
-                        // per-thread arena grows unbounded across
-                        // criterion's 5-sec warmup and eventually
-                        // faults inside the JIT'd code. The lit_a /
-                        // lit_empty operands above are
-                        // `from_static_permanent`, so reclaim is
-                        // safe — only the trace's intermediates
-                        // get dropped.
-                        unsafe {
-                            relon_trace_jit::runtime::reclaim_trace_strings();
-                        }
                     })
                 });
             },
@@ -3186,8 +3117,15 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 });
             },
         );
+        // Honesty fix (/perf Honesty Rules): row name suffixed
+        // `_fixture` because the trace body comes from `w4_recorder_body`
+        // (hand-built IR), not the production auto recorder. Per-iter
+        // ops match the production stdlib chain (str.contains over an
+        // "axb" haystack with "x" needle) but skip the BcOp -> IR Op
+        // converter, so the timing is a lower-bound floor on what the
+        // auto path will deliver once it lands.
         group.bench_function(
-            BenchmarkId::new("W4_string_contains", "relon_trace_jit"),
+            BenchmarkId::new("W4_string_contains", "relon_trace_jit_fixture"),
             |b| {
                 let trace_fn = w4_state
                     .lookup_trace(W4_REC_FN_ID)
@@ -3352,8 +3290,13 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 });
             },
         );
+        // Honesty fix (/perf Honesty Rules): row name suffixed
+        // `_fixture`. Same hand-built `w4_recorder_body` shape as
+        // W4_string_contains but pinned to the 256-byte haystack so
+        // the F-D7-H SIMD-payload path becomes observable. Still
+        // skips the auto recorder; per-iter ops match production.
         group.bench_function(
-            BenchmarkId::new("W4_long_haystack", "relon_trace_jit"),
+            BenchmarkId::new("W4_long_haystack", "relon_trace_jit_fixture"),
             |b| {
                 let trace_fn = w4l_state
                     .lookup_trace(W4_LONG_REC_FN_ID)
@@ -3488,8 +3431,14 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 });
             },
         );
+        // Honesty fix (/perf Honesty Rules): row name suffixed
+        // `_fixture` because the trace body comes from the hand-built
+        // W5 recorder body, not the production auto recorder. Per-iter
+        // dict-lookup ops match the production stdlib chain but skip
+        // the BcOp -> IR Op converter, so the timing is a lower-bound
+        // floor on what the auto path will deliver once it lands.
         group.bench_function(
-            BenchmarkId::new("W5_dict_str_key", "relon_trace_jit"),
+            BenchmarkId::new("W5_dict_str_key", "relon_trace_jit_fixture"),
             |b| {
                 b.iter_custom(|iters| {
                     // 2026-05-25: pre-allocate the TraceContext outside
@@ -3637,8 +3586,15 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 });
             },
         );
+        // Honesty fix (/perf Honesty Rules): row name suffixed
+        // `_fixture` because the trace body comes from
+        // `build_w6_recorder_body` (hand-built IR), not the production
+        // auto recorder. Per-iter list-get ops match the production
+        // stdlib chain but skip the BcOp -> IR Op converter, so the
+        // timing is a lower-bound floor on what the auto path will
+        // deliver once it lands.
         group.bench_function(
-            BenchmarkId::new("W6_dict_num_key", "relon_trace_jit"),
+            BenchmarkId::new("W6_dict_num_key", "relon_trace_jit_fixture"),
             |b| {
                 b.iter_custom(|iters| {
                     // 2026-05-25: same per-iter alloc avoidance + IC
@@ -3840,8 +3796,16 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 });
             },
         );
+        // Honesty fix (/perf Honesty Rules, audit #298 yellow line):
+        // row name suffixed `_fixture` AND `_kernel` semantics flagged
+        // because the trace body is an analytic kernel — it preserves
+        // per-iter arith ops and complexity but skips closure dispatch
+        // (the production source's `dispatch(i % 4)` first-class
+        // closure call) that the recorder cannot trace today. The
+        // measurement bounds dispatch-free arithmetic throughput; do
+        // NOT compare against the LuaJIT row 1:1.
         group.bench_function(
-            BenchmarkId::new("W8_poly_callsite", "relon_trace_jit"),
+            BenchmarkId::new("W8_poly_callsite", "relon_trace_jit_fixture"),
             |b| {
                 b.iter_custom(|iters| {
                     let args: [u64; 1] = warm_args_w8;
@@ -3957,8 +3921,17 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 });
             },
         );
+        // Honesty fix (/perf Honesty Rules, audit #298 yellow line):
+        // row name suffixed `_fixture` AND `_kernel` semantics flagged
+        // because the trace body is an analytic kernel — it preserves
+        // the nested-loop complexity (`i*n + j` accumulator) but skips
+        // the matrix construction (`#private rows` + `rows[i][j]`)
+        // that the production source builds via closure-bodied
+        // `range(n).map(...).reduce(...)`. The measurement bounds
+        // nested-loop arithmetic throughput; do NOT compare against
+        // the LuaJIT row 1:1.
         group.bench_function(
-            BenchmarkId::new("W9_nested_matrix", "relon_trace_jit"),
+            BenchmarkId::new("W9_nested_matrix", "relon_trace_jit_fixture"),
             |b| {
                 b.iter_custom(|iters| {
                     let args: [u64; 1] = warm_args_w9;
@@ -4075,8 +4048,17 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 });
             },
         );
+        // Honesty fix (/perf Honesty Rules, audit #298 yellow line):
+        // row name suffixed `_fixture` AND `_kernel` semantics flagged
+        // because the trace body is an analytic kernel — it preserves
+        // the four-predicate composition (role/region/hour bounds)
+        // but rewrites the production source's `&&` / `||` / `?:` +
+        // closure `allow` into a product of 0/1-valued comparisons so
+        // the trace stays inside the recorder envelope. The
+        // measurement bounds arith+cmp throughput; do NOT compare
+        // against the LuaJIT row 1:1.
         group.bench_function(
-            BenchmarkId::new("W10_config_eval", "relon_trace_jit"),
+            BenchmarkId::new("W10_config_eval", "relon_trace_jit_fixture"),
             |b| {
                 b.iter_custom(|iters| {
                     let args: [u64; 1] = warm_args_w10;
@@ -4192,7 +4174,13 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 black_box(v);
             });
         });
-        group.bench_function(BenchmarkId::new("W12_p99_tail", "relon_trace_jit"), |b| {
+        // Honesty fix (/perf Honesty Rules): row name suffixed
+        // `_fixture` because the 4-op trace body comes from the
+        // hand-built `w12_recorder_body` (`x + 1`), not the production
+        // auto recorder. Per-iter ops match the production source
+        // (`#main(Int x) -> Int\nx + 1`) byte-for-byte but the install
+        // route skips the BcOp -> IR Op converter.
+        group.bench_function(BenchmarkId::new("W12_p99_tail", "relon_trace_jit_fixture"), |b| {
             // Hoist the args slot out of the inner closure so the
             // per-iter cost is just `invoke_with_fallback` dispatch
             // + the 4-op trace body. Mirrors the W5 / W6 trace_jit
@@ -4265,13 +4253,23 @@ fn bench_cmp_lua(c: &mut Criterion) {
     // ===== Dart-style canonical panel: relon_jit + relon_aot =========
     // =================================================================
     //
-    // Naming-alignment (2026-05-25). The 12 workloads above keep the
+    // Naming-alignment (2026-05-25). The workloads above keep the
     // engineer-facing tier breakdown rows (`relon_tree_walk` /
-    // `relon_bytecode` / `relon_trace_jit`) so existing baselines stay
-    // comparable; the two new rows below collapse all internal tiers
-    // behind the user-facing `JitEvaluator` / `AotEvaluator` types so
-    // hosts see a single canonical entry per mode (Dart-style:
-    // `dart run` vs `dart compile exe`).
+    // `relon_bytecode` / `relon_trace_jit_fixture`); the two new rows
+    // below collapse all internal tiers behind the user-facing
+    // `JitEvaluator` / `AotEvaluator` types so hosts see a single
+    // canonical entry per mode (Dart-style: `dart run` vs
+    // `dart compile exe`).
+    //
+    // Honesty fix (/perf Honesty Rules, 2026-05-26 audit #298): the
+    // tier-breakdown trace row was renamed `relon_trace_jit` ->
+    // `relon_trace_jit_fixture` for every workload (W2/W4/W4_long/W5/
+    // W6/W8/W9/W10/W12) because the trace body is hand-built IR, not
+    // the production auto recorder. W3's row was deleted entirely
+    // (the fixture returned byte length instead of reconstructing the
+    // String, so the per-iter cost did not represent the production
+    // path). Downstream baselines keyed on the old row name will see
+    // a one-time break — acceptable per the audit's user approval.
     //
     // Per-row dispatch:
     //
