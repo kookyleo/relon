@@ -237,176 +237,21 @@ fn trace_jit_production_label_eligible(label: &str) -> bool {
     matches!(label, "W1_int_sum" | "W2_f64_dot")
 }
 
-/// Task #270: build a [`relon::JitEvaluator`] for the labels W1-W4
-/// with a hand-crafted recorder fixture pre-installed. The fixture
-/// short-circuits `run_main` through `invoke_with_fallback_slice` so
-/// the `relon_jit` panel row tracks the `relon_trace_jit_fixture`
-/// row on hot loop workloads (instead of decaying to tree-walker
-/// speed because the auto BcOp→IR Op converter inside
-/// `relon::jit::wire_trace_tier` rejects the source's stdlib +
-/// closure surface). Note the `_fixture` suffix — per /perf Honesty
-/// Rules, both rows are driven by the same hand-built IR body, not
-/// the production auto recorder.
-///
-/// Returns `None` for labels that don't have a hand-built fixture
-/// (W5-W12 plus the AOT panel — they either already escalate via the
-/// auto path, are outside the recorder envelope, or are too trivial
-/// to benefit from a trace).
-///
-/// The pack / fallback / decode closures retain `'static` references
-/// because `JitEvaluator` is `Send + Sync` and the bench's
-/// `iter_custom` body re-enters them on every iteration. `StrLiterals`
-/// (the W3/W4 fixture state) is `unsafe impl Send + Sync` and lives
-/// in the bench function's local scope for the entire panel's
-/// duration; the closures capture only `u64`-cast pointers, which are
-/// trivially `Send + Sync`.
-fn try_build_jit_with_fixture(
-    label: &str,
-    src: &str,
-    str_lits: &StrLiterals,
-) -> Option<relon::JitEvaluator> {
-    let fixture: relon::TraceFixture = match label {
-        "W1_int_sum" => {
-            // Fallback returns the analytic sum 0..(n-1) = n*(n-1)/2.
-            // Decode keeps the host-observable shape (`Value::Int`)
-            // matching what the tree-walker / bytecode tiers return.
-            relon::TraceFixture {
-                body: w1_recorder_body(),
-                param_tys: vec![IrType::I64],
-                slot_count: 64,
-                warmup_args: vec![W1_N as u64],
-                pack: std::sync::Arc::new(|args, buf| {
-                    let n = match args.get("n") {
-                        Some(Value::Int(v)) => *v,
-                        other => panic!("W1 fixture: expected Int arg `n`, got {other:?}"),
-                    };
-                    buf.clear();
-                    buf.push(n as u64);
-                }),
-                fallback: std::sync::Arc::new(|args| {
-                    let n = args[0] as i64;
-                    (n * (n - 1) / 2) as u64
-                }),
-                decode: std::sync::Arc::new(|v| Value::Int(v as i64)),
-            }
-        }
-        "W2_f64_dot" => relon::TraceFixture {
-            body: w2_recorder_body(),
-            param_tys: vec![IrType::I64],
-            slot_count: 64,
-            warmup_args: vec![W2_N as u64],
-            pack: std::sync::Arc::new(|args, buf| {
-                let n = match args.get("n") {
-                    Some(Value::Int(v)) => *v,
-                    other => panic!("W2 fixture: expected Int arg `n`, got {other:?}"),
-                };
-                buf.clear();
-                buf.push(n as u64);
-            }),
-            fallback: std::sync::Arc::new(|args| {
-                let n = args[0] as i64;
-                let mut s: i64 = 0;
-                for i in 0..n {
-                    s += (i + 1) * (i + 2);
-                }
-                s as u64
-            }),
-            decode: std::sync::Arc::new(|v| Value::Int(v as i64)),
-        },
-        "W3_string_concat" => {
-            // String literals are address-stable for the bench's
-            // lifetime; cast to u64 here so the closures hold no
-            // raw pointers (which would require `unsafe impl Send`).
-            let lit_a = str_lits.lit_a as u64;
-            let lit_empty = str_lits.lit_empty as u64;
-            relon::TraceFixture {
-                body: w3_recorder_body(),
-                param_tys: vec![IrType::I64, IrType::String, IrType::String],
-                slot_count: 64,
-                // Recorder warmup runs the loop body once at install
-                // time; cap n=4 so the warm walk stays bounded
-                // (matching the bench's W3 trace_jit setup).
-                warmup_args: vec![4, lit_a, lit_empty],
-                pack: std::sync::Arc::new(move |args, buf| {
-                    let n = match args.get("n") {
-                        Some(Value::Int(v)) => *v,
-                        other => panic!("W3 fixture: expected Int arg `n`, got {other:?}"),
-                    };
-                    buf.clear();
-                    buf.extend_from_slice(&[n as u64, lit_a, lit_empty]);
-                }),
-                fallback: std::sync::Arc::new(|args| {
-                    // Analytic answer == n (matches the
-                    // `w3_expected_relon_len` shape; the trace
-                    // emits the running `StringRef::len` via
-                    // `LoadField` which equals `n` after the loop).
-                    args[0]
-                }),
-                // Returning the byte length as `Value::Int` is a
-                // schema mismatch against the W3 source's
-                // `#main(...) -> String` shape, but the bench panel
-                // discards the returned Value (only times the
-                // dispatch) so this trade keeps the per-call cost at
-                // pure trace invoke. Reconstructing the analytic
-                // String (`"a".repeat(n)`) would dominate the
-                // measurement and defeat the row's purpose.
-                decode: std::sync::Arc::new(|v| Value::Int(v as i64)),
-            }
-        }
-        "W4_string_contains" => {
-            let lit_axb = str_lits.lit_axb as u64;
-            let lit_x = str_lits.lit_x as u64;
-            relon::TraceFixture {
-                body: w4_recorder_body(),
-                param_tys: vec![IrType::I64, IrType::String, IrType::String],
-                slot_count: 64,
-                warmup_args: vec![4, lit_axb, lit_x],
-                pack: std::sync::Arc::new(move |args, buf| {
-                    let n = match args.get("n") {
-                        Some(Value::Int(v)) => *v,
-                        other => panic!("W4 fixture: expected Int arg `n`, got {other:?}"),
-                    };
-                    buf.clear();
-                    buf.extend_from_slice(&[n as u64, lit_axb, lit_x]);
-                }),
-                fallback: std::sync::Arc::new(|args| {
-                    // Every "axb" haystack contains "x" → count == n.
-                    args[0]
-                }),
-                decode: std::sync::Arc::new(|v| Value::Int(v as i64)),
-            }
-        }
-        "W4_long_haystack" => {
-            let lit_long = str_lits.lit_long_haystack as u64;
-            let lit_x = str_lits.lit_x as u64;
-            relon::TraceFixture {
-                body: w4_recorder_body(),
-                param_tys: vec![IrType::I64, IrType::String, IrType::String],
-                slot_count: 64,
-                warmup_args: vec![4, lit_long, lit_x],
-                pack: std::sync::Arc::new(move |args, buf| {
-                    let n = match args.get("n") {
-                        Some(Value::Int(v)) => *v,
-                        other => panic!("W4_long fixture: expected Int arg `n`, got {other:?}"),
-                    };
-                    buf.clear();
-                    buf.extend_from_slice(&[n as u64, lit_long, lit_x]);
-                }),
-                fallback: std::sync::Arc::new(|args| {
-                    // 256-byte haystack ends with 'x' → every iter hits → count == n.
-                    args[0]
-                }),
-                decode: std::sync::Arc::new(|v| Value::Int(v as i64)),
-            }
-        }
-        _ => return None,
-    };
-
-    let mut jit = build_jit(src, label);
-    jit.install_trace_fixture(fixture)
-        .unwrap_or_else(|e| panic!("[cmp_lua {label}] install_trace_fixture failed: {e}"));
-    Some(jit)
-}
+// Honesty cleanup #309 (2026-05-28): the previous
+// `try_build_jit_with_fixture` helper lived here. It installed a
+// `relon::TraceFixture` pre-built from `wN_recorder_body()` plus a
+// closed-form / iterative fallback closure (W1 returned
+// `n * (n - 1) / 2` directly; W3/W4/W4_long fallbacks returned `n`)
+// onto a freshly-built `JitEvaluator` so the canonical panel's
+// `relon_jit` row for W1_int_sum / W2_f64_dot / W3_string_concat /
+// W4_string_contains / W4_long_haystack would hit a trace tier the
+// production auto-recorder cannot yet reach. The column name
+// `relon_jit` made it look like a production measurement; per
+// /perf Honesty Rules the rows were deleted entirely and the
+// fixture builder along with them. Phase J.2 (deopt-snapshot fix,
+// #308) lands production trace JIT for W1 / W2 via a dedicated
+// `relon_trace_jit` row added in that work; W3 / W4 / W4_long remain
+// without a JIT row until J.3 follow-up.
 
 /// Dart-style naming-alignment (2026-05-25): try to build an
 /// `AotEvaluator` (the canonical user-facing AOT entry) over `src`.
@@ -580,91 +425,15 @@ fn ir_tag(op: Op) -> TaggedOp {
     }
 }
 
-/// IR body matching the W3 hot loop:
-///   for i in 0..n { acc = acc + lit_a }; return load_i64(acc, 8)
-///
-/// Params (LocalGet indices):
-///   0 — `n: I64`             (loop bound)
-///   1 — `lit_a: String`      (concat right-operand; reused every iter)
-///   2 — `lit_empty: String`  (initial `acc`)
-///
-/// Let-slots:
-///   0 — `i:   I64`
-///   1 — `acc: String`  (carries the running concat pointer)
-///
-/// The trailing `Op::LoadField { offset: 8, ty: I64 }` reads
-/// `StringRef::len` off the final accumulator so `Op::Return` deposits
-/// the byte length into `TraceContext::result_slot` — matching the
-/// hand-built row's pre-store-then-return shape.
-fn w3_recorder_body() -> Vec<TaggedOp> {
-    const I: u32 = 0;
-    const ACC: u32 = 1;
-    vec![
-        // i = 0
-        ir_tag(Op::ConstI64(0)),
-        ir_tag(Op::LetSet {
-            idx: I,
-            ty: IrType::I64,
-        }),
-        // acc = lit_empty
-        ir_tag(Op::LocalGet(2)),
-        ir_tag(Op::LetSet {
-            idx: ACC,
-            ty: IrType::String,
-        }),
-        // outer block { loop { ... } }
-        ir_tag(Op::Block {
-            result_ty: None,
-            body: vec![ir_tag(Op::Loop {
-                result_ty: None,
-                body: vec![
-                    // exit when i >= n
-                    ir_tag(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::LocalGet(0)),
-                    ir_tag(Op::Ge(IrType::I64)),
-                    ir_tag(Op::BrIf { label_depth: 1 }),
-                    // acc = acc + lit_a
-                    ir_tag(Op::LetGet {
-                        idx: ACC,
-                        ty: IrType::String,
-                    }),
-                    ir_tag(Op::LocalGet(1)),
-                    ir_tag(Op::Add(IrType::String)),
-                    ir_tag(Op::LetSet {
-                        idx: ACC,
-                        ty: IrType::String,
-                    }),
-                    // i = i + 1
-                    ir_tag(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::ConstI64(1)),
-                    ir_tag(Op::Add(IrType::I64)),
-                    ir_tag(Op::LetSet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    // continue
-                    ir_tag(Op::Br { label_depth: 0 }),
-                ],
-            })],
-        }),
-        // return load_i64(acc + 8)  // StringRef::len
-        ir_tag(Op::LetGet {
-            idx: ACC,
-            ty: IrType::String,
-        }),
-        ir_tag(Op::LoadField {
-            offset: 8,
-            ty: IrType::I64,
-        }),
-        ir_tag(Op::Return),
-    ]
-}
+// Honesty cleanup #309 (2026-05-28): `w3_recorder_body` lived here.
+// It was only referenced by `try_build_jit_with_fixture`, which
+// installed it as the trace body for the canonical panel's W3
+// `relon_jit` row; that row was a fixture-based paper win (fallback
+// returned `n`, not the analytic String) and was removed in the
+// same commit. The IR shape (an `Op::Add(IrType::String)` /
+// `Op::LoadField { offset: 8 }` chain reading `StringRef::len` off
+// the running concat pointer) is recoverable from commit history if
+// a future micro-bench needs the byte-identical floor.
 
 /// IR body matching the W4 hot loop:
 ///   for i in 0..n { if contains(haystack, needle) count += 1 };
@@ -760,184 +529,16 @@ fn w4_recorder_body() -> Vec<TaggedOp> {
     ]
 }
 
-/// #270: IR body for the W1 (`list.sum(range(n))`) hot loop.
-///
-/// The W1 Relon source folds `range(n)` through `list.sum`; the
-/// recorder cannot trace `list.sum` (stdlib + iterator closure) so
-/// the panel-row JIT fixture short-circuits the analytic body
-/// directly. Pure i64 arith — no IC, no string handles — gives the
-/// same shape as `trace_jit_hot_loop::sum_loop_let_slot_body` but
-/// counted `0..n-1` instead of `1..=n` to match the Relon source's
-/// `range(n)` semantics.
-///
-/// ```text
-/// i = 0; acc = 0
-/// while i < n {
-///     acc += i
-///     i  += 1
-/// }
-/// return acc
-/// ```
-///
-/// Params: 0 — `n: I64`. Let-slots: 0 — `i: I64`, 1 — `acc: I64`.
-fn w1_recorder_body() -> Vec<TaggedOp> {
-    const I: u32 = 0;
-    const ACC: u32 = 1;
-    vec![
-        ir_tag(Op::ConstI64(0)),
-        ir_tag(Op::LetSet {
-            idx: I,
-            ty: IrType::I64,
-        }),
-        ir_tag(Op::ConstI64(0)),
-        ir_tag(Op::LetSet {
-            idx: ACC,
-            ty: IrType::I64,
-        }),
-        ir_tag(Op::Block {
-            result_ty: None,
-            body: vec![ir_tag(Op::Loop {
-                result_ty: None,
-                body: vec![
-                    // exit when i >= n
-                    ir_tag(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::LocalGet(0)),
-                    ir_tag(Op::Ge(IrType::I64)),
-                    ir_tag(Op::BrIf { label_depth: 1 }),
-                    // acc += i
-                    ir_tag(Op::LetGet {
-                        idx: ACC,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::Add(IrType::I64)),
-                    ir_tag(Op::LetSet {
-                        idx: ACC,
-                        ty: IrType::I64,
-                    }),
-                    // i = i + 1
-                    ir_tag(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::ConstI64(1)),
-                    ir_tag(Op::Add(IrType::I64)),
-                    ir_tag(Op::LetSet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::Br { label_depth: 0 }),
-                ],
-            })],
-        }),
-        ir_tag(Op::LetGet {
-            idx: ACC,
-            ty: IrType::I64,
-        }),
-        ir_tag(Op::Return),
-    ]
-}
-
-/// review-improvement-139: IR body for W2's hot loop.
-///
-/// Mirrors the host-observable shape of the W2 Relon source
-/// (`list.sum(range(n).map((i) => (i + 1) * (i + 2)))`) without the
-/// stdlib / closure overhead the recorder can't trace through. The
-/// trace records the inner reduction directly:
-///
-/// ```text
-/// i = 0; acc = 0
-/// while i < n {
-///     acc = acc + (i + 1) * (i + 2)
-///     i  += 1
-/// }
-/// return acc
-/// ```
-///
-/// Params: 0 — `n: I64`.
-/// Let-slots: 0 — `i: I64`, 1 — `acc: I64`.
-fn w2_recorder_body() -> Vec<TaggedOp> {
-    const I: u32 = 0;
-    const ACC: u32 = 1;
-    vec![
-        // i = 0
-        ir_tag(Op::ConstI64(0)),
-        ir_tag(Op::LetSet {
-            idx: I,
-            ty: IrType::I64,
-        }),
-        // acc = 0
-        ir_tag(Op::ConstI64(0)),
-        ir_tag(Op::LetSet {
-            idx: ACC,
-            ty: IrType::I64,
-        }),
-        ir_tag(Op::Block {
-            result_ty: None,
-            body: vec![ir_tag(Op::Loop {
-                result_ty: None,
-                body: vec![
-                    // exit when i >= n
-                    ir_tag(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::LocalGet(0)),
-                    ir_tag(Op::Ge(IrType::I64)),
-                    ir_tag(Op::BrIf { label_depth: 1 }),
-                    // term = (i + 1) * (i + 2)
-                    ir_tag(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::ConstI64(1)),
-                    ir_tag(Op::Add(IrType::I64)),
-                    ir_tag(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::ConstI64(2)),
-                    ir_tag(Op::Add(IrType::I64)),
-                    ir_tag(Op::Mul(IrType::I64)),
-                    // acc += term
-                    ir_tag(Op::LetGet {
-                        idx: ACC,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::Add(IrType::I64)),
-                    ir_tag(Op::LetSet {
-                        idx: ACC,
-                        ty: IrType::I64,
-                    }),
-                    // i = i + 1
-                    ir_tag(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::ConstI64(1)),
-                    ir_tag(Op::Add(IrType::I64)),
-                    ir_tag(Op::LetSet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::Br { label_depth: 0 }),
-                ],
-            })],
-        }),
-        // return acc
-        ir_tag(Op::LetGet {
-            idx: ACC,
-            ty: IrType::I64,
-        }),
-        ir_tag(Op::Return),
-    ]
-}
+// Honesty cleanup #309 (2026-05-28): `w1_recorder_body` and
+// `w2_recorder_body` lived here. They were only referenced by
+// `try_build_jit_with_fixture`, which installed them as
+// `relon::TraceFixture`s for the canonical panel's W1 / W2
+// `relon_jit` rows; both rows were a fixture-based paper win and
+// were removed in the same commit. Phase J.2 (#308) will land
+// production trace JIT for W1/W2 via the `relon_trace_jit` row
+// added there; the W1/W2 IR shapes here can be reconstructed from
+// commit history if a future micro-bench needs the byte-identical
+// floor.
 
 /// review-improvement-167: IR body for W10 (config_eval).
 ///
@@ -1144,12 +745,16 @@ fn install_recorder_trace(
 // along with the `_fixture` panel rows they fed. Restored once the
 // production auto-recorder lands W5 / W6 trace rows via #308 J.2.
 
-/// W3 / W4 fixture: stable `*const StringRef` pointers for the literal
-/// arguments. Stored in a struct so the bench keeps them alive for the
-/// duration of the timed region.
+/// W4 / W4_long fixture: stable `*const StringRef` pointers for the
+/// literal arguments. Stored in a struct so the bench keeps them
+/// alive for the duration of the timed region.
+///
+/// Honesty cleanup #309 (2026-05-28): the `lit_a` / `lit_empty`
+/// fields (W3 concat literals) were removed alongside W3's
+/// canonical-panel `relon_jit` row and the `w3_recorder_body` it
+/// installed — neither is referenced any more. The remaining fields
+/// feed the W4 / W4_long `relon_trace_jit_fixture` rows.
 struct StrLiterals {
-    lit_a: *const StringRef,
-    lit_empty: *const StringRef,
     lit_axb: *const StringRef,
     lit_x: *const StringRef,
     /// F-D7-H: 256-byte lorem-ipsum-style haystack for the
@@ -1209,8 +814,6 @@ fn build_str_literals() -> StrLiterals {
     // `_permanent` variant leaks the header instead, matching the
     // bench-fixture lifetime.
     StrLiterals {
-        lit_a: StringRef::from_static_permanent("a"),
-        lit_empty: StringRef::from_static_permanent(""),
         lit_axb: StringRef::from_static_permanent("axb"),
         lit_x: StringRef::from_static_permanent("x"),
         lit_long_haystack: StringRef::from_static_permanent(W4_LONG_HAYSTACK),
@@ -2387,13 +1990,20 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // reconstruction over N iterations), so the measurement no
         // longer represented the production trace_jit path — even a
         // rename to `_fixture` would be misleading. Row deleted; W3
-        // keeps its tree_walk / bytecode / luajit (and downstream
-        // canonical-panel relon_jit + aot) rows, all of which honour
-        // the production schema.
+        // keeps its tree_walk / bytecode / luajit / aot rows, all of
+        // which honour the production schema.
         //
-        // Recoverable from git history (commit before this honesty
-        // fix) if a future audit revisits W3 with a String-returning
-        // fixture.
+        // Honesty cleanup #309 (2026-05-28): the canonical-panel
+        // `relon_jit` row that previously paired with this comment
+        // was also removed — it routed W3 through the same
+        // `w3_recorder_body` fixture via `try_build_jit_with_fixture`,
+        // so it shared the byte-length-vs-String schema mismatch.
+        // Phase J.2 (#308) will land a production-route trace JIT
+        // row for W3.
+        //
+        // Recoverable from git history (commit before the #298 / #309
+        // honesty fixes) if a future audit revisits W3 with a
+        // String-returning fixture.
 
         group.throughput(Throughput::Elements(STRING_CONCAT_N));
         group.bench_function(
@@ -3359,19 +2969,28 @@ fn bench_cmp_lua(c: &mut Criterion) {
     // the LuaJIT row stays apples-to-apples.
 
     // (label, source, throughput, args_factory)
+    //
+    // Honesty cleanup #309 (2026-05-28): W1_int_sum / W2_f64_dot /
+    // W3_string_concat / W4_string_contains / W4_long_haystack are
+    // intentionally absent from this panel. Their `relon_jit` rows
+    // used to be driven by `try_build_jit_with_fixture` — a hand-built
+    // recorder body plus a closed-form / iterative fallback closure
+    // installed via `install_trace_fixture`. The column name
+    // `relon_jit` made it look like a production auto-tier
+    // measurement, but the timing was a fixture-based paper win
+    // (W1 fallback returned `n * (n - 1) / 2` directly; W3/W4
+    // fallbacks returned `n`). Per /perf Honesty Rules these rows
+    // were deleted entirely rather than renamed: the production
+    // trace JIT for W1/W2/W3/W4/W4_long requires the deopt-snapshot
+    // fix tracked by Phase J.2 (#308). That work will reintroduce
+    // genuine production-route rows under the `relon_trace_jit`
+    // column. Until then these workloads do NOT have a JIT row in
+    // cmp_lua — the engineer-facing `relon_trace_jit_fixture` rows
+    // for W4 / W4_long / W10 above stay (they were intentionally
+    // retained by #306 for the J.2/J.3 swap), but the canonical
+    // panel keeps no fixture-disguised entry.
     type ArgsFactory = fn() -> HashMap<String, Value>;
     let canonical_panel: &[(&str, &str, u64, ArgsFactory)] = &[
-        ("W1_int_sum", w1_relon_src(), W1_N as u64, || args_w_n(W1_N)),
-        ("W2_f64_dot", w2_relon_src(), W2_N as u64, || args_w_n(W2_N)),
-        ("W3_string_concat", w3_relon_src(), STRING_CONCAT_N, || {
-            args_w_n(STRING_CONCAT_N as i64)
-        }),
-        ("W4_string_contains", w4_relon_src(), TREE_WALK_N, || {
-            args_w_n(TREE_WALK_N as i64)
-        }),
-        ("W4_long_haystack", w4_relon_src(), TREE_WALK_N, || {
-            args_w_n(TREE_WALK_N as i64)
-        }),
         ("W5_dict_str_key", w5_relon_src(), TREE_WALK_N, || {
             args_w_n(TREE_WALK_N as i64)
         }),
@@ -3394,38 +3013,19 @@ fn bench_cmp_lua(c: &mut Criterion) {
         ("W12_p99_tail", w12_relon_src(), 1, || w12_relon_args(7)),
     ];
 
-    // Task #270: pin per-row StrLiterals for the W3/W4 fixture. We
-    // build a fresh `StrLiterals` per panel row so each fixture
-    // install observes unique `*const StringRef` pointers — the
-    // trace emitter's `const_bytes` side table is keyed on SSA, but
-    // some emit-time lowerings consult the host's
-    // `from_static_permanent` pointer identity through `pin_*` side
-    // tables; identical pointers across consecutive installs can
-    // collide there (manifests as a cranelift type-mismatch panic
-    // when the second install reuses the recorder's cached
-    // resolution for a const string with a *different* surrounding
-    // body shape).
-    //
-    // `build_str_literals` leaks one `Box<StringRef>` per call via
-    // `from_static_permanent`, so per-row construction is cheap
-    // (one box per literal × 5 literals × 12 panel rows) and leaks
-    // for the bench process lifetime — same contract as
-    // `from_static_permanent`'s docstring.
-    let mut panel_str_lits_pool: Vec<StrLiterals> = Vec::new();
-
     for (label, src, throughput_n, args_factory) in canonical_panel {
         group.throughput(Throughput::Elements(*throughput_n));
 
-        // relon_jit row — the canonical user-facing JIT entry.
-        // Task #270: W1-W4 (and W4_long_haystack) opt into a
-        // hand-built recorder fixture that escalates `run_main`
-        // straight to the trace tier; everything else uses the
-        // default auto-tier path (tree_walk / bytecode + the auto
-        // BcOp→IR Op converter).
-        panel_str_lits_pool.push(build_str_literals());
-        let panel_str_lits = panel_str_lits_pool.last().expect("just-pushed StrLiterals");
-        let jit = try_build_jit_with_fixture(label, src, panel_str_lits)
-            .unwrap_or_else(|| build_jit(src, label));
+        // relon_jit row — the canonical user-facing JIT entry. The
+        // wrapper picks its best-available tier (tree-walker /
+        // bytecode + the auto BcOp→IR Op converter) on each
+        // `run_main`. Honesty cleanup #309 (2026-05-28) removed the
+        // earlier `try_build_jit_with_fixture` short-circuit because
+        // it routed W1/W2/W3/W4/W4_long through a hand-built
+        // recorder body + closed-form/iterative fallback closure;
+        // see the comment on `canonical_panel` above for the full
+        // rationale and the followup tracked by #308 Phase J.2.
+        let jit = build_jit(src, label);
         // Consistency check: drive once before the timed loop. Failure
         // panics so a regression in `JitEvaluator` dispatch surfaces
         // before the bench writes a misleading number.
