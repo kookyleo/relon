@@ -545,34 +545,6 @@ const W9_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 16) as u32;
 /// without short-circuit, which preserves the workload's per-iter
 /// op count.
 const W10_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 17) as u32;
-/// Phase F.W7 (2026-05-27): W7 (recursive fib) trace_jit row.
-///
-/// The W7 production source defines `fib` as a `#private` first-class
-/// closure: `(k) => k < 2 ? k : fib(k - 1) + fib(k - 2)`, returning the
-/// result via `result: fib(n)`. The recorder aborts on `Op::CallClosure`
-/// (`UnrecoverableEffect`) because closure-call inlining and tail-call
-/// rewriting across recursive frames is an RFC-class follow-up tracked
-/// in the trace-emitter roadmap. To keep the panel honest and give the
-/// row a real trace_jit measurement, the IR fixture below collapses the
-/// recursive computation to its iterative analytic kernel:
-///
-/// ```text
-/// a = 0; b = 1; i = 0
-/// while i < n {
-///     tmp = a + b
-///     a   = b
-///     b   = tmp
-///     i  += 1
-/// }
-/// return a
-/// ```
-///
-/// `fib(n)` is the n-th Fibonacci number, identical on both recursive
-/// and iterative formulations. Same modelling discipline as W2 / W8 /
-/// W9 / W10: keep the IR shape inside the recorder's pure-arith
-/// envelope so the row can ship a measurable trace number while the
-/// production closure-call path stays a deopt-fallback footnote.
-const W7_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 18) as u32;
 
 fn ir_tag(op: Op) -> TaggedOp {
     TaggedOp {
@@ -934,129 +906,6 @@ fn w2_recorder_body() -> Vec<TaggedOp> {
         // return acc
         ir_tag(Op::LetGet {
             idx: ACC,
-            ty: IrType::I64,
-        }),
-        ir_tag(Op::Return),
-    ]
-}
-
-/// Phase F.W7 (2026-05-27): IR body for W7 (recursive fib), modelled
-/// as an iterative loop so the recorder stays inside its pure-arith
-/// envelope.
-///
-/// W7 Relon source defines `fib` as a recursive closure `(k) => k < 2
-/// ? k : fib(k - 1) + fib(k - 2)` and returns `result: fib(n)`. The
-/// recorder aborts on `Op::CallClosure` (`UnrecoverableEffect`), so we
-/// substitute the analytic kernel:
-///
-/// ```text
-/// a = 0; b = 1; i = 0
-/// while i < n {
-///     tmp = a + b
-///     a   = b
-///     b   = tmp
-///     i  += 1
-/// }
-/// return a
-/// ```
-///
-/// `a` ends up holding `fib(n)` after `n` iterations — identical
-/// answer to the recursive form on all `n >= 0`. The hot loop is
-/// 7 ops: compare, BrIf, three Add / LetSet pairs for `a`/`b`/`tmp`,
-/// plus the trailing `i += 1` and back-edge.
-///
-/// Params: 0 — `n: I64`. Let-slots: 0 — `a: I64`, 1 — `b: I64`,
-/// 2 — `i: I64`, 3 — `tmp: I64`. The temporary slot keeps the swap
-/// `(a, b) <- (b, a+b)` linear so we never need a second SSA stack
-/// peek before the LetSet.
-fn w7_recorder_body() -> Vec<TaggedOp> {
-    const A: u32 = 0;
-    const B: u32 = 1;
-    const I: u32 = 2;
-    const TMP: u32 = 3;
-    vec![
-        // a = 0
-        ir_tag(Op::ConstI64(0)),
-        ir_tag(Op::LetSet {
-            idx: A,
-            ty: IrType::I64,
-        }),
-        // b = 1
-        ir_tag(Op::ConstI64(1)),
-        ir_tag(Op::LetSet {
-            idx: B,
-            ty: IrType::I64,
-        }),
-        // i = 0
-        ir_tag(Op::ConstI64(0)),
-        ir_tag(Op::LetSet {
-            idx: I,
-            ty: IrType::I64,
-        }),
-        ir_tag(Op::Block {
-            result_ty: None,
-            body: vec![ir_tag(Op::Loop {
-                result_ty: None,
-                body: vec![
-                    // exit when i >= n
-                    ir_tag(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::LocalGet(0)),
-                    ir_tag(Op::Ge(IrType::I64)),
-                    ir_tag(Op::BrIf { label_depth: 1 }),
-                    // tmp = a + b
-                    ir_tag(Op::LetGet {
-                        idx: A,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::LetGet {
-                        idx: B,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::Add(IrType::I64)),
-                    ir_tag(Op::LetSet {
-                        idx: TMP,
-                        ty: IrType::I64,
-                    }),
-                    // a = b
-                    ir_tag(Op::LetGet {
-                        idx: B,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::LetSet {
-                        idx: A,
-                        ty: IrType::I64,
-                    }),
-                    // b = tmp
-                    ir_tag(Op::LetGet {
-                        idx: TMP,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::LetSet {
-                        idx: B,
-                        ty: IrType::I64,
-                    }),
-                    // i = i + 1
-                    ir_tag(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::ConstI64(1)),
-                    ir_tag(Op::Add(IrType::I64)),
-                    ir_tag(Op::LetSet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    // continue
-                    ir_tag(Op::Br { label_depth: 0 }),
-                ],
-            })],
-        }),
-        // return a
-        ir_tag(Op::LetGet {
-            idx: A,
             ty: IrType::I64,
         }),
         ir_tag(Op::Return),
@@ -3849,16 +3698,15 @@ fn bench_cmp_lua(c: &mut Criterion) {
 
     // ----- W7 fib -----
     //
-    // Phase F.W7 (2026-05-27): the `relon_trace_jit` row below routes
-    // through a recorder-friendly **iterative** fib kernel (a single
-    // `Op::Loop` with `a`/`b`/`i`/`tmp` let-slots). The production
-    // source uses a recursive closure (`fib: (k) => k < 2 ? k : fib(k
-    // - 1) + fib(k - 2)`); the recorder aborts on `Op::CallClosure`
-    // (`UnrecoverableEffect`) because closure-call inlining + tail-
-    // call rewriting in trace IR is RFC-class. Until that lands, the
-    // bench models the same analytic answer (`fib(n)`) inside the
-    // recorder's pure-arith envelope. The same "model the analytic
-    // kernel" discipline drives W2 / W8 / W9 / W10 trace_jit rows.
+    // review-improvement-139: no `relon_trace_jit` row for W7. The
+    // workload is a recursive closure (`fib: (k) => k < 2 ? k : fib(k - 1)
+    // + fib(k - 2)`); the recorder treats every `Op::CallClosure` as
+    // `AbortReason::UnrecoverableEffect` (closure-call lowering deferred
+    // until trace inlining lands), so any IR fixture that records the
+    // recursive call site aborts before the first install. Tail-call
+    // rewriting / closure-call inlining are RFC-class follow-ups; until
+    // then W7 carries only the tree-walker + LuaJIT (+ bytecode-bounce)
+    // rows. D5 trace_jit coverage is supplied by W12 below.
     {
         let (walker, scope) = build_tree_walker(w7_relon_src());
         let lua_fn_w7 = lua_fn(&lua, &w7_lua_src());
@@ -3932,55 +3780,6 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // `StoreFieldAtRecord`). The row is keyed `W7_fib` /
         // `relon_llvm_aot`; the bespoke section above stops at the
         // tree-walker / LuaJIT / bytecode breakdown rows.
-
-        // Phase F.W7 (2026-05-27): recorder-driven `relon_trace_jit`
-        // row for W7. The recursive closure (`Op::CallClosure`) is out
-        // of envelope; we substitute the iterative fib kernel
-        // (`w7_recorder_body`) so the recorder + trace JIT can ship a
-        // real number. Result invariant: trace returns `fib(n)`, same
-        // as the recursive form. Closes the long-standing W7
-        // `relon_trace_jit` `n/a` gap noted in review-improvement-139.
-        let warm_args_w7: [u64; 1] = [FIB_N];
-        let _w7_trace_fn = install_recorder_trace(
-            W7_REC_FN_ID,
-            w7_recorder_body(),
-            vec![IrType::I64],
-            &warm_args_w7,
-        );
-        let w7_jit_state = global_trace_jit_state();
-        {
-            let v = unsafe {
-                w7_jit_state.invoke_with_fallback(
-                    W7_REC_FN_ID,
-                    warm_args_w7.as_ptr(),
-                    /* slot_count = */ 64,
-                    |_args| w7_expected() as u64,
-                )
-            };
-            assert_eq!(
-                v as i64,
-                w7_expected(),
-                "W7 recorder trace + fallback must return analytic fib(n)"
-            );
-        }
-        group.bench_function(BenchmarkId::new("W7_fib", "relon_trace_jit"), |b| {
-            b.iter_custom(|iters| {
-                let args: [u64; 1] = warm_args_w7;
-                let args_ptr = args.as_ptr();
-                let expected = w7_expected() as u64;
-                timed_with_warmup(iters, || {
-                    let v = unsafe {
-                        w7_jit_state.invoke_with_fallback(
-                            W7_REC_FN_ID,
-                            black_box(args_ptr),
-                            64,
-                            |_args| expected,
-                        )
-                    };
-                    black_box(v);
-                })
-            });
-        });
     }
 
     // ----- W8 polymorphic -----
