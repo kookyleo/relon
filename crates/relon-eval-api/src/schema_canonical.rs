@@ -81,6 +81,37 @@ pub enum TypeRepr {
         /// Recursive canonical form of the nested schema.
         schema: Box<Schema>,
     },
+    /// Phase F.2 (W7 closure-as-value boundary) — first-class closure
+    /// value. The variant records the closure's user-visible signature
+    /// (`params` declaration order, `ret`); the schema digest treats it
+    /// as a structural shape so two anonymous closure fields with the
+    /// same `(params, ret)` collapse to the same hash regardless of
+    /// declaration site.
+    ///
+    /// The runtime representation is a scratch-heap pointer-indirect
+    /// 8-byte handle (`[fn_table_idx: u32 LE][captures_ptr: u32 LE]`);
+    /// see `relon_ir::IrType::Closure` for the wasm-side layout. The
+    /// canonical form intentionally avoids carrying capture metadata —
+    /// captures are an implementation detail of the lambda's closure
+    /// conversion, not part of its ABI-visible type.
+    ///
+    /// Layout integration is **not** wired in this milestone: any
+    /// `TypeRepr::Closure` reaching `SchemaLayout::offsets_for` surfaces
+    /// as `LayoutError::UnsupportedTypeInLayoutV1` so the cross-boundary
+    /// dangle the binary handshake would otherwise see stays guarded.
+    /// Closure-typed fields are only valid as in-function intermediate
+    /// values (let-bindings, dict-field caches the lowering pass
+    /// owns) — never at a host-visible `#main` boundary.
+    Closure {
+        /// User-visible parameter types in declaration order. Carries
+        /// nested `TypeRepr` so a closure-returning closure
+        /// (`(Int) => (Int) => Int`) hashes as a distinct shape from a
+        /// flat `(Int, Int) => Int`.
+        params: Vec<TypeRepr>,
+        /// Return type. Single value (no tuples) — matches the wasm
+        /// `call_indirect` signature codegen emits today.
+        ret: Box<TypeRepr>,
+    },
 }
 
 /// One field in a canonical schema.
@@ -140,8 +171,12 @@ impl Schema {
 ///   order can't poison the hash even when `BTreeMap` / `HashMap`
 ///   internals reshuffle between minor releases),
 /// * no whitespace (compact form),
-/// * a top-level `"version": 1` marker so future canonical-form
-///   evolutions can bump and stay distinguishable.
+/// * a top-level `"version": 2` marker so future canonical-form
+///   evolutions can bump and stay distinguishable. Phase F.2 lifted
+///   v1 → v2 when adding the [`TypeRepr::Closure`] variant: pre-Phase-F
+///   schemas serialise an enum tag set the new decoders don't
+///   recognise, so the version bump lets a host SDK refuse to load a
+///   module whose digest was computed against the older variant set.
 ///
 /// Field order inside [`Schema::fields`] is **not** sorted — the
 /// `Vec<Field>` is serialised in the order callers declared, matching
@@ -154,7 +189,7 @@ pub fn canonical_schema(schema: &Schema) -> Vec<u8> {
     // structure when constructed via `json!`, which gives us the
     // sorted-keys property without us writing a custom serializer.
     let value = serde_json::json!({
-        "version": 1,
+        "version": 2,
         "schema": schema,
     });
     // `serde_json::to_vec` on a `serde_json::Value` produces compact

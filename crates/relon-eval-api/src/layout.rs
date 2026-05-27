@@ -283,6 +283,14 @@ fn field_layout_decision_for(
             field: field_name.to_string(),
             kind: "Result",
         }),
+        // Phase F.2: closure fields have no host-visible binary layout
+        // — the runtime handle is a scratch-heap pointer that doesn't
+        // survive the `run_main` boundary. Reject here so the binary
+        // handshake builder doesn't paper over a dangling pointer.
+        TypeRepr::Closure { .. } => Err(LayoutError::UnsupportedTypeInLayoutV1 {
+            field: field_name.to_string(),
+            kind: "Closure",
+        }),
     }
 }
 
@@ -344,6 +352,12 @@ fn list_layout_decision(
         TypeRepr::Null => Err(LayoutError::UnsupportedListElement {
             field: field_name.to_string(),
             inner: "Null",
+        }),
+        // Phase F.2: `List<Closure>` is not part of any v1 binary
+        // surface — closures are non-portable scratch-heap pointers.
+        TypeRepr::Closure { .. } => Err(LayoutError::UnsupportedListElement {
+            field: field_name.to_string(),
+            inner: "Closure",
         }),
     }
 }

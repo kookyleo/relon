@@ -1753,6 +1753,7 @@ fn type_label(ty: &TypeRepr) -> &'static str {
         TypeRepr::Option { .. } => "Option",
         TypeRepr::Result { .. } => "Result",
         TypeRepr::Schema { .. } => "Schema",
+        TypeRepr::Closure { .. } => "Closure",
     }
 }
 
