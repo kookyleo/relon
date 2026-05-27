@@ -3086,6 +3086,67 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 },
             );
         }
+
+        // Phase Z.3c-d (2026-05-28): relon_wasm_wasmtime row for W9.
+        // Drives the same inline-Int variant the bytecode row uses
+        // (`w9_relon_src_bytecode()`) through `WasmEvaluator::run_main`,
+        // which lowers via `relon-codegen-wasm` into a pure-WASM nested
+        // accumulator loop. The classifier routes the **production**
+        // `w9_relon_src()` (Dict return + `#internal rows` list +
+        // `rows[i][j]` lookup) to the tree-walker fallback —
+        // `try_build_wasm_compiled` then skips the row entirely rather
+        // than book a tree-walker number under the `wasmtime` label.
+        // Z.4 follow-up promotes the production-source path; until then
+        // this row honestly measures the inline variant (same nested
+        // arithmetic, same I/O shape modulo the Dict wrapper).
+        if let Some(wasm) = try_build_wasm_compiled(
+            w9_relon_src_bytecode(),
+            "W9",
+            w9_expected(),
+            w9_relon_n_arg(),
+        ) {
+            use relon_eval_api::Evaluator as _;
+            group.bench_function(
+                BenchmarkId::new("W9_nested_matrix", "relon_wasm_wasmtime"),
+                |b| {
+                    b.iter_custom(|iters| {
+                        timed_with_warmup(iters, || {
+                            let v = wasm.run_main(w9_relon_n_arg()).unwrap();
+                            black_box(v);
+                        })
+                    });
+                },
+            );
+
+            // Fast row — mirrors W1/W2/W10 patterns. Bypasses the
+            // HashMap<String, Value> pack + Value::Int wrap. Cross-
+            // checked against the buffer path before the timed loop.
+            if wasm.has_fast_path() {
+                let fast_out = wasm
+                    .run_main_legacy_i64_fast(&[W9_N])
+                    .expect("W9 wasm fast path consistency");
+                let slow_out = match wasm.run_main(w9_relon_n_arg()).unwrap() {
+                    Value::Int(n) => n,
+                    other => panic!("W9 wasm fast cross-check: slow path returned {other:?}"),
+                };
+                assert_eq!(
+                    fast_out, slow_out,
+                    "W9 fast/buffer disagree: fast={fast_out} buffer={slow_out}"
+                );
+                group.bench_function(
+                    BenchmarkId::new("W9_nested_matrix", "relon_wasm_wasmtime_fast"),
+                    |b| {
+                        b.iter_custom(|iters| {
+                            let n_in = black_box(W9_N);
+                            timed_with_warmup(iters, || {
+                                let v = wasm.run_main_legacy_i64_fast(&[black_box(n_in)]).unwrap();
+                                black_box(v);
+                            })
+                        });
+                    },
+                );
+            }
+        }
     }
 
     // ----- W10 config eval -----
