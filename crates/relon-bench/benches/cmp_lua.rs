@@ -74,7 +74,6 @@ use relon_evaluator::{Context, Scope, TreeWalkEvaluator};
 use relon_parser::parse_document;
 use relon_trace_abi::TraceContext;
 use relon_trace_jit::runtime::StringRef;
-use relon_trace_jit::{build_dict_record_v2, build_flat_list_record, build_string_record};
 
 // F-D8-D (2026-05-20): recorder-driven trace install path. The W5 / W6
 // `trace_jit` rows below switch from the hand-built cranelift entry
@@ -84,11 +83,10 @@ use relon_trace_jit::{build_dict_record_v2, build_flat_list_record, build_string
 // + JIT install pipeline via `__relon_jump_to_recorder`. The installed
 // `JITedTraceFn` is then what the bench timing loop invokes.
 use relon_codegen_native::trace_install::{
-    __relon_jump_to_recorder, default_host_hooks, global_trace_jit_state, RecordingRegistration,
+    __relon_jump_to_recorder, global_trace_jit_state, RecordingRegistration,
 };
 use relon_codegen_native::JITedTraceFn;
 use relon_ir::ir::{IrType, Op, TaggedOp};
-use relon_ir::shape_hash::shape_hash_for_keys;
 use relon_parser::TokenRange;
 
 // =====================================================================
@@ -522,29 +520,6 @@ const W4_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 11) as u32;
 /// independent haystack pointers at recording time, which means
 /// independent F-D7-C const-needle / F-D7-H str-payload side tables.
 const W4_LONG_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 12) as u32;
-/// review-improvement-139: W2 (Int-mul reduce) trace_jit row. The
-/// "f64 dot" label is the conceptual workload; the actual hot loop
-/// folds `(i+1)*(i+2)` so the IR + trace stay on the integer arith
-/// path the recorder supports (F64 arith aborts as
-/// `UnsupportedOp("FloatArith")`).
-const W2_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 13) as u32;
-/// review-improvement-139: W12 (`x + 1`) trace_jit row. Trivial scalar
-/// — `LocalGet + ConstI64 + Add + Return` — the same 4-op shape as
-/// the `trace_jit_hot_loop` step body, modelled here as a recorder-
-/// install for the cmp_lua D5 row.
-const W12_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 14) as u32;
-/// review-improvement-167: W8 (poly_callsite) trace_jit row. The
-/// source-level `dispatch(tag) = tag + 1` closure (tag ∈ 0..4) gets
-/// modelled as inline arithmetic so the trace stays inside the
-/// recorder's envelope (closure-call abort would otherwise gate the
-/// row out). Hot body: `acc += (i % 4) + 1`.
-const W8_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 15) as u32;
-/// review-improvement-167: W9 (nested_matrix) trace_jit row. Source
-/// nests `range(n).map(...).reduce(...)`; recorder cannot trace the
-/// closure forest. The IR fixture instead emits the workload's
-/// analytic kernel — nested `Op::Loop` summing `i*n + j` — to keep
-/// the trace pure-arith.
-const W9_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 16) as u32;
 /// review-improvement-167: W10 (config_eval) trace_jit row. The
 /// closure-bodied predicate uses `||` / `&&`; recorder has no
 /// `Op::If` / `Op::Select` / `Op::BitAnd` support, so we lower the
@@ -920,261 +895,6 @@ fn w2_recorder_body() -> Vec<TaggedOp> {
     ]
 }
 
-/// review-improvement-139: IR body for W12's per-call body.
-///
-/// Mirrors `#main(Int x) -> Int\nx + 1`: load arg, add 1, return.
-/// Same 4-op shape as `trace_jit_hot_loop::step_body_trace_real`,
-/// modelled inside cmp_lua so the D5 trace_jit row lives next to its
-/// LuaJIT / tree-walker / bytecode siblings.
-///
-/// Params: 0 — `x: I64`.
-fn w12_recorder_body() -> Vec<TaggedOp> {
-    vec![
-        ir_tag(Op::LocalGet(0)),
-        ir_tag(Op::ConstI64(1)),
-        ir_tag(Op::Add(IrType::I64)),
-        ir_tag(Op::Return),
-    ]
-}
-
-/// review-improvement-167: IR body for W8 (poly_callsite).
-///
-/// W8 Relon source defines `dispatch(tag) = tag == 0 ? 1 : tag == 1
-/// ? 2 : tag == 2 ? 3 : 4` (closure) and folds `dispatch(i % 4)`
-/// across `range(n)`. The recorder cannot lower `Op::CallClosure`
-/// (UnrecoverableEffect) nor `Op::If` / `Op::Select` (UnsupportedOp),
-/// so the polymorphic dispatch chain is collapsed analytically to
-/// `tag + 1` — same result on the recorded inputs (tag ∈ 0..=3 by
-/// construction). The hot loop becomes:
-///
-/// ```text
-/// i = 0; acc = 0
-/// while i < n {
-///     acc += (i % 4) + 1
-///     i  += 1
-/// }
-/// return acc
-/// ```
-///
-/// Params: 0 — `n: I64`. Let-slots: 0 — `i: I64`, 1 — `acc: I64`.
-///
-/// Caveat: this is a "what would the trace cost if the recorder
-/// could observe the polymorphic resolution and specialise to the
-/// taken arm" measurement — same modelling discipline review-
-/// improvement-139 used for W2.
-fn w8_recorder_body() -> Vec<TaggedOp> {
-    const I: u32 = 0;
-    const ACC: u32 = 1;
-    vec![
-        // i = 0
-        ir_tag(Op::ConstI64(0)),
-        ir_tag(Op::LetSet {
-            idx: I,
-            ty: IrType::I64,
-        }),
-        // acc = 0
-        ir_tag(Op::ConstI64(0)),
-        ir_tag(Op::LetSet {
-            idx: ACC,
-            ty: IrType::I64,
-        }),
-        ir_tag(Op::Block {
-            result_ty: None,
-            body: vec![ir_tag(Op::Loop {
-                result_ty: None,
-                body: vec![
-                    // exit when i >= n
-                    ir_tag(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::LocalGet(0)),
-                    ir_tag(Op::Ge(IrType::I64)),
-                    ir_tag(Op::BrIf { label_depth: 1 }),
-                    // term = (i % 4) + 1
-                    ir_tag(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::ConstI64(4)),
-                    ir_tag(Op::Mod(IrType::I64)),
-                    ir_tag(Op::ConstI64(1)),
-                    ir_tag(Op::Add(IrType::I64)),
-                    // acc += term
-                    ir_tag(Op::LetGet {
-                        idx: ACC,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::Add(IrType::I64)),
-                    ir_tag(Op::LetSet {
-                        idx: ACC,
-                        ty: IrType::I64,
-                    }),
-                    // i = i + 1
-                    ir_tag(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::ConstI64(1)),
-                    ir_tag(Op::Add(IrType::I64)),
-                    ir_tag(Op::LetSet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    // continue
-                    ir_tag(Op::Br { label_depth: 0 }),
-                ],
-            })],
-        }),
-        // return acc
-        ir_tag(Op::LetGet {
-            idx: ACC,
-            ty: IrType::I64,
-        }),
-        ir_tag(Op::Return),
-    ]
-}
-
-/// review-improvement-167: IR body for W9 (nested_matrix).
-///
-/// W9 Relon source builds `rows: range(n).map((i) => range(n).map((j)
-/// => i * n + j))` and reduces `range(n).reduce(0, (acc, j) => acc +
-/// range(n).reduce(0, (inner, i) => inner + rows[i][j]))`. The
-/// closure+list forest aborts the recorder; we lower the workload's
-/// analytic kernel — a pair of nested loops accumulating `i*n + j`
-/// — directly into IR so the trace covers the inner double loop:
-///
-/// ```text
-/// sum = 0; j = 0
-/// while j < n {
-///     i = 0
-///     while i < n {
-///         sum += i * n + j
-///         i   += 1
-///     }
-///     j += 1
-/// }
-/// return sum
-/// ```
-///
-/// Params: 0 — `n: I64`. Let-slots: 0 — `j: I64`, 1 — `i: I64`,
-/// 2 — `sum: I64`. Nested `Op::Loop` is supported by the recorder
-/// (LIFO `open_loops` stack) and by the optimiser's LICM (innermost-
-/// loop-first traversal).
-fn w9_recorder_body() -> Vec<TaggedOp> {
-    const J: u32 = 0;
-    const I: u32 = 1;
-    const SUM: u32 = 2;
-    vec![
-        // sum = 0
-        ir_tag(Op::ConstI64(0)),
-        ir_tag(Op::LetSet {
-            idx: SUM,
-            ty: IrType::I64,
-        }),
-        // j = 0
-        ir_tag(Op::ConstI64(0)),
-        ir_tag(Op::LetSet {
-            idx: J,
-            ty: IrType::I64,
-        }),
-        // outer block { outer loop { ... } }
-        ir_tag(Op::Block {
-            result_ty: None,
-            body: vec![ir_tag(Op::Loop {
-                result_ty: None,
-                body: vec![
-                    // exit outer when j >= n
-                    ir_tag(Op::LetGet {
-                        idx: J,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::LocalGet(0)),
-                    ir_tag(Op::Ge(IrType::I64)),
-                    ir_tag(Op::BrIf { label_depth: 1 }),
-                    // i = 0 (reset for each j)
-                    ir_tag(Op::ConstI64(0)),
-                    ir_tag(Op::LetSet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    // inner block { inner loop { ... } }
-                    ir_tag(Op::Block {
-                        result_ty: None,
-                        body: vec![ir_tag(Op::Loop {
-                            result_ty: None,
-                            body: vec![
-                                // exit inner when i >= n
-                                ir_tag(Op::LetGet {
-                                    idx: I,
-                                    ty: IrType::I64,
-                                }),
-                                ir_tag(Op::LocalGet(0)),
-                                ir_tag(Op::Ge(IrType::I64)),
-                                ir_tag(Op::BrIf { label_depth: 1 }),
-                                // term = i * n + j
-                                ir_tag(Op::LetGet {
-                                    idx: I,
-                                    ty: IrType::I64,
-                                }),
-                                ir_tag(Op::LocalGet(0)),
-                                ir_tag(Op::Mul(IrType::I64)),
-                                ir_tag(Op::LetGet {
-                                    idx: J,
-                                    ty: IrType::I64,
-                                }),
-                                ir_tag(Op::Add(IrType::I64)),
-                                // sum += term
-                                ir_tag(Op::LetGet {
-                                    idx: SUM,
-                                    ty: IrType::I64,
-                                }),
-                                ir_tag(Op::Add(IrType::I64)),
-                                ir_tag(Op::LetSet {
-                                    idx: SUM,
-                                    ty: IrType::I64,
-                                }),
-                                // i += 1
-                                ir_tag(Op::LetGet {
-                                    idx: I,
-                                    ty: IrType::I64,
-                                }),
-                                ir_tag(Op::ConstI64(1)),
-                                ir_tag(Op::Add(IrType::I64)),
-                                ir_tag(Op::LetSet {
-                                    idx: I,
-                                    ty: IrType::I64,
-                                }),
-                                // continue inner
-                                ir_tag(Op::Br { label_depth: 0 }),
-                            ],
-                        })],
-                    }),
-                    // j += 1
-                    ir_tag(Op::LetGet {
-                        idx: J,
-                        ty: IrType::I64,
-                    }),
-                    ir_tag(Op::ConstI64(1)),
-                    ir_tag(Op::Add(IrType::I64)),
-                    ir_tag(Op::LetSet {
-                        idx: J,
-                        ty: IrType::I64,
-                    }),
-                    // continue outer
-                    ir_tag(Op::Br { label_depth: 0 }),
-                ],
-            })],
-        }),
-        // return sum
-        ir_tag(Op::LetGet {
-            idx: SUM,
-            ty: IrType::I64,
-        }),
-        ir_tag(Op::Return),
-    ]
-}
-
 /// review-improvement-167: IR body for W10 (config_eval).
 ///
 /// W10 Relon source: `(role_ok || role_ok2) && (region_ok ||
@@ -1373,315 +1093,12 @@ fn install_recorder_trace(
 // `trace_jit` rows through the recorder pipeline (`Op::DictGetByStringKey`
 // / `Op::ListGetByIntIdx` → `TraceOp::DictLookup` / `TraceOp::ListGet`)
 // via [`install_recorder_trace`] further below.
-
-// ----- Shared W5 fixture (mirrors cmp_lua_dict_list_trace) ----------
-
-struct W5Fixture {
-    dict_bytes: Vec<u8>,
-    keys_list_bytes: Vec<u8>,
-    shape_hash: u64,
-    _key_records: Vec<Vec<u8>>,
-    _key_record_ptrs: Vec<i64>,
-}
-
-/// Build the W5 fixture using the **canonical** F-D8-D producer-side
-/// shape-hash helper [`shape_hash_for_keys`].
-///
-/// The legacy bench fixture (kept on the hand-built JIT row) computed
-/// `shape_hash = fx_hash_bytes(concat(labels, "\0"))`, which is a
-/// different byte stream than what `shape_hash_for_keys` produces
-/// (per-key fx_hash XOR-mixed against an `INITIAL_SEED`). The F-D8-D
-/// recorder row needs the dict record's first-8-byte header to match
-/// the `Op::DictGetByStringKey { shape_hash }` payload exactly,
-/// otherwise the runtime IC dispatch (`__relon_trace_dict_lookup_v2`)
-/// hits the `dict_shape != shape_hash` branch and returns the deopt
-/// sentinel every iteration.
-fn build_w5_fixture() -> W5Fixture {
-    let labels = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
-    let key_records: Vec<Vec<u8>> = labels.iter().map(|s| build_string_record(s)).collect();
-    // F-D8-D: route through the canonical producer-side helper so the
-    // bench's `shape_hash` lines up bit-for-bit with what an analyzer-
-    // emitted `Op::DictGetByStringKey` would stamp in production.
-    let shape_hash = shape_hash_for_keys(labels.iter().copied());
-    let entries: Vec<(&[u8], i64)> = labels
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.as_bytes(), (i as i64) + 1))
-        .collect();
-    let dict_bytes = build_dict_record_v2(shape_hash, &entries);
-    let key_record_ptrs: Vec<i64> = key_records.iter().map(|kr| kr.as_ptr() as i64).collect();
-    let keys_list_bytes = build_flat_list_record(&key_record_ptrs);
-    if std::env::var_os("RELON_W5_KEYS_DUMP").is_some() {
-        let dict_addr = dict_bytes.as_ptr() as usize;
-        eprintln!("[cmp_lua W5] keys (dict=0x{dict_addr:016x}):");
-        for (i, kr) in key_records.iter().enumerate() {
-            let ka = kr.as_ptr() as usize;
-            // Dump the slot index each hot key hashes to so we can see
-            // whether the 10 keys cluster on a few cache lines or
-            // spread across the whole IC array. Mirrors the cranelift
-            // emitter's IC probe formula (SplitMix64-class multiplier,
-            // top log2(N) bits). Slot count is sourced from
-            // `DICT_LOOKUP_IC_SLOT_COUNT` so this stays accurate when
-            // the IC is rescaled (16 → 32 → 64 → 128 history).
-            let n_slots = relon_trace_abi::DICT_LOOKUP_IC_SLOT_COUNT;
-            let log2_slots = n_slots.trailing_zeros();
-            let mixed = ((dict_addr ^ ka) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15u64);
-            let slot = (mixed >> (64 - log2_slots)) as u32;
-            eprintln!(
-                "  key[{i}] ({}) addr=0x{ka:016x} ic_slot={slot:2} slot_off={}",
-                labels[i],
-                slot * 24,
-            );
-        }
-    }
-    W5Fixture {
-        dict_bytes,
-        keys_list_bytes,
-        shape_hash,
-        _key_records: key_records,
-        _key_record_ptrs: key_record_ptrs,
-    }
-}
-
-fn build_w6_fixture(n: u64) -> Vec<u8> {
-    let elements: Vec<i64> = (1..=(n as i64)).collect();
-    build_flat_list_record(&elements)
-}
-
-// ----- F-D8-D recorder-driven W5 / W6 IR bodies ---------------------
 //
-// These hand-built IR bodies emit the new `Op::DictGetByStringKey` /
-// `Op::ListGetByIntIdx` ops, so the recorder lowers them to
-// `TraceOp::DictLookup` / `TraceOp::ListGet` and the trace-emitter
-// installs a cranelift-JITted entry. Once landed they replace the
-// hand-rolled cranelift in [`build_w5_trace_fn`] / [`build_w6_trace_fn`],
-// which only ever existed as a "byte-identical floor" placeholder
-// until the recorder learned the subscript shapes (the F-D7 / F-D8
-// follow-up these benches called out by name).
-
-/// Convenience tag wrapper used by the recorder-driven IR body builders.
-fn tag(op: Op) -> TaggedOp {
-    TaggedOp {
-        op,
-        range: TokenRange::default(),
-    }
-}
-
-/// W5 recorder body: `for i in 0..n: acc += dict[keys[i % 10]]`.
-///
-/// Args (passed via `__relon_jump_to_recorder`'s `args_ptr`):
-/// - slot 0: `n`         (`IrType::I64`)
-/// - slot 1: `dict_ptr`  (`IrType::I64`, pointer payload)
-/// - slot 2: `keys_list_ptr` (`IrType::I64`, pointer payload)
-///
-/// Let-slot layout:
-/// - 0: `I`         — loop counter
-/// - 1: `ACC`       — accumulator
-/// - 2: `KEY_IDX`   — `i % 10`, lowered through `Op::Mod(IrType::I64)`.
-///   F-D8-E.1 added a dedicated `TraceOp::Mod` so this collapses to
-///   a single `srem` + divisor-zero guard in cranelift, instead of
-///   the old `Div + Mul + Sub` triple (three arith ops, three
-///   `ArithOverflow` guards) the recorder had to emit while no
-///   matching trace op existed. The earlier note about `Op::Select`
-///   not being an option still applies: the recorder specialises
-///   Select on the recorded polarity and would early-deopt every
-///   block once `KEY_IDX == 9`.
-/// - 3: `KEY_PTR`   — `keys_list[KEY_IDX]` (an `i64` payload that the
-///   recorder treats as a pointer through to `TraceOp::DictLookup`).
-///
-/// On exit, the body `Return`s the accumulator, which the trace-
-/// emitter mirrors into `TraceContext::result_slot` for the bench's
-/// consistency check.
-///
-/// `shape_hash` is the canonical [`shape_hash_for_keys`] value
-/// computed by [`build_w5_fixture`]; baking it into the IR Op
-/// matches the F-D8-D analyzer story (the shape is static at IR
-/// emit time, observed by the recorder verbatim).
-fn build_w5_recorder_body(shape_hash: u64, record_len: u32) -> Vec<TaggedOp> {
-    const I: u32 = 0;
-    const ACC: u32 = 1;
-    const KEY_IDX: u32 = 2;
-    const KEY_PTR: u32 = 3;
-    vec![
-        // i = 0
-        tag(Op::ConstI64(0)),
-        tag(Op::LetSet {
-            idx: I,
-            ty: IrType::I64,
-        }),
-        // acc = 0
-        tag(Op::ConstI64(0)),
-        tag(Op::LetSet {
-            idx: ACC,
-            ty: IrType::I64,
-        }),
-        tag(Op::Block {
-            result_ty: None,
-            body: vec![tag(Op::Loop {
-                result_ty: None,
-                body: vec![
-                    // Exit: if i >= n: br 1 (out of loop, fall past block).
-                    tag(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    tag(Op::LocalGet(0)),
-                    tag(Op::Ge(IrType::I64)),
-                    tag(Op::BrIf { label_depth: 1 }),
-                    // KEY_IDX = i % 10 (F-D8-E.1: single TraceOp::Mod)
-                    tag(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    tag(Op::ConstI64(10)),
-                    tag(Op::Mod(IrType::I64)),
-                    tag(Op::LetSet {
-                        idx: KEY_IDX,
-                        ty: IrType::I64,
-                    }),
-                    // KEY_PTR = keys_list[KEY_IDX]
-                    tag(Op::LocalGet(2)),
-                    tag(Op::LetGet {
-                        idx: KEY_IDX,
-                        ty: IrType::I64,
-                    }),
-                    tag(Op::ListGetByIntIdx {
-                        element_ty: IrType::I64,
-                    }),
-                    tag(Op::LetSet {
-                        idx: KEY_PTR,
-                        ty: IrType::I64,
-                    }),
-                    // value = dict[KEY_PTR]
-                    tag(Op::LocalGet(1)),
-                    tag(Op::LetGet {
-                        idx: KEY_PTR,
-                        ty: IrType::I64,
-                    }),
-                    tag(Op::DictGetByStringKey {
-                        shape_hash,
-                        value_ty: IrType::I64,
-                        // W5 fixture has 10 fixed keys and a static v2
-                        // record envelope; forward both hints so the
-                        // trace can use collision-safe dict lookup.
-                        entry_count_hint: Some(10),
-                        record_len_hint: Some(record_len),
-                    }),
-                    // acc = acc + value
-                    tag(Op::LetGet {
-                        idx: ACC,
-                        ty: IrType::I64,
-                    }),
-                    tag(Op::Add(IrType::I64)),
-                    tag(Op::LetSet {
-                        idx: ACC,
-                        ty: IrType::I64,
-                    }),
-                    // i = i + 1
-                    tag(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    tag(Op::ConstI64(1)),
-                    tag(Op::Add(IrType::I64)),
-                    tag(Op::LetSet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    // continue
-                    tag(Op::Br { label_depth: 0 }),
-                ],
-            })],
-        }),
-        // return acc
-        tag(Op::LetGet {
-            idx: ACC,
-            ty: IrType::I64,
-        }),
-        tag(Op::Return),
-    ]
-}
-
-/// W6 recorder body: `for i in 0..n: acc += list[i]`.
-///
-/// Args:
-/// - slot 0: `n`        (`IrType::I64`)
-/// - slot 1: `list_ptr` (`IrType::I64`, pointer payload)
-///
-/// Let-slot layout: `I = 0`, `ACC = 1`.
-fn build_w6_recorder_body() -> Vec<TaggedOp> {
-    const I: u32 = 0;
-    const ACC: u32 = 1;
-    vec![
-        tag(Op::ConstI64(0)),
-        tag(Op::LetSet {
-            idx: I,
-            ty: IrType::I64,
-        }),
-        tag(Op::ConstI64(0)),
-        tag(Op::LetSet {
-            idx: ACC,
-            ty: IrType::I64,
-        }),
-        tag(Op::Block {
-            result_ty: None,
-            body: vec![tag(Op::Loop {
-                result_ty: None,
-                body: vec![
-                    tag(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    tag(Op::LocalGet(0)),
-                    tag(Op::Ge(IrType::I64)),
-                    tag(Op::BrIf { label_depth: 1 }),
-                    // value = list[i]
-                    tag(Op::LocalGet(1)),
-                    tag(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    tag(Op::ListGetByIntIdx {
-                        element_ty: IrType::I64,
-                    }),
-                    // acc = acc + value
-                    tag(Op::LetGet {
-                        idx: ACC,
-                        ty: IrType::I64,
-                    }),
-                    tag(Op::Add(IrType::I64)),
-                    tag(Op::LetSet {
-                        idx: ACC,
-                        ty: IrType::I64,
-                    }),
-                    // i = i + 1
-                    tag(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    tag(Op::ConstI64(1)),
-                    tag(Op::Add(IrType::I64)),
-                    tag(Op::LetSet {
-                        idx: I,
-                        ty: IrType::I64,
-                    }),
-                    tag(Op::Br { label_depth: 0 }),
-                ],
-            })],
-        }),
-        tag(Op::LetGet {
-            idx: ACC,
-            ty: IrType::I64,
-        }),
-        tag(Op::Return),
-    ]
-}
-
-// F-D7-D + F-D8-D merge: the W5 / W6 recorder-driver originally
-// lived here as a leaner copy of `install_recorder_trace`. After
-// merge we route W5 / W6 through the canonical `install_recorder_trace`
-// defined ~line 475 (F-D7-D's pre-flight-diagnostic variant), which
-// is a superset of the original simpler form.
+// 2026-05-27 honesty cleanup: the W5 / W6 hand-built IR fixtures
+// (`build_w5_fixture` + `build_w6_fixture` + `build_w5_recorder_body`
+// + `build_w6_recorder_body`) and their `tag` helper were removed
+// along with the `_fixture` panel rows they fed. Restored once the
+// production auto-recorder lands W5 / W6 trace rows via #308 J.2.
 
 /// W3 / W4 fixture: stable `*const StringRef` pointers for the literal
 /// arguments. Stored in a struct so the bench keeps them alive for the
@@ -2853,39 +2270,13 @@ fn bench_cmp_lua(c: &mut Criterion) {
         let lua_v: i64 = lua_fn_w2.call(()).unwrap();
         assert_relon_lua_consistent("W2", relon_v, lua_v, w2_expected());
 
-        // review-improvement-139: recorder-driven trace_jit row for W2.
-        // The Relon source folds `(i+1)*(i+2)` across `range(n)` via
-        // `list.sum(...map(...))` — stdlib + closure, which the
-        // recorder cannot lower (Op::CallClosure aborts
-        // UnrecoverableEffect). The IR body here records the inner
-        // reduction directly so the trace stays inside the recorder's
-        // arithmetic envelope (Add / Mul on I64). Same deopt-driven
-        // exit pattern as W3 / W4 / W5 / W6: the loop-exit guard
-        // observes `i < n` during recording, so the natural exit deopts
-        // and `invoke_with_fallback` supplies the analytic answer.
-        let warm_args_w2: [u64; 1] = [W2_N as u64];
-        let _w2_trace_fn = install_recorder_trace(
-            W2_REC_FN_ID,
-            w2_recorder_body(),
-            vec![IrType::I64],
-            &warm_args_w2,
-        );
-        let w2_jit_state = global_trace_jit_state();
-        {
-            let v = unsafe {
-                w2_jit_state.invoke_with_fallback(
-                    W2_REC_FN_ID,
-                    warm_args_w2.as_ptr(),
-                    /* slot_count = */ 64,
-                    |_args| w2_expected() as u64,
-                )
-            };
-            assert_eq!(
-                v as i64,
-                w2_expected(),
-                "W2 recorder trace + fallback must return analytic dot sum"
-            );
-        }
+        // W2 trace_jit_fixture row removed (honesty cleanup 2026-05-27):
+        // the hand-built `w2_recorder_body` collapses the production
+        // `list.sum(range(n).map((i) => (i + 1) * (i + 2)))` chain to a
+        // pure-arith loop, skipping the closure + stdlib dispatch the
+        // recorder cannot trace today. Per the /perf honesty rules the
+        // measurement is a paper-win surface — restored once #308 J.2
+        // unblocks the production auto-recorder for this workload.
 
         group.throughput(Throughput::Elements(W2_N as u64));
         group.bench_function(BenchmarkId::new("W2_f64_dot", "relon_tree_walk"), |b| {
@@ -2897,33 +2288,6 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
-        // Honesty fix (/perf Honesty Rules): row name suffixed
-        // `_fixture` because the trace body comes from `w2_recorder_body`
-        // (hand-built IR), not the production auto recorder. Per-iter
-        // ops match the production stdlib chain but skip the
-        // BcOp -> IR Op converter, so the timing is a lower-bound floor
-        // on what the auto path will deliver once it lands.
-        group.bench_function(
-            BenchmarkId::new("W2_f64_dot", "relon_trace_jit_fixture"),
-            |b| {
-                b.iter_custom(|iters| {
-                    let args: [u64; 1] = warm_args_w2;
-                    let args_ptr = args.as_ptr();
-                    let expected = w2_expected() as u64;
-                    timed_with_warmup(iters, || {
-                        let v = unsafe {
-                            w2_jit_state.invoke_with_fallback(
-                                W2_REC_FN_ID,
-                                black_box(args_ptr),
-                                64,
-                                |_args| expected,
-                            )
-                        };
-                        black_box(v);
-                    })
-                });
-            },
-        );
         group.bench_function(BenchmarkId::new("W2_f64_dot", "luajit"), |b| {
             b.iter_custom(|iters| {
                 timed_with_warmup(iters, || {
@@ -3354,73 +2718,11 @@ fn bench_cmp_lua(c: &mut Criterion) {
         let lua_v: i64 = lua_fn_w5.call(()).unwrap();
         assert_relon_lua_consistent("W5", relon_v, lua_v, w5_expected());
 
-        // F-D8-D trace JIT row: drive the W5 IR body through the
-        // recorder + install pipeline. The recorder lowers
-        // `Op::DictGetByStringKey` → `TraceOp::DictLookup` and
-        // `Op::ListGetByIntIdx` → `TraceOp::ListGet` automatically;
-        // the trace-emitter then JIT-compiles the resulting buffer.
-        //
-        // Trace-exit shape: the recorded loop has no natural fall-
-        // through (the body's `BrIf` exit synthesises a polarity
-        // guard that fires on the last iter `i == n`). We invoke via
-        // `invoke_with_fallback`; the fallback's analytic answer
-        // recovers the host-observable return value when the exit
-        // guard deopts. The fallback only fires **once per call** —
-        // every preceding loop iter ran inside the JIT trace — so the
-        // criterion per-element cost still reflects the trace's
-        // per-iter work, not the fallback's `O(1)` shortcut.
-        let w5_fixture = build_w5_fixture();
-        // 2026-05-26 W5 layout RCA: dump fixture addresses up-front so
-        // we can correlate dict/key heap placement with cross-process
-        // timing variance.
-        if std::env::var_os("RELON_W5_FIXTURE_DUMP").is_some() {
-            let da = w5_fixture.dict_bytes.as_ptr() as usize;
-            let ka = w5_fixture.keys_list_bytes.as_ptr() as usize;
-            eprintln!(
-                "[cmp_lua W5] fixture dict=0x{da:016x} mod64={} mod4096={} keys=0x{ka:016x} mod64={} mod4096={}",
-                da % 64,
-                da % 4096,
-                ka % 64,
-                ka % 4096,
-            );
-        }
-        // fn_id chosen outside the ranges other benches in the same
-        // process use (cmp_lua and trace_jit_hot_loop both touch
-        // `global_trace_jit_state`; W5 / W6 carve their own slots).
-        let w5_fn_id: u32 = 220;
-        let warm_args_w5: [u64; 3] = [
-            TREE_WALK_N,
-            w5_fixture.dict_bytes.as_ptr() as u64,
-            w5_fixture.keys_list_bytes.as_ptr() as u64,
-        ];
-        let _w5_trace_fn = install_recorder_trace(
-            w5_fn_id,
-            build_w5_recorder_body(w5_fixture.shape_hash, w5_fixture.dict_bytes.len() as u32),
-            vec![IrType::I64, IrType::I64, IrType::I64],
-            &warm_args_w5,
-        );
-        let w5_jit_state = global_trace_jit_state();
-        // Consistency check: drive one full invocation through the
-        // recorder-installed trace via `invoke_with_fallback` and
-        // assert the host-observable result matches the analytic
-        // expectation. The fallback returns `w5_expected()` (the
-        // bench's analytic answer); if the deopt path fires before
-        // the loop completes, the per-iter cost surfaces here as a
-        // catastrophic ratio shift (every iter goes through the
-        // fallback) — the trace-install pipeline asserts the trace
-        // body lowered cleanly above.
-        {
-            let args: [u64; 3] = warm_args_w5;
-            let v = unsafe {
-                w5_jit_state
-                    .invoke_with_fallback(w5_fn_id, args.as_ptr(), 64, |_args| w5_expected() as u64)
-            };
-            assert_eq!(
-                v as i64,
-                w5_expected(),
-                "W5 recorder-driven trace + fallback must match analytic sum"
-            );
-        }
+        // W5 trace_jit_fixture row removed (honesty cleanup 2026-05-27):
+        // the hand-built `build_w5_recorder_body` collapses the production
+        // dict-lookup chain to a pure-IR loop, skipping the BcOp -> IR Op
+        // converter the recorder needs to learn. Restored once #308 J.2
+        // unblocks the production auto-recorder for this workload.
 
         group.throughput(Throughput::Elements(TREE_WALK_N));
         group.bench_function(
@@ -3430,64 +2732,6 @@ fn bench_cmp_lua(c: &mut Criterion) {
                     let n_in = black_box(TREE_WALK_N as i64);
                     timed_with_warmup(iters, || {
                         let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
-                        black_box(v);
-                    })
-                });
-            },
-        );
-        // Honesty fix (/perf Honesty Rules): row name suffixed
-        // `_fixture` because the trace body comes from the hand-built
-        // W5 recorder body, not the production auto recorder. Per-iter
-        // dict-lookup ops match the production stdlib chain but skip
-        // the BcOp -> IR Op converter, so the timing is a lower-bound
-        // floor on what the auto path will deliver once it lands.
-        group.bench_function(
-            BenchmarkId::new("W5_dict_str_key", "relon_trace_jit_fixture"),
-            |b| {
-                b.iter_custom(|iters| {
-                    // 2026-05-25: pre-allocate the TraceContext outside
-                    // the timed region. Saves the per-call ~150ns
-                    // allocator round-trip and — more importantly —
-                    // keeps the inline-IR dict-lookup IC table warm
-                    // across invocations, so the *first* loop iter of
-                    // every subsequent call hits the IC rather than
-                    // priming it. Mirrors the W3 / W4 pattern that's
-                    // been there since their recorder-driven rewrite.
-                    let mut tctx = TraceContext::with_hooks(64, default_host_hooks());
-                    // 2026-05-26 W5 layout RCA: dump tctx + IC + ssa_slots
-                    // heap addresses once per iter_custom call so we can
-                    // correlate per-process layout with the cross-run
-                    // timing variance. The bench process re-enters this
-                    // closure on every criterion sample; the addresses
-                    // are stable across samples within one process so
-                    // dumping once via OnceLock is enough.
-                    if std::env::var_os("RELON_W5_TCTX_DUMP").is_some() {
-                        use std::sync::OnceLock;
-                        static DUMPED: OnceLock<()> = OnceLock::new();
-                        let _ = DUMPED.get_or_init(|| {
-                            let tctx_addr = &tctx as *const _ as usize;
-                            let ic_addr = tctx.dict_lookup_ic.as_ptr() as usize;
-                            let ssa_addr = tctx.ssa_slots.as_ptr() as usize;
-                            eprintln!(
-                                "[cmp_lua W5] tctx=0x{tctx_addr:016x} mod64={} ic=0x{ic_addr:016x} mod64={} ssa=0x{ssa_addr:016x} mod64={}",
-                                tctx_addr % 64,
-                                ic_addr % 64,
-                                ssa_addr % 64,
-                            );
-                        });
-                    }
-                    let args: [u64; 3] = warm_args_w5;
-                    let args_ptr = args.as_ptr();
-                    let expected = w5_expected() as u64;
-                    timed_with_warmup(iters, || {
-                        let v = unsafe {
-                            w5_jit_state.invoke_with_existing_ctx(
-                                w5_fn_id,
-                                &mut tctx,
-                                black_box(args_ptr),
-                                |_args| expected,
-                            )
-                        };
                         black_box(v);
                     })
                 });
@@ -3547,35 +2791,11 @@ fn bench_cmp_lua(c: &mut Criterion) {
         let lua_v: i64 = lua_fn_w6.call(()).unwrap();
         assert_relon_lua_consistent("W6", relon_v, lua_v, w6_expected());
 
-        // F-D8-D trace JIT row: drive the W6 IR body through the
-        // recorder. `Op::ListGetByIntIdx` becomes `TraceOp::ListGet`
-        // with the bounds-check guard the recorder stamps inline.
-        // Same loop-exit shape as W5: the recorded `BrIf` synthesises
-        // a polarity guard that fires once per call on the natural
-        // exit; we recover the host-observable answer via
-        // `invoke_with_fallback`'s analytic fallback.
-        let w6_list = build_w6_fixture(TREE_WALK_N);
-        let w6_fn_id: u32 = 221;
-        let warm_args_w6: [u64; 2] = [TREE_WALK_N, w6_list.as_ptr() as u64];
-        let _w6_trace_fn = install_recorder_trace(
-            w6_fn_id,
-            build_w6_recorder_body(),
-            vec![IrType::I64, IrType::I64],
-            &warm_args_w6,
-        );
-        let w6_jit_state = global_trace_jit_state();
-        {
-            let args: [u64; 2] = warm_args_w6;
-            let v = unsafe {
-                w6_jit_state
-                    .invoke_with_fallback(w6_fn_id, args.as_ptr(), 64, |_args| w6_expected() as u64)
-            };
-            assert_eq!(
-                v as i64,
-                w6_expected(),
-                "W6 recorder-driven trace + fallback must match analytic sum"
-            );
-        }
+        // W6 trace_jit_fixture row removed (honesty cleanup 2026-05-27):
+        // same rationale as W5 — the hand-built `build_w6_recorder_body`
+        // skips the BcOp -> IR Op converter, so the timing was a paper
+        // win. Restored once #308 J.2 unblocks the production
+        // auto-recorder for this workload.
 
         group.throughput(Throughput::Elements(TREE_WALK_N));
         group.bench_function(
@@ -3585,40 +2805,6 @@ fn bench_cmp_lua(c: &mut Criterion) {
                     let n_in = black_box(TREE_WALK_N as i64);
                     timed_with_warmup(iters, || {
                         let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
-                        black_box(v);
-                    })
-                });
-            },
-        );
-        // Honesty fix (/perf Honesty Rules): row name suffixed
-        // `_fixture` because the trace body comes from
-        // `build_w6_recorder_body` (hand-built IR), not the production
-        // auto recorder. Per-iter list-get ops match the production
-        // stdlib chain but skip the BcOp -> IR Op converter, so the
-        // timing is a lower-bound floor on what the auto path will
-        // deliver once it lands.
-        group.bench_function(
-            BenchmarkId::new("W6_dict_num_key", "relon_trace_jit_fixture"),
-            |b| {
-                b.iter_custom(|iters| {
-                    // 2026-05-25: same per-iter alloc avoidance + IC
-                    // warm-up rationale as W5. The W6 trace also hits
-                    // a single (dict_ptr, key_ptr) pair per loop iter,
-                    // so the carried-forward IC is similarly load-
-                    // bearing.
-                    let mut tctx = TraceContext::with_hooks(64, default_host_hooks());
-                    let args: [u64; 2] = warm_args_w6;
-                    let args_ptr = args.as_ptr();
-                    let expected = w6_expected() as u64;
-                    timed_with_warmup(iters, || {
-                        let v = unsafe {
-                            w6_jit_state.invoke_with_existing_ctx(
-                                w6_fn_id,
-                                &mut tctx,
-                                black_box(args_ptr),
-                                |_args| expected,
-                            )
-                        };
                         black_box(v);
                     })
                 });
@@ -3756,36 +2942,11 @@ fn bench_cmp_lua(c: &mut Criterion) {
         let lua_v: i64 = lua_fn_w8.call(()).unwrap();
         assert_relon_lua_consistent("W8", relon_v, lua_v, w8_expected());
 
-        // review-improvement-167: recorder-driven trace_jit row for W8.
-        // The Relon source's polymorphic `dispatch` closure aborts the
-        // recorder via `Op::CallClosure → UnrecoverableEffect`; the
-        // hand-built IR collapses `dispatch(i % 4)` to `(i % 4) + 1`
-        // (algebraically equal on tag ∈ 0..=3) so the trace stays in
-        // the pure-arith envelope. Same modelling discipline review-
-        // improvement-139 used for W2 / W12.
-        let warm_args_w8: [u64; 1] = [TREE_WALK_N];
-        let _w8_trace_fn = install_recorder_trace(
-            W8_REC_FN_ID,
-            w8_recorder_body(),
-            vec![IrType::I64],
-            &warm_args_w8,
-        );
-        let w8_jit_state = global_trace_jit_state();
-        {
-            let v = unsafe {
-                w8_jit_state.invoke_with_fallback(
-                    W8_REC_FN_ID,
-                    warm_args_w8.as_ptr(),
-                    /* slot_count = */ 64,
-                    |_args| w8_expected() as u64,
-                )
-            };
-            assert_eq!(
-                v as i64,
-                w8_expected(),
-                "W8 recorder trace + fallback must return analytic poly-dispatch sum"
-            );
-        }
+        // W8 trace_jit_fixture row removed (honesty cleanup 2026-05-27):
+        // the hand-built `w8_recorder_body` collapsed the production
+        // polymorphic `dispatch(i % 4)` closure call to inline arith,
+        // bypassing the closure-dispatch cost the recorder needs to
+        // learn. Restored once #308 J.2 unblocks closure tracing.
 
         group.throughput(Throughput::Elements(TREE_WALK_N));
         group.bench_function(
@@ -3795,35 +2956,6 @@ fn bench_cmp_lua(c: &mut Criterion) {
                     let n_in = black_box(TREE_WALK_N as i64);
                     timed_with_warmup(iters, || {
                         let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
-                        black_box(v);
-                    })
-                });
-            },
-        );
-        // Honesty fix (/perf Honesty Rules, audit #298 yellow line):
-        // row name suffixed `_fixture` AND `_kernel` semantics flagged
-        // because the trace body is an analytic kernel — it preserves
-        // per-iter arith ops and complexity but skips closure dispatch
-        // (the production source's `dispatch(i % 4)` first-class
-        // closure call) that the recorder cannot trace today. The
-        // measurement bounds dispatch-free arithmetic throughput; do
-        // NOT compare against the LuaJIT row 1:1.
-        group.bench_function(
-            BenchmarkId::new("W8_poly_callsite", "relon_trace_jit_fixture"),
-            |b| {
-                b.iter_custom(|iters| {
-                    let args: [u64; 1] = warm_args_w8;
-                    let args_ptr = args.as_ptr();
-                    let expected = w8_expected() as u64;
-                    timed_with_warmup(iters, || {
-                        let v = unsafe {
-                            w8_jit_state.invoke_with_fallback(
-                                W8_REC_FN_ID,
-                                black_box(args_ptr),
-                                64,
-                                |_args| expected,
-                            )
-                        };
                         black_box(v);
                     })
                 });
@@ -3880,37 +3012,11 @@ fn bench_cmp_lua(c: &mut Criterion) {
         let lua_v: i64 = lua_fn_w9.call(()).unwrap();
         assert_relon_lua_consistent("W9", relon_v, lua_v, w9_expected());
 
-        // review-improvement-167: recorder-driven trace_jit row for W9.
-        // The Relon source builds nested `range(n).map(...).reduce(...)`
-        // closures; recorder aborts on `Op::CallClosure`. The IR
-        // fixture instead emits a pair of nested `Op::Loop`s
-        // accumulating `i*n + j` — same analytic answer as the
-        // source. Nested loops are supported by the recorder
-        // (`open_loops` LIFO stack) and the trace-JIT optimiser
-        // (LICM iterates innermost loops first).
-        let warm_args_w9: [u64; 1] = [W9_N as u64];
-        let _w9_trace_fn = install_recorder_trace(
-            W9_REC_FN_ID,
-            w9_recorder_body(),
-            vec![IrType::I64],
-            &warm_args_w9,
-        );
-        let w9_jit_state = global_trace_jit_state();
-        {
-            let v = unsafe {
-                w9_jit_state.invoke_with_fallback(
-                    W9_REC_FN_ID,
-                    warm_args_w9.as_ptr(),
-                    /* slot_count = */ 64,
-                    |_args| w9_expected() as u64,
-                )
-            };
-            assert_eq!(
-                v as i64,
-                w9_expected(),
-                "W9 recorder trace + fallback must return analytic nested-sum"
-            );
-        }
+        // W9 trace_jit_fixture row removed (honesty cleanup 2026-05-27):
+        // the hand-built `w9_recorder_body` substituted nested arith
+        // loops for the production `range(n).map(...).reduce(...)`
+        // closure forest, skipping the matrix-construction overhead.
+        // Restored once #308 J.2 unblocks closure / list tracing.
 
         let inner = (W9_N as u64) * (W9_N as u64);
         group.throughput(Throughput::Elements(inner));
@@ -3920,36 +3026,6 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     timed_with_warmup(iters, || {
                         let v = walker.run_main(&scope, w9_relon_n_arg()).unwrap();
-                        black_box(v);
-                    })
-                });
-            },
-        );
-        // Honesty fix (/perf Honesty Rules, audit #298 yellow line):
-        // row name suffixed `_fixture` AND `_kernel` semantics flagged
-        // because the trace body is an analytic kernel — it preserves
-        // the nested-loop complexity (`i*n + j` accumulator) but skips
-        // the matrix construction (`#internal rows` + `rows[i][j]`)
-        // that the production source builds via closure-bodied
-        // `range(n).map(...).reduce(...)`. The measurement bounds
-        // nested-loop arithmetic throughput; do NOT compare against
-        // the LuaJIT row 1:1.
-        group.bench_function(
-            BenchmarkId::new("W9_nested_matrix", "relon_trace_jit_fixture"),
-            |b| {
-                b.iter_custom(|iters| {
-                    let args: [u64; 1] = warm_args_w9;
-                    let args_ptr = args.as_ptr();
-                    let expected = w9_expected() as u64;
-                    timed_with_warmup(iters, || {
-                        let v = unsafe {
-                            w9_jit_state.invoke_with_fallback(
-                                W9_REC_FN_ID,
-                                black_box(args_ptr),
-                                64,
-                                |_args| expected,
-                            )
-                        };
                         black_box(v);
                     })
                 });
@@ -4138,36 +3214,10 @@ fn bench_cmp_lua(c: &mut Criterion) {
         let (walker, scope) = build_tree_walker(w12_relon_src());
         let lua_fn_w12 = lua_fn(&lua, w12_lua_src());
 
-        // review-improvement-139: recorder-driven trace_jit row for W12.
-        // Mirrors `#main(Int x) -> Int\nx + 1` (4-op
-        // `LocalGet + ConstI64 + Add + Return` body). Same shape the
-        // `trace_jit_hot_loop` dispatch-boundary row exercises, but
-        // here it lives in the cmp_lua group so the D5 p99 tail
-        // measurement carries trace_jit numbers next to LuaJIT
-        // and the tree-walker.
-        let warm_args_w12: [u64; 1] = [7];
-        let _w12_trace_fn = install_recorder_trace(
-            W12_REC_FN_ID,
-            w12_recorder_body(),
-            vec![IrType::I64],
-            &warm_args_w12,
-        );
-        let w12_jit_state = global_trace_jit_state();
-        {
-            // Consistency: trace + fallback returns x + 1 (= 8) for x = 7.
-            let v = unsafe {
-                w12_jit_state.invoke_with_fallback(
-                    W12_REC_FN_ID,
-                    warm_args_w12.as_ptr(),
-                    /* slot_count = */ 64,
-                    |args| *args + 1,
-                )
-            };
-            assert_eq!(
-                v as i64, 8,
-                "W12 recorder trace must return x + 1 for x = 7"
-            );
-        }
+        // W12 trace_jit_fixture row removed (honesty cleanup 2026-05-27):
+        // the 4-op `w12_recorder_body` (`x + 1`) skipped the BcOp -> IR Op
+        // converter the production auto recorder must drive. Restored
+        // once #308 J.2 lands the production-route W12 row.
 
         group.throughput(Throughput::Elements(1));
         group.bench_function(BenchmarkId::new("W12_p99_tail", "relon_tree_walk"), |b| {
@@ -4178,36 +3228,6 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 black_box(v);
             });
         });
-        // Honesty fix (/perf Honesty Rules): row name suffixed
-        // `_fixture` because the 4-op trace body comes from the
-        // hand-built `w12_recorder_body` (`x + 1`), not the production
-        // auto recorder. Per-iter ops match the production source
-        // (`#main(Int x) -> Int\nx + 1`) byte-for-byte but the install
-        // route skips the BcOp -> IR Op converter.
-        group.bench_function(
-            BenchmarkId::new("W12_p99_tail", "relon_trace_jit_fixture"),
-            |b| {
-                // Hoist the args slot out of the inner closure so the
-                // per-iter cost is just `invoke_with_fallback` dispatch
-                // + the 4-op trace body. Mirrors the W5 / W6 trace_jit
-                // rows. We pass `7` through `black_box` to defeat
-                // constant-fold + match the host-observable timing of
-                // an opaque `x = 7` invoke.
-                let args: [u64; 1] = [7];
-                let args_ptr = args.as_ptr();
-                b.iter(|| {
-                    let v = unsafe {
-                        w12_jit_state.invoke_with_fallback(
-                            W12_REC_FN_ID,
-                            black_box(args_ptr),
-                            64,
-                            |a| *a + 1,
-                        )
-                    };
-                    black_box(v);
-                });
-            },
-        );
         group.bench_function(BenchmarkId::new("W12_p99_tail", "luajit"), |b| {
             b.iter(|| {
                 let r: i64 = lua_fn_w12.call(black_box(7i64)).unwrap();
