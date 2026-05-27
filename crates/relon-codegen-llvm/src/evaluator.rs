@@ -430,13 +430,26 @@ impl LlvmAotEvaluator {
         // The pipeline is built fresh through `PassBuilderOptions`
         // (the LLVM 17+ new pass manager) since inkwell 0.9 deprecates
         // the legacy `PassManager` for IR-level work on LLVM 18.
+        // Debug: capture pre-opt IR if the env requests it via
+        // `RELON_LLVM_DUMP_PREOPT=1`. The pre-opt shape is mostly
+        // alloca / load / store noise but is useful when verifying
+        // that emitter changes survived the dispatch path (post-opt
+        // IR can have aggressive constant folding that makes brand-
+        // new branches invisible). The flag is intentionally opt-in
+        // so production paths never pay the second IR dump.
+        let preopt_dump: Option<String> = std::env::var_os("RELON_LLVM_DUMP_PREOPT")
+            .map(|_| module.print_to_string().to_string());
+
         run_default_o3_pipeline(&module)?;
 
         // Capture the dumped IR *after* the optimizer ran so tests
         // that assert on the IR see the post-opt shape (mem2reg /
         // loop simplification visible). The pre-opt shape is mostly
         // alloca / load / store noise.
-        let ir_dump = module.print_to_string().to_string();
+        let mut ir_dump = module.print_to_string().to_string();
+        if let Some(p) = preopt_dump {
+            ir_dump = format!("; --- PRE-OPT IR ---\n{p}\n; --- POST-OPT IR ---\n{ir_dump}");
+        }
 
         let engine = module
             .create_jit_execution_engine(OptimizationLevel::Aggressive)

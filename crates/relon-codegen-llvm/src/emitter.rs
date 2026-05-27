@@ -1504,17 +1504,23 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 // pair-wise String + String form (the StrConcatN
                 // fold only fires for compile-time-known chains —
                 // `reduce("", (acc, s) => acc + s)` lowers to a
-                // per-iter `Add(String)`). Route through the bundled
-                // stdlib `concat` body via inline call, matching the
-                // cranelift backend.
-                IrType::String => {
-                    let concat_idx =
-                        relon_ir::stdlib::stdlib_function_index("concat").ok_or_else(|| {
-                            LlvmError::Codegen("stdlib `concat` slot not found".to_string())
-                        })?;
-                    let param_tys = [IrType::String, IrType::String];
-                    self.emit_call_stdlib(&ip_hint, concat_idx, 2, &param_tys, IrType::String)?
-                }
+                // per-iter `Add(String)`).
+                //
+                // Phase I (W3 string-concat gap close): emit the
+                // in-place-append fast path. The W3 reduce hot loop
+                // walks `acc = acc + "a"` for N iters; under the
+                // historical inlined-`concat` body that turned into
+                // an O(N²) byte-copy storm because every iter
+                // reallocated a fresh scratch record. The new
+                // helper recognises the "lhs is the most recent
+                // scratch alloc" case at runtime and extends the
+                // record in place — total work drops to O(N) bytes,
+                // matching `String::push_str`. The slow path stays
+                // bit-identical with the historical lowering so
+                // mixed-source string adds (const-pool literals,
+                // out-of-order scratch records) still produce a
+                // fresh record.
+                IrType::String => self.emit_str_add_inplace_or_concat(&ip_hint)?,
                 _ => self.emit_binop(&ip_hint, *ty, BinOp::Add)?,
             },
             Op::Sub(ty) => self.emit_binop(&ip_hint, *ty, BinOp::Sub)?,
@@ -3562,6 +3568,260 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         }
         // Push the resulting record offset.
         self.push(base_off, IrType::String);
+        Ok(())
+    }
+
+    /// Lower `Op::Add(IrType::String)` with the W3 reduce-accumulator
+    /// fast path. Pops `[lhs_off, rhs_off]` (i32 arena offsets); emits a
+    /// runtime branch that picks between:
+    ///
+    /// * **In-place append (fast)** — when `lhs` is the most recent
+    ///   scratch allocation (`lhs_off + 4 + lhs_len == scratch_base +
+    ///   scratch_cursor`), extend the existing record by `rhs_len`
+    ///   bytes. Updates the header in-place, copies only the rhs
+    ///   payload, bumps `scratch_cursor` by `rhs_len`. Result offset =
+    ///   `lhs_off`. This is the W3 hot loop's steady-state path: every
+    ///   iteration's freshly-built accumulator is the most recent
+    ///   allocation, so concatenating one more byte costs O(1) (a
+    ///   single byte store + cursor bump) instead of the historical
+    ///   O(N) re-copy of the running accumulator.
+    /// * **Full alloc + copy (slow)** — when the lhs sits somewhere
+    ///   else in the arena (e.g. const-pool literal, scratch alloc
+    ///   from a different sub-expression). Replicates the historical
+    ///   `concat` stdlib body: allocate `lhs_len + rhs_len + 4` bytes
+    ///   of scratch, stamp the header, memcpy both payloads. Result
+    ///   offset = the freshly-allocated base.
+    ///
+    /// The two arms merge at a phi node, and the resulting i32 offset
+    /// is pushed back tagged as [`IrType::String`].
+    ///
+    /// ## Correctness ground
+    ///
+    /// The in-place mutation overwrites both:
+    /// * the existing `[len: u32]` header at `[lhs_off..lhs_off+4]`,
+    /// * the bytes immediately past the existing payload, at
+    ///   `[lhs_off+4+lhs_len .. lhs_off+4+lhs_len+rhs_len]`.
+    ///
+    /// The guard `lhs_off + 4 + lhs_len == scratch_base +
+    /// scratch_cursor` ensures the bytes past the payload are inside
+    /// the unallocated scratch tail — no other live data sits there.
+    /// The result offset shares its base with the lhs, so any
+    /// subsequent reader that previously held `lhs_off` would now see
+    /// the longer record — but in the reduce pattern the lhs slot
+    /// (`acc`) is immediately overwritten by the `LetSet` that follows
+    /// `Op::Add(String)`, so no stale alias remains.
+    ///
+    /// The fast path also keeps `scratch_cursor` advanced by exactly
+    /// the same byte count that the slow path would have advanced it
+    /// for the fresh record (`rhs_len` extra bytes vs `lhs_len +
+    /// rhs_len + 4` extra bytes for a full copy), so the arena's
+    /// out-of-bounds budget is *strictly tighter* than the historical
+    /// path — there is no new failure mode where the fast path
+    /// exceeds the arena while the slow path would have fit.
+    fn emit_str_add_inplace_or_concat(&mut self, ip_hint: &str) -> Result<(), LlvmError> {
+        let arena_base_ptr = self.arena_base_ptr.ok_or_else(|| {
+            LlvmError::Codegen(
+                "Op::Add(String) outside buffer-protocol entry shape (no arena_base)".into(),
+            )
+        })?;
+        let state_ptr = self.state_ptr.ok_or_else(|| {
+            LlvmError::Codegen(
+                "Op::Add(String) outside buffer-protocol entry shape (no state)".into(),
+            )
+        })?;
+        let i32_t = self.ctx.i32_type();
+        let i8_t = self.ctx.i8_type();
+        let i64_t = self.ctx.i64_type();
+
+        // Pop in reverse order: stack is `[lhs, rhs]`, top is rhs.
+        let rhs_off = self.pop_int(ip_hint)?;
+        let lhs_off = self.pop_int(ip_hint)?;
+
+        // Load lhs.len and rhs.len from header word at offset 0 of
+        // each record.
+        let lhs_addr = self.arena_addr_i32(lhs_off)?;
+        let lhs_len = self
+            .builder
+            .build_load(i32_t, lhs_addr, "stradd_lhs_len")
+            .map_err(|e| LlvmError::Codegen(format!("Add(String) lhs len load: {e}")))?
+            .into_int_value();
+        let rhs_addr = self.arena_addr_i32(rhs_off)?;
+        let rhs_len = self
+            .builder
+            .build_load(i32_t, rhs_addr, "stradd_rhs_len")
+            .map_err(|e| LlvmError::Codegen(format!("Add(String) rhs len load: {e}")))?
+            .into_int_value();
+
+        // Read scratch_base + scratch_cursor from the arena state.
+        let scratch_cur_gep = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    state_ptr,
+                    &[i32_t.const_int(u64::from(ARENA_STATE_OFFSET_SCRATCH_CURSOR), false)],
+                    "stradd_scratch_cur_gep",
+                )
+                .map_err(|e| LlvmError::Codegen(format!("scratch_cur GEP: {e}")))?
+        };
+        let scratch_cur = self
+            .builder
+            .build_load(i32_t, scratch_cur_gep, "stradd_scratch_cur")
+            .map_err(|e| LlvmError::Codegen(format!("scratch_cur load: {e}")))?
+            .into_int_value();
+        let scratch_base_gep = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    state_ptr,
+                    &[i32_t.const_int(u64::from(ARENA_STATE_OFFSET_SCRATCH_BASE), false)],
+                    "stradd_scratch_base_gep",
+                )
+                .map_err(|e| LlvmError::Codegen(format!("scratch_base GEP: {e}")))?
+        };
+        let scratch_base = self
+            .builder
+            .build_load(i32_t, scratch_base_gep, "stradd_scratch_base")
+            .map_err(|e| LlvmError::Codegen(format!("scratch_base load: {e}")))?
+            .into_int_value();
+
+        // lhs_end = lhs_off + 4 + lhs_len
+        let four = i32_t.const_int(4, false);
+        let lhs_off_plus_4 = self
+            .builder
+            .build_int_add(lhs_off, four, "stradd_lhs_off_plus4")
+            .map_err(|e| LlvmError::Codegen(format!("stradd lhs+4: {e}")))?;
+        let lhs_end = self
+            .builder
+            .build_int_add(lhs_off_plus_4, lhs_len, "stradd_lhs_end")
+            .map_err(|e| LlvmError::Codegen(format!("stradd lhs_end: {e}")))?;
+        // scratch_end = scratch_base + scratch_cursor
+        let scratch_end = self
+            .builder
+            .build_int_add(scratch_base, scratch_cur, "stradd_scratch_end")
+            .map_err(|e| LlvmError::Codegen(format!("stradd scratch_end: {e}")))?;
+        let is_tail = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, lhs_end, scratch_end, "stradd_is_tail")
+            .map_err(|e| LlvmError::Codegen(format!("stradd cmp: {e}")))?;
+
+        let fast_bb = self.ctx.append_basic_block(self.func, "stradd_fast");
+        let slow_bb = self.ctx.append_basic_block(self.func, "stradd_slow");
+        let merge_bb = self.ctx.append_basic_block(self.func, "stradd_merge");
+        self.builder
+            .build_conditional_branch(is_tail, fast_bb, slow_bb)
+            .map_err(|e| LlvmError::Codegen(format!("stradd branch: {e}")))?;
+
+        // --- fast path: in-place append ---
+        self.builder.position_at_end(fast_bb);
+        let total_len_fast = self
+            .builder
+            .build_int_add(lhs_len, rhs_len, "stradd_fast_total")
+            .map_err(|e| LlvmError::Codegen(format!("stradd fast total: {e}")))?;
+        // store updated header
+        self.builder
+            .build_store(lhs_addr, total_len_fast)
+            .map_err(|e| LlvmError::Codegen(format!("stradd fast header store: {e}")))?;
+        // memcpy(arena+lhs_end, arena+rhs_off+4, rhs_len)
+        let fast_dst = self.arena_addr_i32(lhs_end)?;
+        let rhs_payload_off = self
+            .builder
+            .build_int_add(rhs_off, four, "stradd_rhs_payload_off")
+            .map_err(|e| LlvmError::Codegen(format!("stradd rhs payload off: {e}")))?;
+        let fast_src = self.arena_addr_i32(rhs_payload_off)?;
+        let rhs_len64 = self
+            .builder
+            .build_int_z_extend(rhs_len, i64_t, "stradd_rhs_len64")
+            .map_err(|e| LlvmError::Codegen(format!("stradd rhs_len zext: {e}")))?;
+        self.builder
+            .build_memcpy(fast_dst, 1, fast_src, 1, rhs_len64)
+            .map_err(|e| LlvmError::Codegen(format!("stradd fast memcpy: {e}")))?;
+        // bump scratch_cursor by rhs_len
+        let new_cur = self
+            .builder
+            .build_int_add(scratch_cur, rhs_len, "stradd_fast_newcur")
+            .map_err(|e| LlvmError::Codegen(format!("stradd fast new cur: {e}")))?;
+        self.builder
+            .build_store(scratch_cur_gep, new_cur)
+            .map_err(|e| LlvmError::Codegen(format!("stradd fast cursor store: {e}")))?;
+        let fast_end_bb = self.builder.get_insert_block().unwrap();
+        self.builder
+            .build_unconditional_branch(merge_bb)
+            .map_err(|e| LlvmError::Codegen(format!("stradd fast->merge: {e}")))?;
+
+        // --- slow path: full alloc + double memcpy ---
+        self.builder.position_at_end(slow_bb);
+        // total_len = lhs_len + rhs_len
+        let total_len_slow = self
+            .builder
+            .build_int_add(lhs_len, rhs_len, "stradd_slow_total")
+            .map_err(|e| LlvmError::Codegen(format!("stradd slow total: {e}")))?;
+        // record_size = total_len + 4
+        let record_size = self
+            .builder
+            .build_int_add(total_len_slow, four, "stradd_slow_recsize")
+            .map_err(|e| LlvmError::Codegen(format!("stradd slow recsize: {e}")))?;
+        self.emit_alloc_scratch_common(record_size)?;
+        let base_off = self.pop_int(ip_hint)?;
+        // write header at base
+        let base_addr = self.arena_addr_i32(base_off)?;
+        self.builder
+            .build_store(base_addr, total_len_slow)
+            .map_err(|e| LlvmError::Codegen(format!("stradd slow header store: {e}")))?;
+        // memcpy lhs payload to base+4
+        let base_plus_4 = self
+            .builder
+            .build_int_add(base_off, four, "stradd_slow_basep4")
+            .map_err(|e| LlvmError::Codegen(format!("stradd slow base+4: {e}")))?;
+        let dst1 = self.arena_addr_i32(base_plus_4)?;
+        let lhs_payload_off = self
+            .builder
+            .build_int_add(lhs_off, four, "stradd_slow_lhsp")
+            .map_err(|e| LlvmError::Codegen(format!("stradd slow lhsp: {e}")))?;
+        let src1 = self.arena_addr_i32(lhs_payload_off)?;
+        let lhs_len64 = self
+            .builder
+            .build_int_z_extend(lhs_len, i64_t, "stradd_slow_lhs64")
+            .map_err(|e| LlvmError::Codegen(format!("stradd slow lhs_len zext: {e}")))?;
+        self.builder
+            .build_memcpy(dst1, 1, src1, 1, lhs_len64)
+            .map_err(|e| LlvmError::Codegen(format!("stradd slow lhs memcpy: {e}")))?;
+        // memcpy rhs payload to base+4+lhs_len
+        let lhs_dst_cursor = self
+            .builder
+            .build_int_add(base_plus_4, lhs_len, "stradd_slow_cur2")
+            .map_err(|e| LlvmError::Codegen(format!("stradd slow cur2: {e}")))?;
+        let dst2 = self.arena_addr_i32(lhs_dst_cursor)?;
+        let rhs_payload_off2 = self
+            .builder
+            .build_int_add(rhs_off, four, "stradd_slow_rhsp")
+            .map_err(|e| LlvmError::Codegen(format!("stradd slow rhsp: {e}")))?;
+        let src2 = self.arena_addr_i32(rhs_payload_off2)?;
+        let rhs_len64_slow = self
+            .builder
+            .build_int_z_extend(rhs_len, i64_t, "stradd_slow_rhs64")
+            .map_err(|e| LlvmError::Codegen(format!("stradd slow rhs_len zext: {e}")))?;
+        self.builder
+            .build_memcpy(dst2, 1, src2, 1, rhs_len64_slow)
+            .map_err(|e| LlvmError::Codegen(format!("stradd slow rhs memcpy: {e}")))?;
+        let slow_end_bb = self.builder.get_insert_block().unwrap();
+        self.builder
+            .build_unconditional_branch(merge_bb)
+            .map_err(|e| LlvmError::Codegen(format!("stradd slow->merge: {e}")))?;
+
+        // --- merge: phi of lhs_off / base_off ---
+        self.builder.position_at_end(merge_bb);
+        let phi = self
+            .builder
+            .build_phi(i32_t, "stradd_result")
+            .map_err(|e| LlvmError::Codegen(format!("stradd phi: {e}")))?;
+        let lhs_off_val: BasicValueEnum<'ctx> = lhs_off.into();
+        let base_off_val: BasicValueEnum<'ctx> = base_off.into();
+        phi.add_incoming(&[(&lhs_off_val, fast_end_bb), (&base_off_val, slow_end_bb)]);
+        let result = phi.as_basic_value().into_int_value();
+        // arena_base_ptr is referenced implicitly inside arena_addr_i32;
+        // bind it to silence the borrow checker.
+        let _ = arena_base_ptr;
+        self.push(result, IrType::String);
         Ok(())
     }
 

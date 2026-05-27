@@ -108,3 +108,49 @@ fn w4_ir_dumps_str_contains_fast_path() {
          extern shim. Dump:\n{dump}"
     );
 }
+
+/// Phase I regression guard: the W3 reduce-string-accumulator hot
+/// loop must lower through the in-place append fast path
+/// (`emit_str_add_inplace_or_concat`), not the historical inlined
+/// `concat` stdlib body. The pre-rewrite shape allocated a fresh
+/// scratch record on every iter (O(N²) total memcpy bytes) and at
+/// N=2000 overflowed the 1 MiB scratch arena outright — the new path
+/// extends the running accumulator in place whenever the lhs is the
+/// most-recent scratch alloc, cutting per-iter work to a single rhs
+/// memcpy + cursor bump (O(N) total bytes, matching `String::push_str`).
+///
+/// We assert on the post-opt IR rather than wall-clock so the gate is
+/// deterministic in CI; the label `stradd_is_tail` is the SSA name
+/// the emitter pins on the runtime tail-of-scratch check.
+#[test]
+fn w3_ir_emits_inplace_append_fast_path() {
+    let ev =
+        relon_codegen_llvm::LlvmAotEvaluator::from_source(W3_SRC).expect("LLVM AOT from_source");
+    let dump = ev.emit_ir_dump();
+    assert!(
+        dump.contains("stradd_is_tail"),
+        "W3 must lower `Op::Add(IrType::String)` through the in-place \
+         append fast path (`emit_str_add_inplace_or_concat`); the \
+         `stradd_is_tail` SSA name is missing from the post-opt IR. \
+         Re-inlining the historical `concat` stdlib body would re-open \
+         the O(N²) gap that originally SEGV'd at STRING_CONCAT_N=2000. \
+         Dump:\n{dump}"
+    );
+}
+
+/// Phase I correctness guard: W3 at STRING_CONCAT_N=2000 — the same
+/// scalar the cmp_lua bench uses — must return the canonical
+/// `"a".repeat(2000)` payload. Pre-rewrite this SEGV'd because the
+/// 1 MiB scratch arena couldn't hold the O(N²) intermediate records.
+#[test]
+fn w3_string_concat_two_thousand() {
+    let ev =
+        relon_codegen_llvm::LlvmAotEvaluator::from_source(W3_SRC).expect("LLVM AOT from_source");
+    let mut args = std::collections::HashMap::new();
+    args.insert("n".to_string(), relon_eval_api::Value::Int(2000));
+    let result = ev.run_main(args).expect("LLVM run_main n=2000");
+    assert_eq!(
+        result,
+        relon_eval_api::Value::String("a".repeat(2000).into())
+    );
+}
