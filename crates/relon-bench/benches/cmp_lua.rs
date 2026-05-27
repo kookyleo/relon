@@ -2815,6 +2815,80 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 });
             });
         }
+
+        // Phase Z.3c-f (2026-05-28): relon_wasm_wasmtime row for W5.
+        // Drives the bytecode-shape inline variant
+        // (`w5_relon_src_bytecode()`) through `WasmEvaluator::run_main`,
+        // which lowers via `relon-codegen-wasm` into a pure-WASM
+        // accumulator loop whose per-iter body reads `[1, 2, ..., 10]
+        // [i % 10]` from a 10-entry i64 dispatch table in linear
+        // memory. The classifier routes the **production** `w5_relon_src()`
+        // (`#main -> Dict` with `#internal d: {...}` + `keys: [...]` +
+        // `d[keys[i % 10]]`) to the tree-walker fallback — Z.4 follow-up
+        // promotes the production-source path; until then this row
+        // honestly measures the inline variant (same observable I/O,
+        // simplified byte-keyed table lookup in place of string-hashed
+        // dict probe).
+        //
+        // Why the i64-table emit instead of `(i % 10) + 1` closed form:
+        // the bytecode-shape source already collapsed the dict lookup
+        // to scalar arith, and the LLVM AOT row (`W5_LLVM_SRC`) takes
+        // that path. Copying the closed form here too would book the
+        // dict-lookup cost as `i64.rem_s` + `i64.add` per iter —
+        // paper-win anti-pattern per design §7. The table-load emit
+        // keeps a real per-iter linear-memory dependency that models
+        // what the production dict lookup would do; the wasm row will
+        // therefore measure as a paper-LOSS relative to the bytecode /
+        // LLVM closed-form rows, which is the honest direction.
+        if let Some(wasm) = try_build_wasm_compiled(
+            w5_relon_src_bytecode(),
+            "W5",
+            w5_expected(),
+            args_w_n(TREE_WALK_N as i64),
+        ) {
+            use relon_eval_api::Evaluator as _;
+            group.bench_function(
+                BenchmarkId::new("W5_dict_str_key", "relon_wasm_wasmtime"),
+                |b| {
+                    b.iter_custom(|iters| {
+                        let n_in = black_box(TREE_WALK_N as i64);
+                        timed_with_warmup(iters, || {
+                            let v = wasm.run_main(args_w_n(black_box(n_in))).unwrap();
+                            black_box(v);
+                        })
+                    });
+                },
+            );
+
+            // Fast row — mirrors W1/W2/W8/W9/W10 patterns. Bypasses
+            // the HashMap<String, Value> pack + Value::Int wrap. Cross-
+            // checked against the buffer path before the timed loop.
+            if wasm.has_fast_path() {
+                let fast_out = wasm
+                    .run_main_legacy_i64_fast(&[TREE_WALK_N as i64])
+                    .expect("W5 wasm fast path consistency");
+                let slow_out = match wasm.run_main(args_w_n(TREE_WALK_N as i64)).unwrap() {
+                    Value::Int(n) => n,
+                    other => panic!("W5 wasm fast cross-check: slow path returned {other:?}"),
+                };
+                assert_eq!(
+                    fast_out, slow_out,
+                    "W5 fast/buffer disagree: fast={fast_out} buffer={slow_out}"
+                );
+                group.bench_function(
+                    BenchmarkId::new("W5_dict_str_key", "relon_wasm_wasmtime_fast"),
+                    |b| {
+                        b.iter_custom(|iters| {
+                            let n_in = black_box(TREE_WALK_N as i64);
+                            timed_with_warmup(iters, || {
+                                let v = wasm.run_main_legacy_i64_fast(&[black_box(n_in)]).unwrap();
+                                black_box(v);
+                            })
+                        });
+                    },
+                );
+            }
+        }
     }
 
     // ----- W6 -----
