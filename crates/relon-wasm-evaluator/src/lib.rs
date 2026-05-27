@@ -286,6 +286,7 @@ fn program_returns_scalar_int(program: WasmProgram) -> bool {
         WasmProgram::W1IntSumRange
         | WasmProgram::W2DotProduct
         | WasmProgram::W4StringContains { .. }
+        | WasmProgram::W5DictAccessInline
         | WasmProgram::W6ListSumPlusOne
         | WasmProgram::W8PolymorphicDispatchInline
         | WasmProgram::W9NestedMatrixInline
@@ -344,6 +345,7 @@ impl Evaluator for WasmEvaluator {
             | WasmProgram::W2DotProduct
             | WasmProgram::W3StringConcatInline
             | WasmProgram::W4StringContains { .. }
+            | WasmProgram::W5DictAccessInline
             | WasmProgram::W6ListSumPlusOne
             | WasmProgram::W8PolymorphicDispatchInline
             | WasmProgram::W9NestedMatrixInline

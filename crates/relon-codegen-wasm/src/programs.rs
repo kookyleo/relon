@@ -113,8 +113,52 @@ pub enum WasmProgram {
     },
 
     /// W5 dict access — scope-cut Z.1 (dict literal + i % 10 indexing
-    /// needs the IR walker).
+    /// needs the IR walker). The production source binds a `#internal`
+    /// 10-entry dict `d: { a: 1, ..., j: 10 }` + parallel key list
+    /// `keys: ["a", ..., "j"]` and returns a `Dict { d, keys, result }`
+    /// record — bare-`Dict` return + dict-literal + list-literal are
+    /// all outside the Z.3 lowering envelope (Z.4 follow-up).
     W5DictAccess,
+
+    /// W5 dict-access inline (`#main(Int n) -> Int`, matches
+    /// `w5_relon_src_bytecode()` from `cmp_lua`). The production W5
+    /// source materialises a `#internal d: { a: 1, ..., j: 10 }`
+    /// 10-entry string-keyed dict, a parallel `keys: ["a", ..., "j"]`
+    /// list, and per-iter performs `d[keys[i % 10]]` — a string
+    /// hash lookup whose return value is always `(i % 10) + 1` on
+    /// the declaration-ordered `a..j -> 1..10` mapping. Both the
+    /// bare-`Dict` return type and the dict/list literals scope-cut
+    /// at Z.1 (Z.4 follow-up).
+    ///
+    /// Z.3c-f models the per-iter lookup with a **dense i64 table
+    /// in linear memory** rather than the closed-form `(i % 10) + 1`
+    /// the bytecode-shape source declares. The 10-element table
+    /// `[1, 2, ..., 10]` is installed as a data segment at instantiate
+    /// time; per iter the loop computes `idx = i % 10`, loads
+    /// `memory[idx * 8]`, and adds it to the accumulator. The choice
+    /// is deliberate honesty-shaping (design §7):
+    ///
+    /// - The bytecode-shape source already algebraically collapsed
+    ///   the string-keyed dict lookup to `(i % 10) + 1`. Emitting that
+    ///   closed form here would be a single `i64.rem_s` + `i64.add`
+    ///   per iter — a paper-win that **erases the dict-lookup memory
+    ///   dependency** the production source declares.
+    /// - The i64 table emit re-introduces the per-iter memory load
+    ///   the production source's `d[keys[i % 10]]` chain implies
+    ///   (one `i64.rem_s` + index scaling + `i64.load`), while
+    ///   simplifying the string-hash step to a byte-keyed offset —
+    ///   the keys "a".."j" are themselves index-shaped (0..10) under
+    ///   the declaration-ordered `a..j -> 1..10` mapping, so the
+    ///   simplification preserves observable I/O. The lowering does
+    ///   **more** per-iter work than the source declares, not less.
+    /// - The LLVM AOT W5 row (see `W5_LLVM_SRC` in cmp_lua) takes
+    ///   the closed-form path through the same bytecode-shape source.
+    ///   The WASM row's i64-table emit makes the cross-row comparison
+    ///   wasm-disadvantaged (extra memory traffic), which is the
+    ///   honest disclosure rather than the paper-win direction.
+    ///
+    /// See [`emit_w5_dict_access_inline`] for the loop body sketch.
+    W5DictAccessInline,
 
     /// `#main(Int n) -> Int  list.sum(range(n).map((i) => i+1))` —
     /// closed-form via `__relon_list_range_alloc` (offset by 1) +
@@ -237,13 +281,28 @@ pub(crate) fn w4_haystack_bytes(long: bool) -> &'static [u8] {
 
 /// First arena byte the per-call bump may safely consume. For Z.1
 /// programs without data segments this is `0`; for W4 the const
-/// records occupy bytes [16 .. const_segment_end).
+/// records occupy bytes [16 .. const_segment_end); for W5
+/// `W5DictAccessInline` the 10-entry i64 dispatch table occupies
+/// bytes [`W5_TABLE_OFFSET` .. `W5_TABLE_OFFSET + 80`).
 pub fn const_segment_end(program: &WasmProgram) -> u32 {
     match program {
         WasmProgram::W4StringContains { long } => w4_const_segment_end(*long),
+        WasmProgram::W5DictAccessInline => W5_TABLE_OFFSET + (W5_TABLE_ENTRIES as u32) * 8,
         _ => 0,
     }
 }
+
+/// W5 dispatch-table base offset in linear memory. Keep bytes 0..16
+/// reserved (matches W4's null-handle trap-zone convention) so a
+/// stray zero-pointer read lands in the reserved region rather than
+/// returning a plausible table value. Aligned to 8 because each
+/// entry is an `i64`.
+pub(crate) const W5_TABLE_OFFSET: u32 = 16;
+
+/// Number of entries in the W5 i64 dispatch table. The production
+/// dict `d: { a: 1, ..., j: 10 }` and parallel `keys: ["a", ..., "j"]`
+/// list both have exactly 10 entries, indexed by `i % 10`.
+pub(crate) const W5_TABLE_ENTRIES: usize = 10;
 
 /// Compute the byte right after the W4 needle record, rounded up to
 /// 8-byte alignment so the next arena bump can land on a list-header
@@ -272,6 +331,7 @@ pub(crate) fn lower_program(program: &WasmProgram) -> Result<Vec<u8>, LowerError
         WasmProgram::W3StringConcatInline => Ok(emit_w3_string_concat_inline()),
         WasmProgram::W4StringContains { long } => Ok(emit_w4_filter_contains_count(*long)),
         WasmProgram::W5DictAccess => Err(LowerError::ScopeCut("W5-dict-access")),
+        WasmProgram::W5DictAccessInline => Ok(emit_w5_dict_access_inline()),
         WasmProgram::W6ListSumPlusOne => Ok(emit_w6_list_sum_plus_one()),
         WasmProgram::W7FibRecursion => Err(LowerError::ScopeCut("W7-fib-recursion")),
         WasmProgram::W8PolymorphicDispatch => Err(LowerError::ScopeCut("W8-polymorphic-dispatch")),
@@ -1348,6 +1408,135 @@ fn emit_w4_filter_contains_count(long: bool) -> Vec<u8> {
     needle_record.extend_from_slice(W4_NEEDLE);
 
     let data_segments = vec![(haystack_ptr, haystack_record), (needle_ptr, needle_record)];
+
+    finalize_module(prelude, func, &data_segments)
+}
+
+/// W5 dict-access inline lowering. `#main(Int n) -> Int  list.sum(
+///   range(n).map((i) => d[keys[i % 10]]))`, where
+/// `d: { a: 1, ..., j: 10 }` and `keys: ["a", ..., "j"]`.
+///
+/// Z.3c-f models the per-iter dict lookup with a 10-entry **dense i64
+/// table in linear memory** (`[1, 2, ..., 10]`, installed as an active
+/// data segment at instantiate time). Per iter the loop computes
+/// `idx = i % 10`, scales to a byte offset (`idx * 8`), loads the
+/// `i64` value at that offset, and adds it to the accumulator.
+///
+/// Honesty (design §7):
+///   - Same algorithm? — the production source's per-iter work is
+///     a dict lookup `d[keys[i % 10]]` (string hash + dict probe).
+///     The bytecode-shape sibling source `w5_relon_src_bytecode()`
+///     already algebraically collapsed this to `(i % 10) + 1` and is
+///     the path the LLVM AOT W5 row takes (see `W5_LLVM_SRC` in
+///     `crates/relon-bench/benches/cmp_lua.rs`). The WASM emit chose
+///     to **not** copy that closed-form — emitting a single
+///     `i64.rem_s` + `i64.add` per iter would book the dict-lookup
+///     cost as scalar arithmetic (paper-win anti-pattern). Instead
+///     the table-load form keeps a real per-iter memory dependency,
+///     simplifying only the string-hash step (the keys "a".."j" are
+///     index-shaped under the declaration-ordered `a..j -> 1..10`
+///     mapping, so the byte-keyed offset preserves observable I/O).
+///     The lowering does **more** per-iter work than the
+///     bytecode-shape source declares, not less.
+///   - Same code path? — `WasmEvaluator::run_main` lowers via this
+///     module and dispatches through wasmtime. No host imports are
+///     called; the table lives in linear memory.
+///   - Same I/O shape? — `#main(Int n) -> Int`, returns
+///     `Value::Int(Σ_{i in [0..n)} ((i % 10) + 1))`. Cross-checked
+///     against the tree-walker on the production W5 source in
+///     `tests/w5_smoke.rs`.
+///
+/// Loop shape (pure WASM, one data segment, no host imports):
+///   acc = 0
+///   i   = 0
+///   loop:
+///     if i >= n: break
+///     idx     = i % 10
+///     offset  = (idx * 8) as i32
+///     val     = memory.load_i64[W5_TABLE_OFFSET + offset]
+///     acc    += val
+///     i      += 1
+///   return acc
+fn emit_w5_dict_access_inline() -> Vec<u8> {
+    let prelude = build_prelude();
+
+    // Locals layout (function param 0 is `n: i64`; we add three locals):
+    //   local 0 = n (param, i64)
+    //   local 1 = acc (i64)
+    //   local 2 = i   (i64)
+    //   local 3 = idx (i64, = i % 10)
+    let mut func = Function::new([(3u32, ValType::I64)]);
+
+    // acc = 0
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::LocalSet(1));
+    // i = 0
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::LocalSet(2));
+
+    // outer `block` so we can `br` out of the loop.
+    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+    func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+    // if i >= n: br outer
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::LocalGet(0));
+    func.instruction(&Instruction::I64GeS);
+    func.instruction(&Instruction::BrIf(1));
+
+    // idx = i % 10
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I64Const(W5_TABLE_ENTRIES as i64));
+    func.instruction(&Instruction::I64RemS);
+    func.instruction(&Instruction::LocalSet(3));
+
+    // val = memory.load_i64[W5_TABLE_OFFSET + idx * 8]
+    //
+    // Compute the byte-offset address as i32 (i64.load wants an i32
+    // address operand). The `MemArg.offset` field carries the static
+    // base `W5_TABLE_OFFSET` so the runtime address is just
+    // `idx * 8`. Alignment 3 (= log2(8)) — every table entry is
+    // 8-byte aligned because the table base is at offset 16 (≡ 0
+    // mod 8) and each entry is 8 bytes.
+    func.instruction(&Instruction::LocalGet(3));
+    func.instruction(&Instruction::I64Const(8));
+    func.instruction(&Instruction::I64Mul);
+    func.instruction(&Instruction::I32WrapI64);
+    func.instruction(&Instruction::I64Load(MemArg {
+        offset: W5_TABLE_OFFSET as u64,
+        align: 3,
+        memory_index: 0,
+    }));
+
+    // acc += val
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::I64Add);
+    func.instruction(&Instruction::LocalSet(1));
+
+    // i += 1
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I64Const(1));
+    func.instruction(&Instruction::I64Add);
+    func.instruction(&Instruction::LocalSet(2));
+
+    // br to loop head
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // loop
+    func.instruction(&Instruction::End); // block
+
+    // return acc
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::End); // function
+
+    // Build the 10-entry i64 dispatch table data segment. Bytes are
+    // little-endian (WASM linear memory is LE on all targets); each
+    // i64 is 8 bytes for a total of 80 bytes.
+    let mut table_bytes: Vec<u8> = Vec::with_capacity(W5_TABLE_ENTRIES * 8);
+    for k in 1..=(W5_TABLE_ENTRIES as i64) {
+        table_bytes.extend_from_slice(&k.to_le_bytes());
+    }
+    debug_assert_eq!(table_bytes.len(), W5_TABLE_ENTRIES * 8);
+    let data_segments = vec![(W5_TABLE_OFFSET, table_bytes)];
 
     finalize_module(prelude, func, &data_segments)
 }

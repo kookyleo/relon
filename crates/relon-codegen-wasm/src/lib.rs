@@ -142,6 +142,22 @@ mod tests {
     }
 
     #[test]
+    fn lower_w5_inline_round_trips() {
+        let bytes = lower(&WasmProgram::W5DictAccessInline).expect("emit W5 inline");
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .expect("wasmparser validates W5 inline");
+        // Sanity: the data-segment-bearing module has a non-zero
+        // const-segment end so the host's per-call arena reset is
+        // forced past the dispatch table.
+        let end = const_segment_end(&WasmProgram::W5DictAccessInline);
+        assert!(
+            end >= 16 + 10 * 8,
+            "W5 inline const segment must cover the 10-entry i64 table (got {end})"
+        );
+    }
+
+    #[test]
     fn lower_w10_inline_round_trips() {
         let bytes = lower(&WasmProgram::W10ConfigEvalInline).expect("emit W10 inline");
         wasmparser::Validator::new()
