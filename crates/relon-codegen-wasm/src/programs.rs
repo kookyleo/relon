@@ -28,7 +28,7 @@ use wasm_encoder::{
     Instruction, MemArg, MemorySection, MemoryType, Module, TypeSection, ValType,
 };
 
-use crate::host_abi::{import_index, HOST_IMPORTS};
+use crate::host_abi::HOST_IMPORTS;
 use crate::LowerError;
 
 /// Z.1 POC program shape — one variant per cmp_lua workload.
@@ -38,9 +38,10 @@ use crate::LowerError;
 /// workloads return [`LowerError::ScopeCut`] from [`lower_program`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WasmProgram {
-    /// `#main(Int n) -> Int  list.sum(range(n))` — closed-form
-    /// `n*(n-1)/2` lowering via `__relon_list_range_alloc` +
-    /// `__relon_list_sum_i64`.
+    /// `#main(Int n) -> Int  list.sum(range(n))` — inlined as a pure
+    /// WASM accumulator loop (no host imports, no linear-memory walk).
+    /// Computes `n*(n-1)/2` via `for i in [0..n): acc += i`. See
+    /// [`emit_w1_int_sum_range`] for the loop body sketch.
     W1IntSumRange,
 
     /// `#main(Int n) -> Int  list.sum(range(n).map((i) => (i+1)*(i+2)))`
@@ -205,37 +206,83 @@ fn finalize_module(prelude: ModulePrelude, main_body: Function) -> Vec<u8> {
 
 /// W1 lowering. `#main(Int n) -> Int  list.sum(range(n))`.
 ///
-/// Body sketch:
-///   handle = __relon_list_range_alloc(0, n)
-///   return  __relon_list_sum_i64(handle)
+/// Source-level `list.sum(range(n))` is mathematically `n*(n-1)/2`.
+/// Earlier Z.1 lowered this as two host imports
+/// (`__relon_list_range_alloc` + `__relon_list_sum_i64`); profiling in
+/// Phase Z.3a showed ~all of W1's wall time being spent in the Rust
+/// host loop materialising the range and walking it for the sum, with
+/// one boundary crossing per call (design §10.2 W1 follow-up). Z.3b
+/// folds the chain into a pure-WASM accumulator loop — zero host
+/// imports, zero linear-memory traffic, one typed-func entry.
+///
+/// Honesty (design §7):
+///   - Same algorithm? — same closed-form sum over the same index
+///     domain `[0..n)`. The compiler is inlining the stdlib chain
+///     `range.sum` into the equivalent accumulator loop; the source
+///     `list.sum(range(n))` is unchanged.
+///   - Same code path? — `WasmEvaluator::run_main` still takes the
+///     same source, lowers via this module, and runs the compiled
+///     function through wasmtime. The host-import path is simply
+///     unreachable now (imports are still declared at module scope
+///     for ABI uniformity but not called).
+///   - Same I/O shape? — `#main(Int n) -> Int`, returns
+///     `Value::Int(n*(n-1)/2)`, identical to the host-call lowering.
+///
+/// Loop shape (pure WASM, no host imports needed):
+///   acc = 0
+///   i   = 0
+///   loop:
+///     if i >= n: break
+///     acc += i
+///     i   += 1
+///   return acc
 fn emit_w1_int_sum_range() -> Vec<u8> {
     let prelude = build_prelude();
-    let range_alloc_idx = import_index(23);
-    let sum_idx = import_index(24);
 
-    // Function locals: none (we use the operand stack only).
-    let mut func = Function::new(std::iter::empty::<(u32, ValType)>());
-    // Stack: [n: i64]
-    func.instruction(&Instruction::I64Const(0)); // [n, 0]
-    func.instruction(&Instruction::LocalGet(0)); // [0, n]
-                                                 // Re-order so the call signature `(start: i64, end: i64) -> i32` is satisfied
-                                                 // with start = 0, end = n. We emit the constants in order so the runtime
-                                                 // reads (start, end) directly without a swap.
-                                                 //
-                                                 // Redo: simpler to emit (i64.const 0) then (local.get 0) so the
-                                                 // resulting stack is [0, n] which matches the call's argument
-                                                 // declaration order. The two instructions above already produce
-                                                 // that pattern; replace the above with the cleaner emit below.
-                                                 //
-                                                 // (The previous two instructions are a no-op; rebuild the function.)
-    let mut func = Function::new(std::iter::empty::<(u32, ValType)>());
+    // Locals layout (function param 0 is `n: i64`; we add two locals):
+    //   local 0 = n (param)
+    //   local 1 = acc
+    //   local 2 = i
+    let mut func = Function::new([(2u32, ValType::I64)]);
+
+    // acc = 0
     func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::LocalSet(1));
+    // i = 0
+    func.instruction(&Instruction::I64Const(0));
+    func.instruction(&Instruction::LocalSet(2));
+
+    // outer `block` so we can `br` out of the loop. Block return type:
+    // empty (we'll push the result after the loop ends).
+    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty));
+    func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));
+
+    // if i >= n: br outer
+    func.instruction(&Instruction::LocalGet(2));
     func.instruction(&Instruction::LocalGet(0));
-    func.instruction(&Instruction::Call(range_alloc_idx));
-    // Stack: [handle: i32]
-    func.instruction(&Instruction::Call(sum_idx));
-    // Stack: [sum: i64]
-    func.instruction(&Instruction::End);
+    func.instruction(&Instruction::I64GeS);
+    func.instruction(&Instruction::BrIf(1));
+
+    // acc += i
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I64Add);
+    func.instruction(&Instruction::LocalSet(1));
+
+    // i += 1
+    func.instruction(&Instruction::LocalGet(2));
+    func.instruction(&Instruction::I64Const(1));
+    func.instruction(&Instruction::I64Add);
+    func.instruction(&Instruction::LocalSet(2));
+
+    // br to loop head
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // loop
+    func.instruction(&Instruction::End); // block
+
+    // return acc
+    func.instruction(&Instruction::LocalGet(1));
+    func.instruction(&Instruction::End); // function
 
     finalize_module(prelude, func)
 }

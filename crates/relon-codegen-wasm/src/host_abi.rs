@@ -310,6 +310,11 @@ pub const HOST_IMPORTS: &[HostImport] = &[
 /// Look up an import by its frozen id. Used by the emitter to resolve
 /// a `Call(import_idx)` operand; the index is the position in
 /// [`HOST_IMPORTS`], not the design-doc number.
+///
+/// Z.3b currently has no live emit-site after W1 inlined the
+/// `range.sum` chain into a pure-WASM loop. Kept for Z.3c+ (W2 dot
+/// product / W7 fib will both need real host-call resolution again).
+#[allow(dead_code)]
 pub(crate) fn import_index(id: u32) -> u32 {
     HOST_IMPORTS
         .iter()
