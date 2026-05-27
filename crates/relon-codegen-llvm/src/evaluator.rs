@@ -39,8 +39,8 @@ use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
 use relon_parser::Node;
 
 use crate::emitter::{
-    emit_fast_entry, emit_module_funcs, is_buffer_protocol_signature, EntryShape, FastPathProfile,
-    ENTRY_SYMBOL, ENTRY_SYMBOL_FAST,
+    emit_fast_entry, emit_module_funcs, is_buffer_protocol_signature, ConstPool, EntryShape,
+    FastPathProfile, ENTRY_SYMBOL, ENTRY_SYMBOL_FAST,
 };
 use crate::error::LlvmError;
 use crate::state::ArenaState;
@@ -154,6 +154,12 @@ pub struct LlvmAotEvaluator {
     /// arity (matches `buffer_schema.main_schema.fields.len()` when
     /// every field is `Int`).
     fast_path_arity: Option<usize>,
+    /// Phase E.1: const-data bytes the IR's `Op::ConstString` /
+    /// `Op::ConstList*` records reference through arena-relative i32
+    /// offsets. The host copies this blob into the arena prefix at
+    /// every dispatch so the JIT-emitted `iconst(I32, offset)` lands
+    /// on the right record.
+    const_data: Vec<u8>,
 }
 
 thread_local! {
@@ -302,6 +308,12 @@ impl LlvmAotEvaluator {
             .as_ref()
             .map(|s| s.return_layout.root_size as u32)
             .unwrap_or(0);
+        // Phase E.1: build the const-data pool by walking every
+        // function body in `ir`. The blob is shipped to the host
+        // alongside the JIT engine and copied to the arena prefix at
+        // every dispatch so `Op::ConstString { idx }` resolves to a
+        // stable arena-relative offset.
+        let const_pool = ConstPool::from_module(&ir)?;
         // Phase E.2: collect every IR sibling function (non-entry)
         // so the LLVM emit pass can lower them alongside the entry.
         // The entry's `Op::Call` lowering resolves user-defined
@@ -325,6 +337,7 @@ impl LlvmAotEvaluator {
             &module,
             entry,
             buffer_return_size,
+            &const_pool,
             &helpers,
             Some(&helper_ir_indices),
         )?;
@@ -431,6 +444,7 @@ impl LlvmAotEvaluator {
             param_names,
             buffer_schema,
             fast_path_arity,
+            const_data: const_pool.bytes,
         })
     }
 
@@ -663,32 +677,62 @@ impl LlvmAotEvaluator {
         }
         let in_bytes = builder.finish();
 
-        // 2. Lay out the arena: [in_buf | pad | out_buf]. Phase B
-        // does not emit pointer-indirect record returns, so no
-        // tail-cursor / scratch region is needed. The const-data
-        // pool the cranelift backend prepends is also unused — we
-        // don't emit ConstString / ConstListInt yet.
+        // 2. Lay out the arena. Phase E.1 widens the layout to match
+        // the cranelift backend: `[const_data | pad | in_buf | pad |
+        // out_buf (root + tail cap) | pad | scratch]`. The const-data
+        // pool lives at offset 0; ConstString-emitted offsets point
+        // directly at the records inside it. The scratch region at
+        // the tail backs the bump allocator (`AllocScratchDyn`).
         let in_len = in_bytes.len() as u32;
         let out_root_size = schema.return_layout.root_size as u32;
-        // Pad the output reservation to 8 bytes so an i64 return
-        // slot stays aligned. The IR's StoreField offset always
-        // matches the schema layout, but we add a 16-byte cushion
-        // so subsequent fields stay in-bounds if the schema grows.
-        let out_cap = align_up(out_root_size.max(8) + 16, 8);
-        let in_ptr = 0u32;
+        // For String / List return types we reserve a chunky tail-
+        // cursor region so pointer-indirect StoreField can stamp the
+        // payload past the fixed-area slot without re-allocating on
+        // every dispatch.
+        let needs_pointer_indirect_return = return_needs_tail_region(&schema.return_schema);
+        // Cap the output region:
+        //   * fixed area: max(root_size, 8) padded to 8.
+        //   * tail area: 64 KiB cushion for String returns (W3 hits
+        //     ~3 KiB per dispatch at STRING_CONCAT_N = 3 000; a 64 KiB
+        //     reservation keeps the bump path away from arena edges
+        //     without ballooning the allocation).
+        let tail_cap: u32 = if needs_pointer_indirect_return {
+            65_536
+        } else {
+            0
+        };
+        let out_cap = align_up(out_root_size.max(8) + tail_cap + 16, 8);
+        let const_data_len = u32::try_from(self.const_data.len()).map_err(|_| {
+            RuntimeError::IoError("llvm const-data section exceeds u32 range".into())
+        })?;
+        let in_ptr = align_up(const_data_len, 8);
         let out_ptr = align_up(in_ptr + in_len, 8);
-        let arena_size = (out_ptr + out_cap) as usize;
+        let scratch_base = align_up(out_ptr + out_cap, 8);
+        // Scratch region size: 64 KiB matches the cranelift backend's
+        // figure; the W3 hot-loop concat writes ~3*N bytes total but
+        // the scratch cursor never resets within a dispatch (each
+        // iteration's intermediate string sticks around until
+        // run-end) so we need enough headroom for the worst-case
+        // W3-style `O(N^2)` allocation pattern.
+        let scratch_size: u32 = 1_048_576; // 1 MiB
+        let arena_size = (scratch_base + scratch_size) as usize;
 
         // 3. Acquire the per-thread arena buffer, install the
         // input bytes, dispatch. Reentrant calls (a stdlib helper
         // looping back through the evaluator on the same thread)
         // fall back to a fresh `Vec<u8>` — correctness wins over
-        // pool reuse on the vanishingly rare path. Phase B does
-        // not emit any host-call surface so reentrance is currently
-        // impossible; the fallback is still cheap to keep.
+        // pool reuse on the vanishingly rare path.
         LLVM_ARENA_POOL.with(|cell| match cell.try_borrow_mut() {
             Ok(mut buf) => self.dispatch_with_arena(
-                schema, &mut buf, arena_size, in_ptr, in_len, out_ptr, out_cap, &in_bytes,
+                schema,
+                &mut buf,
+                arena_size,
+                in_ptr,
+                in_len,
+                out_ptr,
+                out_cap,
+                scratch_base,
+                &in_bytes,
             ),
             Err(_) => {
                 let mut fallback: Vec<u8> = Vec::new();
@@ -700,6 +744,7 @@ impl LlvmAotEvaluator {
                     in_len,
                     out_ptr,
                     out_cap,
+                    scratch_base,
                     &in_bytes,
                 )
             }
@@ -720,17 +765,29 @@ impl LlvmAotEvaluator {
         in_len: u32,
         out_ptr: u32,
         out_cap: u32,
+        scratch_base: u32,
         in_bytes: &[u8],
     ) -> Result<Value, RuntimeError> {
         if arena.len() < arena_size {
             arena.resize(arena_size, 0);
         }
-        // Zero only the region the JIT can observe.
-        arena[..arena_size].fill(0);
+        // Zero only the region the JIT can observe before writing —
+        // const_data is overwritten in full, in_bytes are copied on
+        // top of the input area, the out region must read as zero
+        // because pointer-indirect StoreField bumps into a
+        // freshly-zero tail cursor, and the scratch tail is written
+        // before being read by the JIT itself.
+        let observable_end = (out_ptr + out_cap) as usize;
+        debug_assert!(observable_end <= arena_size);
+        debug_assert!(self.const_data.len() <= in_ptr as usize);
+        arena[self.const_data.len()..observable_end].fill(0);
+        if !self.const_data.is_empty() {
+            arena[..self.const_data.len()].copy_from_slice(&self.const_data);
+        }
         arena[in_ptr as usize..in_ptr as usize + in_bytes.len()].copy_from_slice(in_bytes);
 
         let live_arena = &mut arena[..arena_size];
-        let state = ArenaState::new(live_arena);
+        let state = ArenaState::new(live_arena, scratch_base);
         let state_ptr: *const ArenaState = &state;
 
         // SAFETY: same pattern as the cranelift backend's
@@ -933,6 +990,16 @@ fn read_value_from_reader(
             .map(Value::Bool)
             .map_err(buffer_to_runtime_error),
         TypeRepr::Null => Ok(Value::Null),
+        // Phase E.1: String return-value decode. The pointer-indirect
+        // StoreField path wrote the `[len:u32][utf8]` record into the
+        // tail region of the output buffer and stamped its buffer-
+        // relative offset into the fixed-area slot. `BufferReader`
+        // walks the same protocol to materialise the borrowed `&str`,
+        // which we then copy into an owned `Value::String`.
+        TypeRepr::String => reader
+            .read_string(&field.name)
+            .map(|s| Value::String(s.into()))
+            .map_err(buffer_to_runtime_error),
         other => Err(RuntimeError::Unsupported {
             reason: format!(
                 "llvm-aot: return field `{}` type {other:?} not supported in Phase B",
@@ -940,6 +1007,19 @@ fn read_value_from_reader(
             ),
         }),
     }
+}
+
+/// Phase E.1: does the return schema include any pointer-indirect
+/// type (`String` / `List*`)? Drives the output buffer's tail-cap
+/// sizing — fixed-area-only returns don't need the 64 KiB cushion.
+fn return_needs_tail_region(schema: &relon_eval_api::schema_canonical::Schema) -> bool {
+    use relon_eval_api::schema_canonical::TypeRepr;
+    schema.fields.iter().any(|f| {
+        matches!(
+            f.ty,
+            TypeRepr::String | TypeRepr::List { .. } | TypeRepr::Schema { .. }
+        )
+    })
 }
 
 fn read_record_into_map(

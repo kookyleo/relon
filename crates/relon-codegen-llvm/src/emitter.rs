@@ -61,10 +61,13 @@ use inkwell::values::{
 };
 use inkwell::{AddressSpace, IntPredicate};
 
-use relon_ir::ir::{Func, IrType, Op, TaggedOp};
+use relon_ir::ir::{Func, IrType, Module as IrModule, Op, TaggedOp};
 
 use crate::error::LlvmError;
-use crate::state::ARENA_STATE_OFFSET_BASE;
+use crate::state::{
+    ARENA_STATE_OFFSET_BASE, ARENA_STATE_OFFSET_SCRATCH_BASE, ARENA_STATE_OFFSET_SCRATCH_CURSOR,
+    ARENA_STATE_OFFSET_TAIL_CURSOR,
+};
 
 /// Canonical export name the entry function uses in the emitted LLVM
 /// module. The evaluator side `dlsym`s / `get_function`s against this
@@ -122,6 +125,95 @@ pub(crate) struct FastPathProfile {
     pub(crate) ret_offset: u32,
 }
 
+/// Phase E.1: per-module const-pool blob laid out at compile time and
+/// copied into the arena prefix on every dispatch. Mirrors
+/// `relon_codegen_native::codegen::ConstPool` (shape only — the LLVM
+/// side keeps it scoped to this crate so the dep direction stays
+/// one-way).
+///
+/// Layout: `[len: u32 LE][utf8 bytes]` records emitted in IR-walk
+/// order, aligned to 4. Each `Op::ConstString { idx }` resolves to
+/// `string_offsets[idx]` — the byte offset of its record inside
+/// [`Self::bytes`] (= the arena-relative offset once the host has
+/// copied the blob to the arena prefix).
+#[derive(Debug, Default, Clone)]
+pub struct ConstPool {
+    /// `idx -> byte offset within `bytes`. The emitter materialises
+    /// `Op::ConstString { idx }` as `iconst(I32, string_offsets[idx])`.
+    pub string_offsets: std::collections::HashMap<u32, u32>,
+    /// Materialised bytes in record order. The host trampoline copies
+    /// these verbatim to `arena[..bytes.len()]` before every dispatch.
+    pub bytes: Vec<u8>,
+}
+
+impl ConstPool {
+    /// Build the pool by walking every function body in `module` and
+    /// collecting each unique `Op::ConstString { idx, value }`. Records
+    /// are laid out in walk-order with 4-byte alignment.
+    pub fn from_module(module: &IrModule) -> Result<Self, LlvmError> {
+        let mut pool = ConstPool::default();
+        for func in &module.funcs {
+            pool.collect_body(&func.body)?;
+        }
+        Ok(pool)
+    }
+
+    fn collect_body(&mut self, body: &[TaggedOp]) -> Result<(), LlvmError> {
+        for tagged in body {
+            self.collect_op(&tagged.op)?;
+        }
+        Ok(())
+    }
+
+    fn collect_op(&mut self, op: &Op) -> Result<(), LlvmError> {
+        match op {
+            Op::ConstString { idx, value } => self.add_string(*idx, value),
+            Op::Block { body, .. } | Op::Loop { body, .. } => self.collect_body(body),
+            Op::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                self.collect_body(then_body)?;
+                self.collect_body(else_body)
+            }
+            // Op::Call inlines a bundled-stdlib body whose own
+            // `Op::ConstString` literals must also land in the pool —
+            // mirror cranelift's recursion through `builtin_stdlib`.
+            Op::Call { fn_index, .. } => {
+                let stdlib = relon_ir::stdlib::builtin_stdlib();
+                if let Some(callee) = stdlib.get(*fn_index as usize) {
+                    let body = callee.body_owned();
+                    self.collect_body(&body)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn add_string(&mut self, idx: u32, value: &str) -> Result<(), LlvmError> {
+        if self.string_offsets.contains_key(&idx) {
+            return Ok(());
+        }
+        // Align to 4 so the `[len: u32]` header lands on a 4-byte
+        // boundary — i32 loads through the JIT use `align=4` and we
+        // don't want an unaligned trap on hosts where it matters.
+        let rem = self.bytes.len() % 4;
+        if rem != 0 {
+            self.bytes.resize(self.bytes.len() + (4 - rem), 0);
+        }
+        let off = u32::try_from(self.bytes.len())
+            .map_err(|_| LlvmError::Codegen("llvm const pool exceeds u32 range".into()))?;
+        let len = u32::try_from(value.len())
+            .map_err(|_| LlvmError::Codegen("ConstString length exceeds u32 range".into()))?;
+        self.bytes.extend_from_slice(&len.to_le_bytes());
+        self.bytes.extend_from_slice(value.as_bytes());
+        self.string_offsets.insert(idx, off);
+        Ok(())
+    }
+}
+
 /// IR param signature that triggers [`EntryShape::Buffer`]. Mirrors
 /// `is_buffer_protocol_signature` on the cranelift side.
 pub(crate) fn is_buffer_protocol_signature(params: &[IrType], ret: IrType) -> bool {
@@ -149,14 +241,22 @@ pub(crate) fn is_buffer_protocol_signature(params: &[IrType], ret: IrType) -> bo
 /// `Op::Call` lowering to resolve `fn_index - stdlib_count` back to the
 /// matching `FunctionValue`.
 ///
+/// `const_pool` ships the per-module ConstString blob the entry +
+/// helper bodies index into via `Op::ConstString { idx }`. The host
+/// copies `const_pool.bytes` to the arena prefix before every
+/// dispatch so the materialised `iconst(I32, offset)` resolves to a
+/// stable address.
+///
 /// Returns the entry `FunctionValue`, the detected entry shape, and the
 /// helper lookup table the `Emit` driver hands off to the per-function
 /// lowering so sibling calls can find their callee.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_module_funcs<'ctx>(
     ctx: &'ctx Context,
     module: &LlvmModule<'ctx>,
     entry: &Func,
     buffer_return_size: u32,
+    const_pool: &ConstPool,
     helpers: &[&Func],
     helper_ir_indices: Option<&[u32]>,
 ) -> Result<
@@ -195,10 +295,19 @@ pub(crate) fn emit_module_funcs<'ctx>(
 
     // Step 2: emit the entry function body.
     let (entry_fn, shape) = if is_buffer_protocol_signature(&entry.params, entry.ret) {
-        let fv =
-            emit_buffer_entry_with_helpers(ctx, module, entry, buffer_return_size, &helper_table)?;
+        let fv = emit_buffer_entry_with_helpers(
+            ctx,
+            module,
+            entry,
+            buffer_return_size,
+            const_pool,
+            &helper_table,
+        )?;
         (fv, EntryShape::Buffer)
     } else {
+        // The legacy-i64 entry shape covers hand-built fixtures only; it
+        // never references ConstString and supplies its own empty pool
+        // inside `emit_legacy_entry_impl`.
         let fv = emit_legacy_entry_with_helpers(ctx, module, entry, &helper_table)?;
         (fv, EntryShape::LegacyI64)
     };
@@ -221,7 +330,7 @@ pub(crate) fn emit_module_funcs<'ctx>(
                     helper.name
                 ))
             })?;
-        emit_helper_body(ctx, module, helper, helper_fn, &helper_table)?;
+        emit_helper_body(ctx, module, helper, helper_fn, const_pool, &helper_table)?;
     }
 
     Ok((entry_fn, shape, helper_table))
@@ -329,11 +438,12 @@ fn basic_to_metadata(bt: BasicTypeEnum<'_>) -> BasicMetadataTypeEnum<'_> {
 /// the legacy-i64 envelope — helpers may carry any
 /// [`IrType`]-shaped param / return mix that `ir_ty_to_llvm_basic`
 /// accepts.
-fn emit_helper_body<'ctx>(
+fn emit_helper_body<'ctx, 'cp>(
     ctx: &'ctx Context,
     module: &LlvmModule<'ctx>,
     func: &Func,
     llvm_fn: FunctionValue<'ctx>,
+    const_pool: &'cp ConstPool,
     helper_table: &HashMap<u32, FunctionValue<'ctx>>,
 ) -> Result<(), LlvmError> {
     let entry_bb = ctx.append_basic_block(llvm_fn, "entry");
@@ -345,8 +455,10 @@ fn emit_helper_body<'ctx>(
         &builder,
         llvm_fn,
         EntryShape::LegacyI64,
-        None,
+        /*arena_base_ptr=*/ None,
+        /*state_ptr=*/ None,
         /*buffer_return_size=*/ 0,
+        const_pool,
     );
     // Helper functions have no implicit state slot; `LocalGet(0)` maps
     // straight to LLVM param 0.
@@ -420,13 +532,21 @@ pub(crate) fn emit_fast_entry<'ctx>(
         .build_store(ret_slot, i64_t.const_zero())
         .map_err(|e| LlvmError::Codegen(format!("fast ret_slot init: {e}")))?;
 
+    // The fast entry is a typed `(i64...) -> i64` shape derived from
+    // the buffer-protocol IR after the dispatch-boundary rewrite. It
+    // doesn't touch the const-data pool (the IR only contains scalar
+    // arithmetic ops) so we hand it an empty pool to keep
+    // `Emit::new` polymorphic.
+    let empty_pool = ConstPool::default();
     let mut emit = Emit::new(
         ctx,
         &builder,
         llvm_fn,
         EntryShape::LegacyI64,
         /*arena_base_ptr=*/ None,
+        /*state_ptr=*/ None,
         /*buffer_return_size=*/ 0,
+        &empty_pool,
     );
     emit.fast_path = Some(FastEmit {
         profile: profile.clone(),
@@ -505,13 +625,19 @@ fn emit_legacy_entry_impl<'ctx>(
     let builder = ctx.create_builder();
     builder.position_at_end(entry_bb);
 
+    // Legacy-i64 entry shape only consumes the hand-built fixtures
+    // (helloworld_arith) which never reference ConstString — an empty
+    // pool is enough.
+    let empty_pool = ConstPool::default();
     let mut emit = Emit::new(
         ctx,
         &builder,
         llvm_fn,
         EntryShape::LegacyI64,
         None,
+        None,
         /*buffer_return_size=*/ 0,
+        &empty_pool,
     );
     // Param order under the legacy envelope: every IR LocalGet(i)
     // maps to llvm_fn.param(i) — no implicit state slot.
@@ -534,9 +660,17 @@ fn emit_buffer_entry_with_helpers<'ctx>(
     module: &LlvmModule<'ctx>,
     func: &Func,
     buffer_return_size: u32,
+    const_pool: &ConstPool,
     helper_table: &HashMap<u32, FunctionValue<'ctx>>,
 ) -> Result<FunctionValue<'ctx>, LlvmError> {
-    emit_buffer_entry_impl(ctx, module, func, buffer_return_size, Some(helper_table))
+    emit_buffer_entry_impl(
+        ctx,
+        module,
+        func,
+        buffer_return_size,
+        const_pool,
+        Some(helper_table),
+    )
 }
 
 /// Emit the buffer-protocol entry function. The cranelift backend's
@@ -548,6 +682,7 @@ fn emit_buffer_entry_impl<'ctx>(
     module: &LlvmModule<'ctx>,
     func: &Func,
     buffer_return_size: u32,
+    const_pool: &ConstPool,
     helper_table: Option<&HashMap<u32, FunctionValue<'ctx>>>,
 ) -> Result<FunctionValue<'ctx>, LlvmError> {
     let i32_t = ctx.i32_type();
@@ -606,13 +741,35 @@ fn emit_buffer_entry_impl<'ctx>(
         .build_int_to_ptr(arena_base_int, ptr_t, "arena_base_ptr")
         .map_err(|e| LlvmError::Codegen(format!("arena_base inttoptr: {e}")))?;
 
+    // Phase E.1 prologue: init `state.tail_cursor = buffer_return_size`
+    // so the first pointer-indirect StoreField lands past the fixed
+    // area. Cheap (one store per call) — keeping it unconditional
+    // avoids a body pre-scan. Bodies that never touch the tail
+    // cursor pay the dead store; mem2reg / DSE eliminate it at -O3.
+    let tail_init_gep = unsafe {
+        builder
+            .build_in_bounds_gep(
+                i8_t,
+                state_param,
+                &[i32_t.const_int(u64::from(ARENA_STATE_OFFSET_TAIL_CURSOR), false)],
+                "tail_cursor_init_gep",
+            )
+            .map_err(|e| LlvmError::Codegen(format!("tail_cursor init GEP: {e}")))?
+    };
+    let tail_init = i32_t.const_int(u64::from(buffer_return_size), false);
+    builder
+        .build_store(tail_init_gep, tail_init)
+        .map_err(|e| LlvmError::Codegen(format!("tail_cursor init store: {e}")))?;
+
     let mut emit = Emit::new(
         ctx,
         &builder,
         llvm_fn,
         EntryShape::Buffer,
         Some(arena_base_ptr),
+        Some(state_param),
         buffer_return_size,
+        const_pool,
     );
     // Buffer-protocol LocalGet(0..=3) reads the four i32 handshake
     // slots; LocalGet(4) reads the i64 `caps` slot. The state
@@ -640,7 +797,7 @@ fn emit_buffer_entry_impl<'ctx>(
 /// the buffer-protocol entry has the `*state` pointer at LLVM param
 /// 0, so `LocalGet(0)` resolves to LLVM param 1. The legacy-i64
 /// entry has no implicit slot, so `param_base = 0`.
-struct Emit<'ctx, 'b> {
+struct Emit<'ctx, 'b, 'cp> {
     ctx: &'ctx Context,
     builder: &'b Builder<'ctx>,
     func: FunctionValue<'ctx>,
@@ -649,6 +806,11 @@ struct Emit<'ctx, 'b> {
     /// `None` for the legacy entry shape — `LoadField` / `StoreField`
     /// reject themselves before reaching for this value.
     arena_base_ptr: Option<PointerValue<'ctx>>,
+    /// Cached state-pointer LLVM value (param 0 of the buffer entry).
+    /// Phase E.1 uses it to load / store the per-call tail-cursor /
+    /// scratch-cursor / scratch-base slots. `None` outside the
+    /// buffer-protocol entry shape.
+    state_ptr: Option<PointerValue<'ctx>>,
     /// Operand stack mirroring the IR's virtual stack. Every value
     /// in flight is an LLVM integer of the matching IR type. The
     /// pair tags the IR type so consumers can pick the right
@@ -700,6 +862,52 @@ struct Emit<'ctx, 'b> {
     /// per-op `Div(I64)` / `Mod(I64)` guards can call it without
     /// re-querying the module.
     llvm_trap_fn: Option<FunctionValue<'ctx>>,
+    /// Phase E.1: per-module const-data lookup. `Op::ConstString { idx }`
+    /// reads the matching offset and pushes `iconst(I32, off)`.
+    const_pool: &'cp ConstPool,
+    /// Phase E.1: stack of inline call frames. `Op::Call` pushes one
+    /// before lowering the callee body; `Op::Return` inside the
+    /// callee body pops the typed value into the topmost frame's
+    /// result alloca and jumps to its exit block. The callee's
+    /// `LocalGet(idx)` resolves to `params[idx]` rather than the
+    /// entry's LLVM params; `LetGet/LetSet` indices are remapped
+    /// against `let_offset` so concurrent inline frames don't clash.
+    inline_frames: Vec<InlineFrame<'ctx>>,
+    /// Phase E.1: did the body emit a pointer-indirect StoreField?
+    /// When set, the buffer-protocol epilogue returns the post-bump
+    /// tail cursor (in bytes past `out_ptr`) rather than the
+    /// statically-known `buffer_return_size`. Mirrors cranelift's
+    /// `needs_tail_cursor` flag.
+    needs_tail_cursor: bool,
+}
+
+/// Phase E.1: per-call inline-frame state. One entry per active
+/// stdlib `Op::Call`; the callee body lowers against the topmost
+/// frame.
+struct InlineFrame<'ctx> {
+    /// LLVM values bound to the callee's `LocalGet(0..arity)` reads.
+    /// Order matches the IR's declared parameter order — the
+    /// `Op::Call` site popped them from the caller's operand stack
+    /// (top-of-stack = last param) and reversed.
+    params: Vec<TypedValue<'ctx>>,
+    /// Offset added to the callee's `LetGet/LetSet` indices so its
+    /// let-bindings don't alias the caller's slots. Mirrors the
+    /// cranelift backend's `let_offset`.
+    let_offset: u32,
+    /// Result alloca + exit basic block. The callee's `Op::Return`
+    /// stores the popped value into the alloca and unconditionally
+    /// branches to `exit_bb`; the caller continues from there with a
+    /// matching load.
+    ret_slot: PointerValue<'ctx>,
+    /// LLVM type stored at [`Self::ret_slot`]. Pre-computed from the
+    /// IR-declared `ret_ty` of the stdlib call so the caller-side
+    /// load knows what width to read.
+    ret_ty: IrType,
+    /// Branch target for `Op::Return` inside the callee body. The
+    /// caller positions the builder here after the inline finishes
+    /// and pushes the loaded return value back onto the operand
+    /// stack.
+    exit_bb: inkwell::basic_block::BasicBlock<'ctx>,
 }
 
 /// Phase D.1 fast-path emission state. Carried inside [`Emit`] when
@@ -747,14 +955,17 @@ struct LabelFrame<'ctx> {
     kind: LabelKind,
 }
 
-impl<'ctx, 'b> Emit<'ctx, 'b> {
+impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         ctx: &'ctx Context,
         builder: &'b Builder<'ctx>,
         func: FunctionValue<'ctx>,
         shape: EntryShape,
         arena_base_ptr: Option<PointerValue<'ctx>>,
+        state_ptr: Option<PointerValue<'ctx>>,
         buffer_return_size: u32,
+        const_pool: &'cp ConstPool,
     ) -> Self {
         Self {
             ctx,
@@ -762,6 +973,7 @@ impl<'ctx, 'b> Emit<'ctx, 'b> {
             func,
             shape,
             arena_base_ptr,
+            state_ptr,
             stack: Vec::with_capacity(8),
             let_slots: std::collections::HashMap::new(),
             param_base: 0,
@@ -772,6 +984,9 @@ impl<'ctx, 'b> Emit<'ctx, 'b> {
             helper_table: None,
             helper_ret_ty: None,
             llvm_trap_fn: None,
+            const_pool,
+            inline_frames: Vec::new(),
+            needs_tail_cursor: false,
         }
     }
 
@@ -845,7 +1060,16 @@ impl<'ctx, 'b> Emit<'ctx, 'b> {
         }
         let llvm_ty: inkwell::types::BasicTypeEnum<'ctx> = match ty {
             IrType::I64 => self.ctx.i64_type().into(),
-            IrType::I32 | IrType::Bool | IrType::Null => self.ctx.i32_type().into(),
+            // Phase E.1: String / List* arena offsets ride on an i32
+            // slot — matches the cranelift backend's pointer-as-i32
+            // wire representation.
+            IrType::I32
+            | IrType::Bool
+            | IrType::Null
+            | IrType::String
+            | IrType::ListInt
+            | IrType::ListFloat
+            | IrType::ListBool => self.ctx.i32_type().into(),
             other => {
                 return Err(LlvmError::Codegen(format!(
                     "let-slot {idx}: unsupported type {other:?}"
@@ -906,22 +1130,37 @@ impl<'ctx, 'b> Emit<'ctx, 'b> {
 
             // ---- locals / lets ----
             Op::LocalGet(idx) => {
-                let p = self.lookup_param(*idx)?;
-                // The legacy envelope walks all-i64; the buffer envelope
-                // walks (i32 ×4, i64). The IR has the right type on
-                // the param descriptor, but we don't carry it through
-                // LocalGet — re-derive from the LLVM param width.
-                let width = p.get_type().get_bit_width();
-                let ty = if width == 32 {
-                    IrType::I32
+                // Phase E.1: an active inline frame redirects
+                // `LocalGet(i)` to the inlined call's `i`-th argument
+                // instead of the entry-function's LLVM params.
+                if let Some(frame) = self.inline_frames.last() {
+                    let i = *idx as usize;
+                    let tv = frame.params.get(i).ok_or_else(|| {
+                        LlvmError::Codegen(format!(
+                            "inline LocalGet({idx}) out of range — callee has {} params",
+                            frame.params.len()
+                        ))
+                    })?;
+                    self.push(tv.val, tv.ty);
                 } else {
-                    IrType::I64
-                };
-                self.push(p, ty);
+                    let p = self.lookup_param(*idx)?;
+                    // The legacy envelope walks all-i64; the buffer envelope
+                    // walks (i32 ×4, i64). The IR has the right type on
+                    // the param descriptor, but we don't carry it through
+                    // LocalGet — re-derive from the LLVM param width.
+                    let width = p.get_type().get_bit_width();
+                    let ty = if width == 32 {
+                        IrType::I32
+                    } else {
+                        IrType::I64
+                    };
+                    self.push(p, ty);
+                }
             }
             Op::LetSet { idx, ty } => {
                 let v = self.pop(&ip_hint)?;
-                let slot = self.ensure_let_slot(*idx, *ty)?;
+                let mapped = self.remap_let_idx(*idx);
+                let slot = self.ensure_let_slot(mapped, *ty)?;
                 // Coerce on bool / null where the producer pushed an i32
                 // slot but the let-slot was declared as the canonical
                 // 32-bit width.
@@ -931,10 +1170,20 @@ impl<'ctx, 'b> Emit<'ctx, 'b> {
                     .map_err(|e| LlvmError::Codegen(format!("LetSet store: {e}")))?;
             }
             Op::LetGet { idx, ty } => {
-                let slot = self.ensure_let_slot(*idx, *ty)?;
+                // Phase E.1: remap the callee's let-idx against the
+                // active inline frame so concurrent stdlib inlines
+                // don't clash on slot numbers.
+                let mapped = self.remap_let_idx(*idx);
+                let slot = self.ensure_let_slot(mapped, *ty)?;
                 let llvm_ty: inkwell::types::BasicTypeEnum<'ctx> = match *ty {
                     IrType::I64 => self.ctx.i64_type().into(),
-                    IrType::I32 | IrType::Bool | IrType::Null => self.ctx.i32_type().into(),
+                    IrType::I32
+                    | IrType::Bool
+                    | IrType::Null
+                    | IrType::String
+                    | IrType::ListInt
+                    | IrType::ListFloat
+                    | IrType::ListBool => self.ctx.i32_type().into(),
                     other => {
                         return Err(LlvmError::Codegen(format!(
                             "LetGet({idx}): unsupported type {other:?}"
@@ -951,7 +1200,24 @@ impl<'ctx, 'b> Emit<'ctx, 'b> {
             }
 
             // ---- arithmetic ----
-            Op::Add(ty) => self.emit_binop(&ip_hint, *ty, BinOp::Add)?,
+            Op::Add(ty) => match ty {
+                // Phase E.1: `Op::Add(IrType::String)` is the
+                // pair-wise String + String form (the StrConcatN
+                // fold only fires for compile-time-known chains —
+                // `reduce("", (acc, s) => acc + s)` lowers to a
+                // per-iter `Add(String)`). Route through the bundled
+                // stdlib `concat` body via inline call, matching the
+                // cranelift backend.
+                IrType::String => {
+                    let concat_idx =
+                        relon_ir::stdlib::stdlib_function_index("concat").ok_or_else(|| {
+                            LlvmError::Codegen("stdlib `concat` slot not found".to_string())
+                        })?;
+                    let param_tys = [IrType::String, IrType::String];
+                    self.emit_call_stdlib(&ip_hint, concat_idx, 2, &param_tys, IrType::String)?
+                }
+                _ => self.emit_binop(&ip_hint, *ty, BinOp::Add)?,
+            },
             Op::Sub(ty) => self.emit_binop(&ip_hint, *ty, BinOp::Sub)?,
             Op::Mul(ty) => self.emit_binop(&ip_hint, *ty, BinOp::Mul)?,
             Op::Div(ty) => self.emit_binop(&ip_hint, *ty, BinOp::Div)?,
@@ -984,21 +1250,90 @@ impl<'ctx, 'b> Emit<'ctx, 'b> {
             // ---- return ----
             Op::Return => self.emit_return(&ip_hint)?,
 
-            // ---- multi-function dispatch ----
+            // ---- Phase E.1: const-data pool ----
+            Op::ConstString { idx, value: _ } => {
+                let off = self
+                    .const_pool
+                    .string_offsets
+                    .get(idx)
+                    .copied()
+                    .ok_or_else(|| {
+                        LlvmError::Codegen(format!(
+                            "Op::ConstString {{ idx: {idx} }}: missing const-pool entry — \
+                         did the host forget to lay out the pool blob before dispatch?"
+                        ))
+                    })?;
+                let c = self.ctx.i32_type().const_int(u64::from(off), false);
+                self.push(c, IrType::String);
+            }
+
+            // ---- Phase E.1: raw-memory primitives ----
+            Op::LoadI32AtAbsolute { offset } => {
+                self.emit_load_at_absolute(&ip_hint, *offset, AbsLoad::I32)?
+            }
+            Op::LoadI64AtAbsolute { offset } => {
+                self.emit_load_at_absolute(&ip_hint, *offset, AbsLoad::I64)?
+            }
+            Op::LoadI8UAtAbsolute { offset } => {
+                self.emit_load_at_absolute(&ip_hint, *offset, AbsLoad::I8U)?
+            }
+            Op::LoadF64AtAbsolute { offset } => {
+                self.emit_load_at_absolute(&ip_hint, *offset, AbsLoad::F64)?
+            }
+            Op::StoreI32AtAbsolute { offset } => {
+                self.emit_store_at_absolute(&ip_hint, *offset, AbsStore::I32)?
+            }
+            Op::StoreI64AtAbsolute { offset } => {
+                self.emit_store_at_absolute(&ip_hint, *offset, AbsStore::I64)?
+            }
+            Op::StoreI8AtAbsolute { offset } => {
+                self.emit_store_at_absolute(&ip_hint, *offset, AbsStore::I8)?
+            }
+            Op::StoreF64AtAbsolute { offset } => {
+                self.emit_store_at_absolute(&ip_hint, *offset, AbsStore::F64)?
+            }
+            Op::MemcpyAtAbsolute => self.emit_memcpy_at_absolute(&ip_hint)?,
+            Op::AllocScratch { size_bytes } => self.emit_alloc_scratch_static(*size_bytes)?,
+            Op::AllocScratchDyn => self.emit_alloc_scratch_dyn(&ip_hint)?,
+            Op::StrConcatN { operand_count } => self.emit_str_concat_n(&ip_hint, *operand_count)?,
+
+            // ---- Phase E.1 + E.2 call dispatch ----
+            // stdlib indices (#278) route through the bundled-body
+            // inline path (`emit_call_stdlib`); user-defined indices
+            // (#279) resolve through the helper table populated by
+            // `emit_module_funcs`.
             Op::Call {
                 fn_index,
                 arg_count,
                 param_tys,
                 ret_ty,
-            } => self.emit_call(&ip_hint, *fn_index, *arg_count, param_tys, *ret_ty)?,
+            } => {
+                let stdlib_count = relon_ir::stdlib::stdlib_function_count();
+                if *fn_index < stdlib_count {
+                    self.emit_call_stdlib(&ip_hint, *fn_index, *arg_count, param_tys, *ret_ty)?
+                } else {
+                    self.emit_call(&ip_hint, *fn_index, *arg_count, param_tys, *ret_ty)?
+                }
+            }
 
             other => {
                 return Err(LlvmError::Codegen(format!(
-                    "unsupported op (Phase B envelope): {other:?} at ip={ip}"
+                    "unsupported op (Phase E.1 envelope): {other:?} at ip={ip}"
                 )));
             }
         }
         Ok(())
+    }
+
+    // -- Phase E.1: inline-call frame helpers --------------------------
+
+    /// Translate a callee `LetGet/LetSet` index against the topmost
+    /// inline frame. Mirrors cranelift's `remap_let_idx`.
+    fn remap_let_idx(&self, idx: u32) -> u32 {
+        match self.inline_frames.last() {
+            Some(frame) => frame.let_offset.saturating_add(idx),
+            None => idx,
+        }
     }
 
     /// Lower `Op::Return`. The shape decides what flows back:
@@ -1012,6 +1347,35 @@ impl<'ctx, 'b> Emit<'ctx, 'b> {
     /// Mirrors the cranelift backend's `emit_return` for the same
     /// shapes.
     fn emit_return(&mut self, ip_hint: &str) -> Result<(), LlvmError> {
+        // Phase E.1: inline-frame return. The callee body pops the
+        // typed return value, stores it into the frame's ret_slot,
+        // then unconditionally jumps to exit_bb. The caller side picks
+        // up from there in `emit_call_stdlib`.
+        if let Some((ret_slot, exit_bb, ret_ty)) = self
+            .inline_frames
+            .last()
+            .map(|f| (f.ret_slot, f.exit_bb, f.ret_ty))
+        {
+            let v = self.pop(ip_hint)?;
+            // Coerce the popped value's width to the slot type if
+            // needed (Bool / Null on an i32 stack but stored as i32
+            // already — no coercion. String / ListInt on i32 — same.
+            // I64 on i64 — same. We rely on the caller's typing
+            // contract.)
+            let stored = self.coerce_to_let_ty(v, ret_ty)?;
+            self.builder
+                .build_store(ret_slot, stored)
+                .map_err(|e| LlvmError::Codegen(format!("inline Return store: {e}")))?;
+            self.builder
+                .build_unconditional_branch(exit_bb)
+                .map_err(|e| LlvmError::Codegen(format!("inline Return br: {e}")))?;
+            // Open a fresh dummy block so any subsequent ops the body
+            // emits (e.g. dead trailing ConstBool after Trap) have
+            // somewhere to land. LLVM's verifier prunes the dead chain.
+            let dummy = self.ctx.append_basic_block(self.func, "after_inline_ret");
+            self.builder.position_at_end(dummy);
+            return Ok(());
+        }
         // Phase D.1 fast path: the trailing buffer-protocol `Op::Return`
         // doesn't carry a value on the stack (the IR producer already
         // emitted a `StoreField` into the output buffer that the fast
@@ -1102,7 +1466,40 @@ impl<'ctx, 'b> Emit<'ctx, 'b> {
             }
             EntryShape::Buffer => {
                 let i32_t = self.ctx.i32_type();
-                let v = i32_t.const_int(u64::from(self.buffer_return_size), false);
+                // Phase E.1: when the body emitted a pointer-indirect
+                // StoreField (String / List* return) the trampoline
+                // needs to know how many bytes past `out_ptr` the tail
+                // cursor advanced to. Read it back from the state slot
+                // so the host can decode the variable-length payload.
+                // Bodies that only wrote into the fixed area keep the
+                // historical "return root_size" path so a trampoline
+                // that doesn't bother to consult `tail_cursor` still
+                // works.
+                let v: IntValue<'ctx> = if self.needs_tail_cursor {
+                    let state_ptr = self.state_ptr.ok_or_else(|| {
+                        LlvmError::Codegen(
+                            "buffer Return needs tail_cursor but state ptr unavailable".into(),
+                        )
+                    })?;
+                    let i8_t = self.ctx.i8_type();
+                    let tail_gep = unsafe {
+                        self.builder
+                            .build_in_bounds_gep(
+                                i8_t,
+                                state_ptr,
+                                &[i32_t
+                                    .const_int(u64::from(ARENA_STATE_OFFSET_TAIL_CURSOR), false)],
+                                "tail_cursor_gep",
+                            )
+                            .map_err(|e| LlvmError::Codegen(format!("tail_cursor GEP: {e}")))?
+                    };
+                    self.builder
+                        .build_load(i32_t, tail_gep, "tail_cursor")
+                        .map_err(|e| LlvmError::Codegen(format!("tail_cursor load: {e}")))?
+                        .into_int_value()
+                } else {
+                    i32_t.const_int(u64::from(self.buffer_return_size), false)
+                };
                 self.builder
                     .build_return(Some(&v))
                     .map_err(|e| LlvmError::Codegen(format!("Return (buffer): {e}")))?;
@@ -1262,7 +1659,13 @@ impl<'ctx, 'b> Emit<'ctx, 'b> {
     ) -> Result<BasicValueEnum<'ctx>, LlvmError> {
         let want_width = match target {
             IrType::I64 => 64,
-            IrType::I32 | IrType::Bool | IrType::Null => 32,
+            IrType::I32
+            | IrType::Bool
+            | IrType::Null
+            | IrType::String
+            | IrType::ListInt
+            | IrType::ListFloat
+            | IrType::ListBool => 32,
             other => {
                 return Err(LlvmError::Codegen(format!(
                     "let-slot coerce: unsupported target type {other:?}"
@@ -1463,6 +1866,18 @@ impl<'ctx, 'b> Emit<'ctx, 'b> {
         offset: u32,
         ty: IrType,
     ) -> Result<(), LlvmError> {
+        // Phase E.1: pointer-indirect types (String / List*) route to
+        // the tail-cursor protocol — bump-allocate inside the output
+        // buffer's tail region, memcpy the record there, and stamp
+        // the buffer-relative offset into the fixed-area slot. Comes
+        // before the Phase D.1 fast-path check because the fast path
+        // explicitly rejects non-I64 stores.
+        if matches!(
+            ty,
+            IrType::String | IrType::ListInt | IrType::ListFloat | IrType::ListBool
+        ) {
+            return self.emit_store_field_pointer_indirect(ip_hint, offset, ty);
+        }
         // Phase D.1 fast path: rewrite trailing StoreField into a
         // store against the i64 ret_slot. Only the single Int return
         // slot is supported — any other offset means the IR is past
@@ -1842,7 +2257,7 @@ impl BinOp {
 /// Inline lookup table used by `emit_load_field`. Picks the LLVM
 /// integer type + the IR tag we push back onto the operand stack
 /// for a Phase-B-supported scalar field type.
-impl<'ctx, 'b> Emit<'ctx, 'b> {
+impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     fn field_load_kind(
         &self,
         ty: IrType,
@@ -1860,5 +2275,649 @@ impl<'ctx, 'b> Emit<'ctx, 'b> {
             }
         };
         Ok(pair)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase E.1: raw-memory primitives, scratch allocator, StrConcatN.
+// ---------------------------------------------------------------------------
+
+/// Variants of the absolute-pointer load lowering paths.
+#[derive(Clone, Copy)]
+enum AbsLoad {
+    I32,
+    I64,
+    I8U,
+    F64,
+}
+
+/// Variants of the absolute-pointer store lowering paths.
+#[derive(Clone, Copy)]
+enum AbsStore {
+    I32,
+    I64,
+    I8,
+    F64,
+}
+
+impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
+    /// Compute `arena_base + off_i32` as an LLVM pointer. Mirrors
+    /// `Codegen::arena_addr` on the cranelift side — used by every
+    /// `*AtAbsolute` lowering path. No bounds check (Phase E.1 retains
+    /// the same "trust the IR + LLVM trap on UB" stance as Phase B).
+    fn arena_addr_i32(&mut self, off_i32: IntValue<'ctx>) -> Result<PointerValue<'ctx>, LlvmError> {
+        let arena_base_ptr = self.arena_base_ptr.ok_or_else(|| {
+            LlvmError::Codegen("absolute load/store outside buffer-protocol entry shape".into())
+        })?;
+        let i64_t = self.ctx.i64_type();
+        let i8_t = self.ctx.i8_type();
+        let name = self.next_name("abs_off_zext");
+        let off64 = self
+            .builder
+            .build_int_z_extend(off_i32, i64_t, &name)
+            .map_err(|e| LlvmError::Codegen(format!("abs offset zext: {e}")))?;
+        let name = self.next_name("abs_addr");
+        let addr = unsafe {
+            self.builder
+                .build_in_bounds_gep(i8_t, arena_base_ptr, &[off64], &name)
+                .map_err(|e| LlvmError::Codegen(format!("abs GEP: {e}")))?
+        };
+        Ok(addr)
+    }
+
+    /// Compose `base + offset` (both i32) into the absolute pointer
+    /// each `Load*AtAbsolute` / `Store*AtAbsolute` op reads from.
+    fn compose_abs_addr(
+        &mut self,
+        base: IntValue<'ctx>,
+        offset: u32,
+    ) -> Result<PointerValue<'ctx>, LlvmError> {
+        let off_const = self.ctx.i32_type().const_int(u64::from(offset), false);
+        let name = self.next_name("abs_compose");
+        let composed = self
+            .builder
+            .build_int_add(base, off_const, &name)
+            .map_err(|e| LlvmError::Codegen(format!("abs compose add: {e}")))?;
+        self.arena_addr_i32(composed)
+    }
+
+    fn emit_load_at_absolute(
+        &mut self,
+        ip_hint: &str,
+        offset: u32,
+        kind: AbsLoad,
+    ) -> Result<(), LlvmError> {
+        let base = self.pop_int(ip_hint)?;
+        let addr = self.compose_abs_addr(base, offset)?;
+        match kind {
+            AbsLoad::I32 => {
+                let name = self.next_name("loadi32_abs");
+                let v = self
+                    .builder
+                    .build_load(self.ctx.i32_type(), addr, &name)
+                    .map_err(|e| LlvmError::Codegen(format!("LoadI32AtAbsolute: {e}")))?
+                    .into_int_value();
+                self.push(v, IrType::I32);
+            }
+            AbsLoad::I64 => {
+                let name = self.next_name("loadi64_abs");
+                let v = self
+                    .builder
+                    .build_load(self.ctx.i64_type(), addr, &name)
+                    .map_err(|e| LlvmError::Codegen(format!("LoadI64AtAbsolute: {e}")))?
+                    .into_int_value();
+                self.push(v, IrType::I64);
+            }
+            AbsLoad::I8U => {
+                let name = self.next_name("loadi8u_abs");
+                let b = self
+                    .builder
+                    .build_load(self.ctx.i8_type(), addr, &name)
+                    .map_err(|e| LlvmError::Codegen(format!("LoadI8UAtAbsolute: {e}")))?
+                    .into_int_value();
+                let name = self.next_name("loadi8u_zext");
+                let v = self
+                    .builder
+                    .build_int_z_extend(b, self.ctx.i32_type(), &name)
+                    .map_err(|e| LlvmError::Codegen(format!("LoadI8UAtAbsolute zext: {e}")))?;
+                self.push(v, IrType::I32);
+            }
+            AbsLoad::F64 => {
+                // Float ops are outside the present W3/W4 envelope; we
+                // still accept LoadF64AtAbsolute to keep the dispatcher
+                // exhaustive. The stack carries the bit-cast i64.
+                let name = self.next_name("loadf64_abs");
+                let v = self
+                    .builder
+                    .build_load(self.ctx.f64_type(), addr, &name)
+                    .map_err(|e| LlvmError::Codegen(format!("LoadF64AtAbsolute: {e}")))?;
+                // Bit-cast to i64 to feed the int-typed virtual stack.
+                let i64_t = self.ctx.i64_type();
+                let name = self.next_name("loadf64_bitcast");
+                let bits = self
+                    .builder
+                    .build_bit_cast(v, i64_t, &name)
+                    .map_err(|e| LlvmError::Codegen(format!("LoadF64 bitcast: {e}")))?
+                    .into_int_value();
+                self.push(bits, IrType::F64);
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_store_at_absolute(
+        &mut self,
+        ip_hint: &str,
+        offset: u32,
+        kind: AbsStore,
+    ) -> Result<(), LlvmError> {
+        // Stack: `[base, value]` — top is the value, below it is the
+        // base. Mirrors cranelift's pop order.
+        let value = self.pop_int(ip_hint)?;
+        let base = self.pop_int(ip_hint)?;
+        let addr = self.compose_abs_addr(base, offset)?;
+        match kind {
+            AbsStore::I32 => {
+                self.builder
+                    .build_store(addr, value)
+                    .map_err(|e| LlvmError::Codegen(format!("StoreI32AtAbsolute: {e}")))?;
+            }
+            AbsStore::I64 => {
+                self.builder
+                    .build_store(addr, value)
+                    .map_err(|e| LlvmError::Codegen(format!("StoreI64AtAbsolute: {e}")))?;
+            }
+            AbsStore::I8 => {
+                // Narrow the i32 value to i8 before the store.
+                let name = self.next_name("storei8_trunc");
+                let narrowed = self
+                    .builder
+                    .build_int_truncate(value, self.ctx.i8_type(), &name)
+                    .map_err(|e| LlvmError::Codegen(format!("StoreI8AtAbsolute trunc: {e}")))?;
+                self.builder
+                    .build_store(addr, narrowed)
+                    .map_err(|e| LlvmError::Codegen(format!("StoreI8AtAbsolute: {e}")))?;
+            }
+            AbsStore::F64 => {
+                // The IR's virtual stack carries f64 as bit-cast i64;
+                // bit-cast back before the store so the destination
+                // bytes match the wasm f64 wire layout.
+                let name = self.next_name("storef64_bitcast");
+                let f = self
+                    .builder
+                    .build_bit_cast(value, self.ctx.f64_type(), &name)
+                    .map_err(|e| LlvmError::Codegen(format!("StoreF64 bitcast: {e}")))?;
+                self.builder
+                    .build_store(addr, f)
+                    .map_err(|e| LlvmError::Codegen(format!("StoreF64AtAbsolute: {e}")))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Lower `Op::MemcpyAtAbsolute`. Stack: `[dst, src, len]`. Calls
+    /// LLVM's `llvm.memcpy.p0.p0.i64` intrinsic with both pointers
+    /// resolved through `arena_base`.
+    fn emit_memcpy_at_absolute(&mut self, ip_hint: &str) -> Result<(), LlvmError> {
+        let len = self.pop_int(ip_hint)?;
+        let src = self.pop_int(ip_hint)?;
+        let dst = self.pop_int(ip_hint)?;
+        let dst_ptr = self.arena_addr_i32(dst)?;
+        let src_ptr = self.arena_addr_i32(src)?;
+        // `inkwell`'s `build_memcpy` requires the length to be the
+        // pointer-width int. Widen our i32 length to i64 (zero-extend).
+        let i64_t = self.ctx.i64_type();
+        let len64 = self
+            .builder
+            .build_int_z_extend(len, i64_t, "memcpy_len_zext")
+            .map_err(|e| LlvmError::Codegen(format!("memcpy len zext: {e}")))?;
+        // Pick a 1-byte alignment hint — the inner records aren't
+        // guaranteed > 1-byte aligned (string headers land on 4-byte
+        // boundaries but their payload follows immediately). The LLVM
+        // optimiser will refine when it can prove a tighter bound.
+        self.builder
+            .build_memcpy(dst_ptr, 1, src_ptr, 1, len64)
+            .map_err(|e| LlvmError::Codegen(format!("MemcpyAtAbsolute build: {e}")))?;
+        Ok(())
+    }
+
+    /// Bump-allocate `size_v` (i32) bytes inside the arena's scratch
+    /// region. Pushes the pre-bump cursor as an arena-relative i32
+    /// offset onto the virtual stack — same shape as cranelift's
+    /// `emit_alloc_scratch`.
+    fn emit_alloc_scratch_common(&mut self, size_v: IntValue<'ctx>) -> Result<(), LlvmError> {
+        let state_ptr = self.state_ptr.ok_or_else(|| {
+            LlvmError::Codegen(
+                "AllocScratch outside buffer-protocol entry shape (no state ptr)".into(),
+            )
+        })?;
+        let i32_t = self.ctx.i32_type();
+        let i8_t = self.ctx.i8_type();
+
+        // GEP-then-load helpers. We hand-roll the i8-offset GEPs
+        // because the inkwell wrappers expect a struct field accessor.
+        let cursor_gep = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    state_ptr,
+                    &[i32_t.const_int(u64::from(ARENA_STATE_OFFSET_SCRATCH_CURSOR), false)],
+                    "scratch_cursor_gep",
+                )
+                .map_err(|e| LlvmError::Codegen(format!("scratch_cursor GEP: {e}")))?
+        };
+        let cur = self
+            .builder
+            .build_load(i32_t, cursor_gep, "scratch_cursor")
+            .map_err(|e| LlvmError::Codegen(format!("scratch_cursor load: {e}")))?
+            .into_int_value();
+        let base_gep = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    state_ptr,
+                    &[i32_t.const_int(u64::from(ARENA_STATE_OFFSET_SCRATCH_BASE), false)],
+                    "scratch_base_gep",
+                )
+                .map_err(|e| LlvmError::Codegen(format!("scratch_base GEP: {e}")))?
+        };
+        let scratch_base = self
+            .builder
+            .build_load(i32_t, base_gep, "scratch_base")
+            .map_err(|e| LlvmError::Codegen(format!("scratch_base load: {e}")))?
+            .into_int_value();
+
+        // Returned arena-relative offset = scratch_base + cur.
+        let off = self
+            .builder
+            .build_int_add(scratch_base, cur, "scratch_off")
+            .map_err(|e| LlvmError::Codegen(format!("scratch off add: {e}")))?;
+        // New cursor = cur + size.
+        let new_cur = self
+            .builder
+            .build_int_add(cur, size_v, "scratch_new_cur")
+            .map_err(|e| LlvmError::Codegen(format!("scratch cur bump: {e}")))?;
+        self.builder
+            .build_store(cursor_gep, new_cur)
+            .map_err(|e| LlvmError::Codegen(format!("scratch cursor store: {e}")))?;
+        self.push(off, IrType::I32);
+        Ok(())
+    }
+
+    fn emit_alloc_scratch_static(&mut self, size_bytes: u32) -> Result<(), LlvmError> {
+        let size_v = self.ctx.i32_type().const_int(u64::from(size_bytes), false);
+        self.emit_alloc_scratch_common(size_v)
+    }
+
+    fn emit_alloc_scratch_dyn(&mut self, ip_hint: &str) -> Result<(), LlvmError> {
+        let size = self.pop_int(ip_hint)?;
+        self.emit_alloc_scratch_common(size)
+    }
+
+    /// Lower `Op::StrConcatN { operand_count }`. Pops N i32 arena
+    /// offsets, sums their `[len: u32]` headers, allocates one scratch
+    /// record sized `total + 4`, stamps the header, then memcpys each
+    /// operand's payload at the running cursor. Pushes the resulting
+    /// i32 offset. Mirrors cranelift's `emit_str_concat_n`.
+    fn emit_str_concat_n(&mut self, ip_hint: &str, operand_count: u32) -> Result<(), LlvmError> {
+        if operand_count < 2 {
+            return Err(LlvmError::Codegen(format!(
+                "Op::StrConcatN with operand_count={operand_count} (expected >= 2)"
+            )));
+        }
+        let n = operand_count as usize;
+        let i32_t = self.ctx.i32_type();
+        // Pop N i32 offsets; reverse so source-order matches stack-
+        // order (deepest leaf is the first operand).
+        let mut offs: Vec<IntValue<'ctx>> = Vec::with_capacity(n);
+        for _ in 0..n {
+            offs.push(self.pop_int(ip_hint)?);
+        }
+        offs.reverse();
+        // Load each operand's `[len: u32]` header once.
+        let mut lens: Vec<IntValue<'ctx>> = Vec::with_capacity(n);
+        for off in &offs {
+            let addr = self.arena_addr_i32(*off)?;
+            let name = self.next_name("strconcat_len");
+            let l = self
+                .builder
+                .build_load(i32_t, addr, &name)
+                .map_err(|e| LlvmError::Codegen(format!("StrConcatN len load: {e}")))?
+                .into_int_value();
+            lens.push(l);
+        }
+        // total_len = Σ lens.
+        let mut total_len = lens[0];
+        for v in &lens[1..] {
+            let name = self.next_name("strconcat_sumlen");
+            total_len = self
+                .builder
+                .build_int_add(total_len, *v, &name)
+                .map_err(|e| LlvmError::Codegen(format!("StrConcatN sum: {e}")))?;
+        }
+        // record_size = total_len + 4 (header).
+        let four = i32_t.const_int(4, false);
+        let name = self.next_name("strconcat_recsize");
+        let record_size = self
+            .builder
+            .build_int_add(total_len, four, &name)
+            .map_err(|e| LlvmError::Codegen(format!("StrConcatN record_size: {e}")))?;
+        // Allocate the scratch record.
+        self.emit_alloc_scratch_common(record_size)?;
+        let base_off = self.pop_int(ip_hint)?;
+        // Write header: i32.store(base, total_len).
+        let base_abs = self.arena_addr_i32(base_off)?;
+        self.builder
+            .build_store(base_abs, total_len)
+            .map_err(|e| LlvmError::Codegen(format!("StrConcatN header store: {e}")))?;
+        // Walk operands in source order, copying payloads at the
+        // running cursor.
+        let name = self.next_name("strconcat_cursor0");
+        let mut cursor_off = self
+            .builder
+            .build_int_add(base_off, four, &name)
+            .map_err(|e| LlvmError::Codegen(format!("StrConcatN cursor init: {e}")))?;
+        for i in 0..n {
+            let len = lens[i];
+            let name = self.next_name("strconcat_srcoff");
+            let src_off_payload = self
+                .builder
+                .build_int_add(offs[i], four, &name)
+                .map_err(|e| LlvmError::Codegen(format!("StrConcatN src off: {e}")))?;
+            let dst_ptr = self.arena_addr_i32(cursor_off)?;
+            let src_ptr = self.arena_addr_i32(src_off_payload)?;
+            let i64_t = self.ctx.i64_type();
+            let name = self.next_name("strconcat_lenzext");
+            let len64 = self
+                .builder
+                .build_int_z_extend(len, i64_t, &name)
+                .map_err(|e| LlvmError::Codegen(format!("StrConcatN len zext: {e}")))?;
+            self.builder
+                .build_memcpy(dst_ptr, 1, src_ptr, 1, len64)
+                .map_err(|e| LlvmError::Codegen(format!("StrConcatN memcpy: {e}")))?;
+            let name = self.next_name("strconcat_cursornext");
+            cursor_off = self
+                .builder
+                .build_int_add(cursor_off, len, &name)
+                .map_err(|e| LlvmError::Codegen(format!("StrConcatN cursor bump: {e}")))?;
+        }
+        // Push the resulting record offset.
+        self.push(base_off, IrType::String);
+        Ok(())
+    }
+
+    /// Lower `Op::StoreField { ty }` for pointer-indirect types
+    /// (`String`, `ListInt`, `ListFloat`, `ListBool`). Pops the source
+    /// arena offset, copies the `[len:u32 LE][payload]` record into
+    /// the output buffer's tail region (`out_ptr + tail_cursor`),
+    /// writes `tail_cursor` (buffer-relative offset of the new record)
+    /// into the fixed-area slot at `offset`, and bumps `tail_cursor`.
+    /// Mirrors cranelift's `emit_store_pointer_indirect`.
+    fn emit_store_field_pointer_indirect(
+        &mut self,
+        ip_hint: &str,
+        offset: u32,
+        ty: IrType,
+    ) -> Result<(), LlvmError> {
+        let arena_base_ptr = self.arena_base_ptr.ok_or_else(|| {
+            LlvmError::Codegen("StoreField (pointer-indirect) outside buffer entry".into())
+        })?;
+        let state_ptr = self.state_ptr.ok_or_else(|| {
+            LlvmError::Codegen("StoreField (pointer-indirect): missing state ptr".into())
+        })?;
+        let src_off_i32 = self.pop_int(ip_hint)?;
+        let i32_t = self.ctx.i32_type();
+        let i8_t = self.ctx.i8_type();
+        // Read the record's `[len: u32]` header to size the memcpy.
+        let src_abs = self.arena_addr_i32(src_off_i32)?;
+        let len_i32 = self
+            .builder
+            .build_load(i32_t, src_abs, "ptr_indirect_len")
+            .map_err(|e| LlvmError::Codegen(format!("ptr-indirect len load: {e}")))?
+            .into_int_value();
+        let record_size = match ty {
+            IrType::String => {
+                let four = i32_t.const_int(4, false);
+                self.builder
+                    .build_int_add(len_i32, four, "string_recsize")
+                    .map_err(|e| LlvmError::Codegen(format!("String record_size: {e}")))?
+            }
+            IrType::ListInt | IrType::ListFloat => {
+                // record_size = 8 + 8 * element_count.
+                let three = i32_t.const_int(3, false);
+                let shifted = self
+                    .builder
+                    .build_left_shift(len_i32, three, "list_shl")
+                    .map_err(|e| LlvmError::Codegen(format!("list shl: {e}")))?;
+                let eight = i32_t.const_int(8, false);
+                self.builder
+                    .build_int_add(shifted, eight, "list_recsize")
+                    .map_err(|e| LlvmError::Codegen(format!("list record_size: {e}")))?
+            }
+            IrType::ListBool => {
+                let four = i32_t.const_int(4, false);
+                self.builder
+                    .build_int_add(len_i32, four, "listbool_recsize")
+                    .map_err(|e| LlvmError::Codegen(format!("listbool record_size: {e}")))?
+            }
+            _ => {
+                return Err(LlvmError::Codegen(format!(
+                    "emit_store_field_pointer_indirect: unsupported {ty:?}"
+                )));
+            }
+        };
+        // Pick the alignment for the tail bump. String / ListBool stay
+        // 4-aligned (the leading u32 length); ListInt / ListFloat need
+        // 8 so the i64 / f64 payload that follows is aligned.
+        let align: u32 = match ty {
+            IrType::String | IrType::ListBool => 4,
+            IrType::ListInt | IrType::ListFloat => 8,
+            _ => unreachable!(),
+        };
+        // Tail bump: aligned = align_up(cur, align); new_cur = aligned + record_size.
+        let tail_gep = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    state_ptr,
+                    &[i32_t.const_int(u64::from(ARENA_STATE_OFFSET_TAIL_CURSOR), false)],
+                    "tail_cursor_gep",
+                )
+                .map_err(|e| LlvmError::Codegen(format!("tail_cursor GEP: {e}")))?
+        };
+        let cur = self
+            .builder
+            .build_load(i32_t, tail_gep, "tail_cursor_pre")
+            .map_err(|e| LlvmError::Codegen(format!("tail_cursor load: {e}")))?
+            .into_int_value();
+        let aligned = if align <= 1 {
+            cur
+        } else {
+            let add = i32_t.const_int(u64::from(align - 1), false);
+            let mask_val = !(align - 1);
+            let mask = i32_t.const_int(u64::from(mask_val), false);
+            let sum = self
+                .builder
+                .build_int_add(cur, add, "tail_align_sum")
+                .map_err(|e| LlvmError::Codegen(format!("tail align add: {e}")))?;
+            self.builder
+                .build_and(sum, mask, "tail_align_and")
+                .map_err(|e| LlvmError::Codegen(format!("tail align and: {e}")))?
+        };
+        let new_cur = self
+            .builder
+            .build_int_add(aligned, record_size, "tail_cursor_post")
+            .map_err(|e| LlvmError::Codegen(format!("tail cur bump: {e}")))?;
+        self.builder
+            .build_store(tail_gep, new_cur)
+            .map_err(|e| LlvmError::Codegen(format!("tail cursor store: {e}")))?;
+        // memcpy(arena_base + out_ptr + aligned, src_abs, record_size).
+        let out_ptr_i32 = self.lookup_param(2)?; // IR LocalGet(2) == out_ptr
+        let dst_off = self
+            .builder
+            .build_int_add(out_ptr_i32, aligned, "ptr_indirect_dst_off")
+            .map_err(|e| LlvmError::Codegen(format!("ptr-indirect dst off: {e}")))?;
+        let dst_ptr = self.arena_addr_i32(dst_off)?;
+        let i64_t = self.ctx.i64_type();
+        let rec64 = self
+            .builder
+            .build_int_z_extend(record_size, i64_t, "ptr_indirect_rec64")
+            .map_err(|e| LlvmError::Codegen(format!("rec64 zext: {e}")))?;
+        let _ = arena_base_ptr;
+        self.builder
+            .build_memcpy(dst_ptr, align, src_abs, 1, rec64)
+            .map_err(|e| LlvmError::Codegen(format!("ptr-indirect memcpy: {e}")))?;
+        // Store `aligned` (buffer-relative offset of the new record)
+        // into the fixed-area slot at `out_ptr + offset`.
+        let slot_off = self
+            .builder
+            .build_int_add(
+                out_ptr_i32,
+                i32_t.const_int(u64::from(offset), false),
+                "ptr_indirect_slot_off",
+            )
+            .map_err(|e| LlvmError::Codegen(format!("ptr-indirect slot off: {e}")))?;
+        let slot_addr = self.arena_addr_i32(slot_off)?;
+        self.builder
+            .build_store(slot_addr, aligned)
+            .map_err(|e| LlvmError::Codegen(format!("ptr-indirect slot store: {e}")))?;
+        // Flag the body so the buffer-protocol epilogue returns the
+        // post-bump tail cursor.
+        self.needs_tail_cursor = true;
+        Ok(())
+    }
+
+    /// Lower `Op::Call { fn_index, ... }` by inlining the bundled
+    /// stdlib body. Mirrors cranelift's `emit_call_stdlib` — pop the
+    /// args, set up an inline frame with an exit-block target, lower
+    /// the callee body recursively against the inline frame, then
+    /// continue at the exit block with the loaded result on the stack.
+    fn emit_call_stdlib(
+        &mut self,
+        ip_hint: &str,
+        fn_index: u32,
+        arg_count: u32,
+        param_tys: &[IrType],
+        ret_ty: IrType,
+    ) -> Result<(), LlvmError> {
+        let stdlib = relon_ir::stdlib::builtin_stdlib();
+        let callee = stdlib.get(fn_index as usize).ok_or_else(|| {
+            LlvmError::Codegen(format!(
+                "Op::Call fn_index {fn_index} outside bundled stdlib (max {})",
+                stdlib.len()
+            ))
+        })?;
+        if callee.params.len() != arg_count as usize {
+            return Err(LlvmError::Codegen(format!(
+                "Op::Call to `{}` declares {arg_count} args but callee has {}",
+                callee.name,
+                callee.params.len()
+            )));
+        }
+        for (i, (declared, expected)) in callee.params.iter().zip(param_tys.iter()).enumerate() {
+            if declared != expected {
+                return Err(LlvmError::Codegen(format!(
+                    "Op::Call to `{}` arg #{i}: callee expects {declared:?}, IR tags {expected:?}",
+                    callee.name
+                )));
+            }
+        }
+        // Pop args in reverse so `params[i]` is the i-th declared arg.
+        let mut args: Vec<TypedValue<'ctx>> = Vec::with_capacity(arg_count as usize);
+        for _ in 0..arg_count {
+            args.push(self.pop(ip_hint)?);
+        }
+        args.reverse();
+
+        // Pick a let_offset window past any active let slots so the
+        // callee's `LetSet 0` lands at `let_offset + 0` and never
+        // clashes with the caller's bindings. Cranelift uses
+        // `max(idx) + 1`; we do the same by inspecting `let_slots`.
+        let let_offset = self
+            .let_slots
+            .keys()
+            .copied()
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+
+        // Alloca for the callee's return value. The callee's
+        // `Op::Return` stores into this slot then jumps to `exit_bb`;
+        // the caller-side load below pushes the value back on the
+        // virtual stack.
+        let ret_llvm_ty: inkwell::types::BasicTypeEnum<'ctx> = match ret_ty {
+            IrType::I64 => self.ctx.i64_type().into(),
+            IrType::I32
+            | IrType::Bool
+            | IrType::Null
+            | IrType::String
+            | IrType::ListInt
+            | IrType::ListFloat
+            | IrType::ListBool => self.ctx.i32_type().into(),
+            other => {
+                return Err(LlvmError::Codegen(format!(
+                    "Op::Call ret_ty {other:?} unsupported in inline frame"
+                )));
+            }
+        };
+        // Allocate the ret slot in the function's entry block so it
+        // stays out of any loop body; mem2reg promotes it on -O2/-O3.
+        let entry_bb = self.func.get_first_basic_block().ok_or_else(|| {
+            LlvmError::Codegen("emit_call_stdlib: function has no entry block".into())
+        })?;
+        let cur = self.builder.get_insert_block();
+        if let Some(first_instr) = entry_bb.get_first_instruction() {
+            self.builder.position_before(&first_instr);
+        } else {
+            self.builder.position_at_end(entry_bb);
+        }
+        let ret_slot = self
+            .builder
+            .build_alloca(ret_llvm_ty, "call_ret_slot")
+            .map_err(|e| LlvmError::Codegen(format!("call ret_slot alloca: {e}")))?;
+        if let Some(bb) = cur {
+            self.builder.position_at_end(bb);
+        }
+
+        let exit_bb = self.ctx.append_basic_block(self.func, "call_exit");
+        let frame = InlineFrame {
+            params: args,
+            let_offset,
+            ret_slot,
+            ret_ty,
+            exit_bb,
+        };
+        self.inline_frames.push(frame);
+        let body = callee.body_owned();
+        let result = self.lower_body(&body);
+        // Always pop the frame before returning the error so the emit
+        // state stays consistent on failure.
+        self.inline_frames.pop();
+        result?;
+
+        // After the inline body finishes the current block has either
+        // hit `Op::Return` (which terminated via `br exit_bb`) or fell
+        // through. If it fell through, branch to exit_bb so the
+        // load + push below has a single in-edge.
+        let cur_terminated = self
+            .builder
+            .get_insert_block()
+            .and_then(|bb| bb.get_terminator())
+            .is_some();
+        if !cur_terminated {
+            self.builder
+                .build_unconditional_branch(exit_bb)
+                .map_err(|e| LlvmError::Codegen(format!("inline call fallthrough: {e}")))?;
+        }
+        // Position at the exit block and load the result.
+        self.builder.position_at_end(exit_bb);
+        let name = self.next_name("call_ret_load");
+        let v = self
+            .builder
+            .build_load(ret_llvm_ty, ret_slot, &name)
+            .map_err(|e| LlvmError::Codegen(format!("inline call ret load: {e}")))?
+            .into_int_value();
+        self.push(v, ret_ty);
+        Ok(())
     }
 }

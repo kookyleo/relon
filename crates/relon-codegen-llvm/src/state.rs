@@ -65,6 +65,22 @@ pub struct ArenaState {
     /// bounds are exposed as `llvm.trap` / panic at most), so this
     /// is recorded for future use rather than read by the JIT today.
     pub arena_len: UnsafeCell<u32>,
+    /// Phase E.1: tail cursor used by pointer-indirect StoreField
+    /// (`String` / `ListInt` / `ListFloat` / `ListBool`) to bump-
+    /// allocate records inside the output buffer's tail region.
+    /// Counts buffer-relative bytes from `out_ptr`. Reset to 0 at the
+    /// start of every dispatch.
+    pub tail_cursor: UnsafeCell<u32>,
+    /// Phase E.1: scratch bump cursor used by stdlib bodies (`concat`,
+    /// `substring`, ...) and `Op::StrConcatN` to allocate temporary
+    /// records inside the arena's scratch region. Counts bytes from
+    /// `scratch_base`. Reset to 0 per dispatch.
+    pub scratch_cursor: UnsafeCell<u32>,
+    /// Phase E.1: arena-relative byte offset at which the scratch
+    /// region starts (= `out_ptr + out_cap`). The bump path reads
+    /// `scratch_base + scratch_cursor` as the i32 pointer returned to
+    /// the stdlib body.
+    pub scratch_base: UnsafeCell<u32>,
 }
 
 /// Byte offset of [`ArenaState::arena_base`] inside the `#[repr(C)]`
@@ -76,11 +92,30 @@ pub const ARENA_STATE_OFFSET_BASE: u32 = 0;
 #[allow(dead_code)]
 pub const ARENA_STATE_OFFSET_LEN: u32 = std::mem::size_of::<usize>() as u32;
 
+/// Byte offset of [`ArenaState::tail_cursor`]. The pointer-indirect
+/// StoreField path loads and stores this u32 to bump-allocate the
+/// output buffer's tail region.
+pub const ARENA_STATE_OFFSET_TAIL_CURSOR: u32 = ARENA_STATE_OFFSET_LEN + 4;
+
+/// Byte offset of [`ArenaState::scratch_cursor`]. Loaded / stored by
+/// the `Op::AllocScratch` / `Op::AllocScratchDyn` lowering.
+pub const ARENA_STATE_OFFSET_SCRATCH_CURSOR: u32 = ARENA_STATE_OFFSET_TAIL_CURSOR + 4;
+
+/// Byte offset of [`ArenaState::scratch_base`]. Loaded by the scratch
+/// allocator to compute the arena-relative offset of a freshly-
+/// reserved scratch block (`scratch_base + scratch_cursor`).
+pub const ARENA_STATE_OFFSET_SCRATCH_BASE: u32 = ARENA_STATE_OFFSET_SCRATCH_CURSOR + 4;
+
 impl ArenaState {
     /// Construct a state that points at `arena[0..]` for a single
     /// dispatch. The caller owns the backing storage; this struct
     /// only borrows it through a raw pointer for the JIT's
     /// lifetime.
+    ///
+    /// `scratch_base` is the arena-relative offset where temporary
+    /// allocations (string concat, ...) live; pass `arena.len()` to
+    /// disable the scratch path. The cursors are reset to 0 so the
+    /// JIT bump path starts fresh on every dispatch.
     ///
     /// # Safety
     ///
@@ -88,10 +123,23 @@ impl ArenaState {
     /// `run_main` invocation that consumes this state. The emitted
     /// JIT code reads and writes through `arena_base` without
     /// touching the Rust borrow checker.
-    pub fn new(arena: &mut [u8]) -> Self {
+    pub fn new(arena: &mut [u8], scratch_base: u32) -> Self {
         Self {
             arena_base: UnsafeCell::new(arena.as_mut_ptr() as usize),
             arena_len: UnsafeCell::new(arena.len() as u32),
+            tail_cursor: UnsafeCell::new(0),
+            scratch_cursor: UnsafeCell::new(0),
+            scratch_base: UnsafeCell::new(scratch_base),
         }
+    }
+
+    /// Read the current tail-cursor value. Used by the evaluator
+    /// after a dispatch returns to know how much was written into the
+    /// tail region (for `String` return-value decoding).
+    #[allow(dead_code)]
+    pub fn tail_cursor(&self) -> u32 {
+        // SAFETY: caller owns the state exclusively for a single
+        // dispatch — no aliasing read can happen.
+        unsafe { *self.tail_cursor.get() }
     }
 }
