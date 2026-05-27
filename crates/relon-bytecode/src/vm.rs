@@ -1164,6 +1164,7 @@ impl BytecodeVm {
                 &mut memory,
                 pc,
                 /*current_captures=*/ None,
+                /*closures_pool=*/ &func.closure_bodies,
             ) {
                 Ok(StepOutcome::Advance) => pc += 1,
                 Ok(StepOutcome::Jump(target)) => {
@@ -1300,6 +1301,7 @@ impl BytecodeVm {
                         &mut memory,
                         pc,
                         /*current_captures=*/ None,
+                        /*closures_pool=*/ &func.closure_bodies,
                     ) {
                         Ok(StepOutcome::Advance) => pc += 1,
                         Ok(StepOutcome::Jump(target)) => {
@@ -1356,6 +1358,7 @@ impl BytecodeVm {
         args: &[VmValue],
         captures: &[VmValue],
         memory: &mut VmMemory,
+        closures_pool: &[BcFunction],
     ) -> Result<VmValue, BcVmError> {
         let needed = (body.locals as usize).max(args.len());
         let mut locals: Vec<VmValue> = vec![0u64; needed];
@@ -1402,6 +1405,7 @@ impl BytecodeVm {
                 memory,
                 pc,
                 Some(captures),
+                closures_pool,
             )? {
                 StepOutcome::Advance => pc += 1,
                 StepOutcome::Jump(target) => {
@@ -1438,6 +1442,16 @@ impl BytecodeVm {
         // with `Some(&closure_slot.captures)` so `BcOp::CaptureGet`
         // resolves against the matching frame.
         current_captures: Option<&[VmValue]>,
+        // Phase D: shared closure-body pool. The top-level invoker
+        // passes `&func.closure_bodies`; nested `BcOp::CallClosure`
+        // invocations forward the same pool unchanged. This decouples
+        // the body resolution from the currently-executing
+        // `BcFunction`, so a closure body whose `closure_bodies` field
+        // is empty (the common shape for non-nesting lambdas — they
+        // never emit their own `MakeClosure`) can still dispatch
+        // self-referential calls: the slot's `body_idx` keys into the
+        // top-level pool, which contains the lambda itself.
+        closures_pool: &[BcFunction],
     ) -> Result<StepOutcome, BcVmError> {
         match op {
             BcOp::ConstI64(v) => {
@@ -2060,10 +2074,12 @@ impl BytecodeVm {
                     captures.push(pop(stack, bc_idx)?);
                 }
                 captures.reverse();
-                // Validate body index is in range. The compile pass is
-                // responsible for emitting only valid indices; this
-                // check guards against hand-built BcFunction misuse.
-                if (*body_idx as usize) >= func.closure_bodies.len() {
+                // Validate body index against the shared closure pool.
+                // Phase D: pool is the top-level function's
+                // `closure_bodies`; inner closure bodies pass the same
+                // pool through so a nested `MakeClosure` (rare today,
+                // but valid IR shape) still resolves correctly.
+                if (*body_idx as usize) >= closures_pool.len() {
                     return Err(BcVmError::StackUnderflow { bc_idx });
                 }
                 let handle = memory.closures.alloc(*body_idx, captures);
@@ -2087,18 +2103,21 @@ impl BytecodeVm {
                 let handle = pop(stack, bc_idx)? as u32;
                 // Clone the Arc<ClosureSlot> so we can release the
                 // mutable borrow on `memory.closures` before re-entering
-                // dispatch. The body lookup uses the body_idx the slot
-                // carries.
+                // dispatch. Phase D: body resolution routes through the
+                // shared `closures_pool` (= top-level closure_bodies),
+                // not `func.closure_bodies` — so a self-recursive call
+                // from inside a closure body (whose own
+                // `closure_bodies` is empty) still finds the lambda.
                 let slot: Arc<ClosureSlot> = memory
                     .closures
                     .get(handle)
                     .map_err(arena_to_vm_error)?
                     .clone();
-                let body = func
-                    .closure_bodies
+                let body = closures_pool
                     .get(slot.body_idx as usize)
                     .ok_or(BcVmError::StackUnderflow { bc_idx })?;
-                let ret = self.invoke_closure_body(body, &args, &slot.captures, memory)?;
+                let ret =
+                    self.invoke_closure_body(body, &args, &slot.captures, memory, closures_pool)?;
                 stack.push(ret);
             }
             BcOp::CaptureGet { idx } => {
