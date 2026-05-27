@@ -283,7 +283,7 @@ impl<'a> Walker<'a> {
     /// Schema-rooted Phase B: emit `UnknownMethod` when a 2-segment
     /// `head.method(...)` call has a head whose static type resolves
     /// to a known schema, but the method isn't recorded on that
-    /// schema's table. Also enforces `#private` visibility — a private
+    /// schema's table. Also enforces `#internal` visibility — an internal
     /// method may only be called from another method on the *same*
     /// schema (currently approximated as: from inside the same
     /// `with { ... }` block, tracked via `self.method_call_context`).
@@ -433,7 +433,7 @@ impl<'a> Walker<'a> {
     /// True when the walker is currently inside the body of a method
     /// declared on `schema`. The typecheck walker only traverses the
     /// entry root today — method bodies are not walked from this
-    /// path — so the answer is always `false`. The `#private` check
+    /// path — so the answer is always `false`. The `#internal` check
     /// in `check_method_dispatch` therefore only flags calls reached
     /// from the entry root, which is the correct conservative
     /// behaviour: private methods are explicitly opt-out of external

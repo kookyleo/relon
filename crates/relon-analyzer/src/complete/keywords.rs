@@ -214,7 +214,7 @@ pub(super) fn push_directive_candidates(items: &mut Vec<CompletionItem>) {
     // `Bare` shapes don't carry a tab stop; `Value` shapes leave the
     // cursor at the argument so the user just types the payload.
     for (name, snippet) in [
-        ("private", "private"),
+        ("internal", "internal"),
         ("expect", "expect ${0:\"message\"}"),
         ("default", "default ${0:value}"),
         ("brand", "brand ${0:TypeName}"),

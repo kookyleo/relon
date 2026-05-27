@@ -2501,13 +2501,13 @@ fn duplicate_main_directive_is_an_analyzer_error() {
 
 #[test]
 fn private_field_is_dropped_from_dict_map_but_visible_to_siblings() {
-    // `#private` keeps a binding alive in the owning dict's locals so
+    // `#internal` keeps a binding alive in the owning dict's locals so
     // siblings can reference it, while excluding it from the produced
     // `Value::Dict::map`. Net effect: `display` resolves correctly,
     // but the consumer never sees `helper` in the output.
     let result = eval_doc(
         r#"{
-            #private
+            #internal
             helper(v): "<" + v + ">",
             display: helper("hi")
         }"#,
@@ -2525,10 +2525,10 @@ fn private_field_is_dropped_from_dict_map_but_visible_to_siblings() {
 #[test]
 fn private_value_field_is_also_dropped_from_dict_map() {
     // The marker isn't closure-specific: any field type — including
-    // plain strings — disappears from the map when `#private`.
+    // plain strings — disappears from the map when `#internal`.
     let result = eval_doc(
         r#"{
-            #private
+            #internal
             secret: "shhh",
             public: &sibling.secret + " (declassified)"
         }"#,
@@ -2552,7 +2552,7 @@ fn private_field_is_not_visible_through_alias_import() {
     std::fs::write(
         dir.join("lib.relon"),
         r#"{
-            #private
+            #internal
             secret: "shhh",
             public: "ok"
         }"#,
@@ -2592,7 +2592,7 @@ fn private_field_is_skipped_by_import_spread() {
     std::fs::write(
         dir.join("lib.relon"),
         r#"{
-            #private
+            #internal
             internal: "kept inside",
             exported: "out"
         }"#,
@@ -2825,7 +2825,7 @@ fn user_defined_decorator_applies_closure_to_value() {
     // closure defined as a sibling.
     let result = eval_doc(
         r#"{
-            #private
+            #internal
             shout(s): s + "!",
             greeting: @shout "hello"
         }"#,
@@ -2844,7 +2844,7 @@ fn user_defined_decorator_with_extra_args() {
     // are appended to the call.
     let result = eval_doc(
         r#"{
-            #private
+            #internal
             wrap(s, l, r): l + s + r,
             display: @wrap("[", "]") "core"
         }"#,
@@ -2862,9 +2862,9 @@ fn user_defined_decorator_stack_is_innermost_first() {
     // `@a @b v` ≡ `a(b(v))` — bottom-up, nearest-to-value first.
     let result = eval_doc(
         r#"{
-            #private
+            #internal
             paren(s): "(" + s + ")",
-            #private
+            #internal
             star(s): "*" + s + "*",
             display: @star @paren "x"
         }"#,
@@ -2977,12 +2977,12 @@ fn next_reference_target_carries_its_own_list_context() {
 
 #[test]
 fn private_field_is_not_visible_through_root_reference() {
-    // P2-C regression: a `#private` field on the root dict must not be
+    // P2-C regression: a `#internal` field on the root dict must not be
     // reachable via `&root.<name>` from a nested dict — the field's
     // visibility is local to its owning dict's siblings.
     let result = eval_doc(
         r#"{
-            #private
+            #internal
             secret: "shhh",
             child: { leak: &root.secret }
         }"#,
@@ -3634,7 +3634,7 @@ fn run_main_path_cache_isolated_across_invocations() {
     );
 }
 
-/// Bug 2: a `#private` field is invisible from `Value::Dict::map`, but
+/// Bug 2: a `#internal` field is invisible from `Value::Dict::map`, but
 /// dict evaluation also seeds the value into `dict_scope.locals` so
 /// same-dict siblings can reach it. A previous fix already taught
 /// `resolve_dict_reference_step` to hide private fields when the
@@ -3646,7 +3646,7 @@ fn run_main_path_cache_isolated_across_invocations() {
 fn private_field_does_not_leak_via_locals_fallback() {
     let result = eval_doc(
         r#"{
-            #private
+            #internal
             secret: "shhh",
             alias: &sibling.secret,
             child: { leak: &root.secret }
@@ -6047,7 +6047,7 @@ fn unprepared_shared_arc_panics_loudly() {
 }
 
 /// Sanity guard for the W7 cmp_lua workload: a top-level dict whose
-/// `#private fib` field holds a recursive closure literal and whose
+/// `#internal fib` field holds a recursive closure literal and whose
 /// `result` field calls that closure with the `#main` parameter. The
 /// tree-walker resolves the closure through the per-dict scope's name
 /// table; this test pins fib(13) = 233 so a future refactor of the
@@ -6065,7 +6065,7 @@ fn run_main_w7_recursive_closure_dict_field() {
     use std::collections::HashMap;
     let source = "#main(Int n) -> Dict\n\
                   {\n\
-                    #private\n\
+                    #internal\n\
                     fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
                     result: fib(n)\n\
                   }";

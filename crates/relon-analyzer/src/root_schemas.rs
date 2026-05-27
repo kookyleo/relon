@@ -2,7 +2,7 @@
 //!
 //! Layout sugar that lets users co-locate schema declarations with the
 //! root entry directive instead of stuffing them inside the root dict
-//! body. Semantically equivalent to declaring each `Name` as a `#private
+//! body. Semantically equivalent to declaring each `Name` as a `#internal
 //! #schema` field of the root dict — once the pass has registered the
 //! schemas, root-level references to them resolve the same way as
 //! dict-field `#schema X {...}` (renamed: `#schema X {...}` at field

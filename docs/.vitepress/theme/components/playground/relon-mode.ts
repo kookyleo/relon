@@ -57,7 +57,7 @@ const HASH_KEYWORDS = new Set([
     '#derive',
     '#no_auto_derive',
     '#native',
-    '#private',
+    '#internal',
     '#brand',
     '#import',
 ]);

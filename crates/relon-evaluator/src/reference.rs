@@ -26,14 +26,14 @@ pub(crate) enum ReferenceStep {
 }
 
 /// Outcome of `resolve_dict_reference_step`. We need to distinguish
-/// "field genuinely doesn't exist" from "field exists but `#private`
+/// "field genuinely doesn't exist" from "field exists but `#internal`
 /// hides it across a dict boundary": in the latter case the caller
-/// must NOT fall back to `scope.locals`, since `#private` values are
+/// must NOT fall back to `scope.locals`, since `#internal` values are
 /// kept in the owning dict's locals (so same-dict siblings can see
 /// them) and would otherwise leak through cross-dict references.
 pub(crate) enum DictStepResult {
     Found(ReferenceStep),
-    /// The named field exists on the dict but is `#private` and the
+    /// The named field exists on the dict but is `#internal` and the
     /// access crossed a dict boundary; treat as invisible without
     /// consulting `locals` fallback.
     PrivateBlocked,
@@ -333,7 +333,7 @@ impl TreeWalkEvaluator {
                     path.iter().map(|k| k.name()).collect::<Vec<_>>().join(".")
                 };
                 // `&this` has no owning-dict relationship — every step is
-                // a cross-dict access from the perspective of `#private`.
+                // a cross-dict access from the perspective of `#internal`.
                 return self.eval_reference_path(root, path, scope, &display, range, None);
             }
             _ => {}
@@ -349,7 +349,7 @@ impl TreeWalkEvaluator {
         // dict that *owns* the reference site (i.e. the `&sibling` /
         // `&uncle` anchor). When the path consumes that many dict steps
         // the next field access is *inside* the owning dict and may
-        // see `#private` siblings; deeper accesses are cross-dict.
+        // see `#internal` siblings; deeper accesses are cross-dict.
         // `None` means "no owning relationship" — `&root` always
         // crosses a dict boundary.
         let (mut target_path, owning_depth): (Vec<TokenKey>, Option<usize>) = match base {
@@ -547,7 +547,7 @@ impl TreeWalkEvaluator {
                 };
                 let remaining_path = &path[1..];
                 // Fix 4: when this dict step lands *outside* the
-                // reference's owning dict, hide `#private` fields. The
+                // reference's owning dict, hide `#internal` fields. The
                 // caller threads `owning_depth` so `&sibling`/`&uncle`
                 // reach their final step with `Some(0)` (allow private),
                 // while `&root` and any deeper step starts with `None`
@@ -585,10 +585,10 @@ impl TreeWalkEvaluator {
                         self.lookup_value_path(*value, remaining_path, display_path, scope, range)
                     }
                     DictStepResult::PrivateBlocked => {
-                        // Field exists but is `#private` and we crossed
+                        // Field exists but is `#internal` and we crossed
                         // a dict boundary. Treat as invisible — and
                         // critically, do NOT fall through to the
-                        // `locals` lookup below, since `#private` keeps
+                        // `locals` lookup below, since `#internal` keeps
                         // the value in the owning dict's locals and
                         // that fallback would silently leak it.
                         if is_optional {
@@ -714,7 +714,7 @@ impl TreeWalkEvaluator {
             match key {
                 TokenKey::Spread(_) => {
                     // Spread results come from a `Value::Dict`, which has
-                    // already had its `#private` fields stripped at dict
+                    // already had its `#internal` fields stripped at dict
                     // build time — so this branch is naturally safe.
                     let spread_value = self.eval(value_node, scope)?;
                     if let Value::Dict(d) = spread_value {
@@ -744,7 +744,7 @@ impl TreeWalkEvaluator {
                         //
                         // Bug 2: must report this as `PrivateBlocked`
                         // rather than `NotFound`, so the caller doesn't
-                        // fall back to `scope.locals` — `#private`
+                        // fall back to `scope.locals` — `#internal`
                         // values are deliberately seeded into the
                         // owning dict's locals (eval.rs:767) so
                         // same-dict siblings can see them, and a naive

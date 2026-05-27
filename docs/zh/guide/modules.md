@@ -61,7 +61,7 @@
 #### 导入保护 (Import Protection)
 
 如果在平铺导入时发生了名称冲突，**覆盖行为会发生**。为了保护命名空
-间，把不希望被平铺导入的字段标上 `#private` 指令：私有字段不会写
+间，把不希望被平铺导入的字段标上 `#internal` 指令：私有字段不会写
 入模块的导出 map，所以平铺导入会自然跳过它们，命名空间形式也访问
 不到（`lib.private_field` → `VariableNotFound`）。
 
@@ -72,14 +72,14 @@
     shout(v): v + "!!!",
 
     // 私有助手函数：不会被任何 #import 形式带出去
-    #private
+    #internal
     add(a, b): a + b
 }
 ```
 
 > 历史说明：早期版本用 `_` 前缀做隐式约定，并使用 `@private` 装
-> 饰器形式。两者都已**完全取消**，请改用 `#private` 指令。详见
-> [`syntax.md`](./syntax.md#字段可见性-private)。
+> 饰器形式。两者都已**完全取消**，请改用 `#internal` 指令。详见
+> [`syntax.md`](./syntax.md#字段可见性-internal)。
 
 ## 入口程序与库
 

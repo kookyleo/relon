@@ -70,7 +70,7 @@ plain JSON
 - **`NodeId` 进程内唯一**：`AtomicU32::fetch_add` 分配，作为 side-table 的 key。AST clone 不重新分配 id（`Node::PartialEq` 跳过 id 比较）。
 - **`Value::Dict` 携带 `brand: Option<String>`**：通过 `#schema` 类型检查后会盖上品牌。重新合并时再次校验，业务侧无法绕过 schema。
 - **`Value::Dict` 携带 `variant_of: Option<String>`**：仅 sum-type variant 携带，标记父 enum 名。`Projector` 据此决定是否按 externally-tagged 形态输出。
-- **JSON 输出闭环**：默认 `JsonProjector` 在 Dict 内对 closure / Schema / EnumSchema / Type / Wildcard 这类运行时-only 的 Value **静默丢弃**；`#private` 字段更进一步——它们根本不进入 `Value::Dict::map`，所以 projector 见不到它们。但在 **List** 或文档**顶层**遇到 closure 会触发 `UnsupportedClosure` 错误而非静默：列表是「数据序列」语义，悄悄丢一个元素会让索引和长度撒谎。`#private` / closure-filtering / `UnsupportedClosure` 是三道层叠防线：前两个把「不该出现的东西」按位置悄悄藏起来，最后一个在「悄悄藏会改变结构」时显式报错。
+- **JSON 输出闭环**：默认 `JsonProjector` 在 Dict 内对 closure / Schema / EnumSchema / Type / Wildcard 这类运行时-only 的 Value **静默丢弃**；`#internal` 字段更进一步——它们根本不进入 `Value::Dict::map`，所以 projector 见不到它们。但在 **List** 或文档**顶层**遇到 closure 会触发 `UnsupportedClosure` 错误而非静默：列表是「数据序列」语义，悄悄丢一个元素会让索引和长度撒谎。`#internal` / closure-filtering / `UnsupportedClosure` 是三道层叠防线：前两个把「不该出现的东西」按位置悄悄藏起来，最后一个在「悄悄藏会改变结构」时显式报错。
 
 ## 扩展点
 

@@ -51,7 +51,7 @@ fn directive_context_suggests_directive_names() {
     assert!(names.contains(&"schema".to_string()), "{names:?}");
     assert!(names.contains(&"main".to_string()), "{names:?}");
     let pragmas = labels_with_kind(&items, CompletionKind::Pragma);
-    assert!(pragmas.contains(&"private".to_string()), "{pragmas:?}");
+    assert!(pragmas.contains(&"internal".to_string()), "{pragmas:?}");
     // Should NOT include unrelated stdlib names in `#` context.
     let stdlib = labels_with_kind(&items, CompletionKind::Stdlib);
     assert!(
@@ -157,7 +157,7 @@ fn keywords_for_cursor_directive_works_without_parse() {
         .filter(|i| i.kind == CompletionKind::Pragma)
         .map(|i| i.label.clone())
         .collect();
-    assert!(pragmas.contains(&"private".to_string()), "{pragmas:?}");
+    assert!(pragmas.contains(&"internal".to_string()), "{pragmas:?}");
 }
 
 #[test]

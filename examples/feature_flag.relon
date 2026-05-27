@@ -44,12 +44,12 @@
     // header. The host is responsible for picking a hash family
     // that's deterministic across runs and uniformly distributed
     // across the input space (siphash / blake3 / fxhash all qualify).
-    #private
+    #internal
     hash_mod_100(s): native_hash(s) % 100,
     // Each flag returns a Bool given the User. Keeping them as
     // closures lets the rollout table below stay tabular.
 
-    #private
+    #internal
     rules: {
         // 1. Hard-off — kill switch for a half-shipped experiment.
         legacy_checkout: (u) => false,

@@ -36,7 +36,7 @@
     // The table is the contract. Adding a new edge means appending a
     // row here — no Rust changes, no redeploy. The schema brand on
     // each row enforces the four-field shape at load time.
-    #private
+    #internal
     transitions: [
         #brand Transition {
             from: "placed",
@@ -81,10 +81,10 @@
     ],
     // Linear scan — workflows tend to have < 50 transitions, so a
     // hash table would be overkill.
-    #private
+    #internal
     match_one(t): t.from == state && t.on == event,
 
-    #private
+    #internal
     matched: _list_filter(&sibling.transitions, &sibling.match_one),
 
     next_state: len(matched) > 0 ? matched[0].to: state,

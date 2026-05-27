@@ -44,19 +44,19 @@
     // args (symbol, value); the decorated field's value is appended
     // as the last positional, so `@currency("USD") x: 12.3` reads as
     // `currency("USD", 12.3)`.
-    #private
+    #internal
     currency(symbol, val): symbol + " " + val,
     // Tiered volume discount expressed as a rate, not a flat amount.
-    #private
+    #internal
     volume_rate(sub): sub >= 1000 ? 0.10: sub >= 500 ? 0.05: 0.0,
     // Loyalty discount stacks on top of volume.
-    #private
+    #internal
     loyalty_rate(tier): tier == "gold" ? 0.03: 0.0,
 
-    #private
+    #internal
     tax_rate: 0.08,
     // Pure aggregation over the line items.
-    #private
+    #internal
     sum_floats(xs): _list_reduce(xs, 0.0, (a, x) => a + x),
 
     subtotal: sum_floats([

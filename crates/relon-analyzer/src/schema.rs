@@ -109,7 +109,7 @@ pub struct SchemaMethodInfo {
     /// True when an `#native` pragma precedes this method — the body
     /// lives in host Rust (registered via `register_method`, Phase D).
     pub is_native: bool,
-    /// True when an `#private` pragma precedes this method (decision
+    /// True when an `#internal` pragma precedes this method (decision
     /// 16: schema-internal visibility, only callable from other method
     /// bodies on the same schema).
     pub is_private: bool,

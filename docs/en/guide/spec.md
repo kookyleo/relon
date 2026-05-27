@@ -69,7 +69,7 @@ NOT allow a single name to exist in both `@`-form and `#`-form.
 | `#name ...` | **Directive** — declaration / structure / metadata | Built-in only; fixed set; not user-extensible |
 
 The complete v1 directive set: `#main(...)`, `#schema X Body`,
-`#import ... from "..."`, `#private`, `#default`, `#expect`,
+`#import ... from "..."`, `#internal`, `#default`, `#expect`,
 `#msg`, `#error`, `#brand X`.
 
 The complete v1 built-in decorator set: `@value(...)`. Any other
@@ -189,7 +189,7 @@ table) and is not user-extensible:
 
 | Shape | Form | Example | Used for |
 | --- | --- | --- | --- |
-| Bare | `#name` | `#private` | Field flag |
+| Bare | `#name` | `#internal` | Field flag |
 | Value | `#name <expr>` | `#default 0`, `#expect "must be ≥0"`, `#brand Color` | Metadata / value transform |
 | NameBody | `#name <ident> <body>` | `#schema User { String name: * }` | Named declaration (no colon) |
 | Import | `#import <bindspec> from "<path>"` | `#import * from "std/list"` | Import |

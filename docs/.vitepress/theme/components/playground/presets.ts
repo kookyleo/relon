@@ -77,15 +77,15 @@ const PRICING_MAIN = `/*
 }
 #main(Order order)
 {
-    #private
+    #internal
     currency(symbol, val): symbol + " " + val,
-    #private
+    #internal
     volume_rate(sub): sub >= 1000 ? 0.10: sub >= 500 ? 0.05: 0.0,
-    #private
+    #internal
     loyalty_rate(tier): tier == "gold" ? 0.03: 0.0,
-    #private
+    #internal
     tax_rate: 0.08,
-    #private
+    #internal
     sum_floats(xs): _list_reduce(xs, 0.0, (a, x) => a + x),
     subtotal: sum_floats([it.qty * it.unit_price for it in order.items]),
     discount_rate: volume_rate(&sibling.subtotal) + loyalty_rate(order.tier),
@@ -116,9 +116,9 @@ const FEATURE_FLAG_MAIN = `/*
 }
 #main(User user) -> Dict<String, Dict<String, Bool>>
 {
-    #private
+    #internal
     hash_mod_100(s): native_hash(s) % 100,
-    #private
+    #internal
     rules: {
         legacy_checkout: (u) => false,
         dark_mode: (u) => true,
@@ -155,7 +155,7 @@ const WORKFLOW_MAIN = `/*
 }
 #main(String state, String event)
 {
-    #private
+    #internal
     transitions: [
         #brand Transition { from: "placed", on: "pay",     to: "paid",      emit: ["charge_card", "log_payment"] },
         #brand Transition { from: "paid",   on: "ship",    to: "shipped",   emit: ["notify_shipper", "email_user"] },
@@ -163,9 +163,9 @@ const WORKFLOW_MAIN = `/*
         #brand Transition { from: "placed", on: "cancel",  to: "cancelled", emit: [] },
         #brand Transition { from: "paid",   on: "cancel",  to: "cancelled", emit: ["refund_card"] }
     ],
-    #private
+    #internal
     match_one(t): t.from == state && t.on == event,
-    #private
+    #internal
     matched: _list_filter(&sibling.transitions, &sibling.match_one),
     next_state: len(matched) > 0 ? matched[0].to: state,
     emit: len(matched) > 0 ? matched[0].emit: ["unhandled_event"]

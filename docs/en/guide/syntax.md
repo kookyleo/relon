@@ -178,7 +178,7 @@ namespaces:
   bottom-up: `@a @b v ≡ a(b(v))`.
 - `#name ...` — **directive**: declaration / structure / metadata.
   The full set is `#main(...)`, `#schema X Body`,
-  `#import ... from "..."`, `#private`, `#default`, `#expect`,
+  `#import ... from "..."`, `#internal`, `#default`, `#expect`,
   `#msg`, `#error`, `#brand X`, `#relaxed` (synonym `#unstrict`),
   `#derive`, `#no_auto_derive`, `#native`, and `#extend`. Directive
   names are fixed and registered by the runtime — not user-extensible.
@@ -186,22 +186,22 @@ namespaces:
 > Rule of thumb: if it **changes the value**, it's `@`; if it
 > **changes the shape or metadata**, it's `#`.
 
-## Field visibility — `#private`
+## Field visibility — `#internal`
 
 Since configs typically need to export clean JSON, internal logic must
-be hideable. Relon uses the `#private` directive to declare that a
+be hideable. Relon uses the `#internal` directive to declare that a
 field is not externally visible:
 
 ```relon
 {
-    #private
+    #internal
     helper(v): "<" + v + ">",
     display: helper("hi")
 }
 // JSON output: { "display": "<hi>" }   // helper is hidden
 ```
 
-A `#private` field:
+An `#internal` field:
 
 - Lives in the local scope of its dict — **other fields in the same
   dict can reference it** (the `display` field calling `helper` above
@@ -216,13 +216,13 @@ A `#private` field:
 
 If a dict value is a **closure (function)**, the default JSON
 projector automatically filters it out. That's another defense beyond
-`#private`, specifically for "values that have no JSON representation".
+`#internal`, specifically for "values that have no JSON representation".
 
 > Historical note: early versions used a `_` prefix as an implicit
 > convention and an `@private` decorator. Both are **fully retired**:
 > identifiers may still start with `_` (e.g. the internal intrinsic
 > `_list_map`), but it carries no visibility, import, or projection
-> meaning. Use `#private` for visibility.
+> meaning. Use `#internal` for visibility.
 
 ## Strict mode — opt out with `#relaxed`
 

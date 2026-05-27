@@ -802,7 +802,7 @@ mod tests {
         let config: ServerConfig = from_str(
             r#"#relaxed
         {
-            #private
+            #internal
             format(v): "port=" + v,
             host: "localhost",
             base: { port: 8080 },

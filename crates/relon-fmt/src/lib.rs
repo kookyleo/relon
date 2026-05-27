@@ -325,21 +325,21 @@ fn first_significant_offset(node: &SyntaxNode) -> Option<usize> {
 ///
 /// The grouping is the product of two orthogonal axes:
 ///   - is the value a Closure? → method vs field
-///   - does the pair carry `#private`? → private vs public
+///   - does the pair carry `#internal`? → private vs public
 ///
-/// Both "method" and "#private" pull a pair forward; together they
-/// pull it furthest forward (private methods are the most-internal
+/// Both "method" and "#internal" pull a pair forward; together they
+/// pull it furthest forward (internal methods are the most-internal
 /// helpers — show them at the very top of the body).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum PairTier {
-    /// `#private name(p): body` — private method, the most-internal
-    /// helpers. Pricing's `#private currency(symbol, val): …` lands
+    /// `#internal name(p): body` — private method, the most-internal
+    /// helpers. Pricing's `#internal currency(symbol, val): …` lands
     /// here.
     PrivateMethod = 0,
-    /// `name(p): body` — public method (closure value, no `#private`).
+    /// `name(p): body` — public method (closure value, no `#internal`).
     PublicMethod = 1,
-    /// `#private name: value` — private constant / config field
-    /// (e.g. pricing's `#private tax_rate: 0.08`).
+    /// `#internal name: value` — private constant / config field
+    /// (e.g. pricing's `#internal tax_rate: 0.08`).
     PrivateField = 2,
     /// `name: value` — public field, the default.
     PublicField = 3,
@@ -356,7 +356,7 @@ fn classify_dict_field(field: &ast::DictField) -> PairTier {
     }
 }
 
-/// True when a `DICT_FIELD` carries a `#private` pragma. The CST
+/// True when a `DICT_FIELD` carries a `#internal` pragma. The CST
 /// stacks pair-level pragmas as `DIRECTIVE` children of the field
 /// itself (the same shape document-level directives use under
 /// `DOCUMENT`).
@@ -365,7 +365,7 @@ fn field_has_private_directive(field: &ast::DictField) -> bool {
         .syntax()
         .children()
         .filter(|c| c.kind() == SyntaxKind::DIRECTIVE)
-        .any(|d| directive_name_text(&d).as_deref() == Some("private"))
+        .any(|d| directive_name_text(&d).as_deref() == Some("internal"))
 }
 
 /// Name of a `DIRECTIVE` node — the IDENT token immediately
@@ -608,7 +608,7 @@ fn pairs_tier_sorted(classified: &[(PairTier, &ast::DictField)]) -> bool {
 //
 // For each reorderable Dict, find the first Method→Field transition.
 // The break offset is the FIRST BYTE of that field pair's span — i.e.
-// at or before any leading `#private` / `@decorator` of the pair.
+// at or before any leading `#internal` / `@decorator` of the pair.
 // The token-stream formatter inserts a blank line at this offset.
 //
 // The break fires at most once per Dict (groups read as "methods
@@ -905,7 +905,7 @@ impl<'a> SourceFormatter<'a> {
     ///     them when not the first thing in the file.
     ///   - `#import` gets a blank above unless the previous content
     ///     was already an `#import` (consecutive imports pack tight).
-    ///   - Non-block directives (pair-level pragmas like `#private`,
+    ///   - Non-block directives (pair-level pragmas like `#internal`,
     ///     `#expect`, `#derive`) get no special treatment — they're
     ///     attached to their following pair.
     fn handle_top_level_hash(&mut self) {
@@ -1342,11 +1342,11 @@ mod tests {
     mod presets {
         pub const DEMO: &str = "// Try editing me - evaluate runs automatically.\n{\n    currency(val, symbol): val + \" \" + symbol,\n    multiply(a, b): a * b,\n    project: {\n        name: \"Relon Playground\",\n        details: {\n            base_price: 1500,\n            total: multiply(&sibling.base_price, 1.2),\n            @currency(\"GBP\")\n            display: &sibling.total\n        }\n    },\n    meta: {\n        tags_count: len([\"rust\", \"config\", \"dsl\"]),\n        summary: f\"Active project: ${&root.project.name}\"\n    }\n}\n";
 
-        pub const PRICING: &str = "/*\n  Invoice pricing with tiered discounts and tax.\n  See examples/pricing.relon in the repo for the full annotated source.\n*/\n#schema LineItem {\n    String sku: *,\n    #expect \"qty must be > 0\"\n    Int qty: (n) => n > 0,\n    #expect \"unit_price must be >= 0\"\n    Float unit_price: (p) => p >= 0\n}\n\n#schema Order {\n    List<LineItem> items: *,\n    #expect \"tier must be one of: standard / gold\"\n    String tier: (t) => t == \"standard\" || t == \"gold\"\n}\n\n#main(Order order)\n{\n    #private\n    currency(symbol, val): symbol + \" \" + val,\n    #private\n    volume_rate(sub): sub >= 1000 ? 0.10: sub >= 500 ? 0.05: 0.0,\n    #private\n    loyalty_rate(tier): tier == \"gold\" ? 0.03: 0.0,\n    #private\n    tax_rate: 0.08,\n    #private\n    sum_floats(xs): _list_reduce(xs, 0.0, (a, x) => a + x),\n    subtotal: sum_floats([it.qty * it.unit_price for it in order.items]),\n    discount_rate: volume_rate(&sibling.subtotal) + loyalty_rate(order.tier),\n    discount_amount: &sibling.subtotal * &sibling.discount_rate,\n    taxable: &sibling.subtotal - &sibling.discount_amount,\n    tax_amount: &sibling.taxable * tax_rate,\n    total: &sibling.taxable + &sibling.tax_amount,\n    @currency(\"USD\")\n    total_display: &sibling.total\n}\n";
+        pub const PRICING: &str = "/*\n  Invoice pricing with tiered discounts and tax.\n  See examples/pricing.relon in the repo for the full annotated source.\n*/\n#schema LineItem {\n    String sku: *,\n    #expect \"qty must be > 0\"\n    Int qty: (n) => n > 0,\n    #expect \"unit_price must be >= 0\"\n    Float unit_price: (p) => p >= 0\n}\n\n#schema Order {\n    List<LineItem> items: *,\n    #expect \"tier must be one of: standard / gold\"\n    String tier: (t) => t == \"standard\" || t == \"gold\"\n}\n\n#main(Order order)\n{\n    #internal\n    currency(symbol, val): symbol + \" \" + val,\n    #internal\n    volume_rate(sub): sub >= 1000 ? 0.10: sub >= 500 ? 0.05: 0.0,\n    #internal\n    loyalty_rate(tier): tier == \"gold\" ? 0.03: 0.0,\n    #internal\n    tax_rate: 0.08,\n    #internal\n    sum_floats(xs): _list_reduce(xs, 0.0, (a, x) => a + x),\n    subtotal: sum_floats([it.qty * it.unit_price for it in order.items]),\n    discount_rate: volume_rate(&sibling.subtotal) + loyalty_rate(order.tier),\n    discount_amount: &sibling.subtotal * &sibling.discount_rate,\n    taxable: &sibling.subtotal - &sibling.discount_amount,\n    tax_amount: &sibling.taxable * tax_rate,\n    total: &sibling.taxable + &sibling.tax_amount,\n    @currency(\"USD\")\n    total_display: &sibling.total\n}\n";
 
-        pub const FEATURE_FLAG: &str = "/*\n  Runtime feature-flag evaluator.\n\n  Percentage rollouts need a host-registered `native_hash(s) -> Int`.\n  See examples/feature_flag.relon for the full annotated source.\n*/\n#schema User {\n    String id: *,\n    String region: (r) => r == \"us\" || r == \"eu\" || r == \"apac\",\n    String plan: (p) => p == \"free\" || p == \"pro\" || p == \"enterprise\"\n}\n\n#main(User user) -> Dict<String, Dict<String, Bool>>\n{\n    #private\n    hash_mod_100(s): native_hash(s) % 100,\n    #private\n    rules: {\n        legacy_checkout: (u) => false,\n        dark_mode: (u) => true,\n        gdpr_banner: (u) => u.region == \"eu\",\n        advanced_editor: (u) => u.plan == \"pro\" || u.plan == \"enterprise\",\n        new_search: (u) => hash_mod_100(u.id) < 25\n    },\n    flags: {\n        legacy_checkout: rules.legacy_checkout(user),\n        dark_mode: rules.dark_mode(user),\n        gdpr_banner: rules.gdpr_banner(user),\n        advanced_editor: rules.advanced_editor(user),\n        new_search: rules.new_search(user)\n    }\n}\n";
+        pub const FEATURE_FLAG: &str = "/*\n  Runtime feature-flag evaluator.\n\n  Percentage rollouts need a host-registered `native_hash(s) -> Int`.\n  See examples/feature_flag.relon for the full annotated source.\n*/\n#schema User {\n    String id: *,\n    String region: (r) => r == \"us\" || r == \"eu\" || r == \"apac\",\n    String plan: (p) => p == \"free\" || p == \"pro\" || p == \"enterprise\"\n}\n\n#main(User user) -> Dict<String, Dict<String, Bool>>\n{\n    #internal\n    hash_mod_100(s): native_hash(s) % 100,\n    #internal\n    rules: {\n        legacy_checkout: (u) => false,\n        dark_mode: (u) => true,\n        gdpr_banner: (u) => u.region == \"eu\",\n        advanced_editor: (u) => u.plan == \"pro\" || u.plan == \"enterprise\",\n        new_search: (u) => hash_mod_100(u.id) < 25\n    },\n    flags: {\n        legacy_checkout: rules.legacy_checkout(user),\n        dark_mode: rules.dark_mode(user),\n        gdpr_banner: rules.gdpr_banner(user),\n        advanced_editor: rules.advanced_editor(user),\n        new_search: rules.new_search(user)\n    }\n}\n";
 
-        pub const WORKFLOW: &str = "/*\n  Order workflow as a data-driven state machine.\n\n  Try via the CLI:\n    cargo run -q -p relon-cli -- run examples/workflow.relon \\\n        --args '{\"state\": \"placed\", \"event\": \"pay\"}'\n*/\n#schema Transition {\n    String from: (s) => s == \"placed\" || s == \"paid\" || s == \"shipped\",\n    String on: *,\n    String to: (s) => s == \"paid\" || s == \"shipped\" || s == \"delivered\" || s == \"cancelled\",\n    List<String> emit: *\n}\n\n#main(String state, String event)\n{\n    #private\n    transitions: [\n        #brand Transition {\n            from: \"placed\",\n            on: \"pay\",\n            to: \"paid\",\n            emit: [\n                \"charge_card\",\n                \"log_payment\"\n            ]\n        },\n        #brand Transition {\n            from: \"paid\",\n            on: \"ship\",\n            to: \"shipped\",\n            emit: [\n                \"notify_shipper\",\n                \"email_user\"\n            ]\n        },\n        #brand Transition {\n            from: \"shipped\",\n            on: \"deliver\",\n            to: \"delivered\",\n            emit: [\n                \"email_user\"\n            ]\n        },\n        #brand Transition {\n            from: \"placed\",\n            on: \"cancel\",\n            to: \"cancelled\",\n            emit: []\n        },\n        #brand Transition {\n            from: \"paid\",\n            on: \"cancel\",\n            to: \"cancelled\",\n            emit: [\n                \"refund_card\"\n            ]\n        }\n    ],\n    #private\n    match_one(t): t.from == state && t.on == event,\n    #private\n    matched: _list_filter(&sibling.transitions, &sibling.match_one),\n    next_state: len(matched) > 0 ? matched[0].to: state,\n    emit: len(matched) > 0 ? matched[0].emit: [\"unhandled_event\"]\n}\n";
+        pub const WORKFLOW: &str = "/*\n  Order workflow as a data-driven state machine.\n\n  Try via the CLI:\n    cargo run -q -p relon-cli -- run examples/workflow.relon \\\n        --args '{\"state\": \"placed\", \"event\": \"pay\"}'\n*/\n#schema Transition {\n    String from: (s) => s == \"placed\" || s == \"paid\" || s == \"shipped\",\n    String on: *,\n    String to: (s) => s == \"paid\" || s == \"shipped\" || s == \"delivered\" || s == \"cancelled\",\n    List<String> emit: *\n}\n\n#main(String state, String event)\n{\n    #internal\n    transitions: [\n        #brand Transition {\n            from: \"placed\",\n            on: \"pay\",\n            to: \"paid\",\n            emit: [\n                \"charge_card\",\n                \"log_payment\"\n            ]\n        },\n        #brand Transition {\n            from: \"paid\",\n            on: \"ship\",\n            to: \"shipped\",\n            emit: [\n                \"notify_shipper\",\n                \"email_user\"\n            ]\n        },\n        #brand Transition {\n            from: \"shipped\",\n            on: \"deliver\",\n            to: \"delivered\",\n            emit: [\n                \"email_user\"\n            ]\n        },\n        #brand Transition {\n            from: \"placed\",\n            on: \"cancel\",\n            to: \"cancelled\",\n            emit: []\n        },\n        #brand Transition {\n            from: \"paid\",\n            on: \"cancel\",\n            to: \"cancelled\",\n            emit: [\n                \"refund_card\"\n            ]\n        }\n    ],\n    #internal\n    match_one(t): t.from == state && t.on == event,\n    #internal\n    matched: _list_filter(&sibling.transitions, &sibling.match_one),\n    next_state: len(matched) > 0 ? matched[0].to: state,\n    emit: len(matched) > 0 ? matched[0].emit: [\"unhandled_event\"]\n}\n";
 
         pub const MODULES: &str = "// Three #import shapes — try Mod-clicking any imported name to\n// jump across files.\n#import lib from \"./lib.relon\"\n#import { format_price } from \"./lib.relon\"\n#import * from \"./lib.relon\"\n\n{\n    namespaced: lib.with_tax(100.0, 0.08),\n    destructured: format_price(199.99, \"USD\"),\n    spread: discount(50.0, 0.15)\n}\n";
 
@@ -1664,23 +1664,23 @@ mod tests {
 
     #[test]
     fn feature_flag_private_attached_to_key() {
-        // `#private` is a pair-level pragma — it MUST sit on the
+        // `#internal` is a pair-level pragma — it MUST sit on the
         // immediately-preceding line of its pair's key. A previous
         // paragraph-break pre-pass inserted a blank between
-        // `#private` and `rules:`, severing the ownership.
+        // `#internal` and `rules:`, severing the ownership.
         let formatted = format_source(presets::FEATURE_FLAG).unwrap();
         assert!(
-            formatted.contains("#private\n    rules:"),
-            "#private must sit directly above `rules:` with no blank line:\n{formatted}"
+            formatted.contains("#internal\n    rules:"),
+            "#internal must sit directly above `rules:` with no blank line:\n{formatted}"
         );
         assert!(
-            formatted.contains("#private\n    hash_mod_100("),
-            "#private must sit directly above `hash_mod_100(`:\n{formatted}"
+            formatted.contains("#internal\n    hash_mod_100("),
+            "#internal must sit directly above `hash_mod_100(`:\n{formatted}"
         );
-        // Defensive: no double-newline between `#private` and any pair key.
+        // Defensive: no double-newline between `#internal` and any pair key.
         assert!(
-            !formatted.contains("#private\n\n"),
-            "found a blank line directly after `#private`:\n{formatted}"
+            !formatted.contains("#internal\n\n"),
+            "found a blank line directly after `#internal`:\n{formatted}"
         );
     }
 
@@ -1694,15 +1694,15 @@ mod tests {
             "tax_rate:",
             "sum_floats(xs):",
         ] {
-            let expected = format!("#private\n    {pair}");
+            let expected = format!("#internal\n    {pair}");
             assert!(
                 formatted.contains(&expected),
-                "#private must sit directly above `{pair}`:\n{formatted}"
+                "#internal must sit directly above `{pair}`:\n{formatted}"
             );
         }
         assert!(
-            !formatted.contains("#private\n\n"),
-            "found a blank line directly after `#private`:\n{formatted}"
+            !formatted.contains("#internal\n\n"),
+            "found a blank line directly after `#internal`:\n{formatted}"
         );
     }
 
@@ -1854,16 +1854,16 @@ mod tests {
 
     #[test]
     fn reorder_carries_pair_directives_intact() {
-        // A method pair with a leading `#private` must move along
+        // A method pair with a leading `#internal` must move along
         // with its directive — never separated. Tests pair_span's
         // ownership boundary.
-        let source = "{\n    field1: 1,\n    #private\n    method1(x): x + 1,\n    field2: 2\n}\n";
+        let source = "{\n    field1: 1,\n    #internal\n    method1(x): x + 1,\n    field2: 2\n}\n";
         let formatted = format_source(source).unwrap();
-        // Method should now precede both fields, and #private should
+        // Method should now precede both fields, and #internal should
         // still sit directly above it.
         assert!(
-            formatted.contains("#private\n    method1(x): x + 1"),
-            "#private must stay glued to method1 after reorder:\n{formatted}"
+            formatted.contains("#internal\n    method1(x): x + 1"),
+            "#internal must stay glued to method1 after reorder:\n{formatted}"
         );
         let method_idx = formatted.find("method1").unwrap();
         let field1_idx = formatted.find("field1:").unwrap();
@@ -1907,26 +1907,26 @@ mod tests {
 
     #[test]
     fn paragraph_break_lands_above_directive_not_key() {
-        // The break must land BEFORE the leading `#private` of the
-        // first field pair, not BETWEEN `#private` and its key. This
+        // The break must land BEFORE the leading `#internal` of the
+        // first field pair, not BETWEEN `#internal` and its key. This
         // is the regression test for the orphan-directive bug.
-        let source = "{\n    method1(a): a + 1,\n    #private\n    field1: 1\n}\n";
+        let source = "{\n    method1(a): a + 1,\n    #internal\n    field1: 1\n}\n";
         let formatted = format_source(source).unwrap();
         assert!(
-            formatted.contains("a + 1,\n\n    #private\n    field1: 1"),
-            "blank line must land above #private, not below it:\n{formatted}"
+            formatted.contains("a + 1,\n\n    #internal\n    field1: 1"),
+            "blank line must land above #internal, not below it:\n{formatted}"
         );
         assert!(
-            !formatted.contains("#private\n\n"),
-            "no blank between #private and its key:\n{formatted}"
+            !formatted.contains("#internal\n\n"),
+            "no blank between #internal and its key:\n{formatted}"
         );
     }
 
     #[test]
     fn private_fields_grouped_between_methods_and_public_fields() {
-        // Three tiers: methods, #private fields, public fields.
+        // Three tiers: methods, #internal fields, public fields.
         // Reorder produces M, M, PrivF, PubF in that group order.
-        let source = "{\n    subtotal: 1,\n    multiply(a, b): a * b,\n    #private\n    tax_rate: 0.08,\n    total: 2\n}\n";
+        let source = "{\n    subtotal: 1,\n    multiply(a, b): a * b,\n    #internal\n    tax_rate: 0.08,\n    total: 2\n}\n";
         let formatted = format_source(source).unwrap();
         let multiply = formatted.find("multiply(a, b)").unwrap();
         let tax_rate = formatted.find("tax_rate:").unwrap();
@@ -1934,39 +1934,39 @@ mod tests {
         assert!(multiply < tax_rate, "methods come first: {formatted}");
         assert!(
             tax_rate < subtotal,
-            "#private fields come before public fields: {formatted}"
+            "#internal fields come before public fields: {formatted}"
         );
-        // #private must stay glued to its key.
+        // #internal must stay glued to its key.
         assert!(
-            formatted.contains("#private\n    tax_rate: 0.08"),
-            "#private must remain adjacent to tax_rate: {formatted}"
+            formatted.contains("#internal\n    tax_rate: 0.08"),
+            "#internal must remain adjacent to tax_rate: {formatted}"
         );
     }
 
     #[test]
     fn private_field_separated_from_next_group() {
         // Direct regression on the pricing case the user flagged:
-        // `#private tax_rate: 0.08` must have a blank line below it,
+        // `#internal tax_rate: 0.08` must have a blank line below it,
         // before `subtotal:` (the first public field).
-        let source = "{\n    method1(a): a + 1,\n    #private\n    tax_rate: 0.08,\n    subtotal: 1,\n    total: 2\n}\n";
+        let source = "{\n    method1(a): a + 1,\n    #internal\n    tax_rate: 0.08,\n    subtotal: 1,\n    total: 2\n}\n";
         let formatted = format_source(source).unwrap();
         assert!(
             formatted.contains("tax_rate: 0.08,\n\n    subtotal:"),
-            "expected blank line between #private tax_rate and subtotal:\n{formatted}"
+            "expected blank line between #internal tax_rate and subtotal:\n{formatted}"
         );
         // And the leading method→private transition still has a blank.
         assert!(
-            formatted.contains("a + 1,\n\n    #private\n    tax_rate:"),
-            "expected blank line between method group and #private group:\n{formatted}"
+            formatted.contains("a + 1,\n\n    #internal\n    tax_rate:"),
+            "expected blank line between method group and #internal group:\n{formatted}"
         );
     }
 
     #[test]
     fn private_methods_lead_public_methods() {
-        // Four-tier reorder: `#private` closures come BEFORE public
+        // Four-tier reorder: `#internal` closures come BEFORE public
         // closures, with a blank line between the two method groups.
         // Public methods then sit ahead of any field group.
-        let source = "{\n    public_method(x): x + 1,\n    #private\n    private_method(y): y * 2,\n    field1: 1\n}\n";
+        let source = "{\n    public_method(x): x + 1,\n    #internal\n    private_method(y): y * 2,\n    field1: 1\n}\n";
         let formatted = format_source(source).unwrap();
         let private_method = formatted.find("private_method").unwrap();
         let public_method = formatted.find("public_method").unwrap();
@@ -1988,7 +1988,7 @@ mod tests {
     #[test]
     fn all_four_tiers_separated_by_blank_lines() {
         // Exercises every tier transition.
-        let source = "{\n    pub_field: 1,\n    pub_method(a): a + 1,\n    #private\n    priv_field: 2,\n    #private\n    priv_method(b): b * 2\n}\n";
+        let source = "{\n    pub_field: 1,\n    pub_method(a): a + 1,\n    #internal\n    priv_field: 2,\n    #internal\n    priv_method(b): b * 2\n}\n";
         let formatted = format_source(source).unwrap();
         let priv_method = formatted.find("priv_method").unwrap();
         let pub_method = formatted.find("pub_method").unwrap();

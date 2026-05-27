@@ -6,7 +6,7 @@
 //!
 //! * **Directives** (`#name`) cover declaration / structure / metadata:
 //!   `#schema`, `#import`, `#default`, `#expect`, `#msg`, `#error`,
-//!   `#brand`, `#private`, `#main`. Host-registered only.
+//!   `#brand`, `#internal`, `#main`. Host-registered only.
 //! * **Decorators** (`@name(...)`) cover value transforms:
 //!   `@value` (the only built-in) plus user-defined `@f` whose name
 //!   resolves to a callable in scope.
@@ -14,7 +14,7 @@
 #![allow(dead_code)]
 
 pub use relon_parser::directive::{
-    BRAND, DEFAULT, ERROR, EXPECT, IMPORT, MAIN, MSG, PRIVATE, SCHEMA,
+    BRAND, DEFAULT, ERROR, EXPECT, IMPORT, INTERNAL, MAIN, MSG, SCHEMA,
 };
 
 // `@`-decorator names ----------------------------------------------------

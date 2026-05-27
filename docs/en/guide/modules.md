@@ -70,7 +70,7 @@ When you want only a few names, possibly renamed:
 
 If a spread import causes a name collision, the **import overwrites**.
 To protect a namespace, mark fields you don't want to be spread-
-imported with the `#private` directive: private fields aren't written
+imported with the `#internal` directive: private fields aren't written
 to the module's export map, so spread imports skip them naturally, and
 namespace-form access also can't reach them
 (`lib.private_field` → `VariableNotFound`).
@@ -82,15 +82,15 @@ namespace-form access also can't reach them
     shout(v): v + "!!!",
 
     // Private helper: not exported by any #import form
-    #private
+    #internal
     add(a, b): a + b
 }
 ```
 
 > Historical note: early versions used a `_` prefix as an implicit
 > convention and an `@private` decorator. Both are **fully retired**;
-> use the `#private` directive. See
-> [Syntax basics](./syntax#field-visibility-—-private).
+> use the `#internal` directive. See
+> [Syntax basics](./syntax#field-visibility-—-internal).
 
 ## Entry programs vs libraries
 

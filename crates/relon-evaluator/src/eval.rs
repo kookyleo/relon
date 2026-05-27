@@ -628,7 +628,7 @@ impl TreeWalkEvaluator {
                                 self.eval(value_node, &item_scope)?
                             };
 
-                            // `#private` keeps the binding in the owning
+                            // `#internal` keeps the binding in the owning
                             // dict's locals (so siblings can reference it)
                             // but excludes it from the produced `Value::Dict`
                             // — making it invisible to imports, projectors,
@@ -2720,12 +2720,12 @@ pub(crate) fn unwrap_optional_for_index(
     Ok(raw)
 }
 
-/// True when `node` carries the `#private` directive. See
-/// [`crate::decorator_names::PRIVATE`] for the field-level semantics.
+/// True when `node` carries the `#internal` directive. See
+/// [`crate::decorator_names::INTERNAL`] for the field-level semantics.
 pub(crate) fn is_private_field(node: &Node) -> bool {
     node.directives
         .iter()
-        .any(|dir| dir.name == crate::decorator_names::PRIVATE)
+        .any(|dir| dir.name == crate::decorator_names::INTERNAL)
 }
 
 // `impl Display for Value` moved to `relon_eval_api::value` so that it

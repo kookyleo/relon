@@ -572,9 +572,9 @@ fn w5_relon_src() -> &'static str {
     "#import list from \"std/list\"\n\
      #main(Int n) -> Dict\n\
      {\n\
-       #private\n\
+       #internal\n\
        d: { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10 },\n\
-       #private\n\
+       #internal\n\
        keys: [\"a\", \"b\", \"c\", \"d\", \"e\", \"f\", \"g\", \"h\", \"i\", \"j\"],\n\
        result: list.sum(range(n).map((i) => d[keys[i % 10]]))\n\
      }"

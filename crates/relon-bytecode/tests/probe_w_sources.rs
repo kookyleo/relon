@@ -39,29 +39,29 @@ fn probe_w5_w7_w8_w9_w10() {
     let w5 = "#import list from \"std/list\"\n\
               #main(Int n) -> Dict\n\
               {\n\
-                #private\n\
+                #internal\n\
                 d: { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10 },\n\
-                #private\n\
+                #internal\n\
                 keys: [\"a\", \"b\", \"c\", \"d\", \"e\", \"f\", \"g\", \"h\", \"i\", \"j\"],\n\
                 result: list.sum(range(n).map((i) => d[keys[i % 10]]))\n\
               }";
     let w7 = "#main(Int n) -> Dict\n\
               {\n\
-                #private\n\
+                #internal\n\
                 fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
                 result: fib(n)\n\
               }";
     let w8 = "#import list from \"std/list\"\n\
               #main(Int n) -> Dict\n\
               {\n\
-                #private\n\
+                #internal\n\
                 dispatch: (tag) => tag == 0 ? 1 : tag == 1 ? 2 : tag == 2 ? 3 : 4,\n\
                 result: list.sum(range(n).map((i) => dispatch(i % 4)))\n\
               }";
     let w9 = "#import list from \"std/list\"\n\
               #main(Int n) -> Dict\n\
               {\n\
-                #private\n\
+                #internal\n\
                 rows: range(n).map((i) => range(n).map((j) => i * n + j)),\n\
                 result: range(n).reduce(0, (acc, j) =>\n\
                   acc + range(n).reduce(0, (inner, i) => inner + rows[i][j]))\n\
@@ -69,7 +69,7 @@ fn probe_w5_w7_w8_w9_w10() {
     let w10 = "#import list from \"std/list\"\n\
                #main(Int n) -> Dict\n\
                {\n\
-                 #private\n\
+                 #internal\n\
                  allow: (i) =>\n\
                    (i % 3 == 0 || i % 3 == 1) &&\n\
                    (i % 4 == 0 || i % 4 == 1) &&\n\
@@ -111,7 +111,7 @@ fn probe_w5_w7_w8_w9_w10() {
 
     // ---- W9 nested reduce, inlined without dict body ----
     // Original W9 stores `rows: range(n).map((i) => range(n).map((j) => i*n+j))`
-    // as a #private binding, but we can compute the same sum without
+    // as a #internal binding, but we can compute the same sum without
     // materialising rows by inlining `rows[i][j]` as `i*n + j` directly.
     let w9_nested_inline = "#main(Int n) -> Int\n\
                             range(n).reduce(0, (acc, j) =>\n\
@@ -291,7 +291,7 @@ fn w4_production_source_runs_through_bytecode() {
 fn w7_production_source_runs_through_bytecode() {
     let src = "#main(Int n) -> Dict\n\
                {\n\
-                 #private\n\
+                 #internal\n\
                  fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
                  result: fib(n)\n\
                }";

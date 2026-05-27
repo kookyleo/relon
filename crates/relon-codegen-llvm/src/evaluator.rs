@@ -234,7 +234,7 @@ impl LlvmAotEvaluator {
     > {
         let ast = relon_parser::parse_document(src).map_err(|e| LlvmError::Parse(e.to_string()))?;
         // W7 closure-as-value (Phase F.W7): the production source
-        // `#main(Int n) -> Dict { #private fib: (k) => ..., result: fib(n) }`
+        // `#main(Int n) -> Dict { #internal fib: (k) => ..., result: fib(n) }`
         // trips the v1.5 / v1.6 strict-mode type-surface diagnostics
         // (`ClosureParamTypeMissing`, `ClosureReturnTypeUnknown`,
         // `ExpressionTypeUnknown`) even though IR lowering accepts the

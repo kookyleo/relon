@@ -250,12 +250,12 @@ pub enum Diagnostic {
     },
 
     #[error(
-        "method `{method}` on schema `{schema}` is `#private` and cannot be called from outside"
+        "method `{method}` on schema `{schema}` is `#internal` and cannot be called from outside"
     )]
     #[diagnostic(
         code(relon::analyze::private_method_violation),
         help(
-            "`#private` methods are only callable from the same `with {{ ... }}` block (sibling methods on the same schema). Drop the `#private` directive, or move the caller into the same block."
+            "`#internal` methods are only callable from the same `with {{ ... }}` block (sibling methods on the same schema). Drop the `#internal` directive, or move the caller into the same block."
         )
     )]
     PrivateMethodViolation {

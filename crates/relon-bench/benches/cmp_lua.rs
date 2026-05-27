@@ -1799,8 +1799,9 @@ const W2_N: i64 = 1_000;
 
 fn w2_relon_src() -> &'static str {
     // Inline form: sum (i+1)*(i+2) for i in 0..n via map+sum.
-    // Avoids local-let dict bindings (Relon's #private only works in the
-    // top-level main body, not inside arbitrary expressions).
+    // Kept dict-binding-free so the bench measures the map+sum chain
+    // rather than dict-scope locals — `#internal` would work here, but
+    // we want the implicit comprehension shape.
     "#import list from \"std/list\"\n\
      #main(Int n) -> Int\n\
      list.sum(range(n).map((i) => (i + 1) * (i + 2)))"
@@ -1934,21 +1935,21 @@ fn w4_long_lua_src() -> String {
 // Build a fixed 10-entry dict, sum values across a key list of length n.
 
 fn w5_relon_src() -> &'static str {
-    // Top-level dict body with #private bindings, returning .result.
-    // Dict body is the only place #private is legal.
+    // Top-level dict body with #internal bindings, returning .result.
+    // Dict body is the only place #internal is legal.
     "#import list from \"std/list\"\n\
      #main(Int n) -> Dict\n\
      {\n\
-       #private\n\
+       #internal\n\
        d: { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10 },\n\
-       #private\n\
+       #internal\n\
        keys: [\"a\", \"b\", \"c\", \"d\", \"e\", \"f\", \"g\", \"h\", \"i\", \"j\"],\n\
        result: list.sum(range(n).map((i) => d[keys[i % 10]]))\n\
      }"
 }
 
 /// Open follow-up #264-cont: bytecode-friendly W5 variant. The production
-/// source materialises a `#private` 10-entry dict + parallel key list
+/// source materialises a `#internal` 10-entry dict + parallel key list
 /// and looks up `d[keys[i % 10]]` per iteration. The dict literal,
 /// the list literal, the dict lookup, and the bare `Dict` return are
 /// each outside the bytecode IR-lowering envelope today. Because the
@@ -2037,7 +2038,7 @@ fn w7_relon_src() -> &'static str {
     // member-access on dict-body is the only public selector.
     "#main(Int n) -> Dict\n\
      {\n\
-       #private\n\
+       #internal\n\
        fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
        result: fib(n)\n\
      }"
@@ -2082,14 +2083,14 @@ fn w8_relon_src() -> &'static str {
     "#import list from \"std/list\"\n\
      #main(Int n) -> Dict\n\
      {\n\
-       #private\n\
+       #internal\n\
        dispatch: (tag) => tag == 0 ? 1 : tag == 1 ? 2 : tag == 2 ? 3 : 4,\n\
        result: list.sum(range(n).map((i) => dispatch(i % 4)))\n\
      }"
 }
 
 /// Open follow-up #264-cont: bytecode-friendly W8 variant. The original
-/// dict-bodied source binds `dispatch: (tag) => ...` as a `#private`
+/// dict-bodied source binds `dispatch: (tag) => ...` as a `#internal`
 /// first-class closure whose body is `tag == k ? v : ...` over k = 0..=3.
 /// On the call site's domain (`i % 4` is in 0..=3) the body collapses to
 /// `tag + 1`, so the inline form `(i % 4) + 1` produces the same per-
@@ -2151,7 +2152,7 @@ fn w9_relon_src() -> &'static str {
     "#import list from \"std/list\"\n\
      #main(Int n) -> Dict\n\
      {\n\
-       #private\n\
+       #internal\n\
        rows: range(n).map((i) => range(n).map((j) => i * n + j)),\n\
        result: range(n).reduce(0, (acc, j) =>\n\
          acc + range(n).reduce(0, (inner, i) => inner + rows[i][j]))\n\
@@ -2221,13 +2222,13 @@ fn w9_relon_n_arg() -> HashMap<String, Value> {
 
 fn w10_relon_src() -> &'static str {
     // 10-rule access control. Inline the role/region/hour predicates
-    // into a single boolean expression so we don't need nested
-    // dict-body scopes (Relon parser rejects #private outside the
-    // top-level main dict body).
+    // into a single boolean expression so we keep the bench inside a
+    // single dict-body scope — the alternative (a nested dict per rule)
+    // would change the shape under measurement.
     "#import list from \"std/list\"\n\
      #main(Int n) -> Dict\n\
      {\n\
-       #private\n\
+       #internal\n\
        allow: (i) =>\n\
          (i % 3 == 0 || i % 3 == 1) &&\n\
          (i % 4 == 0 || i % 4 == 1) &&\n\
@@ -2237,7 +2238,7 @@ fn w10_relon_src() -> &'static str {
 }
 
 /// Open follow-up #264-cont: bytecode-friendly W10 variant. The original
-/// dict-bodied source binds `allow: (i) => ...` as a `#private`
+/// dict-bodied source binds `allow: (i) => ...` as a `#internal`
 /// first-class closure and then references it as `range(n).map(allow)`;
 /// neither the bare `Dict` return type nor first-class closure values
 /// reach the bytecode IR-lowering envelope today (closures are only
@@ -3928,7 +3929,7 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // row name suffixed `_fixture` AND `_kernel` semantics flagged
         // because the trace body is an analytic kernel — it preserves
         // the nested-loop complexity (`i*n + j` accumulator) but skips
-        // the matrix construction (`#private rows` + `rows[i][j]`)
+        // the matrix construction (`#internal rows` + `rows[i][j]`)
         // that the production source builds via closure-bodied
         // `range(n).map(...).reduce(...)`. The measurement bounds
         // nested-loop arithmetic throughput; do NOT compare against
@@ -3963,7 +3964,7 @@ fn bench_cmp_lua(c: &mut Criterion) {
             });
         });
         // Open follow-up #264-cont: bytecode row uses the inline-rewritten
-        // W9 variant (no #private rows list, `rows[i][j]` collapsed to
+        // W9 variant (no #internal rows list, `rows[i][j]` collapsed to
         // `i * n + j`). The arithmetic matches the original analytic
         // expectation; the dict-bodied production source still bounces
         // at the analyzer's bare-`Dict`-return ban (see

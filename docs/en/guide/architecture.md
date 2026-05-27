@@ -99,12 +99,12 @@ Diagnostics have two levels: `Severity::Error` blocks evaluation;
   `Projector` uses it to decide externally tagged output.
 - **JSON output closed-loop**: the default `JsonProjector` silently
   drops runtime-only Values (closures, schemas, EnumSchemas, types,
-  wildcards) inside a Dict; `#private` fields go one step further —
+  wildcards) inside a Dict; `#internal` fields go one step further —
   they never enter `Value::Dict::map`, so the projector can't see
   them. But in a **List** or at the document **root**, encountering
   a closure raises `UnsupportedClosure` instead of being silent: a
   list is a "data sequence", and silently dropping an element would
-  make indices and length lie. `#private` / closure filtering /
+  make indices and length lie. `#internal` / closure filtering /
   `UnsupportedClosure` are three layered defenses: the first two
   hide "things that shouldn't appear" position-by-position; the
   last fires explicitly when silent hiding would change the

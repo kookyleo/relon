@@ -9,7 +9,7 @@
 //!   reach them. They have no `pre_eval` / `wrap` impact on ordinary
 //!   values.
 //!
-//! Other directives (`#schema`, `#import`, `#brand`, `#private`,
+//! Other directives (`#schema`, `#import`, `#brand`, `#internal`,
 //! `#main`) are handled directly by the evaluator
 //! (`apply_directive_pre` / `apply_directive_post`) and the analyzer's
 //! collection passes; they don't appear in this registry.

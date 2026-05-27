@@ -5879,7 +5879,7 @@ mod range_pipeline_tests {
 // =====================================================================
 // Phase F.2 — first-class closure value boundary.
 //
-// The W7 cmp_lua workload (`#main(Int n) -> Dict { #private fib: (k) =>
+// The W7 cmp_lua workload (`#main(Int n) -> Dict { #internal fib: (k) =>
 // ..., result: fib(n) }`) currently fails `lower_workspace_single` at
 // the return-type build step because `-> Dict` has no canonical
 // representation. The downstream `Expr::Closure` at a non-higher-order
@@ -5929,7 +5929,7 @@ mod w7_closure_boundary_tests {
     fn w7_production_source_lowers_via_anon_dict_return_plan() {
         let src = "#main(Int n) -> Dict\n\
                    {\n\
-                     #private\n\
+                     #internal\n\
                      fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
                      result: fib(n)\n\
                    }";
