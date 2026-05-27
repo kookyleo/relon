@@ -1959,6 +1959,7 @@ dependencies = [
  "relon-trace-emitter",
  "relon-trace-jit",
  "relon-trace-recorder",
+ "relon-wasm-evaluator",
  "serde",
  "serde_json",
  "tempfile",

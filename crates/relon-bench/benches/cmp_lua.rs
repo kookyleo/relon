@@ -193,6 +193,75 @@ fn build_jit(src: &str, label: &str) -> relon::JitEvaluator {
         .unwrap_or_else(|e| panic!("[cmp_lua {label}] JitEvaluator setup failed: {e}"))
 }
 
+/// Phase Z.2 (2026-05-28): try to build a `WasmEvaluator` over `src`
+/// and verify the classifier landed it on the Z.1 wasm-compiled tier
+/// (rather than the tree-walker scope-cut fallback). Returns:
+///
+/// - `Some(ev)` when the source classifies into one of the three Z.1
+///   wasm programs (W1 / W6 / W12) **and** a one-shot consistency
+///   `run_main(args)` succeeds and returns the expected analytic
+///   answer. The caller still owns the evaluator and drives the timed
+///   loop through `WasmEvaluator::run_main`.
+/// - `None` when the source is outside the Z.1 lowering envelope
+///   (classifier returned `ScopeCut`) — the bench row is skipped so
+///   the panel never carries a `relon_wasm_wasmtime` row whose
+///   timing would silently be the tree-walker fallback (the W2 /
+///   W3 / ... paper-win anti-pattern called out in design §7).
+///
+/// Construction errors that are NOT scope-cut (parse, wasmtime engine
+/// init, lowering bug) panic — those would be regressions in the
+/// codegen-wasm / wasm-evaluator pipeline that we want to surface at
+/// bench setup, not silently downgrade to an n/a row.
+fn try_build_wasm_compiled(
+    src: &str,
+    label: &str,
+    expected: i64,
+    args: HashMap<String, Value>,
+) -> Option<relon_wasm_evaluator::WasmEvaluator> {
+    use relon_wasm_evaluator::{Tier, WasmEvalError, WasmEvaluator};
+    let ev = match WasmEvaluator::new(src) {
+        Ok(ev) => ev,
+        Err(WasmEvalError::Classify(_)) => {
+            // Scope-cut at classify time should not happen if
+            // `WasmEvaluator::new` follows its documented contract
+            // (scope-cut returns `Ok` with `wasm: None` so
+            // `active_tier()` reports `TreeWalker`). Keep the arm
+            // for forward compatibility but log + skip.
+            eprintln!("[cmp_lua {label}] relon_wasm_wasmtime row n/a (classify scope-cut)");
+            return None;
+        }
+        Err(other) => {
+            panic!("[cmp_lua {label}] WasmEvaluator::new failed (not scope-cut): {other}")
+        }
+    };
+    // The classifier may have routed this source to the tree-walker
+    // fallback (Z.1 only lowers W1 / W6 / W12). Skipping here keeps
+    // the panel free of rows that would silently be tree-walker
+    // measurements wearing a `wasmtime` label.
+    let v = match ev.run_main(args) {
+        Ok(v) => v,
+        Err(e) => panic!("[cmp_lua {label}] relon_wasm_wasmtime consistency run_main failed: {e}"),
+    };
+    let got = relon_int_result(label, v);
+    assert_eq!(
+        got, expected,
+        "[cmp_lua {label}] relon_wasm_wasmtime consistency: got {got}, expected {expected}"
+    );
+    // Tier check AFTER the run — the documented W12 path starts at
+    // `Cold` and transitions to `Compiled` only after the first
+    // successful `run_main`.
+    let tier = ev.active_tier();
+    if tier != Tier::Compiled {
+        eprintln!(
+            "[cmp_lua {label}] relon_wasm_wasmtime row n/a (active_tier = {tier:?} \
+             after consistency run; expected Compiled — source is on tree-walker \
+             fallback per Z.1 scope-cut policy, see classifier.rs)"
+        );
+        return None;
+    }
+    Some(ev)
+}
+
 /// Phase J.2 (post-fix audit, 2026-05-27): the panel's dedicated
 /// `relon_trace_jit` row only opts in for workloads whose production
 /// source actually auto-escalates to the Trace tier under the user-
@@ -1904,6 +1973,31 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 });
             });
         }
+
+        // Phase Z.2 (2026-05-28): relon_wasm_wasmtime row. Drives the
+        // canonical `w1_relon_src()` through `WasmEvaluator::run_main`,
+        // which lowers via `relon-codegen-wasm` (Z.1 W1 program shape)
+        // and dispatches the `__main` export through wasmtime. The
+        // helper enforces the active_tier == Compiled gate so a future
+        // regression in the classifier (e.g. routing W1 to tree-walker
+        // fallback) skips the row entirely rather than silently
+        // booking tree-walker numbers under the `wasmtime` label —
+        // that would be the W2-style paper-win anti-pattern called
+        // out in design §7.
+        if let Some(wasm) =
+            try_build_wasm_compiled(w1_relon_src(), "W1", w1_expected(), args_w_n(W1_N))
+        {
+            use relon_eval_api::Evaluator as _;
+            group.bench_function(BenchmarkId::new("W1_int_sum", "relon_wasm_wasmtime"), |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(W1_N);
+                    timed_with_warmup(iters, || {
+                        let v = wasm.run_main(args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            });
+        }
     }
 
     // ----- W2 -----
@@ -3260,6 +3354,46 @@ fn bench_cmp_lua(c: &mut Criterion) {
                     })
                 });
             });
+        }
+
+        // Phase Z.2 (2026-05-28): relon_wasm_wasmtime row. Same
+        // schema as the W1 wasm row above; this loop covers
+        // W6_dict_num_key + W12_p99_tail. The
+        // `try_build_wasm_compiled` helper enforces
+        // `active_tier() == Compiled`, so canonical-panel workloads
+        // outside Z.1's lowering surface (W5 / W7 / W8 / W9 / W10)
+        // are dropped here instead of being measured through the
+        // tree-walker fallback — that would be the paper-win
+        // anti-pattern called out in design §7. The expected /
+        // args triple flows from the canonical_panel entry above so
+        // the cross-check stays byte-identical with the source the
+        // row labels.
+        {
+            // The expected analytic value is derived from one drive of
+            // the tree-walker path so we don't bake duplicate `expected`
+            // constants into the bench (W6/W12's relon_int_result is
+            // already validated by the per-workload top-of-file
+            // consistency block).
+            let (walker_for_expected, scope_for_expected) = build_tree_walker(src);
+            let expected_v = walker_for_expected
+                .run_main(&scope_for_expected, args_factory())
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "[cmp_lua {label}] wasm row expected-value tree-walker drive failed: {e}"
+                    )
+                });
+            let expected = relon_int_result(label, expected_v);
+            if let Some(wasm) = try_build_wasm_compiled(src, label, expected, args_factory()) {
+                use relon_eval_api::Evaluator as _;
+                group.bench_function(BenchmarkId::new(*label, "relon_wasm_wasmtime"), |b| {
+                    b.iter_custom(|iters| {
+                        timed_with_warmup(iters, || {
+                            let v = wasm.run_main(args_factory()).unwrap();
+                            black_box(v);
+                        })
+                    });
+                });
+            }
         }
     }
 

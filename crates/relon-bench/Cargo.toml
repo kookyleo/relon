@@ -60,6 +60,14 @@ relon-codegen-native = { workspace = true }
 # can match on the concrete `LlvmError` shape and downgrade gracefully
 # to an n/a row when the Phase B envelope rejects the source.
 relon-codegen-llvm = { workspace = true, optional = true }
+# Phase Z.2 (2026-05-28): wasmtime-backed evaluator for the cmp_lua
+# `relon_wasm_wasmtime` panel row. Z.1 lowering surface covers W1/W6/W12
+# only; rows are gated on `WasmEvaluator::new(src).is_ok()` plus
+# `active_tier() == Tier::Compiled` after a consistency run so workloads
+# the classifier hands back as `ScopeCut` (W2/W3/W4/W5/W7/W8/W9/W10)
+# never reach the panel as paper-wins routed through the tree-walker
+# fallback.
+relon-wasm-evaluator = { workspace = true }
 relon-ir = { workspace = true }
 relon-eval-api = { workspace = true }
 # v6-γ M5 trace-JIT hot-loop bench: depends on the trace-abi
