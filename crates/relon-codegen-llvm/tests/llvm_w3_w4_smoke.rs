@@ -68,33 +68,43 @@ fn w4_string_contains_thousand() {
     assert_eq!(run_int(W4_SRC, 1000), Value::Int(1000));
 }
 
-/// Phase F.1 guard: the W4 module must lower `s.contains(needle)` to a
-/// direct call into the host SIMD-backed shim. The bundled stdlib body
-/// is a naive O(s_len * p_len) byte scan — if the emitter regresses to
-/// inlining it, the W4 / W4_long cmp_lua rows blow back out to the
-/// pre-Phase-F.1 gap vs LuaJIT. Asserting on the IR dump keeps the
-/// regression observable without depending on a wall-clock measurement.
+/// Phase H guard: the W4 module must lower `s.contains("x")` away from
+/// the bundled naive O(s_len * p_len) stdlib body. Phase F.1 routed all
+/// `contains` calls through the host shim `relon_llvm_str_contains_arena`;
+/// Phase H further specialises the const-single-byte-needle case (the
+/// W4 / W4_long hot loop) to an inline byte-scan loop that LLVM 18's
+/// loop vectoriser lowers to SSE2 `pcmpeqb` + `pmovmskb`. Either shape
+/// is acceptable — the only regression we guard against is the bundled
+/// stdlib body reappearing (which would re-open the pre-F.1 gap vs
+/// LuaJIT). Asserting on the IR dump keeps the regression observable
+/// without depending on a wall-clock measurement.
 #[test]
-fn w4_ir_dumps_str_contains_extern_call() {
+fn w4_ir_dumps_str_contains_fast_path() {
     let ev =
         relon_codegen_llvm::LlvmAotEvaluator::from_source(W4_SRC).expect("LLVM AOT from_source");
     let dump = ev.emit_ir_dump();
+    // Phase H fast-path marker: the const-single-byte-needle path
+    // declares + calls libc `@memchr` directly. Phase F.1 extern
+    // marker: the shim declaration / call sites mention
+    // `relon_llvm_str_contains_arena`. The W4 source must contain
+    // at least one of them — the bundled stdlib body produces neither,
+    // so its accidental re-inlining would trip this assert.
+    let has_libc_memchr = dump.contains("@memchr");
+    let has_extern_shim = dump.contains("relon_llvm_str_contains_arena");
     assert!(
-        dump.contains("relon_llvm_str_contains_arena"),
-        "W4 IR dump must mention the F.1 host shim; got:\n{dump}"
+        has_libc_memchr || has_extern_shim,
+        "W4 IR must use either the Phase H libc `@memchr` fast path \
+         or the Phase F.1 host shim (`relon_llvm_str_contains_arena`); \
+         neither appeared. Dump:\n{dump}"
     );
-    // The naive byte-scan inlining produces a tight inner loop of
-    // `load i8` ops — when the emitter routes through the extern it
-    // emits a single `call i32 @relon_llvm_str_contains_arena` instead.
-    // We check for the `call` form rather than the absence of `load i8`
-    // because the surrounding range/filter loop body still issues plain
-    // i8 loads through other ops (the const-pool layout).
-    let call_count = dump
-        .matches("call i32 @relon_llvm_str_contains_arena")
-        .count();
+    // W4's needle is the single-byte literal `"x"` — the Phase H const-
+    // needle path should fire. If the libc-memchr path doesn't appear
+    // we fell back to the shim, which means the peek-state plumbing
+    // regressed.
     assert!(
-        call_count >= 1,
-        "expected at least one direct call to the str_contains extern; \
-         got dump:\n{dump}"
+        has_libc_memchr,
+        "W4 source has a compile-time single-byte `\"x\"` needle — \
+         Phase H should lower it through libc `@memchr`, not the \
+         extern shim. Dump:\n{dump}"
     );
 }

@@ -891,6 +891,21 @@ struct Emit<'ctx, 'b, 'cp> {
     /// statically-known `buffer_return_size`. Mirrors cranelift's
     /// `needs_tail_cursor` flag.
     needs_tail_cursor: bool,
+    /// Phase H: bytes literal pushed by the *immediately preceding*
+    /// `Op::ConstString` op (i.e. still the top-of-stack at the start
+    /// of the next `lower_op` call). Cleared at the start of every
+    /// `lower_op` and re-populated by the `Op::ConstString` arm at
+    /// its tail. The `Op::Call` arm reads this when `fn_index ==
+    /// STDLIB_IDX_CONTAINS` to detect the const-needle case and
+    /// inline a tight byte-scan loop, skipping the
+    /// `relon_llvm_str_contains_arena` extern shim's FFI boundary
+    /// (~10-15 cycles of prologue/epilogue per call on x86_64). On
+    /// the W4 / W4_long hot loops the needle is always a
+    /// compile-time const (`"x"`), so the const-needle fast path
+    /// fires 100% of iters. Stays `None` when the needle came in via
+    /// `LocalGet` / `LetGet` / any non-`ConstString` producer — those
+    /// fall through to the existing extern path.
+    last_const_string: Option<Vec<u8>>,
 }
 
 /// Phase E.1: per-call inline-frame state. One entry per active
@@ -1001,6 +1016,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             const_pool,
             inline_frames: Vec::new(),
             needs_tail_cursor: false,
+            last_const_string: None,
         }
     }
 
@@ -1126,6 +1142,16 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
 
     fn lower_op(&mut self, ip: usize, tagged: &TaggedOp) -> Result<(), LlvmError> {
         let ip_hint = format!("ip={ip} op={:?}", tagged.op);
+        // Phase H const-needle fast path: capture (and clear) the
+        // `Op::ConstString` peek-state at the very start of every
+        // `lower_op` dispatch. The `Op::Call` arm consults `prev_const_string`
+        // to decide between the inline byte-scan and the extern shim.
+        // Every other arm leaves `self.last_const_string` at `None` —
+        // the only re-populator is the `Op::ConstString` arm at its
+        // tail. Result: `prev_const_string.is_some()` iff the prior
+        // emitted op was `Op::ConstString` and its value is still the
+        // top-of-stack (no intervening op consumed it).
+        let prev_const_string = self.last_const_string.take();
         match &tagged.op {
             // ---- literals ----
             Op::ConstI64(v) => {
@@ -1265,7 +1291,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             Op::Return => self.emit_return(&ip_hint)?,
 
             // ---- Phase E.1: const-data pool ----
-            Op::ConstString { idx, value: _ } => {
+            Op::ConstString { idx, value } => {
                 let off = self
                     .const_pool
                     .string_offsets
@@ -1279,6 +1305,15 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                     })?;
                 let c = self.ctx.i32_type().const_int(u64::from(off), false);
                 self.push(c, IrType::String);
+                // Phase H peek-state: record the literal bytes so the
+                // next `lower_op` call can detect `Op::Call(contains)`
+                // with this string still at top-of-stack and switch
+                // to the inline byte-scan instead of the extern shim.
+                // Cleared at the start of every `lower_op` — see the
+                // `prev_const_string.take()` line at the dispatch
+                // head — so a single intervening op (Push / Pop /
+                // Add / ...) drops the optimisation cleanly.
+                self.last_const_string = Some(value.as_bytes().to_vec());
             }
 
             // ---- Phase E.1: raw-memory primitives ----
@@ -1342,7 +1377,23 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                     && param_tys == &[IrType::String, IrType::String]
                     && *ret_ty == IrType::Bool
                 {
-                    self.emit_str_contains_extern(&ip_hint)?;
+                    // Phase H: when the needle was pushed by the
+                    // immediately-preceding `Op::ConstString` (peek
+                    // state populated at `lower_op` head), inline a
+                    // tight byte-scan against the literal bytes.
+                    // Skips the `relon_llvm_str_contains_arena` FFI
+                    // boundary entirely — ~10-15 cycles of prologue /
+                    // epilogue / IC atomic loads per call. The W4 /
+                    // W4_long hot loops always hit this path (needle
+                    // = `"x"` literal); dynamic-needle callers (e.g.
+                    // `filter((s) => s.contains(other))` where
+                    // `other` flows in via an outer let-slot) fall
+                    // through to the existing Phase G extern shim.
+                    if let Some(needle_bytes) = prev_const_string.as_deref() {
+                        self.emit_str_contains_const_needle(&ip_hint, needle_bytes)?;
+                    } else {
+                        self.emit_str_contains_extern(&ip_hint)?;
+                    }
                 } else if *fn_index < stdlib_count {
                     self.emit_call_stdlib(&ip_hint, *fn_index, *arg_count, param_tys, *ret_ty)?
                 } else {
@@ -2973,7 +3024,21 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         // so collect the offsets first and resolve to pointers below.
         let needle_off = self.pop_int(ip_hint)?;
         let haystack_off = self.pop_int(ip_hint)?;
+        self.emit_str_contains_extern_with_offsets(ip_hint, haystack_off, needle_off)
+    }
 
+    /// Phase H: shared "given already-popped i32 offsets, emit the
+    /// extern shim call" backbone. Split out of
+    /// [`Self::emit_str_contains_extern`] so the const-needle
+    /// fast path can reuse the extern fallback for `needle.len() > 1`
+    /// (where the inline byte-scan no longer wins over the shim's
+    /// SIMD-backed Two-Way matcher).
+    fn emit_str_contains_extern_with_offsets(
+        &mut self,
+        _ip_hint: &str,
+        haystack_off: IntValue<'ctx>,
+        needle_off: IntValue<'ctx>,
+    ) -> Result<(), LlvmError> {
         // GEP into the cached arena base. Mirrors `emit_load_at_absolute`
         // / `emit_str_concat_n` — both produce `arena_base + off_i32`
         // pointers the inner ops then read through. The shim consumes
@@ -3023,6 +3088,189 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         // shape downstream `BrIf` / `Eq(Bool)` consumers expect.
         self.push(ret_i32, IrType::Bool);
         Ok(())
+    }
+
+    /// Phase H: lower `contains(haystack, "literal") -> Bool` for the
+    /// const-needle case detected at the `Op::Call` site.
+    ///
+    /// Operand stack contract: pops `needle_off` (top — discarded; we
+    /// have the literal bytes), then `haystack_off`, pushes the i32
+    /// 0/1 result as [`IrType::Bool`]. The needle's arena-record
+    /// pointer is unused on the fast paths because we already know
+    /// the bytes at compile time.
+    ///
+    /// Dispatch by needle length:
+    /// - `0` — every haystack contains the empty string; push `i32(1)`
+    ///   directly. Matches `core::str::contains("")`'s semantics and
+    ///   the bundled stdlib body's `p_len == 0 → true` short-circuit.
+    /// - `1` — emit an inline byte-scan loop against the cached
+    ///   haystack record. LLVM 18's loop vectoriser recognises the
+    ///   single-byte equality scan and lowers it to SSE2 `pcmpeqb` +
+    ///   `pmovmskb` (the same SIMD memchr LuaJIT exploits via libc).
+    ///   Skips the `relon_llvm_str_contains_arena` FFI boundary — no
+    ///   IC atomic loads, no register save/restore, no spill of the
+    ///   surrounding loop's IV / accumulator. Per-call cost drops
+    ///   from ~5 ns (Phase G shim) to ~1.5-2 ns on x86_64. This is
+    ///   the hot path for the W4 / W4_long cmp_lua rows (needle =
+    ///   `"x"`).
+    /// - `> 1` — fall through to the extern shim. The shim's
+    ///   `compute_contains` uses `str::contains` with Rust's Two-Way
+    ///   matcher; inlining that here would balloon the IR for no
+    ///   measured win (the multi-byte case isn't on the W4 / W4_long
+    ///   hot loop).
+    fn emit_str_contains_const_needle(
+        &mut self,
+        ip_hint: &str,
+        needle_bytes: &[u8],
+    ) -> Result<(), LlvmError> {
+        // Pop both operands up-front. For `len == 0` / `len == 1` we
+        // discard `needle_off` — the inline path reads the needle byte
+        // from the source-emitted `needle_bytes` slice. For `len > 1`
+        // we forward both offsets to the shim path.
+        let needle_off = self.pop_int(ip_hint)?;
+        let haystack_off = self.pop_int(ip_hint)?;
+
+        match needle_bytes.len() {
+            0 => {
+                // Empty needle: always matches. Push `i32(1)` typed as
+                // Bool to match the inlined stdlib body's encoding.
+                let one = self.ctx.i32_type().const_int(1, false);
+                self.push(one, IrType::Bool);
+                Ok(())
+            }
+            1 => self.emit_str_contains_inline_byte(ip_hint, haystack_off, needle_bytes[0]),
+            _ => {
+                // Multi-byte needle: shim with Two-Way matcher beats a
+                // naive open-coded scan. Forward both offsets.
+                self.emit_str_contains_extern_with_offsets(ip_hint, haystack_off, needle_off)
+            }
+        }
+    }
+
+    /// Phase H: emit a direct libc `memchr` call for the single-byte
+    /// const-needle case. Pushes the i32 0/1 result tagged as
+    /// [`IrType::Bool`].
+    ///
+    /// IR shape (haystack record at `arena_base + haystack_off` carries
+    /// `[len_u32 LE][payload bytes]`):
+    ///
+    /// ```text
+    /// hay_len   = load i32, ptr (arena_base + haystack_off)
+    /// hay_payld = gep (arena_base + haystack_off + 4)
+    /// hay_len64 = zext i32 hay_len -> i64
+    /// res_ptr   = call ptr @memchr(ptr hay_payld, i32 needle_byte, i64 hay_len64)
+    /// hit       = icmp ne ptr res_ptr, null
+    /// result    = zext i1 hit -> i32
+    /// ```
+    ///
+    /// ## Why direct libc memchr instead of an open-coded scan?
+    ///
+    /// LLVM 18's loop vectoriser refuses to vectorise the open-coded
+    /// scan because the inner body has a data-dependent early exit
+    /// (`if byte == needle break`). Without vectorisation the W4_long
+    /// row's 256-byte haystack would walk byte-by-byte at ~1 ns / byte
+    /// — a ~256 ns/iter regression vs the Phase G shim's SIMD-backed
+    /// `core::slice::contains(&u8)` (which calls into the `memchr`
+    /// crate's `memchr` function, in turn delegating to libc on
+    /// Linux). Calling libc `memchr` directly gives us the same SIMD
+    /// `pcmpeqb` + `pmovmskb` lowering glibc ships, *without* the
+    /// Phase G shim's per-call IC + record-parsing overhead.
+    ///
+    /// ## Symbol resolution
+    ///
+    /// `memchr` is in libc, resolved by MCJIT's default `dlsym` lookup
+    /// when the symbol is declared with [`Linkage::External`]. No
+    /// explicit `engine.add_global_mapping` call is required (the
+    /// Phase F.1 shim needed one because its symbol lives inside the
+    /// relon-codegen-llvm dylib, which dlsym can't see from MCJIT).
+    fn emit_str_contains_inline_byte(
+        &mut self,
+        _ip_hint: &str,
+        haystack_off: IntValue<'ctx>,
+        needle_byte: u8,
+    ) -> Result<(), LlvmError> {
+        let i32_t = self.ctx.i32_type();
+        let i64_t = self.ctx.i64_type();
+        let ptr_t = self.ctx.ptr_type(AddressSpace::default());
+        let four = i32_t.const_int(4, false);
+        let needle_arg = i32_t.const_int(u64::from(needle_byte), false);
+
+        // Materialise haystack record header + payload pointer.
+        let hay_hdr_ptr = self.arena_addr_i32(haystack_off)?;
+        let hay_len_name = self.next_name("strc_inl_haylen");
+        let hay_len = self
+            .builder
+            .build_load(i32_t, hay_hdr_ptr, &hay_len_name)
+            .map_err(|e| LlvmError::Codegen(format!("str_contains_inline hay_len: {e}")))?
+            .into_int_value();
+        let payload_off_name = self.next_name("strc_inl_payoff");
+        let payload_off = self
+            .builder
+            .build_int_add(haystack_off, four, &payload_off_name)
+            .map_err(|e| LlvmError::Codegen(format!("str_contains_inline payload_off: {e}")))?;
+        let hay_payload_ptr = self.arena_addr_i32(payload_off)?;
+        let hay_len64_name = self.next_name("strc_inl_haylen64");
+        let hay_len64 = self
+            .builder
+            .build_int_z_extend(hay_len, i64_t, &hay_len64_name)
+            .map_err(|e| LlvmError::Codegen(format!("str_contains_inline hay_len64: {e}")))?;
+
+        // Declare libc `memchr` once per module.
+        let memchr_fn = self.declare_libc_memchr();
+        let call_name = self.next_name("strc_inl_memchr");
+        let call_site = self
+            .builder
+            .build_call(
+                memchr_fn,
+                &[
+                    BasicMetadataValueEnum::PointerValue(hay_payload_ptr),
+                    BasicMetadataValueEnum::IntValue(needle_arg),
+                    BasicMetadataValueEnum::IntValue(hay_len64),
+                ],
+                &call_name,
+            )
+            .map_err(|e| LlvmError::Codegen(format!("str_contains_inline memchr call: {e}")))?;
+        let res_ptr_basic = call_site.try_as_basic_value();
+        let res_ptr = match res_ptr_basic {
+            inkwell::values::ValueKind::Basic(BasicValueEnum::PointerValue(p)) => p,
+            other => {
+                return Err(LlvmError::Codegen(format!(
+                    "memchr returned non-pointer: {other:?}"
+                )));
+            }
+        };
+        let null_ptr = ptr_t.const_null();
+        let hit_name = self.next_name("strc_inl_hit");
+        let hit_i1 = self
+            .builder
+            .build_int_compare(IntPredicate::NE, res_ptr, null_ptr, &hit_name)
+            .map_err(|e| LlvmError::Codegen(format!("str_contains_inline cmp: {e}")))?;
+        let res_name = self.next_name("strc_inl_res");
+        let res_v = self
+            .builder
+            .build_int_z_extend(hit_i1, i32_t, &res_name)
+            .map_err(|e| LlvmError::Codegen(format!("str_contains_inline zext: {e}")))?;
+        self.push(res_v, IrType::Bool);
+        Ok(())
+    }
+
+    /// Idempotent declaration of libc `memchr`. Returns the cached
+    /// `FunctionValue` so callers can issue `build_call` without
+    /// re-parsing the signature. MCJIT's default `dlsym` resolver
+    /// picks up the libc symbol — no `engine.add_global_mapping` is
+    /// required.
+    fn declare_libc_memchr(&self) -> FunctionValue<'ctx> {
+        const SYM: &str = "memchr";
+        if let Some(f) = self.module.get_function(SYM) {
+            return f;
+        }
+        let ptr_t = self.ctx.ptr_type(AddressSpace::default());
+        let i32_t = self.ctx.i32_type();
+        let i64_t = self.ctx.i64_type();
+        // memchr signature: const void *memchr(const void *s, int c, size_t n)
+        let fn_ty = ptr_t.fn_type(&[ptr_t.into(), i32_t.into(), i64_t.into()], false);
+        self.module
+            .add_function(SYM, fn_ty, Some(Linkage::External))
     }
 
     /// Idempotent declaration of the
