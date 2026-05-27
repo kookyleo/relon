@@ -120,6 +120,28 @@ pub fn classify_main(source: &str) -> Result<WasmProgram, ClassifyError> {
     if normalised.contains("d[keys[i % 10]]") {
         return Err(ClassifyError::ScopeCut("W5-dict-access"));
     }
+    // W7 inline-Int variant — matches `w7_relon_src_bytecode()` from
+    // cmp_lua: the production source binds `fib: (k) => ...` as a
+    // `#internal` first-class recursive closure inside a Dict-body
+    // (bare-`Dict` return + first-class closure are both Z.4 follow-ups
+    // — scope-cut below). The `where`-clause sibling moves the same
+    // doubly-recursive `fib` body into a top-level let-binding so the
+    // return type lands on `Int`, keeping the source inside the Z.3
+    // wasm-lowering envelope. Detected by the `#main(Int n) -> Int`
+    // declaration paired with the `fib(n) where { fib: (k) =>` shape
+    // (matching the `where`-form sibling byte-for-byte modulo
+    // whitespace).
+    //
+    // No closed-form Binet's formula / iterative `(a, b) ← (b, a + b)`
+    // substitution: both are the W7-specific honesty traps called out
+    // in `emit_w7_fib_recursion_inline`'s doc. The lowering preserves
+    // the doubly-recursive O(phi^n) work the source declares.
+    if normalised.contains("#main(Int n) -> Int")
+        && normalised.contains("fib(n) where")
+        && normalised.contains("fib(k - 1) + fib(k - 2)")
+    {
+        return Ok(WasmProgram::W7FibRecursionInline);
+    }
     if normalised.contains("fib(k - 1) + fib(k - 2)") {
         return Err(ClassifyError::ScopeCut("W7-fib-recursion"));
     }

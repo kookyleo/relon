@@ -288,6 +288,7 @@ fn program_returns_scalar_int(program: WasmProgram) -> bool {
         | WasmProgram::W4StringContains { .. }
         | WasmProgram::W5DictAccessInline
         | WasmProgram::W6ListSumPlusOne
+        | WasmProgram::W7FibRecursionInline
         | WasmProgram::W8PolymorphicDispatchInline
         | WasmProgram::W9NestedMatrixInline
         | WasmProgram::W10ConfigEvalInline
@@ -347,6 +348,7 @@ impl Evaluator for WasmEvaluator {
             | WasmProgram::W4StringContains { .. }
             | WasmProgram::W5DictAccessInline
             | WasmProgram::W6ListSumPlusOne
+            | WasmProgram::W7FibRecursionInline
             | WasmProgram::W8PolymorphicDispatchInline
             | WasmProgram::W9NestedMatrixInline
             | WasmProgram::W10ConfigEvalInline => extract_named_int(&args, "n")?,

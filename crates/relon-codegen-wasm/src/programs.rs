@@ -168,9 +168,64 @@ pub enum WasmProgram {
     /// accumulator. This is the closed-form `n*(n+1)/2` shape.
     W6ListSumPlusOne,
 
-    /// W7 fib recursion — scope-cut Z.1 (hybrid tail-call emit + funcref
-    /// table is a Z.3 task per design §10.2).
+    /// W7 fib recursion — scope-cut Z.1 placeholder for the
+    /// production-source path (`#main(Int n) -> Dict { #internal fib:
+    /// ..., result: fib(n) }`). The bare-`Dict` return + first-class
+    /// closure binding (`#internal fib: (k) => ...`) need the IR
+    /// walker; Z.4 follow-up.
     W7FibRecursion,
+
+    /// W7 fib recursion inline (`#main(Int n) -> Int`, matches
+    /// `w7_relon_src_bytecode()` from `cmp_lua`). The production W7
+    /// source binds `fib: (k) => ...` as a `#internal` first-class
+    /// recursive closure in a Dict-body and returns
+    /// `Dict { fib, result }` — both shapes scope-cut at Z.1.
+    ///
+    /// The `_bytecode`-style sibling uses the `where`-clause
+    /// equivalent (`fib(n) where { fib: (k) => ... }`) so the return
+    /// type lands on `Int`, while preserving the doubly-recursive
+    /// O(phi^n) work the production source declares. No iterative
+    /// pair-shift rewrite (`(a, b) := (b, a+b)`) and no closed-form
+    /// Binet's formula are emitted — both are the canonical W7
+    /// algorithm-substitution traps called out in design §7 (the
+    /// iterative form is the user-flagged red line from the W7
+    /// trace_jit-fixture history; the Binet closed-form would book
+    /// O(phi^n) recursive work as O(1) arithmetic).
+    ///
+    /// Z.3c-g hand-emits two local wasm functions in the same module:
+    ///
+    /// - `$fib(k: i64) -> i64` — the recursive helper. Body is
+    ///   `if k < 2 { k } else { $fib(k - 1) + $fib(k - 2) }`, with
+    ///   the two recursive calls dispatched as direct `Call(fib_idx)`
+    ///   (not `call_indirect` / funcref-table) because the callee is
+    ///   known at emit time. `call_indirect` would have introduced
+    ///   per-call dispatch overhead that doesn't match what the
+    ///   production source's direct named-closure call resolves to.
+    /// - `$__main(n: i64) -> i64` — entry export, body is just
+    ///   `local.get $n; call $fib`.
+    ///
+    /// Honesty (design §7):
+    ///   - Same algorithm? — yes, doubly-recursive `fib(k - 1) +
+    ///     fib(k - 2)` with the `k < 2` base case, mirroring the
+    ///     production source byte-for-byte. Per call: one i64
+    ///     compare, one recursive call to `fib(k - 1)`, one to
+    ///     `fib(k - 2)`, one `i64.add`. fib(22) materialises ~57k
+    ///     calls, fib(28) ~317k — same shape Lua + LuaJIT measure.
+    ///   - Same code path? — `WasmEvaluator::run_main` lowers via
+    ///     this module and dispatches through wasmtime. The recursive
+    ///     calls stay inside the wasm module (no host boundary
+    ///     crossing per recursive step).
+    ///   - Same I/O shape? — `#main(Int n) -> Int`, returns
+    ///     `Value::Int(fib(n))`. Cross-checked against the tree-
+    ///     walker for the same `n` in `tests/w7_smoke.rs`.
+    ///
+    /// Wasm stack: each recursive call adds one wasm-side frame. The
+    /// host's default wasmtime stack limit (~1 MiB) easily covers
+    /// fib(28) (~28 levels deep). The doubly-recursive shape is **not**
+    /// tail-call-eligible (the trailing `+` happens *after* both
+    /// recursive returns), so the `wasm_tail_call` engine flag the
+    /// host sets in `lib.rs` is a no-op for W7.
+    W7FibRecursionInline,
 
     /// W8 polymorphic dispatch — scope-cut Z.1.
     W8PolymorphicDispatch,
@@ -334,6 +389,7 @@ pub(crate) fn lower_program(program: &WasmProgram) -> Result<Vec<u8>, LowerError
         WasmProgram::W5DictAccessInline => Ok(emit_w5_dict_access_inline()),
         WasmProgram::W6ListSumPlusOne => Ok(emit_w6_list_sum_plus_one()),
         WasmProgram::W7FibRecursion => Err(LowerError::ScopeCut("W7-fib-recursion")),
+        WasmProgram::W7FibRecursionInline => Ok(emit_w7_fib_recursion_inline()),
         WasmProgram::W8PolymorphicDispatch => Err(LowerError::ScopeCut("W8-polymorphic-dispatch")),
         WasmProgram::W8PolymorphicDispatchInline => Ok(emit_w8_polymorphic_dispatch_inline()),
         WasmProgram::W9NestedMatrix => Err(LowerError::ScopeCut("W9-nested-matrix")),
@@ -410,7 +466,58 @@ fn finalize_module(
     main_body: Function,
     data_segments: &[(u32, Vec<u8>)],
 ) -> Vec<u8> {
+    // Default single-fn layout: just `__main`, signature type 0.
+    finalize_module_multi(
+        prelude,
+        &[(LocalFn {
+            type_idx: 0,
+            body: main_body,
+        })],
+        0, // export __main at local-fn index 0
+        data_segments,
+    )
+}
+
+/// One local function entry — the type-index resolves against
+/// `prelude.types`, and the body owns its own locals + instruction
+/// stream. The order in which entries are passed to
+/// [`finalize_module_multi`] determines their function-index space
+/// (`HOST_IMPORTS.len() + position`).
+struct LocalFn {
+    /// Index into the type section. Most Z.1/Z.3 entries reuse
+    /// `prelude.main_type_idx` (`(i64) -> i64`); W7's helper `$fib`
+    /// also uses that signature, so this stays 0 for both fns.
+    type_idx: u32,
+    /// Encoded body (`Function` already carries the locals + ops +
+    /// trailing `End`).
+    body: Function,
+}
+
+/// Compose a complete module with one or more local functions.
+///
+/// `local_fns` is the ordered list of local functions; their wasm
+/// fn-index = `HOST_IMPORTS.len() + position`. `main_local_idx` is the
+/// position (into `local_fns`) of the function exported as `__main`.
+/// Other local functions stay un-exported but callable internally via
+/// `Call(import_count + their_position)`.
+///
+/// `data_segments` is an optional list of `(offset, bytes)` active
+/// data segments to install into linear memory at instantiate time.
+fn finalize_module_multi(
+    prelude: ModulePrelude,
+    local_fns: &[LocalFn],
+    main_local_idx: u32,
+    data_segments: &[(u32, Vec<u8>)],
+) -> Vec<u8> {
     let _ = prelude.host_type_indices; // surfaces unused-binding lint silencing post-prelude
+    assert!(
+        !local_fns.is_empty(),
+        "module must have at least one local fn"
+    );
+    assert!(
+        (main_local_idx as usize) < local_fns.len(),
+        "main_local_idx out of range"
+    );
 
     let mut module = Module::new();
 
@@ -419,9 +526,12 @@ fn finalize_module(
     // Section 2 — imports
     module.section(&prelude.imports);
 
-    // Section 3 — functions (one local fn at index = host_count)
+    // Section 3 — functions (one entry per local fn, in declaration order;
+    // each declares its type index).
     let mut funcs = FunctionSection::new();
-    funcs.function(prelude.main_type_idx);
+    for f in local_fns {
+        funcs.function(f.type_idx);
+    }
     module.section(&funcs);
 
     // Section 5 — memories (one linear memory, exported as `memory`)
@@ -435,18 +545,21 @@ fn finalize_module(
     });
     module.section(&mems);
 
-    // Section 7 — exports (memory + __main)
+    // Section 7 — exports (memory + __main). Imports occupy
+    // fn-indices `[0, HOST_IMPORTS.len())`; local fns start at
+    // `HOST_IMPORTS.len()`.
     let mut exports = ExportSection::new();
     exports.export("memory", ExportKind::Memory, 0);
-    // local fn index = HOST_IMPORTS.len() (imports come first in the fn
-    // index space, then local functions in order of declaration).
-    let main_fn_idx = HOST_IMPORTS.len() as u32;
+    let main_fn_idx = HOST_IMPORTS.len() as u32 + main_local_idx;
     exports.export("__main", ExportKind::Func, main_fn_idx);
     module.section(&exports);
 
-    // Section 10 — code (the one local function's body)
+    // Section 10 — code (one entry per local function, in declaration
+    // order matching the function section).
     let mut code = CodeSection::new();
-    code.function(&main_body);
+    for f in local_fns {
+        code.function(&f.body);
+    }
     module.section(&code);
 
     // Section 11 — data (active segments, written into linear memory
@@ -1307,6 +1420,133 @@ fn emit_w12_increment_int() -> Vec<u8> {
     func.instruction(&Instruction::I64Add);
     func.instruction(&Instruction::End);
     finalize_module(prelude, func, &[])
+}
+
+/// W7 fib recursion inline lowering.
+/// `#main(Int n) -> Int  fib(n) where { fib: (k) =>
+///   k < 2 ? k : fib(k - 1) + fib(k - 2) }`.
+///
+/// Z.3c-g hand-emits two local functions in the same module:
+///
+/// - `$fib(k: i64) -> i64` — the recursive helper, body is
+///   `if k < 2 { k } else { fib(k - 1) + fib(k - 2) }`. Both
+///   recursive arms dispatch via direct `Call(fib_fn_idx)` (the
+///   callee is known at emit time, so `call_indirect` would only
+///   add dispatch overhead with no observable-shape gain).
+/// - `$__main(n: i64) -> i64` — the exported entry, body is
+///   `local.get $n; call $fib`. The host's typed-func cache
+///   resolves `__main` exactly like the other Z.3 entries.
+///
+/// Both fns share the `(i64) -> i64` signature, so we reuse
+/// `prelude.main_type_idx` for both.
+///
+/// Function-index layout:
+///   imports occupy `[0, HOST_IMPORTS.len())`.
+///   local fn 0 (= `HOST_IMPORTS.len() + 0`) = `$fib`
+///   local fn 1 (= `HOST_IMPORTS.len() + 1`) = `$__main`
+///   `__main` is exported at `main_local_idx = 1`.
+///
+/// Honesty (design §7):
+///   - Same algorithm? — doubly-recursive `fib(k-1) + fib(k-2)` with
+///     `k < 2 ? k : ...` base case. Per call: one i64 compare, one
+///     conditional branch, two recursive calls + one `i64.add` on
+///     the non-base arm. fib(22) ~57k calls, fib(28) ~317k. **No
+///     iterative `(a, b) <- (b, a+b)` rewrite** (the canonical W7
+///     algorithm-substitution trap — user explicitly red-flagged
+///     this in the trace_jit fixture history). **No closed-form
+///     Binet's formula** (`fib(n) = (phi^n - psi^n) / sqrt(5)`)
+///     for the same reason — substituting either would book the
+///     polynomial work as O(1) arithmetic.
+///   - Same code path? — both fns live inside the wasm module, so
+///     the recursive call stays a pure wasm `call` instruction
+///     (no host boundary per recursive step). The host's
+///     `WasmEvaluator::run_main` invokes `__main` via the cached
+///     `TypedFunc<i64, i64>` handle.
+///   - Same I/O shape? — `#main(Int n) -> Int`, returns
+///     `Value::Int(fib(n))`. Cross-checked against the tree-walker
+///     reference for the same `n` in `tests/w7_smoke.rs`.
+///
+/// Stack budget: each recursive call adds one wasm-side frame.
+/// wasmtime's default 1 MiB stack covers ~10k frames (frames are
+/// small with two i64 locals); fib(28) needs only ~28 frames deep
+/// (the recursion depth is `n`, not the call count). The doubly-
+/// recursive shape is **not** tail-call-eligible — the trailing
+/// `+` runs after both recursive returns — so the engine's
+/// `wasm_tail_call(true)` flag (set in `lib.rs`) is a no-op for
+/// W7 by design.
+fn emit_w7_fib_recursion_inline() -> Vec<u8> {
+    let prelude = build_prelude();
+
+    // Local fn 0 = $fib (recursive). Function-index in the wasm
+    // namespace = HOST_IMPORTS.len() + 0.
+    let fib_fn_idx = HOST_IMPORTS.len() as u32;
+
+    // === $fib body ===
+    //
+    // Param 0 = k (i64). No extra locals needed.
+    //   if k < 2 { return k }
+    //   return fib(k - 1) + fib(k - 2)
+    let mut fib_body = Function::new(std::iter::empty::<(u32, ValType)>());
+
+    // if k < 2:
+    fib_body.instruction(&Instruction::LocalGet(0));
+    fib_body.instruction(&Instruction::I64Const(2));
+    fib_body.instruction(&Instruction::I64LtS);
+    // `if (result i64) ... else ... end` — both arms push an i64
+    // (the recursive sum or the base-case `k`) and the value is the
+    // function's return.
+    fib_body.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+        ValType::I64,
+    )));
+
+    // then arm: push k
+    fib_body.instruction(&Instruction::LocalGet(0));
+
+    fib_body.instruction(&Instruction::Else);
+
+    // else arm: fib(k - 1) + fib(k - 2)
+    //   fib(k - 1)
+    fib_body.instruction(&Instruction::LocalGet(0));
+    fib_body.instruction(&Instruction::I64Const(1));
+    fib_body.instruction(&Instruction::I64Sub);
+    fib_body.instruction(&Instruction::Call(fib_fn_idx));
+    //   fib(k - 2)
+    fib_body.instruction(&Instruction::LocalGet(0));
+    fib_body.instruction(&Instruction::I64Const(2));
+    fib_body.instruction(&Instruction::I64Sub);
+    fib_body.instruction(&Instruction::Call(fib_fn_idx));
+    //   add
+    fib_body.instruction(&Instruction::I64Add);
+
+    fib_body.instruction(&Instruction::End); // end if (yields i64)
+    fib_body.instruction(&Instruction::End); // end function
+
+    // === $__main body ===
+    //
+    // Param 0 = n (i64). Body is `return fib(n)`.
+    let mut main_body = Function::new(std::iter::empty::<(u32, ValType)>());
+    main_body.instruction(&Instruction::LocalGet(0));
+    main_body.instruction(&Instruction::Call(fib_fn_idx));
+    main_body.instruction(&Instruction::End); // end function
+
+    // Local fn ordering: $fib at position 0, $__main at position 1.
+    // `__main` is exported at main_local_idx = 1.
+    let main_type_idx = prelude.main_type_idx;
+    finalize_module_multi(
+        prelude,
+        &[
+            LocalFn {
+                type_idx: main_type_idx,
+                body: fib_body,
+            },
+            LocalFn {
+                type_idx: main_type_idx,
+                body: main_body,
+            },
+        ],
+        1, // export the second local fn ($__main) as `__main`
+        &[],
+    )
 }
 
 /// W4 lowering. `#main(Int n) -> Int  range(n).map((i) => "<H>").filter((s) => s.contains("x")).len()`.

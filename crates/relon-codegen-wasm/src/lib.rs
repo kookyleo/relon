@@ -190,6 +190,14 @@ mod tests {
     }
 
     #[test]
+    fn lower_w7_inline_round_trips() {
+        let bytes = lower(&WasmProgram::W7FibRecursionInline).expect("emit W7 inline");
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .expect("wasmparser validates W7 inline (two local fns: $fib + $__main)");
+    }
+
+    #[test]
     fn w4_const_segment_end_covers_both_records() {
         // Short haystack: header(4) + payload(3) = 7. Needle pads
         // to align-4 = offset 16 + 8 = 24, then header(4) + payload(1)
