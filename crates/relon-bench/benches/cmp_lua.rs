@@ -2450,6 +2450,65 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 },
             );
         }
+
+        // Phase Z.3c-c (2026-05-28): relon_wasm_wasmtime row for W4.
+        // Drives the production source through `WasmEvaluator::run_main`,
+        // which lowers via `relon-codegen-wasm` into a pure-WASM
+        // accumulator loop that calls `__relon_str_contains` per iter
+        // on a const haystack / needle record installed as a wasm
+        // `data` segment. The host shim reads the `[u32 len][payload]`
+        // record out of linear memory and runs `memchr` (1-byte
+        // needle "x"). No closed-form `count = n` substitution; every
+        // iter actually crosses the wasmtime boundary.
+        if let Some(wasm) = try_build_wasm_compiled(
+            w4_relon_src(),
+            "W4",
+            w4_expected(),
+            args_w_n(TREE_WALK_N as i64),
+        ) {
+            use relon_eval_api::Evaluator as _;
+            group.bench_function(
+                BenchmarkId::new("W4_string_contains", "relon_wasm_wasmtime"),
+                |b| {
+                    b.iter_custom(|iters| {
+                        let n_in = black_box(TREE_WALK_N as i64);
+                        timed_with_warmup(iters, || {
+                            let v = wasm.run_main(args_w_n(black_box(n_in))).unwrap();
+                            black_box(v);
+                        })
+                    });
+                },
+            );
+
+            // Fast row — bypasses the HashMap<String, Value> pack + the
+            // `Value::Int(out)` wrap on the return. Cross-checked
+            // against the buffer path before timing.
+            if wasm.has_fast_path() {
+                let fast_out = wasm
+                    .run_main_legacy_i64_fast(&[TREE_WALK_N as i64])
+                    .expect("W4 wasm fast path consistency");
+                let slow_out = match wasm.run_main(args_w_n(TREE_WALK_N as i64)).unwrap() {
+                    Value::Int(n) => n,
+                    other => panic!("W4 wasm fast cross-check: slow returned {other:?}"),
+                };
+                assert_eq!(
+                    fast_out, slow_out,
+                    "W4 fast/buffer disagree: fast={fast_out} buffer={slow_out}"
+                );
+                group.bench_function(
+                    BenchmarkId::new("W4_string_contains", "relon_wasm_wasmtime_fast"),
+                    |b| {
+                        b.iter_custom(|iters| {
+                            let n_in = black_box(TREE_WALK_N as i64);
+                            timed_with_warmup(iters, || {
+                                let v = wasm.run_main_legacy_i64_fast(&[black_box(n_in)]).unwrap();
+                                black_box(v);
+                            })
+                        });
+                    },
+                );
+            }
+        }
     }
 
     // ----- W4_long_haystack -----
@@ -2596,6 +2655,71 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
+
+        // Phase Z.3c-c (2026-05-28): relon_wasm_wasmtime row for
+        // W4_long. Same lowering as W4 except the haystack data
+        // segment carries the 256-byte literal; the host shim's
+        // `memchr` per-iter walks 256 bytes before reporting hit
+        // (terminal 'x'). The Relon source is the byte-identical
+        // long-haystack literal — the classifier disambiguates W4
+        // vs W4_long by the `aaaaax")` suffix that only appears in
+        // the long variant.
+        static W4_LONG_RELON_SRC: &str = concat!(
+            "#import list from \"std/list\"\n",
+            "#main(Int n) -> Int\n",
+            "range(n)\n",
+            "  .map((i) => \"",
+            "loremipsumdolorsitametconsecteturadipiscingelitseddoeiusmodtemporincididuntutlaboreetdoloremagnaaliquautenimadminimveniamquisnostrudezercitationullamcolaborisnisiutaliquipezeacommodoconsequatduisauteiruredolorinreprehenderitinvoluptatevelitessecillumaaaaax",
+            "\")\n",
+            "  .filter((s) => s.contains(\"x\"))\n",
+            "  .len()",
+        );
+        if let Some(wasm) = try_build_wasm_compiled(
+            W4_LONG_RELON_SRC,
+            "W4_long_haystack",
+            TREE_WALK_N as i64, // every haystack ends with 'x' => count == n
+            args_w_n(TREE_WALK_N as i64),
+        ) {
+            use relon_eval_api::Evaluator as _;
+            group.bench_function(
+                BenchmarkId::new("W4_long_haystack", "relon_wasm_wasmtime"),
+                |b| {
+                    b.iter_custom(|iters| {
+                        let n_in = black_box(TREE_WALK_N as i64);
+                        timed_with_warmup(iters, || {
+                            let v = wasm.run_main(args_w_n(black_box(n_in))).unwrap();
+                            black_box(v);
+                        })
+                    });
+                },
+            );
+
+            if wasm.has_fast_path() {
+                let fast_out = wasm
+                    .run_main_legacy_i64_fast(&[TREE_WALK_N as i64])
+                    .expect("W4_long wasm fast path consistency");
+                let slow_out = match wasm.run_main(args_w_n(TREE_WALK_N as i64)).unwrap() {
+                    Value::Int(n) => n,
+                    other => panic!("W4_long wasm fast cross-check: slow returned {other:?}"),
+                };
+                assert_eq!(
+                    fast_out, slow_out,
+                    "W4_long fast/buffer disagree: fast={fast_out} buffer={slow_out}"
+                );
+                group.bench_function(
+                    BenchmarkId::new("W4_long_haystack", "relon_wasm_wasmtime_fast"),
+                    |b| {
+                        b.iter_custom(|iters| {
+                            let n_in = black_box(TREE_WALK_N as i64);
+                            timed_with_warmup(iters, || {
+                                let v = wasm.run_main_legacy_i64_fast(&[black_box(n_in)]).unwrap();
+                                black_box(v);
+                            })
+                        });
+                    },
+                );
+            }
+        }
     }
 
     // ----- W5 -----
