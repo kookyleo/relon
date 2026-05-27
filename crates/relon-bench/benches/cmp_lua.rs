@@ -4506,11 +4506,23 @@ fn bench_cmp_lua(c: &mut Criterion) {
 
     let relon_bin = std::env::var("RELON_CLI_BIN").unwrap_or_else(|_| {
         // Try a few likely locations; falls back to PATH lookup.
-        // v6-fix-D2-J: prefer the `release-cli` profile binary (fat-LTO
-        // + `panic = "abort"`) when present so the W11 cold-start row
-        // measures the leanest available binary; fall back to the
-        // regular release / debug builds otherwise.
+        //
+        // Order matters — the W11 row measures cold-start wall clock,
+        // so we want the leanest available binary:
+        //
+        // 1. Phase G.W11 Phase 3: `release-cli` + musl `static-pie`
+        //    target. Statically links libc / libm / libgcc_s so the
+        //    dynamic loader does not pay any dyld resolution / lazy
+        //    binding cost on a fresh process — this shaves ~700 µs
+        //    on bench hosts (s90: 1.8 ms → 1.1 ms, beats LuaJIT 1.3
+        //    ms). Build with:
+        //        cargo build --profile release-cli \
+        //            --target x86_64-unknown-linux-musl -p relon-cli
+        // 2. Phase G.W11 Phase 1/2: glibc `release-cli` (fat-LTO +
+        //    `panic = "abort"`, lsp / remote-http feature-gated).
+        // 3. Regular `release` / `debug` fallbacks for local hacks.
         let candidates = [
+            "target/x86_64-unknown-linux-musl/release-cli/relon-cli",
             "target/release-cli/relon-cli",
             "target/release/relon-cli",
             "target/debug/relon-cli",
