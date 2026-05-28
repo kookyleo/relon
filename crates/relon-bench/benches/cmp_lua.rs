@@ -2139,6 +2139,108 @@ fn w17_expected() -> i64 {
 }
 
 // =====================================================================
+// =====  W18 — prime count (trial-division)  ==========================
+// =====================================================================
+//
+// Tier 2 industry-standard workload (panel expansion 2026-05-28).
+// **Algorithm note** (HONESTY disclosure, NOT a paper-win): the task
+// brief names "Eratosthenes sieve". Relon's functional core has no
+// in-place mutable boolean array, so the canonical sieve (mark `i*p`
+// composite for each prime `p`) cannot be lifted byte-identically.
+// The row uses **trial-division primality test** instead — for each
+// candidate `k ∈ [2, n)`, recurse over divisors `d ∈ [2, sqrt(k)]`
+// and return `false` if any divides. Same prime-counting output
+// (`pi(n) = 1229` for n=10000), but the algorithm is O(n*sqrt(n))
+// rather than the sieve's O(n*log(log(n))). The Lua row runs the
+// SAME trial-division algorithm so the per-target cost is apples-
+// to-apples; an in-place mutable-array sieve in Lua would be a
+// paper-win (faster Lua loop wears the row name "prime sieve"
+// while Relon pays the trial-division cost).
+//
+// **HONESTY checklist** (per `HONESTY_POLICY.md`):
+// * Source path: `w18_relon_src()` is the production source. The
+//   row is honestly labelled `W18_prime_count_trial_div` (not
+//   `W18_prime_sieve`) so downstream tooling reflects the actual
+//   algorithm. The Lua equivalent runs the SAME nested-recursion
+//   shape.
+// * Algorithm complexity preserved: O(n*sqrt(n)) — for n=10000,
+//   that's ~1M primality probes worst-case (most candidates fail
+//   early). NO closed-form fold — `pi(n)` is not a polynomial in
+//   `n` (it's transcendental, lower-bounded by `n / ln(n)`); even
+//   an aggressive optimiser cannot reduce the count to a literal.
+// * Time-math sanity: trial-division on `[2, 10000)` does ~30k
+//   divisor probes total (sum_{k<n} sqrt(k) ≈ (2/3) * n * sqrt(n)
+//   for n=10000 ≈ 666k probes; most are early-exit). Tree-walker
+//   ~ 1-3 ms/run; LuaJIT ~ 100 µs/run.
+// * I/O shape: `#main(Int n) -> Int`. Lua matches.
+// * Backend coverage: tree_walk + luajit only. Bytecode rejects
+//   (`where`-clause helper + recursion); LLVM AOT rejects
+//   (recursion path); wasm classifier scope-cuts. rust_native row
+//   IS valid (the algorithm shape doesn't closed-form fold).
+
+/// W18 scale — `pi(10000) = 1229` primes. Tree-walker ~1-3 ms/run;
+/// criterion 100 samples → ~100-300 ms per row.
+const W18_N: i64 = 10_000;
+
+fn w18_relon_src() -> &'static str {
+    // Trial-division primality count. `range(2, n)` is the candidate
+    // stream; `is_prime(k)` recurses on the divisor `d`, early-
+    // exiting at `d * d > k` (the sqrt(k) upper bound) and on the
+    // first divisor that divides `k`. Same nested-recursion shape
+    // the Lua row runs.
+    //
+    // `range(start, end)` is supported (the stdlib `range` Native
+    // accepts 1 or 2 args; 2-arg form yields `[start, end)`).
+    "#unstrict\n\
+     #main(Int n) -> Int\n\
+     _len(_list_filter(range(2, n), (k) => is_prime(k, 2)))\n\
+     where {\n\
+       is_prime(k, d): d * d > k ? true : (k % d == 0 ? false : is_prime(k, d + 1))\n\
+     }"
+}
+
+fn w18_lua_src() -> String {
+    format!(
+        r#"return function()
+            local n = {n}
+            local function is_prime(k, d)
+                if d * d > k then return true end
+                if k % d == 0 then return false end
+                return is_prime(k, d + 1)
+            end
+            local count = 0
+            for k = 2, n - 1 do
+                if is_prime(k, 2) then count = count + 1 end
+            end
+            return count
+        end"#,
+        n = W18_N
+    )
+}
+
+fn w18_expected() -> i64 {
+    fn is_prime(k: i64) -> bool {
+        let mut d: i64 = 2;
+        while d.saturating_mul(d) <= k {
+            if k % d == 0 {
+                return false;
+            }
+            d += 1;
+        }
+        true
+    }
+    let mut count: i64 = 0;
+    let mut k: i64 = 2;
+    while k < W18_N {
+        if is_prime(k) {
+            count += 1;
+        }
+        k += 1;
+    }
+    count
+}
+
+// =====================================================================
 // =====  consistency assertions  ======================================
 // =====================================================================
 
@@ -2537,6 +2639,31 @@ fn rust_native_w17(n: i64) -> i64 {
     acc
 }
 
+/// W18 trial-division primality count baseline. Same nested-
+/// recursion shape the Relon `is_prime(k, d)` closure runs.
+#[inline(never)]
+fn rust_native_w18(n: i64) -> i64 {
+    fn is_prime(k: i64, d: i64) -> bool {
+        if d.wrapping_mul(d) > k {
+            return true;
+        }
+        if k % d == 0 {
+            return false;
+        }
+        is_prime(k, d + 1)
+    }
+    let n = black_box(n);
+    let mut count: i64 = 0;
+    let mut k: i64 = 2;
+    while k < n {
+        if is_prime(k, 2) {
+            count = count.wrapping_add(1);
+        }
+        k += 1;
+    }
+    count
+}
+
 // =====================================================================
 // =====  Phase C: LLVM AOT row glue  ==================================
 // =====================================================================
@@ -2677,6 +2804,13 @@ fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
         // F.W7 lifted the Dict-bodied recursion only); returning
         // `None` keeps the row honest until the envelope widens.
         "W17_binary_search" => None,
+        // Panel expansion 2026-05-28 (Tier 2 industry-standard W18):
+        // production source uses `where`-clause recursive `is_prime`
+        // helper + `_list_filter` closure. Same envelope rejection
+        // as W7 / W17; returning `None` keeps the row honest until
+        // the envelope widens. An inlined iterative variant would
+        // be the algorithm-substitution paper-win pattern.
+        "W18_prime_count_trial_div" => None,
         _ => None,
     }
 }
@@ -2752,6 +2886,11 @@ fn rust_native_dispatch(label: &str, n: i64) -> i64 {
         // `n` (the targets follow `(i * 31) % n`, breaking any
         // closed-form fold), so `rust_native` is a legitimate floor.
         "W17_binary_search" => rust_native_w17(n),
+        // Panel expansion 2026-05-28 (Tier 2 industry-standard W18):
+        // `pi(n)` is transcendental (lower-bounded by `n / ln(n)`,
+        // not a polynomial in `n`), so no closed-form fold collapses
+        // the count. `rust_native` is a legitimate baseline floor.
+        "W18_prime_count_trial_div" => rust_native_w18(n),
         other => panic!("rust_native_dispatch: unknown workload `{other}`"),
     }
 }
@@ -4433,6 +4572,48 @@ fn bench_cmp_lua(c: &mut Criterion) {
         });
     }
 
+    // ----- W18 prime count (trial-division) -----
+    //
+    // Panel-expansion 2026-05-28 (Tier 2 industry-standard). See the
+    // top-of-file W18 doc-comment for the HONESTY disclosure
+    // (algorithm is trial-division, NOT in-place Eratosthenes sieve;
+    // Relon's functional core has no mutable boolean array, the Lua
+    // row runs the SAME trial-division to keep the comparison
+    // honest). Backend coverage: tree_walk + luajit only.
+    {
+        let (walker, scope) = build_tree_walker(w18_relon_src());
+        let lua_fn_w18 = lua_fn(&lua, &w18_lua_src());
+
+        let relon_v = relon_int_result("W18", walker.run_main(&scope, args_w_n(W18_N)).unwrap());
+        let lua_v: i64 = lua_fn_w18.call(()).unwrap();
+        assert_relon_lua_consistent("W18", relon_v, lua_v, w18_expected());
+
+        group.throughput(Throughput::Elements(W18_N as u64));
+        group.bench_function(
+            BenchmarkId::new("W18_prime_count_trial_div", "relon_tree_walk"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(W18_N);
+                    timed_with_warmup(iters, || {
+                        let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
+        group.bench_function(
+            BenchmarkId::new("W18_prime_count_trial_div", "luajit"),
+            |b| {
+                b.iter_custom(|iters| {
+                    timed_with_warmup(iters, || {
+                        let v: i64 = lua_fn_w18.call(()).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
+    }
+
     // =================================================================
     // ===== Dart-style canonical panel: relon_jit + relon_aot =========
     // =================================================================
@@ -4575,6 +4756,17 @@ fn bench_cmp_lua(c: &mut Criterion) {
         ("W17_binary_search", w17_relon_src(), W17_N as u64, || {
             args_w_n(W17_N)
         }),
+        // Panel-expansion 2026-05-28 (Tier 2 industry-standard W18):
+        // Algorithm = trial-division (HONESTY-disclosed substitution
+        // for the in-place sieve, see W18 doc-comment). rust_native
+        // is valid (pi(n) is transcendental, no closed-form fold);
+        // bytecode / LLVM AOT / wasm reject (recursion envelope).
+        (
+            "W18_prime_count_trial_div",
+            w18_relon_src(),
+            W18_N as u64,
+            || args_w_n(W18_N),
+        ),
     ];
 
     for (label, src, throughput_n, args_factory) in canonical_panel {
