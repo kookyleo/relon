@@ -19,7 +19,7 @@ use relon_eval_api::{Evaluator, Value};
 
 const W7_SRC: &str = "#main(Int n) -> Dict\n\
                       {\n\
-                        #private\n\
+                        #internal\n\
                         fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
                         result: fib(n)\n\
                       }";
