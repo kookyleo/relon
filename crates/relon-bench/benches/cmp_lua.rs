@@ -391,7 +391,7 @@ fn paper_win_collapsed_variant_label(label: &str) -> bool {
 /// `LoopReduce` on the lambda body). Until then the row family is
 /// suppressed end-to-end.
 ///
-/// Panel expansion (2026-05-28): W13 / W14 join the gate.
+/// Panel expansion (2026-05-28): W13 / W14 / W15 join the gate.
 /// * **W13_deep_dict_access** — the inner `cfg.db.pool.connections.max
 ///   + cfg.db.pool.connections.timeout.ms` reads constant-fold to
 ///   `5100` (rustc + LLVM at -O3 see the literal dict-tree leaves);
@@ -405,6 +405,9 @@ fn paper_win_collapsed_variant_label(label: &str) -> bool {
 ///   `true` over the input domain (`i % 10 ∈ [0,10)` and
 ///   `i / 10 ∈ [0,n/10]` with `n=1000`), so the body folds to `+2`
 ///   per iter and the reduce folds to `n * 2`. Gated end-to-end.
+/// * **W15_conditional_field** — `Σ_{i<n} (i%2==0 ? 2i : 3i)` is a
+///   closed-form polynomial after even/odd splitting (the half-sums
+///   reduce to scalar arithmetic at -O3); LLVM collapses both halves.
 fn paper_win_closed_form_fold_label(label: &str) -> bool {
     matches!(
         label,
@@ -413,6 +416,7 @@ fn paper_win_closed_form_fold_label(label: &str) -> bool {
             | "W6_list_int_sum_plus_one"
             | "W13_deep_dict_access"
             | "W14_schema_validate"
+            | "W15_conditional_field"
     )
 }
 
@@ -1812,6 +1816,63 @@ fn w14_expected() -> i64 {
 }
 
 // =====================================================================
+// =====  W15 — conditional field (`?:` per-iter render)  ==============
+// =====================================================================
+//
+// Tier 1 Relon-flavour workload (panel expansion 2026-05-28). Models
+// the canonical declarative-DSL `?:` ternary render pattern Relon
+// hosts use for "pick one of two computed expressions per row".
+//
+// **HONESTY checklist** (per `HONESTY_POLICY.md`):
+// * Source path: byte-identical to bench helper. Lua equivalent uses
+//   `if .. then .. else .. end` form (most accurate semantic equivalent
+//   when both branches produce same-type non-falsy values).
+// * Algorithm complexity preserved: O(n) reduce, branch + multiply +
+//   add per iter. The ternary IS evaluated branch-by-branch (the
+//   tree-walker's `Op::If` dispatch picks one arm each iter); no
+//   closed-form fold beyond what an aggressive optimiser could do
+//   on `Σ (i%2==0 ? 2i : 3i)` — which is itself a closed-form
+//   polynomial. The `paper_win_closed_form_fold_label` gate is the
+//   right place to suppress an LLVM AOT row that performs the fold.
+// * Time-math sanity: 1 modulo + 1 compare + 1 multiply + 1 add per
+//   iter ~ 50 ns/iter in the tree-walker.
+// * I/O shape: `#main(Int n) -> Int`; Lua matches.
+// * Backend coverage: tree_walk + luajit + bytecode (if accepted).
+//   LLVM AOT / rust_native suppressed via
+//   `paper_win_closed_form_fold_label`.
+
+const W15_N: i64 = 1_000;
+
+fn w15_relon_src() -> &'static str {
+    "#unstrict\n\
+     #main(Int n) -> Int\n\
+     range(n).reduce(0, (acc, i) =>\n\
+       acc + (i % 2 == 0 ? i * 2 : i * 3))"
+}
+
+fn w15_lua_src() -> String {
+    format!(
+        r#"return function()
+            local n = {n}
+            local acc = 0
+            for i = 0, n - 1 do
+                if (i % 2) == 0 then acc = acc + i * 2 else acc = acc + i * 3 end
+            end
+            return acc
+        end"#,
+        n = W15_N
+    )
+}
+
+fn w15_expected() -> i64 {
+    let mut acc: i64 = 0;
+    for i in 0..W15_N {
+        acc += if i % 2 == 0 { i * 2 } else { i * 3 };
+    }
+    acc
+}
+
+// =====================================================================
 // =====  consistency assertions  ======================================
 // =====================================================================
 
@@ -2121,6 +2182,27 @@ fn rust_native_w14(n: i64) -> i64 {
     acc
 }
 
+/// W15 conditional field. `Σ_{i<n} (i%2==0 ? 2i : 3i)` is a closed-
+/// form polynomial after even/odd splitting (`Σ 2*(2k) + Σ 3*(2k+1)`
+/// over `k ∈ [0, n/2)`). LLVM -O3 collapses both halves to scalar
+/// arithmetic. Gated by `paper_win_closed_form_fold_label`.
+#[inline(never)]
+fn rust_native_w15(n: i64) -> i64 {
+    let mut acc: i64 = 0;
+    let n = black_box(n);
+    let mut i: i64 = 0;
+    while i < n {
+        let term = if i % 2 == 0 {
+            i.wrapping_mul(2)
+        } else {
+            i.wrapping_mul(3)
+        };
+        acc = acc.wrapping_add(term);
+        i += 1;
+    }
+    acc
+}
+
 // =====================================================================
 // =====  Phase C: LLVM AOT row glue  ==================================
 // =====================================================================
@@ -2234,16 +2316,17 @@ fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
         "W9_nested_matrix" => Some(W9_LLVM_SRC),
         "W10_config_eval" => Some(W10_LLVM_SRC),
         "W12_p99_tail" => Some(w12_relon_src()),
-        // Panel expansion 2026-05-28: W13 / W14 production sources are
-        // outside the LLVM AOT envelope (W13 = dict-literal `#internal`
-        // binding; W14 = unstrict ternary chain). Even an inlined
+        // Panel expansion 2026-05-28: W13 / W14 / W15 production sources
+        // are outside the LLVM AOT envelope (W13 = dict-literal `#internal`
+        // binding; W14 / W15 = unstrict ternary chain). Even an inlined
         // variant would land on the `paper_win_closed_form_fold_label`
-        // gate (W13 folds to `n * 5100`; W14 folds to `n * 2`). Returning
-        // `None` here keeps the row honest until the panel grows a
-        // black_box-on-acc shape that defeats induction-variable
-        // reduction.
+        // gate (W13 folds to `n * 5100`; W14 folds to `n * 2`; W15 folds
+        // to a closed-form polynomial). Returning `None` here keeps the
+        // row honest until the panel grows a black_box-on-acc shape
+        // that defeats induction-variable reduction.
         "W13_deep_dict_access" => None,
         "W14_schema_validate" => None,
+        "W15_conditional_field" => None,
         _ => None,
     }
 }
@@ -2300,7 +2383,7 @@ fn rust_native_dispatch(label: &str, n: i64) -> i64 {
         "W9_nested_matrix" => rust_native_w9(n),
         "W10_config_eval" => rust_native_w10(n),
         "W12_p99_tail" => rust_native_w12(n),
-        // Panel expansion 2026-05-28: W13 / W14 are gated by
+        // Panel expansion 2026-05-28: W13 / W14 / W15 are gated by
         // `paper_win_closed_form_fold_label`, so the canonical_panel
         // never dispatches here. Arms retained for grep visibility +
         // panic-on-reintroduction so a future agent who drops the
@@ -2308,6 +2391,7 @@ fn rust_native_dispatch(label: &str, n: i64) -> i64 {
         // failure rather than a silent paper win.
         "W13_deep_dict_access" => rust_native_w13(n),
         "W14_schema_validate" => rust_native_w14(n),
+        "W15_conditional_field" => rust_native_w15(n),
         other => panic!("rust_native_dispatch: unknown workload `{other}`"),
     }
 }
@@ -3855,6 +3939,66 @@ fn bench_cmp_lua(c: &mut Criterion) {
         }
     }
 
+    // ----- W15 conditional field (`?:` per-iter render) -----
+    //
+    // Panel-expansion 2026-05-28 (Tier 1 Relon-flavour). See the
+    // top-of-file W15 doc-comment for the HONESTY checklist.
+    // Backend coverage: tree_walk + luajit + bytecode (if accepted).
+    // LLVM AOT / rust_native suppressed via
+    // `paper_win_closed_form_fold_label` (the arithmetic progression
+    // collapses to a closed-form polynomial at -O3); see W13/W14
+    // doc-comments for the same rationale.
+    {
+        let (walker, scope) = build_tree_walker(w15_relon_src());
+        let lua_fn_w15 = lua_fn(&lua, &w15_lua_src());
+
+        let relon_v = relon_int_result("W15", walker.run_main(&scope, args_w_n(W15_N)).unwrap());
+        let lua_v: i64 = lua_fn_w15.call(()).unwrap();
+        assert_relon_lua_consistent("W15", relon_v, lua_v, w15_expected());
+
+        group.throughput(Throughput::Elements(W15_N as u64));
+        group.bench_function(
+            BenchmarkId::new("W15_conditional_field", "relon_tree_walk"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(W15_N);
+                    timed_with_warmup(iters, || {
+                        let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
+        group.bench_function(BenchmarkId::new("W15_conditional_field", "luajit"), |b| {
+            b.iter_custom(|iters| {
+                timed_with_warmup(iters, || {
+                    let v: i64 = lua_fn_w15.call(()).unwrap();
+                    black_box(v);
+                })
+            });
+        });
+        if let Some(ev) = try_build_bytecode(w15_relon_src(), "W15") {
+            let v = ev.run_main(args_w_n(W15_N)).expect("W15 bytecode run_main");
+            assert_eq!(
+                relon_int_result("W15", v),
+                w15_expected(),
+                "W15 bytecode result must match analytic answer"
+            );
+            group.bench_function(
+                BenchmarkId::new("W15_conditional_field", "relon_bytecode"),
+                |b| {
+                    b.iter_custom(|iters| {
+                        let n_in = black_box(W15_N);
+                        timed_with_warmup(iters, || {
+                            let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
+                            black_box(v);
+                        })
+                    });
+                },
+            );
+        }
+    }
+
     // =================================================================
     // ===== Dart-style canonical panel: relon_jit + relon_aot =========
     // =================================================================
@@ -3965,6 +4109,18 @@ fn bench_cmp_lua(c: &mut Criterion) {
         ("W14_schema_validate", w14_relon_src(), W14_N as u64, || {
             args_w_n(W14_N)
         }),
+        // Panel-expansion 2026-05-28 (Tier 1 Relon-flavour W15):
+        // Same backend coverage as W14 — tree_walk + luajit + bytecode
+        // (if accepted); LLVM AOT + rust_native suppressed via
+        // `paper_win_closed_form_fold_label` (the arithmetic
+        // progression `Σ (i%2==0 ? 2i : 3i)` collapses to a closed-
+        // form polynomial at -O3).
+        (
+            "W15_conditional_field",
+            w15_relon_src(),
+            W15_N as u64,
+            || args_w_n(W15_N),
+        ),
     ];
 
     for (label, src, throughput_n, args_factory) in canonical_panel {

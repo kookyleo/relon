@@ -320,6 +320,34 @@ fn w14_schema_validate() {
     run_pair("W14", r, &l, n, expected);
 }
 
+/// W15 — conditional field. Per-iter ternary picks one of two analytic
+/// expressions, the canonical `?:` declarative-DSL render pattern.
+/// Per HONESTY_POLICY:
+/// * Source path: byte-identical to bench helper.
+/// * Algorithm: O(n) reduce, branch + multiply per iter.
+/// * I/O shape: `#main(Int n) -> Int`; Lua equivalent picks the same
+///   branch via Lua's `if .. then .. else .. end` form.
+#[test]
+fn w15_conditional_field() {
+    let r = "#unstrict\n\
+             #main(Int n) -> Int\n\
+             range(n).reduce(0, (acc, i) =>\n\
+               acc + (i % 2 == 0 ? i * 2 : i * 3))";
+    let n: i64 = 1_000;
+    let l = format!(
+        "return function() local n = {n}; local acc = 0;\n\
+         for i = 0, n - 1 do\n\
+           if (i % 2) == 0 then acc = acc + i * 2 else acc = acc + i * 3 end\n\
+         end;\n\
+         return acc end"
+    );
+    let mut expected: i64 = 0;
+    for i in 0..n {
+        expected += if i % 2 == 0 { i * 2 } else { i * 3 };
+    }
+    run_pair("W15", r, &l, n, expected);
+}
+
 #[test]
 fn w10_config_eval() {
     let r = "#import list from \"std/list\"\n\

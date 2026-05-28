@@ -3,7 +3,7 @@
 Audit history: the `v6_lambda_cmp_lua` panel has been cleaned up
 reactively through eight rounds (audits W7 / `_fixture` rename / W1
 fallback / W5 / W8 / W9 / W10 collapse / W1 / W2 / W6 closed-form fold).
-The Tier 1 panel expansion (2026-05-28) added W13 / W14 with the
+The Tier 1 panel expansion (2026-05-28) added W13 / W14 / W15 with the
 gates pre-applied at row-add time rather than after-the-fact audit.
 This document codifies the patterns so future agents catch paper wins
 at PR review time, not in audit #N+1.
@@ -200,6 +200,11 @@ HONESTY checklist applied at row-add time:
   - tree_walk + luajit + bytecode (if envelope accepts).
   - LLVM AOT / rust_native gated (both predicates constant-true
     over the input domain → folds to `n * 2`).
+* **W15_conditional_field** — `?:` ternary per iter, modelling the
+  declarative-DSL "pick one of two expressions" pattern.
+  - tree_walk + luajit + bytecode (if envelope accepts).
+  - LLVM AOT / rust_native gated (arithmetic progression folds to a
+    closed-form polynomial).
 
 Re-introducing the gated rows requires a `black_box`-on-acc shape
 that defeats LLVM's induction-variable reduction (or an LLVM emitter
