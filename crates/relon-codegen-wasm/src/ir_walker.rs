@@ -130,8 +130,9 @@ use relon_ir::{
     IrType, LoweredEntry, Op, TaggedOp, MAIN_RETURN_SCHEMA_NAME, RETURN_VALUE_FIELD_NAME,
 };
 use wasm_encoder::{
-    CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection, ImportSection,
-    MemArg, MemorySection, MemoryType, Module, TypeSection, ValType,
+    CodeSection, ConstExpr, ElementSection, Elements, EntityType, ExportKind, ExportSection,
+    Function, FunctionSection, ImportSection, MemArg, MemorySection, MemoryType, Module, RefType,
+    TableSection, TableType, TypeSection, ValType,
 };
 
 use crate::host_abi::{import_index, HOST_IMPORTS};
@@ -205,6 +206,41 @@ struct ParamSlot {
     /// String params surface as `LowerError::UnsupportedOp` until
     /// Z.4 follow-ups widen the typed-func envelope.
     ty: IrType,
+}
+
+/// Z.4.3 — which function variant the walker is emitting. Drives
+/// per-op semantics that differ between the `#main` entry and a
+/// lambda body (e.g. `LocalGet(N)` is unused in the entry — params
+/// arrive via `LoadField` against the `MainParams` layout — but is
+/// the canonical way a lambda reads its `(captures_ptr, ...args)`
+/// signature).
+#[derive(Debug, Clone)]
+enum FunctionKind<'a> {
+    /// `#main` entry function. Param decoding goes through the
+    /// `MainParams` schema → typed-func i64 mapping; return decoding
+    /// follows the `ReturnShape` enum.
+    Entry {
+        param_slots: &'a [ParamSlot],
+        return_shape: &'a ReturnShape,
+    },
+    /// One `#internal fib: (k) => ...` lambda function. The wasm
+    /// signature is `(captures_ptr: i32, ...user_params) -> ret_ty`;
+    /// `LocalGet(0)` reads the captures pointer, `LocalGet(i+1)` reads
+    /// the i-th user-visible arg. `Return` ends the function by
+    /// yielding the top-of-stack value (which must already be
+    /// `ret_ty`).
+    Lambda {
+        /// Wasm param valtypes in declaration order. `params[0]` is
+        /// always `i32` (captures_ptr); `params[1..]` are the
+        /// user-visible argument types.
+        params: &'a [IrType],
+        /// IR-level return type. Recorded here so a future
+        /// type-checking widening can verify the top-of-stack type
+        /// at `Op::Return`; the current op-by-op walker trusts the
+        /// IR pipeline's invariants.
+        #[allow(dead_code)]
+        ret_ty: IrType,
+    },
 }
 
 /// How the IR walker interprets the trailing `Return` op.
@@ -370,62 +406,190 @@ pub fn lower_ir_module(lowered: &LoweredEntry) -> Result<Vec<u8>, LowerError> {
     })?;
     let return_shape = classify_return_shape(&lowered.return_schema, &ret_layout)?;
 
-    // --- Walk the body ---------------------------------------------------
-    let mut emit = EmitState::new(&param_slots, &return_shape);
-    emit.walk(&entry_fn.body)?;
+    // --- Walk the entry body --------------------------------------------
+    let mut entry_emit = EmitState::new(FunctionKind::Entry {
+        param_slots: &param_slots,
+        return_shape: &return_shape,
+    });
+    entry_emit.walk(&entry_fn.body)?;
+
+    // --- Walk each lambda body ------------------------------------------
+    //
+    // The IR module's `closure_table` is a list of IR func indices,
+    // one per `#internal fib: (k) => ...` lambda lifted by the
+    // lowering pass. Each lambda's wasm signature is `(captures_ptr:
+    // i32, ...user_params) -> ret_ty` — i.e. exactly what the
+    // closure-as-value `MakeClosure`/`CallClosure` discipline writes
+    // into the funcref table. We walk every lambda eagerly so the
+    // emitted module can resolve every `call_indirect`'s type-index
+    // against a single deduped signature pool.
+    let closure_table = &lowered.module.closure_table;
+    let mut lambda_emits: Vec<(LambdaInfo, EmitState<'_>)> =
+        Vec::with_capacity(closure_table.len());
+    for (slot, ir_fn_idx) in closure_table.iter().enumerate() {
+        let lambda_fn =
+            lowered
+                .module
+                .funcs
+                .get(*ir_fn_idx as usize)
+                .ok_or(LowerError::UnsupportedOp(
+                    "closure_table_idx_out_of_range",
+                    UnsupportedOpReason::ClosureValue,
+                ))?;
+        if lambda_fn.params.is_empty()
+            || !matches!(lambda_fn.params[0], IrType::I32 | IrType::Closure)
+        {
+            return Err(LowerError::UnsupportedOp(
+                "lambda_missing_captures_ptr_param",
+                UnsupportedOpReason::ClosureValue,
+            ));
+        }
+        let info = LambdaInfo {
+            slot: slot as u32,
+            params: lambda_fn.params.clone(),
+            ret_ty: lambda_fn.ret,
+        };
+        let mut emit = EmitState::new(FunctionKind::Lambda {
+            params: &lambda_fn.params,
+            ret_ty: lambda_fn.ret,
+        });
+        // Safety/lifetime: the borrow on `lambda_fn.params` lives
+        // only as long as this iteration; we extract the emitted
+        // instructions + aux locals into `info` immediately after
+        // the walk so the borrow can drop.
+        emit.walk(&lambda_fn.body)?;
+        // We need to drop the &lambda_fn.params borrow before
+        // pushing into the Vec (which contains an EmitState borrowing
+        // the same lifetime). Move the EmitState carefully.
+        lambda_emits.push((info, emit));
+    }
 
     // --- Assemble the wasm module ----------------------------------------
+    //
+    // Determine whether the module needs the host-imports section.
+    // Both Z.4.1 (Dict-return alloc) and Z.4.3 (MakeClosure / captures
+    // alloc) drive `__relon_arena_alloc` calls; we OR across the
+    // entry + every lambda so a lambda-only call still wires imports.
     let n_params = param_slots.len();
-    let needs_imports = emit.needs_arena_alloc;
-    // Pull the data-segment table out before `finalise` consumes
-    // `self`; `lower_ir_module` then encodes them into Section 11.
-    let const_list_data = std::mem::take(&mut emit.const_list_ints);
+    // Z.4.1 / Z.4.3 — host-imports section is wired when the entry OR
+    // any lambda emitted an arena-alloc host call. Z.4.3 lambdas allocate
+    // captures + handle storage, the entry allocates the root record for
+    // Dict-return shapes, so either side can drive the import.
+    let needs_imports =
+        entry_emit.needs_arena_alloc || lambda_emits.iter().any(|(_, e)| e.needs_arena_alloc);
+    let has_lambdas = !lambda_emits.is_empty();
+    // Z.4.2 — pull the const-list data-segment table out of entry_emit
+    // before `finalise` consumes it. The walker today only emits
+    // `Op::ConstListInt` from the entry body (List<Int> return shapes
+    // are `#main`-only); a defensive check below catches the case
+    // where a lambda body produced const-list entries we haven't
+    // designed offset-aggregation for yet.
+    let const_list_data = std::mem::take(&mut entry_emit.const_list_ints);
+    for (_, lambda_emit) in &lambda_emits {
+        if !lambda_emit.const_list_ints.is_empty() {
+            return Err(LowerError::UnsupportedOp(
+                "lambda_const_list_int_not_supported",
+                UnsupportedOpReason::ListLiteral,
+            ));
+        }
+    }
     let mut module = Module::new();
 
-    // Section 1 — types.
+    // --- Build the wasm type pool ---------------------------------------
     //
-    // Type 0: `(i64; n_params) -> i64` — the `__main` signature both
-    // ABI shapes share (scalar Int return + Dict record-ptr return).
-    //
-    // Type 1+ (when `needs_imports`): one entry per host-import
-    // signature the walker references. Z.4.1 only consults
-    // `__relon_arena_alloc(i32, i32) -> i32`; we still allocate the
-    // full host-import slate so the import-section indices match the
-    // frozen `HOST_IMPORTS` table and a future widening (W3 strings,
-    // W4 contains) doesn't have to renumber.
+    // Type 0: entry signature `(i64; n_params) -> i64`. Type 1+: host-
+    // import sigs (one slot per `HOST_IMPORTS` entry, deduped); then
+    // one slot per lambda's `(i32, ...) -> ret` signature, also
+    // deduped; then one slot per distinct `CallClosure` signature
+    // (`(i32 captures_ptr, ...param_tys) -> ret_ty`). Deduplication
+    // is by `(params, results)` tuple so a lambda's signature and
+    // the matching call_indirect signature collapse to one entry.
     let mut types = TypeSection::new();
-    types.ty().function(
-        std::iter::repeat_n(ValType::I64, n_params),
-        std::iter::once(ValType::I64),
-    );
-    // Per-host-import type entries, deduped against type 0 + each
-    // other so the section stays compact.
     let mut sig_pool: Vec<(Vec<ValType>, Vec<ValType>)> = Vec::new();
-    sig_pool.push((vec![ValType::I64; n_params], vec![ValType::I64]));
+    let intern_sig = |pool: &mut Vec<(Vec<ValType>, Vec<ValType>)>,
+                      types: &mut TypeSection,
+                      sig: (Vec<ValType>, Vec<ValType>)|
+     -> u32 {
+        if let Some(p) = pool.iter().position(|s| s == &sig) {
+            return p as u32;
+        }
+        let idx = pool.len() as u32;
+        types
+            .ty()
+            .function(sig.0.iter().copied(), sig.1.iter().copied());
+        pool.push(sig);
+        idx
+    };
+    let entry_type_idx = intern_sig(
+        &mut sig_pool,
+        &mut types,
+        (vec![ValType::I64; n_params], vec![ValType::I64]),
+    );
+
+    // Per-host-import type entries (only when imports are wired).
     let mut host_type_indices: Vec<u32> = Vec::new();
     if needs_imports {
         host_type_indices.reserve(HOST_IMPORTS.len());
         for imp in HOST_IMPORTS {
             let sig = (imp.params.to_vec(), imp.results.to_vec());
-            let idx = if let Some(p) = sig_pool.iter().position(|s| s == &sig) {
-                p as u32
-            } else {
-                let new_idx = sig_pool.len() as u32;
-                types
-                    .ty()
-                    .function(sig.0.iter().copied(), sig.1.iter().copied());
-                sig_pool.push(sig);
-                new_idx
-            };
-            host_type_indices.push(idx);
+            host_type_indices.push(intern_sig(&mut sig_pool, &mut types, sig));
         }
     }
+
+    // Per-lambda type indices. A lambda's signature is its IR-side
+    // `Func::params` translated to wasm valtypes, returning its IR
+    // `ret`'s wasm valtype.
+    let mut lambda_type_indices: Vec<u32> = Vec::with_capacity(lambda_emits.len());
+    for (info, _) in &lambda_emits {
+        let params: Vec<ValType> = info
+            .params
+            .iter()
+            .map(|t| ir_ty_to_wasm_param_valtype(*t))
+            .collect::<Result<Vec<_>, _>>()?;
+        let result = vec![ir_ty_to_wasm_param_valtype(info.ret_ty)?];
+        lambda_type_indices.push(intern_sig(&mut sig_pool, &mut types, (params, result)));
+    }
+
+    // Per-`CallClosure` type indices: one per (param_tys, ret_ty)
+    // pair the walker recorded across the entry + every lambda.
+    // Collected in walk order so the post-walk patcher matches the
+    // sentinels left in each `EmitState::insns`.
+    fn cc_sig(
+        param_tys: &[IrType],
+        ret_ty: IrType,
+    ) -> Result<(Vec<ValType>, Vec<ValType>), LowerError> {
+        let mut params: Vec<ValType> = Vec::with_capacity(1 + param_tys.len());
+        params.push(ValType::I32); // implicit captures_ptr
+        for t in param_tys {
+            params.push(ir_ty_to_wasm_param_valtype(*t)?);
+        }
+        let result = vec![ir_ty_to_wasm_param_valtype(ret_ty)?];
+        Ok((params, result))
+    }
+    // Resolve CallClosure type-indices per-EmitState (in walk order).
+    let entry_call_indirect_type_indices: Vec<u32> = entry_emit
+        .call_indirect_sigs_requested
+        .iter()
+        .map(|(p, r)| -> Result<u32, LowerError> {
+            Ok(intern_sig(&mut sig_pool, &mut types, cc_sig(p, *r)?))
+        })
+        .collect::<Result<_, _>>()?;
+    let mut lambda_call_indirect_type_indices: Vec<Vec<u32>> =
+        Vec::with_capacity(lambda_emits.len());
+    for (_, e) in &lambda_emits {
+        let v: Vec<u32> = e
+            .call_indirect_sigs_requested
+            .iter()
+            .map(|(p, r)| -> Result<u32, LowerError> {
+                Ok(intern_sig(&mut sig_pool, &mut types, cc_sig(p, *r)?))
+            })
+            .collect::<Result<_, _>>()?;
+        lambda_call_indirect_type_indices.push(v);
+    }
+
     module.section(&types);
 
-    // Section 2 — imports (only when the walker emitted a host-import
-    // call, which today means a Dict-return source called
-    // `__relon_arena_alloc`). Skipping the section when imports are
-    // empty keeps the Z.4.0 scalar-Int modules byte-identical.
+    // Section 2 — imports (Z.4.1 / Z.4.3 arena alloc).
     if needs_imports {
         let mut imports = ImportSection::new();
         for (i, imp) in HOST_IMPORTS.iter().enumerate() {
@@ -438,14 +602,48 @@ pub fn lower_ir_module(lowered: &LoweredEntry) -> Result<Vec<u8>, LowerError> {
         module.section(&imports);
     }
 
-    // Section 3 — functions: one local fn (the entry).
+    // Section 3 — functions: declare entry + each lambda. The wasm
+    // function index of `__main` lands at
+    // `HOST_IMPORTS.len()` when imports are wired (imports occupy the
+    // low end of the fn-index namespace) and `0` otherwise; lambdas
+    // follow immediately. The matching closure-table slots are
+    // resolved into wasm fn-indices via `lambda_fn_index(slot)`
+    // below.
     let mut funcs = FunctionSection::new();
-    funcs.function(0);
+    funcs.function(entry_type_idx);
+    for ti in &lambda_type_indices {
+        funcs.function(*ti);
+    }
     module.section(&funcs);
+
+    // Section 4 — table (Z.4.3 funcref). One funcref table sized to
+    // the lambda count; entries are populated via the element
+    // section below. Skipped when no lambdas — keeps the Z.4.0/Z.4.2
+    // modules byte-identical.
+    let host_import_count = if needs_imports {
+        HOST_IMPORTS.len() as u32
+    } else {
+        0
+    };
+    let main_fn_idx = host_import_count;
+    let lambda_fn_index = |slot: u32| -> u32 { main_fn_idx + 1 + slot };
+
+    if has_lambdas {
+        let mut tables = TableSection::new();
+        tables.table(TableType {
+            element_type: RefType::FUNCREF,
+            table64: false,
+            minimum: lambda_emits.len() as u64,
+            maximum: Some(lambda_emits.len() as u64),
+            shared: false,
+        });
+        module.section(&tables);
+    }
 
     // Section 5 — memories: one 16-page linear memory, exported as
     // `memory`. Z.4.0 scalar-Int ops don't touch it; Z.4.1 Dict-return
-    // sources use it for the record alloc.
+    // sources use it for the record alloc; Z.4.3 closure-as-value
+    // sources use it for handle + captures storage.
     let mut mems = MemorySection::new();
     mems.memory(MemoryType {
         minimum: 16,
@@ -456,23 +654,45 @@ pub fn lower_ir_module(lowered: &LoweredEntry) -> Result<Vec<u8>, LowerError> {
     });
     module.section(&mems);
 
-    // Section 7 — exports: memory + __main. The local fn-index for
-    // `__main` is `HOST_IMPORTS.len()` when imports are wired (imports
-    // occupy the low end of the fn-index namespace) and `0` otherwise.
-    let main_fn_idx = if needs_imports {
-        HOST_IMPORTS.len() as u32
-    } else {
-        0
-    };
+    // Section 7 — exports: memory + __main.
     let mut exports = ExportSection::new();
     exports.export("memory", ExportKind::Memory, 0);
     exports.export("__main", ExportKind::Func, main_fn_idx);
     module.section(&exports);
 
-    // Section 10 — code: one entry, walker output.
+    // Section 9 — elements: populate the funcref table with each
+    // lambda's wasm function index in closure-table slot order. The
+    // call_indirect at each `Op::CallClosure` site reads the slot
+    // out of the closure handle and looks the funcref up here.
+    if has_lambdas {
+        let mut elements = ElementSection::new();
+        let fn_indices: Vec<u32> = (0..lambda_emits.len())
+            .map(|i| lambda_fn_index(i as u32))
+            .collect();
+        let offset = ConstExpr::i32_const(0);
+        elements.active(
+            None,
+            &offset,
+            Elements::Functions(fn_indices.as_slice().into()),
+        );
+        module.section(&elements);
+    }
+
+    // Section 10 — code: entry function + every lambda. We patch
+    // each EmitState's recorded `CallIndirect { type_index: u32::MAX
+    // }` placeholders in walk order before finalising.
     let mut code = CodeSection::new();
-    let func = emit.finalise()?;
-    code.function(&func);
+    patch_call_indirect_type_indices(&mut entry_emit.insns, &entry_call_indirect_type_indices)?;
+    let entry_func = entry_emit.finalise()?;
+    code.function(&entry_func);
+    for ((_, mut emit), patches) in lambda_emits
+        .into_iter()
+        .zip(lambda_call_indirect_type_indices.iter())
+    {
+        patch_call_indirect_type_indices(&mut emit.insns, patches)?;
+        let func = emit.finalise()?;
+        code.function(&func);
+    }
     module.section(&code);
 
     // Section 11 — data: active data segments for `Op::ConstListInt`
@@ -513,6 +733,81 @@ fn encode_const_list_int_record(entry: &ConstListIntEntry) -> Vec<u8> {
         bytes.extend_from_slice(&v.to_le_bytes());
     }
     bytes
+}
+
+/// Z.4.3 — per-lambda metadata captured before its `EmitState` is
+/// walked. Used by `lower_ir_module` to compute the lambda's wasm
+/// signature + funcref-table slot when assembling the module-level
+/// sections.
+#[derive(Debug, Clone)]
+struct LambdaInfo {
+    /// Closure-table slot (0-based, source order). Matches
+    /// `Op::MakeClosure { fn_table_idx }`.
+    #[allow(dead_code)]
+    slot: u32,
+    /// IR-side wasm parameter types — `params[0]` is always
+    /// captures_ptr (i32), `params[1..]` are the user-visible args.
+    params: Vec<IrType>,
+    /// IR-side return type. Mapped to the wasm fn's single-result
+    /// slot.
+    ret_ty: IrType,
+}
+
+/// Walker-side IrType → wasm `ValType` mapping for the lambda
+/// signature / call_indirect signature lanes. Closure-typed slots
+/// are i32 arena handles; list / string / null pointers are also
+/// i32. Anything else surfaces as `UnsupportedOp` so the host's
+/// tracing layer pins the scope-cut to the matching follow-up.
+fn ir_ty_to_wasm_param_valtype(ty: IrType) -> Result<ValType, LowerError> {
+    match ty {
+        IrType::I64 => Ok(ValType::I64),
+        IrType::F64 => Ok(ValType::F64),
+        IrType::Bool | IrType::I32 => Ok(ValType::I32),
+        IrType::Closure
+        | IrType::Null
+        | IrType::String
+        | IrType::ListInt
+        | IrType::ListFloat
+        | IrType::ListBool
+        | IrType::ListString
+        | IrType::ListSchema => Ok(ValType::I32),
+    }
+}
+
+/// Patch the `CallIndirect { type_index: u32::MAX }` sentinels left
+/// in the walker's recorded instruction stream with the resolved
+/// type-indices from the matching `call_indirect_sigs_requested`
+/// vector. The two lists are aligned by walk order — the i-th
+/// sentinel resolves against `resolved[i]`.
+fn patch_call_indirect_type_indices(
+    insns: &mut [wasm_encoder::Instruction<'static>],
+    resolved: &[u32],
+) -> Result<(), LowerError> {
+    use wasm_encoder::Instruction as I;
+    let mut i = 0;
+    for insn in insns.iter_mut() {
+        if let I::CallIndirect {
+            type_index,
+            table_index: _,
+        } = insn
+        {
+            if *type_index == u32::MAX {
+                let resolved_idx = *resolved.get(i).ok_or(LowerError::UnsupportedOp(
+                    "call_indirect_resolve_mismatch",
+                    UnsupportedOpReason::ClosureValue,
+                ))?;
+                *type_index = resolved_idx;
+                i += 1;
+            }
+        }
+    }
+    if i != resolved.len() {
+        return Err(LowerError::UnsupportedOp(
+            "call_indirect_resolve_count_mismatch",
+            UnsupportedOpReason::ClosureValue,
+        ));
+    }
+    Ok(())
 }
 
 /// Classify a `Ret`-schema layout into a [`ReturnShape`].
@@ -712,6 +1007,20 @@ struct LetLocal {
     ty: IrType,
 }
 
+/// Z.4.3 — one pooled set of `CallClosure` arg-spill scratch
+/// locals. Two ops with the same `param_tys` share one pool so the
+/// emitted local section stays compact on recursive lambdas (the
+/// W7 `fib` body has two back-to-back `CallClosure { param_tys:
+/// [I64] }` ops; they share one i64 scratch slot).
+#[derive(Debug, Clone)]
+struct CallArgPool {
+    /// IR-arg types in push order. Pools are keyed off this.
+    tys: Vec<IrType>,
+    /// Wasm-local indices, one per arg position. `slots[i]` is the
+    /// scratch slot for the i-th IR arg.
+    slots: Vec<u32>,
+}
+
 /// Per-record-local wasm slot for the Z.4.1 Dict-return path. Each
 /// `AllocRootRecord { record_local_idx }` allocates one i32 wasm
 /// local that holds the record's arena pointer; the matching
@@ -740,6 +1049,14 @@ enum AuxLocal {
     RecordBase,
     /// Z.4.1 — scratch i64 used to spill `StoreFieldAtRecord` rhs.
     ScratchI64,
+    /// Z.4.3 — scratch i32 used by `MakeClosure` / `CallClosure` to
+    /// stash arena pointers / closure handles across the multi-step
+    /// linear-memory write sequence.
+    ScratchI32,
+    /// Z.4.3 — scratch local used by `CallClosure` to spill a user
+    /// arg of `ty` while the operand stack is being re-ordered
+    /// for the indirect-call ABI `(captures_ptr, args..., fn_idx)`.
+    CallArgScratch(IrType),
 }
 
 /// Z.4.2 — per-`Op::ConstListInt` data-segment entry. Each unique
@@ -769,10 +1086,9 @@ struct ConstListIntEntry {
 /// Walker state — accumulates wasm locals declarations and the
 /// function-body instruction stream as we walk the IR Op vector.
 struct EmitState<'a> {
-    param_slots: &'a [ParamSlot],
-    /// Return ABI flavour for the typed-func result. Drives the
-    /// `Return` / trailing `StoreField` / `AllocRootRecord` lowering.
-    return_shape: &'a ReturnShape,
+    /// Which IR function flavour is being emitted (entry vs lambda).
+    /// Drives `LoadField` / `LocalGet` / `Return` interpretation.
+    kind: FunctionKind<'a>,
     /// User-let-local declarations seen so far. Each unique `(idx,
     /// ty)` is allocated one wasm local; reseeing the same idx
     /// reuses the wasm slot.
@@ -786,6 +1102,31 @@ struct EmitState<'a> {
     /// allocated on first use so the Z.4.0 scalar-Int path stays
     /// byte-identical.
     store_field_scratch_i64: Option<u32>,
+    /// Z.4.3 — scratch i32 local used by `MakeClosure` to remember
+    /// the freshly-allocated handle pointer across the captures
+    /// initialisation sequence (so a self-recursive capture writes
+    /// `handle_ptr` itself before the matching `LetSet` runs).
+    /// Lazily allocated.
+    make_closure_handle_scratch: Option<u32>,
+    /// Z.4.3 — scratch i32 local mirroring
+    /// `make_closure_handle_scratch` for the captures-struct base.
+    /// Used when `captures_size > 0` so we can write multiple
+    /// capture fields against the same pointer without re-emitting
+    /// the alloc.
+    make_closure_captures_scratch: Option<u32>,
+    /// Z.4.3 — pools of scratch locals used by `CallClosure` ops to
+    /// spill user-visible args off the operand stack before
+    /// re-pushing them with the `(captures_ptr, args...)` ABI order.
+    /// Pools are keyed by the IR-arg type sequence so two calls with
+    /// the same signature reuse the same slots — keeping the local
+    /// section compact when a recursive lambda (W7 `fib(k-1) +
+    /// fib(k-2)`) has multiple in-body `CallClosure` ops.
+    call_closure_arg_pools: Vec<CallArgPool>,
+    /// Z.4.3 — scratch i32 local used by `CallClosure` to spill the
+    /// closure handle (after popping all user args off the stack)
+    /// so the indirect-call discipline can re-push `captures_ptr`
+    /// then the user args then `fn_table_idx`.
+    call_closure_handle_scratch: Option<u32>,
     /// Auxiliary local allocations in declaration order. `finalise`
     /// reads this vector to emit the wasm `local` section run-length
     /// encoded; the i-th entry's wasm-local index is
@@ -809,7 +1150,9 @@ struct EmitState<'a> {
     /// either a scalar `StoreField(ret.value)` (scalar-Int shape) or
     /// at least one `AllocRootRecord` (Dict shape). The walker's
     /// contract: a body that doesn't honour the shape's prep
-    /// sequence fails closed at `finalise`.
+    /// sequence fails closed at `finalise`. Lambda bodies opt out —
+    /// their `Return` op directly yields the top-of-stack and the
+    /// contract is satisfied by the trailing `End`.
     saw_return_prep: bool,
     /// Z.4.1 — `true` once the walker has emitted a host-import call
     /// (today: `__relon_arena_alloc`). Flips the
@@ -817,22 +1160,43 @@ struct EmitState<'a> {
     /// modules without host calls keep their byte-identical Z.4.0
     /// shape.
     needs_arena_alloc: bool,
+    /// Z.4.3 — the call_indirect type-index per `CallClosure` op
+    /// emitted. Set on the global side-table during walk so the
+    /// caller can populate the wasm `TypeSection` with the matching
+    /// signatures. The walker doesn't know its module's type-index
+    /// layout, so it records each requested signature here and
+    /// reconciles after both function walks complete.
+    call_indirect_sigs_requested: Vec<(Vec<IrType>, IrType)>,
 }
 
 impl<'a> EmitState<'a> {
-    fn new(param_slots: &'a [ParamSlot], return_shape: &'a ReturnShape) -> Self {
+    fn new(kind: FunctionKind<'a>) -> Self {
         Self {
-            param_slots,
-            return_shape,
+            kind,
             let_locals: Vec::new(),
             record_locals: Vec::new(),
             store_field_scratch_i64: None,
+            make_closure_handle_scratch: None,
+            make_closure_captures_scratch: None,
+            call_closure_arg_pools: Vec::new(),
+            call_closure_handle_scratch: None,
             aux_locals: Vec::new(),
             const_list_ints: Vec::new(),
             const_list_cursor: CONST_LIST_DATA_BASE,
             insns: Vec::new(),
             saw_return_prep: false,
             needs_arena_alloc: false,
+            call_indirect_sigs_requested: Vec::new(),
+        }
+    }
+
+    /// How many wasm params this function declares. Drives the
+    /// `wasm_idx` allocation for auxiliary locals (which sit after
+    /// the params in the local namespace).
+    fn n_params(&self) -> u32 {
+        match &self.kind {
+            FunctionKind::Entry { param_slots, .. } => param_slots.len() as u32,
+            FunctionKind::Lambda { params, .. } => params.len() as u32,
         }
     }
 
@@ -840,7 +1204,7 @@ impl<'a> EmitState<'a> {
     /// [`AuxLocal`] tag so [`finalise`] re-emits the matching
     /// `ValType` declaration. Returns the new index.
     fn alloc_aux(&mut self, tag: AuxLocal) -> u32 {
-        let idx = self.param_slots.len() as u32 + self.aux_locals.len() as u32;
+        let idx = self.n_params() + self.aux_locals.len() as u32;
         self.aux_locals.push(tag);
         idx
     }
@@ -888,16 +1252,92 @@ impl<'a> EmitState<'a> {
                         non_int_main_param_reason(ty),
                     ));
                 }
-                let slot = self
-                    .param_slots
-                    .iter()
-                    .find(|p| p.offset == *offset)
-                    .ok_or(LowerError::UnsupportedOp(
+                let param_slots = match &self.kind {
+                    FunctionKind::Entry { param_slots, .. } => *param_slots,
+                    FunctionKind::Lambda { .. } => {
+                        // Lambda bodies read their args via `LocalGet`
+                        // (captures_ptr at idx 0, user args at 1..);
+                        // a `LoadField` reaching one signals an IR
+                        // shape the walker can't handle in a closure
+                        // body today.
+                        return Err(LowerError::UnsupportedOp(
+                            "load_field_in_lambda_body",
+                            UnsupportedOpReason::BufferProtocolRecord,
+                        ));
+                    }
+                };
+                let slot = param_slots.iter().find(|p| p.offset == *offset).ok_or(
+                    LowerError::UnsupportedOp(
                         "load_field_offset_not_main_param",
                         UnsupportedOpReason::BufferProtocolRecord,
-                    ))?;
+                    ),
+                )?;
                 self.insns.push(I::LocalGet(slot.wasm_param_idx));
                 let _ = slot.ty; // future widening reads this
+            }
+
+            // ----- Wasm-local read (lambda captures_ptr + args) -----
+            //
+            // Z.4.3 — `Op::LocalGet(N)` is the canonical way a lambda
+            // body reads its `(captures_ptr, ...user_args)`-shaped
+            // signature: `LocalGet(0)` is the captures pointer,
+            // `LocalGet(i + 1)` is the i-th user-visible argument.
+            // Entry bodies never emit `LocalGet` directly — their
+            // params come in via the `LoadField` against the
+            // `MainParams` schema — so a `LocalGet` reaching the
+            // entry walker is treated as an out-of-envelope op.
+            Op::LocalGet(idx) => match &self.kind {
+                FunctionKind::Lambda { params, .. } => {
+                    if (*idx as usize) >= params.len() {
+                        return Err(LowerError::UnsupportedOp(
+                            "local_get_out_of_range",
+                            UnsupportedOpReason::Other("local_get_out_of_range"),
+                        ));
+                    }
+                    self.insns.push(I::LocalGet(*idx));
+                }
+                FunctionKind::Entry { .. } => {
+                    return Err(LowerError::UnsupportedOp(
+                        "local_get_in_entry_body",
+                        UnsupportedOpReason::BufferProtocolRecord,
+                    ));
+                }
+            },
+
+            // ----- Z.4.3 — raw-memory absolute loads ----------------
+            //
+            // The lambda body's capture-prologue uses these ops to
+            // peel each captured value off the captures struct that
+            // the `MakeClosure` on the outer side wrote. Stack
+            // discipline mirrors the wasm load family: pop an i32
+            // address, push the value at `addr + offset`.
+            Op::LoadI32AtAbsolute { offset } => {
+                self.insns.push(I::I32Load(MemArg {
+                    offset: u64::from(*offset),
+                    align: 2,
+                    memory_index: 0,
+                }));
+            }
+            Op::LoadI64AtAbsolute { offset } => {
+                self.insns.push(I::I64Load(MemArg {
+                    offset: u64::from(*offset),
+                    align: 3,
+                    memory_index: 0,
+                }));
+            }
+            Op::LoadF64AtAbsolute { offset } => {
+                self.insns.push(I::F64Load(MemArg {
+                    offset: u64::from(*offset),
+                    align: 3,
+                    memory_index: 0,
+                }));
+            }
+            Op::LoadI8UAtAbsolute { offset } => {
+                self.insns.push(I::I32Load8U(MemArg {
+                    offset: u64::from(*offset),
+                    align: 0,
+                    memory_index: 0,
+                }));
             }
 
             // ----- Return store: leave value on stack as fn result --
@@ -911,7 +1351,18 @@ impl<'a> EmitState<'a> {
                 // record-base local instead. A `StoreField` reaching
                 // the Dict-return walker indicates a buffer-protocol
                 // record write the typed-func ABI can't model.
-                match self.return_shape {
+                let return_shape = match &self.kind {
+                    FunctionKind::Entry { return_shape, .. } => *return_shape,
+                    FunctionKind::Lambda { .. } => {
+                        // Lambda bodies never emit StoreField — their
+                        // Return is the canonical return prep.
+                        return Err(LowerError::UnsupportedOp(
+                            "store_field_in_lambda_body",
+                            UnsupportedOpReason::BufferProtocolRecord,
+                        ));
+                    }
+                };
+                match return_shape {
                     ReturnShape::ScalarValue {
                         offset: ret_offset, ..
                     } => {
@@ -1052,47 +1503,65 @@ impl<'a> EmitState<'a> {
             },
 
             // ----- Return --------------------------------------------
-            Op::Return => match self.return_shape {
-                ReturnShape::ScalarValue { .. } => {
-                    // No-op for the scalar-Int typed-func ABI — the
-                    // function's trailing `End` already returns the
-                    // top of stack. We still record the explicit op
-                    // so a malformed body (missing both `StoreField`
-                    // and `Return`) fails closed via `finalise`.
-                }
-                ReturnShape::DictRecordPtr { .. } => {
-                    // Z.4.1 — Dict shape. The body's
-                    // `AllocRootRecord` stashed the arena pointer in
-                    // a wasm i32 local; the trailing `Return` reads
-                    // it back, zero-extends to i64, and the typed-
-                    // func returns it. The host's `WasmEvaluator::
-                    // run_main` recognises the Dict-shape return by
-                    // schema name + field shape and decodes the
-                    // record out of linear memory.
-                    let root_local = self
-                        .record_locals
-                        .first()
-                        .ok_or(LowerError::UnsupportedOp(
-                            "dict_return_no_root_record",
-                            UnsupportedOpReason::DictReturn,
-                        ))?
-                        .wasm_idx;
-                    self.insns.push(I::LocalGet(root_local));
-                    self.insns.push(I::I64ExtendI32U);
-                }
-                ReturnShape::ListIntPtr { .. } => {
-                    // Z.4.2 — `List<Int>` return. The body's trailing
-                    // `StoreField { offset, ty: ListInt }` already
-                    // left the i32 list-record pointer on the operand
-                    // stack; widen to i64 so the typed-func's i64
-                    // result carries the zero-extended pointer.
-                    self.insns.push(I::I64ExtendI32U);
+            Op::Return => match &self.kind {
+                FunctionKind::Entry { return_shape, .. } => match return_shape {
+                    ReturnShape::ScalarValue { .. } => {
+                        // No-op for the scalar-Int typed-func ABI — the
+                        // function's trailing `End` already returns the
+                        // top of stack. We still record the explicit op
+                        // so a malformed body (missing both `StoreField`
+                        // and `Return`) fails closed via `finalise`.
+                    }
+                    ReturnShape::DictRecordPtr { .. } => {
+                        // Z.4.1 — Dict shape. The body's
+                        // `AllocRootRecord` stashed the arena pointer in
+                        // a wasm i32 local; the trailing `Return` reads
+                        // it back, zero-extends to i64, and the typed-
+                        // func returns it. The host's `WasmEvaluator::
+                        // run_main` recognises the Dict-shape return by
+                        // schema name + field shape and decodes the
+                        // record out of linear memory.
+                        let root_local = self
+                            .record_locals
+                            .first()
+                            .ok_or(LowerError::UnsupportedOp(
+                                "dict_return_no_root_record",
+                                UnsupportedOpReason::DictReturn,
+                            ))?
+                            .wasm_idx;
+                        self.insns.push(I::LocalGet(root_local));
+                        self.insns.push(I::I64ExtendI32U);
+                    }
+                    ReturnShape::ListIntPtr { .. } => {
+                        // Z.4.2 — `List<Int>` return. The body's trailing
+                        // `StoreField { offset, ty: ListInt }` already
+                        // left the i32 list-record pointer on the operand
+                        // stack; widen to i64 so the typed-func's i64
+                        // result carries the zero-extended pointer.
+                        self.insns.push(I::I64ExtendI32U);
+                    }
+                },
+                FunctionKind::Lambda { .. } => {
+                    // Lambda bodies return the top-of-stack directly;
+                    // the trailing `End` yields it as the function
+                    // result. `saw_return_prep` is satisfied by the
+                    // explicit `Return` op.
+                    self.saw_return_prep = true;
                 }
             },
 
             // ----- Z.4.1 — Dict root record allocation ---------------
             Op::AllocRootRecord { record_local_idx } => {
-                let (root_size, root_align) = match self.return_shape {
+                let return_shape = match &self.kind {
+                    FunctionKind::Entry { return_shape, .. } => *return_shape,
+                    FunctionKind::Lambda { .. } => {
+                        return Err(LowerError::UnsupportedOp(
+                            "alloc_root_record_in_lambda_body",
+                            UnsupportedOpReason::DictReturn,
+                        ));
+                    }
+                };
+                let (root_size, root_align) = match return_shape {
                     ReturnShape::DictRecordPtr {
                         root_size,
                         root_align,
@@ -1263,12 +1732,218 @@ impl<'a> EmitState<'a> {
                 ));
             }
 
-            // ----- Scope-cut: Closure-as-value (Z.4.3 follow-up) -----
-            Op::MakeClosure { .. } | Op::CallClosure { .. } => {
-                return Err(LowerError::UnsupportedOp(
-                    "closure_as_value",
-                    UnsupportedOpReason::ClosureValue,
-                ));
+            // ----- Z.4.3 — Closure-as-value construction -------------
+            //
+            // Build an 8-byte handle in arena memory laid out as
+            // `[fn_table_idx: i32 LE][captures_ptr: i32 LE]`. The
+            // handle pointer (i32) is left on the operand stack so a
+            // following `LetSet { ty: Closure }` stashes it under the
+            // source-level closure name. For self-recursive closures
+            // (the W7 `fib: (k) => fib(k - 1) + fib(k - 2)` shape) the
+            // matching capture's `let_idx` references a let-binding
+            // the IR's `LetSet` has not yet run; we detect that case
+            // and write `handle_ptr` itself as the capture, mirroring
+            // the LLVM emitter's `not yet bound` branch (see
+            // `emit_make_closure` in `relon-codegen-llvm`).
+            Op::MakeClosure {
+                fn_table_idx,
+                captures,
+                captures_size,
+            } => {
+                // Step 1 — alloc 8 bytes for the handle and stash
+                // its pointer in the scratch i32.
+                self.insns.push(I::I32Const(8));
+                self.insns.push(I::I32Const(4));
+                let arena_alloc_fn_idx = import_index(1); // §4.1
+                self.insns.push(I::Call(arena_alloc_fn_idx));
+                self.needs_arena_alloc = true;
+                let handle_scratch = self.make_closure_handle_scratch();
+                self.insns.push(I::LocalSet(handle_scratch));
+
+                // Step 2 — alloc the captures struct (if any) and
+                // stash its pointer in a second scratch i32. When
+                // there are no captures the captures_ptr slot in
+                // the handle stays zero.
+                let captures_scratch = if *captures_size > 0 {
+                    self.insns.push(I::I32Const(*captures_size as i32));
+                    self.insns.push(I::I32Const(8)); // captures align — match LLVM's 8B rule
+                    self.insns.push(I::Call(arena_alloc_fn_idx));
+                    let s = self.make_closure_captures_scratch();
+                    self.insns.push(I::LocalSet(s));
+                    Some(s)
+                } else {
+                    None
+                };
+
+                // Step 3 — write fn_table_idx at handle+0.
+                self.insns.push(I::LocalGet(handle_scratch));
+                self.insns.push(I::I32Const(*fn_table_idx as i32));
+                self.insns.push(I::I32Store(MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+
+                // Step 4 — write captures_ptr at handle+4. Zero when
+                // the closure has no captures (matches LLVM AOT).
+                self.insns.push(I::LocalGet(handle_scratch));
+                if let Some(s) = captures_scratch {
+                    self.insns.push(I::LocalGet(s));
+                } else {
+                    self.insns.push(I::I32Const(0));
+                }
+                self.insns.push(I::I32Store(MemArg {
+                    offset: 4,
+                    align: 2,
+                    memory_index: 0,
+                }));
+
+                // Step 5 — populate captures. Each capture either
+                // references an existing let-local (the common case
+                // for outer-scope captures) or refers to the
+                // closure's own handle for self-recursion (the
+                // matching let-local hasn't been bound yet — the
+                // `LetSet` immediately follows `MakeClosure`).
+                if let Some(s) = captures_scratch {
+                    for cap in captures {
+                        let existing = self.let_locals.iter().find(|l| l.ir_idx == cap.let_idx);
+                        // Push the captures-struct base + per-field
+                        // offset so the typed store has `[addr, value]`
+                        // on the operand stack.
+                        self.insns.push(I::LocalGet(s));
+                        // Value source: either an existing let-local
+                        // (read it back) or — for self-recursion —
+                        // the handle pointer we just allocated.
+                        let cap_ty = cap.ty;
+                        match existing {
+                            Some(local) => {
+                                if local.ty != cap_ty {
+                                    return Err(LowerError::UnsupportedOp(
+                                        "make_closure_capture_type_mismatch",
+                                        UnsupportedOpReason::Other(
+                                            "make_closure_capture_type_mismatch",
+                                        ),
+                                    ));
+                                }
+                                self.insns.push(I::LocalGet(local.wasm_idx));
+                            }
+                            None => {
+                                // Self-recursive capture: only legal
+                                // when the capture type is Closure
+                                // (anything else can't refer to a
+                                // not-yet-bound let-local in source).
+                                if cap_ty != IrType::Closure {
+                                    return Err(LowerError::UnsupportedOp(
+                                        "make_closure_capture_unbound_non_closure",
+                                        UnsupportedOpReason::ClosureValue,
+                                    ));
+                                }
+                                self.insns.push(I::LocalGet(handle_scratch));
+                            }
+                        }
+                        // Emit the per-type store at the capture's
+                        // declared offset inside the captures struct.
+                        match cap_ty {
+                            IrType::I64 => {
+                                self.insns.push(I::I64Store(MemArg {
+                                    offset: u64::from(cap.offset),
+                                    align: 3,
+                                    memory_index: 0,
+                                }));
+                            }
+                            IrType::F64 => {
+                                self.insns.push(I::F64Store(MemArg {
+                                    offset: u64::from(cap.offset),
+                                    align: 3,
+                                    memory_index: 0,
+                                }));
+                            }
+                            IrType::Bool => {
+                                self.insns.push(I::I32Store8(MemArg {
+                                    offset: u64::from(cap.offset),
+                                    align: 0,
+                                    memory_index: 0,
+                                }));
+                            }
+                            IrType::I32
+                            | IrType::Null
+                            | IrType::String
+                            | IrType::ListInt
+                            | IrType::ListFloat
+                            | IrType::ListBool
+                            | IrType::ListString
+                            | IrType::ListSchema
+                            | IrType::Closure => {
+                                self.insns.push(I::I32Store(MemArg {
+                                    offset: u64::from(cap.offset),
+                                    align: 2,
+                                    memory_index: 0,
+                                }));
+                            }
+                        }
+                    }
+                }
+
+                // Step 6 — push the handle pointer as the
+                // `Op::MakeClosure`'s result. The IR pipeline
+                // immediately follows with a `LetSet { ty: Closure }`
+                // that stashes it under the source-level name.
+                self.insns.push(I::LocalGet(handle_scratch));
+            }
+
+            // ----- Z.4.3 — Closure invocation ------------------------
+            //
+            // Stack discipline: `[handle, arg0, ..., argN] -> [ret_ty]`.
+            // wasm `call_indirect` needs the operands in a different
+            // order — `[captures_ptr, arg0, ..., argN, fn_table_idx]`.
+            // We spill all user args + the handle into per-arg
+            // scratch locals, then re-push in the indirect-call
+            // order.
+            Op::CallClosure { param_tys, ret_ty } => {
+                // Reserve / reuse the per-signature arg-spill scratch
+                // pool. `slots[i]` is the scratch local for the i-th
+                // IR arg (in push order).
+                let slots = self.call_arg_scratches_for(param_tys);
+                // Pop user args off in reverse (wasm pops right-to-
+                // left) into the matching scratch slot.
+                for i in (0..param_tys.len()).rev() {
+                    self.insns.push(I::LocalSet(slots[i]));
+                }
+                // Pop the closure handle (i32).
+                let handle_scratch = self.call_handle_scratch();
+                self.insns.push(I::LocalSet(handle_scratch));
+
+                // Re-push: captures_ptr (handle[+4]) first ...
+                self.insns.push(I::LocalGet(handle_scratch));
+                self.insns.push(I::I32Load(MemArg {
+                    offset: 4,
+                    align: 2,
+                    memory_index: 0,
+                }));
+                // ... then user args in declaration order ...
+                for slot in &slots {
+                    self.insns.push(I::LocalGet(*slot));
+                }
+                // ... then fn_table_idx (handle[+0]) on top.
+                self.insns.push(I::LocalGet(handle_scratch));
+                self.insns.push(I::I32Load(MemArg {
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
+                }));
+                // Record the call-indirect signature; the module-level
+                // assembly resolves it against the wasm `TypeSection`
+                // and patches each placeholder `CallIndirect` in the
+                // emitted instruction stream. We emit a placeholder
+                // with `type_index = u32::MAX`; the post-walk
+                // `patch_call_indirect_type_indices` pass replaces it
+                // with the resolved index in IR order.
+                self.call_indirect_sigs_requested
+                    .push((param_tys.clone(), *ret_ty));
+                self.insns.push(I::CallIndirect {
+                    type_index: u32::MAX, // patched in finalise_module
+                    table_index: 0,
+                });
             }
 
             // ----- Scope-cut: Float arithmetic -----------------------
@@ -1376,6 +2051,65 @@ impl<'a> EmitState<'a> {
         abs_offset
     }
 
+    /// Z.4.3 — lazy scratch i32 used by `MakeClosure` to stash the
+    /// freshly-allocated handle pointer across the captures-init
+    /// sequence (so self-recursive captures can write the handle
+    /// itself before the matching `LetSet` runs).
+    fn make_closure_handle_scratch(&mut self) -> u32 {
+        if let Some(idx) = self.make_closure_handle_scratch {
+            return idx;
+        }
+        let idx = self.alloc_aux(AuxLocal::ScratchI32);
+        self.make_closure_handle_scratch = Some(idx);
+        idx
+    }
+
+    /// Z.4.3 — lazy scratch i32 used by `MakeClosure` to stash the
+    /// captures-struct base pointer across the per-field stores.
+    fn make_closure_captures_scratch(&mut self) -> u32 {
+        if let Some(idx) = self.make_closure_captures_scratch {
+            return idx;
+        }
+        let idx = self.alloc_aux(AuxLocal::ScratchI32);
+        self.make_closure_captures_scratch = Some(idx);
+        idx
+    }
+
+    /// Z.4.3 — reserve enough scratch slots for one `CallClosure`'s
+    /// args, returning the wasm-local indices in IR push order. The
+    /// slots are pooled across `CallClosure` ops in the same body —
+    /// a later call with the same param-type-sequence reuses the
+    /// same slots, keeping the local-section compact.
+    fn call_arg_scratches_for(&mut self, param_tys: &[IrType]) -> Vec<u32> {
+        // Look for an existing pool whose ty-sequence matches.
+        let need: Vec<IrType> = param_tys.to_vec();
+        if let Some(pool) = self.call_closure_arg_pools.iter().find(|p| p.tys == need) {
+            return pool.slots.clone();
+        }
+        let mut slots = Vec::with_capacity(param_tys.len());
+        for ty in param_tys {
+            let idx = self.alloc_aux(AuxLocal::CallArgScratch(*ty));
+            slots.push(idx);
+        }
+        self.call_closure_arg_pools.push(CallArgPool {
+            tys: need,
+            slots: slots.clone(),
+        });
+        slots
+    }
+
+    /// Z.4.3 — lazy scratch i32 used by `CallClosure` to stash the
+    /// closure handle while the args are popped + re-pushed in
+    /// indirect-call order.
+    fn call_handle_scratch(&mut self) -> u32 {
+        if let Some(idx) = self.call_closure_handle_scratch {
+            return idx;
+        }
+        let idx = self.alloc_aux(AuxLocal::ScratchI32);
+        self.call_closure_handle_scratch = Some(idx);
+        idx
+    }
+
     /// Encode the walker's accumulated state into a `wasm_encoder::Function`.
     fn finalise(self) -> Result<Function, LowerError> {
         if !self.saw_return_prep {
@@ -1405,15 +2139,36 @@ impl<'a> EmitState<'a> {
                     IrType::I64 => ValType::I64,
                     IrType::Bool | IrType::I32 => ValType::I32,
                     IrType::F64 => ValType::F64,
-                    _ => {
-                        return Err(LowerError::UnsupportedOp(
-                            "let_local_unsupported_ty",
-                            non_int_main_param_reason(ty),
-                        ))
-                    }
+                    // Closure-typed lets are i32 arena handles. Other
+                    // pointer-shaped types (String / List variants)
+                    // currently surface as walker errors at the
+                    // matching op-emit arms, but we accept them here
+                    // for future widening.
+                    IrType::Closure
+                    | IrType::Null
+                    | IrType::String
+                    | IrType::ListInt
+                    | IrType::ListFloat
+                    | IrType::ListBool
+                    | IrType::ListString
+                    | IrType::ListSchema => ValType::I32,
                 },
                 AuxLocal::RecordBase => ValType::I32,
                 AuxLocal::ScratchI64 => ValType::I64,
+                AuxLocal::ScratchI32 => ValType::I32,
+                AuxLocal::CallArgScratch(ty) => match ty {
+                    IrType::I64 => ValType::I64,
+                    IrType::F64 => ValType::F64,
+                    IrType::Bool | IrType::I32 => ValType::I32,
+                    IrType::Closure
+                    | IrType::Null
+                    | IrType::String
+                    | IrType::ListInt
+                    | IrType::ListFloat
+                    | IrType::ListBool
+                    | IrType::ListString
+                    | IrType::ListSchema => ValType::I32,
+                },
             };
             push_group(vt, &mut groups);
         }
@@ -1641,50 +2396,43 @@ mod tests {
     }
 
     #[test]
-    fn walker_scope_cuts_w7_production_closure() {
-        // Production W7-shape: `#main(Int n) -> Dict { ... }` with an
-        // `#internal fib: (k) => ...` first-class recursive closure
-        // called via `result: fib(n)`. Z.4.1 unlocks the
-        // `AllocRootRecord` / `StoreFieldAtRecord` Dict mini-ABI but
-        // the closure-as-value path (`MakeClosure` / `CallClosure`)
-        // is Z.4.3 follow-up — the walker still scope-cuts here,
-        // routed under `ClosureValue` so the host's tracing layer
-        // groups the row with the matching follow-up batch.
-        let src = "#main(Int n) -> Dict\n\
-                   {\n\
-                     #internal\n\
-                     fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
-                     result: fib(n)\n\
-                   }";
-        let ast = relon_parser::parse_document(src).expect("parse");
-        let analyzed = relon_analyzer::analyze(&ast);
-        let lowered = match relon_ir::lower_workspace_single(&analyzed, &ast) {
-            Ok(l) => l,
-            Err(e) => {
-                // If a future IR-pipeline tightening re-rejects the
-                // Dict-return upstream, the walker's contract still
-                // holds — the source can't possibly reach a
-                // compiled tier. Surface the upstream reject as a
-                // pass for THIS test (its purpose is to pin the
-                // walker's scope-cut, not the IR layer's).
-                eprintln!(
-                    "W7 production source rejected upstream of walker: {e:?} \
-                     (test still passes — walker can't lower what doesn't reach it)"
-                );
-                return;
-            }
-        };
-        let err = lower_ir_module(&lowered)
-            .expect_err("walker must reject W7 production closure-as-value (Z.4.3 follow-up)");
-        match err {
-            LowerError::UnsupportedOp(_, reason) => {
-                assert!(
-                    matches!(reason, UnsupportedOpReason::ClosureValue),
-                    "W7 production scope-cut should route to ClosureValue (Z.4.3), got {reason:?}"
-                );
-            }
-            other => panic!("expected UnsupportedOp, got {other:?}"),
-        }
+    fn walker_lowers_w7_production_closure() {
+        // Z.4.3 — production W7 shape: `#main(Int n) -> Dict { ... }`
+        // with an `#internal fib: (k) => ...` first-class recursive
+        // closure called via `result: fib(n)`. The IR pipeline
+        // lowers this into:
+        //
+        //   * an outer entry body emitting `AllocRootRecord` +
+        //     `MakeClosure { fn_table_idx: 0, captures: [
+        //     ClosureCapture { let_idx: 0, ty: Closure, offset: 0 }] }`
+        //     + `LetSet { ty: Closure }` + `LetGet { ty: Closure }`
+        //     + `LoadField { ty: I64 }` + `CallClosure { param_tys:
+        //     [I64], ret_ty: I64 }` + `StoreFieldAtRecord` +
+        //     `Return`, and
+        //   * one lambda function (`__closure_0`) whose body reads
+        //     its self-handle out of the captures struct (LocalGet 0
+        //     + LoadI32AtAbsolute), the loop var k out of LocalGet
+        //     1, then doubly recurses through two `CallClosure {
+        //     param_tys: [I64], ret_ty: I64 }` ops.
+        //
+        // Z.4.3 wires the funcref table + `MakeClosure` / `CallClosure`
+        // lowering so the walker emits a valid wasm module instead of
+        // scope-cutting under `ClosureValue`. Validate the module
+        // round-trips through wasmparser; the semantic smoke
+        // (Compiled tier + correct fib(22) = 17711) lives on the
+        // host side in `tests/z4_closure_smoke.rs`.
+        let lowered = lower_source(
+            "#main(Int n) -> Dict\n\
+             {\n\
+               #internal\n\
+               fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
+               result: fib(n)\n\
+             }",
+        );
+        let bytes = lower_ir_module(&lowered).expect("lower_ir_module(W7 production)");
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .expect("wasmparser validates W7 production walker output");
     }
 
     #[test]
