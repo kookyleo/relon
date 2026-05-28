@@ -1695,9 +1695,12 @@ fn w12_lua_src() -> &'static str {
 // * Algorithm complexity preserved: O(n) reduce with two dict-chain
 //   reads per iter. No closed-form fold — the chain reads materialise
 //   per iter through the tree-walker `Value::Dict` lookup path.
-// * Time-math sanity: dict-chain reads are ~20 ns/iter on a 5-level
-//   path in the tree-walker (1 lookup ~ 4 ns; 10 lookups + 2 adds
-//   ~ 40-50 ns). Sub-1 ns per iter would indicate a closed-form fold.
+// * Time-math sanity: the tree-walker hits ~5 µs/iter on this shape
+//   (smoke 2026-05-28: 5.13 ms for N=1000 ≈ 5.13 µs/iter) — ~500 ns
+//   per dict-chain hop * 10 hops + arithmetic. LuaJIT JITs to
+//   ~5 ns/iter (10 hash-table lookups + 2 adds in ~15 cycles). Sub-
+//   1 ns per iter on the tree-walker row would indicate a closed-
+//   form fold; the dispatch overhead alone rules that out.
 // * I/O shape: `#main(Int n) -> Dict` with `result` field; Lua
 //   returns the same scalar. Cross-checked via `assert_relon_lua_consistent`.
 // * Backend coverage: tree_walk + luajit only. Bytecode / LLVM AOT /
@@ -1772,10 +1775,15 @@ fn w13_expected() -> i64 {
 //   were chosen so both predicates are trivially `true`, so the
 //   sum-per-iter is exactly `+2`. The predicates ARE evaluated per
 //   iter in the tree-walker.
-// * Time-math sanity: 4 comparisons + 4 boolean ops + 2 conditional
-//   adds per iter ~ 100 ns/iter in the tree-walker (dispatch-heavy);
-//   the LLVM AOT row (if widened to lower this shape) would land
-//   in the 1-3 ns/iter range — hence the closed-form-fold gate.
+// * Time-math sanity: smoke 2026-05-28 shows tree_walk 4.5 µs/iter,
+//   luajit 11.4 ns/iter, bytecode 726 ns/iter, cranelift AOT 8.6 ns/iter,
+//   wasm wasmtime_fast 4.9 ns/iter for N=1000. The compiled-backend
+//   range (4.9-11.4 ns/iter) covers 4 comparisons + 4 boolean ops + 2
+//   conditional adds per iter (~15-35 cycles at 3 GHz), consistent
+//   with real loop execution. Sub-1 ns/iter would indicate a closed-
+//   form fold — gated separately for LLVM AOT + rust_native via
+//   `paper_win_closed_form_fold_label` because those reduce the
+//   constant-true predicates to `n * 2` at -O3.
 // * I/O shape: `#main(Int n) -> Int`, single Int param, Int return.
 //   Lua equivalent matches.
 // * Backend coverage: tree_walk + luajit + bytecode (if accepted).
@@ -1834,8 +1842,13 @@ fn w14_expected() -> i64 {
 //   on `Σ (i%2==0 ? 2i : 3i)` — which is itself a closed-form
 //   polynomial. The `paper_win_closed_form_fold_label` gate is the
 //   right place to suppress an LLVM AOT row that performs the fold.
-// * Time-math sanity: 1 modulo + 1 compare + 1 multiply + 1 add per
-//   iter ~ 50 ns/iter in the tree-walker.
+// * Time-math sanity: smoke 2026-05-28 shows tree_walk 2.8 µs/iter,
+//   luajit 5.6 ns/iter, bytecode 315 ns/iter, cranelift AOT 5.6 ns/iter,
+//   wasm wasmtime_fast 2.2 ns/iter for N=1000. The compiled-backend
+//   range (2.2-5.6 ns/iter) covers 1 modulo + 1 compare + 1 multiply
+//   + 1 add per iter (~7-17 cycles at 3 GHz), consistent with real
+//   loop execution (the wasm number is close to the cycle floor for
+//   the body, suggesting strong inlining without closed-form fold).
 // * I/O shape: `#main(Int n) -> Int`; Lua matches.
 // * Backend coverage: tree_walk + luajit + bytecode (if accepted).
 //   LLVM AOT / rust_native suppressed via
