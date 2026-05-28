@@ -59,7 +59,7 @@ use std::time::{Duration, Instant};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use relon_bench::quiescence::verify_quiescence;
-use relon_codegen_native::{
+use relon_codegen_cranelift::{
     clear_recording, global_trace_jit_state, register_recording, AotEvaluator,
     RecordingRegistration, SandboxConfig, MAX_FN_ID,
 };
@@ -537,7 +537,10 @@ fn try_install_recorder_trace(
         },
     );
     unsafe {
-        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, warmup_args.as_ptr());
+        relon_codegen_cranelift::trace_install::__relon_jump_to_recorder(
+            fn_id,
+            warmup_args.as_ptr(),
+        );
     }
     state.lookup_trace(fn_id).is_some()
 }

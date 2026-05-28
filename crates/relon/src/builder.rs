@@ -254,7 +254,7 @@ impl EvaluatorBuilder {
             }
             #[cfg(feature = "cranelift-aot")]
             Backend::CraneliftAot => {
-                let aot = relon_codegen_native::AotEvaluator::from_source(&source_string)
+                let aot = relon_codegen_cranelift::AotEvaluator::from_source(&source_string)
                     .map_err(|e| BackendError::CraneliftAot(e.to_string()))?;
                 Ok(Box::new(aot))
             }

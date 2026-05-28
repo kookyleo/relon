@@ -1,6 +1,6 @@
 //! Public façade implementing [`relon_eval_api::Evaluator`].
 //!
-//! Construction mirrors `relon_codegen_native::AotEvaluator::from_source`:
+//! Construction mirrors `relon_codegen_cranelift::AotEvaluator::from_source`:
 //! parse → analyze → `lower_workspace_single` → bytecode compile.
 //! `run_main` packs the args into virtual local slots, runs the VM,
 //! and unpacks the return slots back into a `Value`. The arena
@@ -73,7 +73,7 @@ pub enum BytecodeError {
 /// pass consumed.
 ///
 /// Returned by [`BytecodeEvaluator::recording_registration_data`].
-/// The `relon-codegen-native` crate translates this into its own
+/// The `relon-codegen-cranelift` crate translates this into its own
 /// `RecordingRegistration` shape (which the recorder dispatcher
 /// consumes); both views carry the same two fields, but the
 /// translation lives at the boundary so the bytecode crate stays
@@ -177,7 +177,7 @@ pub struct BytecodeEvaluator {
     /// vs `i64` SSA values for an integer-overflow trace shape).
     ///
     /// Hosts that orchestrate the recorder registration externally
-    /// (`relon_codegen_native::register_recording`) read this slot via
+    /// (`relon_codegen_cranelift::register_recording`) read this slot via
     /// [`Self::recording_registration_data`] to keep the recorder body
     /// and the bytecode body in lock-step. Empty when the evaluator
     /// was built from a synthetic IR fixture that didn't surface its
@@ -440,7 +440,7 @@ impl BytecodeEvaluator {
     /// consumed.
     ///
     /// Returns a [`RecordingRegistrationData`] view that the
-    /// `relon-codegen-native` crate consumes via its
+    /// `relon-codegen-cranelift` crate consumes via its
     /// `register_recording` API. Cloning the body is the slow path
     /// — the host only registers once per `fn_id`, so the per-clone
     /// cost is amortised across every subsequent trace invocation.
@@ -515,7 +515,7 @@ impl BytecodeEvaluator {
     /// the per-`fn_id` counter crosses the configured threshold (see
     /// [`Self::with_hot_threshold`]), `trigger.on_hot(fn_id, args)`
     /// fires exactly once. Hosts using the cranelift adapter
-    /// (`relon_codegen_native::CraneliftHotTrigger`) get the standard
+    /// (`relon_codegen_cranelift::CraneliftHotTrigger`) get the standard
     /// `__relon_jump_to_recorder` recording-driver pipeline; tests can
     /// install a mock to observe the dispatch shape.
     ///
@@ -542,7 +542,7 @@ impl BytecodeEvaluator {
     /// M2-B phase 4c: stamp the cross-backend `fn_id` on the compiled
     /// function. The slot drives the hot-counter prologue's per-id
     /// lookup and matches the id under which the host registered a
-    /// [`relon_codegen_native::trace_install::RecordingRegistration`]
+    /// [`relon_codegen_cranelift::trace_install::RecordingRegistration`]
     /// for the recorder.
     pub fn with_fn_id(mut self, fn_id: u32) -> Self {
         self.func = self.func.clone().with_fn_id(fn_id);

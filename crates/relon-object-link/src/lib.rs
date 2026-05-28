@@ -1,5 +1,5 @@
 //! `relon-object-link` — the missing link pass between
-//! `relon-codegen-native` and `relon-object-cache` in the v5-gamma
+//! `relon-codegen-cranelift` and `relon-object-cache` in the v5-gamma
 //! native AOT pipeline.
 //!
 //! ## Why this crate exists

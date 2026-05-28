@@ -1,7 +1,7 @@
 //! External-world handles the cranelift-emitted trace shuffles across
 //! the FFI boundary.
 //!
-//! Shared ABI types. trace-jit / trace-emitter / codegen-native all
+//! Shared ABI types. trace-jit / trace-emitter / codegen-cranelift all
 //! import these newtypes rather than redeclaring them. Phase v6-γ M1
 //! starts requiring every shared type live **only** in this crate;
 //! any fork-definition will be rejected by ABI tests.

@@ -80,7 +80,7 @@ relon-evaluator = { path = "crates/relon-evaluator", version = "0.1.0" }
 relon-fmt = { path = "crates/relon-fmt", version = "0.1.0" }
 relon-ir = { path = "crates/relon-ir", version = "0.1.0" }
 relon-bytecode = { path = "crates/relon-bytecode", version = "0.1.0" }
-relon-codegen-native = { path = "crates/relon-codegen-native", version = "0.1.0" }
+relon-codegen-cranelift = { path = "crates/relon-codegen-cranelift", version = "0.1.0" }
 # Phase A bootstrap: LLVM-backed AOT backend (inkwell + llvm-sys 18.1
 # pinned to the system LLVM 18.1.3 install). Lives in a separate
 # crate so the cranelift JIT path stays the workspace-default and

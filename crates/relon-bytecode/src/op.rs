@@ -550,7 +550,7 @@ pub struct BcFunction {
     /// promotion — the VM's hot-counter prologue stays inert.
     ///
     /// Mirrors the `fn_id` the cranelift HotCounter prologue uses
-    /// (`relon_codegen_native::trace_install::__relon_jump_to_recorder`),
+    /// (`relon_codegen_cranelift::trace_install::__relon_jump_to_recorder`),
     /// so a single tracer registry can host both backends without
     /// collisions: hosts that wire bytecode + cranelift dispatchers to
     /// the same source program assign the same `fn_id` to both

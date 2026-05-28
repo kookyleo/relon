@@ -39,7 +39,7 @@
 
 use std::collections::HashMap;
 
-use relon_codegen_native::{
+use relon_codegen_cranelift::{
     global_trace_jit_state, hot_counter_peek, hot_counter_reset, jump_helper_call_count,
     reset_jump_helper_call_count, AotEvaluator, SandboxConfig, TraceJitError, TraceJitState,
     MAX_FN_ID, RELON_HOT_THRESHOLD,
@@ -489,7 +489,7 @@ fn make_const_recorder(v: i64) -> RecorderState {
 
 // ---- v6-γ M4: real `__relon_jump_to_recorder` driver tests ----
 
-use relon_codegen_native::{
+use relon_codegen_cranelift::{
     clear_recording, recording_registration_count, register_recording, RecordingRegistration,
 };
 
@@ -511,7 +511,7 @@ fn jump_helper_no_registration_is_noop() {
     let _ = state.invalidate_trace(fn_id);
     reset_jump_helper_call_count();
     unsafe {
-        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, std::ptr::null());
+        relon_codegen_cranelift::trace_install::__relon_jump_to_recorder(fn_id, std::ptr::null());
     }
     assert_eq!(jump_helper_call_count(), 1);
     assert!(
@@ -555,7 +555,7 @@ fn jump_helper_installs_const_trace_from_registry() {
     );
     reset_jump_helper_call_count();
     unsafe {
-        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, std::ptr::null());
+        relon_codegen_cranelift::trace_install::__relon_jump_to_recorder(fn_id, std::ptr::null());
     }
     assert_eq!(jump_helper_call_count(), 1);
     let installed = state.lookup_trace(fn_id).expect("trace installed");
@@ -573,7 +573,7 @@ fn jump_helper_installs_const_trace_from_registry() {
     use std::sync::Arc;
     let pre_trace = state.lookup_trace(fn_id).expect("pre: trace installed");
     unsafe {
-        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, std::ptr::null());
+        relon_codegen_cranelift::trace_install::__relon_jump_to_recorder(fn_id, std::ptr::null());
     }
     assert_eq!(jump_helper_call_count(), 2);
     let post_trace = state
@@ -738,7 +738,7 @@ fn invalidate_trace_drops_the_install() {
 
 #[test]
 fn default_host_hooks_populates_save_deopt_slot() {
-    use relon_codegen_native::default_host_hooks;
+    use relon_codegen_cranelift::default_host_hooks;
     let hooks = default_host_hooks();
     assert!(hooks.save_deopt.is_some(), "save_deopt must be wired");
     let mut ctx = TraceContext::with_hooks(8, hooks);
@@ -796,7 +796,7 @@ fn let_with_arg_use_installs_via_local_get_lowering() {
     // so the `ArithOverflow` guard does not deopt.
     let raw_args: [u64; 2] = [100u64, 23u64];
     unsafe {
-        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, raw_args.as_ptr());
+        relon_codegen_cranelift::trace_install::__relon_jump_to_recorder(fn_id, raw_args.as_ptr());
     }
     assert!(
         state.lookup_trace(fn_id).is_some(),
@@ -860,7 +860,7 @@ fn arith_overflow_guard_uses_real_carry_bit() {
     // Warm up with non-overflowing values.
     let warm_args: [u64; 2] = [1u64, 2u64];
     unsafe {
-        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, warm_args.as_ptr());
+        relon_codegen_cranelift::trace_install::__relon_jump_to_recorder(fn_id, warm_args.as_ptr());
     }
     assert!(state.lookup_trace(fn_id).is_some(), "trace must install");
 
@@ -953,7 +953,7 @@ fn invoke_with_resume_exposes_deopt_snapshot_to_fallback() {
     );
     let warm_args: [u64; 2] = [1u64, 2u64];
     unsafe {
-        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, warm_args.as_ptr());
+        relon_codegen_cranelift::trace_install::__relon_jump_to_recorder(fn_id, warm_args.as_ptr());
     }
     assert!(state.lookup_trace(fn_id).is_some(), "trace must install");
 
@@ -1057,7 +1057,7 @@ fn save_deopt_dispatches_through_host_hooks_table() {
     );
     let warm: [u64; 2] = [1, 2];
     unsafe {
-        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, warm.as_ptr());
+        relon_codegen_cranelift::trace_install::__relon_jump_to_recorder(fn_id, warm.as_ptr());
     }
     let trace_fn = state.lookup_trace(fn_id).expect("trace");
 
@@ -1222,7 +1222,7 @@ fn jump_helper_aborts_recording_for_unsupported_op() {
         },
     );
     unsafe {
-        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, std::ptr::null());
+        relon_codegen_cranelift::trace_install::__relon_jump_to_recorder(fn_id, std::ptr::null());
     }
     assert!(state.lookup_trace(fn_id).is_none(), "aborted → no install");
     let _ = clear_recording(fn_id);

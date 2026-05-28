@@ -5,7 +5,7 @@
 //! The `lld-sys` / `lld` crates are not on a stable release channel
 //! as of v5-gamma planning, so this module deliberately does **not**
 //! pull them in. The public shape ([`LldLinker`] + `link`) is
-//! defined so the codegen-native crate can write call sites against
+//! defined so the codegen-cranelift crate can write call sites against
 //! a stable API, but every entry point returns
 //! [`LinkError::FeatureNotImplemented`].
 //!

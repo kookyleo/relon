@@ -13,7 +13,7 @@
 //! lifetime of the pass so any future regression that re-introduces
 //! the ArithOverflow guards on W4 surfaces on the next test run.
 
-use relon_codegen_native::{RecordingOutcome, TraceRecordingEvaluator};
+use relon_codegen_cranelift::{RecordingOutcome, TraceRecordingEvaluator};
 use relon_ir::ir::{IrType, Op, TaggedOp};
 use relon_parser::TokenRange;
 use relon_trace_jit::optimizer::OptimizerPipeline;

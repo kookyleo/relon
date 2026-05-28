@@ -1,6 +1,6 @@
 //! Cranelift-agnostic description of the trace-entry function ABI.
 //!
-//! Shared ABI types. trace-jit / trace-emitter / codegen-native all
+//! Shared ABI types. trace-jit / trace-emitter / codegen-cranelift all
 //! import these definitions rather than redeclaring them. Phase v6-γ
 //! M1 starts requiring every shared type live **only** in this crate;
 //! any fork-definition will be rejected by ABI tests.
@@ -61,7 +61,7 @@ pub enum AbiType {
 /// reconstructing a `Signature` from scratch.
 ///
 /// Reviewers: **DO NOT** add a calling-convention field here. The
-/// trace ABI pins SystemV (the only one v5-β-1 codegen-native ever
+/// trace ABI pins SystemV (the only one v5-β-1 codegen-cranelift ever
 /// emits) and the emitter applies it at lowering time. Threading
 /// `CallConv` through this struct would re-introduce a cranelift dep
 /// into the ABI crate.

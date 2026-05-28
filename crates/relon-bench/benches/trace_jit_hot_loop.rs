@@ -161,7 +161,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module as _};
 
 use relon_bench::quiescence::verify_quiescence;
-use relon_codegen_native::{
+use relon_codegen_cranelift::{
     clear_recording, compile_inline_host_fn, global_trace_jit_state, register_recording,
     register_trace_runtime_symbols, trace_install::TraceJitState, AotEvaluator,
     RecordingRegistration, SandboxConfig, TraceIcSlot, MAX_FN_ID,
@@ -265,7 +265,7 @@ fn timed_with_warmup<F: FnMut()>(iters: u64, mut routine: F) -> Duration {
 
 /// Build an IR body that computes `sum(1..=n)` via an `Op::Loop` with
 /// an explicit `BrIf` exit, mirroring the working pattern from
-/// `relon-codegen-native/tests/control_flow_extended.rs`. The loop
+/// `relon-codegen-cranelift/tests/control_flow_extended.rs`. The loop
 /// runs entirely on the wasm operand-stack carrier; the cranelift-AOT
 /// backend lowers the back-edge into a normal cranelift loop.
 ///
@@ -701,7 +701,7 @@ fn install_recorded_loop_trace() -> u32 {
     state.invalidate_trace(fn_id);
     let warm: [u64; 1] = [3];
     unsafe {
-        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, warm.as_ptr());
+        relon_codegen_cranelift::trace_install::__relon_jump_to_recorder(fn_id, warm.as_ptr());
     }
     assert!(
         state.lookup_trace(fn_id).is_some(),
@@ -797,7 +797,7 @@ fn install_trace_for_step() -> u32 {
     state.invalidate_trace(fn_id);
     let warm: [u64; 2] = [1, 2];
     unsafe {
-        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, warm.as_ptr());
+        relon_codegen_cranelift::trace_install::__relon_jump_to_recorder(fn_id, warm.as_ptr());
     }
     assert!(
         state.lookup_trace(fn_id).is_some(),
@@ -840,7 +840,7 @@ fn install_explicit_conv_trace(call_conv: CallConv) -> (TraceJitState, u32) {
 
 /// Build the same 4-op trace through the at-call-site inline path
 /// (v6-ε-0-A). Used by the `dispatch_inline` row.
-fn build_inline_step_host_fn() -> relon_codegen_native::InlineHostFn {
+fn build_inline_step_host_fn() -> relon_codegen_cranelift::InlineHostFn {
     use relon_trace_jit::{TraceBuffer, TraceOp};
     let mut buffer = TraceBuffer::new();
     let a = buffer.fresh_ssa();

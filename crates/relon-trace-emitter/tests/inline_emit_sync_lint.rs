@@ -6,7 +6,7 @@
 //! The two emit paths (standalone trampoline + at-call-site inline) carry
 //! near-identical per-op lowering rules. Today the only sync guard is the
 //! `inline_matches_standalone_result` smoke test in
-//! `crates/relon-codegen-native/tests/trace_jit_inline_smoke.rs` — and
+//! `crates/relon-codegen-cranelift/tests/trace_jit_inline_smoke.rs` — and
 //! that only catches drift when the missed op happens to appear in the
 //! smoke input. Adding a new `TraceOp` variant only forces a match-arm
 //! in the standalone path (Rust's exhaustive match check); the inline

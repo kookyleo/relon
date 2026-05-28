@@ -25,11 +25,11 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use relon_codegen_native::trace_install::{
+use relon_codegen_cranelift::trace_install::{
     __relon_jump_to_recorder, clear_recording, default_host_hooks, global_trace_jit_state,
     register_recording, JITedTraceFn, RecordingRegistration,
 };
-use relon_codegen_native::{RecordingOutcome, TraceRecordingEvaluator};
+use relon_codegen_cranelift::{RecordingOutcome, TraceRecordingEvaluator};
 use relon_ir::ir::{IrType, Op, TaggedOp};
 use relon_ir::shape_hash::shape_hash_for_keys;
 use relon_parser::TokenRange;

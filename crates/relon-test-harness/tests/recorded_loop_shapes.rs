@@ -35,7 +35,7 @@
 //! assert recorder correctness; full 4-way parity for the brief's
 //! catalogue lives on the v6-δ M3 "bytecode VM widening" branch.
 
-use relon_codegen_native::{RecordingOutcome, TraceRecordingEvaluator};
+use relon_codegen_cranelift::{RecordingOutcome, TraceRecordingEvaluator};
 use relon_ir::ir::{IrType, Op, TaggedOp};
 use relon_parser::TokenRange;
 use relon_trace_jit::TraceOp;

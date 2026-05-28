@@ -1,7 +1,7 @@
 //! `TraceContext` — the runtime state every cranelift-emitted trace
 //! reads / writes through the `*mut TraceContext` arg.
 //!
-//! Shared ABI type. trace-jit / trace-emitter / codegen-native all
+//! Shared ABI type. trace-jit / trace-emitter / codegen-cranelift all
 //! import this struct rather than redeclaring it. Phase v6-γ M1 starts
 //! requiring every shared type live **only** in this crate; any
 //! fork-definition will be rejected by ABI tests.

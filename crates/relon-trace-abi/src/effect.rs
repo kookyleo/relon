@@ -1,6 +1,6 @@
 //! Side-effect classification for trace ops.
 //!
-//! Shared ABI type. trace-jit / trace-emitter / codegen-native /
+//! Shared ABI type. trace-jit / trace-emitter / codegen-cranelift /
 //! relon-ir all import this enum rather than redeclaring it. Phase
 //! v6-γ M1 starts requiring every shared type live **only** in this
 //! crate; the ABI smoke tests will reject any fork.

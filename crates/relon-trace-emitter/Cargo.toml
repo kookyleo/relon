@@ -17,7 +17,7 @@ categories = ["compilers"]
 #
 # Dependencies are intentionally narrow: we only need the
 # `relon-trace-jit` data structures and cranelift's frontend + codegen
-# (matched to the version `relon-codegen-native` uses so the workspace
+# (matched to the version `relon-codegen-cranelift` uses so the workspace
 # shares one ISLE backend tree). The recorder is *not* a dependency —
 # this crate consumes the already-optimised trace, not the recording
 # pipeline.
@@ -31,7 +31,7 @@ relon-trace-jit = { workspace = true }
 # byte-for-byte.
 relon-trace-abi = { workspace = true }
 
-# Cranelift v0.131 — kept in lock-step with relon-codegen-native so we
+# Cranelift v0.131 — kept in lock-step with relon-codegen-cranelift so we
 # don't dual-instantiate the same backend in a downstream binary.
 cranelift-codegen = "0.132"
 cranelift-frontend = "0.132"

@@ -66,7 +66,7 @@ use std::collections::BTreeMap;
 
 use relon::JitEvaluator;
 use relon_bytecode::BytecodeEvaluator;
-use relon_codegen_native::{
+use relon_codegen_cranelift::{
     global_trace_jit_state, install_recorder_trace_warmup_with_offset_map, RecordingOutcome,
     TraceRecordingEvaluator,
 };
@@ -286,7 +286,7 @@ fn audit_source(label: &str, src: &str, n: i64) {
             Ok(_) => {
                 // Hook a lookup that captures the snapshot details.
                 let lookup_handle: relon_bytecode::InstalledTraceLookupHandle =
-                    Arc::new(relon_codegen_native::CraneliftTraceLookup);
+                    Arc::new(relon_codegen_cranelift::CraneliftTraceLookup);
                 let _ = lookup_handle;
                 // Drive via the state directly so we can see snapshot.
                 let state = global_trace_jit_state();
@@ -358,7 +358,7 @@ fn audit_source(label: &str, src: &str, n: i64) {
                 // fires.
                 use std::sync::Arc;
                 let lookup_handle: relon_bytecode::InstalledTraceLookupHandle =
-                    Arc::new(relon_codegen_native::CraneliftTraceLookup);
+                    Arc::new(relon_codegen_cranelift::CraneliftTraceLookup);
                 let ev_hooked = BytecodeEvaluator::from_source(src)
                     .unwrap()
                     .with_fn_id(verify_fn_id)

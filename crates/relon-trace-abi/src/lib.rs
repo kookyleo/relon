@@ -13,7 +13,7 @@
 //!   (`__relon_trace_save_deopt`, `__relon_trace_resolve_call`,
 //!   `__relon_trace_inline_cache_lookup`) that the emitted IR calls
 //!   into.
-//! - [`relon-codegen-native`] embeds emitted traces into the generic
+//! - [`relon-codegen-cranelift`] embeds emitted traces into the generic
 //!   backend's dispatch table.
 //!
 //! Prior to this crate each consumer redeclared a "layout-compatible
@@ -45,7 +45,7 @@
 //!
 //! [`relon-trace-emitter`]: https://docs.rs/relon-trace-emitter
 //! [`relon-trace-jit`]: https://docs.rs/relon-trace-jit
-//! [`relon-codegen-native`]: https://docs.rs/relon-codegen-native
+//! [`relon-codegen-cranelift`]: https://docs.rs/relon-codegen-cranelift
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]

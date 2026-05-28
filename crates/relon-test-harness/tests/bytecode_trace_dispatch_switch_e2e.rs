@@ -20,7 +20,7 @@
 //! Side-channel verification: a mock-recording wrapper around the
 //! cranelift lookup counts how many times the trace was consulted
 //! vs. how many times the bytecode dispatch loop actually ticked.
-//! We use `relon_codegen_native::jump_helper_call_count` for the
+//! We use `relon_codegen_cranelift::jump_helper_call_count` for the
 //! recorder side (proxy for "did invocation 1 trigger?") and
 //! `BytecodeEvaluator::run_main_with_metrics` against a no-trace
 //! control to bound the dispatch cost.
@@ -33,11 +33,11 @@ use relon_bytecode::trace_dispatch::{InstalledTraceLookup, TraceInvokeOutcome};
 use relon_bytecode::{
     BytecodeEvaluator, HotTraceTriggerHandle, InstalledTraceLookupHandle, COUNTER_SATURATED,
 };
-use relon_codegen_native::trace_install::{
+use relon_codegen_cranelift::trace_install::{
     clear_recording, global_trace_jit_state, jump_helper_call_count, register_recording,
     reset_jump_helper_call_count, RecordingRegistration,
 };
-use relon_codegen_native::{CraneliftHotTrigger, CraneliftTraceLookup};
+use relon_codegen_cranelift::{CraneliftHotTrigger, CraneliftTraceLookup};
 use relon_eval_api::{Evaluator, Value};
 use relon_ir::{IrType, Op, TaggedOp};
 use relon_parser::TokenRange;

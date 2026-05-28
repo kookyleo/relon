@@ -131,7 +131,7 @@ unsafe impl Send for JitOwned {}
 unsafe impl Sync for JitOwned {}
 
 /// Buffer schema metadata captured by `from_source`. Mirrors
-/// `relon_codegen_native::evaluator::BufferSchema` — kept inside this
+/// `relon_codegen_cranelift::evaluator::BufferSchema` — kept inside this
 /// crate (rather than re-imported) so the LLVM backend stays
 /// independent.
 struct BufferSchema {
@@ -1158,7 +1158,7 @@ impl Evaluator for LlvmAotEvaluator {
 // ---------------------------------------------------------------------------
 // Buffer-protocol packing / unpacking helpers.
 //
-// These mirror what `relon-codegen-native::evaluator` does for
+// These mirror what `relon-codegen-cranelift::evaluator` does for
 // `write_value_into_builder` / `read_value_from_reader` /
 // `read_record_into_map` / `is_single_value_wrapper` /
 // `buffer_to_runtime_error`. Kept inside this crate so the LLVM

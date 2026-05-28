@@ -58,7 +58,7 @@
 //! (`Return`, `MarkLoopHead`, `Mod`, host-helper calls) keep per-path
 //! impls. Cross-path equivalence on the shared lowering still has its
 //! runtime smoke test `inline_matches_standalone_result` in
-//! `crates/relon-codegen-native/tests/trace_jit_inline_smoke.rs`.
+//! `crates/relon-codegen-cranelift/tests/trace_jit_inline_smoke.rs`.
 
 use rustc_hash::FxHashMap;
 

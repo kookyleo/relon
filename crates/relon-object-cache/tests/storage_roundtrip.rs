@@ -37,7 +37,7 @@ fn store_then_load_returns_same_object_bytes() {
     // against the filename — use the actual digest as the key.
     let key = sha_of(&object);
     let triple = "x86_64-unknown-linux-gnu";
-    let meta = sample_metadata("relon-codegen-native 0.1.0");
+    let meta = sample_metadata("relon-codegen-cranelift 0.1.0");
 
     let path = store(dir.path(), key, triple, &object, &meta, None).unwrap();
     assert!(path.exists(), "store must produce a file at {path:?}");

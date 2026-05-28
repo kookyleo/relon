@@ -90,7 +90,7 @@ pub struct Metadata {
     /// only (used by GC heuristics, never by correctness checks).
     pub created_at_unix: u64,
     /// Free-form generator stamp — typically
-    /// `"relon-codegen-native <semver>"`.
+    /// `"relon-codegen-cranelift <semver>"`.
     pub generator_version: String,
 }
 

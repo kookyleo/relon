@@ -1910,7 +1910,7 @@ mod tests {
     /// fires the moment the producer side drifts so the migrant cannot
     /// silently land a partial revision.
     ///
-    /// See also `relon-codegen-native::codegen::const_pool::
+    /// See also `relon-codegen-cranelift::codegen::const_pool::
     /// opvisitor_emits_const_string_record_in_declaration_order` for
     /// the matching pin on the cranelift const-pool producer.
     #[test]

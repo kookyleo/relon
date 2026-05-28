@@ -56,7 +56,7 @@ pub use projector::{JsonProjector, Projector};
 // (see `crates/relon/src/jit.rs` top-comment and the design note).
 pub use relon_analyzer;
 #[cfg(feature = "cranelift-aot")]
-pub use relon_codegen_native::AotEvaluator;
+pub use relon_codegen_cranelift::AotEvaluator;
 // Curated runtime surface. The wildcard re-exports of
 // `relon_evaluator` / `relon_eval_api` / `relon_parser` were dropped
 // in v0.2 — hosts that need a concrete `TreeWalkEvaluator` /
@@ -670,7 +670,7 @@ pub enum BackendError {
     Parse(String),
     /// Cranelift-AOT pipeline failed (typically because the source
     /// uses a construct the cranelift codegen rejects today). Wraps
-    /// the `relon_codegen_native::CraneliftError` stringified so this
+    /// the `relon_codegen_cranelift::CraneliftError` stringified so this
     /// crate stays decoupled from the cranelift crate's surface.
     #[error("cranelift-aot backend setup failed: {0}")]
     CraneliftAot(String),
@@ -707,7 +707,7 @@ pub enum BackendError {
 /// does internally: workspace analysis runs first, the default
 /// sandboxed `Context` is assembled, and the resulting evaluator is
 /// boxed as `dyn Evaluator`. The cranelift-AOT variant lowers the
-/// source through `relon_codegen_native::AotEvaluator::from_source`
+/// source through `relon_codegen_cranelift::AotEvaluator::from_source`
 /// (requires the `cranelift-aot` cargo feature; default-on for
 /// native builds, off for `wasm32-unknown-unknown` because the
 /// cranelift JIT doesn't run there).
@@ -720,7 +720,7 @@ pub fn new_evaluator(
         Backend::TreeWalk => Ok(Box::new(build_tree_walk_evaluator(source)?)),
         #[cfg(feature = "cranelift-aot")]
         Backend::CraneliftAot => {
-            let aot = relon_codegen_native::AotEvaluator::from_source(source)
+            let aot = relon_codegen_cranelift::AotEvaluator::from_source(source)
                 .map_err(|e| BackendError::CraneliftAot(e.to_string()))?;
             Ok(Box::new(aot))
         }

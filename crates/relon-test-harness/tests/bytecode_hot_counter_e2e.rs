@@ -27,11 +27,11 @@ use std::sync::Arc;
 
 use relon_bytecode::hot_counter::{peek_hot, reset_hot_all};
 use relon_bytecode::{BytecodeEvaluator, HotTraceTriggerHandle, COUNTER_SATURATED};
-use relon_codegen_native::trace_install::{
+use relon_codegen_cranelift::trace_install::{
     clear_recording, global_trace_jit_state, jump_helper_call_count, register_recording,
     reset_jump_helper_call_count, RecordingRegistration,
 };
-use relon_codegen_native::CraneliftHotTrigger;
+use relon_codegen_cranelift::CraneliftHotTrigger;
 use relon_eval_api::{Evaluator, Value};
 use relon_ir::{IrType, Op, TaggedOp};
 use relon_parser::TokenRange;

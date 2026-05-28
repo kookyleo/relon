@@ -1,7 +1,7 @@
 //! Deopt-state snapshot the cranelift emitter writes through the
 //! `*mut TraceContext` arg on guard failure.
 //!
-//! Shared ABI types. trace-jit / trace-emitter / codegen-native all
+//! Shared ABI types. trace-jit / trace-emitter / codegen-cranelift all
 //! import these definitions rather than redeclaring them. Phase v6-γ
 //! M1 starts requiring every shared type live **only** in this crate;
 //! any fork-definition will be rejected by ABI tests.

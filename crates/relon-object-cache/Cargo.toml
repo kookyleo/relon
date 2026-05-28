@@ -32,7 +32,7 @@ getrandom = "0.2"
 [dev-dependencies]
 # Tests build a tiny `.o` with cranelift-object to exercise the
 # dlopen / dlsym round-trip end-to-end. Same cranelift channel
-# (0.131) the codegen-native crate uses so the workspace ships one
+# (0.131) the codegen-cranelift crate uses so the workspace ships one
 # ISLE backend tree.
 cranelift-codegen = "0.132"
 cranelift-frontend = "0.132"

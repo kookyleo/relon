@@ -50,7 +50,7 @@ jobs:
     # in the trace-jit runtime helpers, bytecode arena, SmolStr SSO,
     # and recorder bookkeeping.
     #
-    # NOT covered: relon-codegen-native (pulls cranelift / wasmtime
+    # NOT covered: relon-codegen-cranelift (pulls cranelift / wasmtime
     # whose generated nightly code currently uses unstable features
     # the pinned miri rustc rejects) and relon-wasm-bindings (browser target).
     # Those keep their stable-job coverage.

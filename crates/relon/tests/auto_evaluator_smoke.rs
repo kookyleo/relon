@@ -390,7 +390,7 @@ fn default_path_uses_disk_cache_on_second_call() {
     // The cache directory should now contain at least one cache
     // file (object / ir / schema triple). We don't bind to the
     // exact file names so the test stays robust against
-    // `relon_codegen_native`'s internal renaming.
+    // `relon_codegen_cranelift`'s internal renaming.
     let cache_dir = cache_root.path().join("relon");
     let entries: Vec<_> = std::fs::read_dir(&cache_dir)
         .expect("cache dir populated")

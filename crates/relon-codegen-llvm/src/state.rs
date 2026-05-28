@@ -16,7 +16,7 @@
 //! `arena_base` lives at a stable offset on the state. The LLVM
 //! emitter loads it through a `ptrtoint`/`inttoptr` round-trip.
 //!
-//! We **do not** reuse `relon_codegen_native::SandboxState` here on
+//! We **do not** reuse `relon_codegen_cranelift::SandboxState` here on
 //! purpose:
 //!
 //! - It would require pulling cranelift-native as a hard dependency of

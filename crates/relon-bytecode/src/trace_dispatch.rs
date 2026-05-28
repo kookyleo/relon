@@ -14,7 +14,7 @@
 //! This module introduces the trait surface — kept cranelift-free so
 //! the bytecode crate still compiles for wasm32 — that the
 //! [`crate::evaluator::BytecodeEvaluator`] consults on every
-//! `run_main`. The native impl (`relon_codegen_native::bytecode_bridge`)
+//! `run_main`. The native impl (`relon_codegen_cranelift::bytecode_bridge`)
 //! wraps `TraceJitState::invoke_with_resume` and maps its three exit
 //! shapes (no trace / success / guard-failed) onto
 //! [`TraceInvokeOutcome`].
@@ -31,7 +31,7 @@
 //!    canned `TraceInvokeOutcome` variants to assert the routing.
 //! 3. `forbid(unsafe_code)`: the trace fn ABI is `unsafe extern "C"`,
 //!    which can't be invoked from the bytecode crate directly. The
-//!    bridge in `relon_codegen_native` owns the `unsafe` block; the
+//!    bridge in `relon_codegen_cranelift` owns the `unsafe` block; the
 //!    trait surface trades `*mut TraceContext` for owned safe values.
 //!
 //! ## Lookup vs. invoke
@@ -102,7 +102,7 @@ pub enum TraceInvokeOutcome {
 /// `fn_id` it would otherwise dispatch.
 ///
 /// The canonical native impl lives in
-/// `relon_codegen_native::bytecode_bridge::CraneliftTraceLookup` and
+/// `relon_codegen_cranelift::bytecode_bridge::CraneliftTraceLookup` and
 /// wraps `TraceJitState::invoke_with_resume`. Hosts targeting wasm32 (or
 /// unit tests) install a no-op (or a `TestTraceLookup` mock) so the
 /// bytecode dispatch loop runs unchanged.

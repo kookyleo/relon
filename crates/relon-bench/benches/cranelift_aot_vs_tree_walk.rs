@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
-use relon_codegen_native::{AotEvaluator, SandboxConfig};
+use relon_codegen_cranelift::{AotEvaluator, SandboxConfig};
 use relon_eval_api::{Evaluator, Value};
 use relon_evaluator::{Context, Scope, TreeWalkEvaluator};
 use relon_ir::ir::{Func, IrType, Module as IrModule, Op, TaggedOp};

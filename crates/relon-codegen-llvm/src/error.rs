@@ -1,6 +1,6 @@
 //! Error types surfaced by the LLVM AOT pipeline.
 //!
-//! Modelled after `relon_codegen_native::CraneliftError` so the
+//! Modelled after `relon_codegen_cranelift::CraneliftError` so the
 //! relon facade can wrap both backends through the same
 //! `BackendError` shape — switching backends should not change which
 //! variants the host needs to match on.

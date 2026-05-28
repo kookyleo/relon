@@ -3,7 +3,7 @@
 //! This crate is a **pre-integration** drop. It defines the
 //! self-contained data structures + algorithms the v6-gamma trace JIT
 //! will need, without yet depending on `relon-ir` or
-//! `relon-codegen-native`. The goal is to let the trace IR, hot
+//! `relon-codegen-cranelift`. The goal is to let the trace IR, hot
 //! counter, deopt protocol, and optimiser passes be designed and
 //! unit-tested in isolation; the v6-gamma phase then bolts on a
 //! lowering layer (`relon_ir::Op -> TraceOp`) and a cranelift IR

@@ -61,7 +61,7 @@ pub struct BcVmConfig {
     /// `None` leaves the prologue inert — that's the wasm32 / unit-test
     /// default. The hook lives behind a trait object so the bytecode
     /// crate stays cranelift-free; the native adapter lives in
-    /// `relon_codegen_native::bytecode_bridge` (added alongside the
+    /// `relon_codegen_cranelift::bytecode_bridge` (added alongside the
     /// recording-registry wire-up).
     pub hot_trigger: Option<HotTraceTriggerHandle>,
     /// M2-B phase 4c: per-`invoke` hot-counter threshold. Defaults to
@@ -78,7 +78,7 @@ pub struct BcVmConfig {
     ///
     /// `None` leaves the path inert — the VM behaves as before phase
     /// 4c-cont. The native adapter
-    /// (`relon_codegen_native::bytecode_bridge::CraneliftTraceLookup`)
+    /// (`relon_codegen_cranelift::bytecode_bridge::CraneliftTraceLookup`)
     /// wraps `TraceJitState::invoke_with_resume` so a successful
     /// trace returns its `result_slot` value and a guard-failed trace
     /// surfaces the [`relon_trace_abi::DeoptStateSnapshot`] for the
@@ -1097,7 +1097,7 @@ impl BytecodeVm {
             return exit(None, Some(err), last_bc_idx, steps, locals, &memory);
         }
         // M2-B phase 4c: hot-counter prologue. Mirrors the cranelift
-        // entry-fn prologue (`crates/relon-codegen-native/src/codegen/hot_counter.rs`)
+        // entry-fn prologue (`crates/relon-codegen-cranelift/src/codegen/hot_counter.rs`)
         // but as Rust on the dispatch path — no machine-code emit.
         // Only the **outer** invocation entry runs the trigger —
         // `start_bc_idx == 0` filters out partial-resume re-entries

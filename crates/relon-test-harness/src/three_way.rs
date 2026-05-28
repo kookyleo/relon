@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use relon::{new_evaluator, Backend, BackendError};
-use relon_codegen_native::{
+use relon_codegen_cranelift::{
     clear_recording, global_trace_jit_state, register_recording, RecordingRegistration, MAX_FN_ID,
 };
 use relon_eval_api::{RuntimeError, Value};
@@ -941,7 +941,7 @@ fn run_recipe(recipe: SynthRecipe, args: &HashMap<String, Value>) -> Result<Valu
     // SAFETY: the helper interprets `args_ptr` as a packed u64 array
     // with `param_tys.len()` entries. `raw_args` is sized to match.
     unsafe {
-        relon_codegen_native::trace_install::__relon_jump_to_recorder(fn_id, raw_args.as_ptr());
+        relon_codegen_cranelift::trace_install::__relon_jump_to_recorder(fn_id, raw_args.as_ptr());
     }
 
     let state = global_trace_jit_state();

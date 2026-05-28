@@ -127,7 +127,7 @@ pub(crate) struct FastPathProfile {
 
 /// Phase E.1: per-module const-pool blob laid out at compile time and
 /// copied into the arena prefix on every dispatch. Mirrors
-/// `relon_codegen_native::codegen::ConstPool` (shape only — the LLVM
+/// `relon_codegen_cranelift::codegen::ConstPool` (shape only — the LLVM
 /// side keeps it scoped to this crate so the dep direction stays
 /// one-way).
 ///
@@ -1020,7 +1020,7 @@ fn emit_buffer_entry_with_helpers_and_closures<'ctx>(
 }
 
 /// Emit the buffer-protocol entry function. The cranelift backend's
-/// equivalent lives in `relon-codegen-native::codegen::mod.rs` —
+/// equivalent lives in `relon-codegen-cranelift::codegen::mod.rs` —
 /// signature mirrored here so a host that holds either evaluator
 /// can dispatch through the same `(state, in_ptr, …)` argv shape.
 fn emit_buffer_entry_impl<'ctx>(
@@ -3141,7 +3141,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// Phase 2 surface-widening: lower `Op::ReadStringLen` — pop an
     /// arena-relative i32 record pointer (String or List* header),
     /// load the leading 4-byte length prefix, zext to i64, push.
-    /// Mirrors `relon-codegen-native::codegen::field::emit_read_string_len`.
+    /// Mirrors `relon-codegen-cranelift::codegen::field::emit_read_string_len`.
     ///
     /// No bounds check today (Phase B/C/D LLVM emitter doesn't emit
     /// `cond_trap`; Phase 3 wires the trap-propagation work).

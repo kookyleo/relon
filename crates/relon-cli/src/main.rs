@@ -16,7 +16,7 @@ use relon_analyzer::{
     analyze_entry_with_options, analyze_with_options, AnalyzeOptions, WorkspaceDiagnostic,
     WorkspaceTree,
 };
-use relon_codegen_native::AotEvaluator;
+use relon_codegen_cranelift::AotEvaluator;
 use relon_evaluator::module::FilesystemModuleResolver;
 use relon_evaluator::{Capabilities, Context, TreeWalkEvaluator};
 use relon_parser::{parse_document, ParseDocumentError};
@@ -116,7 +116,7 @@ enum Commands {
         /// and keeps every other operation on the tree-walker.
         /// `tree-walk` forces the original interpreter on every
         /// path; `cranelift-aot` pre-compiles the entry into native
-        /// machine code via `relon-codegen-native`'s cranelift JIT
+        /// machine code via `relon-codegen-cranelift`'s cranelift JIT
         /// and dispatches `run_main` through a panic-shielded
         /// trampoline. The cranelift-aot-only backend supports
         /// `#main(...)` entries only and rejects library-mode
@@ -784,7 +784,7 @@ fn cmd_run(
                     } else {
                         relon_eval_api::Capabilities::default()
                     };
-                    let cache_dir = relon_codegen_native::default_cache_dir();
+                    let cache_dir = relon_codegen_cranelift::default_cache_dir();
                     // Cache-hit fast path: pull a matching
                     // pair off disk if present. Any soft
                     // miss (file absent, integrity failure,
@@ -804,7 +804,7 @@ fn cmd_run(
                             // tracing subscriber installed
                             // by `RELON_LOG=...` upstream
                             // would already capture it via
-                            // the codegen-native
+                            // the codegen-cranelift
                             // `tracing::warn!` mirrored
                             // there.
                             eprintln!(

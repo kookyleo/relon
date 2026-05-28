@@ -1,7 +1,7 @@
 //! Observed-type buckets the trace recorder learns by spying on the
 //! cranelift-generic backend's tagged values.
 //!
-//! Shared ABI type. trace-jit / trace-emitter / codegen-native all
+//! Shared ABI type. trace-jit / trace-emitter / codegen-cranelift all
 //! import this enum rather than redeclaring it. Phase v6-γ M1 starts
 //! requiring every shared type live **only** in this crate; the ABI
 //! smoke tests will reject any fork-definition.

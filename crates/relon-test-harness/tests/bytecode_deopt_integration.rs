@@ -26,7 +26,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 
 use relon_bytecode::BytecodeEvaluator;
-use relon_codegen_native::trace_install::{
+use relon_codegen_cranelift::trace_install::{
     __relon_jump_to_recorder, clear_recording, global_trace_jit_state, register_recording,
     RecordingRegistration,
 };

@@ -11,7 +11,7 @@ keywords = ["relon", "llvm", "codegen", "compiler", "aot"]
 categories = ["compilers"]
 
 # Phase A bootstrap: keep the dep surface narrow on purpose. We mirror
-# the IR shape `relon-codegen-native` consumes so a side-by-side
+# the IR shape `relon-codegen-cranelift` consumes so a side-by-side
 # comparison of the two AOT backends shares the same IR contract.
 # Schema layout / sandbox vtable / object cache wiring stay in the
 # cranelift crate for now — they'll move down once Phase B widens the
@@ -25,7 +25,7 @@ relon-eval-api = { workspace = true }
 relon-parser = { workspace = true }
 # `from_source` runs the per-file analyzer before lowering so the
 # codegen path matches what the tree-walker does. Mirrors how
-# `relon-codegen-native` wires the analyzer at its `from_source` site.
+# `relon-codegen-cranelift` wires the analyzer at its `from_source` site.
 relon-analyzer = { workspace = true }
 
 thiserror = { workspace = true }
@@ -55,4 +55,4 @@ libc = "0.2"
 # Phase A.4 perf smoke needs a side-by-side cranelift evaluator built
 # from the same hand-built IR fixture. The dep is dev-only so the
 # crate's production build does not pull in the cranelift backend.
-relon-codegen-native = { workspace = true }
+relon-codegen-cranelift = { workspace = true }

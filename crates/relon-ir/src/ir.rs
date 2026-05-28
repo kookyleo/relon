@@ -1477,7 +1477,7 @@ pub struct ClosureCapture {
 /// Phase 4.c-2 stdlib trap discriminator. Independent of the
 /// codegen crate so the IR has no upward dependency. The
 /// cranelift-native codegen maps each variant onto its sandbox-side
-/// `TrapKind` (see `relon-codegen-native/src/sandbox.rs`); the
+/// `TrapKind` (see `relon-codegen-cranelift/src/sandbox.rs`); the
 /// retired wasm-AOT backend used to mirror the same enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TrapKind {

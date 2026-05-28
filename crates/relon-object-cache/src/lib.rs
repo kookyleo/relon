@@ -1,9 +1,9 @@
 //! `relon-object-cache` — on-disk + in-memory cache layer for the
-//! cranelift-object `.o` artefacts produced by `relon-codegen-native`
+//! cranelift-object `.o` artefacts produced by `relon-codegen-cranelift`
 //! during the v5-gamma cold-start pipeline.
 //!
 //! The crate is intentionally self-contained: it does **not** depend
-//! on the rest of the `relon-*` tree, so the codegen-native agent
+//! on the rest of the `relon-*` tree, so the codegen-cranelift agent
 //! can wire it in incrementally without circular-build problems.
 //!
 //! ## What lives here

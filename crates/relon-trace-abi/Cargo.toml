@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "Shared ABI types for the v6-gamma trace JIT pipeline (trace-emitter / trace-jit / codegen-native)."
+description = "Shared ABI types for the v6-gamma trace JIT pipeline (trace-emitter / trace-jit / codegen-cranelift)."
 authors = ["kookyleo <kookyleo@gmail.com>"]
 
 # Source of truth for layout-critical types crossing the cranelift
@@ -16,7 +16,7 @@ authors = ["kookyleo <kookyleo@gmail.com>"]
 #     relon-trace-abi   <-- (this crate)
 #       ^      ^
 #       |      +-------- relon-trace-emitter
-#       +--------------- relon-trace-jit / codegen-native / host
+#       +--------------- relon-trace-jit / codegen-cranelift / host
 #
 # Adding a relon-* dep here would create a cycle the moment the M1
 # phase wires the consumers; reviewers should reject any such PR.

@@ -3,7 +3,7 @@
 //! ## Design
 //!
 //! Mirrors the cranelift entry-fn prologue in
-//! [`relon_codegen_native::codegen::hot_counter`] (folded directly here
+//! [`relon_codegen_cranelift::codegen::hot_counter`] (folded directly here
 //! as Rust because the bytecode VM dispatches in match-arm code rather
 //! than emitted machine instructions):
 //!
@@ -46,7 +46,7 @@
 //!
 //! The hook lives behind a trait object so the bytecode crate can
 //! still target wasm32 (no cranelift dependency). The cranelift
-//! adapter lives in `relon_codegen_native` (native-only); the
+//! adapter lives in `relon_codegen_cranelift` (native-only); the
 //! wasm32 build leaves the trigger unconfigured and the prologue
 //! becomes inert.
 
@@ -187,7 +187,7 @@ impl Default for HotCounter {
 ///
 /// Implementations adapt the bytecode-side trigger event into whatever
 /// recording driver the host already owns. The canonical native impl
-/// lives in `relon_codegen_native` and forwards to
+/// lives in `relon_codegen_cranelift` and forwards to
 /// `__relon_jump_to_recorder` — mirroring the path the cranelift
 /// entry-fn prologue takes. Hosts targeting wasm32 (or unit tests)
 /// install a mock that simply records the `(fn_id, args)` pair.
@@ -237,7 +237,7 @@ thread_local! {
     /// The map is `RefCell` so the dispatch path can lazily insert
     /// new slots without taking a lock. Concurrent threads each see
     /// their own table — this matches the recorder state machine's
-    /// per-thread shape (`relon_codegen_native` keeps
+    /// per-thread shape (`relon_codegen_cranelift` keeps
     /// `RECORDING_REGISTRY` thread-local for the same reason).
     static HOT_COUNTERS: RefCell<HashMap<u32, HotCounter>> =
         RefCell::new(HashMap::new());

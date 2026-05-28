@@ -68,7 +68,7 @@ pub fn abi_type_to_cranelift(ty: AbiType, pointer_ty: ir::Type) -> ir::Type {
 
 /// Extension trait that lowers an [`AbiSignature`] to a concrete
 /// cranelift [`ir::Signature`]. SystemV is hard-coded because that's
-/// the only calling convention `relon-codegen-native` ever emits;
+/// the only calling convention `relon-codegen-cranelift` ever emits;
 /// threading `CallConv` through [`AbiSignature`] would re-introduce a
 /// cranelift dep into the ABI crate.
 pub trait AbiSignatureExt {
@@ -275,7 +275,7 @@ pub enum HostHookId {
     /// 2026-05-21: `__relon_str_glob_match(*const StringRef, *const StringRef) -> i32`.
     /// Tier-2 glob_match dispatch — same pointer-payload contract as
     /// the F-D7 string shims; the helper body itself lives in
-    /// `relon-codegen-native` so the JIT runtime crate doesn't pick up
+    /// `relon-codegen-cranelift` so the JIT runtime crate doesn't pick up
     /// a `relon-ir` dependency just to surface the matcher.
     StrGlobMatch,
     /// F-D8: `__relon_trace_list_get(list_ptr: *const u8, idx: i64,

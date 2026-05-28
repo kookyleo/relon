@@ -6,7 +6,7 @@
 //! then hands the resulting ET_DYN bytes to `relon-object-cache`'s
 //! `LoadedObject::from_bytes` and actually calls the function. If
 //! any link step in the v5-gamma pipeline regresses, this test will
-//! catch it before the codegen-native crate hits the integration
+//! catch it before the codegen-cranelift crate hits the integration
 //! point.
 
 #![cfg(target_os = "linux")]

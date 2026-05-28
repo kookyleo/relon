@@ -55,7 +55,7 @@ use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module as _};
 
 use relon_bench::quiescence::verify_quiescence;
-use relon_codegen_native::register_trace_runtime_symbols;
+use relon_codegen_cranelift::register_trace_runtime_symbols;
 use relon_eval_api::Value;
 use relon_evaluator::{Context, Scope, TreeWalkEvaluator};
 use relon_parser::parse_document;

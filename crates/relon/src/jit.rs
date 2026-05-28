@@ -1,6 +1,6 @@
 //! Dart-style canonical JIT entry — [`JitEvaluator`].
 //!
-//! Pairs with [`relon_codegen_native::AotEvaluator`] to expose a
+//! Pairs with [`relon_codegen_cranelift::AotEvaluator`] to expose a
 //! two-mode user-facing surface (JIT vs AOT) over the three internal
 //! tiers Relon already ships:
 //!
@@ -18,8 +18,8 @@
 //! * **`JitTier::Trace`** — the cranelift-emitted hot-trace JIT.
 //!   Activated automatically once the bytecode tier's per-`fn_id`
 //!   hot-counter saturates: the wrapper wires
-//!   [`relon_codegen_native::CraneliftHotTrigger`] (recorder kick-off)
-//!   and [`relon_codegen_native::CraneliftTraceLookup`] (dispatcher
+//!   [`relon_codegen_cranelift::CraneliftHotTrigger`] (recorder kick-off)
+//!   and [`relon_codegen_cranelift::CraneliftTraceLookup`] (dispatcher
 //!   switch) onto the bytecode evaluator at construction time so the
 //!   first `run_main` past the threshold (the bytecode VM's default
 //!   [`relon_bytecode::DEFAULT_HOT_THRESHOLD`] = 1000, picked to keep
@@ -36,7 +36,7 @@
 //!    compiled function. It also re-runs the parse + analyze + IR
 //!    lowering pipeline to recover the IR op stream and parameter
 //!    types, then calls
-//!    [`relon_codegen_native::register_recording`] so the recorder
+//!    [`relon_codegen_cranelift::register_recording`] so the recorder
 //!    has a body to walk when the trigger fires.
 //! 2. The bytecode evaluator runs normally for the first
 //!    [`relon_bytecode::DEFAULT_HOT_THRESHOLD`] invocations
@@ -44,8 +44,8 @@
 //! 3. On the threshold-crossing invocation the bytecode dispatch
 //!    prologue trips the `CraneliftHotTrigger`, which drives the
 //!    recorder + optimiser + emitter pipeline; the resulting
-//!    [`relon_codegen_native::JITedTraceFn`] is installed in the
-//!    process-global [`relon_codegen_native::TraceJitState`].
+//!    [`relon_codegen_cranelift::JITedTraceFn`] is installed in the
+//!    process-global [`relon_codegen_cranelift::TraceJitState`].
 //! 4. Subsequent invocations consult the dispatcher switch via the
 //!    `CraneliftTraceLookup` adapter on the same evaluator; a hit
 //!    bypasses the bytecode dispatch loop entirely and returns the
@@ -74,7 +74,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "cranelift-aot")]
-use relon_codegen_native::TraceContext;
+use relon_codegen_cranelift::TraceContext;
 use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
 use relon_evaluator::TreeWalkEvaluator;
 use relon_parser::Node;
@@ -103,7 +103,7 @@ pub enum JitTier {
     /// into the process-global registry. Subsequent `run_main` calls
     /// take the dispatcher-switch bypass (no bytecode dispatch-loop
     /// ticks). Falling back to `Bytecode` on this tier is observable
-    /// via [`relon_codegen_native::global_trace_jit_state`] —
+    /// via [`relon_codegen_cranelift::global_trace_jit_state`] —
     /// `active_tier` re-reads the install state every call so
     /// invalidation (deopt → trace evicted) is reflected
     /// immediately.
@@ -198,7 +198,7 @@ pub struct JitEvaluator {
     /// fixture short-circuits the bytecode / tree-walker dispatch path:
     /// `run_main` packs the `HashMap<String, Value>` into a `Vec<u64>`,
     /// invokes the recorder-installed trace through
-    /// [`relon_codegen_native::TraceJitState::invoke_with_fallback_slice`],
+    /// [`relon_codegen_cranelift::TraceJitState::invoke_with_fallback_slice`],
     /// and decodes the returned scalar back into a [`Value`].
     ///
     /// This path exists for hosts that already know the recorder IR
@@ -403,8 +403,8 @@ impl JitEvaluator {
         // repeatedly cycles fixtures on the same evaluator doesn't
         // bloat the pool's high-water mark.
         if let Some(prev) = self.fixture.take() {
-            let _ = relon_codegen_native::clear_recording(prev.fn_id);
-            let state = relon_codegen_native::global_trace_jit_state();
+            let _ = relon_codegen_cranelift::clear_recording(prev.fn_id);
+            let state = relon_codegen_cranelift::global_trace_jit_state();
             let _ = state.invalidate_trace(prev.fn_id);
             release_jit_fn_id(prev.fn_id);
         }
@@ -433,7 +433,7 @@ impl JitEvaluator {
         // trace fn (validated inside the helper). On failure the
         // helper returns an `Err(reason)` we surface verbatim.
         let param_count = fixture.param_tys.len();
-        if let Err(reason) = relon_codegen_native::install_recorder_trace_warmup(
+        if let Err(reason) = relon_codegen_cranelift::install_recorder_trace_warmup(
             fn_id,
             fixture.body,
             fixture.param_tys,
@@ -451,7 +451,7 @@ impl JitEvaluator {
         // closures so `run_main` can route through it on every call.
         let ctx = TraceContext::with_hooks(
             fixture.slot_count,
-            relon_codegen_native::default_host_hooks(),
+            relon_codegen_cranelift::default_host_hooks(),
         );
         let packed = Vec::with_capacity(param_count);
         self.fixture = Some(TraceFixtureInstalled {
@@ -475,7 +475,7 @@ impl JitEvaluator {
     ///
     /// 1. [`JitTier::Trace`] — only when the `cranelift-aot` feature
     ///    is on, an `fn_id` was allocated, and
-    ///    [`relon_codegen_native::TraceJitState::lookup_trace`]
+    ///    [`relon_codegen_cranelift::TraceJitState::lookup_trace`]
     ///    returns a hit. The hot-counter promotion is the only path
     ///    that publishes a trace at this `fn_id`, so a `Trace` report
     ///    is also evidence the recorder + emitter pipeline succeeded.
@@ -495,7 +495,7 @@ impl JitEvaluator {
             // global registry — a fixture whose trace got invalidated
             // (deopt or external eviction) falls back to whatever
             // auto tier is still live.
-            let state = relon_codegen_native::global_trace_jit_state();
+            let state = relon_codegen_cranelift::global_trace_jit_state();
             if let Some(installed) = &self.fixture {
                 if state.lookup_trace(installed.fn_id).is_some() {
                     return JitTier::Trace;
@@ -540,14 +540,14 @@ impl Drop for JitEvaluator {
     /// (insert-then-remove map ops).
     fn drop(&mut self) {
         if let Some(installed) = self.fixture.take() {
-            let _ = relon_codegen_native::clear_recording(installed.fn_id);
-            let state = relon_codegen_native::global_trace_jit_state();
+            let _ = relon_codegen_cranelift::clear_recording(installed.fn_id);
+            let state = relon_codegen_cranelift::global_trace_jit_state();
             let _ = state.invalidate_trace(installed.fn_id);
             release_jit_fn_id(installed.fn_id);
         }
         if let Some(id) = self.fn_id.take() {
-            let _ = relon_codegen_native::clear_recording(id);
-            let state = relon_codegen_native::global_trace_jit_state();
+            let _ = relon_codegen_cranelift::clear_recording(id);
+            let state = relon_codegen_cranelift::global_trace_jit_state();
             let _ = state.invalidate_trace(id);
             release_jit_fn_id(id);
         }
@@ -649,11 +649,11 @@ fn wire_trace_tier(
     // are >= 8 for the workloads we want to escalate; trivial bodies
     // (`x + 1`-shape) lower to fewer ops on either branch and stay on
     // the bytecode tier.
-    if recorder_body.len() < relon_codegen_native::TINY_TRACE_OP_THRESHOLD {
+    if recorder_body.len() < relon_codegen_cranelift::TINY_TRACE_OP_THRESHOLD {
         tracing::debug!(
             target: "relon::jit_evaluator",
             body_len = recorder_body.len(),
-            threshold = relon_codegen_native::TINY_TRACE_OP_THRESHOLD,
+            threshold = relon_codegen_cranelift::TINY_TRACE_OP_THRESHOLD,
             "tier escalation: recorder body below TINY_TRACE_OP_THRESHOLD; skipping trace install to avoid dispatcher-switch overhead"
         );
         return (Some(Box::new(ev) as Box<dyn Evaluator>), None);
@@ -677,7 +677,7 @@ fn wire_trace_tier(
 
     // Register the recorder body on the **current thread** — the
     // registry is thread_local (see
-    // `relon_codegen_native::trace_install::RECORDING_REGISTRY` docs:
+    // `relon_codegen_cranelift::trace_install::RECORDING_REGISTRY` docs:
     // per-thread recorder state machines mirror the design's
     // §3.4 stance). Multi-threaded hosts that dispatch `run_main`
     // off a different thread than `new` will silently skip the
@@ -685,9 +685,9 @@ fn wire_trace_tier(
     // that owns the registration — this is a documented limitation
     // of v1; if it becomes a pain point the registry can move to a
     // process-global `DashMap` keyed by `(thread_id, fn_id)`.
-    let prior = relon_codegen_native::register_recording(
+    let prior = relon_codegen_cranelift::register_recording(
         fn_id,
-        relon_codegen_native::RecordingRegistration {
+        relon_codegen_cranelift::RecordingRegistration {
             body: body.clone(),
             param_tys: param_tys.clone(),
             field_offset_to_local,
@@ -748,7 +748,7 @@ fn wire_trace_tier(
         // the warmup helper re-registers, so we hand it the map to
         // carry forward.
         let offset_map = registration_data.field_offset_to_local.clone();
-        match relon_codegen_native::install_recorder_trace_warmup_with_offset_map(
+        match relon_codegen_cranelift::install_recorder_trace_warmup_with_offset_map(
             fn_id,
             body.clone(),
             param_tys.clone(),
@@ -769,9 +769,9 @@ fn wire_trace_tier(
                         fn_id,
                         "tier escalation: IR-path trace install verification failed; invalidating trace and falling back to bytecode-only"
                     );
-                    let state = relon_codegen_native::global_trace_jit_state();
+                    let state = relon_codegen_cranelift::global_trace_jit_state();
                     let _ = state.invalidate_trace(fn_id);
-                    let _ = relon_codegen_native::clear_recording(fn_id);
+                    let _ = relon_codegen_cranelift::clear_recording(fn_id);
                     release_jit_fn_id(fn_id);
                     return (Some(Box::new(ev) as Box<dyn Evaluator>), None);
                 }
@@ -783,7 +783,7 @@ fn wire_trace_tier(
                     reason = %reason,
                     "tier escalation: IR-path warmup install failed; falling back to bytecode-only"
                 );
-                let _ = relon_codegen_native::clear_recording(fn_id);
+                let _ = relon_codegen_cranelift::clear_recording(fn_id);
                 release_jit_fn_id(fn_id);
                 return (Some(Box::new(ev) as Box<dyn Evaluator>), None);
             }
@@ -791,9 +791,9 @@ fn wire_trace_tier(
     }
 
     let trigger: relon_bytecode::HotTraceTriggerHandle =
-        Arc::new(relon_codegen_native::CraneliftHotTrigger);
+        Arc::new(relon_codegen_cranelift::CraneliftHotTrigger);
     let lookup: relon_bytecode::InstalledTraceLookupHandle =
-        Arc::new(relon_codegen_native::CraneliftTraceLookup);
+        Arc::new(relon_codegen_cranelift::CraneliftTraceLookup);
     let ev_wired = ev
         .with_fn_id(fn_id)
         .with_hot_trigger(trigger)
@@ -849,7 +849,7 @@ fn verify_installed_trace_against_bytecode(
     let traced_answer = match relon_bytecode::BytecodeEvaluator::from_source(source) {
         Ok(ev_with_hooks) => {
             let lookup_handle: relon_bytecode::InstalledTraceLookupHandle =
-                Arc::new(relon_codegen_native::CraneliftTraceLookup);
+                Arc::new(relon_codegen_cranelift::CraneliftTraceLookup);
             let ev_hooked = ev_with_hooks
                 .with_fn_id(fn_id)
                 .with_trace_lookup(lookup_handle);
@@ -1094,7 +1094,7 @@ impl Evaluator for JitEvaluator {
             // bench rows where the trace exits via a guard every call
             // (e.g. cmp_lua W3 string concat) avoid the per-call Vec
             // allocation `invoke_with_resume` performs.
-            let trace_state = relon_codegen_native::global_trace_jit_state();
+            let trace_state = relon_codegen_cranelift::global_trace_jit_state();
             let raw = {
                 let mut guard = installed
                     .state
@@ -1213,7 +1213,7 @@ mod tests {
 
     /// Tier escalation smoke. With `cranelift-aot` enabled, a
     /// bytecode-envelope source whose recorder body clears the
-    /// [`relon_codegen_native::TINY_TRACE_OP_THRESHOLD`] gate should
+    /// [`relon_codegen_cranelift::TINY_TRACE_OP_THRESHOLD`] gate should
     /// pick up a `fn_id` at construction time, run through the
     /// bytecode tier for the first few invocations, and then have
     /// the dispatcher promote the dispatch shape to the Trace tier
@@ -1568,20 +1568,20 @@ mod tests {
     #[test]
     fn dropped_jit_evaluator_releases_recorder_registration() {
         let src = "#main(Int x) -> Int\nx + x + x + x + x + x + x + x";
-        let before = relon_codegen_native::recording_registration_count();
+        let before = relon_codegen_cranelift::recording_registration_count();
         {
             let _a = JitEvaluator::new(src).expect("a");
             // Inside this scope the registration is live: count
             // must have grown by exactly one above the baseline.
             assert_eq!(
-                relon_codegen_native::recording_registration_count(),
+                relon_codegen_cranelift::recording_registration_count(),
                 before + 1,
                 "JitEvaluator::new must register exactly one recorder body"
             );
         }
         // After drop the registry returns to baseline.
         assert_eq!(
-            relon_codegen_native::recording_registration_count(),
+            relon_codegen_cranelift::recording_registration_count(),
             before,
             "JitEvaluator::drop must clear its recorder registration"
         );

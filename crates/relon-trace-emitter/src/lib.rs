@@ -15,7 +15,7 @@
 //! 1. [`TraceEmitter::emit`] — drains an [`relon_trace_jit::OptimizedTrace`]
 //!    into a pre-built [`cranelift_codegen::Context`]. After a successful
 //!    emit the caller can hand the context off to its existing
-//!    cranelift module pipeline (same path `relon-codegen-native` uses
+//!    cranelift module pipeline (same path `relon-codegen-cranelift` uses
 //!    for non-trace functions).
 //! 2. [`TRACE_ENTRY_SIG`] / [`TraceContext`] — the fixed ABI every
 //!    trace entry obeys. The host installs trace pointers through this
@@ -57,7 +57,7 @@
 //!   they reference are equal AND cover every variant declared in
 //!   `relon_trace_jit::TraceOp`. Drift fails `cargo test` at compile +
 //!   test time.
-//! * `crates/relon-codegen-native/tests/trace_jit_inline_smoke.rs`
+//! * `crates/relon-codegen-cranelift/tests/trace_jit_inline_smoke.rs`
 //!   `inline_matches_standalone_result` — runtime equivalence check
 //!   on a small canned trace (the original sync guard; still useful
 //!   for catching divergent codegen on shared variants).

@@ -2,7 +2,7 @@
 //! `#main(Int x) -> Int : x + 1` bootstrap fixture.
 //!
 //! Compares LLVM JIT against:
-//! - Cranelift AOT (existing `relon-codegen-native::AotEvaluator`,
+//! - Cranelift AOT (existing `relon-codegen-cranelift::AotEvaluator`,
 //!   same hand-built IR fed through `from_ir_direct`).
 //! - Hand-rolled native Rust closure (the floor / target the LLVM
 //!   path is chasing).
@@ -20,8 +20,8 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use relon_codegen_cranelift::{AotEvaluator, SandboxConfig};
 use relon_codegen_llvm::LlvmAotEvaluator;
-use relon_codegen_native::{AotEvaluator, SandboxConfig};
 use relon_eval_api::{Evaluator, Value};
 use relon_ir::ir::{Func, IrType, Module as IrModule, Op, TaggedOp};
 use relon_parser::TokenRange;

@@ -2,7 +2,7 @@
 //!
 //! This crate is the second slice of the dual-backend strategy
 //! decided in Phase A: cranelift keeps the trace-JIT throne
-//! (`relon-codegen-native`) and the LLVM AOT pipeline here chases
+//! (`relon-codegen-cranelift`) and the LLVM AOT pipeline here chases
 //! Rust-native peak performance for the `#main` entry path.
 //!
 //! ## Scope (Phase B)

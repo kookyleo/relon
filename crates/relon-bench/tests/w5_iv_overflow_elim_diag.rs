@@ -15,7 +15,7 @@
 //! count step's check failure and didn't strip i — this test pins the
 //! per-phi refactor that does.
 
-use relon_codegen_native::{RecordingOutcome, TraceRecordingEvaluator};
+use relon_codegen_cranelift::{RecordingOutcome, TraceRecordingEvaluator};
 use relon_ir::ir::{IrType, Op, TaggedOp};
 use relon_ir::shape_hash::shape_hash_for_keys;
 use relon_parser::TokenRange;

@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 
-use relon_codegen_native::trace_install::{
+use relon_codegen_cranelift::trace_install::{
     __relon_jump_to_recorder, clear_recording, global_trace_jit_state, register_recording,
     RecordingRegistration,
 };
@@ -141,7 +141,7 @@ const FN_ID: u32 = 137;
 
 #[test]
 fn dump_recorded_loop_buffer() {
-    use relon_codegen_native::{RecordingOutcome, TraceRecordingEvaluator};
+    use relon_codegen_cranelift::{RecordingOutcome, TraceRecordingEvaluator};
     use relon_trace_recorder::RecorderState;
 
     let mut r = RecorderState::new();
@@ -481,7 +481,7 @@ fn loop_trace_runs_n_iters_before_deopt() {
 /// Expected value for `sum 1..=1_000_000 = 500_000_500_000`.
 #[test]
 fn loop_trace_full_pipeline_returns_correct_sum() {
-    use relon_codegen_native::{AotEvaluator, SandboxConfig};
+    use relon_codegen_cranelift::{AotEvaluator, SandboxConfig};
     use relon_eval_api::{Evaluator, Value};
     use relon_ir::ir::{Func, Module as IrModule};
 
@@ -564,7 +564,7 @@ fn loop_trace_full_pipeline_returns_correct_sum() {
 /// confirm `jit_compile_trace_for_fn` accepts it.
 #[test]
 fn single_phi_loop_compiles() {
-    use relon_codegen_native::trace_install::TraceJitState;
+    use relon_codegen_cranelift::trace_install::TraceJitState;
     use relon_trace_abi::ExternalPc;
     use relon_trace_jit::{CmpKind, GuardKind, GuardSite, LoopPhi, Offset, TraceBuffer};
 

@@ -1,7 +1,7 @@
 //! #171 regression: the `IntegrityMode::HmacRequired` mode must
 //! refuse a load when the caller passes `hmac_key = None`. This is
 //! belt-and-braces against future drift where a higher layer (the
-//! codegen-native object-cache integration) might resolve a `None`
+//! codegen-cranelift object-cache integration) might resolve a `None`
 //! key by accident — without the storage-layer guard, the loader
 //! would otherwise silently fall back to a no-authentication read.
 
@@ -32,7 +32,7 @@ fn hmac_required_refuses_none_key() {
     let key = [0x42u8; 32];
     let object = b"authenticated-payload".to_vec();
     // Caller hashes a source-derived key into the filename stem —
-    // exactly the codegen-native usage pattern.
+    // exactly the codegen-cranelift usage pattern.
     let src_key = [0xAAu8; 32];
 
     // Write with HMAC so the file is authenticated on disk.

@@ -51,7 +51,7 @@ relon = { workspace = true, features = ["cranelift-aot"] }
 # cranelift-native AOT crate for cold/warm measurement against the
 # tree-walker baseline. Bench is host-only so we pull the cranelift
 # dep unconditionally.
-relon-codegen-native = { workspace = true }
+relon-codegen-cranelift = { workspace = true }
 # Phase C (2026-05-26): direct LLVM AOT evaluator for the cmp_lua
 # `relon_llvm_aot` panel row. Optional + feature-gated; off by default
 # so workspace builds without LLVM 18 dev headers stay green. The
@@ -89,7 +89,7 @@ cranelift-codegen = "0.132"
 # hand-builds a cranelift JIT module whose body runs the full N-iter
 # loop internally (bypassing the recorder gap). Frontend + module +
 # jit + native are needed for that build path; they pull in the same
-# 0.131 line the workspace already pins for `relon-codegen-native`.
+# 0.131 line the workspace already pins for `relon-codegen-cranelift`.
 cranelift-frontend = "0.132"
 cranelift-module = "0.132"
 cranelift-jit = "0.132"

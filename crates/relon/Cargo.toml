@@ -13,12 +13,12 @@ categories = ["config", "parsing", "compilers"]
 # v5-β-2 stage 4: `cranelift-aot` toggles the cranelift-backed native
 # AOT evaluator. Default-on for native hosts (the cranelift backend
 # is the only AOT path after wasm-AOT retirement); excluded entirely
-# from wasm32 targets through the absence of `relon-codegen-native`
+# from wasm32 targets through the absence of `relon-codegen-cranelift`
 # under `target.'cfg(target_arch = "wasm32")'.dependencies`, which
 # keeps `relon-wasm-bindings` (browser playground) free of the cranelift
 # dependency tree.
 default = ["cranelift-aot"]
-cranelift-aot = ["dep:relon-codegen-native"]
+cranelift-aot = ["dep:relon-codegen-cranelift"]
 # Phase B LLVM-AOT backend. Off by default because the build requires
 # LLVM 18 dev headers on the host (env `LLVM_SYS_181_PREFIX`). Hosts
 # that have the toolchain on the box opt in with
@@ -41,7 +41,7 @@ relon-analyzer = { workspace = true }
 # the absence of the `cranelift-aot` feature. Since the wasm-AOT
 # backend retired in stage 4 this is the only AOT path; default-on
 # above means native hosts get it without opting in.
-relon-codegen-native = { workspace = true, optional = true }
+relon-codegen-cranelift = { workspace = true, optional = true }
 # Phase B LLVM-AOT backend (off-by-default, gated by the `llvm-aot`
 # feature). Pulled in only when the host has LLVM 18 dev headers on
 # the build box — see the feature comment above.

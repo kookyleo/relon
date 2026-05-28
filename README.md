@@ -103,7 +103,7 @@ parallel workflows). It's advisory — never blocks.
 - `crates/relon-eval-api`: Shared types + the `Evaluator` trait both backends implement.
 - `crates/relon-evaluator`: Tree-walking interpreter (default backend) + standard library.
 - `crates/relon-bytecode`: Stack bytecode compiler/VM and trace-dispatch bridge.
-- `crates/relon-codegen-native`: Cranelift native AOT/JIT backend, sandbox glue, and trace install pipeline.
+- `crates/relon-codegen-cranelift`: Cranelift native AOT/JIT backend, sandbox glue, and trace install pipeline.
 - `crates/relon-object-cache`, `crates/relon-object-link`: Native object cache, HMAC integrity, memfd/dlopen loader, and ET_REL linking support.
 - `crates/relon-trace-abi`, `crates/relon-trace-recorder`, `crates/relon-trace-jit`,
   `crates/relon-trace-emitter`: Trace IR, recorder, optimizer/runtime helpers, and Cranelift emitter.

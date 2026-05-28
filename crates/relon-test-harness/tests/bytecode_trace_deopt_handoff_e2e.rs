@@ -23,11 +23,11 @@ use relon_bytecode::trace_dispatch::{InstalledTraceLookup, TraceInvokeOutcome};
 use relon_bytecode::{
     BytecodeEvaluator, HotTraceTriggerHandle, InstalledTraceLookupHandle, COUNTER_SATURATED,
 };
-use relon_codegen_native::trace_install::{
+use relon_codegen_cranelift::trace_install::{
     clear_recording, global_trace_jit_state, register_recording, reset_jump_helper_call_count,
     RecordingRegistration,
 };
-use relon_codegen_native::{CraneliftHotTrigger, CraneliftTraceLookup};
+use relon_codegen_cranelift::{CraneliftHotTrigger, CraneliftTraceLookup};
 use relon_eval_api::{Evaluator, RuntimeError, Value};
 use relon_ir::{IrType, Op, TaggedOp};
 use relon_parser::TokenRange;
@@ -1075,7 +1075,7 @@ fn layer1_string_production_body_records_and_installs_trace() {
     // recorder ran against the production body and the install
     // pipeline accepted it.
     assert_eq!(
-        relon_codegen_native::trace_install::jump_helper_call_count(),
+        relon_codegen_cranelift::trace_install::jump_helper_call_count(),
         1
     );
 

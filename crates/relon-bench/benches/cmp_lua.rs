@@ -82,10 +82,10 @@ use relon_trace_jit::runtime::StringRef;
 // IR ops, registers via `register_recording`, and drives the recorder
 // + JIT install pipeline via `__relon_jump_to_recorder`. The installed
 // `JITedTraceFn` is then what the bench timing loop invokes.
-use relon_codegen_native::trace_install::{
+use relon_codegen_cranelift::trace_install::{
     __relon_jump_to_recorder, global_trace_jit_state, RecordingRegistration,
 };
-use relon_codegen_native::JITedTraceFn;
+use relon_codegen_cranelift::JITedTraceFn;
 use relon_ir::ir::{IrType, Op, TaggedOp};
 use relon_parser::TokenRange;
 
@@ -330,7 +330,7 @@ fn trace_jit_production_label_eligible(label: &str) -> bool {
 /// the AOT envelope. The bench row mirrors the `try_build_bytecode`
 /// n/a contract: skip the timed inner loop instead of panicking.
 ///
-/// The `relon-bench` crate always pulls in `relon-codegen-native`, so
+/// The `relon-bench` crate always pulls in `relon-codegen-cranelift`, so
 /// the cranelift codegen path is unconditionally available here; no
 /// feature-gate stub needed.
 fn try_build_aot(src: &str, label: &str) -> Option<Box<dyn RelonEvaluator>> {
@@ -414,7 +414,7 @@ fn lua_fn(lua: &mlua::Lua, src: &str) -> mlua::Function {
 // consistency against the analytic expectation before timing.
 //
 // **Why hand-built and not via the recorder?** Per F-D7 §3 and F-D8
-// §7, the `TraceRecordingEvaluator` (in `relon-codegen-native`) does
+// §7, the `TraceRecordingEvaluator` (in `relon-codegen-cranelift`) does
 // not yet recognise the source-side `s + t` / `s.contains(_)` /
 // `d[k]` / `xs[i]` patterns. Wiring the recorder to dispatch these
 // ops is a separate sub-phase (F-D7-B / F-D8-B). The F-D9 mandate is
@@ -471,13 +471,13 @@ fn lua_fn(lua: &mlua::Lua, src: &str) -> mlua::Function {
 // fixture returned analytic byte length instead of reconstructing the
 // String, so the constant is no longer needed. Slot MAX_FN_ID - 10
 // stays unused.
-const W4_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 11) as u32;
+const W4_REC_FN_ID: u32 = (relon_codegen_cranelift::MAX_FN_ID - 11) as u32;
 /// F-D7-H: separate fn_id slot for the long-haystack variant so it
 /// coexists with the short-haystack W4 row in the same bench process
 /// — both rows share the recorder install pipeline but observe
 /// independent haystack pointers at recording time, which means
 /// independent F-D7-C const-needle / F-D7-H str-payload side tables.
-const W4_LONG_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 12) as u32;
+const W4_LONG_REC_FN_ID: u32 = (relon_codegen_cranelift::MAX_FN_ID - 12) as u32;
 /// review-improvement-167: W10 (config_eval) trace_jit row. The
 /// closure-bodied predicate uses `||` / `&&`; recorder has no
 /// `Op::If` / `Op::Select` / `Op::BitAnd` support, so we lower the
@@ -485,7 +485,7 @@ const W4_LONG_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 12) as u32;
 /// where each compare produces an `i64` 0/1 cell. Multiplying ANDs
 /// without short-circuit, which preserves the workload's per-iter
 /// op count.
-const W10_REC_FN_ID: u32 = (relon_codegen_native::MAX_FN_ID - 17) as u32;
+const W10_REC_FN_ID: u32 = (relon_codegen_cranelift::MAX_FN_ID - 17) as u32;
 
 fn ir_tag(op: Op) -> TaggedOp {
     TaggedOp {
@@ -758,8 +758,8 @@ fn install_recorder_trace(
     param_tys: Vec<IrType>,
     warmup_args: &[u64],
 ) -> Arc<JITedTraceFn> {
-    let _ = relon_codegen_native::clear_recording(fn_id);
-    let state = relon_codegen_native::global_trace_jit_state();
+    let _ = relon_codegen_cranelift::clear_recording(fn_id);
+    let state = relon_codegen_cranelift::global_trace_jit_state();
     state.invalidate_trace(fn_id);
     // Pre-flight: step the recorder out-of-band so we surface a
     // precise abort reason if the IR fixture falls outside the
@@ -768,7 +768,7 @@ fn install_recorder_trace(
     // abort reason as a panic message rather than a silent
     // install-skip.
     {
-        use relon_codegen_native::{RecordingOutcome, TraceRecordingEvaluator};
+        use relon_codegen_cranelift::{RecordingOutcome, TraceRecordingEvaluator};
         let args: Vec<(u64, IrType)> = param_tys
             .iter()
             .enumerate()
@@ -783,7 +783,7 @@ fn install_recorder_trace(
             );
         }
     }
-    relon_codegen_native::register_recording(
+    relon_codegen_cranelift::register_recording(
         fn_id,
         RecordingRegistration {
             body,
@@ -2386,7 +2386,7 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // calls then deopts on the loop-exit guard. We use
         // `invoke_with_fallback` so the fallback can return the
         // analytic count once the trace has completed all iterations.
-        let w4_state = relon_codegen_native::global_trace_jit_state();
+        let w4_state = relon_codegen_cranelift::global_trace_jit_state();
         let _ = w4_trace;
         {
             let args: [u64; 3] = [
@@ -2602,7 +2602,7 @@ fn bench_cmp_lua(c: &mut Criterion) {
             vec![IrType::I64, IrType::String, IrType::String],
             &w4l_warmup_args,
         );
-        let w4l_state = relon_codegen_native::global_trace_jit_state();
+        let w4l_state = relon_codegen_cranelift::global_trace_jit_state();
         let _ = w4l_trace;
         {
             let args: [u64; 3] = [

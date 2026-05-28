@@ -4,7 +4,7 @@
 //! and that the cranelift verifier accepts the function shape.
 //!
 //! End-to-end execution (actually running the JIT'd code) lives in
-//! `relon-codegen-native`'s install tests, since that's the crate
+//! `relon-codegen-cranelift`'s install tests, since that's the crate
 //! that owns the host-symbol registration. Here we stop at IR
 //! verification — sufficient to catch shape regressions.
 
