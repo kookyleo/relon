@@ -186,10 +186,13 @@ struct ReturnSlot {
 /// Programs that need linear-memory traffic (Dict, List, String)
 /// scope-cut here today; Z.4.1+ widens the surface incrementally.
 pub fn lower_ir_module(lowered: &LoweredEntry) -> Result<Vec<u8>, LowerError> {
-    let entry_idx = lowered.module.entry_func_index.ok_or(LowerError::UnsupportedOp(
-        "no_entry_func",
-        UnsupportedOpReason::Other("no_entry_func"),
-    ))?;
+    let entry_idx = lowered
+        .module
+        .entry_func_index
+        .ok_or(LowerError::UnsupportedOp(
+            "no_entry_func",
+            UnsupportedOpReason::Other("no_entry_func"),
+        ))?;
     let entry_fn = &lowered.module.funcs[entry_idx];
 
     // --- Resolve MainParams offsets --------------------------------------
