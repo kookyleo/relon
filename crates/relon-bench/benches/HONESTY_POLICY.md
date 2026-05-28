@@ -240,3 +240,56 @@ limitation disclosures.
     does not handle first-class closure values returned from outer
     `map` callbacks. Tracked alongside the W7 closure-recursion
     follow-up (Phase F.W7-style envelope widening).
+
+* **W20_n_body_softened** — 4-body 1D Verlet integration over 1000
+  time steps. Asymmetric masses + initial conditions defeat the
+  momentum-conservation `Σ x_i = const` collapse the symmetric
+  4-body 1D system would otherwise exhibit.
+  - tree_walk + luajit only (Float type + first-class closures both
+    outside today's bytecode / cranelift / LLVM / wasm envelopes).
+  - canonical-panel relon_jit row falls through to tree-walker
+    (same envelope reason — `closure value cannot cross the wasm
+    module boundary`).
+  - rust_native row IS valid (Verlet feedback shape blocks closed-
+    form fold). Throughput uses `n_steps * n_bodies^2` (16k pair-
+    force ops for n=1000) so per-pair ns is the unit.
+  - **Architectural limitation disclosed (algorithm note, NOT a
+    paper-win)**: the canonical Newtonian gravity kernel uses
+    `F = m * dx / r^3` which requires `sqrt(dx^2 + dy^2)` (1D
+    reduces to `sqrt(dx^2) = |dx|`, but the algebra still needs
+    `1/r^3`). Relon's `std/math` stdlib exposes only `abs` / `max` /
+    `min` / `clamp` — there is NO `sqrt` / `pow` / `exp` today. The
+    source substitutes a softened `1/(r^2 + eps)^2` kernel, which
+    is shape-equivalent (per-step cost is 4 mul + 1 add + 1 div per
+    pair, same as `dx / r^3`) but mathematically NOT Newtonian
+    gravity. The row label `W20_n_body_softened` (NOT `W20_n_body`)
+    reflects the substitution at row-add time. The Lua row runs the
+    SAME softened kernel — both sides pay the same per-pair cost.
+    Future `Z.4.x` Float arm widening + `std/math` extension
+    (`sqrt` + `pow`) can promote the row to the canonical kernel;
+    until then the substitution stays explicit at the label level.
+  - **Honesty checks**: the Float consistency assertion uses
+    absolute tolerance `W20_FLOAT_TOL = 1e-6` rather than exact
+    equality — Verlet over 1000 steps × 64 fp ops/step accumulates
+    ~1e-10 relative drift, well within the tolerance; using a
+    tighter check would surface FMA-lane-fusion order differences
+    between the tree-walker and `rustc`'s lowering.
+
+### Row-add-time gates applied for Tier 3 W20
+
+The per-loop canonical-panel additions for W20 include three small
+but load-bearing gates:
+
+1. **`llvm_aot_source_for` returns None** for W20 — no inlined
+   paper-win variant. The source-level rejection mirrors the W7 /
+   W16 / W17 / W18 pattern of "the production source's load-bearing
+   surface (closures, Float, 2D lists) is outside the envelope; an
+   inlined rewrite would be the algorithm-substitution trap".
+2. **`rust_native_dispatch` panics on W20** because W20 returns
+   `f64` and the dispatcher's return type is `i64`. The canonical-
+   panel loop instead routes W20 to a dedicated f64 `rust_native_w20`
+   call site that preserves the Float result for the criterion
+   `black_box` consumer.
+3. **The wasm row block skips W20** entirely (Float return + Z.1
+   classifier scope-cut). Skipping early avoids the panic on
+   `relon_int_result` when the expected-value driver runs.

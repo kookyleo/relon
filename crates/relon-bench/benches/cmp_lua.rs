@@ -2400,6 +2400,236 @@ fn w19_expected() -> i64 {
 }
 
 // =====================================================================
+// =====  W20 — scaled n-body (Verlet integration on 4 bodies)  ========
+// =====================================================================
+//
+// Tier 3 numeric kernel workload (panel expansion 2026-05-28).
+// Mirrors the Computer Language Benchmarks Game "n-body" entry shape:
+// a 4-body 1D system, Verlet-style symplectic integration over n
+// time-steps, asymmetric masses + initial conditions to defeat
+// momentum-conservation closed forms.
+//
+// **HONESTY disclosure — softening kernel substitutes `1/r^3`**:
+// The canonical Verlet kernel uses Newtonian gravity `F = m1*m2 / r^2`
+// (force) → `a = F/m = m / r^2`, which requires a `sqrt(dx^2 + dy^2)`
+// to recover `r` and then `1/r^3` for the per-component acceleration
+// (`a_x = m * dx / r^3`). Relon's stdlib `std/math` exposes only
+// `abs` / `max` / `min` / `clamp` — there is NO `sqrt` / `pow` /
+// `exp` today. The source uses a softened `1/(r^2 + eps)^2`
+// substitute (`inv_r3 ≈ 1 / (r^2 + eps)^2`), which is shape-equivalent
+// (per-step cost is 4 mul + 1 add + 1 div per pair, same as
+// `dx / r^3`) but mathematically NOT Newtonian gravity. The bench
+// row's name is `W20_n_body_softened` (NOT `W20_n_body`) so a
+// future audit sees the substitution at row-add time. The Lua row
+// runs the SAME softened kernel — both sides pay the same per-pair
+// cost; an in-line `math.sqrt` rewrite in Lua would be a paper win
+// (LuaJIT's `vsqrtsd` intrinsic vs Relon's mul-mul fold).
+//
+// **HONESTY checklist** (per `HONESTY_POLICY.md`):
+// * Source path: `w20_relon_src()` IS the production source. Lua row
+//   in `w20_lua_src()` runs the SAME softened 4-body Verlet step
+//   over the SAME initial conditions; no closed-form analytic
+//   shortcut on either side.
+// * Algorithm complexity preserved: O(n_steps * n_bodies^2) — for
+//   4 bodies × 1000 steps = 16 000 pair-force evaluations, each
+//   computing `dx = s[j] - s[i]`, `r2 = dx*dx + soft`, `inv_r4 =
+//   1/(r2*r2)`, and `force = dx * mj * inv_r4`. NO closed-form fold —
+//   the per-step state mutates in a shape-dependent way (each
+//   position update feeds back into the next step's distance), so
+//   neither rustc nor LLVM can reduce the time-loop to a polynomial
+//   in `n_steps`.
+// * Time-math sanity: 4 bodies × 4 pairs/body × 4 mul + 1 div / pair
+//   ≈ 64 ops/step × 1000 steps = 64 000 fp ops per `#main` call.
+//   Tree-walker per-iter ~ 250 ns (closure dispatch dominated) × 4k
+//   inner calls ≈ 1 ms / run. LuaJIT ~ 20 µs / run. rust_native ~ 1
+//   µs / run (4 cache-resident bodies, no allocation). Per-iter cost
+//   << 1 ns/run would indicate the time loop got folded (impossible
+//   because of the feedback-into-next-step shape).
+// * I/O shape: `#main(Int n) -> Float`. `n` = number of time steps
+//   (1000 by default). Float return is the asymmetric weighted
+//   checksum `Σ_i (i+1) * x_i + Σ_i (5+i) * v_i` so a position-only
+//   bug surfaces in the velocity weight. Lua row returns the same.
+//   The smoke runner asserts the result is within 1e-6 absolute of
+//   the Rust-native reference — Float comparison is tolerance-based,
+//   NOT bit-equal, because the tree-walker's expression evaluation
+//   order may differ from `rustc`'s by 1 ULP on a fused-mul-add lane.
+// * Backend coverage: tree_walk + luajit only. Bytecode envelope
+//   rejects (`closure value cannot cross the wasm module boundary` —
+//   the bytecode VM's M2-A scalar envelope does not handle the
+//   first-class closure values `step` / `accel` / `pair_force` the
+//   source carries through `where` bindings). Cranelift AOT rejects
+//   (same reason). LLVM AOT rejects (Float type + first-class
+//   closures both outside the Phase E envelope — Phase F.W7 lifted
+//   only Int recursion). Wasm classifier scope-cuts (no Float
+//   support in Z.1 program set). rust_native row IS valid — the
+//   feedback-shaped time loop does NOT closed-form fold.
+
+/// W20 scale — 1000 Verlet integration steps over a 4-body 1D
+/// system. The CLBG "n-body" entry uses 50 000 000 steps on 5 bodies;
+/// Relon's tree-walker pays closure dispatch + scope clone on every
+/// pair-force call (16 calls/step × 1000 steps = 16 000 closure
+/// invocations), pushing per-run to ~1 ms even at 1000 steps. Larger
+/// step counts blow the criterion 5 s measurement budget; smaller
+/// step counts (100 steps) hide the Verlet drift accumulation that
+/// defeats trivial closed-form folds. 1000 steps is the size that
+/// produces a non-trivial asymmetric checksum (≈ 75.87) with stable
+/// wall-clock.
+const W20_N: i64 = 1_000;
+
+fn w20_relon_src() -> &'static str {
+    // 4-body 1D Verlet step. State `s` is an 8-element list:
+    // `[x0, x1, x2, x3, v0, v1, v2, v3]`. Each step computes the
+    // pairwise softened force `pair_force(s, i, j, mj)` for body
+    // `i` from body `j` (mass `mj`), accumulates the per-body
+    // acceleration `accel(s, i) = Σ_j pair_force(s, i, j, m_j)`,
+    // and produces a new 8-element state by integrating positions
+    // and velocities by `dt`.
+    //
+    // The asymmetric masses (`m0=1`, `m1=2`, `m2=0.5`, `m3=3`) and
+    // initial state (`x = [0.0, 1.0, 2.5, 4.0]`, `v = [0.1, 0.0,
+    // 0.0, 0.2]`) defeat the momentum-conservation symmetries that
+    // would otherwise collapse `Σ x_i` to a constant across all
+    // time steps (in a symmetric 1D 4-body system, the centre-of-
+    // mass position is conserved; the per-step delta on `Σ m_i *
+    // x_i` is zero). With asymmetric masses, the per-step delta
+    // shows up in the final checksum, and the bench measures real
+    // per-step work rather than a Σ-x-equals-const identity.
+    //
+    // Final checksum is the asymmetric weighted sum:
+    // `Σ_i (i+1) * x_i + Σ_i (5+i) * v_i`. Weights `(1..=8)` are
+    // co-prime with the body count, so no 1D 4-body symmetry can
+    // collapse the sum to a constant.
+    //
+    // `#unstrict` is required because the closure params (`s`, `i`,
+    // `j`, `mj`, `_step`) are untyped; the analyzer's strict-mode
+    // envelope demands explicit type annotations. The tree-walker
+    // accepts either way; using `#unstrict` keeps the strict-mode
+    // tightening path from silently dropping the row.
+    "#unstrict\n\
+     #main(Int n) -> Float\n\
+     final_state[0] * 1.0 + final_state[1] * 2.0 + final_state[2] * 3.0 + final_state[3] * 4.0\n\
+       + final_state[4] * 5.0 + final_state[5] * 6.0 + final_state[6] * 7.0 + final_state[7] * 8.0\n\
+     where {\n\
+       dt: 0.01,\n\
+       soft: 0.1,\n\
+       m0: 1.0, m1: 2.0, m2: 0.5, m3: 3.0,\n\
+       init: [0.0, 1.0, 2.5, 4.0, 0.1, 0.0, 0.0, 0.2],\n\
+       pair_force(s, i, j, mj):\n\
+         i == j ? 0.0 :\n\
+           (s[j] - s[i]) * mj * (1.0 / (((s[j] - s[i]) * (s[j] - s[i]) + soft) * ((s[j] - s[i]) * (s[j] - s[i]) + soft))),\n\
+       accel(s, i): pair_force(s, i, 0, m0) + pair_force(s, i, 1, m1) + pair_force(s, i, 2, m2) + pair_force(s, i, 3, m3),\n\
+       step(s): [\n\
+         s[0] + s[4] * dt,\n\
+         s[1] + s[5] * dt,\n\
+         s[2] + s[6] * dt,\n\
+         s[3] + s[7] * dt,\n\
+         s[4] + accel(s, 0) * dt,\n\
+         s[5] + accel(s, 1) * dt,\n\
+         s[6] + accel(s, 2) * dt,\n\
+         s[7] + accel(s, 3) * dt\n\
+       ],\n\
+       final_state: range(n).reduce(init, (s, _step) => step(s))\n\
+     }"
+}
+
+fn w20_lua_src() -> String {
+    // Same softened 4-body 1D Verlet step. Lua's 1-indexed lists
+    // force the `s[i + 1]` shifts when comparing to the Relon
+    // source's 0-indexed reads; the integration kernel and the
+    // final weighted checksum remain byte-equivalent.
+    format!(
+        r#"return function()
+            local n = {n}
+            local dt = 0.01
+            local soft = 0.1
+            local m = {{1.0, 2.0, 0.5, 3.0}}
+            local s = {{0.0, 1.0, 2.5, 4.0, 0.1, 0.0, 0.0, 0.2}}
+            local function pair_force(s, i, j, mj)
+                if i == j then return 0.0 end
+                local dx = s[j + 1] - s[i + 1]
+                local r2 = dx * dx + soft
+                return dx * mj * (1.0 / (r2 * r2))
+            end
+            local function accel(s, i)
+                return pair_force(s, i, 0, m[1]) + pair_force(s, i, 1, m[2])
+                     + pair_force(s, i, 2, m[3]) + pair_force(s, i, 3, m[4])
+            end
+            for _ = 1, n do
+                local ns = {{
+                    s[1] + s[5] * dt,
+                    s[2] + s[6] * dt,
+                    s[3] + s[7] * dt,
+                    s[4] + s[8] * dt,
+                    s[5] + accel(s, 0) * dt,
+                    s[6] + accel(s, 1) * dt,
+                    s[7] + accel(s, 2) * dt,
+                    s[8] + accel(s, 3) * dt,
+                }}
+                s = ns
+            end
+            return s[1] * 1.0 + s[2] * 2.0 + s[3] * 3.0 + s[4] * 4.0
+                 + s[5] * 5.0 + s[6] * 6.0 + s[7] * 7.0 + s[8] * 8.0
+        end"#,
+        n = W20_N
+    )
+}
+
+/// W20 absolute-error tolerance for Float consistency checks.
+///
+/// Verlet integration over 1000 steps with `dt = 0.01` accumulates
+/// ~10 mul/add per step per body (16 body updates × 64 pair-force
+/// evals = ~1k fma per step × 1000 = ~1M fp ops). Each fma carries
+/// ~1 ULP of relative error; cumulative drift over 1M ops is bounded
+/// by `1e-16 * 1e6 ≈ 1e-10` relative, which on a checksum value of
+/// ~75 lands at `~7.5e-9` absolute. 1e-6 is a 100x safety margin
+/// for cross-runtime FMA-vs-no-FMA differences (LuaJIT may emit
+/// `vfmadd213sd` on AVX2; Relon's tree-walker evaluates `a * b + c`
+/// as two operations).
+const W20_FLOAT_TOL: f64 = 1.0e-6;
+
+fn w20_expected() -> f64 {
+    // Hand-rolled reference. Uses `f64` (matches the Relon tree-
+    // walker's Float runtime type) with no `mul_add` so the rounding
+    // mode matches the source's `a * b + c` shape exactly.
+    let n: i64 = W20_N;
+    let dt: f64 = 0.01;
+    let soft: f64 = 0.1;
+    let m: [f64; 4] = [1.0, 2.0, 0.5, 3.0];
+    let mut s: [f64; 8] = [0.0, 1.0, 2.5, 4.0, 0.1, 0.0, 0.0, 0.2];
+    let mut step = 0i64;
+    while step < n {
+        let mut a: [f64; 4] = [0.0; 4];
+        for i in 0..4 {
+            let mut ai = 0.0;
+            for j in 0..4 {
+                if i == j {
+                    continue;
+                }
+                let dx = s[j] - s[i];
+                let r2 = dx * dx + soft;
+                ai += dx * m[j] * (1.0 / (r2 * r2));
+            }
+            a[i] = ai;
+        }
+        let mut ns: [f64; 8] = [0.0; 8];
+        for i in 0..4 {
+            ns[i] = s[i] + s[4 + i] * dt;
+            ns[4 + i] = s[4 + i] + a[i] * dt;
+        }
+        s = ns;
+        step += 1;
+    }
+    s[0] * 1.0
+        + s[1] * 2.0
+        + s[2] * 3.0
+        + s[3] * 4.0
+        + s[4] * 5.0
+        + s[5] * 6.0
+        + s[6] * 7.0
+        + s[7] * 8.0
+}
+
+// =====================================================================
 // =====  consistency assertions  ======================================
 // =====================================================================
 
@@ -2430,6 +2660,22 @@ fn relon_int_result(w: &str, v: Value) -> i64 {
             other => panic!("{w}: dict.result is not Int: {other:?}"),
         },
         other => panic!("{w}: Relon result not Int or Dict: {other:?}"),
+    }
+}
+
+/// Extract a Float value from a Relon `Value`. Mirrors `relon_int_result`
+/// for the Tier 3 W20 row whose production source returns Float (the
+/// checksum after the 4-body Verlet integration). Dict-bodied returns
+/// unwrap a `result` field for symmetry with the Int helper, even though
+/// no current Float workload uses the Dict shape.
+fn relon_float_result(w: &str, v: Value) -> f64 {
+    match v {
+        Value::Float(f) => f.into_inner(),
+        Value::Dict(d) => match d.map.get("result") {
+            Some(Value::Float(f)) => f.into_inner(),
+            other => panic!("{w}: dict.result is not Float: {other:?}"),
+        },
+        other => panic!("{w}: Relon result not Float or Dict: {other:?}"),
     }
 }
 
@@ -2870,6 +3116,52 @@ fn rust_native_w19(n: i64) -> i64 {
     }
 }
 
+/// W20 4-body Verlet baseline. Same shape as the Relon source:
+/// `[f64; 8]` state, `[f64; 4]` masses, no allocation per step. The
+/// per-step force accumulation reads each of 4 bodies' force on each
+/// of 4 partners (skipping self-pairing) before writing the new
+/// state; `black_box` on `n` prevents compile-time constant fold of
+/// the entire integration. Returns the asymmetric weighted checksum.
+#[inline(never)]
+fn rust_native_w20(n: i64) -> f64 {
+    let n = black_box(n);
+    let dt: f64 = 0.01;
+    let soft: f64 = 0.1;
+    let m: [f64; 4] = [1.0, 2.0, 0.5, 3.0];
+    let mut s: [f64; 8] = [0.0, 1.0, 2.5, 4.0, 0.1, 0.0, 0.0, 0.2];
+    let mut step: i64 = 0;
+    while step < n {
+        let mut a: [f64; 4] = [0.0; 4];
+        for i in 0..4 {
+            let mut ai = 0.0;
+            for j in 0..4 {
+                if i == j {
+                    continue;
+                }
+                let dx = s[j] - s[i];
+                let r2 = dx * dx + soft;
+                ai += dx * m[j] * (1.0 / (r2 * r2));
+            }
+            a[i] = ai;
+        }
+        let mut ns: [f64; 8] = [0.0; 8];
+        for i in 0..4 {
+            ns[i] = s[i] + s[4 + i] * dt;
+            ns[4 + i] = s[4 + i] + a[i] * dt;
+        }
+        s = ns;
+        step += 1;
+    }
+    s[0] * 1.0
+        + s[1] * 2.0
+        + s[2] * 3.0
+        + s[3] * 4.0
+        + s[4] * 5.0
+        + s[5] * 6.0
+        + s[6] * 7.0
+        + s[7] * 8.0
+}
+
 // =====================================================================
 // =====  Phase C: LLVM AOT row glue  ==================================
 // =====================================================================
@@ -3032,6 +3324,23 @@ fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
         // table-load cost; collapsing both `a[i][k]` and `b[k][j]`
         // to inline arithmetic skips the load.
         "W19_matrix_multiply" => None,
+        // Panel expansion 2026-05-28 (Tier 3 numeric-kernel W20):
+        // production source uses Float arithmetic + first-class
+        // closure values (`step` / `accel` / `pair_force` defined
+        // in `where` clause). The LLVM AOT envelope has both gaps:
+        // - Float-typed `#main` return is not in the Phase E typed
+        //   surface (Phase E covers Int + String; Float arm tracked
+        //   for Phase Z.4.x).
+        // - First-class closures in non-higher-order position
+        //   surface as `closure value cannot cross the wasm module
+        //   boundary` (same envelope check that rejects W2 / W16 /
+        //   W17 / W18 closure shapes).
+        // No "inlined no-closure" variant — the algorithm structure
+        // requires the per-step state to flow through the pair-force
+        // accumulator; flattening into a single big arithmetic
+        // expression would be a paper-win loss of the per-step
+        // feedback shape (canonical Verlet integration step).
+        "W20_n_body_softened" => None,
         _ => None,
     }
 }
@@ -3118,6 +3427,14 @@ fn rust_native_dispatch(label: &str, n: i64) -> i64 {
         // inner reduce. `rust_native` is a legitimate "what would
         // matmul cost in plain Rust" baseline floor.
         "W19_matrix_multiply" => rust_native_w19(n),
+        // W20_n_body_softened returns f64 (Float checksum); routed
+        // through a dedicated `rust_native_w20` call site rather
+        // than this i64 dispatcher. Reaching this arm is a bug — the
+        // W20 row in the canonical_panel calls `rust_native_w20`
+        // directly via the W20-specific gate in the loop body.
+        "W20_n_body_softened" => {
+            panic!("rust_native_dispatch: W20 returns f64, route through rust_native_w20 directly")
+        }
         other => panic!("rust_native_dispatch: unknown workload `{other}`"),
     }
 }
@@ -4890,6 +5207,67 @@ fn bench_cmp_lua(c: &mut Criterion) {
         });
     }
 
+    // ----- W20 n-body softened (4-body 1D Verlet integration) -----
+    //
+    // Panel-expansion 2026-05-28 (Tier 3 numeric-kernel). See the
+    // top-of-file W20 doc-comment for the HONESTY disclosure
+    // (algorithm is `1/(r^2+eps)^2` softened force, NOT canonical
+    // Newtonian `1/r^3` gravity — Relon's `std/math` stdlib has no
+    // `sqrt`; the Lua row runs the SAME softened kernel to keep the
+    // comparison honest). Backend coverage: tree_walk + luajit only.
+    // Float-typed `#main` return + first-class closure values both
+    // sit outside today's bytecode / cranelift / LLVM / wasm
+    // envelopes.
+    //
+    // Consistency check uses absolute tolerance `W20_FLOAT_TOL` (1e-6)
+    // rather than exact equality — Verlet integration accumulates
+    // ~1e-10 relative rounding drift over 1k steps × 64 fp ops/step,
+    // which the tree-walker's expression-evaluation order may differ
+    // from `rustc`'s by ~1 ULP per FMA-lane fusion.
+    {
+        let (walker, scope) = build_tree_walker(w20_relon_src());
+        let lua_fn_w20 = lua_fn(&lua, &w20_lua_src());
+
+        let relon_v = relon_float_result("W20", walker.run_main(&scope, args_w_n(W20_N)).unwrap());
+        let lua_v: f64 = lua_fn_w20.call(()).unwrap();
+        let expected_v = w20_expected();
+        assert!(
+            (relon_v - expected_v).abs() < W20_FLOAT_TOL,
+            "W20: Relon {relon_v} differs from expected {expected_v} by more than {W20_FLOAT_TOL}",
+        );
+        assert!(
+            (lua_v - expected_v).abs() < W20_FLOAT_TOL,
+            "W20: Lua {lua_v} differs from expected {expected_v} by more than {W20_FLOAT_TOL}",
+        );
+
+        // Throughput is the number of pair-force evaluations per
+        // call: `n_steps * n_bodies^2` (4 bodies × 4 pair calls /
+        // body / step × W20_N steps). With W20_N=1000 that's 16 000
+        // pair-force ops, the dominant work unit.
+        let pair_force_ops = (W20_N as u64) * 4 * 4;
+        group.throughput(Throughput::Elements(pair_force_ops));
+        group.bench_function(
+            BenchmarkId::new("W20_n_body_softened", "relon_tree_walk"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(W20_N);
+                    timed_with_warmup(iters, || {
+                        let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
+        group.bench_function(BenchmarkId::new("W20_n_body_softened", "luajit"), |b| {
+            b.iter_custom(|iters| {
+                timed_with_warmup(iters, || {
+                    let v: f64 = lua_fn_w20.call(()).unwrap();
+                    black_box(v);
+                })
+            });
+        });
+    }
+
     // =================================================================
     // ===== Dart-style canonical panel: relon_jit + relon_aot =========
     // =================================================================
@@ -5065,6 +5443,31 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 s * s * s
             },
             || args_w_n(W19_N),
+        ),
+        // Panel-expansion 2026-05-28 (Tier 3 numeric-kernel W20):
+        // * relon_jit: runs through `JitEvaluator::run_main`; falls
+        //   through to tree-walker (Float type + first-class closures
+        //   sit outside today's bytecode / cranelift / LLVM AOT
+        //   envelopes — Phase Z.4.x Float arm pending).
+        // * relon_aot / relon_llvm_aot: both reject. Returning None
+        //   from `llvm_aot_source_for`.
+        // * rust_native: VALID — Verlet integration has feedback-
+        //   shaped per-step state mutation, no closed-form fold over
+        //   the time loop. But the canonical_panel rust_native row
+        //   downstream dispatches through `rust_native_dispatch(label, n)`
+        //   which returns `i64`; the W20 row is gated out below and
+        //   the bench drops back to a dedicated f64 rust_native row
+        //   block inline (see the W20 rust_native gate in the loop
+        //   body).
+        // * relon_wasm_wasmtime: classifier scope-cut (Z.1 has no
+        //   Float support).
+        // * Throughput uses pair-force evaluation count `n_steps *
+        //   n_bodies^2` rather than `n` so per-pair ns is the unit.
+        (
+            "W20_n_body_softened",
+            w20_relon_src(),
+            { (W20_N as u64) * 4 * 4 },
+            || args_w_n(W20_N),
         ),
     ];
 
@@ -5346,6 +5749,32 @@ fn bench_cmp_lua(c: &mut Criterion) {
                  arithmetic-progression sum to a closed-form polynomial — \
                  see audit #332)"
             );
+        } else if *label == "W20_n_body_softened" {
+            // Panel expansion 2026-05-28 (Tier 3 numeric-kernel W20):
+            // production source returns Float. The i64
+            // `rust_native_dispatch` cannot carry the kernel; we
+            // dispatch through the dedicated `rust_native_w20` (also
+            // black_box-gated) so the row's f64 result is preserved
+            // for the criterion `black_box` consumer.
+            let args = args_factory();
+            let scalar = args
+                .get("n")
+                .map(|v| match v {
+                    Value::Int(n) => *n,
+                    other => panic!(
+                        "[cmp_lua {label}] rust_native row: scalar arg `n` not Int: {other:?}"
+                    ),
+                })
+                .unwrap_or_else(|| panic!("[cmp_lua {label}] rust_native row: missing scalar `n`"));
+            group.bench_function(BenchmarkId::new(*label, "rust_native"), |b| {
+                b.iter_custom(|iters| {
+                    let s_in = black_box(scalar);
+                    timed_with_warmup(iters, || {
+                        let v = rust_native_w20(black_box(s_in));
+                        black_box(v);
+                    })
+                });
+            });
         } else if !paper_win_collapsed_variant_label(label) {
             let args = args_factory();
             // W12 keys on "x"; every other workload keys on "n".
@@ -5390,7 +5819,16 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // args triple flows from the canonical_panel entry above so
         // the cross-check stays byte-identical with the source the
         // row labels.
-        {
+        //
+        // Panel expansion 2026-05-28 (Tier 3 numeric-kernel W20):
+        // W20 returns Float (`#main -> Float`); the expected-value
+        // driver path uses `relon_int_result` which only handles
+        // Int / Dict-with-Int-result. We skip the wasm block for
+        // W20 entirely — the Z.1 wasm program set has no Float
+        // support today, so even if the expected-value helper were
+        // widened to f64 the wasm classifier would still scope-cut.
+        // Skipping early avoids the panic on the Int unwrap.
+        if *label != "W20_n_body_softened" {
             // The expected analytic value is derived from one drive of
             // the tree-walker path so we don't bake duplicate `expected`
             // constants into the bench (W6/W12's relon_int_result is
