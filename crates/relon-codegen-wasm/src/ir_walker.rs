@@ -1,4 +1,5 @@
-//! Phase Z.4.0 — IR walker scaffolding.
+//! Phase Z.4.0 — IR walker scaffolding (extended with Z.4.1 Dict-return
+//! support).
 //!
 //! Replaces the variant-per-workload [`crate::WasmProgram`] shape with
 //! a real walker over [`relon_ir::Op`]. This is the canonical lowering
@@ -7,15 +8,31 @@
 //! host (`relon-wasm-evaluator`) tries when the IR walker reports an
 //! unsupported op shape.
 //!
-//! ## Z.4.0 scope (this commit)
+//! ## Z.4.0 scope (initial)
 //!
 //! The walker handles the **scalar-Int** subset that maps cleanly to a
 //! `__main(i64, ..., i64) -> i64` typed-func ABI, side-stepping the
 //! buffer-protocol handshake the LLVM AOT backend uses
 //! (`(in_ptr, in_len, out_ptr, out_cap, caps) -> i32` per
 //! `lower_workspace_single` §2.b). The host calls `__main` directly
-//! with each `#main(Int n, ...)` arg as a wasm `i64`; the return
-//! value comes back as an `i64` that the host wraps in `Value::Int`.
+//! with each `#main(Int n, ...)` arg as a wasm `i64`; for scalar-Int
+//! returns the result comes back as an `i64` that the host wraps in
+//! `Value::Int`.
+//!
+//! ## Z.4.1 scope (this commit) — Dict-return mini-ABI
+//!
+//! `#main(...) -> Dict { ... }` sources whose lowering ends in
+//! `AllocRootRecord { idx } ... StoreFieldAtRecord ... Return` now
+//! route through the walker too. The typed-func signature stays
+//! `(i64, ..., i64) -> i64` — the trailing i64 carries the record
+//! base pointer (zero-extended from the i32 arena offset) instead of
+//! a scalar value. The host's `WasmEvaluator::run_main` recognises the
+//! Dict-shape return by inspecting the IR module's `return_schema`
+//! (multi-field, or single field whose name is not the canonical
+//! `value`), and walks the schema layout to decode each field out of
+//! linear memory into a `Value::Dict`. Closure-typed fields stay
+//! scope-cut (Z.4.3); the Dict-return path here only covers scalar
+//! Int / Bool record fields.
 //!
 //! Supported ops (Z.4.0):
 //!
@@ -74,14 +91,17 @@
 //! calls or scope-cut to the existing hand-emit fallback —
 //! the walker never silently swaps in an iterative form.
 
-use relon_eval_api::layout::SchemaLayout;
-use relon_eval_api::schema_canonical::TypeRepr;
-use relon_ir::{IrType, LoweredEntry, Op, TaggedOp, MAIN_RETURN_SCHEMA_NAME};
+use relon_eval_api::layout::{OffsetTable, SchemaLayout};
+use relon_eval_api::schema_canonical::{Schema, TypeRepr};
+use relon_ir::{
+    IrType, LoweredEntry, Op, TaggedOp, MAIN_RETURN_SCHEMA_NAME, RETURN_VALUE_FIELD_NAME,
+};
 use wasm_encoder::{
-    CodeSection, ExportKind, ExportSection, Function, FunctionSection, MemorySection, MemoryType,
-    Module, TypeSection, ValType,
+    CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection, ImportSection,
+    MemArg, MemorySection, MemoryType, Module, TypeSection, ValType,
 };
 
+use crate::host_abi::{import_index, HOST_IMPORTS};
 use crate::LowerError;
 
 /// Why the IR walker declined to lower a given op. Carried in
@@ -154,19 +174,56 @@ struct ParamSlot {
     ty: IrType,
 }
 
-/// Return slot info derived from the `Ret` schema (canonical 1-field
-/// `value` slot). The walker treats a `StoreField` at this offset as
-/// "function return" and the popped i64 becomes the typed-func result.
+/// How the IR walker interprets the trailing `Return` op.
+///
+/// The typed-func signature stays `(i64, ...) -> i64` in both shapes;
+/// the i64 result's *meaning* differs:
+///
+/// - [`ReturnShape::ScalarValue`] — the i64 is the user's scalar Int
+///   return (Z.4.0 behaviour). The body's trailing
+///   `StoreField { offset: ret.value }` leaves the value on the wasm
+///   operand stack, and the function's implicit `End` returns it.
+/// - [`ReturnShape::DictRecordPtr`] — the i64 is a zero-extended i32
+///   arena pointer to a record that the body populated via
+///   `AllocRootRecord` + `StoreFieldAtRecord`. The host walks the
+///   schema layout to decode each field out of linear memory.
 #[derive(Debug, Clone)]
-struct ReturnSlot {
-    /// Buffer offset of the `value` field. Used to match
-    /// `StoreField { offset }` against the return path.
-    offset: u32,
-    /// Declared IR type. Z.4.0 only accepts `Int`; the Ret schema's
-    /// `value` field carries the user's declared `#main -> T` type.
-    /// Z.4.1+ uses this for non-Int return-shape dispatch.
-    #[allow(dead_code)]
-    ty: IrType,
+enum ReturnShape {
+    /// The canonical `Ret { value: Int }` wrapper. Single-field
+    /// schema named [`MAIN_RETURN_SCHEMA_NAME`] with field name
+    /// [`RETURN_VALUE_FIELD_NAME`] and `Int` type.
+    ScalarValue {
+        /// Buffer offset of the `value` field. Used to match
+        /// `StoreField { offset }` against the return path.
+        offset: u32,
+        /// Declared IR type. Z.4.0 only accepts `Int`.
+        #[allow(dead_code)]
+        ty: IrType,
+    },
+    /// Z.4.1 — Dict-return shape. The body emits
+    /// `AllocRootRecord { idx }` to bind a record-base local, walks
+    /// the dict body emitting `StoreFieldAtRecord { idx, offset, ty }`
+    /// per field, then `Return` (which loads the record-base local,
+    /// zero-extends to i64, and returns it as the typed-func result).
+    ///
+    /// The walker side only needs the alloc size + alignment to
+    /// emit the `__relon_arena_alloc` call; the matching per-field
+    /// offsets travel with each `StoreFieldAtRecord` op directly,
+    /// and the host-side Dict decode re-derives them from the IR
+    /// module's `return_schema` (no need to ship the layout through
+    /// the walker output).
+    DictRecordPtr {
+        /// Total fixed-area size of the record (= `arena_alloc` size
+        /// arg the walker passes to the host import at the matching
+        /// `AllocRootRecord` op). Padded to the schema's natural
+        /// alignment so subsequent record allocs in nested Dicts
+        /// align cleanly when Z.4.1+ widens this path.
+        root_size: u32,
+        /// Schema layout's natural alignment in bytes (`arena_alloc`'s
+        /// `align` arg). Mirrors the LLVM-side rule that the root
+        /// record's first field's alignment dominates.
+        root_align: u32,
+    },
 }
 
 /// Lower a workspace's IR module into a wasm binary with a
@@ -223,7 +280,24 @@ pub fn lower_ir_module(lowered: &LoweredEntry) -> Result<Vec<u8>, LowerError> {
         });
     }
 
-    // --- Resolve Ret.value offset ----------------------------------------
+    // --- Classify the return shape --------------------------------------
+    //
+    // The IR pipeline emits two return shapes that the walker can lower:
+    //
+    // - Canonical `Ret { value: Int }` (Z.4.0) — single-field record
+    //   whose field is named [`RETURN_VALUE_FIELD_NAME`]. The body's
+    //   trailing `StoreField { offset: ret.value }` leaves the i64 on
+    //   the operand stack and the typed-func returns it directly.
+    // - Dict-return (Z.4.1) — multi-field record OR single-field
+    //   record whose field name is not "value" (the anon-Dict-return
+    //   path reuses the `Ret` schema name but renames the field after
+    //   the user's `result:` dict key). The body emits
+    //   `AllocRootRecord` + per-field `StoreFieldAtRecord` ops; the
+    //   walker turns the first AllocRootRecord into a host
+    //   `__relon_arena_alloc(root_size, root_align)` call, the
+    //   StoreFieldAtRecord ops into typed stores against the
+    //   record-base local, and the trailing `Return` zero-extends
+    //   the record-base i32 into the typed-func's i64 result.
     if lowered.return_schema.name != MAIN_RETURN_SCHEMA_NAME {
         return Err(LowerError::UnsupportedOp(
             "return_schema_unexpected_name",
@@ -233,40 +307,72 @@ pub fn lower_ir_module(lowered: &LoweredEntry) -> Result<Vec<u8>, LowerError> {
     let ret_layout = SchemaLayout::offsets_for(&lowered.return_schema).map_err(|e| {
         LowerError::UnsupportedOp("ret_layout", UnsupportedOpReason::Other(map_layout_err(&e)))
     })?;
-    if ret_layout.fields.len() != 1 {
-        return Err(LowerError::UnsupportedOp(
-            "ret_schema_multi_field",
-            UnsupportedOpReason::DictReturn,
-        ));
-    }
-    let ret_field = &ret_layout.fields[0];
-    let ret_decl_ty = type_repr_to_ir(&lowered.return_schema.fields[0].ty)?;
-    if ret_decl_ty != IrType::I64 {
-        return Err(LowerError::UnsupportedOp(
-            "non_int_return",
-            non_int_main_param_reason(&ret_decl_ty),
-        ));
-    }
-    let return_slot = ReturnSlot {
-        offset: ret_field.offset as u32,
-        ty: ret_decl_ty,
-    };
+    let return_shape = classify_return_shape(&lowered.return_schema, &ret_layout)?;
 
     // --- Walk the body ---------------------------------------------------
-    let mut emit = EmitState::new(&param_slots, &return_slot);
+    let mut emit = EmitState::new(&param_slots, &return_shape);
     emit.walk(&entry_fn.body)?;
 
     // --- Assemble the wasm module ----------------------------------------
     let n_params = param_slots.len();
+    let needs_imports = emit.needs_arena_alloc;
     let mut module = Module::new();
 
-    // Section 1 — types: one entry, `(i64; n_params) -> i64`.
+    // Section 1 — types.
+    //
+    // Type 0: `(i64; n_params) -> i64` — the `__main` signature both
+    // ABI shapes share (scalar Int return + Dict record-ptr return).
+    //
+    // Type 1+ (when `needs_imports`): one entry per host-import
+    // signature the walker references. Z.4.1 only consults
+    // `__relon_arena_alloc(i32, i32) -> i32`; we still allocate the
+    // full host-import slate so the import-section indices match the
+    // frozen `HOST_IMPORTS` table and a future widening (W3 strings,
+    // W4 contains) doesn't have to renumber.
     let mut types = TypeSection::new();
     types.ty().function(
         std::iter::repeat_n(ValType::I64, n_params),
         std::iter::once(ValType::I64),
     );
+    // Per-host-import type entries, deduped against type 0 + each
+    // other so the section stays compact.
+    let mut sig_pool: Vec<(Vec<ValType>, Vec<ValType>)> = Vec::new();
+    sig_pool.push((vec![ValType::I64; n_params], vec![ValType::I64]));
+    let mut host_type_indices: Vec<u32> = Vec::new();
+    if needs_imports {
+        host_type_indices.reserve(HOST_IMPORTS.len());
+        for imp in HOST_IMPORTS {
+            let sig = (imp.params.to_vec(), imp.results.to_vec());
+            let idx = if let Some(p) = sig_pool.iter().position(|s| s == &sig) {
+                p as u32
+            } else {
+                let new_idx = sig_pool.len() as u32;
+                types
+                    .ty()
+                    .function(sig.0.iter().copied(), sig.1.iter().copied());
+                sig_pool.push(sig);
+                new_idx
+            };
+            host_type_indices.push(idx);
+        }
+    }
     module.section(&types);
+
+    // Section 2 — imports (only when the walker emitted a host-import
+    // call, which today means a Dict-return source called
+    // `__relon_arena_alloc`). Skipping the section when imports are
+    // empty keeps the Z.4.0 scalar-Int modules byte-identical.
+    if needs_imports {
+        let mut imports = ImportSection::new();
+        for (i, imp) in HOST_IMPORTS.iter().enumerate() {
+            imports.import(
+                imp.module,
+                imp.name,
+                EntityType::Function(host_type_indices[i]),
+            );
+        }
+        module.section(&imports);
+    }
 
     // Section 3 — functions: one local fn (the entry).
     let mut funcs = FunctionSection::new();
@@ -274,9 +380,8 @@ pub fn lower_ir_module(lowered: &LoweredEntry) -> Result<Vec<u8>, LowerError> {
     module.section(&funcs);
 
     // Section 5 — memories: one 16-page linear memory, exported as
-    // `memory`. Z.4.0 ops don't touch it; we keep the export so the
-    // host's `bind_memory` plumbing stays uniform across IR-walker
-    // and hand-emit lowerings.
+    // `memory`. Z.4.0 scalar-Int ops don't touch it; Z.4.1 Dict-return
+    // sources use it for the record alloc.
     let mut mems = MemorySection::new();
     mems.memory(MemoryType {
         minimum: 16,
@@ -287,10 +392,17 @@ pub fn lower_ir_module(lowered: &LoweredEntry) -> Result<Vec<u8>, LowerError> {
     });
     module.section(&mems);
 
-    // Section 7 — exports: memory + __main.
+    // Section 7 — exports: memory + __main. The local fn-index for
+    // `__main` is `HOST_IMPORTS.len()` when imports are wired (imports
+    // occupy the low end of the fn-index namespace) and `0` otherwise.
+    let main_fn_idx = if needs_imports {
+        HOST_IMPORTS.len() as u32
+    } else {
+        0
+    };
     let mut exports = ExportSection::new();
     exports.export("memory", ExportKind::Memory, 0);
-    exports.export("__main", ExportKind::Func, 0);
+    exports.export("__main", ExportKind::Func, main_fn_idx);
     module.section(&exports);
 
     // Section 10 — code: one entry, walker output.
@@ -300,6 +412,88 @@ pub fn lower_ir_module(lowered: &LoweredEntry) -> Result<Vec<u8>, LowerError> {
     module.section(&code);
 
     Ok(module.finish())
+}
+
+/// Classify a `Ret`-schema layout into a [`ReturnShape`].
+///
+/// The canonical scalar-Int wrapper has exactly one field whose name
+/// is the [`RETURN_VALUE_FIELD_NAME`] sentinel and whose type is `Int`;
+/// anything else routes to the Dict-record-ptr path. Schemas the
+/// walker can't lower (e.g. a single-field `value: Float`) surface as
+/// `UnsupportedOp` with the matching follow-up tag.
+fn classify_return_shape(schema: &Schema, layout: &OffsetTable) -> Result<ReturnShape, LowerError> {
+    let is_canonical_value_wrapper = schema.fields.len() == 1
+        && schema.fields[0].name == RETURN_VALUE_FIELD_NAME
+        && matches!(schema.fields[0].ty, TypeRepr::Int);
+    if is_canonical_value_wrapper {
+        let ret_field = &layout.fields[0];
+        return Ok(ReturnShape::ScalarValue {
+            offset: ret_field.offset as u32,
+            ty: IrType::I64,
+        });
+    }
+    // Reject Dict-return shapes the walker can't lower yet:
+    // - Empty record (no fields to store).
+    // - Any field whose type isn't currently storeable by the walker
+    //   (Int-only for Z.4.1; Bool / String / List / Schema would each
+    //   need a separate `StoreFieldAtRecord` arm extension).
+    if schema.fields.is_empty() {
+        return Err(LowerError::UnsupportedOp(
+            "ret_schema_empty",
+            UnsupportedOpReason::DictReturn,
+        ));
+    }
+    for f in &schema.fields {
+        match &f.ty {
+            TypeRepr::Int => {}
+            TypeRepr::Bool => {
+                // Z.4.1 widens StoreFieldAtRecord to Bool too, but the
+                // host decode still needs the per-type decode arm.
+                // Routed under DictReturn so the host's tracing layer
+                // groups it with the Z.4.1 follow-up batch.
+                return Err(LowerError::UnsupportedOp(
+                    "ret_field_bool",
+                    UnsupportedOpReason::DictReturn,
+                ));
+            }
+            TypeRepr::Float => {
+                return Err(LowerError::UnsupportedOp(
+                    "ret_field_float",
+                    UnsupportedOpReason::FloatArithmetic,
+                ));
+            }
+            TypeRepr::String => {
+                return Err(LowerError::UnsupportedOp(
+                    "ret_field_string",
+                    UnsupportedOpReason::StringOrStdlib,
+                ));
+            }
+            TypeRepr::List { .. } => {
+                return Err(LowerError::UnsupportedOp(
+                    "ret_field_list",
+                    UnsupportedOpReason::ListLiteral,
+                ));
+            }
+            TypeRepr::Schema { .. } => {
+                // Nested sub-record returns need AllocSubRecord +
+                // EmitTailRecordFromAbsoluteAddr — Z.4.1+ follow-up.
+                return Err(LowerError::UnsupportedOp(
+                    "ret_field_nested_schema",
+                    UnsupportedOpReason::DictReturn,
+                ));
+            }
+            _ => {
+                return Err(LowerError::UnsupportedOp(
+                    "ret_field_unsupported",
+                    UnsupportedOpReason::DictReturn,
+                ));
+            }
+        }
+    }
+    Ok(ReturnShape::DictRecordPtr {
+        root_size: layout.root_size as u32,
+        root_align: layout.root_align as u32,
+    })
 }
 
 /// Translate a canonical `TypeRepr` into the IR's `IrType` for the
@@ -361,40 +555,107 @@ struct LetLocal {
     /// IR-side per-function let-local index. Same value across
     /// `LetGet` and `LetSet` for one logical binding.
     ir_idx: u32,
-    /// Wasm local index. Equals `n_params + position_in_let_decls`.
+    /// Wasm local index. Allocated in alloc-order past the params.
     wasm_idx: u32,
     /// IR type of the bound value (drives wasm `ValType`).
     ty: IrType,
+}
+
+/// Per-record-local wasm slot for the Z.4.1 Dict-return path. Each
+/// `AllocRootRecord { record_local_idx }` allocates one i32 wasm
+/// local that holds the record's arena pointer; the matching
+/// `StoreFieldAtRecord` ops read it as the GEP base.
+#[derive(Debug, Clone, Copy)]
+struct RecordLocal {
+    /// IR-side record-local index (same value across the matching
+    /// `AllocRootRecord` / `StoreFieldAtRecord` / `PushRecordBase`
+    /// ops for one logical record).
+    ir_idx: u32,
+    /// Wasm local index. Allocated in alloc-order past the params.
+    wasm_idx: u32,
+}
+
+/// One auxiliary wasm local allocation in alloc-order. The walker
+/// allocates locals lazily as the IR walk visits the matching op —
+/// let-locals on first `LetGet`/`LetSet`, record-base i32 locals on
+/// `AllocRootRecord`, scratch i64 on first `StoreFieldAtRecord`.
+/// `finalise` declares them in alloc-order so each entry's
+/// `wasm_idx` matches the encoded position.
+#[derive(Debug, Clone, Copy)]
+enum AuxLocal {
+    /// User let-binding. `ty` drives the wasm `ValType`.
+    Let(IrType),
+    /// Z.4.1 — record-base i32 (arena pointer).
+    RecordBase,
+    /// Z.4.1 — scratch i64 used to spill `StoreFieldAtRecord` rhs.
+    ScratchI64,
 }
 
 /// Walker state — accumulates wasm locals declarations and the
 /// function-body instruction stream as we walk the IR Op vector.
 struct EmitState<'a> {
     param_slots: &'a [ParamSlot],
-    return_slot: &'a ReturnSlot,
+    /// Return ABI flavour for the typed-func result. Drives the
+    /// `Return` / trailing `StoreField` / `AllocRootRecord` lowering.
+    return_shape: &'a ReturnShape,
     /// User-let-local declarations seen so far. Each unique `(idx,
     /// ty)` is allocated one wasm local; reseeing the same idx
     /// reuses the wasm slot.
     let_locals: Vec<LetLocal>,
+    /// Z.4.1 — record-base i32 locals, one per unique
+    /// `AllocRootRecord { record_local_idx }` seen.
+    record_locals: Vec<RecordLocal>,
+    /// Z.4.1 — scratch i64 local used to spill the
+    /// `StoreFieldAtRecord` rhs while the walker re-pushes the
+    /// `(addr, value)` operand stack pair wasm needs. Lazily
+    /// allocated on first use so the Z.4.0 scalar-Int path stays
+    /// byte-identical.
+    store_field_scratch_i64: Option<u32>,
+    /// Auxiliary local allocations in declaration order. `finalise`
+    /// reads this vector to emit the wasm `local` section run-length
+    /// encoded; the i-th entry's wasm-local index is
+    /// `n_params + i`. Indices stored on [`LetLocal`] /
+    /// [`RecordLocal`] / `store_field_scratch_i64` mirror this layout.
+    aux_locals: Vec<AuxLocal>,
     /// Instructions captured by walking the body. Encoded into a
     /// `wasm_encoder::Function` in `finalise`.
     insns: Vec<wasm_encoder::Instruction<'static>>,
-    /// `true` after we've seen a `StoreField` against the Ret.value
-    /// slot. The walker's contract: the body must end with one
-    /// `StoreField(ret.value)` + `Return` pair so the typed-func
-    /// returns the popped value.
-    saw_return_store: bool,
+    /// `true` after the body emitted its sentinel return-prep op:
+    /// either a scalar `StoreField(ret.value)` (scalar-Int shape) or
+    /// at least one `AllocRootRecord` (Dict shape). The walker's
+    /// contract: a body that doesn't honour the shape's prep
+    /// sequence fails closed at `finalise`.
+    saw_return_prep: bool,
+    /// Z.4.1 — `true` once the walker has emitted a host-import call
+    /// (today: `__relon_arena_alloc`). Flips the
+    /// import-section / fn-index discipline in `lower_ir_module` so
+    /// modules without host calls keep their byte-identical Z.4.0
+    /// shape.
+    needs_arena_alloc: bool,
 }
 
 impl<'a> EmitState<'a> {
-    fn new(param_slots: &'a [ParamSlot], return_slot: &'a ReturnSlot) -> Self {
+    fn new(param_slots: &'a [ParamSlot], return_shape: &'a ReturnShape) -> Self {
         Self {
             param_slots,
-            return_slot,
+            return_shape,
             let_locals: Vec::new(),
+            record_locals: Vec::new(),
+            store_field_scratch_i64: None,
+            aux_locals: Vec::new(),
             insns: Vec::new(),
-            saw_return_store: false,
+            saw_return_prep: false,
+            needs_arena_alloc: false,
         }
+    }
+
+    /// Reserve the next wasm-local index past the params; appends an
+    /// [`AuxLocal`] tag so [`finalise`] re-emits the matching
+    /// `ValType` declaration. Returns the new index.
+    fn alloc_aux(&mut self, tag: AuxLocal) -> u32 {
+        let idx = self.param_slots.len() as u32 + self.aux_locals.len() as u32;
+        self.aux_locals.push(tag);
+        idx
     }
 
     /// Walk a body's Op vector, emitting wasm instructions in order.
@@ -454,22 +715,44 @@ impl<'a> EmitState<'a> {
 
             // ----- Return store: leave value on stack as fn result --
             Op::StoreField { offset, ty } => {
-                if *offset != self.return_slot.offset {
-                    return Err(LowerError::UnsupportedOp(
-                        "store_field_non_return",
-                        UnsupportedOpReason::BufferProtocolRecord,
-                    ));
+                // `StoreField` is the scalar-Int return path's
+                // sentinel: the IR's trailing
+                // `Op::StoreField { offset: Ret.value }` corresponds
+                // to "this i64 is the function's return value".
+                // The Dict-return shape never emits `StoreField` —
+                // it emits `StoreFieldAtRecord` against the
+                // record-base local instead. A `StoreField` reaching
+                // the Dict-return walker indicates a buffer-protocol
+                // record write the typed-func ABI can't model.
+                match self.return_shape {
+                    ReturnShape::ScalarValue {
+                        offset: ret_offset, ..
+                    } => {
+                        if *offset != *ret_offset {
+                            return Err(LowerError::UnsupportedOp(
+                                "store_field_non_return",
+                                UnsupportedOpReason::BufferProtocolRecord,
+                            ));
+                        }
+                        if *ty != IrType::I64 {
+                            return Err(LowerError::UnsupportedOp(
+                                "store_field_non_int",
+                                non_int_main_param_reason(ty),
+                            ));
+                        }
+                        // Nothing to emit — the value is already on
+                        // the stack; the typed-func's `End` will
+                        // return the top. We just record the
+                        // contract was honoured.
+                        self.saw_return_prep = true;
+                    }
+                    ReturnShape::DictRecordPtr { .. } => {
+                        return Err(LowerError::UnsupportedOp(
+                            "store_field_in_dict_return",
+                            UnsupportedOpReason::BufferProtocolRecord,
+                        ));
+                    }
                 }
-                if *ty != IrType::I64 {
-                    return Err(LowerError::UnsupportedOp(
-                        "store_field_non_int",
-                        non_int_main_param_reason(ty),
-                    ));
-                }
-                // Nothing to emit — the value is already on the stack;
-                // the typed-func's `End` will return the top. We just
-                // record the contract was honoured.
-                self.saw_return_store = true;
             }
 
             // ----- Arithmetic ----------------------------------------
@@ -527,22 +810,132 @@ impl<'a> EmitState<'a> {
             },
 
             // ----- Return --------------------------------------------
-            Op::Return => {
-                // No-op for the typed-func ABI — the function's
-                // trailing `End` already returns the top of stack.
-                // We still record the explicit op so a malformed body
-                // (missing both `StoreField` and `Return`) fails
-                // closed via `finalise`.
+            Op::Return => match self.return_shape {
+                ReturnShape::ScalarValue { .. } => {
+                    // No-op for the scalar-Int typed-func ABI — the
+                    // function's trailing `End` already returns the
+                    // top of stack. We still record the explicit op
+                    // so a malformed body (missing both `StoreField`
+                    // and `Return`) fails closed via `finalise`.
+                }
+                ReturnShape::DictRecordPtr { .. } => {
+                    // Z.4.1 — Dict shape. The body's
+                    // `AllocRootRecord` stashed the arena pointer in
+                    // a wasm i32 local; the trailing `Return` reads
+                    // it back, zero-extends to i64, and the typed-
+                    // func returns it. The host's `WasmEvaluator::
+                    // run_main` recognises the Dict-shape return by
+                    // schema name + field shape and decodes the
+                    // record out of linear memory.
+                    let root_local = self
+                        .record_locals
+                        .first()
+                        .ok_or(LowerError::UnsupportedOp(
+                            "dict_return_no_root_record",
+                            UnsupportedOpReason::DictReturn,
+                        ))?
+                        .wasm_idx;
+                    self.insns.push(I::LocalGet(root_local));
+                    self.insns.push(I::I64ExtendI32U);
+                }
+            },
+
+            // ----- Z.4.1 — Dict root record allocation ---------------
+            Op::AllocRootRecord { record_local_idx } => {
+                let (root_size, root_align) = match self.return_shape {
+                    ReturnShape::DictRecordPtr {
+                        root_size,
+                        root_align,
+                        ..
+                    } => (*root_size, *root_align),
+                    ReturnShape::ScalarValue { .. } => {
+                        // `AllocRootRecord` reaching a scalar-return
+                        // body means the IR pipeline emitted Dict-
+                        // construction ops against a non-Dict return
+                        // shape — that's a contract violation.
+                        return Err(LowerError::UnsupportedOp(
+                            "alloc_root_record_in_scalar_return",
+                            UnsupportedOpReason::DictReturn,
+                        ));
+                    }
+                };
+                // Allocate the i32 record-base wasm local on first
+                // sight of this `record_local_idx`. Subsequent
+                // `StoreFieldAtRecord` / `Return` ops re-resolve via
+                // `intern_record_local`.
+                let wasm_idx = self.intern_record_local(*record_local_idx)?;
+                // emit:
+                //   i32.const <root_size>
+                //   i32.const <root_align>
+                //   call $__relon_arena_alloc
+                //   local.set $record_<idx>
+                self.insns.push(I::I32Const(root_size as i32));
+                self.insns.push(I::I32Const(root_align.max(1) as i32));
+                let arena_alloc_fn_idx = import_index(1); // §4.1 / table id 1
+                self.insns.push(I::Call(arena_alloc_fn_idx));
+                self.insns.push(I::LocalSet(wasm_idx));
+                self.needs_arena_alloc = true;
+                self.saw_return_prep = true;
+                // `__relon_arena_alloc` traps via `Err` on OOM (see
+                // `relon-wasm-evaluator::host_imports`); the wasmtime
+                // trap surfaces as `RuntimeError::IoError` on the
+                // host side, mirroring how the LLVM AOT side reports
+                // arena exhaustion.
             }
 
-            // ----- Scope-cut: Dict construction ----------------------
-            Op::AllocRootRecord { .. }
-            | Op::AllocSubRecord { .. }
-            | Op::StoreFieldAtRecord { .. }
+            // ----- Z.4.1 — store into a record field -----------------
+            Op::StoreFieldAtRecord {
+                record_local_idx,
+                offset,
+                ty,
+            } => {
+                // The walker only handles Int (I64) fields for Z.4.1;
+                // Bool / String / nested-schema field writes land
+                // under the Z.4.1+ widening tasks (matching the
+                // `classify_return_shape` per-field guard).
+                if *ty != IrType::I64 {
+                    return Err(LowerError::UnsupportedOp(
+                        "store_field_at_record_non_int",
+                        non_int_main_param_reason(ty),
+                    ));
+                }
+                let record_wasm_idx = self
+                    .record_locals
+                    .iter()
+                    .find(|r| r.ir_idx == *record_local_idx)
+                    .ok_or(LowerError::UnsupportedOp(
+                        "store_field_at_record_no_alloc",
+                        UnsupportedOpReason::DictReturn,
+                    ))?
+                    .wasm_idx;
+                // Wasm `i64.store` expects `[addr, value]` on the
+                // stack — but the IR producer left the value on top
+                // already. Spill it to a scratch local, push the
+                // record base, push the spilled value, then emit
+                // the typed store with the field-offset immediate.
+                let scratch = self.scratch_i64();
+                self.insns.push(I::LocalSet(scratch));
+                self.insns.push(I::LocalGet(record_wasm_idx));
+                self.insns.push(I::LocalGet(scratch));
+                self.insns.push(I::I64Store(MemArg {
+                    offset: u64::from(*offset),
+                    align: 3, // log2(8) for i64 alignment
+                    memory_index: 0,
+                }));
+            }
+
+            // ----- Scope-cut: Dict construction (Z.4.1 follow-up) ----
+            // `AllocSubRecord` / `PushRecordBase` /
+            // `EmitTailRecordFromAbsoluteAddr` cover nested-record /
+            // pointer-indirect Dict fields the Z.4.1 root-only path
+            // doesn't yet model. Surface the cut under `DictReturn`
+            // so the host's tracing layer groups them with the
+            // matching follow-up batch.
+            Op::AllocSubRecord { .. }
             | Op::PushRecordBase { .. }
             | Op::EmitTailRecordFromAbsoluteAddr { .. } => {
                 return Err(LowerError::UnsupportedOp(
-                    "dict_construction",
+                    "dict_construction_nested",
                     UnsupportedOpReason::DictReturn,
                 ));
             }
@@ -592,6 +985,14 @@ impl<'a> EmitState<'a> {
                 ));
             }
 
+            // ----- Scope-cut: Closure-as-value (Z.4.3 follow-up) -----
+            Op::MakeClosure { .. } | Op::CallClosure { .. } => {
+                return Err(LowerError::UnsupportedOp(
+                    "closure_as_value",
+                    UnsupportedOpReason::ClosureValue,
+                ));
+            }
+
             // ----- Scope-cut: Float arithmetic -----------------------
             Op::Add(IrType::F64)
             | Op::Sub(IrType::F64)
@@ -633,9 +1034,7 @@ impl<'a> EmitState<'a> {
             }
             return Ok(existing.wasm_idx);
         }
-        // Wasm local indices: params first (positions 0..n_params), then
-        // let-locals in declaration-of-first-use order.
-        let wasm_idx = self.param_slots.len() as u32 + self.let_locals.len() as u32;
+        let wasm_idx = self.alloc_aux(AuxLocal::Let(ty));
         self.let_locals.push(LetLocal {
             ir_idx,
             wasm_idx,
@@ -644,38 +1043,73 @@ impl<'a> EmitState<'a> {
         Ok(wasm_idx)
     }
 
+    /// Z.4.1 — lookup or allocate a wasm i32 local for a record base
+    /// pointer. The IR pipeline emits one `AllocRootRecord` per root
+    /// record; the wasm local holds the arena pointer
+    /// `__relon_arena_alloc` returned.
+    fn intern_record_local(&mut self, ir_idx: u32) -> Result<u32, LowerError> {
+        if let Some(existing) = self.record_locals.iter().find(|r| r.ir_idx == ir_idx) {
+            return Ok(existing.wasm_idx);
+        }
+        let wasm_idx = self.alloc_aux(AuxLocal::RecordBase);
+        self.record_locals.push(RecordLocal { ir_idx, wasm_idx });
+        Ok(wasm_idx)
+    }
+
+    /// Z.4.1 — lazy scratch i64 local used by `StoreFieldAtRecord`
+    /// to spill the rhs while the walker re-orders the operand stack
+    /// for `i64.store`. One scratch slot per function suffices —
+    /// `StoreFieldAtRecord` always consumes its value in the same op,
+    /// so the slot's lifetime is one op long.
+    fn scratch_i64(&mut self) -> u32 {
+        if let Some(idx) = self.store_field_scratch_i64 {
+            return idx;
+        }
+        let idx = self.alloc_aux(AuxLocal::ScratchI64);
+        self.store_field_scratch_i64 = Some(idx);
+        idx
+    }
+
     /// Encode the walker's accumulated state into a `wasm_encoder::Function`.
     fn finalise(self) -> Result<Function, LowerError> {
-        if !self.saw_return_store {
-            // The IR didn't end on a Ret.value store — that means the
-            // body either returned via a Buffer-protocol record we
-            // can't model with typed-func, or the source's lowering
-            // is mid-construction. Either way, refuse to emit.
+        if !self.saw_return_prep {
+            // The IR didn't honour the return-shape prep contract —
+            // scalar-Int needs a trailing `StoreField(Ret.value)`,
+            // Dict shape needs at least one `AllocRootRecord`. Refuse
+            // to emit so the host re-routes to the tree-walker tier.
             return Err(LowerError::UnsupportedOp(
-                "no_return_store",
+                "no_return_prep",
                 UnsupportedOpReason::BufferProtocolRecord,
             ));
         }
 
-        // Group let-locals by wasm ValType so wasm-encoder's
-        // run-length local declaration shape stays compact.
+        // Group local declarations by wasm `ValType` so wasm-encoder's
+        // run-length local declaration shape stays compact. The walk
+        // honours alloc-order ([`aux_locals`]) so each entry's
+        // pre-recorded `wasm_idx` matches its position in the emitted
+        // section.
         let mut groups: Vec<(u32, ValType)> = Vec::new();
-        for l in &self.let_locals {
-            let vt = match l.ty {
-                IrType::I64 => ValType::I64,
-                IrType::Bool | IrType::I32 => ValType::I32,
-                IrType::F64 => ValType::F64,
-                _ => {
-                    return Err(LowerError::UnsupportedOp(
-                        "let_local_unsupported_ty",
-                        non_int_main_param_reason(&l.ty),
-                    ))
-                }
+        let push_group = |vt: ValType, groups: &mut Vec<(u32, ValType)>| match groups.last_mut() {
+            Some((count, ref last_ty)) if *last_ty == vt => *count += 1,
+            _ => groups.push((1, vt)),
+        };
+        for aux in &self.aux_locals {
+            let vt = match aux {
+                AuxLocal::Let(ty) => match ty {
+                    IrType::I64 => ValType::I64,
+                    IrType::Bool | IrType::I32 => ValType::I32,
+                    IrType::F64 => ValType::F64,
+                    _ => {
+                        return Err(LowerError::UnsupportedOp(
+                            "let_local_unsupported_ty",
+                            non_int_main_param_reason(ty),
+                        ))
+                    }
+                },
+                AuxLocal::RecordBase => ValType::I32,
+                AuxLocal::ScratchI64 => ValType::I64,
             };
-            match groups.last_mut() {
-                Some((count, ref last_ty)) if *last_ty == vt => *count += 1,
-                _ => groups.push((1, vt)),
-            }
+            push_group(vt, &mut groups);
         }
 
         let mut func = Function::new(groups);
@@ -791,19 +1225,56 @@ mod tests {
     }
 
     #[test]
-    fn walker_scope_cuts_dict_return() {
-        // Production W7-shape: `#main(Int n) -> Dict { ... }`. The
-        // F.2 anon-Dict-return work in `relon-ir/src/lowering.rs`
-        // synthesises an anonymous schema for the dict body and lifts
-        // `#internal fib` closures into let-bindings, so the source
-        // DOES reach the walker today — what the walker scope-cuts on
-        // is the `AllocRootRecord` / `StoreFieldAtRecord` /
-        // `MakeClosure` / `CallClosure` op set the lowering pass
-        // synthesises for the dict-body's `result` field. Both
-        // Dict-construction and closure-as-value are Z.4.1 / Z.4.3
-        // follow-ups respectively; the walker groups them under the
-        // matching reason so the host's tracing layer can route by
-        // sub-phase without re-classifying.
+    fn walker_lowers_simple_dict_return() {
+        // Z.4.1 — the minimum-viable Dict-return shape: a single Int
+        // field whose value is derived from an `#main` Int param. The
+        // IR pipeline lowers this to:
+        //
+        //   AllocRootRecord { record_local_idx: 0 }
+        //   LoadField { offset: <n>, ty: I64 }
+        //   ConstI64(1)
+        //   Add(I64)
+        //   StoreFieldAtRecord { record_local_idx: 0, offset: 0, ty: I64 }
+        //   Return
+        //
+        // and the walker emits `(i64) -> i64` where the i64 result is
+        // a zext'd i32 arena pointer to a one-field record. Validate
+        // the module round-trips through wasmparser; the
+        // host-evaluator integration covers semantic correctness
+        // separately in `relon-wasm-evaluator`'s smoke suite.
+        let lowered = lower_source("#main(Int n) -> Dict\n{ result: n + 1 }");
+        let bytes = lower_ir_module(&lowered).expect("lower_ir_module(Dict { result: n + 1 })");
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .expect("wasmparser validates Dict-return walker output");
+    }
+
+    #[test]
+    fn walker_lowers_multi_field_dict_return() {
+        // Z.4.1 — two Int fields. Stresses the per-field offset wiring
+        // in `StoreFieldAtRecord` (field 0 at offset 0, field 1 at
+        // offset 8 per the schema layout's natural Int alignment).
+        let lowered = lower_source(
+            "#main(Int n) -> Dict\n\
+             { first: n, second: n + 1 }",
+        );
+        let bytes =
+            lower_ir_module(&lowered).expect("lower_ir_module(Dict { first: n, second: n + 1 })");
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .expect("wasmparser validates multi-field Dict-return");
+    }
+
+    #[test]
+    fn walker_scope_cuts_w7_production_closure() {
+        // Production W7-shape: `#main(Int n) -> Dict { ... }` with an
+        // `#internal fib: (k) => ...` first-class recursive closure
+        // called via `result: fib(n)`. Z.4.1 unlocks the
+        // `AllocRootRecord` / `StoreFieldAtRecord` Dict mini-ABI but
+        // the closure-as-value path (`MakeClosure` / `CallClosure`)
+        // is Z.4.3 follow-up — the walker still scope-cuts here,
+        // routed under `ClosureValue` so the host's tracing layer
+        // groups the row with the matching follow-up batch.
         let src = "#main(Int n) -> Dict\n\
                    {\n\
                      #internal\n\
@@ -829,18 +1300,12 @@ mod tests {
             }
         };
         let err = lower_ir_module(&lowered)
-            .expect_err("walker must reject W7 production Dict-return (Z.4.1 / Z.4.3 follow-up)");
+            .expect_err("walker must reject W7 production closure-as-value (Z.4.3 follow-up)");
         match err {
             LowerError::UnsupportedOp(_, reason) => {
                 assert!(
-                    matches!(
-                        reason,
-                        UnsupportedOpReason::DictReturn
-                            | UnsupportedOpReason::ClosureValue
-                            | UnsupportedOpReason::BufferProtocolRecord
-                            | UnsupportedOpReason::Other(_)
-                    ),
-                    "W7 Dict-return scope-cut should route to a Z.4 sub-phase, got {reason:?}"
+                    matches!(reason, UnsupportedOpReason::ClosureValue),
+                    "W7 production scope-cut should route to ClosureValue (Z.4.3), got {reason:?}"
                 );
             }
             other => panic!("expected UnsupportedOp, got {other:?}"),
