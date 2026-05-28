@@ -1,5 +1,5 @@
 //! Phase Z.4.0 — IR walker scaffolding (extended with Z.4.1 Dict-return
-//! support).
+//! and Z.4.2 control-flow support).
 //!
 //! Replaces the variant-per-workload [`crate::WasmProgram`] shape with
 //! a real walker over [`relon_ir::Op`]. This is the canonical lowering
@@ -19,7 +19,33 @@
 //! returns the result comes back as an `i64` that the host wraps in
 //! `Value::Int`.
 //!
-//! ## Z.4.1 scope (this commit) — Dict-return mini-ABI
+//! ## Z.4.2 scope (this commit) — structured control flow
+//!
+//! `range(n).reduce(init, (acc, i) => body)` (and the rest of the
+//! `range-chain` consumer family in `relon_ir::lowering`) lowers to a
+//! `Block { Loop { BrIf, Block { ... }, Br } }` skeleton with i64
+//! `LetGet`/`LetSet` carrying the loop counter + accumulator. The
+//! walker emits the matching wasm `block`/`loop`/`br`/`br_if`
+//! primitives one-for-one — the IR's nested block depth becomes the
+//! wasm verifier's structured-control-flow depth verbatim, so the
+//! same `BrIf { label_depth: 1 }` the IR encodes routes to the
+//! enclosing `block`'s exit on the wasm side too. No flattening, no
+//! unrolling, no closed-form rewrites.
+//!
+//! Sources unlocked: any `range(...).reduce(...)`,
+//! `range(...).map(...).reduce(...)`, nested-reduce, factorial / pow
+//! style accumulator loops that previously scope-cut to the tree-
+//! walker fallback. The cmp_lua W9 inline-Int variant still routes
+//! via the classifier (its hand-emit predates the walker); the
+//! walker covers everything outside that frozen panel.
+//!
+//! Out of Z.4.2 scope (still scope-cuts): `Op::ConstListInt` &
+//! sibling literal pushes, `Op::ListGetByIntIdx`, the W9 production
+//! `rows: range(n).map(...)` list-of-list materialization. The list-
+//! literal path lands when the closure-as-value follow-up clears in
+//! Z.4.3 (the production source needs both).
+//!
+//! ## Z.4.1 scope — Dict-return mini-ABI
 //!
 //! `#main(...) -> Dict { ... }` sources whose lowering ends in
 //! `AllocRootRecord { idx } ... StoreFieldAtRecord ... Return` now
@@ -53,6 +79,13 @@
 //! - `If { result_ty: Int|Bool, then_body, else_body }` — branch
 //!   with a single-value yield, lowered via wasm `if (result T) ...
 //!   else ... end`.
+//! - `Block { result_ty: Option<Int|Bool>, body }` / `Loop { ... }`
+//!   (Z.4.2) — labelled structured-control-flow regions; `result_ty
+//!   == None` is the stack-neutral loop carrier shape, `Some(t)`
+//!   yields a single value on exit.
+//! - `Br { label_depth }` / `BrIf { label_depth }` (Z.4.2) — branch
+//!   to the enclosing `Block`/`Loop` at `label_depth` (0 = innermost);
+//!   `BrIf` consumes the i32 condition on top of stack.
 //! - `Select { ty: Int|Bool }` — ternary `?:` lowering, lowers to
 //!   wasm `select` / typed `select t`.
 //! - `Return` — pops the top value into the function result.
@@ -548,6 +581,24 @@ fn map_layout_err(_e: &relon_eval_api::layout::LayoutError) -> &'static str {
     "schema_layout_unsupported_type"
 }
 
+/// Z.4.2 — translate an `Op::Block` / `Op::Loop` `result_ty` into a
+/// `wasm_encoder::BlockType`. `None` becomes the stack-neutral
+/// `BlockType::Empty`; otherwise pick the matching wasm valtype.
+/// Unsupported IR types surface as `UnsupportedOp` so the body's
+/// scope-cut tracks the matching follow-up phase.
+fn block_type_from_ir(ty: Option<IrType>) -> Result<wasm_encoder::BlockType, LowerError> {
+    use wasm_encoder::BlockType;
+    match ty {
+        None => Ok(BlockType::Empty),
+        Some(IrType::I64) => Ok(BlockType::Result(ValType::I64)),
+        Some(IrType::Bool) | Some(IrType::I32) => Ok(BlockType::Result(ValType::I32)),
+        Some(other) => Err(LowerError::UnsupportedOp(
+            "block_result_unsupported",
+            non_int_main_param_reason(&other),
+        )),
+    }
+}
+
 /// Per-let-local wasm-local slot. The walker allocates one wasm local
 /// per unique `(idx, ty)` pair seen in the Op stream.
 #[derive(Debug, Clone, Copy)]
@@ -795,6 +846,41 @@ impl<'a> EmitState<'a> {
                 self.insns.push(I::Else);
                 self.walk(else_body)?;
                 self.insns.push(I::End);
+            }
+
+            // ----- Z.4.2 — labelled block / loop / br / br_if --------
+            //
+            // The `range(n).reduce(...)` lowering (and other range-
+            // chain consumers in `relon-ir::lowering`) emits a
+            // `Block { Loop { ... } }` skeleton with `Br`/`BrIf` ops
+            // driving the iteration. These are the wasm-native
+            // primitives the LLVM AOT backend's `emit_block` /
+            // `emit_loop` / `emit_br` paths target; the walker
+            // mirrors them one-for-one so the same source lands on
+            // the Compiled tier here too.
+            //
+            // Honesty (design §7): the IR's nested block depth maps
+            // directly to wasm's structured-control-flow depth. No
+            // flattening, no unrolling, no closed-form rewrites —
+            // every iteration the IR describes runs as one wasm
+            // loop pass.
+            Op::Block { result_ty, body } => {
+                let block_ty = block_type_from_ir(*result_ty)?;
+                self.insns.push(I::Block(block_ty));
+                self.walk(body)?;
+                self.insns.push(I::End);
+            }
+            Op::Loop { result_ty, body } => {
+                let block_ty = block_type_from_ir(*result_ty)?;
+                self.insns.push(I::Loop(block_ty));
+                self.walk(body)?;
+                self.insns.push(I::End);
+            }
+            Op::Br { label_depth } => {
+                self.insns.push(I::Br(*label_depth));
+            }
+            Op::BrIf { label_depth } => {
+                self.insns.push(I::BrIf(*label_depth));
             }
 
             // ----- Ternary select ------------------------------------
@@ -1222,6 +1308,41 @@ mod tests {
         wasmparser::Validator::new()
             .validate_all(&bytes)
             .expect("wasmparser validates ternary");
+    }
+
+    #[test]
+    fn walker_lowers_range_reduce_loop() {
+        // Z.4.2 — `range(n).reduce(0, (acc, i) => acc + i)` lowers to
+        // a `Block { Loop { BrIf, Block { ... }, Br } }` skeleton with
+        // i64 LetGet/LetSet ops carrying the loop counter + accumulator.
+        // The walker emits wasm-native `block`/`loop`/`br`/`br_if`,
+        // mirroring how the LLVM AOT backend lowers the same IR shape.
+        // Validate the module round-trips through wasmparser; the
+        // host-evaluator smoke (`tests/z4_list_smoke.rs`) covers
+        // semantic correctness end-to-end.
+        let lowered = lower_source("#main(Int n) -> Int\nrange(n).reduce(0, (acc, i) => acc + i)");
+        let bytes = lower_ir_module(&lowered).expect("lower range.reduce");
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .expect("wasmparser validates range.reduce walker output");
+    }
+
+    #[test]
+    fn walker_lowers_nested_range_reduce() {
+        // Z.4.2 — W9 inline-Int shape, nested O(n²) accumulator loop.
+        // Two `Block { Loop { ... } }` regions stacked under the outer
+        // reduce; the walker honours the depth discipline by emitting
+        // matching wasm `block`/`loop` boundaries. The IR's BrIf
+        // depths (0/1) translate to wasm branch depths verbatim.
+        let lowered = lower_source(
+            "#main(Int n) -> Int\n\
+             range(n).reduce(0, (acc, j) =>\n\
+               acc + range(n).reduce(0, (inner, i) => inner + (i * n + j)))",
+        );
+        let bytes = lower_ir_module(&lowered).expect("lower nested range.reduce");
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .expect("wasmparser validates nested range.reduce walker output");
     }
 
     #[test]
