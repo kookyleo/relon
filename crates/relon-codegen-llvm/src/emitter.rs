@@ -1310,6 +1310,16 @@ struct Emit<'ctx, 'b, 'cp> {
     /// `CallClosure` direct-call rewrite alive across the let chain.
     /// Empty when not emitting the fast-path entry.
     fast_path_closure_let_slots: std::collections::HashMap<u32, u32>,
+    /// Phase L W3: let-slot indices holding a `Provenance::ConstString`
+    /// value (i.e. the let was set from a value sourced — directly or
+    /// via prior `LetGet` chains — from an `Op::ConstString`). The
+    /// matching `LetGet` re-stamps the provenance so the downstream
+    /// `Op::Add(String)` lowering can switch to the const-len /
+    /// single-byte-store fast path. Each entry records (len, optional
+    /// first_byte). Empty by default; entries survive only across
+    /// inner-loop iterations because the W3 reduce shape's `s` let is
+    /// re-set every iteration from the same const literal.
+    const_string_let_slots: std::collections::HashMap<u32, (u32, Option<u8>)>,
 }
 
 /// Phase E.1: per-call inline-frame state. One entry per active
@@ -1422,6 +1432,27 @@ enum Provenance {
     FastPathClosure {
         fn_table_idx: u32,
     },
+    /// Phase L W3 (2026-05-28): the IntValue is an i32 arena offset to a
+    /// `[len:u32 LE][payload]` String record whose payload was placed in
+    /// the const-pool prefix at module build time, so its length is
+    /// known at compile time. Carried by `Op::ConstString` and
+    /// propagated through `Op::LetSet { ty: String }` →
+    /// `Op::LetGet { ty: String }` so `Op::Add(String)` can feed the
+    /// const length to LLVM (memcpy intrinsic with const size lowers
+    /// to inline stores) and skip the per-iter `[len]` header reload.
+    ///
+    /// Single-byte payloads (the W3 reduce hot loop's `"a"`) further
+    /// expose `first_byte` so the in-place fast path can emit a single
+    /// `i8 store` instead of `memcpy` — bypassing the LLVM lowering
+    /// pass altogether for the dominant reduce shape.
+    ConstString {
+        len: u32,
+        /// `Some(byte)` when `len == 1` so the lowering can emit an
+        /// inline `store i8 byte, dst` instead of a memcpy intrinsic.
+        /// `None` for longer payloads (LLVM's memcpy intrinsic
+        /// lowering still handles those well once the size is const).
+        first_byte: Option<u8>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1486,6 +1517,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             self_capture_let_slots: std::collections::HashMap::new(),
             captures_ptr_param: None,
             fast_path_closure_let_slots: std::collections::HashMap::new(),
+            const_string_let_slots: std::collections::HashMap::new(),
         }
     }
 
@@ -1769,6 +1801,27 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                             .insert(mapped, fn_table_idx);
                     }
                 }
+                // Phase L W3: propagate `Provenance::ConstString`
+                // across the `LetSet` → `LetGet` chain so the reduce
+                // closure's `s` (set every iteration from the same
+                // const literal "a" in the W3 source) can be picked
+                // up by `Op::Add(String)` as a const-len operand.
+                // Any non-const-string `LetSet` against the same idx
+                // wipes the entry below.
+                match (v.prov, *ty) {
+                    (Provenance::ConstString { len, first_byte }, IrType::String) => {
+                        self.const_string_let_slots
+                            .insert(mapped, (len, first_byte));
+                    }
+                    (_, IrType::String) => {
+                        // A non-const value just overwrote the slot —
+                        // drop any stale const-string record so a
+                        // later `LetGet` cannot fraudulently claim
+                        // const-len status.
+                        self.const_string_let_slots.remove(&mapped);
+                    }
+                    _ => {}
+                }
             }
             Op::LetGet { idx, ty } => {
                 // Phase E.1: remap the callee's let-idx against the
@@ -1826,6 +1879,20 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                         // `CallClosure` keeps the direct-call rewrite
                         // available.
                         self.push_with_prov(v, *ty, Provenance::FastPathClosure { fn_table_idx });
+                    } else {
+                        self.push(v, *ty);
+                    }
+                } else if matches!(*ty, IrType::String) {
+                    // Phase L W3: re-stamp `Provenance::ConstString`
+                    // when the let-slot is known to hold a value
+                    // sourced from `Op::ConstString`. Crucial for the
+                    // reduce closure's `s` operand — the iter-body
+                    // sets `s` from a const literal then `LetGet`s it
+                    // into the `Op::Add(String)` rhs, so without
+                    // propagation the const-len fast path can never
+                    // fire across the let chain.
+                    if let Some(&(len, first_byte)) = self.const_string_let_slots.get(&mapped) {
+                        self.push_with_prov(v, *ty, Provenance::ConstString { len, first_byte });
                     } else {
                         self.push(v, *ty);
                     }
@@ -1940,7 +2007,34 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                         ))
                     })?;
                 let c = self.ctx.i32_type().const_int(u64::from(off), false);
-                self.push(c, IrType::String);
+                // Phase L W3: stamp const-len provenance so the
+                // downstream `Op::Add(String)` lowering (via
+                // `emit_str_add_inplace_or_concat`) can use the
+                // compile-time-known length to elide the per-iter
+                // `[len]` header reload and replace the rhs memcpy
+                // with a single byte store when the literal is one
+                // byte (the dominant cmp_lua W3 reduce shape). The
+                // provenance only survives across `LetSet`/`LetGet`
+                // for `IrType::String` (tracked in
+                // `const_string_let_slots`) so non-String consumers
+                // never observe it.
+                let bytes = value.as_bytes();
+                let len_u32 = u32::try_from(bytes.len()).map_err(|_| {
+                    LlvmError::Codegen("ConstString length exceeds u32 range".into())
+                })?;
+                let first_byte = if bytes.len() == 1 {
+                    Some(bytes[0])
+                } else {
+                    None
+                };
+                self.push_with_prov(
+                    c,
+                    IrType::String,
+                    Provenance::ConstString {
+                        len: len_u32,
+                        first_byte,
+                    },
+                );
                 // Phase H peek-state: record the literal bytes so the
                 // next `lower_op` call can detect `Op::Call(contains)`
                 // with this string still at top-of-stack and switch
@@ -1949,7 +2043,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 // `prev_const_string.take()` line at the dispatch
                 // head — so a single intervening op (Push / Pop /
                 // Add / ...) drops the optimisation cleanly.
-                self.last_const_string = Some(value.as_bytes().to_vec());
+                self.last_const_string = Some(bytes.to_vec());
             }
 
             // ---- Phase E.1: raw-memory primitives ----
@@ -4350,23 +4444,65 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         let i64_t = self.ctx.i64_type();
 
         // Pop in reverse order: stack is `[lhs, rhs]`, top is rhs.
-        let rhs_off = self.pop_int(ip_hint)?;
-        let lhs_off = self.pop_int(ip_hint)?;
+        // Phase L W3: keep the TypedValue so we can read provenance
+        // (notably `Provenance::ConstString { len, first_byte }`) to
+        // pick the const-len fast path below. LLVM cannot prove the
+        // const length on its own — the rhs offset is a runtime i32
+        // that happens to point into the const-pool prefix, and the
+        // `[len]` header at that offset is reloaded every iteration
+        // because the in-place append's header store at `lhs_addr`
+        // aliases against it from the optimiser's point of view.
+        let rhs_tv = self.pop(ip_hint)?;
+        let lhs_tv = self.pop(ip_hint)?;
+        let rhs_off = rhs_tv.val;
+        let lhs_off = lhs_tv.val;
+        let rhs_const_len: Option<(u32, Option<u8>)> = match rhs_tv.prov {
+            Provenance::ConstString { len, first_byte } => Some((len, first_byte)),
+            _ => None,
+        };
+        // SAFETY: when the *lhs* is sourced from `Op::ConstString` the
+        // operand points into the per-module const-pool prefix (read-
+        // only). Allowing the in-place fast path to fire in that case
+        // would write the new `[len]` header — and the appended payload
+        // — *into the const pool*, corrupting every subsequent
+        // `Op::ConstString` load. We deliberately do **not** propagate
+        // const-len knowledge for the lhs: keep the runtime `[len]`
+        // load + the `lhs_end == scratch_end` runtime guard. In
+        // practice the const-pool record sits at a fixed prefix offset
+        // and the scratch tail is past every literal, so the guard
+        // mismatches and the slow path (fresh scratch alloc + double
+        // memcpy) takes over for the W3 reduce's first iteration
+        // (`acc = "" + "a"`). The const-len optimisation is restricted
+        // to the rhs slot.
+        let lhs_const_len: Option<u32> = None;
+        // Bind to silence the unused-binding lint while keeping the
+        // structural symmetry with `rhs_const_len`.
+        let _ = lhs_tv;
 
         // Load lhs.len and rhs.len from header word at offset 0 of
-        // each record.
+        // each record. Phase L W3: when the operand is known
+        // const-string (provenance carries the literal byte length),
+        // skip the per-iter `[len]` header load and feed LLVM an
+        // i32 const — this removes the alias hazard between the
+        // in-place store at `lhs_addr` and the rhs header read.
         let lhs_addr = self.arena_addr_i32(lhs_off)?;
-        let lhs_len = self
-            .builder
-            .build_load(i32_t, lhs_addr, "stradd_lhs_len")
-            .map_err(|e| LlvmError::Codegen(format!("Add(String) lhs len load: {e}")))?
-            .into_int_value();
-        let rhs_addr = self.arena_addr_i32(rhs_off)?;
-        let rhs_len = self
-            .builder
-            .build_load(i32_t, rhs_addr, "stradd_rhs_len")
-            .map_err(|e| LlvmError::Codegen(format!("Add(String) rhs len load: {e}")))?
-            .into_int_value();
+        let lhs_len = if let Some(len) = lhs_const_len {
+            i32_t.const_int(u64::from(len), false)
+        } else {
+            self.builder
+                .build_load(i32_t, lhs_addr, "stradd_lhs_len")
+                .map_err(|e| LlvmError::Codegen(format!("Add(String) lhs len load: {e}")))?
+                .into_int_value()
+        };
+        let rhs_len = if let Some((len, _)) = rhs_const_len {
+            i32_t.const_int(u64::from(len), false)
+        } else {
+            let rhs_addr = self.arena_addr_i32(rhs_off)?;
+            self.builder
+                .build_load(i32_t, rhs_addr, "stradd_rhs_len")
+                .map_err(|e| LlvmError::Codegen(format!("Add(String) rhs len load: {e}")))?
+                .into_int_value()
+        };
 
         // Read scratch_base + scratch_cursor from the arena state.
         let scratch_cur_gep = unsafe {
@@ -4437,20 +4573,57 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         self.builder
             .build_store(lhs_addr, total_len_fast)
             .map_err(|e| LlvmError::Codegen(format!("stradd fast header store: {e}")))?;
-        // memcpy(arena+lhs_end, arena+rhs_off+4, rhs_len)
+        // Append the rhs payload onto the lhs tail. Phase L W3: when
+        // the rhs is a known const string (the dominant W3 reduce
+        // shape — `acc + "a"`), specialise the copy:
+        //   * len == 1 — emit a single `store i8 byte, ptr` against
+        //     the lhs tail; bypasses the memcpy intrinsic entirely
+        //     so the LLVM mid-end sees just a one-byte store + cursor
+        //     bump (matching `String::push_str("a")`).
+        //   * len > 1 — still use `build_memcpy`, but pass an i64
+        //     const for the size so LLVM's `expand-memcpy` lowering
+        //     unrolls to inline loads/stores instead of an indirect
+        //     `callq *memcpy`.
+        //   * non-const — historical path: zext runtime rhs_len to
+        //     i64 and hand it to memcpy.
         let fast_dst = self.arena_addr_i32(lhs_end)?;
-        let rhs_payload_off = self
-            .builder
-            .build_int_add(rhs_off, four, "stradd_rhs_payload_off")
-            .map_err(|e| LlvmError::Codegen(format!("stradd rhs payload off: {e}")))?;
-        let fast_src = self.arena_addr_i32(rhs_payload_off)?;
-        let rhs_len64 = self
-            .builder
-            .build_int_z_extend(rhs_len, i64_t, "stradd_rhs_len64")
-            .map_err(|e| LlvmError::Codegen(format!("stradd rhs_len zext: {e}")))?;
-        self.builder
-            .build_memcpy(fast_dst, 1, fast_src, 1, rhs_len64)
-            .map_err(|e| LlvmError::Codegen(format!("stradd fast memcpy: {e}")))?;
+        match rhs_const_len {
+            Some((1, Some(byte))) => {
+                let byte_const = i8_t.const_int(u64::from(byte), false);
+                self.builder
+                    .build_store(fast_dst, byte_const)
+                    .map_err(|e| {
+                        LlvmError::Codegen(format!("stradd fast inline-byte store: {e}"))
+                    })?;
+            }
+            Some((len, _)) => {
+                let rhs_payload_off = self
+                    .builder
+                    .build_int_add(rhs_off, four, "stradd_rhs_payload_off")
+                    .map_err(|e| LlvmError::Codegen(format!("stradd rhs payload off: {e}")))?;
+                let fast_src = self.arena_addr_i32(rhs_payload_off)?;
+                let rhs_len64 = i64_t.const_int(u64::from(len), false);
+                self.builder
+                    .build_memcpy(fast_dst, 1, fast_src, 1, rhs_len64)
+                    .map_err(|e| {
+                        LlvmError::Codegen(format!("stradd fast memcpy (const-len): {e}"))
+                    })?;
+            }
+            None => {
+                let rhs_payload_off = self
+                    .builder
+                    .build_int_add(rhs_off, four, "stradd_rhs_payload_off")
+                    .map_err(|e| LlvmError::Codegen(format!("stradd rhs payload off: {e}")))?;
+                let fast_src = self.arena_addr_i32(rhs_payload_off)?;
+                let rhs_len64 = self
+                    .builder
+                    .build_int_z_extend(rhs_len, i64_t, "stradd_rhs_len64")
+                    .map_err(|e| LlvmError::Codegen(format!("stradd rhs_len zext: {e}")))?;
+                self.builder
+                    .build_memcpy(fast_dst, 1, fast_src, 1, rhs_len64)
+                    .map_err(|e| LlvmError::Codegen(format!("stradd fast memcpy: {e}")))?;
+            }
+        }
         // bump scratch_cursor by rhs_len
         let new_cur = self
             .builder
@@ -4494,10 +4667,18 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .build_int_add(lhs_off, four, "stradd_slow_lhsp")
             .map_err(|e| LlvmError::Codegen(format!("stradd slow lhsp: {e}")))?;
         let src1 = self.arena_addr_i32(lhs_payload_off)?;
-        let lhs_len64 = self
-            .builder
-            .build_int_z_extend(lhs_len, i64_t, "stradd_slow_lhs64")
-            .map_err(|e| LlvmError::Codegen(format!("stradd slow lhs_len zext: {e}")))?;
+        // Phase L W3: hand LLVM an i64 const memcpy size whenever
+        // the lhs / rhs comes from `Op::ConstString` so the
+        // `expand-memcpy` lowering can unroll to inline stores
+        // instead of an indirect `callq *memcpy`. Falls back to the
+        // historical zext path for non-const operands.
+        let lhs_len64: IntValue<'ctx> = if let Some(len) = lhs_const_len {
+            i64_t.const_int(u64::from(len), false)
+        } else {
+            self.builder
+                .build_int_z_extend(lhs_len, i64_t, "stradd_slow_lhs64")
+                .map_err(|e| LlvmError::Codegen(format!("stradd slow lhs_len zext: {e}")))?
+        };
         self.builder
             .build_memcpy(dst1, 1, src1, 1, lhs_len64)
             .map_err(|e| LlvmError::Codegen(format!("stradd slow lhs memcpy: {e}")))?;
@@ -4512,10 +4693,13 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .build_int_add(rhs_off, four, "stradd_slow_rhsp")
             .map_err(|e| LlvmError::Codegen(format!("stradd slow rhsp: {e}")))?;
         let src2 = self.arena_addr_i32(rhs_payload_off2)?;
-        let rhs_len64_slow = self
-            .builder
-            .build_int_z_extend(rhs_len, i64_t, "stradd_slow_rhs64")
-            .map_err(|e| LlvmError::Codegen(format!("stradd slow rhs_len zext: {e}")))?;
+        let rhs_len64_slow: IntValue<'ctx> = if let Some((len, _)) = rhs_const_len {
+            i64_t.const_int(u64::from(len), false)
+        } else {
+            self.builder
+                .build_int_z_extend(rhs_len, i64_t, "stradd_slow_rhs64")
+                .map_err(|e| LlvmError::Codegen(format!("stradd slow rhs_len zext: {e}")))?
+        };
         self.builder
             .build_memcpy(dst2, 1, src2, 1, rhs_len64_slow)
             .map_err(|e| LlvmError::Codegen(format!("stradd slow rhs memcpy: {e}")))?;
