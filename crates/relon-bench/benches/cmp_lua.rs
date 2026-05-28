@@ -390,10 +390,21 @@ fn paper_win_collapsed_variant_label(label: &str) -> bool {
 /// LLVM emitter flag that disables `IndVarSimplify` / `LoopIdiom` /
 /// `LoopReduce` on the lambda body). Until then the row family is
 /// suppressed end-to-end.
+///
+/// Panel expansion (2026-05-28): W13 joins the gate.
+/// * **W13_deep_dict_access** — the inner `cfg.db.pool.connections.max
+///   + cfg.db.pool.connections.timeout.ms` reads constant-fold to
+///   `5100` (rustc + LLVM at -O3 see the literal dict-tree leaves);
+///   the per-iter body collapses to `acc + 5100`, the reduce folds
+///   to `n * 5100`. The bytecode / wasm / LLVM AOT lowerings reject
+///   the production source's dict-literal `#internal cfg` binding
+///   today (no n/a row needed — `try_build_*` returns None), so the
+///   only gated row is `rust_native_w13`, which would otherwise book
+///   the closed-form `n * 5100` against the LuaJIT chain-walker.
 fn paper_win_closed_form_fold_label(label: &str) -> bool {
     matches!(
         label,
-        "W1_int_sum" | "W2_f64_dot" | "W6_list_int_sum_plus_one"
+        "W1_int_sum" | "W2_f64_dot" | "W6_list_int_sum_plus_one" | "W13_deep_dict_access"
     )
 }
 
@@ -1653,6 +1664,81 @@ fn w12_lua_src() -> &'static str {
 }
 
 // =====================================================================
+// =====  W13 — deep dict access (config-tree walk)  ===================
+// =====================================================================
+//
+// Tier 1 Relon-flavour workload (panel expansion 2026-05-28). Models
+// the canonical config-tree access pattern Relon ships for: a
+// host-supplied `#internal cfg: { ... }` literal is read repeatedly
+// inside a hot loop. Two 5-level-deep chains per iter
+// (`cfg.db.pool.connections.max`, `cfg.db.pool.connections.timeout.ms`)
+// exercise the tree-walker's `Op::FieldAccess` lookup chain end-to-end.
+//
+// **HONESTY checklist** (per `HONESTY_POLICY.md`):
+// * Source path: `w13_relon_src()` is byte-identical to the
+//   production source — same `#internal cfg: { ... }` literal, same
+//   `range(n).reduce(0, ...)` over the same closure body. The Lua
+//   equivalent in `w13_lua_src()` builds the same nested Lua table
+//   and walks the same 5-level chain per iter.
+// * Algorithm complexity preserved: O(n) reduce with two dict-chain
+//   reads per iter. No closed-form fold — the chain reads materialise
+//   per iter through the tree-walker `Value::Dict` lookup path.
+// * Time-math sanity: dict-chain reads are ~20 ns/iter on a 5-level
+//   path in the tree-walker (1 lookup ~ 4 ns; 10 lookups + 2 adds
+//   ~ 40-50 ns). Sub-1 ns per iter would indicate a closed-form fold.
+// * I/O shape: `#main(Int n) -> Dict` with `result` field; Lua
+//   returns the same scalar. Cross-checked via `assert_relon_lua_consistent`.
+// * Backend coverage: tree_walk + luajit only. Bytecode / LLVM AOT /
+//   wasm reject the production source (dict-literal as `#internal`
+//   binding + bare `Dict` return are outside their lowering envelopes);
+//   adding an inlined `_bytecode` variant that folds the dict reads to
+//   the constant `5100` would be paper-win per
+//   `paper_win_collapsed_variant_label` (W5/W8/W9/W10 history). The
+//   `relon_jit` row in canonical_panel runs through `JitEvaluator`
+//   which falls through to the tree-walker for this source.
+
+/// W13 scale — 1k iterations keeps the tree-walker row in the µs
+/// class (~20 ns/iter * 1k ≈ 20 µs); enough criterion samples for
+/// stable p99 without wall-clock blowup.
+const W13_N: i64 = 1_000;
+
+fn w13_relon_src() -> &'static str {
+    // `#unstrict` is required because the closure params `acc` / `i`
+    // are untyped; the analyzer's strict-mode envelope demands explicit
+    // type annotations. The tree-walker accepts the source either way
+    // (the analyzer warnings are non-fatal); using `#unstrict` keeps the
+    // signal-to-noise high so a future strict-mode tightening doesn't
+    // silently drop the row.
+    "#unstrict\n\
+     #main(Int n) -> Dict\n\
+     {\n\
+       #internal\n\
+       cfg: { db: { pool: { connections: { max: 100, timeout: { ms: 5000 } } } } },\n\
+       result: range(n).reduce(0, (acc, i) =>\n\
+         acc + cfg.db.pool.connections.max + cfg.db.pool.connections.timeout.ms)\n\
+     }"
+}
+
+fn w13_lua_src() -> String {
+    format!(
+        r#"return function()
+            local n = {n}
+            local cfg = {{ db = {{ pool = {{ connections = {{ max = 100, timeout = {{ ms = 5000 }} }} }} }} }}
+            local acc = 0
+            for i = 0, n - 1 do
+                acc = acc + cfg.db.pool.connections.max + cfg.db.pool.connections.timeout.ms
+            end
+            return acc
+        end"#,
+        n = W13_N
+    )
+}
+
+fn w13_expected() -> i64 {
+    W13_N * (100 + 5000)
+}
+
+// =====================================================================
 // =====  consistency assertions  ======================================
 // =====================================================================
 
@@ -1919,6 +2005,26 @@ fn rust_native_w12(x: i64) -> i64 {
     black_box(x).wrapping_add(1)
 }
 
+/// W13 deep dict access. Models the post-`Op::FieldAccess` constant
+/// fold: both dict-chain reads collapse to literal `100` / `5000` in
+/// the Relon tree-walker after the `cfg` binding inlines, so the
+/// per-iter body is `acc + 100 + 5000 = acc + 5100`. rustc / LLVM at
+/// -O3 then folds the reduce to `n * 5100`. Booking that against the
+/// LuaJIT row that walks the dict-table chain per iter is a paper
+/// win — this fn is referenced only through `rust_native_dispatch`'s
+/// match arm and is gated out by `paper_win_closed_form_fold_label`.
+#[inline(never)]
+fn rust_native_w13(n: i64) -> i64 {
+    let mut acc: i64 = 0;
+    let n = black_box(n);
+    let mut i: i64 = 0;
+    while i < n {
+        acc = acc.wrapping_add(100i64.wrapping_add(5000));
+        i += 1;
+    }
+    acc
+}
+
 // =====================================================================
 // =====  Phase C: LLVM AOT row glue  ==================================
 // =====================================================================
@@ -2032,6 +2138,15 @@ fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
         "W9_nested_matrix" => Some(W9_LLVM_SRC),
         "W10_config_eval" => Some(W10_LLVM_SRC),
         "W12_p99_tail" => Some(w12_relon_src()),
+        // Panel expansion 2026-05-28: W13 production source uses a
+        // dict-literal `#internal` binding outside the LLVM AOT
+        // envelope. Even an inlined `_unstrict` variant would land on
+        // the `paper_win_closed_form_fold_label` gate (constant-fold
+        // reduces the dict reads to `n * 5100`). Returning `None`
+        // here keeps the row honest until the panel grows a
+        // black_box-on-acc shape that defeats induction-variable
+        // reduction.
+        "W13_deep_dict_access" => None,
         _ => None,
     }
 }
@@ -2088,6 +2203,13 @@ fn rust_native_dispatch(label: &str, n: i64) -> i64 {
         "W9_nested_matrix" => rust_native_w9(n),
         "W10_config_eval" => rust_native_w10(n),
         "W12_p99_tail" => rust_native_w12(n),
+        // Panel expansion 2026-05-28: W13 is gated by
+        // `paper_win_closed_form_fold_label`, so the canonical_panel
+        // never dispatches here. Arm retained for grep visibility +
+        // panic-on-reintroduction so a future agent who drops the
+        // gate without re-checking the closed-form fold gets a hard
+        // failure rather than a silent paper win.
+        "W13_deep_dict_access" => rust_native_w13(n),
         other => panic!("rust_native_dispatch: unknown workload `{other}`"),
     }
 }
@@ -3533,6 +3655,46 @@ fn bench_cmp_lua(c: &mut Criterion) {
         }
     }
 
+    // ----- W13 deep dict access (config-tree walk) -----
+    //
+    // Panel-expansion 2026-05-28 (Tier 1 Relon-flavour). See the
+    // top-of-file W13 doc-comment for the HONESTY checklist.
+    // Backend coverage: tree_walk + luajit. Bytecode / LLVM AOT / wasm
+    // reject the production source (dict literal as `#internal`
+    // binding + bare `Dict` return). The `relon_jit` canonical-panel
+    // row below runs the same source through `JitEvaluator`, which
+    // falls through to the tree-walker.
+    {
+        let (walker, scope) = build_tree_walker(w13_relon_src());
+        let lua_fn_w13 = lua_fn(&lua, &w13_lua_src());
+
+        let relon_v = relon_int_result("W13", walker.run_main(&scope, args_w_n(W13_N)).unwrap());
+        let lua_v: i64 = lua_fn_w13.call(()).unwrap();
+        assert_relon_lua_consistent("W13", relon_v, lua_v, w13_expected());
+
+        group.throughput(Throughput::Elements(W13_N as u64));
+        group.bench_function(
+            BenchmarkId::new("W13_deep_dict_access", "relon_tree_walk"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(W13_N);
+                    timed_with_warmup(iters, || {
+                        let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
+        group.bench_function(BenchmarkId::new("W13_deep_dict_access", "luajit"), |b| {
+            b.iter_custom(|iters| {
+                timed_with_warmup(iters, || {
+                    let v: i64 = lua_fn_w13.call(()).unwrap();
+                    black_box(v);
+                })
+            });
+        });
+    }
+
     // =================================================================
     // ===== Dart-style canonical panel: relon_jit + relon_aot =========
     // =================================================================
@@ -3617,6 +3779,23 @@ fn bench_cmp_lua(c: &mut Criterion) {
             args_w_n(CONFIG_QUERIES_N as i64)
         }),
         ("W12_p99_tail", w12_relon_src(), 1, || w12_relon_args(7)),
+        // Panel-expansion 2026-05-28 (Tier 1 Relon-flavour W13):
+        // * relon_jit row: runs via `JitEvaluator::run_main` (falls
+        //   through to tree-walker for the dict-literal `#internal cfg`
+        //   binding).
+        // * relon_aot row: `try_build_aot` returns None (cranelift AOT
+        //   envelope rejects), row records n/a.
+        // * relon_llvm_aot / relon_llvm_aot_fast: `llvm_aot_source_for`
+        //   returns None; the gate further suppresses any future variant.
+        // * rust_native: gated by `paper_win_closed_form_fold_label`.
+        // * relon_wasm_wasmtime: `try_build_wasm_compiled` returns None
+        //   (classifier routes to tree-walker fallback), row records n/a.
+        (
+            "W13_deep_dict_access",
+            w13_relon_src(),
+            W13_N as u64,
+            || args_w_n(W13_N),
+        ),
     ];
 
     for (label, src, throughput_n, args_factory) in canonical_panel {

@@ -3,6 +3,8 @@
 Audit history: the `v6_lambda_cmp_lua` panel has been cleaned up
 reactively through eight rounds (audits W7 / `_fixture` rename / W1
 fallback / W5 / W8 / W9 / W10 collapse / W1 / W2 / W6 closed-form fold).
+The Tier 1 panel expansion (2026-05-28) added W13 with the gates
+pre-applied at row-add time rather than after-the-fact audit.
 This document codifies the patterns so future agents catch paper wins
 at PR review time, not in audit #N+1.
 
@@ -178,3 +180,23 @@ report should:
 The previous reports' counts (e.g. "Relon JIT exceeds LuaJIT on
 8/12 workloads") are stale relative to the current row set and
 should not be repeated without re-derivation.
+
+## Tier 1 panel expansion (2026-05-28)
+
+The panel grows Relon-flavour workloads to balance the original
+12-row matrix's micro-codegen bias. Each row is added with the
+HONESTY checklist applied at row-add time:
+
+* **W13_deep_dict_access** — 5-level `cfg.db.pool.connections.max`
+  chain inside `range(n).reduce(0, ...)`. Models the canonical
+  Relon config-tree access pattern.
+  - tree_walk + luajit only.
+  - Bytecode / LLVM AOT / wasm reject the production source
+    (dict-literal as `#internal cfg` binding + bare `Dict` return).
+  - `rust_native` gated by `paper_win_closed_form_fold_label`
+    (constant-fold collapses the dict-chain reads to `n * 5100`).
+
+Re-introducing the gated rows requires a `black_box`-on-acc shape
+that defeats LLVM's induction-variable reduction (or an LLVM emitter
+flag that disables `IndVarSimplify` / `LoopIdiom` / `LoopReduce` on
+the lambda body).

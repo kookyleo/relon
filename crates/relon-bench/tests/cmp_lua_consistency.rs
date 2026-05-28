@@ -256,6 +256,38 @@ fn w9_nested_matrix() {
     run_pair("W9", r, &l, n, expected);
 }
 
+/// W13 — deep dict access. Models a config-tree walk that touches two
+/// 5-level-deep nested dict literal leaves per iter. Per HONESTY_POLICY:
+/// * Source path: production source is byte-identical to bench helper.
+/// * Algorithm: O(n) reduce, two dict-chain reads per iter; constants
+///   in dict literal NOT folded into the kernel (analyzer treats the
+///   dict-body `#internal cfg` as a runtime binding).
+/// * I/O shape: `#main(Int n) -> Dict` with `result` field; Lua equivalent
+///   sums the same constant pair per iter, returns the same `i64`.
+#[test]
+fn w13_deep_dict_access() {
+    let r = "#unstrict\n\
+             #main(Int n) -> Dict\n\
+             {\n\
+               #internal\n\
+               cfg: { db: { pool: { connections: { max: 100, timeout: { ms: 5000 } } } } },\n\
+               result: range(n).reduce(0, (acc, i) =>\n\
+                 acc + cfg.db.pool.connections.max + cfg.db.pool.connections.timeout.ms)\n\
+             }";
+    let n: i64 = 1_000;
+    let l = format!(
+        "return function() local n = {n};\n\
+         local cfg = {{ db = {{ pool = {{ connections = {{ max = 100, timeout = {{ ms = 5000 }} }} }} }} }};\n\
+         local acc = 0;\n\
+         for i = 0, n - 1 do\n\
+           acc = acc + cfg.db.pool.connections.max + cfg.db.pool.connections.timeout.ms\n\
+         end;\n\
+         return acc end"
+    );
+    let expected = n * (100 + 5000);
+    run_pair("W13", r, &l, n, expected);
+}
+
 #[test]
 fn w10_config_eval() {
     let r = "#import list from \"std/list\"\n\
