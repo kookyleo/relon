@@ -126,11 +126,17 @@ fn w7_fast_path_round_trips() {
 fn w7_production_dict_source_still_scope_cuts() {
     // The production source binds `fib: (k) => ...` as a `#internal`
     // first-class recursive closure inside a Dict-body and returns
-    // `Dict { fib, result }`. Until Z.4 lands real IR-walker support
-    // for first-class closure values + bare-`Dict` returns, this path
+    // `Dict { result: fib(n) }`. Phase Z.4.1 unlocked the
+    // bare-`Dict` return path (`AllocRootRecord` /
+    // `StoreFieldAtRecord` /  Dict mini-ABI lowering — see
+    // `z4_dict_return_smoke.rs` for the positive coverage), but the
+    // closure-as-value primitives (`MakeClosure` / `CallClosure`)
+    // the IR pipeline emits for the `#internal fib` binding stay
+    // scope-cut at the walker — that's Z.4.3 follow-up. Until Z.4.3
+    // lands the funcref-table + `call_indirect` shape this source
     // must still surface a tree-walker fallback tier — a silent
-    // fast-path pass on the production source would be the paper-win
-    // anti-pattern called out in design §7.
+    // fast-path pass on the production source would be the paper-
+    // win anti-pattern called out in design §7.
     let prod_src = "#main(Int n) -> Dict\n\
                     {\n\
                       #internal\n\
@@ -141,6 +147,6 @@ fn w7_production_dict_source_still_scope_cuts() {
     assert_eq!(
         ev.active_tier(),
         Tier::TreeWalker,
-        "W7 production Dict source must surface tree-walker fallback (Z.4 follow-up)"
+        "W7 production Dict source must surface tree-walker fallback (Z.4.3 closure follow-up)"
     );
 }

@@ -107,11 +107,14 @@ fn w9_fast_path_round_trips() {
 fn w9_production_dict_source_still_scope_cuts() {
     // The production source binds `rows: range(n).map(...)` as a
     // `#internal` list-of-list and returns `Dict { rows, result }`.
-    // Until Z.4 lands real IR-walker support for record returns +
-    // list-of-list materialisation, this path must still surface a
-    // tree-walker fallback tier — a silent fast-path pass on the
-    // production source would be the paper-win anti-pattern called
-    // out in design §7.
+    // Phase Z.4.1 unlocked the bare-`Dict` mini-ABI on the walker;
+    // W9 production stays scope-cut upstream of the walker — the
+    // IR-pipeline's `anon_dict_return_plan` rejects the list-of-list
+    // value for `rows:` (the classifier only accepts calls into
+    // previously-classified closure fields), so the source never
+    // reaches the walker. Resolving this needs both an IR-pipeline
+    // widening AND the Z.4.2 List-literal walker arm; until then
+    // the tree-walker fallback is the honest path.
     let prod_src = "#import list from \"std/list\"\n\
                     #main(Int n) -> Dict\n\
                     {\n\

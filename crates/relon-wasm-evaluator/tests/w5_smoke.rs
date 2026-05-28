@@ -130,10 +130,13 @@ fn w5_fast_path_round_trips() {
 fn w5_production_dict_source_still_scope_cuts() {
     // The production source binds `d: { a: 1, ..., j: 10 }` as a
     // `#internal` dict and a parallel `keys: ["a", ..., "j"]` list,
-    // returning `Dict { d, keys, result }`. Until Z.4 lands real
-    // IR-walker support for dict / list literals + bare-`Dict`
-    // returns, this path must still surface a tree-walker fallback
-    // tier — a silent fast-path pass on the production source would
+    // returning `Dict { d, keys, result }`. Phase Z.4.1 unlocked the
+    // bare-`Dict` mini-ABI on the walker; W5 production stays scope-
+    // cut upstream — both the dict literal and the list literal for
+    // the `#internal` fields land outside the walker's Int-scalar
+    // envelope (those need Z.4.2 List + nested-Dict literal support
+    // plus an IR-pipeline widening). Until then the tree-walker
+    // fallback is the honest path — a silent fast-path pass would
     // be the paper-win anti-pattern called out in design §7.
     let prod_src = "#import list from \"std/list\"\n\
                     #main(Int n) -> Dict\n\

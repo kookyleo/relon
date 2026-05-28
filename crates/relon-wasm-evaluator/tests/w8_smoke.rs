@@ -136,11 +136,16 @@ fn w8_fast_path_round_trips() {
 fn w8_production_dict_source_still_scope_cuts() {
     // The production source binds `dispatch: (tag) => ...` as a
     // `#internal` closure called via `dispatch(i % 4)` and returns
-    // `Dict { dispatch, result }`. Until Z.4 lands real IR-walker
-    // support for first-class closure values + bare-`Dict` returns,
-    // this path must still surface a tree-walker fallback tier — a
-    // silent fast-path pass on the production source would be the
-    // paper-win anti-pattern called out in design §7.
+    // `Dict { dispatch, result }`. Phase Z.4.1 unlocked the bare-
+    // `Dict` mini-ABI on the walker; W8 production stays scope-cut
+    // upstream of the walker — the IR-pipeline's
+    // `anon_dict_return_plan` rejects `list.sum(range(n).map(...))`
+    // as the value for `result:` (the classifier only accepts
+    // calls into previously-classified closure fields), so the
+    // source never reaches the walker. Resolving this needs an IR-
+    // side widening (track its own Z.4 follow-up); until then the
+    // tree-walker fallback is the honest path — a silent fast-path
+    // pass would be the paper-win anti-pattern from design §7.
     let prod_src = "#import list from \"std/list\"\n\
                     #main(Int n) -> Dict\n\
                     {\n\
@@ -152,6 +157,7 @@ fn w8_production_dict_source_still_scope_cuts() {
     assert_eq!(
         ev.active_tier(),
         Tier::TreeWalker,
-        "W8 production Dict source must surface tree-walker fallback (Z.4 follow-up)"
+        "W8 production Dict source must surface tree-walker fallback \
+         (IR anon-Dict-plan rejects stdlib calls — separate follow-up)"
     );
 }
