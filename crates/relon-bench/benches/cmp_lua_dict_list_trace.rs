@@ -711,22 +711,26 @@ fn bench_dict_list(c: &mut Criterion) {
         );
     }
 
-    group.bench_function(BenchmarkId::new("W6_dict_num_key", "trace_jit"), |b| {
-        b.iter_custom(|iters| {
-            let mut ctx = TraceContext::with_capacity(0);
-            let args: [u64; 2] = [HOT_LOOP_N, w6_list_bytes.as_ptr() as u64];
-            let args_ptr = args.as_ptr();
-            timed_with_warmup(iters, || {
-                let s =
-                    unsafe { (w6_trace.entry)(&mut ctx as *mut TraceContext, black_box(args_ptr)) };
-                black_box(s);
-            })
-        });
-    });
+    group.bench_function(
+        BenchmarkId::new("W6_list_int_sum_plus_one", "trace_jit"),
+        |b| {
+            b.iter_custom(|iters| {
+                let mut ctx = TraceContext::with_capacity(0);
+                let args: [u64; 2] = [HOT_LOOP_N, w6_list_bytes.as_ptr() as u64];
+                let args_ptr = args.as_ptr();
+                timed_with_warmup(iters, || {
+                    let s = unsafe {
+                        (w6_trace.entry)(&mut ctx as *mut TraceContext, black_box(args_ptr))
+                    };
+                    black_box(s);
+                })
+            });
+        },
+    );
 
     let (walker_w6, scope_w6) = build_tree_walker(w6_relon_src());
     group.bench_function(
-        BenchmarkId::new("W6_dict_num_key", "relon_tree_walk"),
+        BenchmarkId::new("W6_list_int_sum_plus_one", "relon_tree_walk"),
         |b| {
             b.iter_custom(|iters| {
                 let n_in = black_box(HOT_LOOP_N as i64);

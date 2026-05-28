@@ -358,9 +358,13 @@ fn paper_win_collapsed_variant_label(label: &str) -> bool {
 ///   Post-O3 IR: cubic polynomial collapse via Faulhaber's formula,
 ///   the magic constant `6148914691236517206 = (2^64 - 4)/3` is the
 ///   `/3` modular inverse, again no loop instructions.
-/// * **W6_dict_num_key** — `list.sum(range(n).map((i) => i + 1))` ≡
-///   `Σ_{i<n} (i+1)`. Post-O3 IR: closed form `n*(n+1)/2`. Same
-///   shape as W1.
+/// * **W6_list_int_sum_plus_one** — `list.sum(range(n).map((i) => i + 1))`
+///   ≡ `Σ_{i<n} (i+1)`. Post-O3 IR: closed form `n*(n+1)/2`. Same
+///   shape as W1. (Pre-2026-05-28 row name `W6_dict_num_key` was a
+///   carry-over from the Relon-vs-Lua design table where "D8 dict
+///   numeric key" referred to LuaJIT's array-part path; the Relon
+///   side is genuinely a `List<Int>` accumulator, so the label was
+///   renamed for accuracy.)
 ///
 /// Per `/perf` Honesty Rules ("closed-form fold that changes
 /// complexity class = red-line"), booking O(1) arithmetic under a
@@ -387,7 +391,10 @@ fn paper_win_collapsed_variant_label(label: &str) -> bool {
 /// `LoopReduce` on the lambda body). Until then the row family is
 /// suppressed end-to-end.
 fn paper_win_closed_form_fold_label(label: &str) -> bool {
-    matches!(label, "W1_int_sum" | "W2_f64_dot" | "W6_dict_num_key")
+    matches!(
+        label,
+        "W1_int_sum" | "W2_f64_dot" | "W6_list_int_sum_plus_one"
+    )
 }
 
 // Honesty cleanup #309 (2026-05-28): the previous
@@ -2012,7 +2019,7 @@ fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
         "W4_string_contains" => Some(W4_LLVM_SRC),
         "W4_long_haystack" => Some(W4_LONG_LLVM_SRC),
         "W5_dict_str_key" => Some(W5_LLVM_SRC),
-        "W6_dict_num_key" => Some(W6_LLVM_SRC),
+        "W6_list_int_sum_plus_one" => Some(W6_LLVM_SRC),
         // Phase F.W7 (2026-05-27): the W7 production-source recursive
         // `fib` closure now lowers all the way through
         // `LlvmAotEvaluator::from_source` — the emitter handles
@@ -2075,7 +2082,7 @@ fn rust_native_dispatch(label: &str, n: i64) -> i64 {
         "W4_string_contains" => rust_native_w4(n),
         "W4_long_haystack" => rust_native_w4_long(n),
         "W5_dict_str_key" => rust_native_w5(n),
-        "W6_dict_num_key" => rust_native_w6(n),
+        "W6_list_int_sum_plus_one" => rust_native_w6(n),
         "W7_fib" => rust_native_w7(n),
         "W8_poly_callsite" => rust_native_w8(n),
         "W9_nested_matrix" => rust_native_w9(n),
@@ -3003,7 +3010,7 @@ fn bench_cmp_lua(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(TREE_WALK_N));
         group.bench_function(
-            BenchmarkId::new("W6_dict_num_key", "relon_tree_walk"),
+            BenchmarkId::new("W6_list_int_sum_plus_one", "relon_tree_walk"),
             |b| {
                 b.iter_custom(|iters| {
                     let n_in = black_box(TREE_WALK_N as i64);
@@ -3014,14 +3021,17 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 });
             },
         );
-        group.bench_function(BenchmarkId::new("W6_dict_num_key", "luajit"), |b| {
-            b.iter_custom(|iters| {
-                timed_with_warmup(iters, || {
-                    let v: i64 = lua_fn_w6.call(()).unwrap();
-                    black_box(v);
-                })
-            });
-        });
+        group.bench_function(
+            BenchmarkId::new("W6_list_int_sum_plus_one", "luajit"),
+            |b| {
+                b.iter_custom(|iters| {
+                    timed_with_warmup(iters, || {
+                        let v: i64 = lua_fn_w6.call(()).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
         // Open follow-up #2: same range-pipeline peephole as W2 — the
         // `list.sum(range(n).map(...))` chain inlines into a pure
         // i64 accumulator loop the bytecode VM accepts.
@@ -3034,15 +3044,18 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 w6_expected(),
                 "W6 bytecode result must match analytic answer"
             );
-            group.bench_function(BenchmarkId::new("W6_dict_num_key", "relon_bytecode"), |b| {
-                b.iter_custom(|iters| {
-                    let n_in = black_box(TREE_WALK_N as i64);
-                    timed_with_warmup(iters, || {
-                        let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
-                        black_box(v);
-                    })
-                });
-            });
+            group.bench_function(
+                BenchmarkId::new("W6_list_int_sum_plus_one", "relon_bytecode"),
+                |b| {
+                    b.iter_custom(|iters| {
+                        let n_in = black_box(TREE_WALK_N as i64);
+                        timed_with_warmup(iters, || {
+                            let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
+                            black_box(v);
+                        })
+                    });
+                },
+            );
         }
     }
 
@@ -3584,9 +3597,12 @@ fn bench_cmp_lua(c: &mut Criterion) {
         ("W5_dict_str_key", w5_relon_src(), TREE_WALK_N, || {
             args_w_n(TREE_WALK_N as i64)
         }),
-        ("W6_dict_num_key", w6_relon_src(), TREE_WALK_N, || {
-            args_w_n(TREE_WALK_N as i64)
-        }),
+        (
+            "W6_list_int_sum_plus_one",
+            w6_relon_src(),
+            TREE_WALK_N,
+            || args_w_n(TREE_WALK_N as i64),
+        ),
         ("W7_fib", w7_relon_src(), FIB_N, || args_w_n(FIB_N as i64)),
         ("W8_poly_callsite", w8_relon_src(), TREE_WALK_N, || {
             args_w_n(TREE_WALK_N as i64)
@@ -3915,7 +3931,7 @@ fn bench_cmp_lua(c: &mut Criterion) {
 
         // Phase Z.2 (2026-05-28): relon_wasm_wasmtime row. Same
         // schema as the W1 wasm row above; this loop covers
-        // W6_dict_num_key + W12_p99_tail. The
+        // W6_list_int_sum_plus_one + W12_p99_tail. The
         // `try_build_wasm_compiled` helper enforces
         // `active_tier() == Compiled`, so canonical-panel workloads
         // outside Z.1's lowering surface (W5 / W7 / W8 / W9 / W10)
