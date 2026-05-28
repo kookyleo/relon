@@ -344,6 +344,52 @@ fn paper_win_collapsed_variant_label(label: &str) -> bool {
     )
 }
 
+/// Honesty cleanup (2026-05-28, audit #332): label gate for rows whose
+/// source body is a pure arithmetic-progression sum that LLVM at -O3
+/// reduces to a closed-form polynomial — `n*(n-1)/2`, `n*(n+1)/2`,
+/// Faulhaber-class cubics, etc. Verified by dumping post-O3 IR via
+/// `crates/relon-codegen-llvm/examples/dump_audit_w1_w2_w6.rs`:
+///
+/// * **W1_int_sum** — `list.sum(range(n))` ≡ `Σ_{i<n} i`. Post-O3 IR:
+///   the loop preheader is replaced by `(n-1) * (n-2) / 2 + (n-1)`
+///   followed by an unconditional branch to the exit phi. No loop
+///   instructions emitted in the lambda body.
+/// * **W2_f64_dot** — `list.sum(range(n).map((i) => (i+1)*(i+2)))`.
+///   Post-O3 IR: cubic polynomial collapse via Faulhaber's formula,
+///   the magic constant `6148914691236517206 = (2^64 - 4)/3` is the
+///   `/3` modular inverse, again no loop instructions.
+/// * **W6_dict_num_key** — `list.sum(range(n).map((i) => i + 1))` ≡
+///   `Σ_{i<n} (i+1)`. Post-O3 IR: closed form `n*(n+1)/2`. Same
+///   shape as W1.
+///
+/// Per `/perf` Honesty Rules ("closed-form fold that changes
+/// complexity class = red-line"), booking O(1) arithmetic under a
+/// `relon_llvm_aot` / `relon_llvm_aot_fast` / `rust_native` label
+/// against a LuaJIT row that walks the O(n) loop is a paper win.
+/// The W1 / W2 entries here are precautionary — neither workload is
+/// in the canonical_panel today, so the LLVM source variants in
+/// `llvm_aot_source_for` are dead branches; the gate keeps them
+/// dormant if a future agent reintroduces the workloads to the panel.
+/// W6 IS in the panel today; the row was emitting a paper-win
+/// measurement against the LuaJIT loop until this audit.
+///
+/// **Note on rust_native**: the `rust_native_w{1,2,6}` helpers use
+/// `wrapping_add` + `black_box` on `n`, which the doc-comment on
+/// `rust_native_w1` framed as "same freedom the LLVM AOT pipeline
+/// has". rustc / LLVM still recognises the arithmetic progression
+/// at the call site after inlining and folds to the same closed
+/// form, so the `rust_native` row for these labels measures the
+/// same O(1) arithmetic and lands the same paper win.
+///
+/// The deleted rows return once the bench grows a `black_box`-on-acc
+/// shape that defeats LLVM's induction-variable reduction (or an
+/// LLVM emitter flag that disables `IndVarSimplify` / `LoopIdiom` /
+/// `LoopReduce` on the lambda body). Until then the row family is
+/// suppressed end-to-end.
+fn paper_win_closed_form_fold_label(label: &str) -> bool {
+    matches!(label, "W1_int_sum" | "W2_f64_dot" | "W6_dict_num_key")
+}
+
 // Honesty cleanup #309 (2026-05-28): the previous
 // `try_build_jit_with_fixture` helper lived here. It installed a
 // `relon::TraceFixture` pre-built from `wN_recorder_body()` plus a
@@ -1951,6 +1997,15 @@ fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
            (i % 4 == 0 || i % 4 == 1) &&\n\
            (i % 24 >= 8 && i % 24 < 18) ? 1 : 0))";
     match label {
+        // Audit #332 (2026-05-28): W1 / W2 / W6 source variants are
+        // arithmetic-progression sums that LLVM -O3 collapses to a
+        // closed-form polynomial. The canonical_panel suppresses the
+        // `relon_llvm_aot` + `relon_llvm_aot_fast` rows for these
+        // labels via `paper_win_closed_form_fold_label` so the
+        // source entries below are dead match arms today; retained
+        // (not deleted) so the audit trail stays grep-able and so
+        // the entries remain dormant if W1 / W2 are reintroduced
+        // to the canonical_panel without re-checking the gate.
         "W1_int_sum" => Some(w1_relon_src()),
         "W2_f64_dot" => Some(W2_LLVM_SRC),
         "W3_string_concat" => Some(W3_LLVM_SRC),
@@ -2006,6 +2061,14 @@ fn try_build_llvm_aot(src: &str, label: &str) -> Option<relon_codegen_llvm::Llvm
 #[inline(never)]
 fn rust_native_dispatch(label: &str, n: i64) -> i64 {
     match label {
+        // Audit #332 (2026-05-28): the W1 / W2 / W6 rust_native arms
+        // are unreachable from the canonical_panel today — the panel
+        // gates the `rust_native` row via
+        // `paper_win_closed_form_fold_label` because rustc / LLVM
+        // collapses the arithmetic-progression sum to a closed-form
+        // polynomial. Arms retained for grep visibility and so the
+        // dispatcher panics rather than silently no-ops if a future
+        // agent reintroduces the labels without re-checking the gate.
         "W1_int_sum" => rust_native_w1(n),
         "W2_f64_dot" => rust_native_w2(n),
         "W3_string_concat" => rust_native_w3(n),
@@ -3664,6 +3727,18 @@ fn bench_cmp_lua(c: &mut Criterion) {
                  first-class closure / materialised list literal; the LLVM AOT variant \
                  would book an algebraically-collapsed kernel — see audit #318)"
             );
+        } else if paper_win_closed_form_fold_label(label) {
+            // Audit #332 (2026-05-28): LLVM -O3 reduces this workload's
+            // arithmetic-progression sum to a closed-form polynomial in
+            // the lambda body. Post-O3 IR verified by
+            // `examples/dump_audit_w1_w2_w6.rs` shows zero loop
+            // instructions emitted; the row would book O(1) arithmetic
+            // against a LuaJIT row that walks the O(n) loop.
+            eprintln!(
+                "[cmp_lua {label}] relon_llvm_aot row n/a (LLVM -O3 folds the \
+                 arithmetic-progression sum to a closed-form polynomial — \
+                 see audit #332)"
+            );
         } else {
             if let Some(llvm_src) = llvm_aot_source_for(label) {
                 if let Some(ev) = try_build_llvm_aot(llvm_src, label) {
@@ -3793,7 +3868,20 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // materialisation — booking that under a label that paired
         // with the LuaJIT-walks-the-production-source row is a
         // paper-win per `/perf` Honesty Rules.
-        if !paper_win_collapsed_variant_label(label) {
+        if paper_win_closed_form_fold_label(label) {
+            // Audit #332 (2026-05-28): rust_native_w{1,2,6} model the
+            // same arithmetic-progression sum that LLVM at -O3 collapses
+            // to a closed-form polynomial (the doc-comments on those
+            // helpers explicitly call out the fold as "same freedom the
+            // LLVM AOT pipeline has"). Booking that O(1) arithmetic
+            // under a `rust_native` label against a LuaJIT row that
+            // walks the O(n) loop is a paper win.
+            eprintln!(
+                "[cmp_lua {label}] rust_native row n/a (rustc / LLVM fold the \
+                 arithmetic-progression sum to a closed-form polynomial — \
+                 see audit #332)"
+            );
+        } else if !paper_win_collapsed_variant_label(label) {
             let args = args_factory();
             // W12 keys on "x"; every other workload keys on "n".
             let scalar = args
