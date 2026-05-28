@@ -102,7 +102,7 @@ enum ProgramSource {
 }
 
 /// Z.4.0+ — Return-shape provenance for the IR-walker path. The
-/// walker's typed-func signature stays `(i64) -> i64` across both
+/// walker's typed-func signature stays `(i64) -> i64` across all
 /// variants; the i64's *meaning* differs.
 #[derive(Debug, Clone)]
 enum IrWalkerReturn {
@@ -123,6 +123,13 @@ enum IrWalkerReturn {
         /// avoids the `SchemaLayout::offsets_for` re-walk.
         layout: OffsetTable,
     },
+    /// Z.4.2 — the i64 is a zero-extended i32 absolute pointer to a
+    /// `List<Int>` record (`[len: u32 LE][pad: u32 zero][i64
+    /// elements...]`). The walker installs the record as an active
+    /// data segment at module instantiate time; `run_main` reads the
+    /// header + payload back out of linear memory and wraps the
+    /// elements as a `Value::List`.
+    ListInt,
 }
 
 /// Bundled wasmtime objects returned from
@@ -455,6 +462,12 @@ fn program_returns_scalar_int(program: &ProgramSource) -> bool {
         // is `false` for non-canonical-Ret-wrapper returns).
         ProgramSource::IrWalker(IrWalkerReturn::ScalarInt) => true,
         ProgramSource::IrWalker(IrWalkerReturn::DictRecord { .. }) => false,
+        // Phase Z.4.2 — `List<Int>` return: the i64 is an absolute
+        // data-segment pointer, which is meaningless under the
+        // `wasmtime_fast` label (callers expect a scalar Int). Match
+        // the LLVM-side discipline: non-canonical-Ret-wrapper returns
+        // surface as `false`.
+        ProgramSource::IrWalker(IrWalkerReturn::ListInt) => false,
     }
 }
 
@@ -567,6 +580,22 @@ impl Evaluator for WasmEvaluator {
                 let dict = decode_dict_record(record_base, schema, layout, view)?;
                 Ok(dict)
             }
+            // Phase Z.4.2 — `List<Int>` return. The i64 carries the
+            // i32 absolute pointer to a `[len: u32 LE][pad: u32
+            // zero][i64 elements...]` record installed as an active
+            // data segment at module instantiate time (no arena
+            // alloc, so the record stays valid across `reset`).
+            // Decode the header + payload into a `Value::List`.
+            ProgramSource::IrWalker(IrWalkerReturn::ListInt) => {
+                let record_base = (out as u64) as u32;
+                let memory = rt
+                    .instance
+                    .get_memory(&mut *store, "memory")
+                    .ok_or_else(|| io_err("wasm-eval: instance missing `memory` export"))?;
+                let view = memory.data(&*store);
+                let list = decode_list_int_record(record_base, view)?;
+                Ok(list)
+            }
             _ => Ok(Value::Int(out)),
         }
     }
@@ -645,6 +674,24 @@ fn classify_walker_return_shape(schema: &Schema) -> Result<IrWalkerReturn, &'sta
         && matches!(schema.fields[0].ty, TypeRepr::Int);
     if is_canonical_wrapper {
         return Ok(IrWalkerReturn::ScalarInt);
+    }
+    // Z.4.2 — `List<Int>` return shape. The canonical
+    // `Ret { value: List<Int> }` wrapper matches the same single-field
+    // shape as the scalar wrapper; the discriminator is the element
+    // type. Mirrors `classify_return_shape` on the codegen side so
+    // both layers agree before any byte hits the wasm encoder.
+    if schema.fields.len() == 1 && schema.fields[0].name == RETURN_VALUE_FIELD_NAME {
+        if let TypeRepr::List { element } = &schema.fields[0].ty {
+            if matches!(**element, TypeRepr::Int) {
+                return Ok(IrWalkerReturn::ListInt);
+            }
+            // Other list element types still scope-cut — the codegen
+            // side rejects them under `UnsupportedOpReason::ListLiteral`,
+            // so reaching this branch means the IR pipeline somehow
+            // accepted a shape the codegen will reject; surface a
+            // descriptive tag instead of `DictRecord`-shaped misdecode.
+            return Err("ret_list_non_int_elem");
+        }
     }
     // Re-derive the layout — `SchemaLayout::offsets_for` walks the
     // same canonical-form rules the codegen side uses. Failures are
@@ -758,6 +805,65 @@ fn decode_dict_record(
         Some(schema.name.clone())
     };
     Ok(Value::branded_dict(map, brand))
+}
+
+/// Z.4.2 — decode a `List<Int>`-shape return record. The walker
+/// installs the record as an active data segment whose layout is
+/// `[len: u32 LE][pad: u32 zero][i64 elements...]`. We read the
+/// header back, bounds-check the payload against the memory view,
+/// and wrap the elements as a `Value::List` (with `Value::Int` per
+/// element).
+///
+/// Mirrors the LLVM-side List<Int> decode: same header layout, same
+/// pad placement, same little-endian element order. A regression in
+/// the encoder's `encode_const_list_int_record` would surface here
+/// as either a header mismatch (wrong `len`) or a misaligned i64
+/// read (wrong values).
+fn decode_list_int_record(record_base: u32, view: &[u8]) -> Result<Value, RuntimeError> {
+    let header_start = record_base as usize;
+    let header_end = header_start.checked_add(8).ok_or_else(|| {
+        io_err(format!(
+            "wasm-eval List<Int> decode: header offset overflow (base={record_base})"
+        ))
+    })?;
+    if header_end > view.len() {
+        return Err(io_err(format!(
+            "wasm-eval List<Int> decode: header out of bounds (base={record_base}, mem={})",
+            view.len()
+        )));
+    }
+    let len = u32::from_le_bytes(
+        view[header_start..header_start + 4]
+            .try_into()
+            .expect("8-byte header slice"),
+    ) as usize;
+    // The 4-byte pad lives at `view[header_start+4 .. header_start+8]`; we
+    // skip it and read the i64 payload starting at `header_start + 8`.
+    let payload_start = header_start + 8;
+    let payload_end = payload_start
+        .checked_add(8usize.saturating_mul(len))
+        .ok_or_else(|| {
+            io_err(format!(
+                "wasm-eval List<Int> decode: payload range overflow (len={len})"
+            ))
+        })?;
+    if payload_end > view.len() {
+        return Err(io_err(format!(
+            "wasm-eval List<Int> decode: payload out of bounds (len={len}, mem={})",
+            view.len()
+        )));
+    }
+    let mut elements: Vec<Value> = Vec::with_capacity(len);
+    for i in 0..len {
+        let elem_off = payload_start + i * 8;
+        let v = i64::from_le_bytes(
+            view[elem_off..elem_off + 8]
+                .try_into()
+                .expect("8-byte element slice"),
+        );
+        elements.push(Value::Int(v));
+    }
+    Ok(Value::List(elements.into()))
 }
 
 fn extract_named_int(args: &HashMap<String, Value>, name: &str) -> Result<i64, RuntimeError> {

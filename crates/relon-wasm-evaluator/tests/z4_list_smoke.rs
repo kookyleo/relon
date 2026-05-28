@@ -148,6 +148,61 @@ fn walker_lowers_nested_range_reduce() {
 const FACTORIAL_REDUCE_SRC: &str = "#main(Int n) -> Int\n\
                                     range(n).reduce(1, (acc, i) => acc * (i + 1))";
 
+/// Z.4.2 — bare `List<Int>` literal return. Lowers to:
+///
+///   ConstListInt { idx: 0, elements: [10, 20, 30] }
+///   StoreField { offset: 0, ty: ListInt }
+///   Return
+///
+/// The walker installs the record `[len: u32 LE][pad: u32 zero][i64
+/// elements...]` as an active data segment at `CONST_LIST_DATA_BASE`
+/// and emits `i32.const <abs_offset>` for the `ConstListInt` op; the
+/// trailing `Return` zero-extends the pointer to i64 for the typed-
+/// func result. The host's `decode_list_int_record` reads the header
+/// + payload back and wraps the elements as `Value::List`.
+const CONST_LIST_INT_RETURN_SRC: &str = "#main(Int n) -> List<Int>\n[10, 20, 30]";
+
+#[test]
+fn walker_lowers_const_list_int_return() {
+    let ev = WasmEvaluator::new(CONST_LIST_INT_RETURN_SRC)
+        .expect("WasmEvaluator::new(const list int return)");
+    let mut args = HashMap::new();
+    args.insert("n".to_string(), Value::Int(0));
+    let out = ev.run_main(args.clone()).expect("run_main");
+    let expected = tree_walker_run(CONST_LIST_INT_RETURN_SRC, args);
+    assert_eq!(
+        out, expected,
+        "walker list-int return must match tree-walker reference"
+    );
+    match out {
+        Value::List(items) => {
+            assert_eq!(items.len(), 3, "list len mismatch");
+            assert_eq!(items[0], Value::Int(10));
+            assert_eq!(items[1], Value::Int(20));
+            assert_eq!(items[2], Value::Int(30));
+        }
+        other => panic!("expected List, got {other:?}"),
+    }
+    assert_eq!(
+        ev.active_tier(),
+        Tier::Compiled,
+        "List<Int> literal return must land on Compiled tier via IR walker"
+    );
+}
+
+#[test]
+fn walker_const_list_int_return_no_fast_path() {
+    // The fast-path entry hands back a raw i64 — for the List<Int>
+    // shape that's a meaningless absolute pointer. `has_fast_path`
+    // must report `false` so callers don't accidentally use it.
+    let ev = WasmEvaluator::new(CONST_LIST_INT_RETURN_SRC)
+        .expect("WasmEvaluator::new(const list int return)");
+    assert!(
+        !ev.has_fast_path(),
+        "List<Int> return must not expose the i64 fast path"
+    );
+}
+
 #[test]
 fn walker_lowers_factorial_reduce() {
     let ev =
