@@ -2241,6 +2241,165 @@ fn w18_expected() -> i64 {
 }
 
 // =====================================================================
+// =====  W19 — matrix multiply (O(n^3) triple-nested loop)  ===========
+// =====================================================================
+//
+// Tier 3 numeric kernel workload (panel expansion 2026-05-28). Mirrors
+// the Computer Language Benchmarks Game "matrix-multiply" entry: build
+// two 16x16 Int matrices via a deterministic generator, compute the
+// product `C = A * B` via the canonical triple-nested loop
+// `c[i][j] = Σ_k a[i][k] * b[k][j]`, and return the sum of all 256
+// entries of the result matrix. The sum-of-product reduce keeps the
+// `#main` return shape scalar (Int) so the bench harness can dispatch
+// uniformly with the rest of the panel.
+//
+// **HONESTY checklist** (per `HONESTY_POLICY.md`):
+// * Source path: `w19_relon_src()` IS the production source — a
+//   `where`-clause builds `a`, `b`, `c` as nested-`map` lists, the
+//   `#main` body folds the result matrix to a scalar via two stacked
+//   reduces. The Lua row runs the SAME triple-loop algorithm; no
+//   transpose / strided rewrite / Strassen replacement that would
+//   change the algorithm complexity class.
+// * Algorithm complexity preserved: O(n^3) for the inner reduce loop,
+//   plus O(n^2) for the result-sum fold; n=16 means 4096 multiplies +
+//   adds + 256 reductions, the dominant cost. NO closed-form fold
+//   possible — `(i * size + k) % 100` and `(k + j) % 100` carry mod-
+//   100 discontinuities that defeat algebraic collapse; an optimiser
+//   can unroll but cannot reduce the inner reduce to a polynomial in
+//   `n`.
+// * Time-math sanity: 4096 inner iterations × ~50 ns/iter on the
+//   tree-walker (closure dispatch + scope-clone + 2D index probe) ≈
+//   200 µs/run. LuaJIT ~ 30 µs/run (the canonical matmul ratio).
+//   Per-iter cost < 5 ns on the tree-walker would indicate the inner
+//   reduce got constant-folded (impossible because of the mod-100
+//   discontinuity); per-iter cost < 1 ns on rust_native would
+//   indicate rustc / LLVM saw through the closure shape.
+// * I/O shape: `#main(Int n) -> Int`. Here `n` IS the matrix size
+//   (configurable, defaults to W19_N = 16). Lua row reads `n` from
+//   the same constant. Both sides produce a scalar Int checksum.
+// * Backend coverage: tree_walk + luajit only. Bytecode envelope
+//   rejects (`unknown stdlib method range` — the bytecode lowering
+//   does not yet accept the 2D `range(size).map((i) => range(size).
+//   map(...))` shape because it materialises a `List<List<Int>>` the
+//   bytecode VM's M2-A scalar envelope does not handle). LLVM AOT
+//   envelope rejects (same surface). Cranelift AOT rejects
+//   (`ir lowering failed: unknown stdlib method range` — Cranelift's
+//   envelope inherits the same 2D-list scope-cut). Wasm classifier
+//   scope-cuts (Z.1 program set does not cover matmul). rust_native
+//   row IS valid here — the algorithm shape does NOT closed-form
+//   fold (mod-100 discontinuity), so a Rust triple-loop baseline is
+//   the honest "what would matmul cost as plain Rust" floor.
+
+/// W19 scale — 16x16 matrix. The Computer Language Benchmarks Game
+/// uses 800x800 for the headline numbers; Relon's tree-walker pays
+/// closure / scope-clone overhead on every inner-loop call, so 16x16
+/// (4k inner mul-adds) is the largest size that keeps the criterion
+/// sample loop within the 5 s measurement budget. Larger matrices
+/// (e.g. 32x32 = 32k inner) push tree-walker run to ~2 ms each, which
+/// with the 100-sample criterion budget exceeds the configured
+/// measurement_time. Smaller sizes (8x8 = 512 inner) cut the signal-
+/// to-noise by 8x without saving meaningful wall-clock.
+///
+/// `n` IS the matrix size at runtime (the source resolves `size: n`
+/// in the `where` clause), so callers can dial the workload by
+/// supplying a different `n`. Smoke runner uses W19_N; bench uses
+/// W19_N.
+const W19_N: i64 = 16;
+
+fn w19_relon_src() -> &'static str {
+    // Triple-nested matrix multiply:
+    //   a[i][j] = (i * size + j) % 100
+    //   b[i][j] = (i + j) % 100
+    //   c[i][j] = Σ_k a[i][k] * b[k][j]
+    //   result  = Σ_i Σ_j c[i][j]
+    //
+    // The mod-100 in the generators is load-bearing — without it,
+    // both `a[i][k]` and `b[k][j]` are arithmetic-progression terms
+    // an aggressive optimiser could collapse to a closed form. The
+    // mod-100 discontinuity keeps the per-cell cost shape-dependent
+    // so neither rustc nor LLVM can reduce the inner reduce to a
+    // polynomial in `size`.
+    //
+    // `where`-clause defines `a` / `b` / `c` as lazy bindings; the
+    // tree-walker materialises each `List<List<Int>>` once (on first
+    // reference), then the outer fold reads cells via `a[i][k]` /
+    // `b[k][j]` per inner step. The bytecode / LLVM AOT / cranelift
+    // backends all reject this shape today — see the doc-comment
+    // above.
+    "#unstrict\n\
+     #main(Int n) -> Int\n\
+     c.reduce(0, (row_acc, row) => row_acc + row.reduce(0, (cell_acc, cell) => cell_acc + cell))\n\
+     where {\n\
+       size: n,\n\
+       a: range(size).map((i) => range(size).map((j) => (i * size + j) % 100)),\n\
+       b: range(size).map((i) => range(size).map((j) => (i + j) % 100)),\n\
+       c: range(size).map((i) => range(size).map((j) => range(size).reduce(0, (acc, k) => acc + a[i][k] * b[k][j])))\n\
+     }"
+}
+
+fn w19_lua_src() -> String {
+    // Same triple-nested matmul. Lua's 1-indexed arrays force the
+    // `i + 1` / `j + 1` / `k + 1` shifts when comparing to the Relon
+    // source's 0-indexed reads; the mod-100 generator and the final
+    // sum-fold remain byte-equivalent.
+    format!(
+        r#"return function()
+            local n = {n}
+            local size = n
+            local a, b = {{}}, {{}}
+            for i = 1, size do
+                a[i], b[i] = {{}}, {{}}
+                for j = 1, size do
+                    a[i][j] = ((i - 1) * size + (j - 1)) % 100
+                    b[i][j] = ((i - 1) + (j - 1)) % 100
+                end
+            end
+            local result = 0
+            for i = 1, size do
+                for j = 1, size do
+                    local s = 0
+                    for k = 1, size do
+                        s = s + a[i][k] * b[k][j]
+                    end
+                    result = result + s
+                end
+            end
+            return result
+        end"#,
+        n = W19_N
+    )
+}
+
+fn w19_expected() -> i64 {
+    // Closed-form analytic check (mirrors the smoke runner): for each
+    // cell of the result matrix, accumulate `a[i][k] * b[k][j]`, then
+    // sum all cells. Wrapping arithmetic matches the Relon `Op::Add` /
+    // `Op::Mul(I64)` lowering semantics (no overflow check because the
+    // value range is bounded above by 16 * 99 * 99 ≈ 156 k per cell, well
+    // below 2^63).
+    let size: i64 = W19_N;
+    let mut total: i64 = 0;
+    let mut i: i64 = 0;
+    while i < size {
+        let mut j: i64 = 0;
+        while j < size {
+            let mut s: i64 = 0;
+            let mut k: i64 = 0;
+            while k < size {
+                let aik = (i.wrapping_mul(size).wrapping_add(k)) % 100;
+                let bkj = (k.wrapping_add(j)) % 100;
+                s = s.wrapping_add(aik.wrapping_mul(bkj));
+                k += 1;
+            }
+            total = total.wrapping_add(s);
+            j += 1;
+        }
+        i += 1;
+    }
+    total
+}
+
+// =====================================================================
 // =====  consistency assertions  ======================================
 // =====================================================================
 
@@ -2664,6 +2823,53 @@ fn rust_native_w18(n: i64) -> i64 {
     count
 }
 
+/// W19 matmul baseline. Triple-nested loop with two `Vec<Vec<i64>>`
+/// matrices generated by the same `(i * size + j) % 100` / `(i + j)
+/// % 100` rules. `black_box` on `n` defeats compile-time fold over a
+/// constant size; the per-cell inner reduce still has shape `Σ_k a[i]
+/// [k] * b[k][j]` with mod-100 discontinuity so neither LLVM nor
+/// rustc can collapse to a polynomial. Allocates both matrices on
+/// every call so the row times the canonical matmul shape, not a
+/// pre-loaded scratchpad.
+#[inline(never)]
+fn rust_native_w19(n: i64) -> i64 {
+    let size = black_box(n);
+    let usize_s = size as usize;
+    // Build a, b via the same generator the Relon source uses.
+    let mut a: Vec<Vec<i64>> = Vec::with_capacity(usize_s);
+    let mut b: Vec<Vec<i64>> = Vec::with_capacity(usize_s);
+    for i in 0..size {
+        let mut row_a: Vec<i64> = Vec::with_capacity(usize_s);
+        let mut row_b: Vec<i64> = Vec::with_capacity(usize_s);
+        for j in 0..size {
+            row_a.push((i.wrapping_mul(size).wrapping_add(j)) % 100);
+            row_b.push((i.wrapping_add(j)) % 100);
+        }
+        a.push(row_a);
+        b.push(row_b);
+    }
+    // Triple-loop matmul + sum-fold of the result matrix.
+    // The body deliberately probes `a[i][k]` / `b[k][j]` by index
+    // (matching the Relon source's 2D-index pattern) rather than via
+    // `.iter()` adapters — the index-probe is what the bench is
+    // measuring against the LuaJIT row's array-load cost. The
+    // `#[allow(clippy::needless_range_loop)]` matches that intent.
+    #[allow(clippy::needless_range_loop)]
+    {
+        let mut total: i64 = 0;
+        for i in 0..usize_s {
+            for j in 0..usize_s {
+                let mut s: i64 = 0;
+                for k in 0..usize_s {
+                    s = s.wrapping_add(a[i][k].wrapping_mul(b[k][j]));
+                }
+                total = total.wrapping_add(s);
+            }
+        }
+        total
+    }
+}
+
 // =====================================================================
 // =====  Phase C: LLVM AOT row glue  ==================================
 // =====================================================================
@@ -2811,6 +3017,21 @@ fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
         // the envelope widens. An inlined iterative variant would
         // be the algorithm-substitution paper-win pattern.
         "W18_prime_count_trial_div" => None,
+        // Panel expansion 2026-05-28 (Tier 3 numeric-kernel W19):
+        // production source materialises two 16x16 `List<List<Int>>`
+        // matrices via nested `range(size).map(...).map(...)` chains.
+        // The LLVM AOT envelope today rejects nested-list construction
+        // (`Op::AllocListInt` does not chain through `Op::MakeClosure`
+        // for the outer map's return-list shape — the bytecode VM /
+        // cranelift / LLVM emitters surface as `unknown stdlib method
+        // range` because the lowering pipeline rejects the 2D shape
+        // before it reaches the codegen). An inlined variant that
+        // skips list materialisation (e.g. `sum_{i,j,k} ((i*size+k)
+        // %100) * ((k+j)%100)`) would be a paper-win per audit #318 —
+        // the LuaJIT row walks the materialised arrays and pays the
+        // table-load cost; collapsing both `a[i][k]` and `b[k][j]`
+        // to inline arithmetic skips the load.
+        "W19_matrix_multiply" => None,
         _ => None,
     }
 }
@@ -2891,6 +3112,12 @@ fn rust_native_dispatch(label: &str, n: i64) -> i64 {
         // not a polynomial in `n`), so no closed-form fold collapses
         // the count. `rust_native` is a legitimate baseline floor.
         "W18_prime_count_trial_div" => rust_native_w18(n),
+        // Panel expansion 2026-05-28 (Tier 3 numeric-kernel W19):
+        // matmul's `Σ_k a[i][k] * b[k][j]` has mod-100 discontinuity
+        // in the generators so no closed-form fold collapses the
+        // inner reduce. `rust_native` is a legitimate "what would
+        // matmul cost in plain Rust" baseline floor.
+        "W19_matrix_multiply" => rust_native_w19(n),
         other => panic!("rust_native_dispatch: unknown workload `{other}`"),
     }
 }
@@ -4614,6 +4841,55 @@ fn bench_cmp_lua(c: &mut Criterion) {
         );
     }
 
+    // ----- W19 matrix multiply (triple-nested O(n^3) loop) -----
+    //
+    // Panel-expansion 2026-05-28 (Tier 3 numeric-kernel). See the
+    // top-of-file W19 doc-comment for the HONESTY checklist. Backend
+    // coverage: tree_walk + luajit only. Bytecode envelope rejects
+    // (`unknown stdlib method range` — the 2D `range(size).map((i) =>
+    // range(size).map(...))` lowering is not yet in the bytecode VM's
+    // M2-A scalar envelope). LLVM AOT / Cranelift AOT both reject
+    // the same surface. The canonical-panel `relon_jit` row routes
+    // the same source through `JitEvaluator`, which falls through to
+    // the tree-walker.
+    {
+        let (walker, scope) = build_tree_walker(w19_relon_src());
+        let lua_fn_w19 = lua_fn(&lua, &w19_lua_src());
+
+        let relon_v = relon_int_result("W19", walker.run_main(&scope, args_w_n(W19_N)).unwrap());
+        let lua_v: i64 = lua_fn_w19.call(()).unwrap();
+        assert_relon_lua_consistent("W19", relon_v, lua_v, w19_expected());
+
+        // Throughput is the number of inner mul-add operations per
+        // call: `size^3`. With W19_N=16 that's 4096 elements, which
+        // criterion uses to compute per-element ns figures so the
+        // matmul row is directly comparable across runs at different
+        // matrix sizes (a future agent dialling W19_N to 8 or 32 gets
+        // the same units in the criterion report).
+        let inner_ops = (W19_N as u64) * (W19_N as u64) * (W19_N as u64);
+        group.throughput(Throughput::Elements(inner_ops));
+        group.bench_function(
+            BenchmarkId::new("W19_matrix_multiply", "relon_tree_walk"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(W19_N);
+                    timed_with_warmup(iters, || {
+                        let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
+        group.bench_function(BenchmarkId::new("W19_matrix_multiply", "luajit"), |b| {
+            b.iter_custom(|iters| {
+                timed_with_warmup(iters, || {
+                    let v: i64 = lua_fn_w19.call(()).unwrap();
+                    black_box(v);
+                })
+            });
+        });
+    }
+
     // =================================================================
     // ===== Dart-style canonical panel: relon_jit + relon_aot =========
     // =================================================================
@@ -4766,6 +5042,29 @@ fn bench_cmp_lua(c: &mut Criterion) {
             w18_relon_src(),
             W18_N as u64,
             || args_w_n(W18_N),
+        ),
+        // Panel-expansion 2026-05-28 (Tier 3 numeric-kernel W19):
+        // * relon_jit: runs through `JitEvaluator::run_main`; falls
+        //   through to tree-walker (nested `range.map.map` + 2D index
+        //   `a[i][k]` sits outside the bytecode envelope's
+        //   M2-A scalar surface).
+        // * relon_aot / relon_llvm_aot: both reject (same 2D-list +
+        //   nested-closure surface as W16/W17/W18). Returning None
+        //   from `llvm_aot_source_for`.
+        // * rust_native: VALID — matmul has no closed-form fold over
+        //   the mod-100 generator discontinuity.
+        // * relon_wasm_wasmtime: classifier scope-cut (Z.1 program
+        //   set does not include matmul).
+        // * Throughput uses inner-mul-add count `size^3` rather than
+        //   `n` so per-element ns is comparable across matrix sizes.
+        (
+            "W19_matrix_multiply",
+            w19_relon_src(),
+            {
+                let s = W19_N as u64;
+                s * s * s
+            },
+            || args_w_n(W19_N),
         ),
     ];
 

@@ -210,3 +210,33 @@ Re-introducing the gated rows requires a `black_box`-on-acc shape
 that defeats LLVM's induction-variable reduction (or an LLVM emitter
 flag that disables `IndVarSimplify` / `LoopIdiom` / `LoopReduce` on
 the lambda body).
+
+## Tier 3 panel expansion (2026-05-28)
+
+The panel grows numeric-kernel workloads to test the codegen quality
+on triple-nested loops and Float arithmetic. Each row carries the
+HONESTY checklist at row-add time; both rows ship architectural
+limitation disclosures.
+
+* **W19_matrix_multiply** — 16x16 matrix multiply (triple-nested
+  O(n^3) loop), built from two `range(size).map.map` matrices and
+  reduced cell-by-cell. The mod-100 entries on `a` / `b` defeat
+  algebraic collapse, so neither rustc nor LLVM can closed-form
+  fold the inner reduce.
+  - tree_walk + luajit only (production source level).
+  - canonical-panel relon_jit row runs the production source through
+    `JitEvaluator`, which falls through to the tree-walker (nested
+    2D-list materialisation + 2D index sit outside the bytecode VM's
+    M2-A scalar envelope; cranelift / LLVM AOT inherit the same
+    rejection — `unknown stdlib method range` at lowering time).
+  - rust_native row IS valid (mod-100 discontinuity blocks closed-
+    form fold). Throughput uses `size^3` (4096 ops for 16x16) so the
+    per-element ns is comparable across sizes.
+  - **Architectural limitation discovered**: the 2D `range(size).
+    map((i) => range(size).map(...))` lowering reaches the bytecode /
+    cranelift / LLVM AOT codegen pipelines as `unknown stdlib method
+    range (arity=1)`. This is the same envelope gap that rejects
+    W16/W17/W18's `_list_filter` closures — the lowering pipeline
+    does not handle first-class closure values returned from outer
+    `map` callbacks. Tracked alongside the W7 closure-recursion
+    follow-up (Phase F.W7-style envelope widening).
