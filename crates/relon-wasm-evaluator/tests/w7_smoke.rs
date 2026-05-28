@@ -21,11 +21,12 @@
 //!
 //! Note: the **production** W7 source (`#main(Int n) -> Dict` with an
 //! `#internal fib: (k) => ...` first-class recursive closure called
-//! via `result: fib(n)`) still scope-cuts at the classifier and
-//! routes through the tree-walker fallback — that path is Z.4
-//! follow-up. See `scope_cut_smoke.rs` for the scope-cut tier check
-//! pattern, and the `w7_production_dict_source_still_scope_cuts`
-//! test below for the W7-specific assertion.
+//! via `result: fib(n)`) is now lowered end-to-end through the IR
+//! walker as of Phase Z.4.3 — see `z4_closure_smoke.rs` for the
+//! positive coverage. The `w7_production_dict_source_runs_on_walker`
+//! test below pins the W7-specific assertion: production source
+//! must surface `Tier::Compiled` and `Value::Dict { result: Int(17711) }`
+//! for `n = 22`.
 
 use std::collections::HashMap;
 
@@ -123,20 +124,31 @@ fn w7_fast_path_round_trips() {
 }
 
 #[test]
-fn w7_production_dict_source_still_scope_cuts() {
-    // The production source binds `fib: (k) => ...` as a `#internal`
-    // first-class recursive closure inside a Dict-body and returns
-    // `Dict { result: fib(n) }`. Phase Z.4.1 unlocked the
-    // bare-`Dict` return path (`AllocRootRecord` /
-    // `StoreFieldAtRecord` /  Dict mini-ABI lowering — see
-    // `z4_dict_return_smoke.rs` for the positive coverage), but the
-    // closure-as-value primitives (`MakeClosure` / `CallClosure`)
-    // the IR pipeline emits for the `#internal fib` binding stay
-    // scope-cut at the walker — that's Z.4.3 follow-up. Until Z.4.3
-    // lands the funcref-table + `call_indirect` shape this source
-    // must still surface a tree-walker fallback tier — a silent
-    // fast-path pass on the production source would be the paper-
-    // win anti-pattern called out in design §7.
+fn w7_production_dict_source_runs_on_walker() {
+    // Z.4.3 — production W7 source binds `fib: (k) => ...` as a
+    // `#internal` first-class recursive closure inside a Dict-body
+    // and returns `Dict { result: fib(n) }`. The IR pipeline lowers
+    // this into the closure-as-value `MakeClosure` / `CallClosure`
+    // primitives plus the Z.4.1 `AllocRootRecord` /
+    // `StoreFieldAtRecord` Dict mini-ABI; Z.4.3 wires the funcref
+    // table + `call_indirect` shape so the walker emits a real wasm
+    // module instead of routing through the tree-walker fallback.
+    //
+    // Honesty (design §7):
+    //
+    // 1. Same algorithm? — yes, the recursive `fib` body lifts to a
+    //    separate wasm function (`__closure_0`) called via
+    //    `call_indirect` against the module's funcref table. No
+    //    iterative `(a, b) <- (b, a + b)` rewrite, no Binet's
+    //    closed-form trick. Each `fib(k)` call burns one wasm stack
+    //    frame.
+    // 2. Same code path? — yes, `WasmEvaluator::new` lowers via
+    //    `relon-codegen-wasm`'s IR walker (not the W7 inline-Int
+    //    classifier); the Dict-return + closure-as-value combo
+    //    routes straight to `lower_ir_module`.
+    // 3. Same I/O shape? — input `args["n"] = Int(22)`, output
+    //    `Value::Dict { result: Int(17711) }` matching the
+    //    tree-walker reference end-to-end.
     let prod_src = "#main(Int n) -> Dict\n\
                     {\n\
                       #internal\n\
@@ -144,9 +156,31 @@ fn w7_production_dict_source_still_scope_cuts() {
                       result: fib(n)\n\
                     }";
     let ev = WasmEvaluator::new(prod_src).expect("WasmEvaluator::new(W7 production)");
+
+    // Same I/O shape — pass `n = 22` (the bench point) and check
+    // the matching Dict-return decode.
+    let mut args = HashMap::new();
+    args.insert("n".to_string(), Value::Int(22));
+    let out = ev.run_main(args).expect("run_main(W7 production, n=22)");
+
+    let dict_map = match &out {
+        Value::Dict(d) => &d.map,
+        other => panic!("W7 production must return Value::Dict, got {other:?}"),
+    };
+    assert_eq!(
+        dict_map.get("result").cloned(),
+        Some(Value::Int(expected_w7(22))),
+        "W7 production Dict.result must equal fib(22) (tree-walker reference)"
+    );
+    assert_eq!(
+        dict_map.get("result").cloned(),
+        Some(Value::Int(17711)),
+        "W7 production Dict.result must equal 17711 (fib(22) per closed-form check)"
+    );
     assert_eq!(
         ev.active_tier(),
-        Tier::TreeWalker,
-        "W7 production Dict source must surface tree-walker fallback (Z.4.3 closure follow-up)"
+        Tier::Compiled,
+        "W7 production Dict source must reach the compiled tier post Z.4.3 \
+         (funcref table + call_indirect closure-as-value lowering)"
     );
 }
