@@ -257,6 +257,34 @@ enum ReturnShape {
         /// record's first field's alignment dominates.
         root_align: u32,
     },
+    /// Z.4.2 — `List<Int>`-return shape. The body emits one or more
+    /// `Op::ConstListInt` ops (each materialised into the wasm
+    /// module's data section) plus a trailing
+    /// `StoreField { offset: 0, ty: ListInt }` whose effect is to
+    /// leave the list-record's absolute pointer (i32) on the wasm
+    /// stack. The function's implicit `End` then returns it as an
+    /// i64 — wasm's typed-func `i64` result carries the zero-extended
+    /// pointer; the host's `WasmEvaluator::run_main` recognises the
+    /// shape from the IR module's `return_schema` and decodes the
+    /// list out of linear memory into a `Value::List`.
+    ///
+    /// Today's reach: bare-literal returns
+    /// (`#main(...) -> List<Int>\n[1, 2, 3]`) plus future shapes that
+    /// flow a constant list through the body (let-bound literal,
+    /// ternary-selected literal). Dynamic list construction
+    /// (`range(n).map(...)` materialising into a fresh list) lands
+    /// alongside the Z.4.3 closure-as-value follow-up — it needs a
+    /// runtime list-builder against the arena allocator, not a
+    /// data-section blob.
+    ListIntPtr {
+        /// Buffer offset of the `Ret.value` slot the IR's lowering
+        /// pass writes the list pointer to. The walker matches a
+        /// `StoreField { offset, ty: ListInt }` against this offset
+        /// so a non-Ret list write would still scope-cut (the buffer
+        /// protocol's parallel Ret slot isn't visible through the
+        /// typed-func ABI).
+        offset: u32,
+    },
 }
 
 /// Lower a workspace's IR module into a wasm binary with a
@@ -349,6 +377,9 @@ pub fn lower_ir_module(lowered: &LoweredEntry) -> Result<Vec<u8>, LowerError> {
     // --- Assemble the wasm module ----------------------------------------
     let n_params = param_slots.len();
     let needs_imports = emit.needs_arena_alloc;
+    // Pull the data-segment table out before `finalise` consumes
+    // `self`; `lower_ir_module` then encodes them into Section 11.
+    let const_list_data = std::mem::take(&mut emit.const_list_ints);
     let mut module = Module::new();
 
     // Section 1 — types.
@@ -444,7 +475,44 @@ pub fn lower_ir_module(lowered: &LoweredEntry) -> Result<Vec<u8>, LowerError> {
     code.function(&func);
     module.section(&code);
 
+    // Section 11 — data: active data segments for `Op::ConstListInt`
+    // literals. Each entry installs the matching list record
+    // (`[len: u32 LE][pad: u32 zero][i64 elements...]`) at the
+    // resolved absolute offset. Empty list keeps modules without
+    // list literals byte-identical to the Z.4.0/Z.4.1 emit.
+    if !const_list_data.is_empty() {
+        let mut data = wasm_encoder::DataSection::new();
+        for entry in &const_list_data {
+            let bytes = encode_const_list_int_record(entry);
+            data.active(
+                0,
+                &wasm_encoder::ConstExpr::i32_const(entry.abs_offset as i32),
+                bytes.iter().copied(),
+            );
+        }
+        module.section(&data);
+    }
+
     Ok(module.finish())
+}
+
+/// Z.4.2 — serialize one `Op::ConstListInt` record into its
+/// little-endian wire form. Layout: `[len: u32 LE][pad: u32 zero][i64
+/// elements...]`. The pad keeps the i64 payload 8-aligned inside the
+/// record when the record itself sits at an 8-aligned absolute
+/// offset (the walker's `intern_const_list_int` cursor guarantees
+/// this for every entry).
+fn encode_const_list_int_record(entry: &ConstListIntEntry) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(8 + 8 * entry.elements.len());
+    let len_u32 = entry.elements.len() as u32;
+    bytes.extend_from_slice(&len_u32.to_le_bytes());
+    // 4-byte pad to push elements onto an 8-byte boundary inside the
+    // record. Mirrors the LLVM AOT layout exactly.
+    bytes.extend_from_slice(&[0u8; 4]);
+    for v in &entry.elements {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    bytes
 }
 
 /// Classify a `Ret`-schema layout into a [`ReturnShape`].
@@ -464,6 +532,31 @@ fn classify_return_shape(schema: &Schema, layout: &OffsetTable) -> Result<Return
             offset: ret_field.offset as u32,
             ty: IrType::I64,
         });
+    }
+    // Z.4.2 — `List<Int>` return. The canonical `Ret { value: List<Int> }`
+    // wrapper matches the same single-field-named-`value` shape as the
+    // scalar-Int wrapper; the discriminator is the element type. The
+    // body emits `ConstListInt` (materialised in the data section)
+    // followed by `StoreField { offset, ty: ListInt }` to leave the
+    // i32 pointer on the wasm stack, then `Return` zero-extends to
+    // the typed-func's i64 result.
+    if schema.fields.len() == 1 && schema.fields[0].name == RETURN_VALUE_FIELD_NAME {
+        if let TypeRepr::List { element } = &schema.fields[0].ty {
+            if matches!(**element, TypeRepr::Int) {
+                let ret_field = &layout.fields[0];
+                return Ok(ReturnShape::ListIntPtr {
+                    offset: ret_field.offset as u32,
+                });
+            }
+            // Other list element types (Float / Bool / String / Schema)
+            // each need their own data-section / runtime alloc + host
+            // decode arm. Group them under the same Z.4.2 follow-up tag
+            // so the host's tracing layer pins them to this batch.
+            return Err(LowerError::UnsupportedOp(
+                "ret_list_non_int",
+                UnsupportedOpReason::ListLiteral,
+            ));
+        }
     }
     // Reject Dict-return shapes the walker can't lower yet:
     // - Empty record (no fields to store).
@@ -581,6 +674,13 @@ fn map_layout_err(_e: &relon_eval_api::layout::LayoutError) -> &'static str {
     "schema_layout_unsupported_type"
 }
 
+/// Z.4.2 — base absolute offset of the walker's `Op::ConstListInt`
+/// data-segment region. Set to 1024 (4 KiB) to leave the wasm-page-0
+/// low region available for future extensions (the LLVM AOT layout
+/// pass uses a similar reserve); the cursor advances upward from
+/// here as each new `ConstListInt` is interned.
+const CONST_LIST_DATA_BASE: u32 = 1024;
+
 /// Z.4.2 — translate an `Op::Block` / `Op::Loop` `result_ty` into a
 /// `wasm_encoder::BlockType`. `None` becomes the stack-neutral
 /// `BlockType::Empty`; otherwise pick the matching wasm valtype.
@@ -642,6 +742,30 @@ enum AuxLocal {
     ScratchI64,
 }
 
+/// Z.4.2 — per-`Op::ConstListInt` data-segment entry. Each unique
+/// `ConstListInt { idx, elements }` materialises into one active
+/// data segment whose absolute address `lower_ir_module` emits at
+/// the matching `Op::ConstListInt` site (as `i32.const <abs_offset>`).
+///
+/// Record layout (mirrors the LLVM AOT side, see
+/// `relon_ir::ir::Op::ConstListInt` docstring): `[len: u32 LE][pad:
+/// u32 zero][i64 elements...]`, total `8 + 8 * elements.len()` bytes.
+/// Aligned to 8 so the i64 payload sits on an 8-byte boundary.
+#[derive(Debug, Clone)]
+struct ConstListIntEntry {
+    /// IR-side per-module identifier (`Op::ConstListInt { idx }`).
+    /// The walker interns by `idx` so two ops referencing the same
+    /// const-list share one data segment.
+    ir_idx: u32,
+    /// Absolute wasm linear-memory offset the active data segment
+    /// installs the record at. Resolved at body-walk time by bumping
+    /// a per-module cursor by `8 + 8 * len`, padded to 8 alignment.
+    abs_offset: u32,
+    /// The i64 elements — copied so the IR can be dropped without
+    /// invalidating the data-segment payload.
+    elements: Vec<i64>,
+}
+
 /// Walker state — accumulates wasm locals declarations and the
 /// function-body instruction stream as we walk the IR Op vector.
 struct EmitState<'a> {
@@ -668,6 +792,16 @@ struct EmitState<'a> {
     /// `n_params + i`. Indices stored on [`LetLocal`] /
     /// [`RecordLocal`] / `store_field_scratch_i64` mirror this layout.
     aux_locals: Vec<AuxLocal>,
+    /// Z.4.2 — interned `Op::ConstListInt` entries seen during the
+    /// walk. `lower_ir_module` reads this vector to install one
+    /// active data segment per entry; the matching `i32.const
+    /// <abs_offset>` is already in the body's instruction stream.
+    const_list_ints: Vec<ConstListIntEntry>,
+    /// Z.4.2 — running cursor for the data section's next available
+    /// absolute offset. Starts at `CONST_LIST_DATA_BASE` (1024 — past
+    /// wasm-page 0's reserved low region) and advances by each list
+    /// record's padded length. Reset per-module via `EmitState::new`.
+    const_list_cursor: u32,
     /// Instructions captured by walking the body. Encoded into a
     /// `wasm_encoder::Function` in `finalise`.
     insns: Vec<wasm_encoder::Instruction<'static>>,
@@ -694,6 +828,8 @@ impl<'a> EmitState<'a> {
             record_locals: Vec::new(),
             store_field_scratch_i64: None,
             aux_locals: Vec::new(),
+            const_list_ints: Vec::new(),
+            const_list_cursor: CONST_LIST_DATA_BASE,
             insns: Vec::new(),
             saw_return_prep: false,
             needs_arena_alloc: false,
@@ -766,10 +902,10 @@ impl<'a> EmitState<'a> {
 
             // ----- Return store: leave value on stack as fn result --
             Op::StoreField { offset, ty } => {
-                // `StoreField` is the scalar-Int return path's
-                // sentinel: the IR's trailing
+                // `StoreField` is the scalar-Int / List<Int>-return
+                // path's sentinel: the IR's trailing
                 // `Op::StoreField { offset: Ret.value }` corresponds
-                // to "this i64 is the function's return value".
+                // to "this value is the function's return value".
                 // The Dict-return shape never emits `StoreField` —
                 // it emits `StoreFieldAtRecord` against the
                 // record-base local instead. A `StoreField` reaching
@@ -802,6 +938,26 @@ impl<'a> EmitState<'a> {
                             "store_field_in_dict_return",
                             UnsupportedOpReason::BufferProtocolRecord,
                         ));
+                    }
+                    ReturnShape::ListIntPtr { offset: ret_offset } => {
+                        // Z.4.2 — `List<Int>` return. The body's
+                        // trailing `StoreField { offset: ret.value,
+                        // ty: ListInt }` leaves the i32 list-record
+                        // pointer on the operand stack; the matching
+                        // `Op::Return` zero-extends it to i64 below.
+                        if *offset != *ret_offset {
+                            return Err(LowerError::UnsupportedOp(
+                                "store_field_non_return",
+                                UnsupportedOpReason::BufferProtocolRecord,
+                            ));
+                        }
+                        if *ty != IrType::ListInt {
+                            return Err(LowerError::UnsupportedOp(
+                                "store_field_list_ret_non_int_elem",
+                                UnsupportedOpReason::ListLiteral,
+                            ));
+                        }
+                        self.saw_return_prep = true;
                     }
                 }
             }
@@ -924,6 +1080,14 @@ impl<'a> EmitState<'a> {
                     self.insns.push(I::LocalGet(root_local));
                     self.insns.push(I::I64ExtendI32U);
                 }
+                ReturnShape::ListIntPtr { .. } => {
+                    // Z.4.2 — `List<Int>` return. The body's trailing
+                    // `StoreField { offset, ty: ListInt }` already
+                    // left the i32 list-record pointer on the operand
+                    // stack; widen to i64 so the typed-func's i64
+                    // result carries the zero-extended pointer.
+                    self.insns.push(I::I64ExtendI32U);
+                }
             },
 
             // ----- Z.4.1 — Dict root record allocation ---------------
@@ -934,13 +1098,13 @@ impl<'a> EmitState<'a> {
                         root_align,
                         ..
                     } => (*root_size, *root_align),
-                    ReturnShape::ScalarValue { .. } => {
-                        // `AllocRootRecord` reaching a scalar-return
+                    ReturnShape::ScalarValue { .. } | ReturnShape::ListIntPtr { .. } => {
+                        // `AllocRootRecord` reaching a non-Dict-return
                         // body means the IR pipeline emitted Dict-
                         // construction ops against a non-Dict return
                         // shape — that's a contract violation.
                         return Err(LowerError::UnsupportedOp(
-                            "alloc_root_record_in_scalar_return",
+                            "alloc_root_record_in_non_dict_return",
                             UnsupportedOpReason::DictReturn,
                         ));
                     }
@@ -1026,9 +1190,37 @@ impl<'a> EmitState<'a> {
                 ));
             }
 
-            // ----- Scope-cut: List construction / iter ---------------
-            Op::ConstListInt { .. }
-            | Op::ConstListFloat { .. }
+            // ----- Z.4.2 — `List<Int>` literal materialization -------
+            //
+            // Intern the (idx, elements) pair into the walker's data-
+            // segment table; emit `i32.const <abs_offset>` so the
+            // body pushes the list-record's absolute wasm linear-
+            // memory address. `lower_ir_module` installs the matching
+            // active data segment (record layout `[len: u32 LE][pad:
+            // u32 zero][i64 elements...]`) at the resolved offset.
+            //
+            // Honesty (design §7): the data-section blob is byte-
+            // identical to what the LLVM AOT side produces for the
+            // same literal (see `relon_ir::ir::Op::ConstListInt`
+            // docstring) — no closed-form rewrites, no const-fold-
+            // through-stdlib hacks. The pointer is the value the
+            // body pushes; downstream consumption (Call into stdlib
+            // `length`, `list.sum`, …) still scope-cuts pending the
+            // string/stdlib follow-up batch.
+            Op::ConstListInt { idx, elements } => {
+                let abs_offset = self.intern_const_list_int(*idx, elements);
+                self.insns.push(I::I32Const(abs_offset as i32));
+            }
+
+            // ----- Scope-cut: other list shapes / iter ---------------
+            //
+            // Float / Bool / String list literals each need their own
+            // data-segment encoding (f64 / packed u8 / nested-record);
+            // `LoadList*Ptr` is the buffer-protocol param-load path the
+            // typed-func ABI sidesteps; `ListGetByIntIdx` is the
+            // trace-recorder hot-path op that the standard IR lowering
+            // doesn't emit yet. All routed to the Z.4.2 follow-up bucket.
+            Op::ConstListFloat { .. }
             | Op::ConstListBool { .. }
             | Op::ConstListString { .. }
             | Op::LoadListIntPtr { .. }
@@ -1154,6 +1346,34 @@ impl<'a> EmitState<'a> {
         let idx = self.alloc_aux(AuxLocal::ScratchI64);
         self.store_field_scratch_i64 = Some(idx);
         idx
+    }
+
+    /// Z.4.2 — intern an `Op::ConstListInt { idx, elements }` into the
+    /// walker's data-segment table. Returns the resolved absolute
+    /// offset (the value the walker emits as `i32.const <abs_offset>`
+    /// at the matching op site).
+    ///
+    /// Layout: `[len: u32 LE][pad: u32 zero][i64 elements...]`. The
+    /// record occupies `8 + 8 * elements.len()` bytes and the next
+    /// cursor advances by that amount, rounded up to 8 so any
+    /// subsequent list record's i64 payload stays 8-aligned (the
+    /// `i64.load` the host decode uses doesn't care, but keeping the
+    /// invariant matches what the LLVM AOT layout pass guarantees).
+    fn intern_const_list_int(&mut self, ir_idx: u32, elements: &[i64]) -> u32 {
+        if let Some(existing) = self.const_list_ints.iter().find(|e| e.ir_idx == ir_idx) {
+            return existing.abs_offset;
+        }
+        let abs_offset = self.const_list_cursor;
+        let record_len = 8u32 + 8u32 * (elements.len() as u32);
+        // Round up to 8-byte alignment for the next record.
+        let next_cursor = (abs_offset + record_len + 7) & !7u32;
+        self.const_list_cursor = next_cursor;
+        self.const_list_ints.push(ConstListIntEntry {
+            ir_idx,
+            abs_offset,
+            elements: elements.to_vec(),
+        });
+        abs_offset
     }
 
     /// Encode the walker's accumulated state into a `wasm_encoder::Function`.
@@ -1325,6 +1545,40 @@ mod tests {
         wasmparser::Validator::new()
             .validate_all(&bytes)
             .expect("wasmparser validates range.reduce walker output");
+    }
+
+    #[test]
+    fn walker_lowers_const_list_int_return() {
+        // Z.4.2 — `#main(...) -> List<Int>\n[1, 2, 3]` lowers to:
+        //
+        //   ConstListInt { idx: 0, elements: [1, 2, 3] }
+        //   StoreField { offset: 0, ty: ListInt }
+        //   Return
+        //
+        // The walker materialises the list record into an active data
+        // segment (layout `[len: u32 LE][pad: u32 zero][i64
+        // elements...]`) at offset `CONST_LIST_DATA_BASE` and emits
+        // `i32.const 1024` for the `ConstListInt` op. The trailing
+        // `Return` zext's the i32 pointer to i64 for the typed-func
+        // result; the host's `WasmEvaluator::run_main` decodes the
+        // list out of linear memory.
+        let lowered = lower_source("#main(Int n) -> List<Int>\n[1, 2, 3]");
+        let bytes = lower_ir_module(&lowered).expect("lower const-list-int return");
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .expect("wasmparser validates const-list-int return walker output");
+        // The emitted module MUST carry exactly one data segment
+        // (the list record); count it via a quick wasmparser walk.
+        let mut data_segments = 0usize;
+        for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
+            if let Ok(wasmparser::Payload::DataSection(reader)) = payload {
+                data_segments += reader.count() as usize;
+            }
+        }
+        assert_eq!(
+            data_segments, 1,
+            "const-list-int return should install exactly one data segment"
+        );
     }
 
     #[test]
