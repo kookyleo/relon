@@ -2050,8 +2050,11 @@ dependencies = [
 name = "relon-codegen-wasm"
 version = "0.1.0"
 dependencies = [
+ "relon-analyzer",
  "relon-eval-api",
+ "relon-evaluator",
  "relon-ir",
+ "relon-parser",
  "thiserror 2.0.18",
  "wasm-encoder 0.244.0",
  "wasmparser 0.244.0",

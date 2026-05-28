@@ -22,3 +22,10 @@ thiserror = { workspace = true }
 # wasm-encoder declares to avoid binary-format drift between encode and
 # parse paths.
 wasmparser = "0.244"
+# Phase Z.4.0: parse + analyze pipeline so the IR walker tests can
+# drive sources end-to-end (parse -> analyze -> lower_workspace_single
+# -> lower_ir_module -> wasm bytes) without hand-building IR
+# fixtures.
+relon-parser = { workspace = true }
+relon-analyzer = { workspace = true }
+relon-evaluator = { workspace = true }

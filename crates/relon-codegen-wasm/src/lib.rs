@@ -37,11 +37,13 @@
 #![deny(missing_docs)]
 
 mod host_abi;
+mod ir_walker;
 mod programs;
 
 use thiserror::Error;
 
 pub use host_abi::{HostImport, HOST_IMPORTS};
+pub use ir_walker::{lower_ir_module, UnsupportedOpReason};
 pub use programs::{const_segment_end, WasmProgram};
 
 /// Lowering error surface. Each variant carries enough context for the
@@ -62,6 +64,15 @@ pub enum LowerError {
     /// emitter, not a user-facing failure mode.
     #[error("emit produced invalid module: {0}")]
     Invalid(String),
+
+    /// Phase Z.4.0 — the IR walker met an op outside its envelope.
+    /// First field is the op's debug tag; the [`UnsupportedOpReason`]
+    /// groups the scope-cut by follow-up sub-phase (Z.4.1 Dict,
+    /// Z.4.2 List, Z.4.3 Closure, etc.). The host's tracing layer
+    /// uses the reason to log the row's follow-up phase without
+    /// grepping individual op names.
+    #[error("phase Z.4 unsupported op: {0} ({1:?})")]
+    UnsupportedOp(&'static str, UnsupportedOpReason),
 }
 
 /// Emit a complete WASM module for the supplied program.
