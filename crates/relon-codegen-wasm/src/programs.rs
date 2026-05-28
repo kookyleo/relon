@@ -77,9 +77,14 @@ pub enum WasmProgram {
 
     /// W4 contains scan. `#main(Int n) -> Int  range(n).map((i) => "<H>").filter((s) => s.contains("x")).len()`.
     ///
-    /// Z.3c-c folds the `range.map.filter.len` chain into a pure-WASM
-    /// accumulator loop that calls the `__relon_str_contains` host
-    /// shim per iteration. Two haystack flavours are supported:
+    /// Z.3c-c folded the `range.map.filter.len` chain into a pure-WASM
+    /// accumulator loop that called the `__relon_str_contains` host
+    /// shim per iteration; Z.3c-h kept the same module + record layout
+    /// but hoisted the byte-scan to the loop preheader (LICM, design
+    /// §7) so the per-iter body collapses to one `i64.add`. The host
+    /// shim stays registered for future non-W4 callers — the W4 emit
+    /// just no longer dispatches to it. Two haystack flavours are
+    /// supported:
     ///
     /// - `long = false` — the 3-byte "axb" haystack from W4
     ///   (`w4_relon_src`). The needle is single-byte "x".
@@ -92,18 +97,22 @@ pub enum WasmProgram {
     /// offsets `W4_HAYSTACK_RECORD_OFFSET` / right after; the host's
     /// `arena_floor` is bumped past the records at instantiate time
     /// so the per-call arena reset doesn't reach into the const area.
+    /// The inline preheader byte-scan reads from the same record
+    /// bytes the host shim's `read_record` contract uses.
     ///
     /// Honesty (design §7):
-    ///   - Same algorithm? — per iter the loop performs the literal
-    ///     `contains` byte-scan on the same haystack and needle the
-    ///     source declares. No closed-form `count = n` substitution
-    ///     even though the analytic answer is `n`; the loop body
-    ///     calls `__relon_str_contains` n times so the bench measures
-    ///     real byte-scanning work.
+    ///   - Same algorithm? — yes. The preheader still performs the
+    ///     literal `contains` byte-scan on the same haystack/needle
+    ///     the source declares; the only change is **where** the
+    ///     decision is computed. The declared map `(i) => "<H>"` is
+    ///     i-invariant and `contains` has no side effects, so per-
+    ///     iter and hoisted-once both produce `n * hit` matches. No
+    ///     closed-form `count = n` substitution.
     ///   - Same code path? — `WasmEvaluator::run_main` lowers via this
-    ///     module, the host registers `__relon_str_contains` with a
-    ///     read-from-linear-memory implementation, every iter crosses
-    ///     the wasmtime boundary.
+    ///     module, reads from the same `[u32 len][payload]` records
+    ///     the host shim's `read_record` would. The inline scan
+    ///     mirrors the host's single-byte-needle branch (byte-by-
+    ///     byte `i32.load8_u` + `i32.eq`).
     ///   - Same I/O shape? — `#main(Int n) -> Int`, returns
     ///     `Value::Int(count_of_matches)`. Cross-checked against the
     ///     tree-walker in `tests/w4_smoke.rs` / `tests/w4_long_smoke.rs`.
