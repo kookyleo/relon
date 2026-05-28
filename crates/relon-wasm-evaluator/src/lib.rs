@@ -17,7 +17,10 @@ pub use host_state::HostState;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use relon_eval_api::layout::{OffsetTable, SchemaLayout};
+use relon_eval_api::schema_canonical::{Schema, TypeRepr};
 use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
+use relon_ir::{MAIN_RETURN_SCHEMA_NAME, RETURN_VALUE_FIELD_NAME};
 use relon_parser::Node;
 use relon_parser::TokenRange;
 use wasmtime::{Config, Engine, Instance, Linker, Module, Store, TypedFunc};
@@ -91,10 +94,35 @@ enum ProgramSource {
     /// Classifier matched a known cmp_lua workload — the runtime uses
     /// the variant's per-program packing / unpacking rules.
     Classifier(WasmProgram),
-    /// Phase Z.4.0: IR walker emitted the module. The return shape is
-    /// pinned to scalar `i64` (the walker scope-cuts on anything
-    /// else), so `run_main` always wraps the result as `Value::Int`.
-    IrWalker,
+    /// Phase Z.4.0+ — IR walker emitted the module. The
+    /// [`IrWalkerReturn`] discriminator picks the per-call return-
+    /// unpack discipline (scalar Int wrap for Z.4.0; Dict-record
+    /// decode for Z.4.1).
+    IrWalker(IrWalkerReturn),
+}
+
+/// Z.4.0+ — Return-shape provenance for the IR-walker path. The
+/// walker's typed-func signature stays `(i64) -> i64` across both
+/// variants; the i64's *meaning* differs.
+#[derive(Debug, Clone)]
+enum IrWalkerReturn {
+    /// Z.4.0 — the i64 is a scalar Int value; `run_main` wraps it as
+    /// `Value::Int(out)`.
+    ScalarInt,
+    /// Z.4.1 — the i64 is a zero-extended i32 arena pointer to a
+    /// record laid out per `schema` / `layout`. `run_main` walks the
+    /// schema to decode each field out of linear memory into a
+    /// `Value::Dict`.
+    DictRecord {
+        /// Synthesised return schema. Owned so the runtime stays
+        /// thread-safe without re-borrowing the original lowering
+        /// output.
+        schema: Schema,
+        /// Per-field offset table for `schema`. Re-derived from the
+        /// schema once at instantiate time so the per-call decode
+        /// avoids the `SchemaLayout::offsets_for` re-walk.
+        layout: OffsetTable,
+    },
 }
 
 /// Bundled wasmtime objects returned from
@@ -281,7 +309,7 @@ impl WasmEvaluator {
             wasm: Some(WasmRuntime {
                 store: Mutex::new(outcome.store),
                 instance: outcome.instance,
-                program: ProgramSource::IrWalker,
+                program: ProgramSource::IrWalker(walker.return_shape),
                 main_typed: outcome.main_typed,
                 arg_name: walker.arg_name,
             }),
@@ -415,11 +443,18 @@ fn program_returns_scalar_int(program: &ProgramSource) -> bool {
             | WasmProgram::W9NestedMatrix
             | WasmProgram::W10ConfigEval => false,
         },
-        // Phase Z.4.0: the IR walker only emits modules with a
-        // scalar-Int return (it scope-cuts on Dict / List / String /
-        // closure return shapes before instantiation), so the fast-
-        // path is always semantically meaningful here.
-        ProgramSource::IrWalker => true,
+        // Phase Z.4.0 — scalar-Int return: the i64 IS the user's
+        // `Value::Int` directly, so the fast-path entry is
+        // semantically meaningful.
+        // Phase Z.4.1 — Dict-record return: the i64 is an arena
+        // pointer the host needs to walk into a `Value::Dict`; the
+        // fast-path entry would hand back the raw pointer (a
+        // meaningless arena offset under the `wasmtime_fast` label),
+        // so it's NOT semantically meaningful and must surface as
+        // `false`. Matches the LLVM-side discipline (`has_fast_path`
+        // is `false` for non-canonical-Ret-wrapper returns).
+        ProgramSource::IrWalker(IrWalkerReturn::ScalarInt) => true,
+        ProgramSource::IrWalker(IrWalkerReturn::DictRecord { .. }) => false,
     }
 }
 
@@ -515,6 +550,23 @@ impl Evaluator for WasmEvaluator {
                     .to_string();
                 Ok(Value::String(s.into()))
             }
+            // Phase Z.4.1 — Dict-record return. The i64 carries the
+            // i32 arena pointer the walker emitted at the matching
+            // `AllocRootRecord`; walk the schema layout to materialise
+            // each field into the resulting `Value::Dict`. The arena
+            // slice stays valid until the next `HostState::reset`, so
+            // we read out every field before releasing the store
+            // mutex.
+            ProgramSource::IrWalker(IrWalkerReturn::DictRecord { schema, layout }) => {
+                let record_base = (out as u64) as u32;
+                let memory = rt
+                    .instance
+                    .get_memory(&mut *store, "memory")
+                    .ok_or_else(|| io_err("wasm-eval: instance missing `memory` export"))?;
+                let view = memory.data(&*store);
+                let dict = decode_dict_record(record_base, schema, layout, view)?;
+                Ok(dict)
+            }
             _ => Ok(Value::Int(out)),
         }
     }
@@ -557,21 +609,62 @@ fn try_lower_ir_walker(node: &Node) -> Result<WalkerOutcome, IrWalkerSkipReason>
         ));
     }
     let arg_name = main_params[0].name.clone();
+    // Classify the return shape from the lowering output so the host
+    // knows how to unpack the typed-func's i64 result. The walker
+    // applies the same classification rule (canonical
+    // `Ret { value: Int }` → ScalarInt; everything else → DictRecord)
+    // and refuses sources whose shape it can't lower; we mirror the
+    // classification here so a successful `lower_ir_module` always
+    // pairs with a matching [`IrWalkerReturn`] variant.
+    let return_shape = classify_walker_return_shape(&lowered.return_schema)
+        .map_err(|tag| IrWalkerSkipReason::WalkerScopeCut(tag, "Z.4.1-dict-return"))?;
     let bytes = lower_ir_module(&lowered).map_err(|e| match e {
         relon_codegen_wasm::LowerError::UnsupportedOp(tag, reason) => {
             IrWalkerSkipReason::WalkerScopeCut(tag, reason.tag())
         }
         other => IrWalkerSkipReason::IrLoweringFailed(other.to_string()),
     })?;
-    Ok(WalkerOutcome { bytes, arg_name })
+    Ok(WalkerOutcome {
+        bytes,
+        arg_name,
+        return_shape,
+    })
+}
+
+/// Walker-side return-shape classifier — mirrors the codegen
+/// `classify_return_shape` rule (scalar `Ret { value: Int }` →
+/// `ScalarInt`; everything else → `DictRecord`). Re-derives the
+/// per-field offset table so the host-side decode skips the
+/// per-call layout re-walk.
+fn classify_walker_return_shape(schema: &Schema) -> Result<IrWalkerReturn, &'static str> {
+    if schema.name != MAIN_RETURN_SCHEMA_NAME {
+        return Err("ret_schema_unexpected_name");
+    }
+    let is_canonical_wrapper = schema.fields.len() == 1
+        && schema.fields[0].name == RETURN_VALUE_FIELD_NAME
+        && matches!(schema.fields[0].ty, TypeRepr::Int);
+    if is_canonical_wrapper {
+        return Ok(IrWalkerReturn::ScalarInt);
+    }
+    // Re-derive the layout — `SchemaLayout::offsets_for` walks the
+    // same canonical-form rules the codegen side uses. Failures are
+    // unexpected (the codegen would have already errored) but we
+    // route them through the scope-cut path for symmetry.
+    let layout = SchemaLayout::offsets_for(schema).map_err(|_| "ret_layout_unsupported")?;
+    Ok(IrWalkerReturn::DictRecord {
+        schema: schema.clone(),
+        layout,
+    })
 }
 
 /// Output of a successful IR-walker emit. Carries the wasm bytes plus
-/// the resolved arg name so the host can pack `#main`'s named arg
+/// the resolved arg name + return-shape classification so the host
+/// can pack `#main`'s named arg and unpack the typed-func result
 /// uniformly with the classifier path.
 struct WalkerOutcome {
     bytes: Vec<u8>,
     arg_name: String,
+    return_shape: IrWalkerReturn,
 }
 
 /// Reason the IR-walker path skipped a source. Distinguishes upstream
@@ -586,6 +679,85 @@ enum IrWalkerSkipReason {
     /// is the op's debug name; the second is the
     /// `UnsupportedOpReason::tag()` follow-up-phase grouping.
     WalkerScopeCut(&'static str, &'static str),
+}
+
+/// Z.4.1 — decode a Dict-shape return record. The walker stored each
+/// scalar field via `i64.store` at `record_base + offset`; the host
+/// walks the schema layout in declaration order and reads each field
+/// back out of linear memory. Closure-typed fields stay scope-cut at
+/// codegen time (Z.4.3), so this decode only handles the scalar
+/// surface (`Int`, `Bool` — String / Float / nested-schema fields
+/// would each need their own decode arm + matching `StoreFieldAtRecord`
+/// support in the walker).
+///
+/// Mirrors the LLVM-side `read_record_into_map` /
+/// `read_value_from_reader` contract: each field's `name` keys into
+/// the resulting `Value::branded_dict` map; the schema name passes
+/// through as the brand.
+fn decode_dict_record(
+    record_base: u32,
+    schema: &Schema,
+    layout: &OffsetTable,
+    view: &[u8],
+) -> Result<Value, RuntimeError> {
+    let mut map: HashMap<String, Value> = HashMap::with_capacity(schema.fields.len());
+    for (i, field) in schema.fields.iter().enumerate() {
+        let layout_field = layout.fields.get(i).ok_or_else(|| {
+            io_err(format!(
+                "wasm-eval Dict decode: layout missing field {} (schema/layout desync)",
+                field.name
+            ))
+        })?;
+        let abs_off = record_base as usize + layout_field.offset;
+        let value = match &field.ty {
+            TypeRepr::Int => {
+                let end = abs_off.checked_add(8).ok_or_else(|| {
+                    io_err(format!(
+                        "wasm-eval Dict decode: Int offset overflow at field `{}`",
+                        field.name
+                    ))
+                })?;
+                if end > view.len() {
+                    return Err(io_err(format!(
+                        "wasm-eval Dict decode: field `{}` Int read out of memory \
+                         (off={abs_off}, mem={})",
+                        field.name,
+                        view.len()
+                    )));
+                }
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&view[abs_off..end]);
+                Value::Int(i64::from_le_bytes(bytes))
+            }
+            other => {
+                // Codegen's `classify_return_shape` should have
+                // refused non-Int Dict-return fields before we
+                // reach here; surface a defensive `Unsupported`
+                // for safety.
+                return Err(RuntimeError::Unsupported {
+                    reason: format!(
+                        "wasm-eval Dict decode: field `{}` type {other:?} \
+                         not supported (Z.4.1 — Int-only)",
+                        field.name
+                    ),
+                });
+            }
+        };
+        map.insert(field.name.clone(), value);
+    }
+    // The anon-Dict-return path's synthesised schema reuses the
+    // canonical `Ret` schema name, but the user surface is bare
+    // `Dict { ... }` — the tree-walker reference produces an
+    // unbranded dict, so we mirror that here. (Branded user-defined
+    // dict returns — `#main(...) -> User { ... }` — re-use the
+    // user's schema name and stay branded; that path needs its own
+    // arm once Z.4.1+ extends the walker to user-Schema returns.)
+    let brand = if schema.name == MAIN_RETURN_SCHEMA_NAME {
+        None
+    } else {
+        Some(schema.name.clone())
+    };
+    Ok(Value::branded_dict(map, brand))
 }
 
 fn extract_named_int(args: &HashMap<String, Value>, name: &str) -> Result<i64, RuntimeError> {
