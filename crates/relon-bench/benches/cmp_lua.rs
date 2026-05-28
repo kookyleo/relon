@@ -306,6 +306,44 @@ fn trace_jit_production_label_eligible(label: &str) -> bool {
     matches!(label, "W1_int_sum" | "W2_f64_dot")
 }
 
+/// Honesty cleanup (2026-05-28, audit #318): label gate for rows whose
+/// only currently-available driver is an algebraically-collapsed
+/// variant that skips the production source's load-bearing work. The
+/// production source carries one of:
+///
+/// * **W5_dict_str_key** — `d[keys[i % 10]]` (string-array index →
+///   string hash → dict probe). The bytecode / LLVM AOT / rust_native
+///   variants all run the collapsed kernel `(i % 10) + 1`; the wasm
+///   variant runs a 10-entry i64-table load. None of them re-create
+///   the string-hash + dict-probe cost the LuaJIT row pays.
+/// * **W8_poly_callsite** — `dispatch(i % 4)` via a first-class
+///   `#internal` closure. The bytecode / LLVM AOT / rust_native
+///   variants collapse to `(i % 4) + 1`; the wasm variant retains the
+///   `?:` ladder (lowered as `br_table`) so it stays.
+/// * **W9_nested_matrix** — `range(n).map(...).reduce(...)` over a
+///   materialised `rows` list. The bytecode / wasm / LLVM AOT /
+///   rust_native variants all inline `rows[i][j]` as `i * n + j` and
+///   skip the list materialisation entirely.
+/// * **W10_config_eval** — `range(n).map(allow)` where `allow` is a
+///   first-class `#internal` closure. Bytecode / wasm / LLVM AOT /
+///   rust_native inline the closure body into the `.map(...)`
+///   literal, dodging the closure-dispatch cost.
+///
+/// For these labels the bench keeps the production-source rows
+/// (`relon_tree_walk`, `luajit`, and the canonical-panel `relon_jit`
+/// which dispatches `JitEvaluator::run_main` through the
+/// best-available tier on the **production** source). The deleted
+/// rows return once the IR pipeline (Z.4.4) widens the bytecode /
+/// wasm / LLVM AOT codegens to accept the production-source surface
+/// (`#internal` dicts / first-class closures / materialised list
+/// literals / bare-`Dict` returns).
+fn paper_win_collapsed_variant_label(label: &str) -> bool {
+    matches!(
+        label,
+        "W5_dict_str_key" | "W8_poly_callsite" | "W9_nested_matrix" | "W10_config_eval"
+    )
+}
+
 // Honesty cleanup #309 (2026-05-28): the previous
 // `try_build_jit_with_fixture` helper lived here. It installed a
 // `relon::TraceFixture` pre-built from `wN_recorder_body()` plus a
@@ -1089,6 +1127,15 @@ fn w5_relon_src() -> &'static str {
 /// dict maps "a".."j" to 1..10 in declaration order and `keys[i % 10]`
 /// picks the i%10-th letter, the per-iteration value collapses to
 /// `(i % 10) + 1` — preserving the arithmetic the bench measures.
+///
+/// Honesty cleanup (2026-05-28, audit #318): no callers remain — the
+/// W5 `relon_bytecode` / `relon_wasm_wasmtime` / `relon_wasm_wasmtime_fast`
+/// rows that used to feed this variant into the bench were deleted
+/// because the algebraic collapse skips the production source's
+/// string-hash + dict-probe work. Retained as documentation of the
+/// variant shape the Z.4.4 IR pipeline must subsume before the bench
+/// rows are reintroduced.
+#[allow(dead_code)]
 fn w5_relon_src_bytecode() -> &'static str {
     "#import list from \"std/list\"\n\
      #main(Int n) -> Int\n\
@@ -1254,6 +1301,14 @@ fn w8_relon_src() -> &'static str {
 /// `tag + 1`, so the inline form `(i % 4) + 1` produces the same per-
 /// iteration value while staying inside the IR-lowering envelope (no
 /// first-class closure value, no bare `Dict` return).
+///
+/// Honesty cleanup (2026-05-28, audit #318): no callers remain — the
+/// W8 `relon_bytecode` row that used to feed this variant was deleted
+/// because the algebraic collapse skips the production source's
+/// closure-call indirection. Retained as documentation of the
+/// variant shape the IR pipeline must subsume before the bench row
+/// is reintroduced.
+#[allow(dead_code)]
 fn w8_relon_src_bytecode() -> &'static str {
     "#import list from \"std/list\"\n\
      #main(Int n) -> Int\n\
@@ -1276,6 +1331,13 @@ fn w8_relon_src_bytecode() -> &'static str {
 /// every iter. The Z.3c-e WASM lowering picks `br_table` for the
 /// dispatch (constant-time 4-way jump on the runtime tag operand);
 /// other backends are free to lower the chain however they like.
+///
+/// Honesty cleanup (2026-05-28, audit #318): no callers remain — the
+/// W8 `relon_wasm_wasmtime` row that used to feed this variant was
+/// deleted because the inlined `?:` ladder still skips the production
+/// source's first-class closure-call indirection (preserving the
+/// 4-arm decision is necessary but not sufficient).
+#[allow(dead_code)]
 fn w8_relon_src_bytecode_dispatch() -> &'static str {
     "#import list from \"std/list\"\n\
      #main(Int n) -> Int\n\
@@ -1347,6 +1409,15 @@ fn w9_relon_src() -> &'static str {
 /// today. The transformation inlines `rows[i][j]` as `i * n + j`, which
 /// is the same analytic value the list slot would carry — preserving
 /// the nested-reduce arithmetic that the bench is actually measuring.
+///
+/// Honesty cleanup (2026-05-28, audit #318): no callers remain — the
+/// W9 `relon_bytecode` / `relon_wasm_wasmtime` /
+/// `relon_wasm_wasmtime_fast` rows that used to feed this variant
+/// were deleted because the inlined arithmetic skips the production
+/// source's `rows` list materialisation + double table lookup per
+/// iter. Retained as documentation of the variant shape the IR
+/// pipeline must subsume before the bench rows are reintroduced.
+#[allow(dead_code)]
 fn w9_relon_src_bytecode() -> &'static str {
     "#main(Int n) -> Int\n\
      range(n).reduce(0, (acc, j) =>\n\
@@ -1427,6 +1498,15 @@ fn w10_relon_src() -> &'static str {
 /// variant inlines `allow`'s body into the `.map(...)` closure literal,
 /// which matches the `range_pipeline` peephole shape, and unwraps the
 /// dict-body's `result` field to a scalar `Int` return.
+///
+/// Honesty cleanup (2026-05-28, audit #318): no callers remain — the
+/// W10 `relon_bytecode` / `relon_wasm_wasmtime` /
+/// `relon_wasm_wasmtime_fast` rows that used to feed this variant
+/// were deleted because the inlined predicate skips the production
+/// source's first-class closure-call indirection. Retained as
+/// documentation of the variant shape the IR pipeline must subsume
+/// before the bench rows are reintroduced.
+#[allow(dead_code)]
 fn w10_relon_src_bytecode() -> &'static str {
     "#import list from \"std/list\"\n\
      #main(Int n) -> Int\n\
@@ -2811,109 +2891,30 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
-        // Open follow-up #264-cont: bytecode row uses the inline-rewritten
-        // W5 variant — the dict lookup `d[keys[i % 10]]` on the
-        // declaration-ordered `a..j -> 1..10` dict collapses analytically
-        // to `(i % 10) + 1`. Keeps every per-iteration value identical to
-        // the production source while staying inside the IR-lowering
-        // envelope (no dict / list literals, no bare `Dict` return).
-        if let Some(ev) = try_build_bytecode(w5_relon_src_bytecode(), "W5") {
-            let v = ev
-                .run_main(args_w_n(TREE_WALK_N as i64))
-                .expect("W5 bytecode run_main");
-            let got = match v {
-                Value::Int(n) => n,
-                other => panic!("W5 bytecode result not Int: {other:?}"),
-            };
-            assert_eq!(
-                got,
-                w5_expected(),
-                "W5 bytecode result must match analytic dict-lookup sum"
-            );
-            group.bench_function(BenchmarkId::new("W5_dict_strkey", "relon_bytecode"), |b| {
-                b.iter_custom(|iters| {
-                    let n_in = black_box(TREE_WALK_N as i64);
-                    timed_with_warmup(iters, || {
-                        let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
-                        black_box(v);
-                    })
-                });
-            });
-        }
-
-        // Phase Z.3c-f (2026-05-28): relon_wasm_wasmtime row for W5.
-        // Drives the bytecode-shape inline variant
-        // (`w5_relon_src_bytecode()`) through `WasmEvaluator::run_main`,
-        // which lowers via `relon-codegen-wasm` into a pure-WASM
-        // accumulator loop whose per-iter body reads `[1, 2, ..., 10]
-        // [i % 10]` from a 10-entry i64 dispatch table in linear
-        // memory. The classifier routes the **production** `w5_relon_src()`
-        // (`#main -> Dict` with `#internal d: {...}` + `keys: [...]` +
-        // `d[keys[i % 10]]`) to the tree-walker fallback — Z.4 follow-up
-        // promotes the production-source path; until then this row
-        // honestly measures the inline variant (same observable I/O,
-        // simplified byte-keyed table lookup in place of string-hashed
-        // dict probe).
+        // Honesty cleanup (2026-05-28, audit #318): the W5
+        // `relon_bytecode` / `relon_wasm_wasmtime` / `relon_wasm_wasmtime_fast`
+        // rows were deleted. The production W5 source is
+        //     d[keys[i % 10]]
+        // (string-array index → string-hash → dict probe per iter); the
+        // bytecode envelope rejects dict + list literals + bare-`Dict`
+        // returns, and the wasm lowering does not yet implement string
+        // hashing / dict lookup, so all three rows ran an algebraically
+        // collapsed variant (`(i % 10) + 1` or a 10-entry i64-table
+        // load) that skips the string-hash + dict-probe work the
+        // production source mandates. Per `/perf` Honesty Rules,
+        // "same algorithm" is the first question and a `relon_bytecode`
+        // / `relon_wasm_wasmtime` label measuring scalar arith against
+        // a LuaJIT row that walks the dict was a paper-win.
         //
-        // Why the i64-table emit instead of `(i % 10) + 1` closed form:
-        // the bytecode-shape source already collapsed the dict lookup
-        // to scalar arith, and the LLVM AOT row (`W5_LLVM_SRC`) takes
-        // that path. Copying the closed form here too would book the
-        // dict-lookup cost as `i64.rem_s` + `i64.add` per iter —
-        // paper-win anti-pattern per design §7. The table-load emit
-        // keeps a real per-iter linear-memory dependency that models
-        // what the production dict lookup would do; the wasm row will
-        // therefore measure as a paper-LOSS relative to the bytecode /
-        // LLVM closed-form rows, which is the honest direction.
-        if let Some(wasm) = try_build_wasm_compiled(
-            w5_relon_src_bytecode(),
-            "W5",
-            w5_expected(),
-            args_w_n(TREE_WALK_N as i64),
-        ) {
-            use relon_eval_api::Evaluator as _;
-            group.bench_function(
-                BenchmarkId::new("W5_dict_str_key", "relon_wasm_wasmtime"),
-                |b| {
-                    b.iter_custom(|iters| {
-                        let n_in = black_box(TREE_WALK_N as i64);
-                        timed_with_warmup(iters, || {
-                            let v = wasm.run_main(args_w_n(black_box(n_in))).unwrap();
-                            black_box(v);
-                        })
-                    });
-                },
-            );
-
-            // Fast row — mirrors W1/W2/W8/W9/W10 patterns. Bypasses
-            // the HashMap<String, Value> pack + Value::Int wrap. Cross-
-            // checked against the buffer path before the timed loop.
-            if wasm.has_fast_path() {
-                let fast_out = wasm
-                    .run_main_legacy_i64_fast(&[TREE_WALK_N as i64])
-                    .expect("W5 wasm fast path consistency");
-                let slow_out = match wasm.run_main(args_w_n(TREE_WALK_N as i64)).unwrap() {
-                    Value::Int(n) => n,
-                    other => panic!("W5 wasm fast cross-check: slow path returned {other:?}"),
-                };
-                assert_eq!(
-                    fast_out, slow_out,
-                    "W5 fast/buffer disagree: fast={fast_out} buffer={slow_out}"
-                );
-                group.bench_function(
-                    BenchmarkId::new("W5_dict_str_key", "relon_wasm_wasmtime_fast"),
-                    |b| {
-                        b.iter_custom(|iters| {
-                            let n_in = black_box(TREE_WALK_N as i64);
-                            timed_with_warmup(iters, || {
-                                let v = wasm.run_main_legacy_i64_fast(&[black_box(n_in)]).unwrap();
-                                black_box(v);
-                            })
-                        });
-                    },
-                );
-            }
-        }
+        // The bench keeps the production-source `relon_tree_walk` +
+        // `luajit` rows here, and the canonical-panel `relon_jit` row
+        // below (which feeds the production source through
+        // `JitEvaluator::run_main` — today that means tree-walker
+        // dispatch, which is honest about the dict-lookup cost). The
+        // deleted rows return once Z.4.4 widens the IR pipeline to
+        // accept the production `#internal d: {...}` + `keys: [...]`
+        // + `d[keys[i % 10]]` surface in the bytecode / wasm
+        // codegens.
     }
 
     // ----- W6 -----
@@ -3179,112 +3180,27 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
-        // Open follow-up #264-cont: bytecode row uses the inline-rewritten
-        // W8 variant — `dispatch(t)` for t in 0..=3 collapses to `t + 1`,
-        // so the production `dispatch(i % 4)` is replaced by `(i % 4) + 1`
-        // inside the `.map(...)` literal. Keeps every per-iteration value
-        // identical to the production source while staying inside the
-        // IR-lowering envelope (no first-class closure, no bare `Dict`).
-        if let Some(ev) = try_build_bytecode(w8_relon_src_bytecode(), "W8") {
-            let v = ev
-                .run_main(args_w_n(TREE_WALK_N as i64))
-                .expect("W8 bytecode run_main");
-            let got = match v {
-                Value::Int(n) => n,
-                other => panic!("W8 bytecode result not Int: {other:?}"),
-            };
-            assert_eq!(
-                got,
-                w8_expected(),
-                "W8 bytecode result must match analytic poly-dispatch sum"
-            );
-            group.bench_function(
-                BenchmarkId::new("W8_poly_callsite", "relon_bytecode"),
-                |b| {
-                    b.iter_custom(|iters| {
-                        let n_in = black_box(TREE_WALK_N as i64);
-                        timed_with_warmup(iters, || {
-                            let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
-                            black_box(v);
-                        })
-                    });
-                },
-            );
-        }
-
-        // Phase Z.3c-e (2026-05-28): relon_wasm_wasmtime row for W8.
-        // Drives the dispatch-preserving inline variant
-        // (`w8_relon_src_bytecode_dispatch()`) through
-        // `WasmEvaluator::run_main`, which lowers via `relon-codegen-
-        // wasm` into a pure-WASM accumulator loop whose per-iter 4-arm
-        // `?:` ladder is emitted as a `br_table` (constant-time jump
-        // on the runtime tag value). The classifier routes the
-        // **production** `w8_relon_src()` (Dict return + `#internal
-        // dispatch` first-class closure called via `dispatch(i % 4)`)
-        // to the tree-walker fallback — `try_build_wasm_compiled`
-        // would then skip the row entirely rather than book a tree-
-        // walker number under the `wasmtime` label. Z.4 follow-up
-        // promotes the production-source path; until then this row
-        // honestly measures the inline-dispatch variant (same 4-arm
-        // dispatch decision per iter, same I/O shape modulo the Dict
-        // wrapper).
+        // Honesty cleanup (2026-05-28, audit #318): the W8
+        // `relon_bytecode` / `relon_wasm_wasmtime` /
+        // `relon_wasm_wasmtime_fast` rows were deleted. The production
+        // W8 source dispatches `dispatch(i % 4)` through a first-class
+        // `#internal` closure; the bytecode envelope rejects
+        // first-class closure values and bare-`Dict` returns, and the
+        // wasm lowering does not yet implement closure-call
+        // indirection. The deleted rows all ran a variant that
+        // inlined the closure body (`(i % 4) + 1` for bytecode +
+        // LLVM AOT, the 4-arm `?:` ladder for wasm) — both skip the
+        // per-iter closure-call indirection the LuaJIT row pays. Per
+        // `/perf` Honesty Rules a row labelled `relon_bytecode` /
+        // `relon_wasm_wasmtime` that measures the inlined body
+        // against a LuaJIT row that walks the closure is a paper-win.
         //
-        // The closed-form `w8_relon_src_bytecode()` variant
-        // (`(i % 4) + 1`) is deliberately NOT used here: feeding it
-        // to the WASM lowering would emit a single `i64.add` per iter
-        // and book the polymorphic-dispatch cost as scalar arith
-        // (paper-win anti-pattern per design §7). The bytecode row
-        // above keeps the closed-form for ABI-uniformity reasons that
-        // don't apply to wasmtime's typed-func surface.
-        if let Some(wasm) = try_build_wasm_compiled(
-            w8_relon_src_bytecode_dispatch(),
-            "W8",
-            w8_expected(),
-            args_w_n(TREE_WALK_N as i64),
-        ) {
-            use relon_eval_api::Evaluator as _;
-            group.bench_function(
-                BenchmarkId::new("W8_poly_callsite", "relon_wasm_wasmtime"),
-                |b| {
-                    b.iter_custom(|iters| {
-                        let n_in = black_box(TREE_WALK_N as i64);
-                        timed_with_warmup(iters, || {
-                            let v = wasm.run_main(args_w_n(black_box(n_in))).unwrap();
-                            black_box(v);
-                        })
-                    });
-                },
-            );
-
-            // Fast row — mirrors W1/W2/W9/W10 patterns. Bypasses the
-            // HashMap<String, Value> pack + Value::Int wrap. Cross-
-            // checked against the buffer path before the timed loop.
-            if wasm.has_fast_path() {
-                let fast_out = wasm
-                    .run_main_legacy_i64_fast(&[TREE_WALK_N as i64])
-                    .expect("W8 wasm fast path consistency");
-                let slow_out = match wasm.run_main(args_w_n(TREE_WALK_N as i64)).unwrap() {
-                    Value::Int(n) => n,
-                    other => panic!("W8 wasm fast cross-check: slow path returned {other:?}"),
-                };
-                assert_eq!(
-                    fast_out, slow_out,
-                    "W8 fast/buffer disagree: fast={fast_out} buffer={slow_out}"
-                );
-                group.bench_function(
-                    BenchmarkId::new("W8_poly_callsite", "relon_wasm_wasmtime_fast"),
-                    |b| {
-                        b.iter_custom(|iters| {
-                            let n_in = black_box(TREE_WALK_N as i64);
-                            timed_with_warmup(iters, || {
-                                let v = wasm.run_main_legacy_i64_fast(&[black_box(n_in)]).unwrap();
-                                black_box(v);
-                            })
-                        });
-                    },
-                );
-            }
-        }
+        // The bench keeps the production-source `relon_tree_walk` +
+        // `luajit` rows here, and the canonical-panel `relon_jit` row
+        // below (which feeds the production source through
+        // `JitEvaluator::run_main`). The deleted rows return once
+        // the IR pipeline widens the bytecode / wasm codegens to
+        // accept first-class closures + bare-`Dict` returns.
     }
 
     // ----- W9 matrix transpose -----
@@ -3323,96 +3239,25 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
-        // Open follow-up #264-cont: bytecode row uses the inline-rewritten
-        // W9 variant (no #internal rows list, `rows[i][j]` collapsed to
-        // `i * n + j`). The arithmetic matches the original analytic
-        // expectation; the dict-bodied production source still bounces
-        // at the analyzer's bare-`Dict`-return ban (see
-        // `crates/relon-bytecode/tests/probe_w_sources.rs`).
-        if let Some(ev) = try_build_bytecode(w9_relon_src_bytecode(), "W9") {
-            let v = ev.run_main(w9_relon_n_arg()).expect("W9 bytecode run_main");
-            let got = match v {
-                Value::Int(n) => n,
-                other => panic!("W9 bytecode result not Int: {other:?}"),
-            };
-            assert_eq!(
-                got,
-                w9_expected(),
-                "W9 bytecode result must match analytic nested-sum"
-            );
-            group.bench_function(
-                BenchmarkId::new("W9_nested_matrix", "relon_bytecode"),
-                |b| {
-                    b.iter_custom(|iters| {
-                        timed_with_warmup(iters, || {
-                            let v = ev.run_main(w9_relon_n_arg()).unwrap();
-                            black_box(v);
-                        })
-                    });
-                },
-            );
-        }
-
-        // Phase Z.3c-d (2026-05-28): relon_wasm_wasmtime row for W9.
-        // Drives the same inline-Int variant the bytecode row uses
-        // (`w9_relon_src_bytecode()`) through `WasmEvaluator::run_main`,
-        // which lowers via `relon-codegen-wasm` into a pure-WASM nested
-        // accumulator loop. The classifier routes the **production**
-        // `w9_relon_src()` (Dict return + `#internal rows` list +
-        // `rows[i][j]` lookup) to the tree-walker fallback —
-        // `try_build_wasm_compiled` then skips the row entirely rather
-        // than book a tree-walker number under the `wasmtime` label.
-        // Z.4 follow-up promotes the production-source path; until then
-        // this row honestly measures the inline variant (same nested
-        // arithmetic, same I/O shape modulo the Dict wrapper).
-        if let Some(wasm) = try_build_wasm_compiled(
-            w9_relon_src_bytecode(),
-            "W9",
-            w9_expected(),
-            w9_relon_n_arg(),
-        ) {
-            use relon_eval_api::Evaluator as _;
-            group.bench_function(
-                BenchmarkId::new("W9_nested_matrix", "relon_wasm_wasmtime"),
-                |b| {
-                    b.iter_custom(|iters| {
-                        timed_with_warmup(iters, || {
-                            let v = wasm.run_main(w9_relon_n_arg()).unwrap();
-                            black_box(v);
-                        })
-                    });
-                },
-            );
-
-            // Fast row — mirrors W1/W2/W10 patterns. Bypasses the
-            // HashMap<String, Value> pack + Value::Int wrap. Cross-
-            // checked against the buffer path before the timed loop.
-            if wasm.has_fast_path() {
-                let fast_out = wasm
-                    .run_main_legacy_i64_fast(&[W9_N])
-                    .expect("W9 wasm fast path consistency");
-                let slow_out = match wasm.run_main(w9_relon_n_arg()).unwrap() {
-                    Value::Int(n) => n,
-                    other => panic!("W9 wasm fast cross-check: slow path returned {other:?}"),
-                };
-                assert_eq!(
-                    fast_out, slow_out,
-                    "W9 fast/buffer disagree: fast={fast_out} buffer={slow_out}"
-                );
-                group.bench_function(
-                    BenchmarkId::new("W9_nested_matrix", "relon_wasm_wasmtime_fast"),
-                    |b| {
-                        b.iter_custom(|iters| {
-                            let n_in = black_box(W9_N);
-                            timed_with_warmup(iters, || {
-                                let v = wasm.run_main_legacy_i64_fast(&[black_box(n_in)]).unwrap();
-                                black_box(v);
-                            })
-                        });
-                    },
-                );
-            }
-        }
+        // Honesty cleanup (2026-05-28, audit #318): the W9
+        // `relon_bytecode` / `relon_wasm_wasmtime` /
+        // `relon_wasm_wasmtime_fast` rows were deleted. The production
+        // W9 source materialises a `#internal rows: range(n).map((i)
+        // => range(n).map((j) => i * n + j))` 2-D list and then sums
+        // `rows[i][j]` across a nested reduce. The bytecode envelope
+        // rejects list literals + bare-`Dict` returns and the wasm
+        // lowering does not yet implement list materialisation, so
+        // all three deleted rows ran the inline variant that skips
+        // the `rows` allocation entirely (`i * n + j` directly).
+        // Per `/perf` Honesty Rules that is a paper-win against the
+        // LuaJIT row, which pays the matrix allocation + double
+        // table-lookup per iter.
+        //
+        // The bench keeps the production-source `relon_tree_walk` +
+        // `luajit` rows here, and the canonical-panel `relon_jit`
+        // row below. The deleted rows return once the IR pipeline
+        // widens the bytecode / wasm codegens to lower list literals
+        // and bare-`Dict` returns.
     }
 
     // ----- W10 config eval -----
@@ -3511,99 +3356,28 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
-        // Open follow-up #264-cont: bytecode row uses the inline-rewritten
-        // W10 variant — `allow`'s closure body is inlined into the
-        // `.map(...)` literal so the `range_pipeline` peephole fires, and
-        // the dict-body's `result` field is unwrapped to a scalar `Int`
-        // return to bypass the bare-`Dict`-return analyzer ban. The
-        // short-circuit `&&` / `||` lowering added by #264-cont keeps the
-        // boolean composition inside the IR envelope without needing
-        // first-class closure values.
-        if let Some(ev) = try_build_bytecode(w10_relon_src_bytecode(), "W10") {
-            let v = ev
-                .run_main(args_w_n(CONFIG_QUERIES_N as i64))
-                .expect("W10 bytecode run_main");
-            let got = match v {
-                Value::Int(n) => n,
-                other => panic!("W10 bytecode result not Int: {other:?}"),
-            };
-            assert_eq!(
-                got,
-                w10_expected(),
-                "W10 bytecode result must match analytic access-control count"
-            );
-            group.bench_function(BenchmarkId::new("W10_config_eval", "relon_bytecode"), |b| {
-                b.iter_custom(|iters| {
-                    let n_in = black_box(CONFIG_QUERIES_N as i64);
-                    timed_with_warmup(iters, || {
-                        let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
-                        black_box(v);
-                    })
-                });
-            });
-        }
-
-        // Phase Z.3c-b (2026-05-28): relon_wasm_wasmtime row for W10.
-        // Drives the same inline-Int variant the bytecode row uses
-        // (`w10_relon_src_bytecode()`) through `WasmEvaluator::run_main`,
-        // which lowers via `relon-codegen-wasm` into a pure-WASM
-        // accumulator loop. The classifier routes the **production**
-        // `w10_relon_src()` (Dict return + `#internal` closure) to the
-        // tree-walker fallback — `try_build_wasm_compiled` would then
-        // skip the row entirely rather than book a tree-walker number
-        // under the `wasmtime` label. Z.4 follow-up promotes the
-        // production-source path; until then this row honestly
-        // measures the inline variant (same arithmetic, same I/O
-        // shape modulo the Dict wrapper).
-        if let Some(wasm) = try_build_wasm_compiled(
-            w10_relon_src_bytecode(),
-            "W10",
-            w10_expected(),
-            args_w_n(CONFIG_QUERIES_N as i64),
-        ) {
-            use relon_eval_api::Evaluator as _;
-            group.bench_function(
-                BenchmarkId::new("W10_config_eval", "relon_wasm_wasmtime"),
-                |b| {
-                    b.iter_custom(|iters| {
-                        let n_in = black_box(CONFIG_QUERIES_N as i64);
-                        timed_with_warmup(iters, || {
-                            let v = wasm.run_main(args_w_n(black_box(n_in))).unwrap();
-                            black_box(v);
-                        })
-                    });
-                },
-            );
-
-            // Fast row — mirrors W1/W2 patterns. Bypasses the
-            // HashMap<String, Value> pack + Value::Int wrap. Cross-
-            // checked against the buffer path before the timed loop.
-            if wasm.has_fast_path() {
-                let fast_out = wasm
-                    .run_main_legacy_i64_fast(&[CONFIG_QUERIES_N as i64])
-                    .expect("W10 wasm fast path consistency");
-                let slow_out = match wasm.run_main(args_w_n(CONFIG_QUERIES_N as i64)).unwrap() {
-                    Value::Int(n) => n,
-                    other => panic!("W10 wasm fast cross-check: slow path returned {other:?}"),
-                };
-                assert_eq!(
-                    fast_out, slow_out,
-                    "W10 fast/buffer disagree: fast={fast_out} buffer={slow_out}"
-                );
-                group.bench_function(
-                    BenchmarkId::new("W10_config_eval", "relon_wasm_wasmtime_fast"),
-                    |b| {
-                        b.iter_custom(|iters| {
-                            let n_in = black_box(CONFIG_QUERIES_N as i64);
-                            timed_with_warmup(iters, || {
-                                let v = wasm.run_main_legacy_i64_fast(&[black_box(n_in)]).unwrap();
-                                black_box(v);
-                            })
-                        });
-                    },
-                );
-            }
-        }
+        // Honesty cleanup (2026-05-28, audit #318): the W10
+        // `relon_bytecode` / `relon_wasm_wasmtime` /
+        // `relon_wasm_wasmtime_fast` rows were deleted. The production
+        // W10 source binds `allow: (i) => ...` as a first-class
+        // `#internal` closure and feeds it to `range(n).map(allow)`;
+        // bytecode + wasm reject first-class closure values and
+        // bare-`Dict` returns, so all three deleted rows ran an
+        // inline variant that copied the closure body into the
+        // `.map(...)` literal. The boolean composition stays
+        // identical, but the closure-dispatch indirection is gone —
+        // a `relon_bytecode` / `relon_wasm_wasmtime` label measuring
+        // the inline body against a LuaJIT row that walks the closure
+        // is a paper-win per `/perf` Honesty Rules.
+        //
+        // The bench keeps the production-source `relon_tree_walk` +
+        // `luajit` rows here, the engineer-facing
+        // `relon_trace_jit_fixture` row above (already
+        // honestly-suffixed; the trace body is an analytic 0/1
+        // multiply kernel), and the canonical-panel `relon_jit` row
+        // below. The deleted rows return once the IR pipeline
+        // widens to first-class closure values + bare-`Dict`
+        // returns.
     }
 
     // ----- W12 p99 tail (1 invoke per iter, large sample) -----
@@ -3870,8 +3644,27 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // `concat` / `contains`, pointer-indirect StoreField, scratch
         // bump allocator). W7 still records `n/a` (recursion path
         // tracked for Phase F).
+        //
+        // Honesty cleanup (2026-05-28, audit #318):
+        // `paper_win_collapsed_variant_label` short-circuits the row
+        // for W5 / W8 / W9 / W10. Those labels' LLVM AOT source
+        // variants (`W5_LLVM_SRC`, `W8_LLVM_SRC`, `W9_LLVM_SRC`,
+        // `W10_LLVM_SRC`) skip the production source's load-bearing
+        // work (dict probe / closure dispatch / list materialisation
+        // / closure inlining) — booking the collapsed scalar kernel
+        // under the `relon_llvm_aot` label against a LuaJIT row that
+        // walks the production source is a paper-win per `/perf`
+        // Honesty Rules. Re-enabled once the LLVM AOT envelope
+        // widens to accept the production-source surface for these
+        // workloads.
         #[cfg(feature = "llvm-aot")]
-        {
+        if paper_win_collapsed_variant_label(label) {
+            eprintln!(
+                "[cmp_lua {label}] relon_llvm_aot row n/a (production source uses dict / \
+                 first-class closure / materialised list literal; the LLVM AOT variant \
+                 would book an algebraically-collapsed kernel — see audit #318)"
+            );
+        } else {
             if let Some(llvm_src) = llvm_aot_source_for(label) {
                 if let Some(ev) = try_build_llvm_aot(llvm_src, label) {
                     use relon_eval_api::Evaluator;
@@ -3989,7 +3782,18 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // Pulls the scalar argument out of the workload's
         // args_factory'd `HashMap` once outside the timed region so
         // the per-iter cost is just the hand-written kernel.
-        {
+        //
+        // Honesty cleanup (2026-05-28, audit #318):
+        // `paper_win_collapsed_variant_label` short-circuits the row
+        // for W5 / W8 / W9 / W10. The `rust_native_w{5,8,9,10}`
+        // kernels all model the algebraically-collapsed variant
+        // (`(i % 10) + 1` for W5, `(i % 4) + 1` for W8, `i * n + j`
+        // for W9, the inlined predicate for W10) rather than the
+        // production source's dict probe / closure dispatch / list
+        // materialisation — booking that under a label that paired
+        // with the LuaJIT-walks-the-production-source row is a
+        // paper-win per `/perf` Honesty Rules.
+        if !paper_win_collapsed_variant_label(label) {
             let args = args_factory();
             // W12 keys on "x"; every other workload keys on "n".
             let scalar = args
@@ -4013,6 +3817,12 @@ fn bench_cmp_lua(c: &mut Criterion) {
                     })
                 });
             });
+        } else {
+            eprintln!(
+                "[cmp_lua {label}] rust_native row n/a (kernel models the \
+                 algebraically-collapsed variant; production-source baseline \
+                 requires LuaJIT-style dict probe / closure dispatch — see audit #318)"
+            );
         }
 
         // Phase Z.2 (2026-05-28): relon_wasm_wasmtime row. Same
