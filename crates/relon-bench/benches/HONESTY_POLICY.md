@@ -3,8 +3,8 @@
 Audit history: the `v6_lambda_cmp_lua` panel has been cleaned up
 reactively through eight rounds (audits W7 / `_fixture` rename / W1
 fallback / W5 / W8 / W9 / W10 collapse / W1 / W2 / W6 closed-form fold).
-The Tier 1 panel expansion (2026-05-28) added W13 with the gates
-pre-applied at row-add time rather than after-the-fact audit.
+The Tier 1 panel expansion (2026-05-28) added W13 / W14 with the
+gates pre-applied at row-add time rather than after-the-fact audit.
 This document codifies the patterns so future agents catch paper wins
 at PR review time, not in audit #N+1.
 
@@ -195,6 +195,11 @@ HONESTY checklist applied at row-add time:
     (dict-literal as `#internal cfg` binding + bare `Dict` return).
   - `rust_native` gated by `paper_win_closed_form_fold_label`
     (constant-fold collapses the dict-chain reads to `n * 5100`).
+* **W14_schema_validate** — two boolean range checks per iter,
+  modelling Relon's `#expect ...` schema-gate surface.
+  - tree_walk + luajit + bytecode (if envelope accepts).
+  - LLVM AOT / rust_native gated (both predicates constant-true
+    over the input domain → folds to `n * 2`).
 
 Re-introducing the gated rows requires a `black_box`-on-acc shape
 that defeats LLVM's induction-variable reduction (or an LLVM emitter

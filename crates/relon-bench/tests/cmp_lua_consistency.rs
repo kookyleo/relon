@@ -288,6 +288,38 @@ fn w13_deep_dict_access() {
     run_pair("W13", r, &l, n, expected);
 }
 
+/// W14 — schema-validate. Per-iter boolean range checks (both
+/// trivially-true), emulating Relon's `#expect ...` schema gate
+/// surface in a tight reduce loop. Per HONESTY_POLICY:
+/// * Source path: byte-identical to bench helper.
+/// * Algorithm: O(n) reduce, two boolean range checks per iter (each
+///   compiles to a comparison chain — no closed form in Relon source).
+/// * I/O shape: `#main(Int n) -> Int`; Lua equivalent runs the same
+///   ternary chain.
+#[test]
+fn w14_schema_validate() {
+    let r = "#unstrict\n\
+             #main(Int n) -> Int\n\
+             range(n).reduce(0, (acc, i) =>\n\
+               acc\n\
+                 + ((i % 10) >= 0 && (i % 10) < 10 ? 1 : 0)\n\
+                 + ((i / 10) >= 0 && (i / 10) < 1000 ? 1 : 0))";
+    let n: i64 = 1_000;
+    let l = format!(
+        "return function() local n = {n}; local acc = 0;\n\
+         for i = 0, n - 1 do\n\
+           local role = i % 10\n\
+           local region = math.floor(i / 10)\n\
+           acc = acc\n\
+             + ((role >= 0 and role < 10) and 1 or 0)\n\
+             + ((region >= 0 and region < 1000) and 1 or 0)\n\
+         end;\n\
+         return acc end"
+    );
+    let expected = n * 2;
+    run_pair("W14", r, &l, n, expected);
+}
+
 #[test]
 fn w10_config_eval() {
     let r = "#import list from \"std/list\"\n\

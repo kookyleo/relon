@@ -391,7 +391,7 @@ fn paper_win_collapsed_variant_label(label: &str) -> bool {
 /// `LoopReduce` on the lambda body). Until then the row family is
 /// suppressed end-to-end.
 ///
-/// Panel expansion (2026-05-28): W13 joins the gate.
+/// Panel expansion (2026-05-28): W13 / W14 join the gate.
 /// * **W13_deep_dict_access** — the inner `cfg.db.pool.connections.max
 ///   + cfg.db.pool.connections.timeout.ms` reads constant-fold to
 ///   `5100` (rustc + LLVM at -O3 see the literal dict-tree leaves);
@@ -401,10 +401,18 @@ fn paper_win_collapsed_variant_label(label: &str) -> bool {
 ///   today (no n/a row needed — `try_build_*` returns None), so the
 ///   only gated row is `rust_native_w13`, which would otherwise book
 ///   the closed-form `n * 5100` against the LuaJIT chain-walker.
+/// * **W14_schema_validate** — both range predicates are trivially
+///   `true` over the input domain (`i % 10 ∈ [0,10)` and
+///   `i / 10 ∈ [0,n/10]` with `n=1000`), so the body folds to `+2`
+///   per iter and the reduce folds to `n * 2`. Gated end-to-end.
 fn paper_win_closed_form_fold_label(label: &str) -> bool {
     matches!(
         label,
-        "W1_int_sum" | "W2_f64_dot" | "W6_list_int_sum_plus_one" | "W13_deep_dict_access"
+        "W1_int_sum"
+            | "W2_f64_dot"
+            | "W6_list_int_sum_plus_one"
+            | "W13_deep_dict_access"
+            | "W14_schema_validate"
     )
 }
 
@@ -1739,6 +1747,71 @@ fn w13_expected() -> i64 {
 }
 
 // =====================================================================
+// =====  W14 — schema validate (boolean range checks)  ================
+// =====================================================================
+//
+// Tier 1 Relon-flavour workload (panel expansion 2026-05-28). Models
+// the per-iter cost of Relon's `#expect ...` schema gate surface — two
+// boolean range checks per iter that always succeed on the synthetic
+// input domain. The kernel exercises `Op::Lt` / `Op::Ge` / `Op::And`
+// / `Op::If` chains in the tree-walker.
+//
+// **HONESTY checklist** (per `HONESTY_POLICY.md`):
+// * Source path: `w14_relon_src()` byte-identical to the production
+//   source. Lua equivalent in `w14_lua_src()` runs the same ternary
+//   chain via Lua's `and` / `or` short-circuit form (Lua doesn't have
+//   a `?:` ternary; the canonical `cond and a or b` rewrite is
+//   semantically equivalent when `a` is non-falsy, which is true for
+//   `1` here).
+// * Algorithm complexity preserved: O(n) reduce, two boolean range
+//   checks + two conditional `0/1` adds per iter. The range bounds
+//   were chosen so both predicates are trivially `true`, so the
+//   sum-per-iter is exactly `+2`. The predicates ARE evaluated per
+//   iter in the tree-walker.
+// * Time-math sanity: 4 comparisons + 4 boolean ops + 2 conditional
+//   adds per iter ~ 100 ns/iter in the tree-walker (dispatch-heavy);
+//   the LLVM AOT row (if widened to lower this shape) would land
+//   in the 1-3 ns/iter range — hence the closed-form-fold gate.
+// * I/O shape: `#main(Int n) -> Int`, single Int param, Int return.
+//   Lua equivalent matches.
+// * Backend coverage: tree_walk + luajit + bytecode (if accepted).
+//   LLVM AOT / rust_native suppressed via
+//   `paper_win_closed_form_fold_label`.
+
+const W14_N: i64 = 1_000;
+
+fn w14_relon_src() -> &'static str {
+    "#unstrict\n\
+     #main(Int n) -> Int\n\
+     range(n).reduce(0, (acc, i) =>\n\
+       acc\n\
+         + ((i % 10) >= 0 && (i % 10) < 10 ? 1 : 0)\n\
+         + ((i / 10) >= 0 && (i / 10) < 1000 ? 1 : 0))"
+}
+
+fn w14_lua_src() -> String {
+    format!(
+        r#"return function()
+            local n = {n}
+            local acc = 0
+            for i = 0, n - 1 do
+                local role = i % 10
+                local region = math.floor(i / 10)
+                acc = acc
+                    + ((role >= 0 and role < 10) and 1 or 0)
+                    + ((region >= 0 and region < 1000) and 1 or 0)
+            end
+            return acc
+        end"#,
+        n = W14_N
+    )
+}
+
+fn w14_expected() -> i64 {
+    W14_N * 2
+}
+
+// =====================================================================
 // =====  consistency assertions  ======================================
 // =====================================================================
 
@@ -2025,6 +2098,29 @@ fn rust_native_w13(n: i64) -> i64 {
     acc
 }
 
+/// W14 schema validate. Models the constant-true predicate chain:
+/// both range checks always succeed on the synthetic input domain
+/// (`i % 10 ∈ [0,10)` and `i / 10 ∈ [0,n/10]` for n=1000), so the
+/// per-iter body folds to `+ 2`. LLVM -O3 then collapses the reduce
+/// to `n * 2`. Gated by `paper_win_closed_form_fold_label`.
+#[inline(never)]
+fn rust_native_w14(n: i64) -> i64 {
+    let mut acc: i64 = 0;
+    let n = black_box(n);
+    let mut i: i64 = 0;
+    while i < n {
+        let role = i % 10;
+        let region = i / 10;
+        let role_ok = (0..10).contains(&role);
+        let region_ok = (0..1000).contains(&region);
+        acc = acc
+            .wrapping_add(if role_ok { 1 } else { 0 })
+            .wrapping_add(if region_ok { 1 } else { 0 });
+        i += 1;
+    }
+    acc
+}
+
 // =====================================================================
 // =====  Phase C: LLVM AOT row glue  ==================================
 // =====================================================================
@@ -2138,15 +2234,16 @@ fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
         "W9_nested_matrix" => Some(W9_LLVM_SRC),
         "W10_config_eval" => Some(W10_LLVM_SRC),
         "W12_p99_tail" => Some(w12_relon_src()),
-        // Panel expansion 2026-05-28: W13 production source uses a
-        // dict-literal `#internal` binding outside the LLVM AOT
-        // envelope. Even an inlined `_unstrict` variant would land on
-        // the `paper_win_closed_form_fold_label` gate (constant-fold
-        // reduces the dict reads to `n * 5100`). Returning `None`
-        // here keeps the row honest until the panel grows a
+        // Panel expansion 2026-05-28: W13 / W14 production sources are
+        // outside the LLVM AOT envelope (W13 = dict-literal `#internal`
+        // binding; W14 = unstrict ternary chain). Even an inlined
+        // variant would land on the `paper_win_closed_form_fold_label`
+        // gate (W13 folds to `n * 5100`; W14 folds to `n * 2`). Returning
+        // `None` here keeps the row honest until the panel grows a
         // black_box-on-acc shape that defeats induction-variable
         // reduction.
         "W13_deep_dict_access" => None,
+        "W14_schema_validate" => None,
         _ => None,
     }
 }
@@ -2203,13 +2300,14 @@ fn rust_native_dispatch(label: &str, n: i64) -> i64 {
         "W9_nested_matrix" => rust_native_w9(n),
         "W10_config_eval" => rust_native_w10(n),
         "W12_p99_tail" => rust_native_w12(n),
-        // Panel expansion 2026-05-28: W13 is gated by
+        // Panel expansion 2026-05-28: W13 / W14 are gated by
         // `paper_win_closed_form_fold_label`, so the canonical_panel
-        // never dispatches here. Arm retained for grep visibility +
+        // never dispatches here. Arms retained for grep visibility +
         // panic-on-reintroduction so a future agent who drops the
         // gate without re-checking the closed-form fold gets a hard
         // failure rather than a silent paper win.
         "W13_deep_dict_access" => rust_native_w13(n),
+        "W14_schema_validate" => rust_native_w14(n),
         other => panic!("rust_native_dispatch: unknown workload `{other}`"),
     }
 }
@@ -3695,6 +3793,68 @@ fn bench_cmp_lua(c: &mut Criterion) {
         });
     }
 
+    // ----- W14 schema validate (boolean range checks) -----
+    //
+    // Panel-expansion 2026-05-28 (Tier 1 Relon-flavour). See the
+    // top-of-file W14 doc-comment for the HONESTY checklist.
+    // Backend coverage: tree_walk + luajit + bytecode (if the
+    // analyzer / bytecode IR-lift accept the unstrict ternary chain).
+    // LLVM AOT / rust_native suppressed via
+    // `paper_win_closed_form_fold_label` (the constant-true predicate
+    // chain folds to `n * 2` at -O3); reintroduce when the panel grows
+    // a black_box-on-acc shape that defeats induction-variable
+    // reduction.
+    {
+        let (walker, scope) = build_tree_walker(w14_relon_src());
+        let lua_fn_w14 = lua_fn(&lua, &w14_lua_src());
+
+        let relon_v = relon_int_result("W14", walker.run_main(&scope, args_w_n(W14_N)).unwrap());
+        let lua_v: i64 = lua_fn_w14.call(()).unwrap();
+        assert_relon_lua_consistent("W14", relon_v, lua_v, w14_expected());
+
+        group.throughput(Throughput::Elements(W14_N as u64));
+        group.bench_function(
+            BenchmarkId::new("W14_schema_validate", "relon_tree_walk"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(W14_N);
+                    timed_with_warmup(iters, || {
+                        let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
+        group.bench_function(BenchmarkId::new("W14_schema_validate", "luajit"), |b| {
+            b.iter_custom(|iters| {
+                timed_with_warmup(iters, || {
+                    let v: i64 = lua_fn_w14.call(()).unwrap();
+                    black_box(v);
+                })
+            });
+        });
+        if let Some(ev) = try_build_bytecode(w14_relon_src(), "W14") {
+            let v = ev.run_main(args_w_n(W14_N)).expect("W14 bytecode run_main");
+            assert_eq!(
+                relon_int_result("W14", v),
+                w14_expected(),
+                "W14 bytecode result must match analytic answer"
+            );
+            group.bench_function(
+                BenchmarkId::new("W14_schema_validate", "relon_bytecode"),
+                |b| {
+                    b.iter_custom(|iters| {
+                        let n_in = black_box(W14_N);
+                        timed_with_warmup(iters, || {
+                            let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
+                            black_box(v);
+                        })
+                    });
+                },
+            );
+        }
+    }
+
     // =================================================================
     // ===== Dart-style canonical panel: relon_jit + relon_aot =========
     // =================================================================
@@ -3796,6 +3956,15 @@ fn bench_cmp_lua(c: &mut Criterion) {
             W13_N as u64,
             || args_w_n(W13_N),
         ),
+        // Panel-expansion 2026-05-28 (Tier 1 Relon-flavour W14):
+        // * relon_jit: runs through `JitEvaluator::run_main`; falls
+        //   through to tree-walker for the unstrict ternary chain.
+        // * relon_aot / relon_llvm_aot / rust_native: see comment on
+        //   W13 entry above. The closed-form-fold gate suppresses LLVM
+        //   AOT + rust_native; cranelift AOT envelope rejects.
+        ("W14_schema_validate", w14_relon_src(), W14_N as u64, || {
+            args_w_n(W14_N)
+        }),
     ];
 
     for (label, src, throughput_n, args_factory) in canonical_panel {
