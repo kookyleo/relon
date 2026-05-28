@@ -198,7 +198,7 @@ impl ModuleResolver for FilesystemModuleResolver {
 /// v3+ a-3 / v3++ b-3 remote `#import` machinery.
 ///
 /// HTTPS fetch resolver for `#import "https://..."`. Gated to non-wasm32
-/// targets so the browser playground build of `relon-wasm` does not link
+/// targets so the browser playground build of `relon-wasm-bindings` does not link
 /// `ureq` (no sockets / TLS / DNS in `wasm32-unknown-unknown`).
 ///
 /// Mount it manually on hosts that want remote modules; the default

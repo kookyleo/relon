@@ -2277,7 +2277,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "relon-wasm"
+name = "relon-wasm-bindings"
 version = "0.1.0"
 dependencies = [
  "miette",

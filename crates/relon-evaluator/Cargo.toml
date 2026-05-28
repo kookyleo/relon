@@ -56,7 +56,7 @@ regex = { workspace = true }
 
 # v3+ a-3: HTTPS fetch for remote `#import "https://..."` modules.
 # Restricted to native hosts so the browser playground build of
-# `relon-wasm` (which depends on this crate) keeps compiling against
+# `relon-wasm-bindings` (which depends on this crate) keeps compiling against
 # `wasm32-unknown-unknown` without dragging in native sockets / TLS.
 # Phase G.W11 Phase 2 cold-start: also gated behind the `remote-http`
 # cargo feature so the W11 trivial-`#main` CLI build (which does not

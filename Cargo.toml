@@ -68,10 +68,10 @@ regex = "1"
 # using the in-tree source. A version-less path dependency is a
 # `cargo publish` blocker.
 # v5-β-2 stage 4: workspace-level default-features = false lets the
-# wasm32-targeting `relon-wasm` opt out of the cranelift-aot default
-# without pulling cranelift-jit / region into a target where neither
-# builds. Native consumers (relon-cli, relon-bench, downstream hosts)
-# re-enable `default-features = true` in their own dependency entries.
+# wasm32-targeting `relon-wasm-bindings` opt out of the cranelift-aot
+# default without pulling cranelift-jit / region into a target where
+# neither builds. Native consumers (relon-cli, relon-bench, downstream
+# hosts) re-enable `default-features = true` in their own dep entries.
 relon = { path = "crates/relon", version = "0.1.0", default-features = false }
 relon-parser = { path = "crates/relon-parser", version = "0.1.0" }
 relon-analyzer = { path = "crates/relon-analyzer", version = "0.1.0" }
@@ -94,7 +94,7 @@ relon-trace-jit = { path = "crates/relon-trace-jit", version = "0.1.0" }
 relon-trace-recorder = { path = "crates/relon-trace-recorder", version = "0.1.0" }
 relon-trace-emitter = { path = "crates/relon-trace-emitter", version = "0.1.0" }
 relon-lsp = { path = "crates/relon-lsp", version = "0.1.0" }
-relon-wasm = { path = "crates/relon-wasm", version = "0.1.0" }
+relon-wasm-bindings = { path = "crates/relon-wasm-bindings", version = "0.1.0" }
 # Phase Z (2026-05-28): WASM canonical lowered form. New `relon-codegen-wasm`
 # lowers IR -> wasm bytes, new `relon-wasm-evaluator` runs them through
 # wasmtime. Long-term these replace `relon-bytecode` + the trace-JIT stack

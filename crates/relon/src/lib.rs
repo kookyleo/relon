@@ -13,7 +13,7 @@
 //! Hosts that previously reached `relon::TreeWalkEvaluator` /
 //! `relon::Context` / `relon::parse_document` through the wildcard
 //! re-exports must now either (a) take a dep on the downstream crate
-//! by name (the in-tree binaries — `relon-cli`, `relon-wasm`,
+//! by name (the in-tree binaries — `relon-cli`, `relon-wasm-bindings`,
 //! `relon-lsp`, `relon-bench` — already do this) or (b) drive an
 //! [`EvaluatorBuilder`] which produces a `Box<dyn Evaluator>`
 //! without exposing the concrete backend type.

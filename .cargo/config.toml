@@ -4,7 +4,7 @@
 # "link-arg=-fuse-ld=mold"]` in their global `~/.cargo/config.toml` to
 # accelerate native link times. `mold` is x86_64-only and `rust-lld`
 # (the wasm32 linker) rejects `-fuse-ld=mold` outright, so without an
-# override here the wasm cdylib build (`relon-wasm`) fails at link
+# override here the wasm cdylib build (`relon-wasm-bindings`) fails at link
 # time. We explicitly blank out the wasm32 target rustflags so the
 # project builds out of the box regardless of the host's global cargo
 # settings. The default `release` and `release-small` profile knobs
@@ -28,7 +28,7 @@
 #
 # IMPORTANT: this rustflag MUST stay in sync with the
 # `--enable-simd` argument in
-# `crates/relon-wasm/Cargo.toml::package.metadata.wasm-pack.profile.*`.
+# `crates/relon-wasm-bindings/Cargo.toml::package.metadata.wasm-pack.profile.*`.
 # Removing one without the other yields either (a) scalar wasm (slow
 # but correct) or (b) wasm-validator rejection in `wasm-opt` post-
 # processing. Both knobs together is the supported state.

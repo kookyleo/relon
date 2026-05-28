@@ -2,7 +2,7 @@
 //! Relon Language Server.
 //!
 //! Implements the editor-facing LSP capabilities exposed by relon-cli's
-//! `relon lsp` subcommand and re-used by `relon-wasm` for the browser
+//! `relon lsp` subcommand and re-used by `relon-wasm-bindings` for the browser
 //! playground:
 //!
 //! - hover (`textDocument/hover`)

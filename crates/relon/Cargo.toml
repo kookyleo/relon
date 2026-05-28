@@ -15,7 +15,7 @@ categories = ["config", "parsing", "compilers"]
 # is the only AOT path after wasm-AOT retirement); excluded entirely
 # from wasm32 targets through the absence of `relon-codegen-native`
 # under `target.'cfg(target_arch = "wasm32")'.dependencies`, which
-# keeps `relon-wasm` (browser playground) free of the cranelift
+# keeps `relon-wasm-bindings` (browser playground) free of the cranelift
 # dependency tree.
 default = ["cranelift-aot"]
 cranelift-aot = ["dep:relon-codegen-native"]
@@ -37,7 +37,7 @@ relon-evaluator = { workspace = true }
 relon-parser = { workspace = true }
 relon-analyzer = { workspace = true }
 # v5-β-2 stage 4: cranelift-AOT backend lives in a separate crate so
-# the wasm32 target (`relon-wasm`, browser playground) can opt out via
+# the wasm32 target (`relon-wasm-bindings`, browser playground) can opt out via
 # the absence of the `cranelift-aot` feature. Since the wasm-AOT
 # backend retired in stage 4 this is the only AOT path; default-on
 # above means native hosts get it without opting in.

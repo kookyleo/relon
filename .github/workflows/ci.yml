@@ -52,7 +52,7 @@ jobs:
     #
     # NOT covered: relon-codegen-native (pulls cranelift / wasmtime
     # whose generated nightly code currently uses unstable features
-    # the pinned miri rustc rejects) and relon-wasm (browser target).
+    # the pinned miri rustc rejects) and relon-wasm-bindings (browser target).
     # Those keep their stable-job coverage.
     name: miri (unsafe modules)
     runs-on: ubuntu-latest

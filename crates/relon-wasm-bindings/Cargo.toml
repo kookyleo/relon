@@ -1,5 +1,5 @@
 [package]
-name = "relon-wasm"
+name = "relon-wasm-bindings"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

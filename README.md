@@ -113,5 +113,5 @@ parallel workflows). It's advisory — never blocks.
 - `crates/relon-lsp`: Language Server (parse + analyze + diagnostics).
 - `crates/relon-test-harness`: Cross-backend differential and recorded-loop integration tests.
 - `crates/relon-bench`: Internal micro-benchmark harness (not published).
-- `crates/relon-wasm`: Browser-side wasm bindings for the playground.
+- `crates/relon-wasm-bindings`: Browser-side wasm bindings for the playground.
 - `examples/`, `fixtures/`: Demo / golden files.

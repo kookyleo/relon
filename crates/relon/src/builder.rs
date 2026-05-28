@@ -13,7 +13,7 @@
 //! capability flips, low-level `Context::with_root` wiring) still
 //! reach into [`crate::ResolverChainLoader`] + the lower-level
 //! `relon-eval-api` / `relon-evaluator` crates directly — same as
-//! the in-tree `relon-cli` / `relon-wasm` / `relon-lsp` binaries do.
+//! the in-tree `relon-cli` / `relon-wasm-bindings` / `relon-lsp` binaries do.
 //!
 //! ## Trust posture
 //!
