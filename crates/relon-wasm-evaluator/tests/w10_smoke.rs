@@ -102,13 +102,16 @@ fn w10_fast_path_round_trips() {
 fn w10_production_dict_source_still_scope_cuts() {
     // The production source binds `allow: (i) => ...` as a `#internal`
     // closure and returns `Dict { result: Int }`. Phase Z.4.1
-    // unlocked the bare-`Dict` mini-ABI on the walker; W10 production
-    // stays scope-cut upstream of the walker — the IR-pipeline's
+    // unlocked the bare-`Dict` mini-ABI on the walker; Phase Z.4.3
+    // unlocked the closure-as-value path (`MakeClosure` /
+    // `CallClosure` + funcref-table dispatch). W10 production still
+    // stays scope-cut **upstream** of the walker — the IR-pipeline's
     // `anon_dict_return_plan` rejects `list.sum(range(n).map(allow))`
     // as the value for `result:` (the classifier only accepts calls
     // into previously-classified closure fields), so the source never
-    // reaches the walker. Resolving this needs an IR-pipeline
-    // widening AND the Z.4.3 closure walker arm; until then the
+    // reaches the walker even after Z.4.3. Resolving this needs an
+    // IR-pipeline widening that recognises the `list.sum(... map(closure
+    // ))` shape against the anon-Dict-return plan; until then the
     // tree-walker fallback is the honest path.
     let prod_src = "#import list from \"std/list\"\n\
                     #main(Int n) -> Dict\n\

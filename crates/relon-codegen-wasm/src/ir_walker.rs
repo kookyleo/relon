@@ -90,25 +90,43 @@
 //!   wasm `select` / typed `select t`.
 //! - `Return` — pops the top value into the function result.
 //!
-//! ## Out of Z.4.0 scope (stubs return `UnsupportedOp`)
+//! ## Z.4.3 scope (this commit) — closure-as-value
 //!
-//! - **Z.4.1 — Dict literal / member access**: `AllocRootRecord`,
-//!   `AllocSubRecord`, `StoreFieldAtRecord`, `PushRecordBase`,
-//!   `EmitTailRecordFromAbsoluteAddr`. Production `#main(...) -> Dict
-//!   { #internal ..., result: X }` lowering. See
-//!   [`UnsupportedOpReason::DictReturn`].
-//! - **Z.4.2 — List literal / index / iter**: `ConstListInt`,
-//!   `LoadListIntPtr`, `ListGetByIntIdx`. Nested
-//!   `range(n).map((i) => range(n).map(...))` materialisation. See
+//! `#internal fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2)` plus
+//! `result: fib(n)` is the canonical W7 production source the
+//! closure-as-value path unlocks. The walker now emits each
+//! `#internal` lambda as its own wasm function whose signature is
+//! `(captures_ptr: i32, ...user_params) -> ret_ty`, materialises a
+//! funcref table + element section so `MakeClosure` /
+//! `CallClosure`-stamped handles resolve at runtime, and emits
+//! wasm `call_indirect` against the deduped type-pool entry for
+//! each call site. Self-recursive closures (the W7 shape) stamp
+//! the handle pointer into the captures struct at `MakeClosure`
+//! time — same trick the LLVM AOT emitter's `emit_make_closure`
+//! `not yet bound` branch uses (see
+//! `crates/relon-codegen-llvm/src/emitter.rs`).
+//!
+//! ## Out of Z.4.x scope (stubs return `UnsupportedOp`)
+//!
+//! - **Z.4.2 — List literal / index / iter** (partially open):
+//!   `ConstListInt`, `LoadListIntPtr`, `ListGetByIntIdx`. The
+//!   range-chain consumer family (`range(n).reduce(...)`, etc.)
+//!   reaches Compiled via Z.4.2; list-literal materialisation
+//!   (`#internal rows: range(n).map(...)`) stays scope-cut. See
 //!   [`UnsupportedOpReason::ListLiteral`].
-//! - **Z.4.3 — Closure-as-value**: `MakeClosure`, `CallClosure`,
-//!   funcref table emit. First-class `#internal fib: (k) => ...`
-//!   captured into Dict fields. See
-//!   [`UnsupportedOpReason::ClosureValue`].
-//! - **Z.4 follow-up — String/stdlib calls**: `ConstString`,
+//! - **Z.4 follow-up — String / stdlib calls**: `ConstString`,
 //!   `StrConcatN`, `ReadStringLen`, `Call { ... stdlib idx ... }`.
 //!   The hand-emit W3/W4 variants still cover these via the
 //!   classifier path for now.
+//!
+//! ## Note on `UnsupportedOpReason::ClosureValue`
+//!
+//! The variant is retained as a defensive surface for malformed
+//! closure-construction shapes the walker can't yet model
+//! (e.g. a `MakeClosure` whose `fn_table_idx` exceeds the closure
+//! table, or a non-`Closure`-typed self-recursive capture). The
+//! canonical W7 production source no longer routes through it — it
+//! emits a valid wasm module instead.
 //!
 //! Each sub-phase has a parking-spot constructor on
 //! [`UnsupportedOpReason`] so the host's tracing layer can group
