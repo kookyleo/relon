@@ -301,6 +301,12 @@ implementation's `crates/relon-evaluator/src/std_relon/<name>.relon`
 sources; those `.relon` files are themselves part of the spec
 (reference behavior of the std modules).
 
+> Beyond this catalog, the reference tree-walker registers an
+> additional JSON-Schema-parity wave (`sqrt`, `is_email`, `to_json`,
+> `trim`, `unique`, …) that exists **only** in the tree-walker — no
+> analyzer signatures, no compiled-backend lowering. See §6.7 for the
+> exact set and the tier caveat before depending on any of them.
+
 ### 6.3 `ensure.*` validators
 
 The `#schema` machinery depends internally on `ensure.*` functions
@@ -464,8 +470,10 @@ its `#import` graph reaches* requires every value to have a
 statically inferable type. Sites the analyzer would otherwise let
 pass with an implicit `Any` fallback now produce errors.
 
-A module opts out by writing the file-level `Bare` directive
-`#relaxed` (or its synonym `#unstrict`) at the top:
+There is **no `#strict` directive** — strict is the default, so
+there is nothing to opt *in* to. A module opts *out* by writing the
+file-level `Bare` directive `#relaxed` (or its exact synonym
+`#unstrict`) at the top; these two names are the only opt-out:
 
 ```relon
 #relaxed
@@ -651,7 +659,9 @@ Semantics:
   `Tuple<Int, String>`.
 * **Tuple → List collapse**: a homogeneous tuple still subsumes
   `List<T>` (every element subsumes `T`), so all pre-v1.7 homogeneous-
-  list usage keeps working.
+  list usage keeps working. `Tuple` lives **only** in the analyzer's
+  type lattice — there is no `Value::Tuple` runtime variant; at
+  runtime a tuple is a `Value::List` (see §6.7).
 * **Tuple → Tuple**: arity check first, then per-position recursion.
   Any mismatch raises `StaticTypeMismatch` pinpointed to the position.
 * Nesting is fine: `List<(Int, String)>`, `(List<Int>, String)`,
@@ -762,6 +772,63 @@ are now mandatory.
 ```relon
 { Dict<String, Int> scores: { math: 100, art: 90 } }
 ```
+
+### 6.7 Implementation tiers and honest inventory
+
+This subsection records, without euphemism, which surface is
+implemented in which evaluation tier so authors do not write against
+a function or syntax that silently exists in only one backend.
+
+**Tier-2 (tree-walker) only stdlib.** The tree-walker's free-fn
+registry holds ~77 `register_pure_fn` names
+(`crates/relon-evaluator/src/stdlib.rs`); within that surface a wave
+of JSON-Schema-parity helpers is registered **only in the
+tree-walker**. They have **no analyzer signatures** and are **absent
+from every compiled backend** (Cranelift / LLVM AOT, trace JIT).
+Calling them under a
+compiled backend, or relying on them to be statically typed, will not
+behave like the tree-walker. The set is:
+
+* numeric: `sqrt`, `pow`, `round`, `floor`, `ceil`, `multiple_of`,
+  `in_range`
+* format predicates: `is_email`, `is_uri`, `is_uuid`, `is_iso_date`,
+  `is_ipv4`, `is_ipv6`
+* string: `trim`, `trim_start`, `trim_end`, `starts_with`,
+  `ends_with`
+* list: `unique`, `count`, `every`, `some`
+* dict: `select_keys`, `omit_keys`
+* json / date: `to_json`, `from_json`, `parse_iso_date`,
+  `size_in_range`
+
+These are **tier-2 / tree-walker-only**. Treat them as
+reference-evaluator conveniences, not portable language surface,
+until they gain analyzer signatures and compiled-backend lowering.
+
+**There is no `#strict` directive.** Strict static inference is the
+analyzer's **default** — you do not opt *in* to it. The only opt-out
+is the file-level `#relaxed` directive, with `#unstrict` as an exact
+synonym (`crates/relon-parser/src/directive.rs`). No `#strict`
+keyword is parsed or recognized.
+
+**`Tuple` is a static-only type; there is no `Value::Tuple` runtime
+variant.** A tuple exists only in the analyzer's type lattice: list
+literals infer as `Tuple<T1, T2, ...>`, and `Tuple` slots are
+arity- and position-checked statically. At runtime a tuple **is** a
+`Value::List` — there is no dedicated tuple value
+(`crates/relon-evaluator/src/stdlib.rs`,
+`crates/relon-evaluator/src/schema.rs`). Positional access (`pair.0`)
+resolves through ordinary list indexing.
+
+**Known doc-only gaps (not yet implemented end-to-end).** The
+following appear in design discussion but are **not** working
+features; they are blockers, not capabilities:
+
+* `??` null-coalescing operator — not wired through end-to-end.
+* `&root` / `&uncle` references inside `reduce` — not resolvable
+  end-to-end.
+
+Do not write programs that depend on either; they will not evaluate
+as a finished feature would.
 
 ## 7. Boundary of host-registered extensions
 
