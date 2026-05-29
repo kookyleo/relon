@@ -30,6 +30,10 @@ relon-analyzer = { workspace = true }
 
 thiserror = { workspace = true }
 
+# AOT-1: f64 return-value decode constructs `Value::Float(OrderedFloat(..))`.
+# Pinned by the workspace (also used by relon-ir / relon-eval-api).
+ordered-float = { workspace = true }
+
 # Phase A.1 decision: inkwell 0.9.0 with `llvm18-1` feature.
 # - llvm-sys 181.3.0 pulled in transitively; pinned by inkwell's
 #   feature flag so the workspace lock stays deterministic.
@@ -56,3 +60,6 @@ libc = "0.2"
 # from the same hand-built IR fixture. The dep is dev-only so the
 # crate's production build does not pull in the cranelift backend.
 relon-codegen-cranelift = { workspace = true }
+# AOT-1 differential oracle: the f64 arithmetic tests cross-check the
+# LLVM JIT output against the tree-walking interpreter bit-for-bit.
+relon-evaluator = { workspace = true }

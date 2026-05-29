@@ -35,6 +35,7 @@ use inkwell::targets::{
 };
 use inkwell::OptimizationLevel;
 
+use ordered_float::OrderedFloat;
 use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
 use relon_parser::Node;
 
@@ -1232,17 +1233,13 @@ fn read_value_from_reader(
             .read_int(&field.name)
             .map(Value::Int)
             .map_err(buffer_to_runtime_error),
-        // Phase B does not exercise Float returns through the LLVM
-        // backend (W1 / W2 are Int-only). When the W3+ work calls
-        // for Float we'll add `ordered-float` as a dep or convert
-        // through `f64::to_bits` round-trips — for now reject so a
-        // future regression surfaces explicitly.
-        TypeRepr::Float => Err(RuntimeError::Unsupported {
-            reason: format!(
-                "llvm-aot: return field `{}` Float not yet supported in Phase B",
-                field.name
-            ),
-        }),
+        // AOT-1 scalar Float slice: the buffer stores the f64 as 8 LE
+        // bytes (write side: `write_value_into_builder` Float arm); the
+        // reader decodes them back through `read_float`.
+        TypeRepr::Float => reader
+            .read_float(&field.name)
+            .map(|f| Value::Float(OrderedFloat(f)))
+            .map_err(buffer_to_runtime_error),
         TypeRepr::Bool => reader
             .read_bool(&field.name)
             .map(Value::Bool)

@@ -2039,9 +2039,11 @@ version = "0.1.0"
 dependencies = [
  "inkwell",
  "libc",
+ "ordered-float",
  "relon-analyzer",
  "relon-codegen-cranelift",
  "relon-eval-api",
+ "relon-evaluator",
  "relon-ir",
  "relon-parser",
  "thiserror 2.0.18",
