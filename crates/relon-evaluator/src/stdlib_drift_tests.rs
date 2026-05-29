@@ -1,0 +1,234 @@
+//! Reverse stdlib-drift defense + tier-2 tree-walker-only execution
+//! coverage.
+//!
+//! Background: `stdlib::register_to` (crates/relon-evaluator/src/stdlib.rs)
+//! registers ~50 free functions via `register_pure_fn(name, ...)`. The
+//! analyzer's drift-defense test
+//! (`relon-analyzer::typecheck::tests::stage3_stdlib_signatures_cover_all_register_fn_names`)
+//! only checks that a *curated* allowlist of names HAS analyzer
+//! signatures; it never enumerates the evaluator's real register sites.
+//! As a result a whole wave of free functions — the JSON-Schema parity
+//! batch (`is_email` / `to_json` / `trim` / `unique` / `count` / ...) and
+//! the numeric helpers (`sqrt` / `pow` / `round` / `floor` / `ceil`) —
+//! drifted in with ZERO analyzer signatures and ZERO test coverage.
+//!
+//! The functions in that drift set are *tier-2 tree-walker-only*: because
+//! they lack an analyzer signature, the analyzer rejects any program that
+//! calls them in its default strict mode with
+//! `ExpressionTypeUnknown: "call to <fn> has no static return type"`. They
+//! can only be reached through the tree-walking evaluator; they do NOT run
+//! on the cranelift / LLVM / wasm-AOT backends.
+//!
+//! This module:
+//!   1. Pins that drift set (`TIER2_TREEWALK_ONLY_DRIFT`) and FAILS if the
+//!      evaluator gains a NEW free fn without either an analyzer signature
+//!      or an explicit drift-allowlist entry — i.e. the reverse of the
+//!      analyzer-side test, driven from the evaluator's real register
+//!      sites rather than a curated name list.
+//!   2. Exercises a representative slice of the drift set through the
+//!      tree-walker against a golden fixture so they get *some* execution
+//!      coverage.
+
+use crate::{Context, Scope, TreeWalkEvaluator, Value};
+use std::collections::BTreeSet;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+/// Names registered with `register_pure_fn` by the evaluator that have
+/// NO signature in the analyzer's `stdlib_signatures` table. These are
+/// the tier-2 tree-walker-only free functions: reachable through the
+/// tree-walking evaluator only, never on a compiled backend, and invisible
+/// to static type inference (any call site infers `ExpressionTypeUnknown`).
+///
+/// This constant pins the *currently known* drift. The reverse-drift test
+/// computes (registered free fns) − (analyzer-known names) and asserts it
+/// equals exactly this set, so adding a new free fn without an analyzer
+/// signature — or shipping a signature for one of these — fails the test
+/// and forces a deliberate decision.
+const TIER2_TREEWALK_ONLY_DRIFT: &[&str] = &[
+    // -- string: case-fold / normalization / glob (underscore intrinsics
+    //    plus the bare `glob_match` surface) --
+    "_string_title",
+    "_string_upper_locale",
+    "_string_lower_locale",
+    "_string_title_locale",
+    "_string_nfc",
+    "_string_nfd",
+    "_string_nfkc",
+    "_string_nfkd",
+    "_string_glob_match",
+    "glob_match",
+    // -- math: bare-name aliases + the JSON-Schema numeric wave --
+    "abs",
+    "max",
+    "min",
+    "clamp",
+    "round",
+    "floor",
+    "ceil",
+    "sqrt",
+    "pow",
+    "in_range",
+    "multiple_of",
+    // -- string predicates / transforms (JSON-Schema parity wave) --
+    "matches",
+    "starts_with",
+    "ends_with",
+    "is_email",
+    "is_uri",
+    "is_uuid",
+    "is_iso_date",
+    "is_ipv4",
+    "is_ipv6",
+    "trim",
+    "trim_start",
+    "trim_end",
+    // -- list helpers (JSON-Schema parity wave) --
+    "unique",
+    "count",
+    "every",
+    "some",
+    // -- dict helpers + json + date --
+    "select_keys",
+    "omit_keys",
+    "size_in_range",
+    "parse_iso_date",
+    "to_json",
+    "from_json",
+];
+
+/// Scan `stdlib.rs` for every `register_pure_fn("<name>", ...)` call and
+/// return the set of free-fn names actually registered by the evaluator.
+///
+/// We parse the source text rather than spinning up a `Context` and
+/// reading back its registered-fn table because the registry is a
+/// `pub(crate)`-internal detail of `relon-eval-api`; a source scan keeps
+/// the drift check anchored to the literal register sites the maintainer
+/// edits, which is exactly what we want to defend.
+///
+/// Note: `register_pure_method(Type, name, ...)` registrations are NOT
+/// included — methods dispatch through the receiver's `native_methods`
+/// table and are never looked up in the analyzer's free-fn
+/// `stdlib_signatures`, so they are out of scope for this signature-drift
+/// check.
+fn registered_free_fn_names() -> BTreeSet<String> {
+    const SRC: &str = include_str!("stdlib.rs");
+    const MARKER: &str = "register_pure_fn(\"";
+    let mut names = BTreeSet::new();
+    let mut rest = SRC;
+    while let Some(pos) = rest.find(MARKER) {
+        rest = &rest[pos + MARKER.len()..];
+        if let Some(end) = rest.find('"') {
+            names.insert(rest[..end].to_string());
+            rest = &rest[end + 1..];
+        } else {
+            break;
+        }
+    }
+    names
+}
+
+/// Reverse drift defense, driven from the evaluator's real register sites.
+///
+/// Asserts that the set of `register_pure_fn` names lacking an analyzer
+/// signature equals exactly [`TIER2_TREEWALK_ONLY_DRIFT`]. Fails loudly
+/// when a maintainer:
+///   * adds a NEW free fn without an analyzer signature (it lands in the
+///     computed drift but not the pinned allowlist), or
+///   * finally gives one of the drift fns a signature (it leaves the
+///     computed drift but lingers in the pinned allowlist), or
+///   * removes / renames a drift fn.
+#[test]
+fn reverse_stdlib_drift_is_pinned() {
+    let registered = registered_free_fn_names();
+    assert!(
+        !registered.is_empty(),
+        "failed to scan any register_pure_fn names out of stdlib.rs"
+    );
+
+    // Sanity: the analyzer-covered names the curated allowlist already
+    // guards must really be registered (guards against the scan silently
+    // missing the early register block).
+    for known in ["len", "range", "type", "ensure.int", "_math_abs"] {
+        assert!(
+            registered.contains(known),
+            "expected `{known}` among scanned register_pure_fn names; scan is broken"
+        );
+    }
+
+    let analyzer_known: BTreeSet<String> = relon_analyzer::stdlib_signatures::stdlib_fn_names()
+        .map(|s| s.to_string())
+        .collect();
+
+    let actual_drift: BTreeSet<String> = registered.difference(&analyzer_known).cloned().collect();
+    let pinned_drift: BTreeSet<String> = TIER2_TREEWALK_ONLY_DRIFT
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    // Allowlist hygiene: no stale entries that aren't even registered.
+    let stale: Vec<&String> = pinned_drift.difference(&registered).collect();
+    assert!(
+        stale.is_empty(),
+        "TIER2_TREEWALK_ONLY_DRIFT lists names that are not registered as free fns: {stale:?}"
+    );
+
+    let newly_drifted: Vec<&String> = actual_drift.difference(&pinned_drift).collect();
+    let now_covered: Vec<&String> = pinned_drift.difference(&actual_drift).collect();
+    assert!(
+        newly_drifted.is_empty() && now_covered.is_empty(),
+        "reverse stdlib drift changed.\n  NEW drift (registered free fn with no analyzer \
+         signature, not yet in the tier-2 allowlist): {newly_drifted:?}\n  RESOLVED (now has a \
+         signature — drop from TIER2_TREEWALK_ONLY_DRIFT): {now_covered:?}"
+    );
+}
+
+/// Run a relon source string through the tree-walking evaluator,
+/// bypassing the analyzer's strict static-type gate. This is the only
+/// execution path the tier-2 tree-walker-only stdlib fns can take.
+fn tree_walk(source: &str) -> Value {
+    let node = relon_parser::parse_document(source).expect("fixture must parse");
+    let mut ctx = Context::new().with_root(node);
+    TreeWalkEvaluator::prepare_in_place(&mut ctx);
+    let ctx = Arc::new(ctx);
+    TreeWalkEvaluator::new(Arc::clone(&ctx))
+        .eval_root(&Arc::new(Scope::default()))
+        .expect("fixture must evaluate")
+}
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("workspace root above crates/relon-evaluator")
+}
+
+/// Execution coverage for a representative slice of the tier-2
+/// tree-walker-only stdlib (sqrt / pow / round / floor / ceil / in_range /
+/// trim / unique / count / to_json). Drives the fixture through the
+/// tree-walker — NOT the cross-backend golden harness, which the analyzer
+/// would reject — and compares the serialized result to the golden JSON.
+#[test]
+fn tier2_treewalk_only_fixture_executes() {
+    let root = workspace_root();
+    let fixture = root.join("fixtures/golden/tier2_treewalk/stdlib_treewalk_only.relon");
+    let golden = root.join("fixtures/golden/tier2_treewalk/stdlib_treewalk_only.json");
+
+    let source = std::fs::read_to_string(&fixture)
+        .unwrap_or_else(|e| panic!("read {}: {e}", fixture.display()));
+    let value = tree_walk(&source);
+    let actual: serde_json::Value =
+        serde_json::to_value(&value).expect("tree-walk result serializes to JSON");
+
+    let expected_raw = std::fs::read_to_string(&golden)
+        .unwrap_or_else(|e| panic!("read {}: {e}", golden.display()));
+    let expected: serde_json::Value =
+        serde_json::from_str(&expected_raw).expect("golden JSON parses");
+
+    assert_eq!(
+        actual,
+        expected,
+        "tier-2 tree-walker-only golden mismatch.\n  actual: {}",
+        serde_json::to_string_pretty(&actual).unwrap()
+    );
+}

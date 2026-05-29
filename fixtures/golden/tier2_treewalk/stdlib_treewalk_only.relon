@@ -1,0 +1,33 @@
+// Tier-2 tree-walker-only stdlib coverage fixture.
+//
+// Every function called here is registered by the evaluator's
+// `stdlib::register_to` (crates/relon-evaluator/src/stdlib.rs) but has
+// NO signature in the analyzer's `stdlib_signatures` table. The analyzer
+// therefore rejects these calls in its default strict mode with
+// `ExpressionTypeUnknown: "call to <fn> has no static return type"`, so
+// this fixture is driven exclusively through the tree-walking evaluator
+// (see `stdlib_drift_tests.rs`), NOT through the cross-backend golden
+// harness in `crates/relon`. These functions are tree-walker-only; they
+// do NOT run on the cranelift / LLVM / wasm-AOT backends.
+{
+    // math batch: sqrt / pow / round (banker's) / floor / ceil / in_range
+    sqrt_9: sqrt(9.0),
+    sqrt_2: sqrt(2.0),
+    pow_2_10: pow(2.0, 10.0),
+    round_half_even: round(2.5),
+    floor_x: floor(3.7),
+    ceil_x: ceil(3.2),
+    in_range_hit: in_range(5, 1, 10),
+
+    // string trim
+    trim_x: trim("  hi  "),
+
+    // list helpers: unique (uniqueItems predicate) + count
+    unique_true: unique([1, 2, 3]),
+    unique_false: unique([1, 2, 2]),
+    count_x: count([10, 20, 30]),
+
+    // json serialisation
+    to_json_dict: to_json({ a: 1, b: "two" }),
+    to_json_list: to_json([1, 2, 3])
+}

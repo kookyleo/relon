@@ -1,0 +1,15 @@
+{
+  "ceil_x": 4,
+  "count_x": 3,
+  "floor_x": 3,
+  "in_range_hit": true,
+  "pow_2_10": 1024.0,
+  "round_half_even": 2,
+  "sqrt_2": 1.4142135623730951,
+  "sqrt_9": 3.0,
+  "to_json_dict": "{\"a\":1,\"b\":\"two\"}",
+  "to_json_list": "[1,2,3]",
+  "trim_x": "hi",
+  "unique_false": false,
+  "unique_true": true
+}
