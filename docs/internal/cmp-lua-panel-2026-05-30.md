@@ -84,3 +84,72 @@ strategy or correctness limitation.
   build variance, both parity).
 - W16/W17/W18/W19: **new** `llvm_aot` rows (previously `None` / n/a). These are the
   first real numeric-kernel AOT-vs-Rust comparisons in the panel's history.
+
+## Full single-binary panel refresh (md5 `9738c99a`, s90, 100 samples × 5s)
+
+All rows below are from ONE binary/run (no mixed-binary caveat). `relon_jit` rows are
+**tree-walker / bytecode fallthrough** (recorder aborts `Op::If`/`CallClosure`) — NOT
+trace-JIT data; shown for completeness, excluded from all "beats" counts.
+
+| Workload | luajit | relon_jit¹ | wasm | wasm_fast | llvm_aot | llvm_aot_fast | cranelift | bytecode | tree_walk | rust_native |
+|---|---|---|---|---|---|---|---|---|---|---|
+| W1_int_sum | 14.52 µs | — | 6.27 µs | 6.11 µs² | — | — | — | 1.236 ms | 16.90 ms | — |
+| W2_f64_dot | 12.58 µs | — | 1.265 µs | 1.096 µs | — | — | — | 244.0 µs | 3.449 ms | — |
+| W3_string_concat | 1.154 ms | — | 2.354 µs | — | — | — | — | 2.501 ms | 5.817 ms | — |
+| W4_string_contains | 14.55 µs | 16.88 µs (fx) | 5.076 µs | 4.902 µs | — | — | — | 5.203 ms | 36.50 ms | — |
+| W4_long_haystack | 14.56 µs | 16.36 µs (fx) | 5.309 µs | 5.133 µs | — | — | — | — | 36.21 ms | — |
+| W5_dict_str_key | 99.37 µs | 51.21 ms | — | — | — | — | — | — | 52.08 ms | — |
+| W6_list_int_sum_plus_one | 53.08 µs | 2.106 ms | 14.67 µs | 14.50 µs | — | — | — | 2.038 ms | 30.71 ms | — |
+| W7_fib | 909.8 µs | 20.30 ms | 229.2 µs | 228.9 µs | 85.85 µs | **84.99 µs** | — | 20.29 ms | 132.1 ms | 84.96 µs |
+| W8_poly_callsite | 105.4 µs | 51.20 ms | — | — | — | — | — | — | 51.60 ms | — |
+| W9_nested_matrix | 44.62 µs | 6.449 ms | — | — | — | — | — | — | 6.538 ms | — |
+| W10_config_eval | 17.58 µs | 4.544 ms | — | — | — | — | — | — | 4.600 ms | — |
+| W12_p99_tail | 89.10 ns | 559.3 ns | 229.3 ns | 62.86 ns | 196.2 ns | **2.89 ns** | 683.7 ns | 105.1 ns | 1.291 µs | 4.82 ns |
+| W13_deep_dict_access | 3.993 µs | 3.989 ms | — | — | — | — | — | — | 4.086 ms | — |
+| W14_schema_validate | 9.111 µs | 567.96 µs | 4.159 µs | 3.977 µs | — | — | 6.990 µs | 575.4 µs | 3.645 ms | — |
+| W15_conditional_field | 4.525 µs | 259.3 µs | 1.951 µs | 1.755 µs | — | — | 4.589 µs | 258.7 µs | 2.156 ms | — |
+| W16_quicksort | 1.336 ms | 119.4 ms | — | — | **150.1 µs** | — | n/a³ | — | 119.0 ms | 148.1 µs |
+| W17_binary_search | 6.241 µs | 483.0 µs | 12.81 µs | 12.63 µs | 3.439 µs | **3.226 µs** | — | — | 3.863 ms | 2.282 µs |
+| W18_prime_count_trial_div | 2.732 ms | 536.7 ms | — | — | **1.682 ms** | — | — | — | 533.0 ms | 751.0 µs |
+| W19_matrix_multiply | 46.64 µs | 28.69 ms | — | — | **12.58 µs** | — | — | — | 28.55 ms | 10.40 µs |
+| W20_n_body_softened | 211.9 µs | 242.7 ms | — | — | — | — | — | — | 241.1 ms | 25.14 µs |
+| W21_match_dispatch | 133.8 µs | 43.88 ms | — | — | — | — | — | — | 45.04 ms | — |
+| W23_dict_spread | 2.860 ms | — | — | — | — | — | — | — | 86.13 ms | — |
+| W24_list_comprehension | 77.40 µs | — | — | — | — | — | — | — | 10.76 ms | — |
+| W25_pipe_chain | 45.01 µs | — | — | — | — | — | — | — | 35.75 ms | — |
+| W26_fstring_interp | 63.38 µs | 2.582 ms | — | — | — | — | — | — | 2.633 ms | — |
+| W27_stdlib_dict | 10.12 ms | — | — | — | — | — | — | — | 151.3 ms | — |
+| W28_float_mixed_ops | 72.64 µs | — | — | — | — | — | — | — | 20.85 ms | — |
+| W30_strict_mode_baseline | 52.92 µs | — | — | — | — | — | — | 2.037 ms | 30.50 ms | — |
+
+¹ `relon_jit` = tree-walker/bytecode fallthrough (active_tier ≠ Compiled), NOT trace-JIT.
+² W1 wasm_fast 6.11 µs ≈ 0.61 ns/iter — below the <1 ns/iter fold gate; the Cranelift
+backend re-folds the arithmetic-progression sum (the same fold suppressed for LLVM in
+audit #332). Excluded from the headline JIT-beats-LuaJIT count as a paper-win risk.
+³ W16 cranelift `relon_aot` row n/a — cranelift frontend panic (var3 type mismatch on the
+list-materialize shape; caught → n/a). LLVM AOT path is unaffected (150.1 µs). Follow-up.
+
+### Re-derived honest "beats" scorecard (from the surviving real rows above)
+
+**A real compiled tier (wasm/wasm_fast/llvm_aot/llvm_aot_fast — NOT relon_jit, NOT _fixture)
+beats LuaJIT on 13 of 28 workloads** (excluding the W1 fold-suspect; 14 if W1 counted):
+W2 0.087×, W3 0.002×⁴, W4 0.34×, W4_long 0.35×, W6 0.27×, W7 0.093×, W12 0.032×,
+W14 0.44×, W15 0.39×, W16 0.11×, W17 0.52×, W18 0.62×, W19 0.27×. **The four numeric
+kernels W16/W17/W18/W19 are new this push.** → JIT 超越 LuaJIT: MET, broad.
+⁴ W3 0.002× is a complexity-class asymmetry (LuaJIT O(n²) `..` concat vs relon O(n) arena
+fill), not a pure codegen ratio — noted, not a headline.
+
+**llvm_aot rivals/beats rust_native on 6 workloads with valid (non-fold) Rust baselines:**
+| Workload | best llvm_aot | rust_native | ratio | verdict |
+|---|---|---|---|---|
+| W12_p99_tail | 2.89 ns | 4.82 ns | **0.60×** | beats Rust |
+| W7_fib | 84.99 µs | 84.96 µs | **1.00×** | parity |
+| W16_quicksort | 150.1 µs | 148.1 µs | **1.013×** | parity |
+| W19_matrix_multiply | 12.58 µs | 10.40 µs | **1.21×** | near |
+| W17_binary_search | 3.226 µs | 2.282 µs | **1.41×** | close |
+| W18_prime_count_trial_div | 1.682 ms | 751.0 µs | **2.24×** | outlier (closure-dispatch gap, #354) |
+
+→ AOT 比肩 Rust: MET on 5 of 6 (≤1.41×; 3 at/below parity); W18 the lone outlier at
+2.24×, a localized per-element closure-dispatch codegen gap (#354), not list-materialization
+(W16 proves that competitive). W20 (n-body) has a Rust baseline (25.14 µs) but no llvm_aot
+row yet — Float + List<Float> + float-closure track, deferred.
