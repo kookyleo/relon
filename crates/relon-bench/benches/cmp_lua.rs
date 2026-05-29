@@ -446,8 +446,8 @@ fn paper_win_brand_dispatch_label(label: &str) -> bool {
 }
 
 /// Tier 4 Phase 2 (panel expansion 2026-05-29): label gate for the
-/// container-construction-sugar rows. Initial entry: W23 dict spread;
-/// W24 / W25 join in their respective Phase 2 commits.
+/// container-construction-sugar rows. Entries: W23 dict spread; W24
+/// list comprehension. W25 joins in its follow-up commit.
 ///
 /// Per-workload rationale:
 ///
@@ -458,8 +458,15 @@ fn paper_win_brand_dispatch_label(label: &str) -> bool {
 ///   production source is a paper-win per the /perf "Same code path?"
 ///   rule — the host-allocator dict copy is not the same code path
 ///   the tree-walker / LuaJIT runs.
+/// * **W24** — the comprehension `[x * 2 for x in range(n) if x % 3
+///   == 0]` is an arithmetic progression (multiples of 3 doubled);
+///   rustc + LLVM -O3 collapses the loop to a closed-form polynomial
+///   in `n` (same fold pattern as W1 / W6 in
+///   `paper_win_closed_form_fold_label`). Booking that O(1)
+///   arithmetic under a `rust_native` label against an O(n) LuaJIT
+///   loop is a paper-win per the /perf "Same algorithm?" rule.
 ///
-/// The label IS retained in `canonical_panel` because the
+/// The labels ARE retained in `canonical_panel` because the
 /// `relon_jit` row legitimately routes the production source through
 /// `JitEvaluator::run_main` (falls through to the tree-walker today);
 /// the wasm / llvm_aot / cranelift_aot rows already gate out via
@@ -467,7 +474,7 @@ fn paper_win_brand_dispatch_label(label: &str) -> bool {
 /// dedicated tree_walk + luajit rows above carry the row headlines.
 /// The `rust_native` row is suppressed end-to-end via this gate.
 fn paper_win_container_sugar_label(label: &str) -> bool {
-    matches!(label, "W23_dict_spread")
+    matches!(label, "W23_dict_spread" | "W24_list_comprehension")
 }
 
 // Honesty cleanup #309 (2026-05-28): the previous
@@ -2953,6 +2960,114 @@ fn w23_expected() -> i64 {
 }
 
 // =====================================================================
+// =====  W24 — list comprehension with predicate filter  ==============
+// =====================================================================
+//
+// Tier 4 Relon-flavour workload (panel expansion 2026-05-29, Phase 2
+// "Group B — container construction sugar"). Mirrors the
+// `fixtures/data_structures.relon` showcase `[x for x in range(n) if
+// pred]` form: the comprehension materialises a filtered + mapped
+// list, then `list.sum` reduces it to a scalar. Tests the lowering
+// path that goes through the comprehension AST node rather than the
+// `.filter().map()` chain (which W6 / W10 already cover).
+//
+// **HONESTY checklist** (per `HONESTY_POLICY.md`):
+// * Source path: `w24_relon_src()` IS the spec form — `list.sum([x *
+//   2 for x in range(n) if x % 3 == 0])`. The comprehension AST node
+//   walks `range(n)`, applies the predicate, doubles surviving
+//   elements, and builds a materialised list; `list.sum` then
+//   reduces it. The Lua row uses the equivalent `for / if` loop.
+// * Algorithm complexity preserved: O(n) iteration over `range(n)`,
+//   one predicate eval + one mul + one conditional list-push per
+//   iter, plus a final O(filtered) sum. The per-iter result depends
+//   on the predicate hit/miss alternation, no closed-form fold.
+// * Time-math sanity: predicate `x % 3 == 0` over `x ∈ [0, n)` keeps
+//   `x ∈ {0, 3, 6, ..., 3*floor((n-1)/3)}`. For n=10 000 the count
+//   is `ceil(10000/3) = 3334`; the kept values are `0, 3, ..., 9999`.
+//   Doubling gives `0, 6, ..., 19998`. Sum = `2 * (0 + 3 + ... +
+//   9999) = 2 * 3 * (0 + 1 + ... + 3333) = 6 * 3333 * 3334 / 2 =
+//   3 * 3333 * 3334 = 33 336 666`.
+// * I/O shape: `#main(Int n) -> Int`. Returns the Int sum directly;
+//   Lua row returns the scalar Int. Both flow through
+//   `assert_relon_lua_consistent` for an exact-equal cross-check.
+// * Backend coverage: tree_walk + luajit. Bytecode envelope rejects
+//   the comprehension AST node (`unsupported expression
+//   `Comprehension`` from the bytecode lowering pipeline, probed
+//   2026-05-29); LLVM AOT / Cranelift AOT / wasm reject the same
+//   surface (comprehension lowering not in any of the Z.4 / Phase E
+//   roadmaps today). The canonical-panel `relon_jit` row routes the
+//   production source through `JitEvaluator::run_main`, which falls
+//   through to the tree-walker for the comprehension body.
+//   `rust_native` is NOT applicable: a Rust-side iterator chain
+//   (`(0..n).filter(...).map(...).sum()`) collapses the predicate
+//   + map + sum to an arithmetic-progression closed form (the
+//   even-spaced multiples of 3 are an arithmetic sequence — LLVM
+//   -O3 folds the sum to a closed-form polynomial, same fold pattern
+//   as W6 in `paper_win_closed_form_fold_label`). Booking that
+//   O(1) arithmetic under a `rust_native` label against the
+//   production-source LuaJIT row would be a paper win per `/perf`
+//   Honesty Rules. The row is gated out via
+//   `paper_win_container_sugar_label` below.
+
+/// W24 scale — n = 10 000 input range. Same scale as W23. The
+/// per-iter work is lighter than W23 (one mod + one mul + one
+/// optional list-push) so the tree-walker per run lands sub-ms;
+/// 100 samples + warmup fits comfortably in the 5 s budget.
+const W24_N: i64 = 10_000;
+
+fn w24_relon_src() -> &'static str {
+    // Production source: spec form straight from §1 W24 of
+    // `docs/internal/tier4-plan-2026-05-29.md`. The comprehension
+    // node materialises the filtered + mapped list; `list.sum`
+    // reduces it. `#import list from "std/list"` brings the `sum`
+    // method into scope (same import the W1 / W2 / W6 sources use).
+    // `#unstrict` for the untyped `x` binder.
+    "#unstrict\n\
+     #import list from \"std/list\"\n\
+     #main(Int n) -> Int\n\
+     list.sum([x * 2 for x in range(n) if x % 3 == 0])"
+}
+
+fn w24_lua_src() -> String {
+    // Lua row uses the equivalent imperative loop. Lua has no list
+    // comprehension; the canonical equivalent is `for x = 0, n-1 do
+    // if x % 3 == 0 then s = s + x * 2 end end`. Per-iter work is
+    // shape-equivalent: one mod + one branch + (on hit) one mul +
+    // one acc add. We do NOT materialise an intermediate table; the
+    // comprehension's per-iter work folds to the same `s += x*2`
+    // shape after the dead-store elimination LuaJIT would perform on
+    // a `table.insert` + `sum` two-pass form, so the direct loop is
+    // the honest equivalent baseline.
+    format!(
+        r#"return function()
+            local n = {n}
+            local s = 0
+            for x = 0, n - 1 do
+                if x % 3 == 0 then
+                    s = s + x * 2
+                end
+            end
+            return s
+        end"#,
+        n = W24_N
+    )
+}
+
+fn w24_expected() -> i64 {
+    // Analytic check: for n=10 000 the kept values are 0, 3, ..., 9999.
+    // Count = 3334; sum of kept values = 3 * (0 + 1 + ... + 3333) =
+    // 3 * 3333 * 3334 / 2 = 16 668 333. Doubled = 33 336 666.
+    //
+    // Closed-form derivation kept as code so any change to n
+    // surfaces immediately in the cross-check.
+    let n = W24_N;
+    let count = (n + 2) / 3; // ceil(n/3) for n>=0
+    let last_kept = (count - 1) * 3; // largest multiple of 3 < n
+    let sum_kept = last_kept * count / 2; // arithmetic sum 0..last step 3
+    2 * sum_kept
+}
+
+// =====================================================================
 // =====  consistency assertions  ======================================
 // =====================================================================
 
@@ -3684,6 +3799,15 @@ fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
         // `paper_win_container_sugar_label`). Returning `None` keeps
         // the row honest.
         "W23_dict_spread" => None,
+        // Panel expansion 2026-05-29 (Tier 4 Phase 2 — Group B container
+        // construction sugar W24): production source uses the
+        // comprehension AST node outside the Phase E typed envelope.
+        // No inlined variant — a `.filter().map().sum()` rewrite is
+        // an arithmetic-progression sum that LLVM -O3 folds to a
+        // closed-form polynomial (same shape as W6, gated via
+        // `paper_win_container_sugar_label`). Returning `None` keeps
+        // the row honest.
+        "W24_list_comprehension" => None,
         _ => None,
     }
 }
@@ -5754,6 +5878,76 @@ fn bench_cmp_lua(c: &mut Criterion) {
         }
     }
 
+    // ----- W24 list comprehension with predicate filter -----
+    //
+    // Panel expansion 2026-05-29 (Tier 4 Phase 2 — Group B container
+    // construction sugar). See the top-of-file W24 doc-comment for
+    // the HONESTY checklist. Backend coverage: tree_walk + luajit
+    // only. Bytecode envelope rejects the comprehension AST node;
+    // LLVM AOT / Cranelift AOT / wasm reject the same surface. The
+    // canonical-panel `relon_jit` row falls through to the
+    // tree-walker.
+    {
+        let (walker, scope) = build_tree_walker(w24_relon_src());
+        let lua_fn_w24 = lua_fn(&lua, &w24_lua_src());
+
+        let relon_v = relon_int_result("W24", walker.run_main(&scope, args_w_n(W24_N)).unwrap());
+        let lua_v: i64 = lua_fn_w24.call(()).unwrap();
+        assert_relon_lua_consistent("W24", relon_v, lua_v, w24_expected());
+
+        // Throughput is the input range count (`n`) — each input
+        // element pays one predicate eval + one optional mul +
+        // conditional list-push, plus the final sum is O(filtered).
+        // We use `n` rather than the filtered count so per-element
+        // ns is directly comparable across the Tier 1-4 rows.
+        group.throughput(Throughput::Elements(W24_N as u64));
+        group.bench_function(
+            BenchmarkId::new("W24_list_comprehension", "relon_tree_walk"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(W24_N);
+                    timed_with_warmup(iters, || {
+                        let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
+        group.bench_function(BenchmarkId::new("W24_list_comprehension", "luajit"), |b| {
+            b.iter_custom(|iters| {
+                timed_with_warmup(iters, || {
+                    let v: i64 = lua_fn_w24.call(()).unwrap();
+                    black_box(v);
+                })
+            });
+        });
+        // Bytecode row — honest try. Comprehension AST node sits
+        // outside the M2-A envelope; `try_build_bytecode` returns
+        // None and the row is omitted.
+        if let Some(ev) = try_build_bytecode(w24_relon_src(), "W24_list_comprehension") {
+            let v = ev.run_main(args_w_n(W24_N)).expect("W24 bytecode run_main");
+            let got = relon_int_result("W24", v);
+            assert_eq!(
+                got,
+                w24_expected(),
+                "W24 bytecode result mismatch: got {got}, expected {}",
+                w24_expected()
+            );
+            group.bench_function(
+                BenchmarkId::new("W24_list_comprehension", "relon_bytecode"),
+                |b| {
+                    b.iter_custom(|iters| {
+                        let n_in = black_box(W24_N);
+                        timed_with_warmup(iters, || {
+                            let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
+                            black_box(v);
+                        })
+                    });
+                },
+            );
+        }
+    }
+
     // =================================================================
     // ===== Dart-style canonical panel: relon_jit + relon_aot =========
     // =================================================================
@@ -5995,6 +6189,27 @@ fn bench_cmp_lua(c: &mut Criterion) {
         ("W23_dict_spread", w23_relon_src(), W23_N as u64, || {
             args_w_n(W23_N)
         }),
+        // Panel expansion 2026-05-29 (Tier 4 Phase 2 — Group B container
+        // construction sugar W24):
+        // * relon_jit: runs through `JitEvaluator::run_main`; falls
+        //   through to the tree-walker (comprehension AST node sits
+        //   outside the M2-A bytecode envelope today — bytecode probe
+        //   surfaces `unsupported expression `Comprehension``).
+        // * relon_aot / relon_llvm_aot: both reject. Returning None
+        //   from `llvm_aot_source_for`.
+        // * rust_native: gated out by `paper_win_container_sugar_label`.
+        //   The kept values are multiples of 3 doubled — arithmetic
+        //   progression that LLVM -O3 folds to a closed-form polynomial,
+        //   same shape as W6.
+        // * relon_wasm_wasmtime: classifier scope-cut.
+        // * Throughput uses input range count `n` so per-element ns is
+        //   directly comparable across the Tier 1-4 Relon-flavour rows.
+        (
+            "W24_list_comprehension",
+            w24_relon_src(),
+            W24_N as u64,
+            || args_w_n(W24_N),
+        ),
     ];
 
     for (label, src, throughput_n, args_factory) in canonical_panel {
