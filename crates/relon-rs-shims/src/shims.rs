@@ -183,8 +183,30 @@ mod tests {
         (buf, h_off, n_off)
     }
 
+    /// Serialize + reset the process-global `STR_CONTAINS_ARENA_IC` for the
+    /// duration of a test. Without this, sibling tests run concurrently and
+    /// the allocator can hand a fresh buffer the same address a prior test's
+    /// freed buffer used; the pointer-keyed IC would then surface that prior
+    /// test's stale result. Holding the guard for the whole test (not just the
+    /// reset) keeps a concurrent sibling from re-polluting the slot mid-call.
+    fn lock_and_reset_ic() -> std::sync::MutexGuard<'static, ()> {
+        static IC_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = IC_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        STR_CONTAINS_ARENA_IC
+            .last_haystack
+            .store(core::ptr::null_mut(), Ordering::Relaxed);
+        STR_CONTAINS_ARENA_IC
+            .last_needle
+            .store(core::ptr::null_mut(), Ordering::Relaxed);
+        STR_CONTAINS_ARENA_IC
+            .last_result
+            .store(0, Ordering::Relaxed);
+        guard
+    }
+
     #[test]
     fn matches_short_needle() {
+        let _ic = lock_and_reset_ic();
         let (buf, h_off, n_off) = build_two_records(b"axb", b"x");
         let h_ptr = unsafe { buf.as_ptr().add(h_off) };
         let n_ptr = unsafe { buf.as_ptr().add(n_off) };
@@ -194,6 +216,7 @@ mod tests {
 
     #[test]
     fn misses_when_needle_absent() {
+        let _ic = lock_and_reset_ic();
         let (buf, h_off, n_off) = build_two_records(b"abc", b"z");
         let h_ptr = unsafe { buf.as_ptr().add(h_off) };
         let n_ptr = unsafe { buf.as_ptr().add(n_off) };
@@ -203,6 +226,7 @@ mod tests {
 
     #[test]
     fn empty_needle_always_matches() {
+        let _ic = lock_and_reset_ic();
         let (buf, h_off, n_off) = build_two_records(b"anything", b"");
         let h_ptr = unsafe { buf.as_ptr().add(h_off) };
         let n_ptr = unsafe { buf.as_ptr().add(n_off) };
@@ -218,6 +242,7 @@ mod tests {
 
     #[test]
     fn multibyte_utf8_needle() {
+        let _ic = lock_and_reset_ic();
         let haystack = "hello 🦀 world".as_bytes();
         let needle = "🦀".as_bytes();
         let (buf, h_off, n_off) = build_two_records(haystack, needle);
