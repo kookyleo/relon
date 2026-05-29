@@ -4189,46 +4189,19 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .map_err(|e| LlvmError::Codegen(format!("CallClosure captures load: {e}")))?
             .into_int_value();
 
-        // Coerce each user arg's LLVM type to the callee's expected
-        // shape (mirrors `emit_call`'s width-coercion path).
-        for (i, (slot, want_ty)) in user_args.iter_mut().zip(param_tys.iter()).enumerate() {
-            let want_width = match *want_ty {
-                IrType::I64 => 64,
-                IrType::I32
-                | IrType::Bool
-                | IrType::Null
-                | IrType::String
-                | IrType::ListInt
-                | IrType::ListFloat
-                | IrType::ListBool
-                | IrType::ListString
-                | IrType::ListSchema
-                | IrType::Closure => 32,
-                IrType::F64 => 64,
-            };
-            let have_width = slot.get_type().get_bit_width();
-            if have_width != want_width {
-                let target_ty = if want_width == 64 {
-                    self.ctx.i64_type()
-                } else {
-                    self.ctx.i32_type()
-                };
-                let coerced = if have_width < want_width {
-                    self.builder
-                        .build_int_z_extend(*slot, target_ty, "cc_arg_zext")
-                        .map_err(|e| {
-                            LlvmError::Codegen(format!("CallClosure arg #{i} zext: {e}"))
-                        })?
-                } else {
-                    self.builder
-                        .build_int_truncate(*slot, target_ty, "cc_arg_trunc")
-                        .map_err(|e| {
-                            LlvmError::Codegen(format!("CallClosure arg #{i} trunc: {e}"))
-                        })?
-                };
-                *slot = coerced;
-            }
-        }
+        // NOTE: per-arg width coercion is deferred into each switch
+        // case below. A module may host several same-arity lambdas with
+        // *different* param widths (AOT-4 W16 binds a `List<Int>`-taking
+        // recursive `sum_qs` (i32 handle) alongside a 1-arg `(x: Int)`
+        // filter predicate (i64) — both arity 1). Coercing once here to
+        // this call site's `param_tys` and then reusing the coerced
+        // values across every switch case would emit a wrong-width arg
+        // into the sibling lambda's case (which is statically present
+        // but dynamically dead) and the LLVM verifier rejects the whole
+        // module. Coercing per-case against the *callee's* declared LLVM
+        // param type keeps each case well-typed; the runtime
+        // `fn_table_idx` only ever selects the case whose lambda matches
+        // the handle, so the sibling cases are never executed.
 
         // Dispatch through a switch over fn_table_idx → one direct
         // call per lambda. This avoids needing a runtime function-
@@ -4329,13 +4302,45 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 })?;
                 continue;
             }
-            // Build args: (state, captures_ptr, user_args...).
+            // Build args: (state, captures_ptr, user_args...). Coerce
+            // each user arg to *this callee's* declared LLVM param width
+            // (param 0 = state ptr, param 1 = captures_ptr, params 2.. =
+            // the user args) so a same-arity sibling lambda with a
+            // different param width still type-checks in its (dead) case.
+            let callee_param_tys = callee.get_type().get_param_types();
             let mut call_args: Vec<BasicMetadataValueEnum<'ctx>> =
                 Vec::with_capacity(2 + user_args.len());
             call_args.push(state_ptr.into());
             call_args.push(captures_ptr.into());
-            for v in &user_args {
-                call_args.push((*v).into());
+            for (i, v) in user_args.iter().enumerate() {
+                let want_width = match callee_param_tys.get(2 + i) {
+                    Some(inkwell::types::BasicMetadataTypeEnum::IntType(t)) => t.get_bit_width(),
+                    _ => v.get_type().get_bit_width(),
+                };
+                let have_width = v.get_type().get_bit_width();
+                let coerced = if have_width == want_width {
+                    *v
+                } else {
+                    let target_ty = if want_width == 64 {
+                        self.ctx.i64_type()
+                    } else {
+                        self.ctx.i32_type()
+                    };
+                    if have_width < want_width {
+                        self.builder
+                            .build_int_z_extend(*v, target_ty, "cc_arg_zext")
+                            .map_err(|e| {
+                                LlvmError::Codegen(format!("CallClosure arg #{i} zext: {e}"))
+                            })?
+                    } else {
+                        self.builder
+                            .build_int_truncate(*v, target_ty, "cc_arg_trunc")
+                            .map_err(|e| {
+                                LlvmError::Codegen(format!("CallClosure arg #{i} trunc: {e}"))
+                            })?
+                    }
+                };
+                call_args.push(coerced.into());
             }
             let name = self.next_name("cc_call");
             let call_site = self

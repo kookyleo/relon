@@ -106,10 +106,21 @@ struct LowerCtx<'a> {
     /// Phase 10-a: lambda functions emitted in this lowering pass.
     /// Each entry is a fully-lowered closure body with the implicit
     /// `captures_ptr: i32` as its first parameter; the closure-table
-    /// emit step picks the entries up in declaration order. Shared
-    /// across nested closure sites so the table assignment stays
-    /// stable.
-    lambda_funcs: Vec<Func>,
+    /// emit step picks the entries up in declaration order.
+    ///
+    /// AOT-4 fix: this is a **module-wide shared** slot table (an
+    /// `Rc<RefCell<...>>` cloned into every nested closure-body ctx) so
+    /// the `fn_table_idx` an `Op::MakeClosure` bakes in is a GLOBAL
+    /// closure-table slot — even for a lambda created *inside* another
+    /// lambda's body (the W16 filter predicate built inside the
+    /// recursive `sum_qs` helper). Pre-fix each nested ctx numbered its
+    /// own lambdas from 0, so a predicate MakeClosure'd inside a helper
+    /// got `fn_table_idx=0` and dispatched to the helper at runtime
+    /// (wrong callee → trap / SIGSEGV). The slot is RESERVED (a `None`
+    /// placeholder pushed) before the lambda body lowers so a nested
+    /// lambda created during that body takes the next slot; the Func is
+    /// filled in afterwards.
+    lambda_table: Rc<RefCell<Vec<Option<Func>>>>,
     /// Phase F.2 (W7 anon-Dict-return): per-let-idx signature for
     /// closure-typed let-bindings. Populated when the W7 anon-Dict
     /// return path binds a closure-typed dict field as an internal
@@ -270,7 +281,7 @@ impl<'a> LowerCtx<'a> {
             method_registry,
             self_binding: None,
             method_params: Vec::new(),
-            lambda_funcs: Vec::new(),
+            lambda_table: Rc::new(RefCell::new(Vec::new())),
             closure_let_signatures: HashMap::new(),
         }
     }
@@ -299,9 +310,33 @@ impl<'a> LowerCtx<'a> {
             method_registry,
             self_binding: Some(self_binding),
             method_params,
-            lambda_funcs: Vec::new(),
+            lambda_table: Rc::new(RefCell::new(Vec::new())),
             closure_let_signatures: HashMap::new(),
         }
+    }
+
+    /// Clone the shared module-wide lambda slot table for a nested
+    /// closure-body ctx so a lambda created inside that body reserves a
+    /// GLOBAL `fn_table_idx`. Mirrors [`intern_handle`].
+    fn lambda_table_handle(&self) -> Rc<RefCell<Vec<Option<Func>>>> {
+        Rc::clone(&self.lambda_table)
+    }
+
+    /// Reserve the next global closure-table slot, returning its index.
+    /// The slot is filled with [`None`] until the lambda Func is built;
+    /// reserving up-front (before the body lowers) keeps a nested
+    /// lambda's slot strictly after its parent's.
+    fn reserve_lambda_slot(&self) -> u32 {
+        let mut table = self.lambda_table.borrow_mut();
+        let idx = table.len() as u32;
+        table.push(None);
+        idx
+    }
+
+    /// Fill a previously [`reserve_lambda_slot`]-reserved slot with its
+    /// built Func.
+    fn set_lambda_slot(&self, idx: u32, func: Func) {
+        self.lambda_table.borrow_mut()[idx as usize] = Some(func);
     }
 
     /// Clone the shared intern handle for spawning a nested
@@ -781,10 +816,26 @@ fn lower_entry_with_resolver<'a>(
         op: Op::Return,
         range: sig.range,
     });
+    // Hoist the lambda funcs emitted by the entry body's lowering pass
+    // from the module-wide shared slot table. Each slot was reserved in
+    // global `fn_table_idx` order (a parent lambda before any lambda
+    // created inside its body), so the table is already in
+    // closure-table order. Every slot must be filled by now — a `None`
+    // would mean a reserved slot whose Func was never built (a lowering
+    // bug), so surface it loudly rather than emit a broken module.
+    let entry_lambda_funcs: Vec<Func> = ctx
+        .lambda_table
+        .borrow_mut()
+        .drain(..)
+        .enumerate()
+        .map(|(i, slot)| {
+            slot.ok_or_else(|| LoweringError::UnsupportedExpr {
+                kind: format!("closure-table slot {i} reserved but never filled"),
+                range: sig.range,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let body = ctx.out;
-    // Hoist the lambda funcs emitted by the entry body's lowering
-    // pass; the entry context is consumed by the move below.
-    let entry_lambda_funcs = ctx.lambda_funcs;
 
     let func = Func {
         name: "run_main".to_string(),
@@ -2045,12 +2096,21 @@ fn lower_closure_as_value(
     lambda_param_tys.push(IrType::I32);
     lambda_param_tys.extend(expected_param_tys.iter().copied());
 
+    // AOT-4 fix: reserve THIS lambda's global closure-table slot BEFORE
+    // lowering its body, so any lambda created inside the body (e.g. the
+    // W16 filter predicate built inside the recursive `sum_qs` helper)
+    // reserves a strictly-later slot. The reserved slot is the
+    // `fn_table_idx` the outer `MakeClosure` will reference; the body is
+    // lowered next, then the built Func is dropped into the slot.
+    let fn_table_idx = ctx.reserve_lambda_slot();
+
     // Use a fresh LowerCtx — captures + lambda params become its let
     // bindings. Cloning the schema resolver / method registry is a
     // cheap re-use of the outer-side shared maps; the inner walk
     // never mutates them. #151 — share the outer ctx's intern handle
     // so any literal lowered inside the lambda body participates in
-    // the module-wide dedup table.
+    // the module-wide dedup table. AOT-4 — share the module-wide lambda
+    // slot table so a nested lambda's `fn_table_idx` is a global slot.
     const EMPTY_PARAMS: &[LocalBinding] = &[];
     let mut inner = LowerCtx::new(
         EMPTY_PARAMS,
@@ -2058,6 +2118,7 @@ fn lower_closure_as_value(
         ctx.method_registry.clone(),
         ctx.intern_handle(),
     );
+    inner.lambda_table = ctx.lambda_table_handle();
 
     // Prologue: load each capture into a fresh inner let-local.
     let mut inner_let_idx: u32 = 0;
@@ -2172,19 +2233,14 @@ fn lower_closure_as_value(
         range: lambda_body.range,
     });
 
-    // Nested lambdas inside `inner` would land in `inner.lambda_funcs`;
-    // append them after the outer body so the closure table stays
-    // contiguous. (Phase 10-a doesn't surface nested lambdas through
-    // the user-facing stdlib calls, but the recursion stays sound.)
-    let nested_lambdas = std::mem::take(&mut inner.lambda_funcs);
-
     // -----------------------------------------------------------------
-    // Outer-side: emit the MakeClosure op. The closure-table slot is
-    // determined by the lambda's position in `ctx.lambda_funcs` —
-    // appending below makes the slot a deterministic index from
-    // source order.
+    // Outer-side: emit the MakeClosure op. The closure-table slot was
+    // RESERVED before the body lowered (`fn_table_idx` above) on the
+    // module-wide shared `lambda_table`; nested lambdas created during
+    // the body took strictly-later slots through the same shared table.
+    // Drop the built Func into its reserved slot. The final closure
+    // table is assembled (in slot order) by the entry assembler.
     // -----------------------------------------------------------------
-    let fn_table_idx = ctx.lambda_funcs.len() as u32;
     let lambda_func = Func {
         name: format!("__closure_{}", fn_table_idx),
         params: lambda_param_tys,
@@ -2192,10 +2248,7 @@ fn lower_closure_as_value(
         body: inner.out,
         range: closure_range,
     };
-    ctx.lambda_funcs.push(lambda_func);
-    // Append nested lambdas (if any) immediately after — they'll get
-    // table slots `fn_table_idx + 1..N`.
-    ctx.lambda_funcs.extend(nested_lambdas);
+    ctx.set_lambda_slot(fn_table_idx, lambda_func);
 
     ctx.out.push(TaggedOp {
         op: Op::MakeClosure {
@@ -2364,6 +2417,21 @@ fn lower_fn_call(
     if let Some(()) = try_lower_len_filter_range(path, args, range, ctx)? {
         return Ok(());
     }
+    // AOT-4 (W16 slice): general `_len(xs)` / `_list_filter(xs, f)` on
+    // an arbitrary `List<Int>`-typed argument (a where-bound
+    // materialised range, a `#main` `List<Int>` param, or a nested
+    // `_list_filter(...)` result). These run AFTER the fused
+    // `_len(_list_filter(range(...)))` peephole above so that specific
+    // shape keeps its single-pass lowering; here the argument is
+    // lowered first and the handler only commits when it actually
+    // produced a `List<Int>` handle (otherwise the speculative
+    // lowering is discarded and dispatch falls through).
+    if let Some(()) = try_lower_list_len(path, args, range, ctx)? {
+        return Ok(());
+    }
+    if let Some(()) = try_lower_list_filter(path, args, range, ctx)? {
+        return Ok(());
+    }
     // review-improvement-160 bytecode M3 phase 2: peephole-desugar
     // `list.sum(range(end))` / `list.sum(range(start, end))` into an
     // explicit `Op::Loop` accumulator before normal lowering kicks in.
@@ -2387,6 +2455,14 @@ fn lower_fn_call(
     // `range(start, end)` produces the integers `[start, end)` (empty
     // when `start >= end`) and `list.sum([])` returns `0`.
     if let Some(()) = try_lower_list_sum_range(path, args, range, ctx)? {
+        return Ok(());
+    }
+    // AOT-4 (W16 slice): general `list.sum(<List<Int> handle>)` — the
+    // equal-partition fold in the W16 quicksort kernel
+    // (`list.sum(_list_filter(xs, (x) => x == xs[0]))`). Runs after the
+    // `list.sum(range(...))` eliding peephole so a raw range still folds
+    // without materialising; here the argument is a materialised handle.
+    if let Some(()) = try_lower_list_sum_value(path, args, range, ctx)? {
         return Ok(());
     }
     // Open follow-up #2: `range(start, end)[. map(...) | . filter(...)]*.len()`
@@ -3633,6 +3709,361 @@ fn try_lower_len_filter_range(
     ctx.tstack.pop(); // filtered list handle
     ctx.tstack.push(IrType::I64);
     Ok(Some(()))
+}
+
+/// AOT-4 (W16 slice): general `_len(xs)` / `len(xs)` over an arbitrary
+/// `List<Int>`-typed argument (vs the fused
+/// `_len(_list_filter(range(...)))` peephole). Lowers the argument
+/// speculatively into a scratch op stream; commits only when it
+/// produced an `IrType::ListInt` handle, emitting `Op::ReadStringLen`
+/// (reads the leading `[len: u32 LE]` prefix the record layout shares
+/// with strings) widened to I64 — matching the tree-walker `_len`,
+/// which returns the element count as `Int`.
+fn try_lower_list_len(
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    if path.len() != 1 || args.len() != 1 || args[0].name.is_some() {
+        return Ok(None);
+    }
+    if !matches!(&path[0], TokenKey::String(s, _, _) if s == "_len" || s == "len") {
+        return Ok(None);
+    }
+    // Lower the argument into a scratch stream so a non-list result can
+    // be rolled back without polluting `ctx.out` / `ctx.tstack`.
+    let saved_out = std::mem::take(&mut ctx.out);
+    let saved_stack = std::mem::take(&mut ctx.tstack);
+    let saved_next_let = ctx.next_let_idx;
+    let saved_lambda_len = ctx.lambda_table.borrow().len();
+    let lower_res = lower_expr(&args[0].value.expr, args[0].value.range, ctx);
+    let produced = ctx.tstack.last().copied();
+    if lower_res.is_err() || produced != Some(IrType::ListInt) {
+        // Roll back: discard the scratch stream and restore the outer
+        // ctx untouched so the regular dispatch path re-lowers cleanly.
+        // Truncate any closure-table slots reserved during the discarded
+        // speculative lowering so the slot numbering stays dense (a
+        // leaked slot would offset every later `fn_table_idx`).
+        ctx.out = saved_out;
+        ctx.tstack = saved_stack;
+        ctx.next_let_idx = saved_next_let;
+        ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+        return Ok(None);
+    }
+    // Commit: splice the scratch stream back onto the outer ctx.
+    let arg_stream = std::mem::replace(&mut ctx.out, saved_out);
+    ctx.out.extend(arg_stream);
+    let arg_stack = std::mem::replace(&mut ctx.tstack, saved_stack);
+    ctx.tstack.extend(arg_stack);
+    ctx.out.push(TaggedOp {
+        op: Op::ReadStringLen,
+        range,
+    });
+    ctx.tstack.pop(); // ListInt handle
+    ctx.tstack.push(IrType::I64);
+    Ok(Some(()))
+}
+
+/// AOT-4 (W16 slice): general `_list_filter(xs, (x) => <pred>)` over an
+/// arbitrary `List<Int>`-typed first argument (vs the fused
+/// `_len(_list_filter(range(...)))` peephole, which only handles a bare
+/// `range(...)` source). Lowers the list argument speculatively;
+/// commits only when it produced an `IrType::ListInt` handle, then
+/// lowers the predicate closure and emits `Op::Call(list_int_filter)`,
+/// leaving a fresh `List<Int>` handle on the vstack so the result can
+/// be indexed, re-filtered, or recursed on.
+fn try_lower_list_filter(
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    if path.len() != 1 || args.len() != 2 || args.iter().any(|a| a.name.is_some()) {
+        return Ok(None);
+    }
+    if !matches!(&path[0], TokenKey::String(s, _, _) if s == "_list_filter") {
+        return Ok(None);
+    }
+    // Second arg must be a single-param closure literal.
+    let Expr::Closure { params, .. } = &*args[1].value.expr else {
+        return Ok(None);
+    };
+    if params.len() != 1 {
+        return Ok(None);
+    }
+    // Speculatively lower the list argument; roll back on a non-list
+    // result (or a lowering error) so dispatch can fall through.
+    let saved_out = std::mem::take(&mut ctx.out);
+    let saved_stack = std::mem::take(&mut ctx.tstack);
+    let saved_next_let = ctx.next_let_idx;
+    let saved_lambda_len = ctx.lambda_table.borrow().len();
+    let lower_res = lower_expr(&args[0].value.expr, args[0].value.range, ctx);
+    let produced = ctx.tstack.last().copied();
+    if lower_res.is_err() || produced != Some(IrType::ListInt) {
+        ctx.out = saved_out;
+        ctx.tstack = saved_stack;
+        ctx.next_let_idx = saved_next_let;
+        ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+        return Ok(None);
+    }
+    let arg_stream = std::mem::replace(&mut ctx.out, saved_out);
+    ctx.out.extend(arg_stream);
+    let arg_stack = std::mem::replace(&mut ctx.tstack, saved_stack);
+    ctx.tstack.extend(arg_stack);
+
+    // Resolve the bundled `list_int_filter` slot.
+    let filter_idx = stdlib_function_index("list_int_filter").ok_or_else(|| {
+        LoweringError::UnknownStdlibMethod {
+            name: "list_int_filter".to_string(),
+            arity: 2,
+            range,
+        }
+    })?;
+    let filter_meta = builtin_stdlib().get(filter_idx as usize).ok_or_else(|| {
+        LoweringError::UnknownStdlibMethod {
+            name: "list_int_filter".to_string(),
+            arity: 2,
+            range,
+        }
+    })?;
+    let filter_params = filter_meta.params.clone();
+    let filter_ret = filter_meta.ret;
+
+    // Lower the predicate closure (`(I64) -> Bool`).
+    let (param_tys_c, ret_ty_c) =
+        stdlib_closure_arg_signature("list_int_filter", 1).ok_or_else(|| {
+            LoweringError::UnsupportedExpr {
+                kind: "list_int_filter closure signature missing".to_string(),
+                range,
+            }
+        })?;
+    lower_closure_as_value(
+        &args[1].value.expr,
+        args[1].value.range,
+        &param_tys_c,
+        ret_ty_c,
+        ctx,
+    )?;
+    // Op::Call(list_int_filter): consumes [ListInt, Closure], produces a
+    // fresh List<Int> handle.
+    ctx.tstack.pop(); // closure
+    ctx.tstack.pop(); // source list handle
+    ctx.out.push(TaggedOp {
+        op: Op::Call {
+            fn_index: filter_idx,
+            arg_count: 2,
+            param_tys: filter_params,
+            ret_ty: filter_ret,
+        },
+        range,
+    });
+    ctx.tstack.push(filter_ret);
+    Ok(Some(()))
+}
+
+/// AOT-4 (W16 slice): general `list.sum(xs)` over an arbitrary
+/// `List<Int>`-typed argument (vs the `list.sum(range(...))` eliding
+/// peephole, which folds a raw range without materialising). Lowers the
+/// argument speculatively; commits only when it produced an
+/// `IrType::ListInt` handle, then emits `Op::Call(list_int_sum)` (the
+/// bundled i64-accumulator body) — used by the W16 quicksort kernel's
+/// `list.sum(_list_filter(xs, (x) => x == xs[0]))` equal-partition fold.
+fn try_lower_list_sum_value(
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    if path.len() != 2 || args.len() != 1 || args[0].name.is_some() {
+        return Ok(None);
+    }
+    let outer_head = matches!(&path[0], TokenKey::String(s, _, _) if s == "list");
+    let outer_method = matches!(&path[1], TokenKey::String(s, _, _) if s == "sum");
+    if !(outer_head && outer_method) {
+        return Ok(None);
+    }
+    // Speculatively lower the argument; roll back on a non-list result.
+    let saved_out = std::mem::take(&mut ctx.out);
+    let saved_stack = std::mem::take(&mut ctx.tstack);
+    let saved_next_let = ctx.next_let_idx;
+    let saved_lambda_len = ctx.lambda_table.borrow().len();
+    let lower_res = lower_expr(&args[0].value.expr, args[0].value.range, ctx);
+    let produced = ctx.tstack.last().copied();
+    if lower_res.is_err() || produced != Some(IrType::ListInt) {
+        ctx.out = saved_out;
+        ctx.tstack = saved_stack;
+        ctx.next_let_idx = saved_next_let;
+        ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+        return Ok(None);
+    }
+    let arg_stream = std::mem::replace(&mut ctx.out, saved_out);
+    ctx.out.extend(arg_stream);
+    let arg_stack = std::mem::replace(&mut ctx.tstack, saved_stack);
+    ctx.tstack.extend(arg_stack);
+
+    let sum_idx = stdlib_function_index("list_int_sum").ok_or_else(|| {
+        LoweringError::UnknownStdlibMethod {
+            name: "list_int_sum".to_string(),
+            arity: 1,
+            range,
+        }
+    })?;
+    let sum_meta = builtin_stdlib().get(sum_idx as usize).ok_or_else(|| {
+        LoweringError::UnknownStdlibMethod {
+            name: "list_int_sum".to_string(),
+            arity: 1,
+            range,
+        }
+    })?;
+    let sum_params = sum_meta.params.clone();
+    let sum_ret = sum_meta.ret;
+    ctx.out.push(TaggedOp {
+        op: Op::Call {
+            fn_index: sum_idx,
+            arg_count: 1,
+            param_tys: sum_params,
+            ret_ty: sum_ret,
+        },
+        range,
+    });
+    ctx.tstack.pop(); // ListInt handle
+    ctx.tstack.push(sum_ret);
+    Ok(Some(()))
+}
+
+/// AOT-4 (W16 slice): lower a 1D `xs[i]` index on a `List<Int>`
+/// receiver whose arena handle is already on top of the vstack (pushed
+/// by [`lower_variable`]'s head load, tagged `IrType::ListInt`).
+///
+/// Emits the inline payload addressing that mirrors the record layout
+/// the bundled `list_int_*` bodies write
+/// (`stdlib::defs::list_int_filter_body`): `[len: u32 LE][pad: u32]
+/// [i64 elements...]`, payload aligned at `(base + 4 + 7) & -8`,
+/// element `i` at `payload + i*8`:
+///
+/// ```text
+/// base    = <handle on vstack>             ; i32, stashed in a let
+/// idx     = <index expr>                   ; i64 -> truncated to i32
+/// payload = (base + 11) & -8               ; i32
+/// addr    = payload + idx*8                 ; i32
+/// push i64.load(addr)                       ; LoadI64AtAbsolute{0}
+/// ```
+///
+/// No bounds branch is emitted — see the caller doc-comment for the
+/// in-bounds rationale. The element is left on the vstack tagged
+/// `IrType::I64`.
+fn lower_list_int_index(
+    index_node: &Node,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    // Reserve let slots: `base` (i32 handle) + `idx` (i32 element
+    // index). Each slot is single-typed for its lifetime so the LLVM
+    // emitter's `ensure_let_slot` aliasing guard stays happy.
+    let base_i = ctx.next_let_idx;
+    let idx_i = ctx.next_let_idx + 1;
+    ctx.next_let_idx += 2;
+
+    // Stash the receiver handle (already on the vstack as ListInt).
+    let top = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
+        kind: "Variable(list-index-empty-stack)".to_string(),
+        range,
+    })?;
+    debug_assert_eq!(top, IrType::ListInt);
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: base_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+
+    // Lower the index expression; it must be an Int (I64). Truncate
+    // into the i32 `idx` slot via the type-narrowing `LetSet` (the
+    // emitter's `coerce_to_let_ty` truncates I64 -> I32).
+    lower_expr(&index_node.expr, index_node.range, ctx)?;
+    expect_int_top(ctx, range)?;
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: idx_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // payload = (base + 11) & -8
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: base_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(4 + 7),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I32),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(-8),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::BitAnd(IrType::I32),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+
+    // addr = payload + idx*8
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: idx_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(8),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::Mul(IrType::I32),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I32),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+
+    // push i64.load(addr)
+    ctx.out.push(TaggedOp {
+        op: Op::LoadI64AtAbsolute { offset: 0 },
+        range,
+    });
+    ctx.tstack.pop(); // i32 addr
+    ctx.tstack.push(IrType::I64);
+    Ok(())
 }
 
 /// Match a bare `range(a, b)` / `range(b)` call, returning its arg
@@ -5126,6 +5557,55 @@ fn infer_closure_body_ret_ty(expr: &Expr) -> IrType {
     }
 }
 
+/// AOT-4 (W16 slice): infer that a closure param named `name` is a
+/// `List<Int>` from how the body uses it. Returns `true` when the body
+/// contains an index access `name[...]`, a `_len(name)` / `len(name)`,
+/// or a `_list_filter(name, ...)` whose first argument is the bare
+/// param. The walk is purely structural (no type-checking) and
+/// conservative — it only fires on uses that are unambiguously
+/// list-shaped, so a scalar param is never mis-inferred.
+fn closure_param_used_as_list_int(name: &str, expr: &Expr) -> bool {
+    fn expr_is_bare_param(expr: &Expr, name: &str) -> bool {
+        matches!(expr, Expr::Variable(path)
+            if path.len() == 1
+                && matches!(&path[0], TokenKey::String(s, _, _) if s == name))
+    }
+    match expr {
+        // `name[...]` -> `Variable([String(name), Dynamic(idx)])`.
+        Expr::Variable(path) | Expr::Reference { path, .. } => {
+            path.len() == 2
+                && matches!(&path[0], TokenKey::String(s, _, _) if s == name)
+                && matches!(&path[1], TokenKey::Dynamic(_, _))
+        }
+        Expr::FnCall { path, args } => {
+            // `_len(name)` / `len(name)` / `_list_filter(name, ...)`.
+            let head_list_intrinsic = path.len() == 1
+                && matches!(&path[0], TokenKey::String(s, _, _)
+                    if s == "_len" || s == "len" || s == "_list_filter");
+            if head_list_intrinsic
+                && args
+                    .first()
+                    .is_some_and(|a| expr_is_bare_param(&a.value.expr, name))
+            {
+                return true;
+            }
+            args.iter()
+                .any(|a| closure_param_used_as_list_int(name, &a.value.expr))
+        }
+        Expr::Binary(_, l, r) => {
+            closure_param_used_as_list_int(name, &l.expr)
+                || closure_param_used_as_list_int(name, &r.expr)
+        }
+        Expr::Unary(_, n) => closure_param_used_as_list_int(name, &n.expr),
+        Expr::Ternary { cond, then, els } => {
+            closure_param_used_as_list_int(name, &cond.expr)
+                || closure_param_used_as_list_int(name, &then.expr)
+                || closure_param_used_as_list_int(name, &els.expr)
+        }
+        _ => false,
+    }
+}
+
 /// `true` for the comparison + logical operators whose IR lowering
 /// leaves a `Bool` on the operand stack.
 fn operator_yields_bool(op: Operator) -> bool {
@@ -5199,14 +5679,30 @@ fn lower_where(
             // Unannotated params / return default to `Int` (I64) — the
             // same convention `anon_dict_return_plan` uses for W7. A
             // `(k: Bool) =>` style annotation is honoured when present.
+            //
+            // AOT-4 (W16 slice): an unannotated param defaults to
+            // `List<Int>` when the body uses it as a list — indexed
+            // (`p[i]`) or handed to `_len(p)` / `_list_filter(p, ...)`.
+            // The W16 quicksort helper `sum_qs(xs)` takes a `List<Int>`
+            // handle with NO annotation (the closure-param grammar does
+            // not accept `List<Int>`), so the recursive lift must infer
+            // it; an I64 default would mis-tag the recursive list arg
+            // and reject lowering. The inference is a cheap structural
+            // walk that only fires on the list-shaped uses above.
             let mut param_irts: Vec<IrType> = Vec::with_capacity(params.len());
             for p in params {
-                let irt = p
+                let annotated = p
                     .type_hint
                     .as_ref()
                     .and_then(type_node_to_canonical)
-                    .and_then(|r| type_repr_to_ir_type(&r).ok())
-                    .unwrap_or(IrType::I64);
+                    .and_then(|r| type_repr_to_ir_type(&r).ok());
+                let irt = annotated.unwrap_or_else(|| {
+                    if closure_param_used_as_list_int(&p.name, &closure_body.expr) {
+                        IrType::ListInt
+                    } else {
+                        IrType::I64
+                    }
+                });
                 param_irts.push(irt);
             }
             // Return type: honour an explicit annotation, else infer
@@ -5252,6 +5748,39 @@ fn lower_where(
                     ty: IrType::Closure,
                 },
                 range: value.range,
+            });
+            continue;
+        }
+        // AOT-4 (W16 slice): a where-binding whose value is a bare
+        // `range(a, b)` (or `range(b)`) MUST materialise into a
+        // `List<Int>` arena record so a downstream consumer can index
+        // it (`xs[0]`) or recurse on a filtered sub-list. The eliding
+        // range peepholes only fire for the fusable `.sum` / `.len` /
+        // `.reduce` terminals — a where-bound range has no such
+        // terminal, so without this it would fall through to the
+        // generic FnCall dispatch and reject as
+        // `UnknownStdlibMethod { name: "range" }`.
+        if let Some(range_args) = match_bare_range(&value.expr) {
+            emit_range_materialize(range_args, value.range, ctx)?;
+            let value_ty = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
+                kind: "Where(range-materialize-empty-stack)".to_string(),
+                range: value.range,
+            })?;
+            debug_assert_eq!(value_ty, IrType::ListInt);
+            let idx = ctx.next_let_idx;
+            ctx.next_let_idx += 1;
+            ctx.out.push(TaggedOp {
+                op: Op::LetSet {
+                    idx,
+                    ty: IrType::ListInt,
+                },
+                range: value.range,
+            });
+            ctx.lets.push(LetBinding {
+                name,
+                idx,
+                ty: IrType::ListInt,
+                schema_brand: None,
             });
             continue;
         }
@@ -5507,6 +6036,8 @@ fn try_lower_str_concat_chain(
     // starting state without observing partial ops.
     let saved_out_len = ctx.out.len();
     let saved_tstack_len = ctx.tstack.len();
+    let saved_next_let = ctx.next_let_idx;
+    let saved_lambda_len = ctx.lambda_table.borrow().len();
     // Lower each leaf, type-checking after each so we abort early on
     // the first non-String operand (the common rejection — e.g. an
     // outer-Add was actually Schema-merge from a non-Add LHS, which
@@ -5518,12 +6049,18 @@ fn try_lower_str_concat_chain(
             // Mismatch — restore the snapshot and let the caller fall
             // back to pair-wise lowering. `const_intern` interning is
             // idempotent so any literals we pushed into the intern
-            // table are still correct; the leaf-lowering ops never
-            // touch `next_let_idx` / `lambda_funcs` for non-Where /
-            // non-Lambda leaves, and those shapes aren't legal inside
-            // an `Add` chain anyway.
+            // table are still correct. AOT-4: a leaf may now lower a
+            // closure (the W16 `+` chain has `qs(_list_filter(xs, (x)
+            // => ...))` operands whose `_list_filter` builds a predicate
+            // lambda), so restore `next_let_idx` AND truncate any
+            // closure-table slots reserved during the discarded
+            // speculative leaf lowering — leaking a slot would offset
+            // every later `fn_table_idx` and dispatch the predicate to
+            // the wrong lambda at runtime.
             ctx.out.truncate(saved_out_len);
             ctx.tstack.truncate(saved_tstack_len);
+            ctx.next_let_idx = saved_next_let;
+            ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
             return Ok(false);
         }
     }
@@ -6550,6 +7087,43 @@ fn lower_variable(
     if path.len() == 1 {
         return Ok(());
     }
+    // AOT-4 (W16 slice): 1D `xs[i]` index on a materialised `List<Int>`
+    // receiver. The parser lowers the bracket form to a single trailing
+    // `TokenKey::Dynamic(<index Node>)` segment after the root name (a
+    // dotted `xs.0` would arrive as `TokenKey::Index`, which we do NOT
+    // accept here — the materialised-list index path is bracket-only).
+    // The head pushed an `IrType::ListInt` arena handle (i32); the index
+    // is read with inline payload addressing that mirrors the record
+    // layout the bundled `list_int_*` bodies write
+    // (`stdlib::defs::list_int_filter_body`): `[len: u32 LE][pad: u32]
+    // [i64 elements...]`, payload at `(base + 4 + 7) & -8`, element `i`
+    // at `payload + i*8`. The load is emitted WITHOUT a bounds branch —
+    // every caller in scope (the W16 quicksort kernel) guards
+    // `_len(xs) <= 1` before reaching `xs[0]`, so the index is provably
+    // in-bounds on the hot path. A shape we cannot prove in-bounds is
+    // DECLINED (falls through to the generic non-string-segment
+    // diagnostic) rather than emitting a possibly-wrong load. We do NOT
+    // emit `Op::ListGetByIntIdx` (that op is trace-recorder-only; static
+    // codegen rejects it).
+    if path.len() == 2 {
+        if let TokenKey::Dynamic(index_node, optional) = &path[1] {
+            let receiver_ty = ctx.tstack.last().copied();
+            if receiver_ty == Some(IrType::ListInt) {
+                // Optional indexing (`xs[i]?`) would need a Null-or-value
+                // result the i64 element path can't represent; decline.
+                if *optional {
+                    return Err(LoweringError::UnsupportedExpr {
+                        kind: "Variable(optional-list-index unsupported)".to_string(),
+                        range,
+                    });
+                }
+                return lower_list_int_index(index_node, range, ctx);
+            }
+            // A `Dynamic` segment on a non-`List<Int>` receiver is not a
+            // materialised-list index — fall through to the generic
+            // diagnostic below so the rejection message stays precise.
+        }
+    }
     for seg in &path[1..] {
         let field_name = match seg {
             TokenKey::String(s, _, _) => s.as_str(),
@@ -6909,6 +7483,101 @@ fn lower_one_method<'a>(
 #[cfg(test)]
 mod intern_tests {
     use super::*;
+
+    /// AOT-4 (W16 slice): a 1D `xs[i]` index on a materialised
+    /// `List<Int>` receiver lowers to the inline payload addressing —
+    /// `(base + 11) & -8` then `+ i*8` then `Op::LoadI64AtAbsolute
+    /// { offset: 0 }` — and NEVER to `Op::ListGetByIntIdx` (a
+    /// trace-recorder-only op that static codegen rejects) nor to an
+    /// eliding peephole that would collapse the index away. Pins the
+    /// lowering shape so a regression that swaps the op surfaces here.
+    #[test]
+    fn list_int_index_emits_inline_payload_load() {
+        // `arr: range(0, n)` materialises a `List<Int>`; `arr[1]` indexes
+        // it. The `_len <= 1` guard keeps the bench-shape in-bounds; the
+        // index lowering itself is what we inspect.
+        let src = "#unstrict\n#main(Int n) -> Int\n\
+                   (_len(arr) <= 1 ? 0 : arr[1]) where { arr: range(0, n) }";
+        let m = lower_source(src);
+
+        // Collect every op (recursing into If / Block / Loop arms) so the
+        // assertions see the index ops wherever the ternary places them.
+        fn collect(body: &[TaggedOp], out: &mut Vec<Op>) {
+            for t in body {
+                out.push(t.op.clone());
+                match &t.op {
+                    Op::If {
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
+                        collect(then_body, out);
+                        collect(else_body, out);
+                    }
+                    Op::Block { body, .. } | Op::Loop { body, .. } => collect(body, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut ops = Vec::new();
+        for f in &m.funcs {
+            collect(&f.body, &mut ops);
+        }
+
+        // The index must lower to an inline `LoadI64AtAbsolute { 0 }`.
+        let has_inline_load = ops
+            .iter()
+            .any(|op| matches!(op, Op::LoadI64AtAbsolute { offset: 0 }));
+        assert!(
+            has_inline_load,
+            "xs[i] index must emit an inline `LoadI64AtAbsolute {{ offset: 0 }}`; ops = {ops:?}"
+        );
+
+        // It must NOT lower to the trace-recorder-only index op.
+        let has_trace_index = ops
+            .iter()
+            .any(|op| matches!(op, Op::ListGetByIntIdx { .. }));
+        assert!(
+            !has_trace_index,
+            "xs[i] index must NOT emit `Op::ListGetByIntIdx` (trace-recorder-only; static codegen rejects it)"
+        );
+
+        // The payload-alignment math must be present: `& -8` (BitAnd I32)
+        // plus the `* 8` element stride (Mul I32). A peephole that
+        // collapsed the index would drop these.
+        let has_align = ops.iter().any(|op| matches!(op, Op::BitAnd(IrType::I32)));
+        let has_stride = ops.iter().any(|op| matches!(op, Op::Mul(IrType::I32)));
+        assert!(
+            has_align && has_stride,
+            "xs[i] index must emit payload-align (`BitAnd I32`) + element-stride (`Mul I32`) math; \
+             has_align={has_align} has_stride={has_stride}"
+        );
+    }
+
+    /// AOT-4 (W16 slice): the recursive `sum_qs(xs)` helper's param is
+    /// inferred as `List<Int>` (not the I64 default) from the body using
+    /// `xs` as a list (`xs[0]`, `_len(xs)`, `_list_filter(xs, ...)`), so
+    /// the recursive list arg type-checks. Pins the inference.
+    #[test]
+    fn recursive_list_helper_param_inferred_list_int() {
+        let src = "#unstrict\n#main(Int n) -> Int\n\
+                   sum_lt(arr) where { arr: range(0, n), \
+                   sum_lt(xs): _len(xs) == 0 ? 0 : (xs[0] + sum_lt(_list_filter(xs, (x) => x > xs[0]))) }";
+        let m = lower_source(src);
+        // The lifted recursive helper (a lambda) takes `(captures_ptr:
+        // I32, xs: ListInt)`. Find a lambda whose user param is ListInt.
+        let has_list_param = m.funcs.iter().any(|f| {
+            f.params.len() == 2 && f.params[0] == IrType::I32 && f.params[1] == IrType::ListInt
+        });
+        assert!(
+            has_list_param,
+            "recursive `sum_lt(xs)` helper must take a `List<Int>` param; funcs = {:?}",
+            m.funcs
+                .iter()
+                .map(|f| (&f.name, &f.params))
+                .collect::<Vec<_>>()
+        );
+    }
 
     /// Walk `funcs` and collect every `Op::ConstString { idx, value }`
     /// across each func's body (and into any nested `If` / `Block` /
