@@ -4301,6 +4301,34 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         for (slot, case_bb) in case_bbs.iter().enumerate() {
             self.builder.position_at_end(*case_bb);
             let callee = self.closure_fn_table[slot];
+            // AOT-4: a module may host lambdas of *different* arities
+            // (W18 binds a 1-arg filter predicate alongside a 2-arg
+            // recursive `is_prime`). The `fn_idx` switch enumerates
+            // every lambda slot, but only the slot whose arity matches
+            // this call site's `param_tys` can be selected at runtime
+            // (the handle's `fn_table_idx` always points at the lambda
+            // the predicate / recursion actually targets). Statically
+            // emitting a call into a wrong-arity callee would make the
+            // LLVM verifier reject the module ("Incorrect number of
+            // arguments"). Guard each case: when the callee's arity
+            // (state + captures_ptr + user params) disagrees with this
+            // call's shape, the case is dead — emit `llvm.trap` +
+            // `unreachable` instead of the ill-typed call.
+            let want_arity = 2 + user_args.len();
+            if callee.count_params() as usize != want_arity {
+                let trap = self.llvm_trap_fn.ok_or_else(|| {
+                    LlvmError::Codegen(
+                        "CallClosure arity-mismatch case: llvm.trap not declared".into(),
+                    )
+                })?;
+                self.builder
+                    .build_call(trap, &[], "cc_arity_trap")
+                    .map_err(|e| LlvmError::Codegen(format!("CallClosure arity trap call: {e}")))?;
+                self.builder.build_unreachable().map_err(|e| {
+                    LlvmError::Codegen(format!("CallClosure arity unreachable: {e}"))
+                })?;
+                continue;
+            }
             // Build args: (state, captures_ptr, user_args...).
             let mut call_args: Vec<BasicMetadataValueEnum<'ctx>> =
                 Vec::with_capacity(2 + user_args.len());

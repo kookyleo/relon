@@ -2347,6 +2347,23 @@ fn lower_fn_call(
     if let Some(()) = try_lower_local_closure_call(path, args, range, ctx)? {
         return Ok(());
     }
+    // AOT-4 (W18 slice): materialize a runtime `range(a, b)` into a
+    // `List<Int>` scratch record, run it through the bundled
+    // `list_int_filter` body, then read the survivor count via
+    // `ReadStringLen`. The canonical caller is the W18 prime-count
+    // kernel `_len(_list_filter(range(2, n), (k) => is_prime(k, 2)))`.
+    //
+    // Unlike the eliding `range(...).len()` / `list.sum(range(...))`
+    // peepholes below, the filtered list MUST be materialised: the
+    // predicate decides survivor membership per element, and the
+    // count cannot be expressed as a closed-form fold over the loop
+    // counter (the survivors are a data-dependent subset). The
+    // materialise + filter + length path mirrors the bundled stdlib
+    // bodies (`list_int_filter` / `list_int_length`) so the record
+    // layout flows through unchanged.
+    if let Some(()) = try_lower_len_filter_range(path, args, range, ctx)? {
+        return Ok(());
+    }
     // review-improvement-160 bytecode M3 phase 2: peephole-desugar
     // `list.sum(range(end))` / `list.sum(range(start, end))` into an
     // explicit `Op::Loop` accumulator before normal lowering kicks in.
@@ -3494,6 +3511,599 @@ fn combine_operator_to_op(op: Operator, range: TokenRange) -> Result<Op, Lowerin
     }
 }
 
+/// AOT-4 (W18 slice): recognise `_len(_list_filter(range(a, b),
+/// (x) => <pred>))` and lower it to: materialise `range(a, b)` into a
+/// `List<Int>` scratch record, call the bundled `list_int_filter`
+/// body, then read the survivor count via `Op::ReadStringLen` (the
+/// shared `[len: u32 LE]` record prefix).
+///
+/// `_len` and `_list_filter` are the underscore intrinsics the
+/// tree-walker registers (`relon-evaluator::stdlib::register_to`);
+/// they have no bundled IR stdlib slot keyed under those exact names,
+/// so the default `lower_fn_call` dispatch would surface an
+/// `UnknownStdlibMethod`. This peephole maps the W18 shape onto the
+/// already-LLVM-runnable `list_int_filter` + `ReadStringLen` ops.
+///
+/// Returns `Ok(Some(()))` on a successful desugar (vstack carries one
+/// `I64` survivor count after return), `Ok(None)` when the pattern
+/// didn't match (caller falls through to the regular dispatch), `Err`
+/// when an inner expression failed to lower.
+fn try_lower_len_filter_range(
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    // Outer call must be the free-call `_len(<single positional arg>)`.
+    if path.len() != 1 || args.len() != 1 || args[0].name.is_some() {
+        return Ok(None);
+    }
+    if !matches!(&path[0], TokenKey::String(s, _, _) if s == "_len" || s == "len") {
+        return Ok(None);
+    }
+    // The argument must itself be `_list_filter(range(a, b), closure)`.
+    let Expr::FnCall {
+        path: inner_path,
+        args: inner_args,
+    } = &*args[0].value.expr
+    else {
+        return Ok(None);
+    };
+    if inner_path.len() != 1 || inner_args.len() != 2 {
+        return Ok(None);
+    }
+    if !matches!(&inner_path[0], TokenKey::String(s, _, _) if s == "_list_filter") {
+        return Ok(None);
+    }
+    if inner_args.iter().any(|a| a.name.is_some()) {
+        return Ok(None);
+    }
+    // First inner arg: a bare `range(a, b)` (or `range(b)`). Second:
+    // the predicate closure literal.
+    let Some(range_args) = match_bare_range(&inner_args[0].value.expr) else {
+        return Ok(None);
+    };
+    let Expr::Closure { params, .. } = &*inner_args[1].value.expr else {
+        return Ok(None);
+    };
+    if params.len() != 1 {
+        return Ok(None);
+    }
+
+    // Resolve the bundled `list_int_filter` slot up front so a missing
+    // registry entry surfaces as a hard error rather than a silent
+    // fall-through to the (now-failing) default dispatch.
+    let filter_idx = stdlib_function_index("list_int_filter").ok_or_else(|| {
+        LoweringError::UnknownStdlibMethod {
+            name: "list_int_filter".to_string(),
+            arity: 2,
+            range,
+        }
+    })?;
+    let filter_meta = builtin_stdlib().get(filter_idx as usize).ok_or_else(|| {
+        LoweringError::UnknownStdlibMethod {
+            name: "list_int_filter".to_string(),
+            arity: 2,
+            range,
+        }
+    })?;
+    let filter_params = filter_meta.params.clone();
+    let filter_ret = filter_meta.ret;
+
+    // 1. Materialise `range(a, b)` -> List<Int> handle on the vstack.
+    emit_range_materialize(range_args, range, ctx)?;
+    // 2. Lower the predicate closure as the filter's second arg. The
+    //    closure surface matches `stdlib_closure_arg_signature`'s
+    //    `("list_int_filter", 1)` entry (`(I64) -> Bool`).
+    let (param_tys_c, ret_ty_c) =
+        stdlib_closure_arg_signature("list_int_filter", 1).ok_or_else(|| {
+            LoweringError::UnsupportedExpr {
+                kind: "list_int_filter closure signature missing".to_string(),
+                range,
+            }
+        })?;
+    lower_closure_as_value(
+        &inner_args[1].value.expr,
+        inner_args[1].value.range,
+        &param_tys_c,
+        ret_ty_c,
+        ctx,
+    )?;
+    // 3. Op::Call(list_int_filter) — consumes [ListInt, Closure],
+    //    produces a fresh `List<Int>` handle.
+    ctx.tstack.pop(); // closure
+    ctx.tstack.pop(); // materialised list handle
+    ctx.out.push(TaggedOp {
+        op: Op::Call {
+            fn_index: filter_idx,
+            arg_count: 2,
+            param_tys: filter_params,
+            ret_ty: filter_ret,
+        },
+        range,
+    });
+    ctx.tstack.push(filter_ret);
+    // 4. `_len(<filtered>)` -> read the leading `[len: u32 LE]` prefix
+    //    of the survivor record and widen to I64 (matches the
+    //    tree-walker `_len` which returns the element count as Int).
+    ctx.out.push(TaggedOp {
+        op: Op::ReadStringLen,
+        range,
+    });
+    ctx.tstack.pop(); // filtered list handle
+    ctx.tstack.push(IrType::I64);
+    Ok(Some(()))
+}
+
+/// Match a bare `range(a, b)` / `range(b)` call, returning its arg
+/// slice. Unlike [`match_range_chain`] this rejects any trailing
+/// `.map(...)` / `.filter(...)` stages — the W18 slice materialises the
+/// raw range before handing it to `list_int_filter`.
+fn match_bare_range(expr: &Expr) -> Option<&[relon_parser::CallArg]> {
+    let Expr::FnCall { path, args } = expr else {
+        return None;
+    };
+    if path.len() != 1 || !matches!(&path[0], TokenKey::String(s, _, _) if s == "range") {
+        return None;
+    }
+    if args.is_empty() || args.len() > 2 || args.iter().any(|a| a.name.is_some()) {
+        return None;
+    }
+    Some(args)
+}
+
+/// AOT-4 (W18 slice): emit the IR that materialises a runtime
+/// `range(a, b)` (or `range(b)`, start defaulting to 0) into a fresh
+/// `List<Int>` scratch record and leaves its arena-relative handle on
+/// the vstack tagged `IrType::ListInt`.
+///
+/// Record layout (must match the bundled stdlib contract — see
+/// `stdlib::defs::list_int_filter_body`): `[len: u32 LE][pad: u32
+/// zero][i64 elements...]`, total `8 + 8*count` bytes, payload aligned
+/// at `(base + 4 + 7) & -8`.
+///
+/// Emitted shape (all address arithmetic in I32, element value I64):
+///
+/// ```text
+/// start = a; end = b
+/// count = max(end - start, 0)              ; i32 (truncated)
+/// base  = AllocScratchDyn(8 + 8*count)     ; i32 handle
+/// i32.store(base, count)                   ; header len prefix
+/// payload = (base + 4 + 7) & -8
+/// i = 0
+/// block { loop {
+///   if i >= count { br 1 }
+///   i64.store(payload + i*8, start + i)    ; element
+///   i = i + 1
+///   br 0
+/// } }
+/// push base                                ; ListInt handle
+/// ```
+fn emit_range_materialize(
+    range_args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    // Reserve let slots. `start` / `span` / `elem` ride as I64;
+    // `count`, `base`, `payload`, `i` are all I32 (address arithmetic
+    // + the loop counter), mirroring `list_int_filter_body`. Each slot
+    // is single-typed for its whole lifetime — the LLVM emitter
+    // rejects a let-slot reused under two IR types (`ensure_let_slot`
+    // aliasing guard). `elem` is the running i64 element value (start
+    // + i); carried in a dedicated I64 slot so the I32 loop counter
+    // `i` is never read back widened (which would alias its slot).
+    let start_i = ctx.next_let_idx;
+    let span_i = ctx.next_let_idx + 1;
+    let count_i = ctx.next_let_idx + 2;
+    let base_i = ctx.next_let_idx + 3;
+    let payload_i = ctx.next_let_idx + 4;
+    let i_i = ctx.next_let_idx + 5;
+    let elem_i = ctx.next_let_idx + 6;
+    ctx.next_let_idx += 7;
+
+    // start = a (or 0 for the 1-arg `range(b)` form).
+    if range_args.len() == 2 {
+        lower_expr(&range_args[0].value.expr, range_args[0].value.range, ctx)?;
+        expect_int_top(ctx, range)?;
+    } else {
+        ctx.out.push(TaggedOp {
+            op: Op::ConstI64(0),
+            range,
+        });
+        ctx.tstack.push(IrType::I64);
+    }
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: start_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // span = end - start. Stashed in a dedicated I64 slot so the
+    // clamp below can re-read it without juggling the operand stack.
+    let end_arg = &range_args[range_args.len() - 1];
+    lower_expr(&end_arg.value.expr, end_arg.value.range, ctx)?;
+    expect_int_top(ctx, range)?;
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: start_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I64);
+    ctx.out.push(TaggedOp {
+        op: Op::Sub(IrType::I64),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I64);
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: span_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // count = span > 0 ? span : 0, then truncate into the I32 `count`
+    // slot. The clamp guards `range(b, a)` with `b > a` so it yields
+    // an empty list (matches the tree-walker `range`, which produces
+    // `[]` when start >= end) and keeps the `AllocScratchDyn` size
+    // non-negative. An `Op::If` is used rather than `Op::Select`
+    // because the LLVM emitter lowers `If` (both arms leave an I64)
+    // but has no `Select` arm.
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: span_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I64);
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI64(0),
+        range,
+    });
+    ctx.tstack.push(IrType::I64);
+    ctx.out.push(TaggedOp {
+        op: Op::Gt(IrType::I64),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::Bool);
+    ctx.out.push(TaggedOp {
+        op: Op::If {
+            result_ty: IrType::I64,
+            then_body: vec![TaggedOp {
+                op: Op::LetGet {
+                    idx: span_i,
+                    ty: IrType::I64,
+                },
+                range,
+            }],
+            else_body: vec![TaggedOp {
+                op: Op::ConstI64(0),
+                range,
+            }],
+        },
+        range,
+    });
+    ctx.tstack.pop(); // the Bool predicate
+    ctx.tstack.push(IrType::I64); // the If's I64 result
+                                  // Truncate the clamped span into the I32 `count` slot.
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: count_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // record_size = 8 + 8*count  (i32 arithmetic; matches
+    // list_int_filter_body's `16 + 8*n` header sizing minus the
+    // filter's extra slack — we size exactly to `count`).
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(8),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: count_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(8),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::Mul(IrType::I32),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I32),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::AllocScratchDyn,
+        range,
+    });
+    // AllocScratchDyn: [i32 size] -> [i32 base]. tstack stays I32.
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: base_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // header: i32.store(base, count)
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: base_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: count_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::StoreI32AtAbsolute { offset: 0 },
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+
+    // payload = (base + 4 + 7) & -8
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: base_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(4 + 7),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I32),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(-8),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::BitAnd(IrType::I32),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: payload_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // i = 0
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(0),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: i_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // elem = start (the first element value; advanced by 1 per iter)
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: start_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I64);
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: elem_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // Fill loop: redirect ctx.out into a sub-buffer for the loop body
+    // (mirrors `emit_range_pipeline_loop`'s splice dance).
+    let saved_outer = std::mem::take(&mut ctx.out);
+
+    // exit when i >= count -> br 1 (out of the loop-exit block)
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: i_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: count_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::Ge(IrType::I32),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::BrIf { label_depth: 1 },
+        range,
+    });
+
+    // addr = payload + i*8
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: payload_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: i_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(8),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::Mul(IrType::I32),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I32),
+        range,
+    });
+    // value = elem (the running i64 element value start + i). Read
+    // from the dedicated I64 slot so the I32 loop counter is never
+    // read back widened (which would alias its let-slot).
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: elem_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    // i64.store(addr, value) — Stack discipline: [addr(i32), value(i64)].
+    ctx.out.push(TaggedOp {
+        op: Op::StoreI64AtAbsolute { offset: 0 },
+        range,
+    });
+
+    // i = i + 1
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: i_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(1),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I32),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: i_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    // elem = elem + 1 (keeps the i64 element value in lock-step with i)
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: elem_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI64(1),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I64),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: elem_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::Br { label_depth: 0 },
+        range,
+    });
+
+    // Wrap the loop body under Block { Loop { ... } }.
+    let loop_body = std::mem::replace(&mut ctx.out, saved_outer);
+    ctx.out.push(TaggedOp {
+        op: Op::Block {
+            result_ty: None,
+            body: vec![TaggedOp {
+                op: Op::Loop {
+                    result_ty: None,
+                    body: loop_body,
+                },
+                range,
+            }],
+        },
+        range,
+    });
+
+    // Push the materialised list handle (base) tagged ListInt.
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: base_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::ListInt);
+    Ok(())
+}
+
 /// One stage in a `range(...).chain(...)` pipeline. Each stage takes
 /// the running per-iteration value (initially the loop counter `i`)
 /// and produces a new value of the recorded `result_ty`.
@@ -4480,6 +5090,58 @@ fn check_stdlib_arg(
     Ok(())
 }
 
+/// AOT-4: infer the IR return type of a where-bound helper closure
+/// from its body, used when no explicit `: Type` annotation is
+/// present. The inference is intentionally narrow — it only needs to
+/// distinguish `Bool` (W18 `is_prime`) from the `Int`/I64 default
+/// (W17 `bs`):
+///
+///   * a `Bool` / comparison / logical expression -> `Bool`;
+///   * a ternary -> the type of whichever branch is determinable
+///     without recursing into the helper itself (so the recursive arm,
+///     which has no fixed type yet, doesn't dominate the inference);
+///   * everything else -> the `Int` (I64) default.
+///
+/// This keeps the self-recursive call's return type in agreement with
+/// the sibling literal branches, which is what `lower_ternary`'s
+/// `IfBranchTypeMismatch` check enforces.
+fn infer_closure_body_ret_ty(expr: &Expr) -> IrType {
+    match expr {
+        Expr::Bool(_) => IrType::Bool,
+        Expr::Binary(op, _, _) if operator_yields_bool(*op) => IrType::Bool,
+        Expr::Unary(Operator::Not, _) => IrType::Bool,
+        Expr::Ternary { then, els, .. } => {
+            // Prefer the branch that resolves to a concrete scalar
+            // type — the recursive arm typically falls through to the
+            // I64 default, so a definite Bool on either side wins.
+            let then_ty = infer_closure_body_ret_ty(&then.expr);
+            let else_ty = infer_closure_body_ret_ty(&els.expr);
+            if then_ty == IrType::Bool || else_ty == IrType::Bool {
+                IrType::Bool
+            } else {
+                then_ty
+            }
+        }
+        _ => IrType::I64,
+    }
+}
+
+/// `true` for the comparison + logical operators whose IR lowering
+/// leaves a `Bool` on the operand stack.
+fn operator_yields_bool(op: Operator) -> bool {
+    matches!(
+        op,
+        Operator::Eq
+            | Operator::Ne
+            | Operator::Lt
+            | Operator::Gt
+            | Operator::Le
+            | Operator::Ge
+            | Operator::And
+            | Operator::Or
+    )
+}
+
 /// Lower a `<expr> where { name: value, ... }` form by emitting one
 /// `LetSet` per binding (in declaration order) and then lowering
 /// `expr` with the names in scope.
@@ -4528,7 +5190,12 @@ fn lower_where(
         // `Op::CallClosure`. Pre-Phase-AOT-3 this hit the
         // `Expr::Closure { .. } => ClosureAcrossBoundary` arm of
         // `lower_expr` and the whole W17 source was rejected at lowering.
-        if let Expr::Closure { params, .. } = &*value.expr {
+        if let Expr::Closure {
+            params,
+            body: closure_body,
+            return_type,
+        } = &*value.expr
+        {
             // Unannotated params / return default to `Int` (I64) — the
             // same convention `anon_dict_return_plan` uses for W7. A
             // `(k: Bool) =>` style annotation is honoured when present.
@@ -4542,7 +5209,19 @@ fn lower_where(
                     .unwrap_or(IrType::I64);
                 param_irts.push(irt);
             }
-            let ret_ty = IrType::I64;
+            // Return type: honour an explicit annotation, else infer
+            // from the body. AOT-3 hardcoded I64 (W17's `bs` returns
+            // `Int`); AOT-4's W18 `is_prime` returns `Bool`, so the
+            // self-recursive call inside the ternary must agree with
+            // the sibling `true`/`false` literal branches — a fixed
+            // I64 default surfaces an `IfBranchTypeMismatch`. The
+            // inference is a cheap structural walk (ternary branches /
+            // comparison + logical ops -> Bool, otherwise Int).
+            let ret_ty = return_type
+                .as_ref()
+                .and_then(type_node_to_canonical)
+                .and_then(|r| type_repr_to_ir_type(&r).ok())
+                .unwrap_or_else(|| infer_closure_body_ret_ty(&closure_body.expr));
 
             // Pre-allocate the let-idx the closure handle lands in and
             // register both the binding and its signature before the
@@ -6749,6 +7428,100 @@ mod range_pipeline_tests {
             .filter(|op| matches!(op, Op::Loop { .. }))
             .count();
         assert_eq!(loops, 2, "expected two nested Loops, got {loops}");
+    }
+
+    /// AOT-4 (W18 slice): `_len(_list_filter(range(2, n), (k) => ...))`
+    /// materialises the runtime range into a `List<Int>` scratch
+    /// record (`AllocScratchDyn` + `StoreI32` header + a fill `Loop`
+    /// of `StoreI64` per element), then routes the list through the
+    /// bundled `list_int_filter` body via a real `Op::Call`, and reads
+    /// the survivor count with `Op::ReadStringLen`.
+    ///
+    /// This is the materialise path — NOT an eliding peephole: the
+    /// filter's `Op::Call(list_int_filter)` MUST survive (the survivor
+    /// subset is data-dependent and cannot be folded into a scalar
+    /// counter the way `range(n).filter(c).len()` is).
+    #[test]
+    fn len_filter_range_materializes_and_calls_list_int_filter() {
+        let src = "#unstrict\n\
+                   #main(Int n) -> Int\n\
+                   _len(_list_filter(range(2, n), (k) => k % 2 == 0))";
+        let ops = lower_and_flatten(src);
+
+        // The materialise path emits a dynamic scratch allocation for
+        // the range record.
+        let alloc_dyn = ops
+            .iter()
+            .filter(|op| matches!(op, Op::AllocScratchDyn))
+            .count();
+        assert!(
+            alloc_dyn >= 1,
+            "expected at least one AllocScratchDyn for the materialised range, got {alloc_dyn}"
+        );
+
+        // The filtered list flows through the bundled `list_int_filter`
+        // body via a real Op::Call (NOT inlined / elided).
+        let filter_idx = stdlib_function_index("list_int_filter").unwrap();
+        let filter_calls = ops
+            .iter()
+            .filter(|op| matches!(op, Op::Call { fn_index, .. } if *fn_index == filter_idx))
+            .count();
+        assert_eq!(
+            filter_calls, 1,
+            "expected exactly one Op::Call(list_int_filter), got {filter_calls}"
+        );
+
+        // `_len` reads the survivor record's leading length prefix.
+        let read_len = ops
+            .iter()
+            .filter(|op| matches!(op, Op::ReadStringLen))
+            .count();
+        assert!(
+            read_len >= 1,
+            "expected ReadStringLen for the `_len` survivor count, got {read_len}"
+        );
+
+        // The eliding `range(...).len()` peephole must NOT have fired:
+        // it would inline the filter into a scalar counter loop and
+        // leave no `list_int_filter` Op::Call (asserted above) — this
+        // guard pins the materialise vs elide distinction explicitly.
+        let store_i64 = ops
+            .iter()
+            .filter(|op| matches!(op, Op::StoreI64AtAbsolute { .. }))
+            .count();
+        assert!(
+            store_i64 >= 1,
+            "expected at least one StoreI64AtAbsolute filling the materialised payload, got {store_i64}"
+        );
+    }
+
+    /// AOT-4: the full W18 production shape — a `where`-bound recursive
+    /// `is_prime` helper called from the filter predicate — lowers
+    /// cleanly (the AOT-3 where-bound recursive lift composes with the
+    /// materialise + filter + length path).
+    #[test]
+    fn w18_prime_count_shape_lowers() {
+        let src = "#unstrict\n\
+                   #main(Int n) -> Int\n\
+                   _len(_list_filter(range(2, n), (k) => is_prime(k, 2)))\n\
+                   where {\n\
+                     is_prime(k, d): d * d > k ? true : (k % d == 0 ? false : is_prime(k, d + 1))\n\
+                   }";
+        let ops = lower_and_flatten(src);
+        let filter_idx = stdlib_function_index("list_int_filter").unwrap();
+        assert_eq!(
+            ops.iter()
+                .filter(|op| matches!(op, Op::Call { fn_index, .. } if *fn_index == filter_idx))
+                .count(),
+            1,
+            "W18 shape must route the materialised range through list_int_filter"
+        );
+        // The lifted `is_prime` recursive helper produces a closure
+        // (MakeClosure) and a self-recursive CallClosure.
+        assert!(
+            ops.iter().any(|op| matches!(op, Op::MakeClosure { .. })),
+            "expected the where-bound `is_prime` helper to lift to a closure"
+        );
     }
 }
 
