@@ -4516,6 +4516,66 @@ fn lower_where(
                 });
             }
         };
+        // AOT-3: a where-binding whose value is a closure (the
+        // method-shorthand `name(params): body` desugars to an
+        // `Expr::Closure`) is lifted to a closure-typed let-binding,
+        // exactly the way the W7 anon-Dict-return path lifts its
+        // `#internal fib: (k) => ...` field (see `lower_anon_dict_body`).
+        // The closure let-idx + its signature are registered in
+        // `ctx.closure_let_signatures` BEFORE the body lowers so a
+        // recursive self-call inside the body (W17's `bs((lo+hi)/2, hi,
+        // t)`) resolves through `try_lower_local_closure_call` ->
+        // `Op::CallClosure`. Pre-Phase-AOT-3 this hit the
+        // `Expr::Closure { .. } => ClosureAcrossBoundary` arm of
+        // `lower_expr` and the whole W17 source was rejected at lowering.
+        if let Expr::Closure { params, .. } = &*value.expr {
+            // Unannotated params / return default to `Int` (I64) — the
+            // same convention `anon_dict_return_plan` uses for W7. A
+            // `(k: Bool) =>` style annotation is honoured when present.
+            let mut param_irts: Vec<IrType> = Vec::with_capacity(params.len());
+            for p in params {
+                let irt = p
+                    .type_hint
+                    .as_ref()
+                    .and_then(type_node_to_canonical)
+                    .and_then(|r| type_repr_to_ir_type(&r).ok())
+                    .unwrap_or(IrType::I64);
+                param_irts.push(irt);
+            }
+            let ret_ty = IrType::I64;
+
+            // Pre-allocate the let-idx the closure handle lands in and
+            // register both the binding and its signature before the
+            // body lowers, so a self-recursive call resolves to this
+            // slot.
+            let idx = ctx.next_let_idx;
+            ctx.next_let_idx += 1;
+            ctx.lets.push(LetBinding {
+                name,
+                idx,
+                ty: IrType::Closure,
+                schema_brand: None,
+            });
+            ctx.closure_let_signatures
+                .insert(idx, (param_irts.clone(), ret_ty));
+
+            // Lower the closure body — pushes `IrType::Closure` and
+            // appends the lambda Func to `ctx.lambda_funcs`.
+            lower_closure_as_value(&value.expr, value.range, &param_irts, ret_ty, ctx)?;
+            let popped = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
+                kind: "Where(closure-binding-empty-stack)".to_string(),
+                range: value.range,
+            })?;
+            debug_assert_eq!(popped, IrType::Closure);
+            ctx.out.push(TaggedOp {
+                op: Op::LetSet {
+                    idx,
+                    ty: IrType::Closure,
+                },
+                range: value.range,
+            });
+            continue;
+        }
         lower_expr(&value.expr, value.range, ctx)?;
         let value_ty = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
             kind: "Where(binding-empty-stack)".to_string(),
@@ -6894,5 +6954,99 @@ mod w7_closure_boundary_tests {
                 "expected LayoutError::UnsupportedTypeInLayoutV1 {{ kind: \"Closure\" }}, got {other:?}"
             ),
         }
+    }
+
+    /// AOT-3 verification: a W17-shaped where-bound recursive helper
+    /// (`bs(lo, hi, t): ...` declared in a `where { ... }` clause and
+    /// called from a `reduce` fold) now lowers cleanly. Pre-AOT-3 the
+    /// `bs(...)` closure binding hit the `Expr::Closure { .. } =>
+    /// ClosureAcrossBoundary` arm of `lower_expr` and the whole source
+    /// was rejected at IR lowering, leaving W17 `n/a` on every compiled
+    /// backend.
+    ///
+    /// The lowered entry func must:
+    /// * emit `MakeClosure` once for the lifted `bs` let,
+    /// * emit `CallClosure` for the recursive self-calls + the fold-site
+    ///   call (the W17 body has three `bs(...)` calls: the two recursive
+    ///   tails and the `acc + bs(0, n, ...)` fold combine).
+    #[test]
+    fn w17_where_bound_recursive_helper_lifts_to_closure_let() {
+        // W17-shaped binary search: pure recursion over an arithmetic
+        // index range, no list materialisation.
+        let src = "#unstrict\n\
+                   #main(Int n) -> Int\n\
+                   range(n).reduce(0, (acc, i) => acc + bs(0, n, (i * 31) % n))\n\
+                   where {\n\
+                     bs(lo, hi, t): hi - lo <= 1 ? lo : (\n\
+                       (lo + hi) / 2 <= t\n\
+                         ? bs((lo + hi) / 2, hi, t)\n\
+                         : bs(lo, (lo + hi) / 2, t)\n\
+                     )\n\
+                   }";
+        let module = try_lower(src).expect("AOT-3 lowers W17 where-bound recursive helper");
+
+        // The `bs` lambda lands in the closure table.
+        assert_eq!(
+            module.closure_table.len(),
+            1,
+            "expected one closure-table entry for the lifted `bs` helper"
+        );
+        let entry_idx = module.entry_func_index.expect("AOT-3 builds an entry func");
+        let entry = &module.funcs[entry_idx];
+
+        // Exactly one MakeClosure for the `bs` let-binding.
+        let make_count = entry
+            .body
+            .iter()
+            .filter(|t| matches!(t.op, Op::MakeClosure { .. }))
+            .count();
+        assert_eq!(
+            make_count, 1,
+            "expected MakeClosure once for the `bs` where-binding, got {make_count}"
+        );
+
+        // Walk the op tree (the reduce fold lowers into an `Op::Loop`,
+        // so the fold-site call nests inside the loop body).
+        fn count_call_closure(body: &[TaggedOp]) -> usize {
+            let mut n = 0;
+            for t in body {
+                match &t.op {
+                    Op::CallClosure { .. } => n += 1,
+                    Op::If {
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
+                        n += count_call_closure(then_body);
+                        n += count_call_closure(else_body);
+                    }
+                    Op::Block { body, .. } | Op::Loop { body, .. } => n += count_call_closure(body),
+                    _ => {}
+                }
+            }
+            n
+        }
+        // The fold-site `bs(0, n, ...)` call lowers to CallClosure in
+        // the entry body (nested inside the reduce loop).
+        let entry_calls = count_call_closure(&entry.body);
+        assert_eq!(
+            entry_calls, 1,
+            "expected one fold-site CallClosure in the entry body, got {entry_calls}"
+        );
+
+        // Walk every non-entry func (the lifted `bs` lambda) and count
+        // its recursive CallClosure self-calls — the two bisection
+        // tails.
+        let lambda_self_calls: usize = module
+            .funcs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != entry_idx)
+            .map(|(_, f)| count_call_closure(&f.body))
+            .sum();
+        assert_eq!(
+            lambda_self_calls, 2,
+            "expected two recursive self-CallClosure inside the `bs` lambda, got {lambda_self_calls}"
+        );
     }
 }
