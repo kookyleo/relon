@@ -230,7 +230,9 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         match ty {
             IrType::I64 => self.emit_cmp(IntCC::Equal),
             IrType::I32 | IrType::Bool => self.emit_cmp_i32(IntCC::Equal),
-            IrType::F64 => self.emit_fcmp(FloatCC::Equal),
+            // F64 `==` follows `OrderedFloat` (NaN == NaN is true), not
+            // raw ordered IEEE — see `emit_fcmp_eq`.
+            IrType::F64 => self.emit_fcmp_eq(/*negate=*/ false),
             _ => unsupported("Eq"),
         }
     }
@@ -239,7 +241,9 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         match ty {
             IrType::I64 => self.emit_cmp(IntCC::NotEqual),
             IrType::I32 | IrType::Bool => self.emit_cmp_i32(IntCC::NotEqual),
-            IrType::F64 => self.emit_fcmp(FloatCC::NotEqual),
+            // F64 `!=` is the negation of the NaN-aware `==` (so
+            // NaN != NaN is false) — see `emit_fcmp_eq`.
+            IrType::F64 => self.emit_fcmp_eq(/*negate=*/ true),
             _ => unsupported("Ne"),
         }
     }

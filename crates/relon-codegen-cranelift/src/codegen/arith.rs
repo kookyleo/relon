@@ -216,29 +216,93 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         Ok(())
     }
 
-    /// `Op::Div(IrType::F64)` — IEEE-754 `fdiv`. No division-by-zero
-    /// guard: Float division by zero yields ±inf / NaN per IEEE-754,
-    /// matching the tree-walker (`lhs / rhs`) and the bytecode VM's
-    /// `DivF64`. The integer `DivisionByZero` trap deliberately does not
-    /// apply here.
+    /// `Op::Div(IrType::F64)` — IEEE-754 `fdiv` with a `DivisionByZero`
+    /// guard (gated by `sandbox.div_check`).
+    ///
+    /// The tree-walker oracle (`relon-evaluator::arithmetic::
+    /// eval_numeric_division`) checks `right.as_f64() == 0.0` *before*
+    /// the Int/Float split and raises `RuntimeError::DivisionByZero`, so
+    /// a Float divide-by-zero is a runtime error rather than ±inf / NaN.
+    /// A plain `fdiv` would diverge from the oracle on that operand, so
+    /// we mirror the integer path (and the LLVM AOT `f64` div lowering,
+    /// commit 4b59ebd1): compare the divisor against `0.0` with the
+    /// *ordered-equal* predicate (`FloatCC::Equal`, which matches both
+    /// `+0.0` and `-0.0` and declines for NaN, exactly like LLVM `OEQ`)
+    /// and branch to the typed trap before the `fdiv`. The `cond_trap`
+    /// helper routes through `raise_trap` so the trap surfaces as a
+    /// `RuntimeError::DivisionByZero` rather than an IEEE infinity.
     pub(super) fn emit_div_f64(&mut self) -> Result<(), CraneliftError> {
         let b = self.pop()?;
         let a = self.pop()?;
+        if self.sandbox.div_check {
+            let zero = self.builder.ins().f64const(0.0);
+            let cmp = self.builder.ins().fcmp(FloatCC::Equal, b, zero);
+            self.cond_trap(cmp, TrapKind::DivisionByZero);
+        }
         let r = self.builder.ins().fdiv(a, b);
         self.push(r);
         Ok(())
     }
 
     /// Pop `[b, a]` and push `a fcmp(cc) b` widened to the IR's `Bool`
-    /// slot (cranelift `i32`). Float comparisons use the *ordered*
-    /// predicates so NaN operands compare `false` for `<`/`<=`/`>`/`>=`
-    /// /`==` and `true` only for `!=`, matching Rust's `f64` operators
-    /// the tree-walker + bytecode VM use.
+    /// slot (cranelift `i32`). Float *ordering* comparisons use the
+    /// ordered predicates (`LessThan` / `LessThanOrEqual` /
+    /// `GreaterThan` / `GreaterThanOrEqual`) so a NaN operand compares
+    /// `false`, matching the tree-walker's `eval_numeric_comparison`
+    /// (Rust native `f64` `<`/`<=`/`>`/`>=`). Equality (`==` / `!=`)
+    /// must NOT route here — it has NaN-equals-NaN semantics handled by
+    /// [`Self::emit_fcmp_eq`].
     pub(super) fn emit_fcmp(&mut self, cc: FloatCC) -> Result<(), CraneliftError> {
         let b = self.pop()?;
         let a = self.pop()?;
         let r = self.builder.ins().fcmp(cc, a, b);
         let r = self.builder.ins().uextend(I32, r);
+        self.push(r);
+        Ok(())
+    }
+
+    /// Pop `[b, a]` and push the Float `==` (when `negate` is `false`)
+    /// or `!=` (when `negate` is `true`) result, widened to the IR's
+    /// `Bool` slot.
+    ///
+    /// `relon` compares `Value::Float` through `OrderedFloat`'s
+    /// `PartialEq`, where `NaN == NaN` is **true** and `NaN != NaN` is
+    /// **false** — the opposite of raw IEEE. A plain ordered `fcmp`
+    /// (`FloatCC::Equal` / `FloatCC::NotEqual`) gets the finite and
+    /// signed-zero cases right but reports `NaN == NaN` as false, so we
+    /// OR in an explicit both-NaN test, mirroring the LLVM AOT lowering
+    /// (`eq = OEQ(a,b) | (isnan(a) & isnan(b))`, `ne = !eq`):
+    ///
+    /// * `oeq = fcmp(Equal, a, b)` — ordered-equal (false for any NaN,
+    ///   true for `+0.0 == -0.0`), matching LLVM `OEQ`.
+    /// * `fcmp(Unordered, x, x)` is true iff `x` is NaN (a value is
+    ///   unordered with itself only when it is NaN), the cranelift
+    ///   analogue of LLVM `UNO(x, x)` / `x.is_nan()`.
+    /// * `eq = oeq | (a_nan & b_nan)`, and `ne = eq XOR 1`.
+    ///
+    /// All boolean composition is done at the `I32` `Bool`-slot width so
+    /// the result matches what the rest of the pipeline expects and does
+    /// not depend on the native scalar `fcmp` result width.
+    pub(super) fn emit_fcmp_eq(&mut self, negate: bool) -> Result<(), CraneliftError> {
+        let b = self.pop()?;
+        let a = self.pop()?;
+
+        let oeq = self.builder.ins().fcmp(FloatCC::Equal, a, b);
+        let oeq = self.builder.ins().uextend(I32, oeq);
+
+        let a_nan = self.builder.ins().fcmp(FloatCC::Unordered, a, a);
+        let a_nan = self.builder.ins().uextend(I32, a_nan);
+        let b_nan = self.builder.ins().fcmp(FloatCC::Unordered, b, b);
+        let b_nan = self.builder.ins().uextend(I32, b_nan);
+        let both_nan = self.builder.ins().band(a_nan, b_nan);
+
+        let eq = self.builder.ins().bor(oeq, both_nan);
+        let r = if negate {
+            let one = self.builder.ins().iconst(I32, 1);
+            self.builder.ins().bxor(eq, one)
+        } else {
+            eq
+        };
         self.push(r);
         Ok(())
     }
