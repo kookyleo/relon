@@ -2503,6 +2503,15 @@ fn lower_fn_call(
     if let Some(()) = try_lower_range_chain_reduce(path, args, range, ctx)? {
         return Ok(());
     }
+    // AOT-4 (W19 slice): `<materialised-list>.reduce(init, (acc, elem)
+    // => body)` over a where-bound `List<Int>` / `List<List<Int>>`
+    // handle — the W19 `#main` outer fold `c.reduce(...)` (with the
+    // nested `row.reduce(...)` re-reducing each row handle). Runs after
+    // the range-chain reduce so a `range(...)` receiver still elides; it
+    // only fires when the receiver is a bare list-typed let.
+    if let Some(()) = try_lower_materialized_list_reduce(path, args, range, ctx)? {
+        return Ok(());
+    }
     // Final path segment is the method / function name. Earlier
     // segments either form the receiver (method-call form) or are
     // unused (free-call form has exactly one path segment).
@@ -2852,6 +2861,438 @@ fn try_lower_range_chain_reduce(
         range,
         ctx,
     )?;
+    Ok(Some(()))
+}
+
+/// AOT-4 (W19 slice): `<materialised-list>.reduce(<init>, (acc, elem)
+/// => body)` over a where-bound `List<Int>` / `List<List<Int>>` handle
+/// (NOT a `range(...)` chain — that's `try_lower_range_chain_reduce`).
+/// The canonical caller is the W19 `#main` body
+/// `c.reduce(0, (row_acc, row) => row_acc + row.reduce(0, (cell_acc,
+/// cell) => cell_acc + cell))`, where `c` is the materialised result
+/// matrix (a `List<List<Int>>`) and each `row` is an inner row handle
+/// re-reduced cell-by-cell.
+///
+/// Returns `Ok(Some(()))` on a successful desugar (vstack carries the
+/// accumulator type), `Ok(None)` when the receiver is NOT a materialised
+/// list handle (so the range-chain / generic paths get a clean shot),
+/// `Err` when an inner expression failed to lower.
+///
+/// The element loop reads the record's `[len]` header for the bound,
+/// then loads each i64 element from the payload (`payload + i*8`, the
+/// same inline addressing the index path uses). When the reduce body
+/// uses `elem` as a list (e.g. `row.reduce(...)`), the element is an
+/// inner row handle — it's retagged `ListInt` (`LetSet{ListInt}`
+/// truncates the i64 to the i32 handle) so the nested reduce sees a
+/// proper list receiver; otherwise `elem` rides as `I64`.
+fn try_lower_materialized_list_reduce(
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    if path.len() != 2 || args.len() != 2 {
+        return Ok(None);
+    }
+    if args.iter().any(|a| a.name.is_some()) {
+        return Ok(None);
+    }
+    // The method name is the LAST path segment. The receiver is the
+    // FIRST: a bare-variable receiver (`c.reduce(...)`) parses as
+    // `[String(recv_name), String("reduce")]`; a complex-expression
+    // receiver (`<expr>.reduce(...)`) parses as
+    // `[Dynamic(<receiver Node>), String("reduce")]`. We only accept the
+    // bare-variable form here — a where-bound `List<Int>` let resolves
+    // by name.
+    let TokenKey::String(method_name, _, _) = &path[1] else {
+        return Ok(None);
+    };
+    if method_name.as_str() != "reduce" {
+        return Ok(None);
+    }
+    let recv_name = match &path[0] {
+        TokenKey::String(s, _, _) => s.clone(),
+        // A `Dynamic` receiver is a complex expression (e.g. a range
+        // chain), which `try_lower_range_chain_reduce` owns; bail.
+        _ => return Ok(None),
+    };
+    let Expr::Closure {
+        params,
+        body,
+        return_type: _,
+    } = &*args[1].value.expr
+    else {
+        return Ok(None);
+    };
+    if params.len() != 2 {
+        return Ok(None);
+    }
+    // Only fire when the receiver name resolves to a where-bound
+    // `List<Int>` let. We peek the let table WITHOUT lowering so a
+    // non-list receiver bails cleanly to the generic path.
+    let is_list_let = ctx
+        .lets
+        .iter()
+        .rev()
+        .find(|b| b.name == recv_name)
+        .map(|b| b.ty == IrType::ListInt)
+        .unwrap_or(false);
+    if !is_list_let {
+        return Ok(None);
+    }
+
+    let init_node = &args[0].value;
+
+    // Lower the receiver — emit a `LetGet` of the list handle. (We can't
+    // `lower_expr` a `Variable` path slice directly through the FnCall
+    // surface, so resolve the let by hand and push its handle.)
+    let recv_idx = ctx
+        .lets
+        .iter()
+        .rev()
+        .find(|b| b.name == recv_name)
+        .map(|b| b.idx)
+        .ok_or_else(|| LoweringError::UnresolvedVariable {
+            name: recv_name.clone(),
+            range,
+        })?;
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: recv_idx,
+            ty: IrType::ListInt,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::ListInt);
+
+    // Slot plan.
+    let base_i = ctx.next_let_idx;
+    let count_i = ctx.next_let_idx + 1;
+    let payload_i = ctx.next_let_idx + 2;
+    let i_i = ctx.next_let_idx + 3;
+    let acc_i = ctx.next_let_idx + 4;
+    ctx.next_let_idx += 5;
+
+    // base = receiver handle (i32).
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: base_i,
+            ty: IrType::ListInt,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // count = i32.load(base) — the record's `[len]` header.
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: base_i,
+            ty: IrType::ListInt,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::ListInt);
+    ctx.out.push(TaggedOp {
+        op: Op::LoadI32AtAbsolute { offset: 0 },
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: count_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // payload = (base + 4 + 7) & -8
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: base_i,
+            ty: IrType::ListInt,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::ListInt);
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(4 + 7),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I32),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(-8),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::BitAnd(IrType::I32),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: payload_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // acc = <init>.
+    lower_expr(&init_node.expr, init_node.range, ctx)?;
+    let acc_ty = ctx
+        .tstack
+        .last()
+        .copied()
+        .ok_or_else(|| LoweringError::UnsupportedExpr {
+            kind: "materialised-list reduce: init produced no value".to_string(),
+            range: init_node.range,
+        })?;
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: acc_i,
+            ty: acc_ty,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // i = 0
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(0),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: i_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // The element type: `ListInt` when the body treats `elem` as a list
+    // (nested `row.reduce(...)` etc.), else `I64`.
+    let elem_ty = if closure_param_used_as_list_int(&params[1].name, &body.expr) {
+        IrType::ListInt
+    } else {
+        IrType::I64
+    };
+    // Reserve the acc + elem param let slots up front so the body's
+    // `Variable` lookups resolve.
+    let acc_param_let = ctx.next_let_idx;
+    let elem_param_let = ctx.next_let_idx + 1;
+    let raw_elem_i = ctx.next_let_idx + 2; // raw i64 element load
+    ctx.next_let_idx += 3;
+
+    // Build the loop body in a sub-buffer.
+    let saved_outer = std::mem::take(&mut ctx.out);
+
+    // exit when i >= count -> br 1
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: i_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: count_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::Ge(IrType::I32),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::BrIf { label_depth: 1 },
+        range,
+    });
+
+    // raw_elem = i64.load(payload + i*8)
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: payload_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: i_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(8),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::Mul(IrType::I32),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I32),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LoadI64AtAbsolute { offset: 0 },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: raw_elem_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+
+    // Bind acc = acc_i contents.
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: acc_i,
+            ty: acc_ty,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: acc_param_let,
+            ty: acc_ty,
+        },
+        range,
+    });
+    ctx.lets.push(LetBinding {
+        name: params[0].name.clone(),
+        idx: acc_param_let,
+        ty: acc_ty,
+        schema_brand: None,
+    });
+    // Bind elem. When `elem` is a list handle, `LetSet{ListInt}`
+    // truncates the i64 element to the i32 row handle.
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: raw_elem_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: elem_param_let,
+            ty: elem_ty,
+        },
+        range,
+    });
+    ctx.lets.push(LetBinding {
+        name: params[1].name.clone(),
+        idx: elem_param_let,
+        ty: elem_ty,
+        schema_brand: None,
+    });
+
+    // Lower the reduce body — leaves the new acc on top.
+    lower_expr(&body.expr, body.range, ctx)?;
+    let produced = ctx
+        .tstack
+        .last()
+        .copied()
+        .ok_or_else(|| LoweringError::UnsupportedExpr {
+            kind: "materialised-list reduce: body produced no value".to_string(),
+            range: body.range,
+        })?;
+    if produced.wasm_slot() != acc_ty.wasm_slot() {
+        ctx.lets.pop();
+        ctx.lets.pop();
+        let _ = std::mem::replace(&mut ctx.out, saved_outer);
+        return Err(LoweringError::UnsupportedExpr {
+            kind: format!(
+                "materialised-list reduce: body returned {:?}, expected init type {:?}",
+                produced, acc_ty
+            ),
+            range: body.range,
+        });
+    }
+    ctx.lets.pop(); // elem
+    ctx.lets.pop(); // acc
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: acc_i,
+            ty: acc_ty,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // i += 1 ; br 0
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: i_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(1),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I32),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: i_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::Br { label_depth: 0 },
+        range,
+    });
+
+    // Wrap under Block { Loop { ... } }.
+    let loop_body = std::mem::replace(&mut ctx.out, saved_outer);
+    ctx.out.push(TaggedOp {
+        op: Op::Block {
+            result_ty: None,
+            body: vec![TaggedOp {
+                op: Op::Loop {
+                    result_ty: None,
+                    body: loop_body,
+                },
+                range,
+            }],
+        },
+        range,
+    });
+
+    // Push the final accumulator.
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: acc_i,
+            ty: acc_ty,
+        },
+        range,
+    });
+    ctx.tstack.push(acc_ty);
     Ok(Some(()))
 }
 
@@ -4535,6 +4976,554 @@ fn emit_range_materialize(
     Ok(())
 }
 
+/// Recognise a where-bound list value the AOT-4 materialiser can build:
+/// either a bare `range(a, b)` (1D `List<Int>`) or a single-stage
+/// `range(a, b).map((p) => <inner>)` whose `<inner>` is itself a
+/// materialisable list (nested -> `List<List<Int>>`) or an `Int`-valued
+/// scalar (`List<Int>`). Returns the outer range args + the map closure
+/// when the `.map` form matches; `None` for the bare-range / unmatched
+/// forms (the caller handles bare range via `match_bare_range`).
+fn match_materializable_outer_map(
+    expr: &Expr,
+) -> Option<(&[relon_parser::CallArg], &ClosureParam, &Node)> {
+    let chain = match_range_chain(expr)?;
+    // Exactly one `map` stage (a 2D row builder). `filter` stages and
+    // multi-stage pipelines are out of scope for the where-bound
+    // materialiser — those flow through the eliding consumers.
+    if chain.stages.len() != 1 || chain.stages[0].method != "map" {
+        return None;
+    }
+    let stage = &chain.stages[0];
+    if stage.closure_params.len() != 1 {
+        return None;
+    }
+    Some((
+        chain.range_args,
+        &stage.closure_params[0],
+        stage.closure_body,
+    ))
+}
+
+/// AOT-4 (W19 slice): materialise a where-bound list value into an arena
+/// record, leaving its `ListInt` handle on the vstack. Dispatches on the
+/// value shape:
+///
+///   * bare `range(a, b)` / `range(b)` -> [`emit_range_materialize`]
+///     (1D `List<Int>`);
+///   * `range(a, b).map((p) => <inner>)` -> an outer `List<Int>` record
+///     whose i-th i64 element is either the materialised inner row's i32
+///     arena handle (when `<inner>` is itself a materialisable list, so
+///     the outer record is a `List<List<Int>>`) or the `<inner>` scalar
+///     cell value directly (when `<inner>` is `Int`-valued).
+///
+/// The outer fill-loop binds the map closure param `p` to the running
+/// element value (`start + i`), lowers `<inner>` inline against the
+/// outer ctx (so captures like a prior where-bound `a` / `b` resolve
+/// through the normal let table), widens an inner `ListInt` handle to
+/// the i64 element slot (`LetSet{I64}` zero-extends an i32), and stores
+/// it at `payload + i*8`. Same record layout + payload alignment as
+/// [`emit_range_materialize`] so the result flows through the bundled
+/// `list_int_*` bodies and the inline index path unchanged.
+fn emit_list_value_materialize(
+    value_expr: &Expr,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    // Bare range -> reuse the 1D materialiser.
+    if let Some(range_args) = match_bare_range(value_expr) {
+        return emit_range_materialize(range_args, range, ctx);
+    }
+    let Some((range_args, param, inner_body)) = match_materializable_outer_map(value_expr) else {
+        return Err(LoweringError::UnsupportedExpr {
+            kind: "where-bound list value is neither a bare range nor a range().map((p) => ...)"
+                .to_string(),
+            range,
+        });
+    };
+
+    // Slot plan (all distinct, single-typed for their lifetime — the
+    // LLVM emitter's `ensure_let_slot` aliasing guard requires it, so
+    // the I64 `span` and the I32 `count` are SEPARATE slots).
+    let start_i = ctx.next_let_idx;
+    let span_i = ctx.next_let_idx + 1; // I64 clamped element count
+    let count_i = ctx.next_let_idx + 2; // I32 element count
+    let base_i = ctx.next_let_idx + 3;
+    let payload_i = ctx.next_let_idx + 4;
+    let i_i = ctx.next_let_idx + 5;
+    let elem_i = ctx.next_let_idx + 6; // running i64 element (start + i), bound to `p`
+    let val_i = ctx.next_let_idx + 7; // i64 element value to store
+    ctx.next_let_idx += 8;
+
+    // start = a (or 0 for `range(b)`).
+    if range_args.len() == 2 {
+        lower_expr(&range_args[0].value.expr, range_args[0].value.range, ctx)?;
+        expect_int_top(ctx, range)?;
+    } else {
+        ctx.out.push(TaggedOp {
+            op: Op::ConstI64(0),
+            range,
+        });
+        ctx.tstack.push(IrType::I64);
+    }
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: start_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // count = clamp(end - start, 0), truncated to i32. `Op::If` (not
+    // `Select`, which the LLVM emitter has no arm for) yields the
+    // clamped i64; the trailing `LetSet{I32}` truncates.
+    let end_arg = &range_args[range_args.len() - 1];
+    lower_expr(&end_arg.value.expr, end_arg.value.range, ctx)?;
+    expect_int_top(ctx, range)?;
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: start_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I64);
+    ctx.out.push(TaggedOp {
+        op: Op::Sub(IrType::I64),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I64);
+    // span on top: clamp to >= 0 via If.
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: span_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: span_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I64);
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI64(0),
+        range,
+    });
+    ctx.tstack.push(IrType::I64);
+    ctx.out.push(TaggedOp {
+        op: Op::Gt(IrType::I64),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::Bool);
+    ctx.out.push(TaggedOp {
+        op: Op::If {
+            result_ty: IrType::I64,
+            then_body: vec![TaggedOp {
+                op: Op::LetGet {
+                    idx: span_i,
+                    ty: IrType::I64,
+                },
+                range,
+            }],
+            else_body: vec![TaggedOp {
+                op: Op::ConstI64(0),
+                range,
+            }],
+        },
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I64);
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: count_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // record_size = 8 + 8*count
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(8),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: count_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(8),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::Mul(IrType::I32),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I32),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::AllocScratchDyn,
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: base_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // header: i32.store(base, count)
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: base_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: count_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::StoreI32AtAbsolute { offset: 0 },
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+
+    // payload = (base + 4 + 7) & -8
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: base_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(4 + 7),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I32),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(-8),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::BitAnd(IrType::I32),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: payload_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // i = 0
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(0),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: i_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // elem = start
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: start_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I64);
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: elem_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // Bind the map closure param `p` to `elem` for the inner body.
+    // Source value is read live each iteration (the loop body re-reads
+    // the `elem` slot), so the binding is just a name->slot alias.
+    let param_let = ctx.next_let_idx;
+    ctx.next_let_idx += 1;
+    ctx.lets.push(LetBinding {
+        name: param.name.clone(),
+        idx: param_let,
+        ty: IrType::I64,
+        schema_brand: None,
+    });
+
+    // Fill loop: redirect ctx.out into a sub-buffer for the body.
+    let saved_outer = std::mem::take(&mut ctx.out);
+
+    // exit when i >= count -> br 1
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: i_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: count_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::Ge(IrType::I32),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::BrIf { label_depth: 1 },
+        range,
+    });
+
+    // p = elem (the running i64 element value).
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: elem_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I64);
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: param_let,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // Lower the inner element value. A nested materialisable list ->
+    // recurse (produces a `ListInt` i32 handle); otherwise lower the
+    // scalar `Int` cell expression directly (produces `I64`). Either
+    // way the result is normalised into the i64 `val` slot:
+    // `LetSet{I64}` zero-extends an i32 handle and is a no-op width
+    // match for an i64 cell.
+    let inner_is_list = match_bare_range(&inner_body.expr).is_some()
+        || match_materializable_outer_map(&inner_body.expr).is_some();
+    if inner_is_list {
+        emit_list_value_materialize(&inner_body.expr, inner_body.range, ctx)?;
+        let produced = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
+            kind: "where-bound 2D materialise: inner row produced no value".to_string(),
+            range: inner_body.range,
+        })?;
+        debug_assert_eq!(produced, IrType::ListInt);
+        // Widen the i32 row handle into the i64 element slot.
+        ctx.out.push(TaggedOp {
+            op: Op::LetSet {
+                idx: val_i,
+                ty: IrType::I64,
+            },
+            range,
+        });
+    } else {
+        lower_expr(&inner_body.expr, inner_body.range, ctx)?;
+        let produced = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
+            kind: "where-bound list materialise: map body produced no value".to_string(),
+            range: inner_body.range,
+        })?;
+        if produced != IrType::I64 {
+            // Restore the op stream before surfacing the diagnostic.
+            ctx.lets.pop();
+            let _ = std::mem::replace(&mut ctx.out, saved_outer);
+            return Err(LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "where-bound list materialise: map body must be Int- or list-valued, got {:?}",
+                    produced
+                ),
+                range: inner_body.range,
+            });
+        }
+        ctx.out.push(TaggedOp {
+            op: Op::LetSet {
+                idx: val_i,
+                ty: IrType::I64,
+            },
+            range,
+        });
+    }
+
+    // addr = payload + i*8 ; i64.store(addr, val)
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: payload_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: i_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(8),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::Mul(IrType::I32),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I32),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: val_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::StoreI64AtAbsolute { offset: 0 },
+        range,
+    });
+
+    // i += 1 ; elem += 1 ; br 0
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: i_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(1),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I32),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: i_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: elem_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI64(1),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I64),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: elem_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::Br { label_depth: 0 },
+        range,
+    });
+
+    // Wrap under Block { Loop { ... } }.
+    let loop_body = std::mem::replace(&mut ctx.out, saved_outer);
+    ctx.out.push(TaggedOp {
+        op: Op::Block {
+            result_ty: None,
+            body: vec![TaggedOp {
+                op: Op::Loop {
+                    result_ty: None,
+                    body: loop_body,
+                },
+                range,
+            }],
+        },
+        range,
+    });
+
+    // Pop the `p` binding now the body is closed.
+    ctx.lets.pop();
+
+    // Push the outer list handle (base) tagged ListInt.
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: base_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::ListInt);
+    Ok(())
+}
+
 /// One stage in a `range(...).chain(...)` pipeline. Each stage takes
 /// the running per-iteration value (initially the loop counter `i`)
 /// and produces a new value of the recorded `result_ty`.
@@ -5589,6 +6578,28 @@ fn closure_param_used_as_list_int(name: &str, expr: &Expr) -> bool {
             {
                 return true;
             }
+            // AOT-4 (W19 slice): a method call whose receiver is the bare
+            // param — `name.reduce(...)` / `name.sum()` / `name.map(...)`
+            // / `name.fold(...)` / `name.length()` — is a list use. A
+            // bare-variable receiver parses as `[String(name),
+            // String(method)]`; a complex-expression receiver parses as
+            // `[Dynamic(<receiver>), String(method)]`. Cover both.
+            if path.len() == 2 {
+                if let TokenKey::String(m, _, _) = &path[1] {
+                    let is_list_method = matches!(
+                        m.as_str(),
+                        "reduce" | "sum" | "map" | "fold" | "filter" | "length" | "max"
+                    );
+                    let recv_is_param = match &path[0] {
+                        TokenKey::String(s, _, _) => s == name,
+                        TokenKey::Dynamic(recv, _) => expr_is_bare_param(&recv.expr, name),
+                        _ => false,
+                    };
+                    if is_list_method && recv_is_param {
+                        return true;
+                    }
+                }
+            }
             args.iter()
                 .any(|a| closure_param_used_as_list_int(name, &a.value.expr))
         }
@@ -5760,8 +6771,15 @@ fn lower_where(
         // terminal, so without this it would fall through to the
         // generic FnCall dispatch and reject as
         // `UnknownStdlibMethod { name: "range" }`.
-        if let Some(range_args) = match_bare_range(&value.expr) {
-            emit_range_materialize(range_args, value.range, ctx)?;
+        // AOT-4 (W19 slice): also materialise a where-bound nested
+        // `range(a, b).map((p) => <inner>)` — a `List<List<Int>>` (when
+        // `<inner>` is itself a materialisable row) or a `List<Int>`
+        // (when `<inner>` is `Int`-valued). `emit_list_value_materialize`
+        // subsumes the bare-range case, so route both shapes through it.
+        if match_bare_range(&value.expr).is_some()
+            || match_materializable_outer_map(&value.expr).is_some()
+        {
+            emit_list_value_materialize(&value.expr, value.range, ctx)?;
             let value_ty = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
                 kind: "Where(range-materialize-empty-stack)".to_string(),
                 range: value.range,
@@ -7105,10 +8123,32 @@ fn lower_variable(
     // diagnostic) rather than emitting a possibly-wrong load. We do NOT
     // emit `Op::ListGetByIntIdx` (that op is trace-recorder-only; static
     // codegen rejects it).
-    if path.len() == 2 {
-        if let TokenKey::Dynamic(index_node, optional) = &path[1] {
-            let receiver_ty = ctx.tstack.last().copied();
-            if receiver_ty == Some(IrType::ListInt) {
+    // AOT-4 (W19 slice): generalise to a CHAIN of trailing `Dynamic`
+    // index segments so 2D `a[i][k]` (and any N-D `xs[i][j]...`) on a
+    // materialised `List<List<Int>>` lowers. A `List<List<Int>>` is the
+    // outer `List<Int>` record whose i64 elements are i32 arena offsets
+    // of inner `List<Int>` rows (the materialiser writes the handle
+    // truncated into the i64 element slot — see
+    // `emit_list_value_materialize`). An outer index `a[i]` therefore
+    // loads an i64 whose low 32 bits ARE the inner row's arena handle;
+    // to index it again the i64 is round-tripped through a ListInt
+    // let-slot (`LetSet{ListInt}` truncates i64->i32) so the next
+    // `lower_list_int_index` sees a properly tagged `ListInt` receiver.
+    // The FINAL segment loads the i64 cell value. Inline payload
+    // addressing throughout (NO `Op::ListGetByIntIdx`, NO bounds branch
+    // — every W19 index is provably within `range(size)`).
+    if path.len() >= 2
+        && path[1..]
+            .iter()
+            .all(|s| matches!(s, TokenKey::Dynamic(_, _)))
+    {
+        let receiver_ty = ctx.tstack.last().copied();
+        if receiver_ty == Some(IrType::ListInt) {
+            let last = path.len() - 1;
+            for (off, seg) in path[1..].iter().enumerate() {
+                let TokenKey::Dynamic(index_node, optional) = seg else {
+                    unreachable!("guarded by the all-Dynamic check above");
+                };
                 // Optional indexing (`xs[i]?`) would need a Null-or-value
                 // result the i64 element path can't represent; decline.
                 if *optional {
@@ -7117,12 +8157,36 @@ fn lower_variable(
                         range,
                     });
                 }
-                return lower_list_int_index(index_node, range, ctx);
+                // Pops the `ListInt` receiver, pushes the i64 element.
+                lower_list_int_index(index_node, range, ctx)?;
+                // Not the last segment: the loaded i64 is an inner row
+                // handle — retag it as `ListInt` for the next index step.
+                if 1 + off != last {
+                    let handle_i = ctx.next_let_idx;
+                    ctx.next_let_idx += 1;
+                    ctx.out.push(TaggedOp {
+                        op: Op::LetSet {
+                            idx: handle_i,
+                            ty: IrType::ListInt,
+                        },
+                        range,
+                    });
+                    ctx.tstack.pop(); // i64 element
+                    ctx.out.push(TaggedOp {
+                        op: Op::LetGet {
+                            idx: handle_i,
+                            ty: IrType::ListInt,
+                        },
+                        range,
+                    });
+                    ctx.tstack.push(IrType::ListInt);
+                }
             }
-            // A `Dynamic` segment on a non-`List<Int>` receiver is not a
-            // materialised-list index — fall through to the generic
-            // diagnostic below so the rejection message stays precise.
+            return Ok(());
         }
+        // A `Dynamic` segment on a non-`List<Int>` receiver is not a
+        // materialised-list index — fall through to the generic
+        // diagnostic below so the rejection message stays precise.
     }
     for seg in &path[1..] {
         let field_name = match seg {
@@ -7484,6 +8548,27 @@ fn lower_one_method<'a>(
 mod intern_tests {
     use super::*;
 
+    /// Recursively flatten a func body's op stream into `out`, descending
+    /// into `If` / `Block` / `Loop` arms so assertions see ops wherever
+    /// the control-flow places them.
+    fn flatten_into(body: &[TaggedOp], out: &mut Vec<Op>) {
+        for t in body {
+            out.push(t.op.clone());
+            match &t.op {
+                Op::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    flatten_into(then_body, out);
+                    flatten_into(else_body, out);
+                }
+                Op::Block { body, .. } | Op::Loop { body, .. } => flatten_into(body, out),
+                _ => {}
+            }
+        }
+    }
+
     /// AOT-4 (W16 slice): a 1D `xs[i]` index on a materialised
     /// `List<Int>` receiver lowers to the inline payload addressing —
     /// `(base + 11) & -8` then `+ i*8` then `Op::LoadI64AtAbsolute
@@ -7552,6 +8637,125 @@ mod intern_tests {
             "xs[i] index must emit payload-align (`BitAnd I32`) + element-stride (`Mul I32`) math; \
              has_align={has_align} has_stride={has_stride}"
         );
+    }
+
+    /// AOT-4 (W19 slice): a where-bound `List<List<Int>>` materialises
+    /// nested arena records and a 2D index `m[i][k]` composes TWO inline
+    /// payload loads — NOT `Op::ListGetByIntIdx`, NOT an eliding peephole
+    /// that would collapse the matrix. Pins the materialised 2D path
+    /// distinct from the reduce-only fused nested-range shape (which
+    /// allocates no list at all).
+    #[test]
+    fn matmul_2d_materializes_nested_records_and_double_indexes() {
+        // `m` is a where-bound `List<List<Int>>` (outer map over an
+        // inner map). `m[i][k]` is a cross-row double index — the kernel
+        // shape the eliding peephole cannot serve. The `_len` guards keep
+        // the read in-bounds without changing the lowering under test.
+        let src = "#unstrict\n#main(Int n) -> Int\n\
+                   (_len(m) <= 1 ? 0 : m[1][0]) \
+                   where { m: range(n).map((i) => range(n).map((j) => i * 10 + j)) }";
+        let m = lower_source(src);
+        let mut ops = Vec::new();
+        for f in &m.funcs {
+            flatten_into(&f.body, &mut ops);
+        }
+
+        // A 2D materialise allocates the outer record PLUS one inner row
+        // record per outer iteration — at least two distinct
+        // `AllocScratchDyn` sites in the op stream (outer + inner-in-loop).
+        let alloc_dyn = ops
+            .iter()
+            .filter(|op| matches!(op, Op::AllocScratchDyn))
+            .count();
+        assert!(
+            alloc_dyn >= 2,
+            "2D materialise must emit >=2 AllocScratchDyn (outer record + inner rows), got {alloc_dyn}"
+        );
+
+        // The double index composes inline payload loads.
+        let inline_loads = ops
+            .iter()
+            .filter(|op| matches!(op, Op::LoadI64AtAbsolute { offset: 0 }))
+            .count();
+        assert!(
+            inline_loads >= 2,
+            "2D index m[i][k] must emit >=2 inline LoadI64AtAbsolute (outer handle + inner cell), got {inline_loads}"
+        );
+
+        // Never the trace-recorder-only index op.
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, Op::ListGetByIntIdx { .. })),
+            "2D index must NOT emit Op::ListGetByIntIdx (trace-only; static codegen rejects it)"
+        );
+
+        // The materialise path fills the payload with StoreI64AtAbsolute
+        // — an eliding peephole would collapse the matrix to a scalar
+        // loop and leave none.
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, Op::StoreI64AtAbsolute { .. })),
+            "2D materialise must fill payloads with StoreI64AtAbsolute (no eliding collapse)"
+        );
+
+        // Payload-align (`BitAnd I32`) + element-stride (`Mul I32`) math
+        // is present (both materialise + index emit it).
+        assert!(
+            ops.iter().any(|op| matches!(op, Op::BitAnd(IrType::I32)))
+                && ops.iter().any(|op| matches!(op, Op::Mul(IrType::I32))),
+            "2D path must emit payload-align + element-stride math"
+        );
+    }
+
+    /// AOT-4 (W19 slice): the production `c.reduce(0, (row_acc, row) =>
+    /// row_acc + row.reduce(...))` over a materialised `List<List<Int>>`
+    /// lowers through the reduce-over-materialised-list path — it reads
+    /// the record headers (`LoadI32AtAbsolute`) for the loop bounds and
+    /// the elements (`LoadI64AtAbsolute`) inline, NOT through
+    /// `Op::ListGetByIntIdx` or a `list_int_fold` stdlib `Op::Call`.
+    #[test]
+    fn matmul_reduce_over_materialized_list_lowers_inline() {
+        let src = "#unstrict\n\
+                   #main(Int n) -> Int\n\
+                   c.reduce(0, (row_acc, row) => row_acc + row.reduce(0, (cell_acc, cell) => cell_acc + cell))\n\
+                   where {\n\
+                     size: n,\n\
+                     c: range(size).map((i) => range(size).map((j) => i + j))\n\
+                   }";
+        let m = lower_source(src);
+        let mut ops = Vec::new();
+        for f in &m.funcs {
+            flatten_into(&f.body, &mut ops);
+        }
+
+        // The reduce loops read the `[len]` header with LoadI32AtAbsolute.
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, Op::LoadI32AtAbsolute { offset: 0 })),
+            "reduce-over-list must read the record header via LoadI32AtAbsolute"
+        );
+        // And the elements with inline LoadI64AtAbsolute.
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, Op::LoadI64AtAbsolute { offset: 0 })),
+            "reduce-over-list must read elements via inline LoadI64AtAbsolute"
+        );
+        // Never via the trace-only index op.
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, Op::ListGetByIntIdx { .. })),
+            "reduce-over-list must NOT emit Op::ListGetByIntIdx"
+        );
+        // The fold must NOT route through the `list_int_fold` stdlib body
+        // (that would require a closure conversion the inline reduce
+        // avoids). Pins the inline reduce-loop path.
+        if let Some(fold_idx) = stdlib_function_index("list_int_fold") {
+            assert!(
+                !ops.iter()
+                    .any(|op| matches!(op, Op::Call { fn_index, .. } if *fn_index == fold_idx)),
+                "reduce-over-list must lower inline, not via Op::Call(list_int_fold) (fold_idx={fold_idx})"
+            );
+        }
     }
 
     /// AOT-4 (W16 slice): the recursive `sum_qs(xs)` helper's param is
