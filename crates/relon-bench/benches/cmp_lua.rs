@@ -4449,18 +4449,28 @@ fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
         // the algorithm-substitution honesty rule (W7 history).
         "W16_quicksort" => None,
         // Panel expansion 2026-05-28 (Tier 2 industry-standard W17):
-        // production source uses `where`-clause recursive helper
-        // `bs(lo, hi, t)`. Same envelope rejection as W7 fib (Phase
-        // F.W7 lifted the Dict-bodied recursion only); returning
-        // `None` keeps the row honest until the envelope widens.
-        "W17_binary_search" => None,
+        // production source uses a `where`-clause recursive helper
+        // `bs(lo, hi, t)`. AOT-3 (2026-05-30) generalised the W7
+        // Dict-bodied-recursion lifting to where-bound closure lets,
+        // so the verbatim production source now compiles + runs
+        // through `LlvmAotEvaluator::from_source` (proven by
+        // `crates/relon-codegen-llvm/tests/llvm_w17_binary_search.rs`
+        // against the tree-walker oracle). Same algorithm, same code
+        // path, same I/O shape (`#main(Int n) -> Int`) as the
+        // tree_walk / luajit rows — passes the 3 honesty questions.
+        "W17_binary_search" => Some(w17_relon_src()),
         // Panel expansion 2026-05-28 (Tier 2 industry-standard W18):
-        // production source uses `where`-clause recursive `is_prime`
-        // helper + `_list_filter` closure. Same envelope rejection
-        // as W7 / W17; returning `None` keeps the row honest until
-        // the envelope widens. An inlined iterative variant would
-        // be the algorithm-substitution paper-win pattern.
-        "W18_prime_count_trial_div" => None,
+        // production source uses a `where`-clause recursive `is_prime`
+        // helper + `_list_filter` over a runtime-materialised
+        // `range(2, n)`. AOT-4 W18 slice (2026-05-30) added runtime
+        // List<Int> materialization + `_list_filter` -> Op::Call +
+        // `_len` lowering, so the verbatim production source now
+        // compiles + runs through `LlvmAotEvaluator::from_source`
+        // (proven by `crates/relon-codegen-llvm/tests/llvm_w18_prime_count.rs`
+        // against the tree-walker oracle). The survivor subset is
+        // data-dependent (no closed-form fold), same algorithm /
+        // code path / I/O shape as the tree_walk / luajit rows.
+        "W18_prime_count_trial_div" => Some(w18_relon_src()),
         // Panel expansion 2026-05-28 (Tier 3 numeric-kernel W19):
         // production source materialises two 16x16 `List<List<Int>>`
         // matrices via nested `range(size).map(...).map(...)` chains.
