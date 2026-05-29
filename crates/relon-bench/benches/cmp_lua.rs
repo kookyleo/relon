@@ -493,6 +493,62 @@ fn paper_win_container_sugar_label(label: &str) -> bool {
     )
 }
 
+/// Tier 4 Phase 4 (panel expansion 2026-05-29): label gate for the
+/// f-string interpolation row. The Relon tree-walker pays a per-iter
+/// String allocation, decimal write, and concat for every iter via
+/// the `Expr::FString` evaluator in `eval.rs`; the LuaJIT row walks
+/// `string.format` plus `#str`, the same int-to-decimal then alloc
+/// then length-read shape. A Rust-side `format!("item {} of {}", i,
+/// n).len()` could be folded by rustc / LLVM after inlining: the
+/// constant prefix lengths plus `ilog10(i) + 1` digit count are all
+/// closed-form expressions of `i` and `n`, and rustc's `format!` macro
+/// expansion is known to be aggressively constant-folded when the
+/// fmt-spec is a literal and only the integer args vary. Booking that
+/// potential closed-form sum under a `rust_native` label against the
+/// LuaJIT row that walks the format-then-strlen path is a paper-win
+/// per the `/perf` Honesty Rules' "closed-form fold that changes
+/// complexity class = red-line" — here the fold could replace the
+/// O(n) loop with an O(1) digit-bucket sum.
+///
+/// The label IS retained in `canonical_panel` because the
+/// `relon_jit` row legitimately routes the production source through
+/// `JitEvaluator::run_main` (falls through to the tree-walker today;
+/// the bytecode envelope rejects f-string lowering until Z.4.x adds
+/// `Op::FString`); the wasm / llvm_aot / cranelift_aot rows already
+/// gate out via `llvm_aot_source_for` / `try_build_*` returning None;
+/// and the dedicated tree_walk + luajit rows above carry the row's
+/// headline numbers. The `rust_native` row is suppressed end-to-end
+/// via this gate.
+fn paper_win_fstring_interp_label(label: &str) -> bool {
+    matches!(label, "W26_fstring_interp")
+}
+
+/// Tier 4 Phase 4 (panel expansion 2026-05-29): label gate for the
+/// non-list stdlib coverage row (W27 `std/dict.keys`). The Relon
+/// tree-walker pays a per-iter module-resolver call + dict literal
+/// allocation + List materialisation in `_dict_keys`. A Rust-side
+/// `HashMap<&str, i32>::from([...]).keys().count()` would be folded
+/// by rustc / LLVM after inlining: the dict literal is a constant
+/// 3-element map, and `keys().count()` is a constant `3`. Booking
+/// that O(1) compile-time constant under a `rust_native` label
+/// against the LuaJIT row that walks the table-iter + list-
+/// materialise path is a paper-win per the `/perf` Honesty Rules'
+/// "closed-form fold that changes complexity class = red-line" — the
+/// fold could replace the O(n) loop with an O(1) `n * 3`.
+///
+/// The label IS retained in `canonical_panel` because the
+/// `relon_jit` row legitimately routes the production source through
+/// `JitEvaluator::run_main` (falls through to the tree-walker today;
+/// the bytecode envelope rejects stdlib-module-resolver + dict
+/// literal lowering); the wasm / llvm_aot / cranelift_aot rows
+/// already gate out via `llvm_aot_source_for` / `try_build_*`
+/// returning None; and the dedicated tree_walk + luajit rows above
+/// carry the row's headline numbers. The `rust_native` row is
+/// suppressed end-to-end via this gate.
+fn paper_win_stdlib_dict_label(label: &str) -> bool {
+    matches!(label, "W27_stdlib_dict")
+}
+
 // Honesty cleanup #309 (2026-05-28): the previous
 // `try_build_jit_with_fixture` helper lived here. It installed a
 // `relon::TraceFixture` pre-built from `wN_recorder_body()` plus a
@@ -3411,6 +3467,300 @@ fn w30_expected() -> i64 {
 }
 
 // =====================================================================
+// =====  W26 — f-string interpolation per-iter concat  ================
+// =====================================================================
+//
+// Tier 4 Relon-flavour workload (panel expansion 2026-05-29, Phase 4
+// "Group C — strings / formatting"). Directly mirrors the
+// `f"... ${expr} ..."` log / error / message-rendering hot path
+// (`fixtures/decorators.relon`, `fixtures/operators.relon` carry the
+// same shape). The reduce closure interpolates a per-iter Int (`i`)
+// into a constant template alongside the closed-over `n`, so neither
+// the tree-walker nor LuaJIT can hoist the string allocation out of
+// the loop.
+//
+// **HONESTY checklist** (per `HONESTY_POLICY.md`):
+// * Source path: `w26_relon_src()` IS the production source — a
+//   `#main(Int n) -> Int` body whose `range(n).reduce(0, (acc, i)
+//   => acc + _len(f"item ${i} of ${n}"))` walks the f-string
+//   evaluator codepath in `eval.rs::Expr::FString` for every iter:
+//   each `FStringPart::Literal` push + `FStringPart::Interpolation`
+//   eval + `Display` write into the resulting String allocation,
+//   then `_len` returns the byte length. The Lua row uses
+//   `string.format("item %d of %d", i, n)` + `#str` which exercises
+//   LuaJIT's own format-then-measure path; the per-iter work is the
+//   same — int-to-decimal write + concat into a fresh string + byte
+//   length read.
+// * Algorithm complexity preserved: O(n) reduce, one f-string alloc
+//   + one `_len` read + one Int add per iter. No closed-form fold —
+//   the byte length depends on `len(str(i))` which transitions at
+//   the decimal-digit boundaries (i=10, i=100), so the per-iter
+//   contribution is not a single polynomial in `i`.
+// * Time-math sanity: for n=1000 the template renders as
+//   `"item <i> of 1000"` = 5 ("item ") + len(str(i)) + 4 (" of ")
+//   + 4 ("1000") = 13 + len(str(i)). Buckets:
+//     - i ∈ [0, 10):  len=1 → 14 bytes × 10  = 140
+//     - i ∈ [10, 100): len=2 → 15 bytes × 90  = 1 350
+//     - i ∈ [100, 1000): len=3 → 16 bytes × 900 = 14 400
+//     - total = 15 890. Both the Relon tree-walker and the LuaJIT
+//   row are asserted against this exact constant at construction
+//   time via `assert_relon_lua_consistent`.
+// * I/O shape: `#main(Int n) -> Int`. Returned scalar Int is the sum
+//   of per-iter byte lengths; `relon_int_result` passes it straight
+//   through. Lua row returns the same scalar Int.
+// * Backend coverage: tree_walk + luajit. Bytecode rejects (f-string
+//   lowering not in the M2-A scalar envelope today — `Op::FString`
+//   tracked under Z.4.x); `try_build_bytecode` returns None, the
+//   row logs `n/a (UnsupportedOp: <reason>)`. LLVM AOT / Cranelift
+//   AOT / wasm reject (same f-string surface — Phase E String ops
+//   cover concat + contains, not formatted interpolation; the wasm
+//   walker's String shape lacks the Int→decimal writer). The
+//   canonical-panel `relon_jit` row routes the production source
+//   through `JitEvaluator::run_main`, which falls through to the
+//   tree-walker for the f-string evaluation. `rust_native` is NOT
+//   applicable: a Rust-side `format!("item {} of {}", i, n).len()`
+//   could be folded by rustc / LLVM after inlining (the digit-
+//   counter is a closed-form expression of the input integers and
+//   the `_len` of the resulting `String` is a closed-form sum of
+//   constant prefix lengths plus `ilog10(i) + 1`). Booking that
+//   potential closed-form under a `rust_native` label against the
+//   LuaJIT row that walks the format-then-strlen path is a paper-
+//   win per `/perf` Honesty Rules; the row is gated out by adding
+//   the label to `paper_win_fstring_interp_label`.
+
+/// W26 scale — n = 1 000 reduce iters. The f-string evaluator
+/// allocates a fresh String per iter (Rope-free; the production
+/// FStringPart writer pushes into a `String::with_capacity(len_hint)`),
+/// so each iter pays an alloc + write + drop. At ~ 200-300 ns / iter
+/// on the tree-walker and ~ 50-80 ns / iter on LuaJIT, n=1 000 gives a
+/// 200-300 µs / 50-80 µs total per run — fits within the criterion 5 s
+/// measurement budget at 100 samples + warmup, and stays clear of the
+/// criterion variance floor (~ 100 ns). Larger n (matching W21's
+/// 10 000) would push tree-walker time into multi-ms territory which
+/// makes the warm-up + measurement budget thin; smaller n hides the
+/// per-iter cost in the variance floor.
+const W26_N: i64 = 1_000;
+
+fn w26_relon_src() -> &'static str {
+    // The reduce closure interpolates `i` (per-iter Int) and `n`
+    // (closed-over loop bound) into a constant template. The
+    // tree-walker's `Expr::FString` evaluator iterates the
+    // FStringPart list (one Literal, one Interpolation, one
+    // Literal, one Interpolation), writes each piece into a fresh
+    // String accumulator, and returns the byte length via `_len`.
+    // `#unstrict` so the (acc, i) closure params stay untyped (the
+    // analyzer's strict mode demands `(Int acc, Int i): Int =>`
+    // annotations; the tree-walker accepts either). Returns scalar
+    // Int rather than Dict — matches W1 / W3 / W18 shape so
+    // `relon_int_result` passes the value straight through and the
+    // Lua row's return is byte-identical.
+    "#unstrict\n\
+     #main(Int n) -> Int\n\
+     range(n).reduce(0, (acc, i) => acc + _len(f\"item ${i} of ${n}\"))"
+}
+
+fn w26_lua_src() -> String {
+    // Lua equivalent: `string.format("item %d of %d", i, n)` writes
+    // the same template through LuaJIT's format-then-allocate path,
+    // `#str` reads the byte length. The per-iter work shape (int-to-
+    // decimal write + concat + byte-length read) is the same as the
+    // Relon tree-walker's `Expr::FString` + `_len` path.
+    format!(
+        r#"return function()
+            local n = {n}
+            local acc = 0
+            for i = 0, n - 1 do
+                acc = acc + #string.format("item %d of %d", i, n)
+            end
+            return acc
+        end"#,
+        n = W26_N
+    )
+}
+
+fn w26_expected() -> i64 {
+    // Analytic check (computed once at startup so the bench setup
+    // panics if the production source / Lua source diverges from
+    // the closed-form prediction):
+    //
+    //   per-iter byte length = 5 ("item ") + len(str(i)) + 4 (" of ")
+    //                        + len(str(n))
+    //
+    // For n=1 000, len(str(n)) = 4, so the constant prefix is 13:
+    //   - i ∈ [0, 10):   1-digit → 14 × 10  = 140
+    //   - i ∈ [10, 100): 2-digit → 15 × 90  = 1 350
+    //   - i ∈ [100, n):  3-digit → 16 × 900 = 14 400
+    //   total = 15 890
+    //
+    // We recompute the sum here from `W26_N` rather than baking in
+    // the literal `15890` so future scale changes stay honest
+    // without a separate audit.
+    let n = W26_N;
+    let n_len = decimal_len(n) as i64;
+    let prefix_const = 5 + 4; // "item " + " of "
+    let mut total: i64 = 0;
+    for i in 0..n {
+        total += prefix_const + decimal_len(i) as i64 + n_len;
+    }
+    total
+}
+
+/// Helper: byte length of an Int rendered through Relon's f-string
+/// interpolation writer (and Lua's `%d`). Decimal, no sign for non-
+/// negative inputs. Used only by `w26_expected()` so the bench setup
+/// can cross-check the f-string per-iter byte count against the
+/// engine's actual output.
+fn decimal_len(n: i64) -> u32 {
+    if n == 0 {
+        1
+    } else if n < 0 {
+        // Not reached for W26 (n >= 0), but kept symmetric so the
+        // helper is safe to reuse if a future workload negates `i`.
+        1 + (n.unsigned_abs() as f64).log10().floor() as u32 + 1
+    } else {
+        (n as f64).log10().floor() as u32 + 1
+    }
+}
+
+// =====================================================================
+// =====  W27 — std/dict stdlib module dispatch  =======================
+// =====================================================================
+//
+// Tier 4 Relon-flavour workload (panel expansion 2026-05-29, Phase 4
+// "Group E — non-list stdlib coverage"). Adds the first cmp_lua row
+// that exercises an `#import` of a non-`std/list` stdlib module. The
+// pre-existing panel runs 13 / 15 rows through `std/list` only; this
+// row swaps in `std/dict` so the module-resolver + dict-helper call
+// surface is covered.
+//
+// Stdlib audit (2026-05-29, source: `crates/relon-evaluator/src/std_
+// relon/dict.relon`): `std/dict` exports `merge(a, b)`, `keys(d)`,
+// `values(d)`, `has_key(d, k)`. No `len(d)` — the plan-doc's
+// speculative `dict.len({a:1,b:2,c:3})` shape is replaced here with
+// `_len(dict.keys({a:1,b:2,c:3}))`, which routes the per-iter work
+// through the genuine `dict.keys` dispatch + the resulting `List`
+// length read.
+//
+// **HONESTY checklist** (per `HONESTY_POLICY.md`):
+// * Source path: `w27_relon_src()` IS the production source — a
+//   `#main(Int n) -> Int` body whose `range(n).reduce(0, (acc, _)
+//   => acc + _len(dict.keys({ a: 1, b: 2, c: 3 })))` walks the
+//   stdlib module-resolver per iter: closure call to the
+//   `dict.keys` arm of the resolved `std/dict` module (one stdlib-
+//   method dispatch), the closure body materialises a new
+//   `List<String>` from the dict literal, then `_len` reads the
+//   list length. The Lua row uses a hand-written `dict_keys(d)`
+//   helper (Lua has no std/dict module) that walks the table's
+//   `pairs(d)` iterator, accumulates keys into a fresh list, and
+//   returns the list — same per-iter shape (key iteration + list
+//   materialisation + length read).
+// * Algorithm complexity preserved: O(n) reduce, one `dict.keys`
+//   call + one List `_len` + one Int add per iter. The dict literal
+//   `{ a: 1, b: 2, c: 3 }` re-evaluates per iter (it sits inside
+//   the closure body), so the dict alloc + keys() copy fires every
+//   iter — neither the tree-walker nor LuaJIT can hoist the alloc
+//   out of the loop without proving the closure body is pure (it
+//   is, but the engines do not perform that proof today).
+// * Time-math sanity: `dict.keys({a:1,b:2,c:3})` returns a
+//   `List<String>` of length 3 (one entry per key), `_len(...)`
+//   returns 3, the reduce folds `acc + 3` over n iters → `n * 3`.
+//   For n=10_000 → 30_000. Both the Relon tree-walker and the
+//   LuaJIT row are asserted against this exact constant at
+//   construction time via `assert_relon_lua_consistent`.
+// * I/O shape: `#main(Int n) -> Int`. Returned scalar Int is the
+//   sum of per-iter list lengths; `relon_int_result` passes it
+//   straight through. Lua row returns the same scalar Int.
+// * Backend coverage: tree_walk + luajit. Bytecode envelope rejects
+//   (stdlib module-resolver + dict literal + Closure dispatch all
+//   outside the M2-A scalar envelope today); `try_build_bytecode`
+//   returns None, the row logs `n/a (UnsupportedOp: <reason>)`.
+//   LLVM AOT / Cranelift AOT / wasm reject (same module-resolver /
+//   dict surface — Phase E typed surface covers Int + String only;
+//   the Z.1 wasm program set has no stdlib-import shape). The
+//   canonical-panel `relon_jit` row routes the production source
+//   through `JitEvaluator::run_main`, which falls through to the
+//   tree-walker for the std/dict dispatch. `rust_native` is NOT
+//   applicable: a Rust-side `HashMap<&str, i32>` + `.keys().count()`
+//   would be folded by rustc / LLVM (the dict literal is a constant
+//   3-element map, `keys().count()` is a constant `3`); booking
+//   that O(1) compile-time constant under a `rust_native` label
+//   against the LuaJIT row that walks the table-iter + list-
+//   materialise path is a paper-win per `/perf` Honesty Rules. The
+//   row is gated out by adding the label to
+//   `paper_win_stdlib_dict_label`.
+
+/// W27 scale — n = 10 000 reduce iters. Same scale as W13 / W14 /
+/// W18 / W21 (other Tier 1 / 2 / 4 Relon-flavour workloads). The
+/// per-iter dict.keys dispatch costs ~ 200-400 ns on the tree-walker
+/// (one module-arm closure call + one dict-literal alloc + one
+/// List<String> materialise + one `_len`), so n=10_000 gives a
+/// 2-4 ms / run wall clock — fits the criterion 5 s measurement
+/// budget at 100 samples + warmup and stays above the variance
+/// floor.
+const W27_N: i64 = 10_000;
+
+fn w27_relon_src() -> &'static str {
+    // `#import dict from "std/dict"` resolves through the module
+    // registry to the `std_relon/dict.relon` carrier (`merge`,
+    // `keys`, `values`, `has_key`). The reduce body calls
+    // `dict.keys(...)` per iter, which evaluates the dict literal
+    // `{ a: 1, b: 2, c: 3 }` (fresh `Dict` per iter), invokes the
+    // `dict.keys(d)` closure (closure body lowers to
+    // `_dict_keys(d)`), and returns a `List<String>` of length 3.
+    // `_len(...)` reads the list byte length.
+    //
+    // `#unstrict` so the `(acc, _)` closure params stay untyped (the
+    // analyzer's strict mode demands `(Int acc, Int _): Int =>`
+    // annotations; the tree-walker accepts either). Returns scalar
+    // Int rather than Dict — matches W1 / W18 shape so
+    // `relon_int_result` passes the value straight through and the
+    // Lua row's return is byte-identical.
+    "#unstrict\n\
+     #import dict from \"std/dict\"\n\
+     #main(Int n) -> Int\n\
+     range(n).reduce(0, (acc, _) => acc + _len(dict.keys({ a: 1, b: 2, c: 3 })))"
+}
+
+fn w27_lua_src() -> String {
+    // Lua has no `std/dict` module; the canonical equivalent is to
+    // hand-write a `dict_keys(d)` helper that walks `pairs(d)`,
+    // accumulates keys into a fresh list, and returns the list. The
+    // per-iter work shape (table-iter + list-materialise +
+    // length-read) mirrors the Relon `_dict_keys` host fn body. Lua's
+    // `#tbl` returns the array-part length; we measure the keys-list
+    // length via `#keys` so the list materialisation cost is paid.
+    format!(
+        r#"return function()
+            local n = {n}
+            local function dict_keys(d)
+                local out = {{}}
+                local i = 0
+                for k, _ in pairs(d) do
+                    i = i + 1
+                    out[i] = k
+                end
+                return out
+            end
+            local acc = 0
+            for _ = 0, n - 1 do
+                local d = {{ a = 1, b = 2, c = 3 }}
+                acc = acc + #dict_keys(d)
+            end
+            return acc
+        end"#,
+        n = W27_N
+    )
+}
+
+fn w27_expected() -> i64 {
+    // Analytic check: `dict.keys({a:1,b:2,c:3})` always materialises
+    // a 3-element list (one entry per key); `_len(...)` reads 3; the
+    // reduce folds `acc + 3` over n iters → `n * 3`. For n=10_000 →
+    // 30_000.
+    W27_N * 3
+}
+
+// =====================================================================
 // =====  consistency assertions  ======================================
 // =====================================================================
 
@@ -4133,6 +4483,28 @@ fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
         // - Float-typed `#main` return is not in the Phase E typed
         //   surface (Phase E covers Int + String; Float arm tracked
         //   for Phase Z.4.x).
+        // Panel expansion 2026-05-29 (Tier 4 Phase 4 — Group C strings
+        // / formatting W26): production source uses an f-string
+        // (`f"item ${i} of ${n}"`) inside the reduce closure. The
+        // LLVM AOT envelope rejects the f-string surface — Phase E
+        // String ops cover concat + contains, not the Int→decimal
+        // formatter the FString writer needs. No "inlined
+        // pre-rendered template" variant — the per-iter String
+        // allocation + decimal write IS the load-bearing measurement
+        // here, and pre-rendering would skip both.
+        "W26_fstring_interp" => None,
+        // Panel expansion 2026-05-29 (Tier 4 Phase 4 — Group E
+        // non-list stdlib W27): production source uses `#import
+        // dict from "std/dict"` + `dict.keys({ ... })` inside the
+        // reduce closure. The LLVM AOT envelope rejects all three
+        // pieces — the stdlib module-resolver routes through the
+        // analyzer's module graph (not in the Phase B LLVM IR
+        // surface), the dict literal allocates a `Dict<String,
+        // Int>` (the Phase E typed surface covers Int + String
+        // only), and the `_dict_keys` host fn materialises a
+        // `List<String>` (no closed-form replacement that keeps
+        // the per-iter alloc cost the workload measures).
+        "W27_stdlib_dict" => None,
         // - First-class closures in non-higher-order position
         //   surface as `closure value cannot cross the wasm module
         //   boundary` (same envelope check that rejects W2 / W16 /
@@ -6587,6 +6959,159 @@ fn bench_cmp_lua(c: &mut Criterion) {
         }
     }
 
+    // ----- W26 f-string interpolation per-iter concat -----
+    //
+    // Panel expansion 2026-05-29 (Tier 4 Phase 4 — Group C strings /
+    // formatting). See the top-of-file W26 doc-comment for the
+    // HONESTY checklist. Backend coverage: tree_walk + luajit only.
+    // Bytecode envelope rejects (`Op::FString` lowering outside the
+    // M2-A scalar envelope today); the row is suppressed by
+    // `try_build_bytecode` returning None and logs `n/a` to stderr.
+    // LLVM AOT / Cranelift AOT / wasm reject (same f-string surface
+    // — Phase E String ops cover concat + contains, not formatted
+    // interpolation). The canonical-panel `relon_jit` row routes the
+    // production source through `JitEvaluator::run_main`, which
+    // falls through to the tree-walker for the f-string evaluation.
+    {
+        let (walker, scope) = build_tree_walker(w26_relon_src());
+        let lua_fn_w26 = lua_fn(&lua, &w26_lua_src());
+
+        let relon_v = relon_int_result("W26", walker.run_main(&scope, args_w_n(W26_N)).unwrap());
+        let lua_v: i64 = lua_fn_w26.call(()).unwrap();
+        assert_relon_lua_consistent("W26", relon_v, lua_v, w26_expected());
+
+        // Throughput is the number of reduce iters (`n`) — each iter
+        // performs one f-string evaluation (alloc + write + concat) +
+        // one `_len` read + one Int add, the dominant per-iter work
+        // unit. Matches W1 / W3 / W21 throughput shape so per-element
+        // ns figures line up across the Tier 1 / 2 / 4 Relon-flavour
+        // rows.
+        group.throughput(Throughput::Elements(W26_N as u64));
+        group.bench_function(
+            BenchmarkId::new("W26_fstring_interp", "relon_tree_walk"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(W26_N);
+                    timed_with_warmup(iters, || {
+                        let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
+        group.bench_function(BenchmarkId::new("W26_fstring_interp", "luajit"), |b| {
+            b.iter_custom(|iters| {
+                timed_with_warmup(iters, || {
+                    let v: i64 = lua_fn_w26.call(()).unwrap();
+                    black_box(v);
+                })
+            });
+        });
+        // Bytecode row — honest try. The f-string evaluator surface is
+        // outside the M2-A scalar envelope today; `try_build_bytecode`
+        // returns None and the row is omitted. The eprintln log line
+        // emitted by the helper makes the gate visible at bench time.
+        if let Some(ev) = try_build_bytecode(w26_relon_src(), "W26_fstring_interp") {
+            let v = ev.run_main(args_w_n(W26_N)).expect("W26 bytecode run_main");
+            let got = relon_int_result("W26", v);
+            assert_eq!(
+                got,
+                w26_expected(),
+                "W26 bytecode result mismatch: got {got}, expected {}",
+                w26_expected()
+            );
+            group.bench_function(
+                BenchmarkId::new("W26_fstring_interp", "relon_bytecode"),
+                |b| {
+                    b.iter_custom(|iters| {
+                        let n_in = black_box(W26_N);
+                        timed_with_warmup(iters, || {
+                            let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
+                            black_box(v);
+                        })
+                    });
+                },
+            );
+        }
+    }
+
+    // ----- W27 stdlib std/dict dispatch -----
+    //
+    // Panel expansion 2026-05-29 (Tier 4 Phase 4 — Group E non-list
+    // stdlib coverage). See the top-of-file W27 doc-comment for the
+    // HONESTY checklist + the stdlib audit notes
+    // (`std/dict` exports `merge` / `keys` / `values` / `has_key`;
+    // no `len`). Backend coverage: tree_walk + luajit only. Bytecode
+    // envelope rejects (stdlib module-resolver + dict literal +
+    // Closure dispatch all outside the M2-A scalar envelope today);
+    // the row is suppressed by `try_build_bytecode` returning None
+    // and logs `n/a` to stderr. LLVM AOT / Cranelift AOT / wasm
+    // reject (same module-resolver + dict-literal surface — Phase E
+    // typed surface covers Int + String only). The canonical-panel
+    // `relon_jit` row routes the production source through
+    // `JitEvaluator::run_main`, which falls through to the tree-
+    // walker for the std/dict dispatch.
+    {
+        let (walker, scope) = build_tree_walker(w27_relon_src());
+        let lua_fn_w27 = lua_fn(&lua, &w27_lua_src());
+
+        let relon_v = relon_int_result("W27", walker.run_main(&scope, args_w_n(W27_N)).unwrap());
+        let lua_v: i64 = lua_fn_w27.call(()).unwrap();
+        assert_relon_lua_consistent("W27", relon_v, lua_v, w27_expected());
+
+        // Throughput is the number of reduce iters (`n`) — each iter
+        // performs one stdlib-module dispatch (`dict.keys`) + one
+        // dict-literal alloc + one List<String> materialise + one
+        // `_len` read + one Int add. Matches W13 / W14 / W18 / W21
+        // throughput shape so per-element ns figures line up across
+        // the Tier 1 / 2 / 4 Relon-flavour rows.
+        group.throughput(Throughput::Elements(W27_N as u64));
+        group.bench_function(
+            BenchmarkId::new("W27_stdlib_dict", "relon_tree_walk"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(W27_N);
+                    timed_with_warmup(iters, || {
+                        let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
+        group.bench_function(BenchmarkId::new("W27_stdlib_dict", "luajit"), |b| {
+            b.iter_custom(|iters| {
+                timed_with_warmup(iters, || {
+                    let v: i64 = lua_fn_w27.call(()).unwrap();
+                    black_box(v);
+                })
+            });
+        });
+        // Bytecode row — honest try. The stdlib module-resolver + dict
+        // literal lowering are outside the M2-A scalar envelope today;
+        // `try_build_bytecode` returns None and the row is omitted.
+        // The eprintln log line emitted by the helper makes the gate
+        // visible at bench time.
+        if let Some(ev) = try_build_bytecode(w27_relon_src(), "W27_stdlib_dict") {
+            let v = ev.run_main(args_w_n(W27_N)).expect("W27 bytecode run_main");
+            let got = relon_int_result("W27", v);
+            assert_eq!(
+                got,
+                w27_expected(),
+                "W27 bytecode result mismatch: got {got}, expected {}",
+                w27_expected()
+            );
+            group.bench_function(BenchmarkId::new("W27_stdlib_dict", "relon_bytecode"), |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(W27_N);
+                    timed_with_warmup(iters, || {
+                        let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            });
+        }
+    }
+
     // =================================================================
     // ===== Dart-style canonical panel: relon_jit + relon_aot =========
     // =================================================================
@@ -6808,6 +7333,55 @@ fn bench_cmp_lua(c: &mut Criterion) {
         //   rows.
         ("W21_match_dispatch", w21_relon_src(), W21_N as u64, || {
             args_w_n(W21_N)
+        }),
+        // Panel expansion 2026-05-29 (Tier 4 Phase 4 — Group C strings
+        // / formatting W26):
+        // * relon_jit: runs through `JitEvaluator::run_main`; falls
+        //   through to the tree-walker (f-string evaluator + `_len`
+        //   reduce body sit outside the M2-A bytecode envelope
+        //   today; Op::FString tracked under Z.4.x).
+        // * relon_aot / relon_llvm_aot: both reject (same f-string
+        //   surface — Phase E String ops cover concat + contains,
+        //   not formatted interpolation). Returning None from
+        //   `llvm_aot_source_for`.
+        // * rust_native: gated out by adding the label to
+        //   `paper_win_fstring_interp_label`. A Rust-side
+        //   `format!("item {} of {}", i, n).len()` could be folded
+        //   by rustc / LLVM to a digit-bucket closed form, and the
+        //   per-iter "cost of f-string interpolation alloc + write"
+        //   IS the load-bearing measurement here.
+        // * relon_wasm_wasmtime: classifier scope-cut (Z.1 program
+        //   set does not include the f-string surface).
+        // * Throughput uses reduce iter count `n` so per-iter ns is
+        //   directly comparable across the Tier 1-2-4 Relon-flavour
+        //   rows.
+        ("W26_fstring_interp", w26_relon_src(), W26_N as u64, || {
+            args_w_n(W26_N)
+        }),
+        // Panel expansion 2026-05-29 (Tier 4 Phase 4 — Group E
+        // non-list stdlib W27):
+        // * relon_jit: runs through `JitEvaluator::run_main`; falls
+        //   through to the tree-walker (stdlib module-resolver +
+        //   dict literal + Closure dispatch sit outside the M2-A
+        //   bytecode envelope today).
+        // * relon_aot / relon_llvm_aot: both reject (same module-
+        //   resolver + dict-literal surface — Phase E typed surface
+        //   covers Int + String only). Returning None from
+        //   `llvm_aot_source_for`.
+        // * rust_native: gated out by adding the label to
+        //   `paper_win_stdlib_dict_label`. A Rust-side
+        //   `HashMap::from([...]).keys().count()` would be folded
+        //   by rustc / LLVM to the compile-time constant `3`, and
+        //   the per-iter "cost of std/dict module dispatch + dict
+        //   literal alloc + keys() materialise" IS the load-bearing
+        //   measurement here.
+        // * relon_wasm_wasmtime: classifier scope-cut (Z.1 program
+        //   set does not include stdlib-module imports).
+        // * Throughput uses reduce iter count `n` so per-iter ns is
+        //   directly comparable across the Tier 1-2-4 Relon-flavour
+        //   rows.
+        ("W27_stdlib_dict", w27_relon_src(), W27_N as u64, || {
+            args_w_n(W27_N)
         }),
         // Panel expansion 2026-05-29 (Tier 4 Phase 2 — Group B container
         // construction sugar W23):
@@ -7218,6 +7792,40 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 "[cmp_lua {label}] rust_native row n/a (Rust kernel either uses \
                  host-allocator dict copy or LLVM folds the arithmetic-progression \
                  sum to a closed-form polynomial — see paper_win_container_sugar_label)"
+            );
+        } else if paper_win_fstring_interp_label(label) {
+            // Panel expansion 2026-05-29 (Tier 4 Phase 4 — W26): a
+            // Rust-side `format!("item {} of {}", i, n).len()` could
+            // be folded by rustc / LLVM after inlining — the constant
+            // prefix lengths + `ilog10(i) + 1` digit count are all
+            // closed-form expressions of `i` / `n`. Booking that
+            // potential digit-bucket closed-form under a
+            // `rust_native` label against the LuaJIT row that walks
+            // the format-then-strlen path is a paper-win per the
+            // `/perf` Honesty Rules — see
+            // `paper_win_fstring_interp_label` doc-comment for the
+            // full rationale.
+            eprintln!(
+                "[cmp_lua {label}] rust_native row n/a (Rust `format!` + `.len()` \
+                 may fold to a digit-bucket closed form via rustc / LLVM \
+                 constant propagation — see paper_win_fstring_interp_label)"
+            );
+        } else if paper_win_stdlib_dict_label(label) {
+            // Panel expansion 2026-05-29 (Tier 4 Phase 4 — W27): a
+            // Rust-side `HashMap::from([("a", 1), ("b", 2), ("c",
+            // 3)]).keys().count()` would be folded by rustc / LLVM
+            // to the compile-time constant `3` (the dict literal is
+            // constant; `.keys().count()` is a constant-evaluable
+            // expression on a constant map). Booking that O(1)
+            // compile-time constant under a `rust_native` label
+            // against the LuaJIT row that walks the table-iter +
+            // list-materialise path is a paper-win per the `/perf`
+            // Honesty Rules — see `paper_win_stdlib_dict_label`
+            // doc-comment for the full rationale.
+            eprintln!(
+                "[cmp_lua {label}] rust_native row n/a (Rust `HashMap::keys().count()` \
+                 folds to the compile-time constant `3` via rustc / LLVM \
+                 constant propagation — see paper_win_stdlib_dict_label)"
             );
         } else if *label == "W20_n_body_softened" {
             // Panel expansion 2026-05-28 (Tier 3 numeric-kernel W20):
