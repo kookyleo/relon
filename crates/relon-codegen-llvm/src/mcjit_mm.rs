@@ -30,15 +30,28 @@
 //!
 //! ## Code allocation strategy
 //!
-//! Plain `mmap` with `PROT_READ | PROT_WRITE` (later promoted to
-//! `PROT_READ | PROT_EXEC` via `finalize_memory`). We do **not** use
-//! `MAP_32BIT` — Small CodeModel only needs cross-section
-//! displacements to fit in 32 bits, and we ensure that by allocating
-//! all code sections from one contiguous arena. Externs that live in
-//! the host process binary (e.g. the `relon_llvm_str_contains_arena`
-//! shim) are an explicit non-goal for the Small-mode path; the host
-//! falls back to `JITDefault` whenever the module references an
-//! extern symbol. See `should_use_small_code_model` in `evaluator.rs`.
+//! `mmap` with `PROT_READ | PROT_WRITE | MAP_32BIT` (later promoted to
+//! `PROT_READ | PROT_EXEC` via `finalize_memory`). `MAP_32BIT` pins
+//! every code **and** data section into the low 2 GiB.
+//!
+//! `MAP_32BIT` is load-bearing, not a perf knob: the Small code model
+//! addresses jump tables (the `.rodata` block a `switch` over >= 4
+//! dense cases lowers to) through a 32-bit *absolute* reference
+//! (`jmp *table(,%idx,8)`), not a PC-relative displacement. A
+//! `Op::CallClosure` over a module with >= 4 closures (W16's
+//! `<`/`==`/`>` filter predicates plus the recursive where-helper)
+//! emits exactly such a table; without `MAP_32BIT` the section landed
+//! at a 64-bit address whose truncated low 32 bits pointed at unmapped
+//! memory, and the indirect jump SIGSEGV'd (EMIT-INLINE). Code→code
+//! `callq pcrel32` references stay within ±2 GiB regardless, but
+//! pinning the whole arena low keeps the absolute jump-table references
+//! valid too.
+//!
+//! Externs that live in the host process binary (e.g. the
+//! `relon_llvm_str_contains_arena` shim) are an explicit non-goal for
+//! the Small-mode path; the host falls back to `JITDefault` whenever
+//! the module references an extern symbol. See the engine-selection
+//! branch in `evaluator.rs`.
 //!
 //! ## Scope
 //!
@@ -123,7 +136,7 @@ impl ContiguousCodeMemoryManager {
                 std::ptr::null_mut(),
                 want,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_32BIT,
                 -1 as c_int,
                 0,
             )
@@ -178,7 +191,7 @@ impl McjitMemoryManager for ContiguousCodeMemoryManager {
                 std::ptr::null_mut(),
                 want,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_32BIT,
                 -1 as c_int,
                 0,
             )

@@ -4260,6 +4260,14 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         let default_bb = self.ctx.append_basic_block(self.func, "cc_default_trap");
 
         // Position at the switch's current block and emit it.
+        //
+        // The switch's jump-table lowering is JIT-safe only because the
+        // MCJIT memory manager allocates every code / data section
+        // (including the `.rodata` jump table the `switch` lowers to) in
+        // the low 2 GiB (`MAP_32BIT`) — the Small code model addresses
+        // the table through a 32-bit *absolute* reference. See
+        // `mcjit_mm::ContiguousCodeMemoryManager` for the EMIT-INLINE
+        // fix that closed the SIGSEGV on >= 4-closure dispatch tables.
         self.builder.position_at_end(cur_bb);
         let cases: Vec<(IntValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> = case_bbs
             .iter()
@@ -4287,19 +4295,50 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             // (state + captures_ptr + user params) disagrees with this
             // call's shape, the case is dead — emit `llvm.trap` +
             // `unreachable` instead of the ill-typed call.
+            //
+            // EMIT-INLINE fix: arity alone is *not* enough to decide a
+            // case is live. A module can host several same-arity lambdas
+            // whose *signatures* still differ — most importantly in their
+            // return type. The W16 3-partition kernel binds a recursive
+            // `List<Int> -> Int` where-helper (`closure_fn_table[0]`,
+            // returns i64) *alongside* the `(x: Int) -> Bool` filter
+            // predicates (return i32); both have arity 3 (`state`,
+            // `captures_ptr`, one user param). A predicate call site's
+            // `ret_slot` is i32, so emitting a real `call i64 @helper`
+            // in that case would `store i64 <result>, ptr <i32 slot>` —
+            // an 8-byte write into a 4-byte entry-block alloca that
+            // clobbers the adjacent slot, plus a recursive call into the
+            // helper with the predicate's i64 element coerced into the
+            // helper's `List<Int>` handle param (a wild arena offset).
+            // The case is dynamically dead (the handle's `fn_table_idx`
+            // only ever selects a lambda whose signature matches the call
+            // site) but its *static* presence is memory-unsafe and gives
+            // the optimiser license to miscompile. Trap the case as dead
+            // whenever the callee's return-type width disagrees with this
+            // call site's expected return width, not just on arity.
             let want_arity = 2 + user_args.len();
-            if callee.count_params() as usize != want_arity {
+            let want_ret_llvm = match ret_ty {
+                IrType::Null => None,
+                other => Some(self.ir_ty_to_llvm_int(other)?.get_bit_width()),
+            };
+            let have_ret_llvm = callee.get_type().get_return_type().and_then(|t| match t {
+                inkwell::types::BasicTypeEnum::IntType(it) => Some(it.get_bit_width()),
+                _ => None,
+            });
+            let signature_compatible =
+                callee.count_params() as usize == want_arity && have_ret_llvm == want_ret_llvm;
+            if !signature_compatible {
                 let trap = self.llvm_trap_fn.ok_or_else(|| {
                     LlvmError::Codegen(
-                        "CallClosure arity-mismatch case: llvm.trap not declared".into(),
+                        "CallClosure incompatible-signature case: llvm.trap not declared".into(),
                     )
                 })?;
                 self.builder
-                    .build_call(trap, &[], "cc_arity_trap")
-                    .map_err(|e| LlvmError::Codegen(format!("CallClosure arity trap call: {e}")))?;
-                self.builder.build_unreachable().map_err(|e| {
-                    LlvmError::Codegen(format!("CallClosure arity unreachable: {e}"))
-                })?;
+                    .build_call(trap, &[], "cc_sig_trap")
+                    .map_err(|e| LlvmError::Codegen(format!("CallClosure sig trap call: {e}")))?;
+                self.builder
+                    .build_unreachable()
+                    .map_err(|e| LlvmError::Codegen(format!("CallClosure sig unreachable: {e}")))?;
                 continue;
             }
             // Build args: (state, captures_ptr, user_args...). Coerce
