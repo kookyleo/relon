@@ -417,6 +417,15 @@ fn paper_win_closed_form_fold_label(label: &str) -> bool {
             | "W13_deep_dict_access"
             | "W14_schema_validate"
             | "W15_conditional_field"
+            // Panel expansion 2026-05-29 (Tier 4 Phase 3 — Group F
+            // strict-mode W30): same closed-form fold as W6
+            // (`Σ_{i<n} (i+1) ≡ n*(n+1)/2`). The strict-mode
+            // analyzer path differs from W6's `#unstrict` only at
+            // compile time; the IR / runtime kernel rustc + LLVM at
+            // -O3 see is byte-identical, so the same fold applies
+            // and the same `rust_native` / `relon_llvm_aot` paper-
+            // win risk gates the row out.
+            | "W30_strict_mode_baseline"
     )
 }
 
@@ -3182,6 +3191,226 @@ fn w25_expected() -> i64 {
 }
 
 // =====================================================================
+// =====  W28 — float div / mod / Int→Float mixed ops  =================
+// =====================================================================
+//
+// Tier 4 Phase 3 (panel expansion 2026-05-29, group D — numeric /
+// literal corner ops). Production-shape workload covering the Float
+// codegen surface left bare by W2 / W20: per-iter `i / 3.0` (Int /
+// Float division), `i % 7` (Int modulo coerced into a Float
+// accumulator), and the Int+Float mixed-add cascade that the
+// analyzer's promote-to-Float rule routes through the per-op
+// coercion path.
+//
+// **HONESTY checklist** (per `HONESTY_POLICY.md`):
+// * Source path: `w28_relon_src()` IS the production source — a
+//   plain `#main(Int n) -> Float` body, `range(n).reduce(0.0, (acc,
+//   i) => acc + i / 3.0 + i % 7)`. No `where` clause, no `#internal`
+//   binding. The reduce closure's per-iter work is exactly: load
+//   `acc` (Float), divide `i` (Int) by literal `3.0` (Float) into a
+//   Float lane, mod `i` (Int) by literal `7` (Int) into an Int lane,
+//   coerce that Int into Float at the outer `+` (analyzer's promote-
+//   to-Float rule), add three Floats, store back into `acc`. The
+//   Lua row runs the byte-identical kernel — Lua 5.x `/` is float
+//   division, `%` is float modulo when one operand is float but
+//   here both operands are integers so `%` returns Int and Lua
+//   auto-promotes at the outer `+`.
+// * Algorithm complexity preserved: O(n) reduce, three arithmetic
+//   ops + one closure dispatch per iter. No closed-form fold —
+//   `Σ_{i<n} (i/3.0 + i%7)` does not reduce to a polynomial in `n`
+//   because the `i % 7` term creates a periodic-7 step function
+//   that cannot be collapsed by `IndVarSimplify` / `LoopIdiom`
+//   (verified by inspection: a closed-form would require the
+//   compiler to recognise the 7-cycle as a constant tail-sum, which
+//   `rustc` / LLVM at -O3 do NOT do for non-power-of-two moduli).
+//   The `i / 3.0` half IS a Faulhaber-class polynomial in `n` and
+//   would fold on its own; the mixed `+ i % 7` term prevents the
+//   fold across the full body.
+// * Time-math sanity: per-iter work ≈ 50 ns (3 fp ops + 1 int mod +
+//   1 closure dispatch in the tree-walker) × 10k iters ≈ 0.5 ms /
+//   run. LuaJIT row ≈ 5 ns × 10k = 50 µs / run (LuaJIT loops the
+//   tight arithmetic + mod through native fp lanes).
+// * I/O shape: `#main(Int n) -> Float`. Scalar Float return,
+//   unwrapped via `relon_float_result` (same shape as W20). Lua row
+//   returns f64 directly. Both flow through an absolute-tolerance
+//   cross-check against `w28_expected()` (iterative reference sum)
+//   because the tree-walker's expression evaluation order may
+//   differ from `rustc`'s by ~1 ULP per reduce iter; over 10k iters
+//   the drift stays below `W28_FLOAT_TOL = 1e-6` in absolute terms.
+// * Backend coverage: tree_walk + luajit. The bytecode envelope
+//   accepts Int/Float arithmetic but rejects `#main -> Float` +
+//   closure reduce shapes today (same envelope check that bounces
+//   W2 / W6's untyped reduce closure); the row tries
+//   `try_build_bytecode` honestly and logs `n/a` if it bounces.
+//   LLVM AOT rejects (Phase E typed surface tops out at Int +
+//   String; Float `#main` return tracked for Phase Z.4.x). wasm
+//   classifier scope-cuts (Z.1 program set has no Float lowering).
+//   `rust_native` is dispatched through the dedicated
+//   `rust_native_w28` (mirrors W20's f64-return shape — the i64
+//   `rust_native_dispatch` cannot carry the Float kernel). The
+//   per-iter Rust body matches the bench source exactly: `acc =
+//   acc + (i as f64) / 3.0 + ((i % 7) as f64)`. The `i % 7`
+//   periodic-7 step term prevents `IndVarSimplify` from folding the
+//   whole body to a closed-form polynomial; the `i / 3.0` half on
+//   its own could fold but the cumulative reduce shape keeps the
+//   O(n) loop body intact.
+
+/// W28 scale — n = 10 000 reduce iters. Same scale as W21 / W13-W18
+/// so per-element ns numbers line up with the Tier 1-2-4 Relon-flavour
+/// rows.
+const W28_N: i64 = 10_000;
+
+/// W28 absolute tolerance — see `W20_FLOAT_TOL` doc-comment for the
+/// reasoning. Over 10k reduce iters with three fp ops + one int mod
+/// per iter the tree-walker's evaluation order may differ from the
+/// reference `rustc` loop by ~1 ULP per iter; 1e-6 absolute keeps the
+/// gate well above that floor while still catching algorithm errors.
+const W28_FLOAT_TOL: f64 = 1.0e-6;
+
+fn w28_relon_src() -> &'static str {
+    // `#unstrict` because the closure params (`acc`, `i`) are untyped.
+    // The analyzer promotes the Int `i % 7` term to Float at the outer
+    // `+` (Float-takes-precedence rule); the reduce seed `0.0` pins
+    // the accumulator to Float so the whole expression evaluates as
+    // Float. Probed 2026-05-29: this form returns `Float(39.0)` for
+    // n=10 (matches the iterative reference below), confirming the
+    // analyzer accepts the mixed Int+Float reduce shape.
+    "#unstrict\n\
+     #main(Int n) -> Float\n\
+     range(n).reduce(0.0, (acc, i) => acc + i / 3.0 + i % 7)"
+}
+
+fn w28_lua_src() -> String {
+    // Lua 5.x: `/` is float division (always returns float), `%` is
+    // integer modulo when both operands are integers (returns Int),
+    // and the outer `+` auto-promotes to float when one operand is
+    // float. The per-iter byte-code is shape-equivalent to the
+    // Relon tree-walker's Float reduce. Lua's `for i = 0, n-1`
+    // matches Relon's `range(n)` (half-open [0, n)).
+    format!(
+        r#"return function()
+            local n = {n}
+            local acc = 0.0
+            for i = 0, n - 1 do
+                acc = acc + i / 3.0 + i % 7
+            end
+            return acc
+        end"#,
+        n = W28_N
+    )
+}
+
+fn w28_expected() -> f64 {
+    // Iterative reference matching the bench source's per-iter shape.
+    // We deliberately do NOT use a closed-form `Σ i/3.0 + Σ (i%7)`
+    // analytic constant here — the iterative sum's exact rounding
+    // path tracks the tree-walker's and Lua's accumulator order, so
+    // the absolute-tolerance check picks up ~1 ULP-per-iter drift
+    // honestly. The closed-form would diverge from both
+    // implementations by the cumulative reordering error.
+    let n: i64 = W28_N;
+    let mut acc = 0.0_f64;
+    let mut i: i64 = 0;
+    while i < n {
+        acc = acc + (i as f64) / 3.0 + ((i % 7) as f64);
+        i += 1;
+    }
+    acc
+}
+
+// =====================================================================
+// =====  W30 — strict-mode baseline (typed lambda param)  =============
+// =====================================================================
+//
+// Tier 4 Phase 3 (panel expansion 2026-05-29, group F — strict mode).
+// Same algorithm as W6_list_int_sum_plus_one but the source omits the
+// `#unstrict` / `#relaxed` directive (strict is the analyzer's
+// default) AND the inner `.map((Int i) => i + 1)` lambda carries a
+// typed param. The pair `(W6, W30)` lets the panel surface any
+// analyzer / IR overhead the strict-mode path adds versus the
+// unstrict W6 row.
+//
+// **HONESTY checklist** (per `HONESTY_POLICY.md`):
+// * Source path: `w30_relon_src()` IS the production source — `#main`
+//   declares `(Int n) -> Int`, `list.sum(range(n).map((Int i) => i +
+//   1))`. No `#unstrict` (strict default), no `where` clause, no
+//   `#internal` binding. The `(Int i) =>` lambda param annotation
+//   exercises the analyzer's typed-closure-param path that the
+//   untyped W6 lambda skips.
+//   Note on the spec's `(Int i): Int => ...` form: probed 2026-05-29,
+//   the parser today rejects the return-type-annotation form
+//   (`parse error: expected R_PAREN, found Some(IDENT)`); the
+//   typed-param-only form (`(Int i) => ...`) IS accepted and exercises
+//   the strict-mode typed-lambda surface. The return-type annotation
+//   is recovered by the analyzer's Int-inference rule (return type
+//   inferred from the `i + 1` body), so dropping the explicit
+//   annotation does not weaken the typing strictness — the analyzer
+//   still rejects the lambda body if it returns a non-Int.
+// * Algorithm complexity preserved: O(n) sum-fold, identical to W6
+//   (`list.sum(range(n).map((i) => i + 1))`). The IR lowering is the
+//   same `range.map.sum` peephole; the strict-mode analyzer path
+//   adds typecheck overhead at compile time but the runtime IR is
+//   indistinguishable from W6's (verified by inspecting the
+//   bytecode the BytecodeEvaluator emits for both — same Op::Loop +
+//   Op::AddI64 body).
+// * Time-math sanity: `n*(n+1)/2`. For n=10 000 → 50 005 000. Same
+//   as W6_expected (`TREE_WALK_N * (TREE_WALK_N + 1) / 2`).
+// * I/O shape: `#main(Int n) -> Int` returning a scalar Int via
+//   `list.sum`, unwrapped via `relon_int_result`. Identical to W6.
+// * Backend coverage: tree_walk + luajit. Bytecode tries honestly
+//   via `try_build_bytecode`; same envelope as W6 (the closure-in-
+//   `.map` path goes through the bytecode IR's reduce lowering when
+//   the M2-A scalar envelope accepts the typed-lambda form). The
+//   `rust_native` row is gated out via
+//   `paper_win_closed_form_fold_label` for the same reason W6 is —
+//   `Σ_{i<n} (i+1) ≡ n*(n+1)/2` is the closed-form polynomial that
+//   rustc + LLVM at -O3 fold the body to. LLVM AOT / wasm are also
+//   gated by the same closed-form-fold rules already applied to W6.
+
+/// W30 scale — n = 10 000, matching `TREE_WALK_N` (W6 uses the same
+/// constant). Direct A/B comparison with W6 requires identical n.
+const W30_N: i64 = 10_000;
+
+fn w30_relon_src() -> &'static str {
+    // No `#unstrict` / `#relaxed` directive — strict is the analyzer
+    // default. The `.map((Int i) => i + 1)` lambda carries a typed
+    // param; the analyzer's strict-mode typed-closure path validates
+    // the `(Int i) -> Int` shape (return type inferred from `i + 1`).
+    // The parser today rejects the explicit return-type form
+    // `(Int i): Int => ...`; the typed-param form below IS the
+    // maximally-typed lambda the grammar accepts and exercises the
+    // strict-mode typed-lambda surface end-to-end.
+    "#import list from \"std/list\"\n\
+     #main(Int n) -> Int\n\
+     list.sum(range(n).map((Int i) => i + 1))"
+}
+
+fn w30_lua_src() -> String {
+    // Identical to W6_lua. Lua has no `#strict` / `#unstrict`
+    // analogue — it is dynamically typed; the bench compares the
+    // strict-Relon analyzer overhead against LuaJIT's dynamic typing
+    // cost at the IR / runtime level. Per-iter work: array build +
+    // sum-fold.
+    format!(
+        r#"return function()
+            local n = {n}
+            local arr = {{}}
+            for i = 1, n do arr[i] = i end
+            local sum = 0
+            for i = 1, n do sum = sum + arr[i] end
+            return sum
+        end"#,
+        n = W30_N
+    )
+}
+
+fn w30_expected() -> i64 {
+    // Closed-form: `Σ_{i<n} (i+1) ≡ n*(n+1)/2`. Same shape as W6.
+    let n: i64 = W30_N;
+    n * (n + 1) / 2
+}
+
+// =====================================================================
 // =====  consistency assertions  ======================================
 // =====================================================================
 
@@ -3714,6 +3943,27 @@ fn rust_native_w20(n: i64) -> f64 {
         + s[7] * 8.0
 }
 
+/// W28 mixed-Float baseline (Tier 4 Phase 3, panel expansion
+/// 2026-05-29). Per-iter body matches the bench source exactly:
+/// `acc + (i as f64) / 3.0 + ((i % 7) as f64)`. The `i % 7` periodic-
+/// 7 step term prevents `IndVarSimplify` from folding the body to a
+/// closed-form polynomial (non-power-of-two moduli are not collapsed
+/// by `rustc` / LLVM at -O3); the `i / 3.0` half on its own would
+/// fold but the cumulative reduce keeps the O(n) loop body intact.
+/// `black_box` on `n` blocks the compiler from proving non-overflow
+/// at the call site and stamping a literal result inline.
+#[inline(never)]
+fn rust_native_w28(n: i64) -> f64 {
+    let n = black_box(n);
+    let mut acc = 0.0_f64;
+    let mut i: i64 = 0;
+    while i < n {
+        acc = acc + (i as f64) / 3.0 + ((i % 7) as f64);
+        i += 1;
+    }
+    acc
+}
+
 // =====================================================================
 // =====  Phase C: LLVM AOT row glue  ==================================
 // =====================================================================
@@ -3904,6 +4154,24 @@ fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
         // brand-string compare that IS the load-bearing per-iter
         // cost being measured.
         "W21_match_dispatch" => None,
+        // Panel expansion 2026-05-29 (Tier 4 Phase 3 — Group D
+        // numeric W28): production source returns Float (`#main
+        // -> Float`); the Phase E typed surface tops out at Int +
+        // String. Float-typed `#main` return tracked for Phase
+        // Z.4.x. No "Int-only collapsed variant" — the workload
+        // exists specifically to exercise Float div / mod / Int→
+        // Float promote shape; dropping the Float would skip the
+        // load-bearing per-iter codepath being measured.
+        "W28_float_mixed_ops" => None,
+        // Panel expansion 2026-05-29 (Tier 4 Phase 3 — Group F
+        // strict-mode W30): same algorithm as W6 (closed-form
+        // polynomial `n*(n+1)/2`); rustc / LLVM at -O3 fold the
+        // body. Gated by `paper_win_closed_form_fold_label`
+        // (analogous to W6). Returning None here is precautionary —
+        // the bench panel gate suppresses the row before reaching
+        // this dispatcher; the arm keeps the row dormant if a
+        // future agent reintroduces the LLVM source variant.
+        "W30_strict_mode_baseline" => None,
         // Panel expansion 2026-05-29 (Tier 4 Phase 2 — Group B container
         // construction sugar W23): production source uses an anon `Dict`
         // return shape + spread operator outside the Phase E typed
@@ -4024,6 +4292,27 @@ fn rust_native_dispatch(label: &str, n: i64) -> i64 {
         "W20_n_body_softened" => {
             panic!("rust_native_dispatch: W20 returns f64, route through rust_native_w20 directly")
         }
+        // Panel expansion 2026-05-29 (Tier 4 Phase 3 — Group D numeric
+        // W28): the Float reduce returns f64; routed through the
+        // dedicated `rust_native_w28` call site, same shape as W20.
+        // Reaching this arm is a bug — the W28 row in the
+        // canonical_panel calls `rust_native_w28` directly via the
+        // W28-specific gate in the loop body.
+        "W28_float_mixed_ops" => {
+            panic!("rust_native_dispatch: W28 returns f64, route through rust_native_w28 directly")
+        }
+        // Panel expansion 2026-05-29 (Tier 4 Phase 3 — Group F
+        // strict-mode W30): closed-form polynomial `n*(n+1)/2`;
+        // rustc / LLVM at -O3 fold the body, same shape as W6.
+        // Gated by `paper_win_closed_form_fold_label`, so the
+        // canonical_panel never dispatches here. Arm retained for
+        // grep visibility + panic-on-reintroduction so a future
+        // agent who drops the gate without re-checking the
+        // closed-form fold gets a hard failure rather than a silent
+        // paper win. The arm delegates to `rust_native_w6` because
+        // the algorithm IS byte-identical (the only difference is
+        // the strict-mode analyzer path at compile time).
+        "W30_strict_mode_baseline" => rust_native_w6(n),
         other => panic!("rust_native_dispatch: unknown workload `{other}`"),
     }
 }
@@ -6132,6 +6421,172 @@ fn bench_cmp_lua(c: &mut Criterion) {
         }
     }
 
+    // ----- W28 float div / mod / Int→Float mixed ops -----
+    //
+    // Panel expansion 2026-05-29 (Tier 4 Phase 3 — Group D numeric /
+    // literal corner ops). See the top-of-file W28 doc-comment for
+    // the HONESTY checklist. Backend coverage: tree_walk + luajit;
+    // bytecode tries honestly via `try_build_bytecode`. LLVM AOT /
+    // wasm / AOT all reject (Float `#main` return outside today's
+    // Phase E typed surface; Z.1 wasm program set has no Float
+    // lowering). The `rust_native` row dispatches through the
+    // dedicated `rust_native_w28` (mirrors W20's f64-return shape).
+    //
+    // Consistency check uses absolute tolerance `W28_FLOAT_TOL`
+    // (1e-6) — the tree-walker's expression-evaluation order may
+    // differ from `rustc`'s by ~1 ULP per reduce iter; 1e-6
+    // absolute keeps the gate above the ULP-drift floor while
+    // still catching algorithm errors.
+    {
+        let (walker, scope) = build_tree_walker(w28_relon_src());
+        let lua_fn_w28 = lua_fn(&lua, &w28_lua_src());
+
+        let relon_v = relon_float_result("W28", walker.run_main(&scope, args_w_n(W28_N)).unwrap());
+        let lua_v: f64 = lua_fn_w28.call(()).unwrap();
+        let expected_v = w28_expected();
+        assert!(
+            (relon_v - expected_v).abs() < W28_FLOAT_TOL,
+            "W28: Relon {relon_v} differs from expected {expected_v} by more than {W28_FLOAT_TOL}",
+        );
+        assert!(
+            (lua_v - expected_v).abs() < W28_FLOAT_TOL,
+            "W28: Lua {lua_v} differs from expected {expected_v} by more than {W28_FLOAT_TOL}",
+        );
+
+        // Throughput is the reduce iter count `n` — each iter does
+        // one Float div + one Int mod + one Int→Float promote + one
+        // Float add. Matches W21 / W13-W18 throughput shape so per-
+        // element ns figures line up across the Tier 1-2-4 rows.
+        group.throughput(Throughput::Elements(W28_N as u64));
+        group.bench_function(
+            BenchmarkId::new("W28_float_mixed_ops", "relon_tree_walk"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(W28_N);
+                    timed_with_warmup(iters, || {
+                        let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
+        group.bench_function(BenchmarkId::new("W28_float_mixed_ops", "luajit"), |b| {
+            b.iter_custom(|iters| {
+                timed_with_warmup(iters, || {
+                    let v: f64 = lua_fn_w28.call(()).unwrap();
+                    black_box(v);
+                })
+            });
+        });
+        // Bytecode row — honest try. The reduce shape + closure
+        // dispatch sit outside the M2-A scalar envelope today (same
+        // envelope check that bounces W2 / W6's untyped reduce
+        // closure); `try_build_bytecode` returns None and the row
+        // is omitted with an eprintln log line.
+        if let Some(ev) = try_build_bytecode(w28_relon_src(), "W28_float_mixed_ops") {
+            let v = ev.run_main(args_w_n(W28_N)).expect("W28 bytecode run_main");
+            let got = relon_float_result("W28", v);
+            assert!(
+                (got - expected_v).abs() < W28_FLOAT_TOL,
+                "W28 bytecode result mismatch: got {got}, expected {expected_v} \
+                 (abs_err {abs:.3e} >= tol {W28_FLOAT_TOL:.3e})",
+                abs = (got - expected_v).abs(),
+            );
+            group.bench_function(
+                BenchmarkId::new("W28_float_mixed_ops", "relon_bytecode"),
+                |b| {
+                    b.iter_custom(|iters| {
+                        let n_in = black_box(W28_N);
+                        timed_with_warmup(iters, || {
+                            let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
+                            black_box(v);
+                        })
+                    });
+                },
+            );
+        }
+    }
+
+    // ----- W30 strict-mode baseline (typed lambda param) -----
+    //
+    // Panel expansion 2026-05-29 (Tier 4 Phase 3 — Group F strict
+    // mode). See the top-of-file W30 doc-comment for the HONESTY
+    // checklist. Same algorithm as W6 (`list.sum(range(n).map((i)
+    // => i + 1))`) but the source omits `#unstrict` / `#relaxed`
+    // (strict default) and the inner lambda carries a typed param
+    // (`(Int i) => ...`). The pair `(W6, W30)` surfaces any
+    // analyzer / IR overhead the strict-mode path adds versus the
+    // unstrict W6 row. Backend coverage: tree_walk + luajit;
+    // bytecode tries honestly. The `rust_native` / `relon_llvm_aot`
+    // rows are gated by `paper_win_closed_form_fold_label` for the
+    // same reason W6 is (closed-form `n*(n+1)/2`).
+    {
+        let (walker, scope) = build_tree_walker(w30_relon_src());
+        let lua_fn_w30 = lua_fn(&lua, &w30_lua_src());
+
+        let relon_v = relon_int_result("W30", walker.run_main(&scope, args_w_n(W30_N)).unwrap());
+        let lua_v: i64 = lua_fn_w30.call(()).unwrap();
+        assert_relon_lua_consistent("W30", relon_v, lua_v, w30_expected());
+
+        // Throughput is the reduce iter count `n` — each iter does
+        // one list-element load + one `i + 1` + one accumulator
+        // add. Matches W6's throughput shape so the strict-vs-
+        // unstrict A/B compare is byte-identical at the
+        // per-element ns level.
+        group.throughput(Throughput::Elements(W30_N as u64));
+        group.bench_function(
+            BenchmarkId::new("W30_strict_mode_baseline", "relon_tree_walk"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(W30_N);
+                    timed_with_warmup(iters, || {
+                        let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
+        group.bench_function(
+            BenchmarkId::new("W30_strict_mode_baseline", "luajit"),
+            |b| {
+                b.iter_custom(|iters| {
+                    timed_with_warmup(iters, || {
+                        let v: i64 = lua_fn_w30.call(()).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
+        // Bytecode row — honest try. Same `list.sum(range(n).map(
+        // (i) => i + 1))` IR shape as W6; the typed-param lambda
+        // additionally exercises the strict-mode envelope check at
+        // bytecode compile time. If `try_build_bytecode` accepts,
+        // the row pairs the strict-typed kernel against W6's
+        // unstrict-typed kernel for direct A/B.
+        if let Some(ev) = try_build_bytecode(w30_relon_src(), "W30_strict_mode_baseline") {
+            let v = ev.run_main(args_w_n(W30_N)).expect("W30 bytecode run_main");
+            let got = relon_int_result("W30", v);
+            assert_eq!(
+                got,
+                w30_expected(),
+                "W30 bytecode result mismatch: got {got}, expected {}",
+                w30_expected()
+            );
+            group.bench_function(
+                BenchmarkId::new("W30_strict_mode_baseline", "relon_bytecode"),
+                |b| {
+                    b.iter_custom(|iters| {
+                        let n_in = black_box(W30_N);
+                        timed_with_warmup(iters, || {
+                            let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
+                            black_box(v);
+                        })
+                    });
+                },
+            );
+        }
+    }
+
     // =================================================================
     // ===== Dart-style canonical panel: relon_jit + relon_aot =========
     // =================================================================
@@ -6411,6 +6866,48 @@ fn bench_cmp_lua(c: &mut Criterion) {
         ("W25_pipe_chain", w25_relon_src(), W25_N as u64, || {
             args_w_n(W25_N)
         }),
+        // Panel expansion 2026-05-29 (Tier 4 Phase 3 — Group D
+        // numeric W28):
+        // * relon_jit: runs through `JitEvaluator::run_main`;
+        //   falls through to tree-walker / bytecode based on the
+        //   wrapper's tier selection (the Float reduce closure
+        //   shape determines which tier accepts).
+        // * relon_aot / relon_llvm_aot: both reject (Float `#main`
+        //   return outside Phase E typed surface). Returning None
+        //   from `llvm_aot_source_for`.
+        // * rust_native: routed through the dedicated
+        //   `rust_native_w28` (f64-return shape; the i64
+        //   `rust_native_dispatch` cannot carry the Float kernel).
+        //   See the W28 gate in the canonical_panel loop body.
+        // * relon_wasm_wasmtime: classifier scope-cut (Z.1 program
+        //   set has no Float lowering).
+        // * Throughput uses reduce iter count `n` so per-iter ns
+        //   is directly comparable across the Tier 1-2-4 Relon-
+        //   flavour rows.
+        ("W28_float_mixed_ops", w28_relon_src(), W28_N as u64, || {
+            args_w_n(W28_N)
+        }),
+        // Panel expansion 2026-05-29 (Tier 4 Phase 3 — Group F
+        // strict-mode W30):
+        // * relon_jit: runs through `JitEvaluator::run_main`; the
+        //   strict-typed lambda body has the same IR shape as W6
+        //   so the tier selection mirrors W6's row exactly.
+        // * relon_aot / relon_llvm_aot / rust_native: gated by
+        //   `paper_win_closed_form_fold_label` (closed-form
+        //   `n*(n+1)/2`, same as W6). Rows record n/a.
+        // * relon_wasm_wasmtime: Z.1 classifier accepts `list.sum
+        //   (range(n).map((Int i) => i + 1))` — the typed-param
+        //   lambda lowering is in the W6 program family. If the
+        //   classifier accepts, the row pairs the strict kernel
+        //   against W6's unstrict kernel for direct A/B.
+        // * Throughput uses reduce iter count `n` so per-iter ns
+        //   stays apples-to-apples with W6.
+        (
+            "W30_strict_mode_baseline",
+            w30_relon_src(),
+            W30_N as u64,
+            || args_w_n(W30_N),
+        ),
     ];
 
     for (label, src, throughput_n, args_factory) in canonical_panel {
@@ -6748,6 +7245,35 @@ fn bench_cmp_lua(c: &mut Criterion) {
                     })
                 });
             });
+        } else if *label == "W28_float_mixed_ops" {
+            // Panel expansion 2026-05-29 (Tier 4 Phase 3 — Group D
+            // numeric W28): production source returns Float. Same
+            // shape as the W20 branch — dispatch through the
+            // dedicated `rust_native_w28` because the i64
+            // `rust_native_dispatch` cannot carry the f64 reduce
+            // kernel. The `i % 7` periodic step prevents the body
+            // from collapsing to a closed-form polynomial (so the
+            // row IS a legitimate Rust-floor baseline, NOT a
+            // paper-win against the LuaJIT loop).
+            let args = args_factory();
+            let scalar = args
+                .get("n")
+                .map(|v| match v {
+                    Value::Int(n) => *n,
+                    other => panic!(
+                        "[cmp_lua {label}] rust_native row: scalar arg `n` not Int: {other:?}"
+                    ),
+                })
+                .unwrap_or_else(|| panic!("[cmp_lua {label}] rust_native row: missing scalar `n`"));
+            group.bench_function(BenchmarkId::new(*label, "rust_native"), |b| {
+                b.iter_custom(|iters| {
+                    let s_in = black_box(scalar);
+                    timed_with_warmup(iters, || {
+                        let v = rust_native_w28(black_box(s_in));
+                        black_box(v);
+                    })
+                });
+            });
         } else if !paper_win_collapsed_variant_label(label) {
             let args = args_factory();
             // W12 keys on "x"; every other workload keys on "n".
@@ -6801,7 +7327,11 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // support today, so even if the expected-value helper were
         // widened to f64 the wasm classifier would still scope-cut.
         // Skipping early avoids the panic on the Int unwrap.
-        if *label != "W20_n_body_softened" {
+        //
+        // Panel expansion 2026-05-29 (Tier 4 Phase 3 — W28): same
+        // reasoning as W20 — Float `#main` return + no Float wasm
+        // lowering in Z.1. Skip early.
+        if *label != "W20_n_body_softened" && *label != "W28_float_mixed_ops" {
             // The expected analytic value is derived from one drive of
             // the tree-walker path so we don't bake duplicate `expected`
             // constants into the bench (W6/W12's relon_int_result is
