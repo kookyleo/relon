@@ -420,6 +420,31 @@ fn paper_win_closed_form_fold_label(label: &str) -> bool {
     )
 }
 
+/// Tier 4 Phase 1 (panel expansion 2026-05-29): label gate for the
+/// brand-tagged-value `match` dispatch row. The Relon tree-walker pays
+/// a per-iter brand-string compare + arm-table walk (see W21 doc-
+/// comment). A Rust-side equivalent would model the items as
+/// `enum { Image, Text }` and lower the `match` to a `cmov` / `br_table`
+/// — both of which collapse the runtime brand-string compare to a
+/// compile-time variant tag dispatch. Booking that O(1) variant
+/// dispatch under a `rust_native` label against a LuaJIT row that
+/// walks the `if it.__type == "..."` ladder is a paper-win per
+/// `/perf` Honesty Rules ("Same algorithm? Same code path?" — the
+/// Rust `enum` discriminant compare is a different code path than
+/// the tree-walker's brand-string-equal probe).
+///
+/// The label IS retained in `canonical_panel` because the
+/// `relon_jit` row legitimately routes the production source through
+/// `JitEvaluator::run_main` (falls through to the tree-walker for
+/// this surface today); the wasm / llvm_aot / cranelift_aot rows
+/// already gate out via `llvm_aot_source_for` / `try_build_*`
+/// returning None; and the dedicated tree_walk + luajit + bytecode
+/// rows above carry the row's headline numbers. The
+/// `rust_native` row is suppressed end-to-end via this gate.
+fn paper_win_brand_dispatch_label(label: &str) -> bool {
+    matches!(label, "W21_match_dispatch")
+}
+
 // Honesty cleanup #309 (2026-05-28): the previous
 // `try_build_jit_with_fixture` helper lived here. It installed a
 // `relon::TraceFixture` pre-built from `wN_recorder_body()` plus a
@@ -2630,6 +2655,158 @@ fn w20_expected() -> f64 {
 }
 
 // =====================================================================
+// =====  W21 — match dispatch over brand-tagged values  ===============
+// =====================================================================
+//
+// Tier 4 Relon-flavour workload (panel expansion 2026-05-29, Phase 1
+// "Group A — high-frequency runtime dispatch"). Directly mirrors the
+// `fixtures/polymorphism.relon` showcase shape: a heterogeneous list
+// of `#brand Schema { ... }`-tagged dicts is dispatched per iter via
+// a `match` arm-table keyed on the brand label. The reduce closure
+// alternates between the two brands by `i % 2`, so neither LuaJIT
+// nor the tree-walker can collapse the branch to a constant.
+//
+// **HONESTY checklist** (per `HONESTY_POLICY.md`):
+// * Source path: `w21_relon_src()` IS the production source — a
+//   `#main(Int n) -> Dict` body builds the two `#brand Image` /
+//   `#brand Text` items, the `classify(it)` closure runs `it match {
+//   Image: 1, Text: 2, *: 0 }` per iter, the reduce folds the per-
+//   iter classification into the running accumulator. Lua row uses
+//   the `__type` field convention to simulate the brand tag and a
+//   small `if / elseif / else` ladder (LuaJIT has no `match`); the
+//   per-iter work is the same — table-field probe + brand-equal
+//   compare + branch select.
+// * Algorithm complexity preserved: O(n) reduce, one `items[i % 2]`
+//   subscript + one brand-label compare + one Int add per iter. No
+//   closed-form fold — the branch select alternates per iter and
+//   the per-iter result depends on which brand the runtime resolved,
+//   which is shape-dependent.
+// * Time-math sanity: items[0] is `#brand Image` → classify → 1;
+//   items[1] is `#brand Text` → classify → 2. Over n=10 000 iters
+//   (even n) half land on Image and half on Text, so the analytic
+//   answer is `n / 2 * 1 + n / 2 * 2 = n * 3 / 2 = 15 000`. The
+//   tree-walker per-iter cost is closure dispatch (~ 200 ns) + brand
+//   compare (~ 20 ns) + list subscript (~ 30 ns); ≈ 250-300 ns/iter
+//   × 10k iters = 2.5-3 ms / run. LuaJIT row pays the same per-iter
+//   ladder via `if-elseif` lowered to `cmp + cmov`; ≈ 5-10 ns/iter
+//   × 10k iters ≈ 50-100 µs / run.
+// * I/O shape: `#main(Int n) -> Dict`. Returned Dict carries a
+//   `result: Int` field; `relon_int_result` unwraps it (same shape
+//   as W13 / W14 / W15 / W16 / W17 / W18 / W19). Lua row returns the
+//   scalar Int directly. Both flow through `assert_relon_lua_
+//   consistent` for an exact-equal cross-check.
+// * Backend coverage: tree_walk + luajit. Bytecode envelope rejects
+//   (`#brand` + `match` lowering both outside the M2-A scalar
+//   envelope today); `try_build_bytecode` returns None, the row
+//   logs `n/a (UnsupportedOp: <reason>)`. LLVM AOT / Cranelift AOT /
+//   wasm reject (same `#brand` / `match` / `#schema` surface — the
+//   Z.4 wasm-walker envelope does not lower the brand-tag compare,
+//   and the LLVM Phase E envelope tops out at String ops). The
+//   canonical-panel `relon_jit` row routes the production source
+//   through `JitEvaluator::run_main`, which falls through to the
+//   tree-walker for the brand+match dispatch. The dedicated
+//   `relon_trace_jit` row is gated out via
+//   `trace_jit_production_label_eligible` — the recorder rejects
+//   `Op::Match` arms today (closure-abort path tracked under the
+//   J.4 envelope expansion). `rust_native` is NOT applicable: a
+//   rust-side `enum + match` would be a closed-form replacement
+//   that skips the tree-walker's runtime brand-string compare; the
+//   per-iter "cost of dynamic brand dispatch" is the load-bearing
+//   measurement here. The row is gated out by adding the label to
+//   `paper_win_collapsed_variant_label`-style honesty rules below.
+
+/// W21 scale — n = 10 000 reduce iters. Same scale as W13 / W14 /
+/// W18 (tier-1 / tier-2 Relon-flavour workloads). Smaller n hides the
+/// per-iter brand-dispatch cost in criterion's variance floor; larger
+/// n would push tree-walker run-time to multi-ms which blows the 5 s
+/// measurement budget when combined with the per-iter brand-compare
+/// overhead (~ 250 ns × 10k = 2.5 ms / run; × 100 samples + warmup
+/// fits within budget).
+const W21_N: i64 = 10_000;
+
+fn w21_relon_src() -> &'static str {
+    // The `#main` body is the standard W13-shape Dict literal: two
+    // `#schema` declarations register the brand labels with the
+    // analyzer, the `items` list materialises two `#brand`-decorated
+    // dicts (one per schema), the `classify(it)` closure dispatches
+    // on the brand label via `match`, and the `result: range(n).
+    // reduce(...)` field carries the scalar accumulator the Dict
+    // unwrap helper projects out.
+    //
+    // `#unstrict` is required because the closure params (`acc`,
+    // `i`, `it`) are untyped — the analyzer's strict-mode envelope
+    // demands explicit type annotations; the tree-walker accepts
+    // either way. The schemas are declared inline inside the `#main`
+    // body Dict rather than at top-level because the parser today
+    // rejects top-level `#schema X { ... },` directives outside a
+    // Dict context (probed 2026-05-29; v1 form returned
+    // `parse error: expected expression`). Declaring inside the
+    // Dict body keeps the production-source shape valid; the brand-
+    // tag lookup still happens at `#brand` evaluation time and the
+    // match arms still key on the schema label registered by the
+    // inner `#schema` declarations.
+    "#unstrict\n\
+     #main(Int n) -> Dict\n\
+     {\n\
+       #schema Image { name: String, url: String },\n\
+       #schema Text { name: String, content: String },\n\
+       items: [\n\
+         #brand Image { name: \"img\", url: \"http://a.png\" },\n\
+         #brand Text { name: \"txt\", content: \"hello\" }\n\
+       ],\n\
+       classify(it): it match {\n\
+         Image: 1,\n\
+         Text: 2,\n\
+         *: 0\n\
+       },\n\
+       result: range(n).reduce(0, (acc, i) => acc + classify(items[i % 2]))\n\
+     }"
+}
+
+fn w21_lua_src() -> String {
+    // Lua has no `match` and no brand tag; the canonical equivalent
+    // is to carry a `__type` field on each dict and dispatch with
+    // `if / elseif / else`. The per-iter work is shape-equivalent:
+    // table-field probe (`it.__type`) + string compare + branch
+    // select, mirroring the tree-walker's brand-label compare. Lua's
+    // 1-indexed tables force the `(i % 2) + 1` subscript shift; the
+    // per-iter sum semantics stay byte-identical (5000×1 + 5000×2 =
+    // 15 000 over n=10 000).
+    format!(
+        r#"return function()
+            local n = {n}
+            local items = {{
+                {{ __type = "Image", name = "img", url = "http://a.png" }},
+                {{ __type = "Text", name = "txt", content = "hello" }},
+            }}
+            local function classify(it)
+                if it.__type == "Image" then
+                    return 1
+                elseif it.__type == "Text" then
+                    return 2
+                else
+                    return 0
+                end
+            end
+            local acc = 0
+            for i = 0, n - 1 do
+                acc = acc + classify(items[(i % 2) + 1])
+            end
+            return acc
+        end"#,
+        n = W21_N
+    )
+}
+
+fn w21_expected() -> i64 {
+    // Analytic check: items[0] is Image (classify → 1), items[1] is
+    // Text (classify → 2). Over n iters with `i % 2` alternation and
+    // n even (10 000), exactly half the iters hit each arm. The sum
+    // is `n / 2 * 1 + n / 2 * 2 = n * 3 / 2`. For n=10 000 → 15 000.
+    W21_N * 3 / 2
+}
+
+// =====================================================================
 // =====  consistency assertions  ======================================
 // =====================================================================
 
@@ -3341,6 +3518,17 @@ fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
         // expression would be a paper-win loss of the per-step
         // feedback shape (canonical Verlet integration step).
         "W20_n_body_softened" => None,
+        // Panel expansion 2026-05-29 (Tier 4 Phase 1 — Group A runtime
+        // dispatch W21): production source uses `#brand` +
+        // `#schema` + `match` arm-table dispatch. The LLVM AOT
+        // envelope rejects all three constructs today (Phase E
+        // typed surface covers Int + String only; brand-tagged
+        // Dict values + match-arm lowering both outside the Phase
+        // F / Z.4.x roadmap). No "inlined classify" variant — a
+        // flat `enum + match` Rust lowering would skip the runtime
+        // brand-string compare that IS the load-bearing per-iter
+        // cost being measured.
+        "W21_match_dispatch" => None,
         _ => None,
     }
 }
@@ -5268,6 +5456,81 @@ fn bench_cmp_lua(c: &mut Criterion) {
         });
     }
 
+    // ----- W21 match dispatch over brand-tagged values -----
+    //
+    // Panel expansion 2026-05-29 (Tier 4 Phase 1 — Group A runtime
+    // dispatch). See the top-of-file W21 doc-comment for the HONESTY
+    // checklist. Backend coverage: tree_walk + luajit only. Bytecode
+    // envelope rejects (`#brand` + `match` lowering both outside the
+    // M2-A scalar envelope today); the row is suppressed by
+    // `try_build_bytecode` returning None and logs `n/a` to stderr.
+    // LLVM AOT / Cranelift AOT / wasm reject (same `#brand` /
+    // `match` / `#schema` surface). The canonical-panel `relon_jit`
+    // row routes the production source through `JitEvaluator::
+    // run_main`, which falls through to the tree-walker for the
+    // brand+match dispatch.
+    {
+        let (walker, scope) = build_tree_walker(w21_relon_src());
+        let lua_fn_w21 = lua_fn(&lua, &w21_lua_src());
+
+        let relon_v = relon_int_result("W21", walker.run_main(&scope, args_w_n(W21_N)).unwrap());
+        let lua_v: i64 = lua_fn_w21.call(()).unwrap();
+        assert_relon_lua_consistent("W21", relon_v, lua_v, w21_expected());
+
+        // Throughput is the number of reduce iters (`n`) — each iter
+        // performs one list subscript + one brand-label compare +
+        // one Int add, the dominant per-iter work unit. Matches W13 /
+        // W14 / W15 / W18 throughput shape so per-element ns figures
+        // line up across the Tier 1-2-4 Relon-flavour rows.
+        group.throughput(Throughput::Elements(W21_N as u64));
+        group.bench_function(
+            BenchmarkId::new("W21_match_dispatch", "relon_tree_walk"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(W21_N);
+                    timed_with_warmup(iters, || {
+                        let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
+        group.bench_function(BenchmarkId::new("W21_match_dispatch", "luajit"), |b| {
+            b.iter_custom(|iters| {
+                timed_with_warmup(iters, || {
+                    let v: i64 = lua_fn_w21.call(()).unwrap();
+                    black_box(v);
+                })
+            });
+        });
+        // Bytecode row — honest try. The brand-tag + `match` arms are
+        // outside the M2-A scalar envelope today; `try_build_bytecode`
+        // returns None and the row is omitted. The eprintln log line
+        // emitted by the helper makes the gate visible at bench time.
+        if let Some(ev) = try_build_bytecode(w21_relon_src(), "W21_match_dispatch") {
+            let v = ev.run_main(args_w_n(W21_N)).expect("W21 bytecode run_main");
+            let got = relon_int_result("W21", v);
+            assert_eq!(
+                got,
+                w21_expected(),
+                "W21 bytecode result mismatch: got {got}, expected {}",
+                w21_expected()
+            );
+            group.bench_function(
+                BenchmarkId::new("W21_match_dispatch", "relon_bytecode"),
+                |b| {
+                    b.iter_custom(|iters| {
+                        let n_in = black_box(W21_N);
+                        timed_with_warmup(iters, || {
+                            let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
+                            black_box(v);
+                        })
+                    });
+                },
+            );
+        }
+    }
+
     // =================================================================
     // ===== Dart-style canonical panel: relon_jit + relon_aot =========
     // =================================================================
@@ -5469,6 +5732,27 @@ fn bench_cmp_lua(c: &mut Criterion) {
             { (W20_N as u64) * 4 * 4 },
             || args_w_n(W20_N),
         ),
+        // Panel expansion 2026-05-29 (Tier 4 Phase 1 — Group A runtime
+        // dispatch W21):
+        // * relon_jit: runs through `JitEvaluator::run_main`; falls
+        //   through to the tree-walker (brand-tag + `match` arms sit
+        //   outside the M2-A bytecode envelope today).
+        // * relon_aot / relon_llvm_aot: both reject (same `#brand` /
+        //   `match` / `#schema` surface as the bytecode envelope).
+        //   Returning None from `llvm_aot_source_for`.
+        // * rust_native: gated out by adding the label to
+        //   `paper_win_brand_dispatch_label`. A Rust-side `enum +
+        //   match` would skip the tree-walker's runtime brand-string
+        //   compare; the per-iter "cost of dynamic brand dispatch"
+        //   IS the load-bearing measurement here.
+        // * relon_wasm_wasmtime: classifier scope-cut (Z.1 program
+        //   set does not include brand-tag dispatch).
+        // * Throughput uses reduce iter count `n` so per-iter ns is
+        //   directly comparable across the Tier 1-2-4 Relon-flavour
+        //   rows.
+        ("W21_match_dispatch", w21_relon_src(), W21_N as u64, || {
+            args_w_n(W21_N)
+        }),
     ];
 
     for (label, src, throughput_n, args_factory) in canonical_panel {
@@ -5748,6 +6032,21 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 "[cmp_lua {label}] rust_native row n/a (rustc / LLVM fold the \
                  arithmetic-progression sum to a closed-form polynomial — \
                  see audit #332)"
+            );
+        } else if paper_win_brand_dispatch_label(label) {
+            // Panel expansion 2026-05-29 (Tier 4 Phase 1 — W21): a
+            // Rust-side `enum + match` lowering collapses the brand-
+            // tag compare to a `cmov` / `br_table` on the variant
+            // discriminant, skipping the tree-walker / LuaJIT runtime
+            // string-equal probe. Booking that closed-form variant
+            // dispatch under a `rust_native` label against the
+            // production-source LuaJIT row is a paper-win per the
+            // `/perf` Honesty Rules — see `paper_win_brand_dispatch_
+            // label` doc-comment for the full rationale.
+            eprintln!(
+                "[cmp_lua {label}] rust_native row n/a (Rust `enum + match` \
+                 collapses the runtime brand-string compare to a compile-time \
+                 variant tag dispatch — see paper_win_brand_dispatch_label)"
             );
         } else if *label == "W20_n_body_softened" {
             // Panel expansion 2026-05-28 (Tier 3 numeric-kernel W20):
