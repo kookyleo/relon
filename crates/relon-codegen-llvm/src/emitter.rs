@@ -388,10 +388,18 @@ pub(crate) fn emit_module_funcs<'ctx>(
     // loads so the recursive call site can pick the direct-call fast
     // path. Empty for modules that have no self-recursive closures.
     let self_capture_table = build_self_capture_table(entry, helpers, lambdas);
+    // Devirtualisation (W18): companion table for captures of known
+    // (non-self) closures — lets the W18 predicate's `is_prime` call
+    // devirtualise inside the predicate lambda body.
+    let known_capture_table = build_known_capture_table(entry, helpers, lambdas);
     for (slot, lambda) in lambdas.iter().enumerate() {
         let lambda_fn = closure_fn_table[slot];
         let slot_u32 = slot as u32;
         let offsets = self_capture_table
+            .get(&slot_u32)
+            .cloned()
+            .unwrap_or_default();
+        let known_offsets = known_capture_table
             .get(&slot_u32)
             .cloned()
             .unwrap_or_default();
@@ -404,6 +412,7 @@ pub(crate) fn emit_module_funcs<'ctx>(
             &helper_table,
             &closure_fn_table,
             &offsets,
+            &known_offsets,
         )?;
     }
 
@@ -479,6 +488,136 @@ fn build_self_capture_table(
         scan(l, &mut table);
     }
     table
+}
+
+/// Devirtualisation (W18, 2026-05-30): companion to
+/// [`build_self_capture_table`] for *non-self* captures of a closure
+/// whose `fn_table_idx` is a compile-time constant.
+///
+/// Maps each lambda's `fn_table_idx` to the captures-struct offsets that
+/// hold a handle produced by a literal `Op::MakeClosure { K }` (a
+/// *known* closure), together with that `K`. The lambda-body emit uses
+/// this to stamp [`Provenance::KnownClosure`] on the matching capture
+/// load (the prologue `LocalGet(0); LoadI32AtAbsolute { offset };
+/// LetSet { Closure }`), so a `CallClosure` against the capture (e.g.
+/// the W18 predicate's `is_prime(k, 2)` call) emits a direct call
+/// instead of the runtime `switch i32 %cc_fn_idx`.
+///
+/// Soundness: within each function we track, in source order, the
+/// most-recent `MakeClosure { K }; LetSet { idx, Closure }` assignment
+/// per outer let-slot. Any *other* `LetSet { idx, Closure }` clears the
+/// slot — so a let that is reassigned to a dynamically-chosen closure is
+/// never recorded as known. A capture is recorded only when its
+/// `let_idx` resolves to a still-known slot AND the captured `K` differs
+/// from the capturing lambda `L` (a self-capture, `K == L`, is owned by
+/// [`build_self_capture_table`], whose `captures_ptr`-reuse fast path is
+/// strictly better). The lowering pass emits the capturing
+/// `MakeClosure` only after the captured let is bound and reads the live
+/// slot, so the tracked `K` is exactly the value the capture holds.
+fn build_known_capture_table(
+    entry: &Func,
+    helpers: &[&Func],
+    lambdas: &[&Func],
+) -> HashMap<u32, Vec<(u32, u32)>> {
+    use relon_ir::ir::IrType as Irt;
+    let mut table: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+
+    let scan = |func: &Func, table: &mut HashMap<u32, Vec<(u32, u32)>>| {
+        let ops = &func.body;
+        // outer let-slot -> known captured `fn_table_idx`, last-write
+        // wins; cleared when the slot is reassigned a non-known closure.
+        let mut known_slots: HashMap<u32, u32> = HashMap::new();
+        for (i, tagged) in ops.iter().enumerate() {
+            // Maintain `known_slots` off each `LetSet { idx, Closure }`:
+            // if the immediately-preceding op is a `MakeClosure { K }`
+            // (the canonical `MakeClosure; LetSet` binding the lowering
+            // emits) the slot becomes a *known* closure `K`; any other
+            // `LetSet { Closure }` stores a value we cannot prove is one
+            // statically-known closure, so the slot is dropped. Driving
+            // this off the `LetSet` (rather than the `MakeClosure`)
+            // avoids the binding `LetSet` clobbering the very entry the
+            // preceding `MakeClosure` established.
+            if let Op::LetSet {
+                idx,
+                ty: Irt::Closure,
+            } = tagged.op
+            {
+                if let Some(Op::MakeClosure { fn_table_idx, .. }) =
+                    i.checked_sub(1).and_then(|p| ops.get(p)).map(|t| &t.op)
+                {
+                    known_slots.insert(idx, *fn_table_idx);
+                } else {
+                    known_slots.remove(&idx);
+                }
+                continue;
+            }
+            // At a capturing `MakeClosure { L }`, record each capture
+            // that reads a still-known slot. The capturing closure's own
+            // handle need NOT be stored to a let — the W18 predicate is
+            // passed straight into `_list_filter` — because the fact
+            // recorded here is about lambda `L`'s captures-struct layout
+            // (offset O holds known closure K), which is fixed by `L`'s
+            // own `MakeClosure` captures and the known-ness of the
+            // captured outer let, independent of where `L`'s handle goes.
+            if let Op::MakeClosure {
+                fn_table_idx: l_idx,
+                ref captures,
+                ..
+            } = tagged.op
+            {
+                for cap in captures {
+                    if !matches!(cap.ty, Irt::Closure) {
+                        continue;
+                    }
+                    if let Some(&k_idx) = known_slots.get(&cap.let_idx) {
+                        // `k_idx == l_idx` is a self-capture — owned by
+                        // `build_self_capture_table`; skip here.
+                        if k_idx != l_idx {
+                            table.entry(l_idx).or_default().push((cap.offset, k_idx));
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    scan(entry, &mut table);
+    for h in helpers {
+        scan(h, &mut table);
+    }
+    for l in lambdas {
+        scan(l, &mut table);
+    }
+    table
+}
+
+/// Devirtualisation (W18) correctness helper: collect every let-slot
+/// index that a body assigns via `Op::LetSet { ty: Closure }`, recursing
+/// into nested `Op::If` / `Op::Block` / `Op::Loop` bodies. Used by
+/// `emit_loop` to conservatively invalidate the `KnownClosure` let-slot
+/// tracker for any closure slot the loop body reassigns, so a
+/// cross-iteration read cannot devirtualise to a stale target.
+fn collect_closure_letset_slots(body: &[TaggedOp], out: &mut Vec<u32>) {
+    for t in body {
+        match &t.op {
+            Op::LetSet {
+                idx,
+                ty: relon_ir::ir::IrType::Closure,
+            } => out.push(*idx),
+            Op::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_closure_letset_slots(then_body, out);
+                collect_closure_letset_slots(else_body, out);
+            }
+            Op::Block { body, .. } | Op::Loop { body, .. } => {
+                collect_closure_letset_slots(body, out);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Declare a sibling helper function's LLVM signature without emitting
@@ -700,6 +839,7 @@ fn emit_lambda_body<'ctx>(
     helper_table: &HashMap<u32, FunctionValue<'ctx>>,
     closure_fn_table: &[FunctionValue<'ctx>],
     self_capture_offsets: &[(u32, u32)],
+    known_capture_offsets: &[(u32, u32)],
 ) -> Result<(), LlvmError> {
     let entry_bb = ctx.append_basic_block(llvm_fn, "entry");
     let builder = ctx.create_builder();
@@ -769,6 +909,7 @@ fn emit_lambda_body<'ctx>(
     emit.helper_ret_ty = Some(func.ret);
     emit.llvm_trap_fn = Some(declare_llvm_trap(ctx, module));
     emit.self_capture_offsets = self_capture_offsets.to_vec();
+    emit.known_capture_offsets = known_capture_offsets.to_vec();
     emit.captures_ptr_param = Some(captures_ptr_param);
     emit.lower_body(&func.body)?;
     Ok(())
@@ -1320,6 +1461,27 @@ struct Emit<'ctx, 'b, 'cp> {
     /// inner-loop iterations because the W3 reduce shape's `s` let is
     /// re-set every iteration from the same const literal.
     const_string_let_slots: std::collections::HashMap<u32, (u32, Option<u8>)>,
+    /// Devirtualisation (W18): let-slot indices holding a real
+    /// arena-resident closure handle whose `fn_table_idx` is a
+    /// compile-time constant (`Provenance::KnownClosure`). The `LetSet`
+    /// that catches such a value stashes the `fn_table_idx` here so the
+    /// matching `LetGet` re-stamps the provenance, letting the downstream
+    /// `CallClosure` emit a direct call (LLVM inlines it) instead of the
+    /// runtime `switch i32 %cc_fn_idx`. A non-known-closure `LetSet`
+    /// against the same slot wipes the entry so a later `LetGet` cannot
+    /// fraudulently claim a static target. Empty by default.
+    known_closure_let_slots: std::collections::HashMap<u32, u32>,
+    /// Devirtualisation (W18): `(capture_offset, captured_fn_table_idx)`
+    /// pairs for the lambda body currently being emitted, identifying
+    /// captures-struct offsets that hold a handle produced by a literal
+    /// `MakeClosure` with a compile-time-constant `fn_table_idx` (a
+    /// *known* closure that is NOT a self-capture). The capture-load
+    /// prologue (`LocalGet(0); LoadI32AtAbsolute { offset }`) stamps
+    /// [`Provenance::KnownClosure`] on the matching load so a body
+    /// `CallClosure` against the capture emits a direct call. Seeded by
+    /// [`build_known_capture_table`]; empty when emitting the entry /
+    /// helpers or a lambda with no such captures.
+    known_capture_offsets: Vec<(u32, u32)>,
 }
 
 /// Phase E.1: per-call inline-frame state. One entry per active
@@ -1432,6 +1594,29 @@ enum Provenance {
     FastPathClosure {
         fn_table_idx: u32,
     },
+    /// Devirtualisation (W18, 2026-05-30): the IntValue is a *real*
+    /// arena-resident closure handle (`[fn_table_idx][captures_ptr]`)
+    /// produced by a literal [`Op::MakeClosure`] whose `fn_table_idx` is
+    /// a compile-time constant. Unlike [`Self::FastPathClosure`] the
+    /// handle is fully materialised in the arena (the buffer-protocol
+    /// entry has state + arena), so the matching `CallClosure` still
+    /// loads the real `captures_ptr` from `handle + 4` — it only skips
+    /// the runtime `switch i32 %cc_fn_idx` over `handle + 0`, because the
+    /// handle's `fn_table_idx` word is *provably* this constant.
+    ///
+    /// Soundness: the value flows unmodified from the `MakeClosure` (or a
+    /// `LetSet`/`LetGet` round-trip, or an inline-frame argument bind)
+    /// to the `CallClosure`; there is exactly one possible callee, so the
+    /// switch's runtime selection is statically decided. The slow-path
+    /// `build_switch` stays for any handle that did *not* arrive with
+    /// this provenance (a genuinely-dynamic dispatch). When the W18
+    /// `_list_filter` predicate (a literal `(k) => is_prime(k, 2)`
+    /// MakeClosure) is inlined into the bundled `list_int_filter` body,
+    /// this lets the per-element predicate dispatch become a direct call
+    /// LLVM then inlines, killing the hot-loop switch.
+    KnownClosure {
+        fn_table_idx: u32,
+    },
     /// Phase L W3 (2026-05-28): the IntValue is an i32 arena offset to a
     /// `[len:u32 LE][payload]` String record whose payload was placed in
     /// the const-pool prefix at module build time, so its length is
@@ -1518,6 +1703,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             captures_ptr_param: None,
             fast_path_closure_let_slots: std::collections::HashMap::new(),
             const_string_let_slots: std::collections::HashMap::new(),
+            known_closure_let_slots: std::collections::HashMap::new(),
+            known_capture_offsets: Vec::new(),
         }
     }
 
@@ -1562,11 +1749,25 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         if !matches!(top.prov, Provenance::OwnCapturesPtr) {
             return None;
         }
+        // Self-recursive capture wins (its `captures_ptr`-reuse direct
+        // path is strictly cheaper than re-loading the handle's
+        // captures_ptr field).
         for (cap_offset, self_fn_table_idx) in &self.self_capture_offsets {
             if *cap_offset == offset {
                 return Some(Provenance::OwnCaptureHandle {
                     offset,
                     self_fn_table_idx: *self_fn_table_idx,
+                });
+            }
+        }
+        // Devirtualisation (W18): a capture of a known (non-self)
+        // closure. Stamp `KnownClosure` so the body's `CallClosure`
+        // against the capture emits a direct call (still loading the
+        // capture's own captures_ptr) instead of the runtime switch.
+        for (cap_offset, captured_fn_table_idx) in &self.known_capture_offsets {
+            if *cap_offset == offset {
+                return Some(Provenance::KnownClosure {
+                    fn_table_idx: *captured_fn_table_idx,
                 });
             }
         }
@@ -1742,7 +1943,24 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                             frame.params.len()
                         ))
                     })?;
-                    self.push(tv.val, tv.ty);
+                    // Preserve provenance across the inline-frame argument
+                    // bind. The bundled `list_int_filter` body reads its
+                    // closure parameter via `LocalGet(1)`; when the caller
+                    // passed a literal `MakeClosure` (a `KnownClosure`
+                    // handle), forwarding that provenance lets the body's
+                    // per-element `CallClosure` devirtualise into a direct
+                    // call. Only `KnownClosure` is propagated here — the
+                    // self-recursion / fast-path-entry tags depend on the
+                    // current function's `captures_ptr_param` / fast-path
+                    // state, which a *callee* inline frame does not share,
+                    // so forwarding those would be unsound.
+                    let (val, prov) = (tv.val, tv.prov);
+                    match prov {
+                        Provenance::KnownClosure { .. } => {
+                            self.push_with_prov(val, tv.ty, prov);
+                        }
+                        _ => self.push(val, tv.ty),
+                    }
                 } else {
                     let p = self.lookup_param(*idx)?;
                     // The legacy envelope walks all-i64; the buffer envelope
@@ -1812,6 +2030,25 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                         self.fast_path_closure_let_slots
                             .insert(mapped, fn_table_idx);
                     }
+                }
+                // Devirtualisation (W18): propagate `KnownClosure`
+                // across the `LetSet` → `LetGet` chain so a closure
+                // handle stored into a let then read back at a
+                // `CallClosure` site keeps its compile-time
+                // `fn_table_idx`. A `LetSet { Closure }` of any *other*
+                // provenance overwrites the slot with a value we cannot
+                // prove is the same single closure, so drop the entry —
+                // a later `LetGet` then falls back to the runtime
+                // switch. This invalidation is what keeps a slot that is
+                // reassigned to a dynamically-chosen closure correct.
+                match (v.prov, *ty) {
+                    (Provenance::KnownClosure { fn_table_idx }, IrType::Closure) => {
+                        self.known_closure_let_slots.insert(mapped, fn_table_idx);
+                    }
+                    (_, IrType::Closure) => {
+                        self.known_closure_let_slots.remove(&mapped);
+                    }
+                    _ => {}
                 }
                 // Phase L W3: propagate `Provenance::ConstString`
                 // across the `LetSet` → `LetGet` chain so the reduce
@@ -1889,6 +2126,13 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                         // `CallClosure` keeps the direct-call rewrite
                         // available.
                         self.push_with_prov(v, *ty, Provenance::FastPathClosure { fn_table_idx });
+                    } else if let Some(&fn_table_idx) = self.known_closure_let_slots.get(&mapped) {
+                        // Devirtualisation (W18): re-stamp `KnownClosure`
+                        // so a `CallClosure` reading this handle through
+                        // the let chain emits a direct call (still
+                        // loading the real captures_ptr) instead of the
+                        // runtime switch.
+                        self.push_with_prov(v, *ty, Provenance::KnownClosure { fn_table_idx });
                     } else {
                         self.push(v, *ty);
                     }
@@ -3062,8 +3306,25 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             tail_bb,
             kind: LabelKind::Block,
         });
+        // Devirtualisation (W18) correctness: a `Br` can exit the block
+        // early, skipping a later `LetSet { Closure }`; a `LetGet` after
+        // the block (the `Br` target) would then read a slot the emitter
+        // believes holds a known closure (because emission walks the
+        // body linearly) but a runtime early-exit path never set. Drop,
+        // around the block, every closure slot the body reassigns — the
+        // post-block `LetGet` then falls back to the runtime switch on
+        // the early-exit path. Straight-line uses inside the block still
+        // devirtualise.
+        let mut body_closure_setslots: Vec<u32> = Vec::new();
+        collect_closure_letset_slots(body, &mut body_closure_setslots);
+        for s in &body_closure_setslots {
+            self.known_closure_let_slots.remove(&self.remap_let_idx(*s));
+        }
         for (ip, tagged) in body.iter().enumerate() {
             self.lower_op(ip, tagged)?;
+        }
+        for s in &body_closure_setslots {
+            self.known_closure_let_slots.remove(&self.remap_let_idx(*s));
         }
         // If the body ran without an explicit `Br`, fall through to
         // `tail_bb`. A `Br` that fired already terminated the current
@@ -3104,8 +3365,31 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             tail_bb,
             kind: LabelKind::Loop,
         });
+        // Devirtualisation (W18) correctness: a loop body runs 0+ times
+        // and a `LetGet` at the top of the body re-executes every
+        // iteration, so a `KnownClosure` let-slot the body *reassigns*
+        // cannot be trusted on a path that reads it before that
+        // reassignment ran (iteration 1's top, or after a 0-trip loop).
+        // Conservatively drop, both before emitting the body and on loop
+        // exit, every slot the body contains a `LetSet { Closure }` for
+        // (at any nesting depth). A within-body `MakeClosure; LetSet`
+        // still re-establishes the entry in source order for the reads
+        // that follow it in the same iteration (its `fn_table_idx` is a
+        // compile-time constant, identical every iteration), so
+        // straight-line uses inside the body keep devirtualising; only
+        // cross-iteration / loop-carried reads fall back to the switch.
+        // W18's filter loop reads its predicate via the inline-frame
+        // param (not a body-bound let), so it is unaffected.
+        let mut body_closure_setslots: Vec<u32> = Vec::new();
+        collect_closure_letset_slots(body, &mut body_closure_setslots);
+        for s in &body_closure_setslots {
+            self.known_closure_let_slots.remove(&self.remap_let_idx(*s));
+        }
         for (ip, tagged) in body.iter().enumerate() {
             self.lower_op(ip, tagged)?;
+        }
+        for s in &body_closure_setslots {
+            self.known_closure_let_slots.remove(&self.remap_let_idx(*s));
         }
         // If the body fell through without an explicit `Br`, that's
         // an implicit "exit the loop" in wasm semantics — the loop
@@ -3209,12 +3493,29 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .build_conditional_branch(cond_i1, then_bb, else_bb)
             .map_err(|e| LlvmError::Codegen(format!("If branch: {e}")))?;
 
+        // Devirtualisation (W18) correctness: the `KnownClosure`
+        // let-slot tracker is path-insensitive (it mutates a flat map as
+        // the emitter walks ops). Across an `If`, the two arms may bind
+        // the *same* let-slot to *different* known closures; a flat
+        // last-write would let a post-merge `LetGet` devirtualise to the
+        // wrong target on the path that didn't run — a miscompile. Take
+        // the dataflow *meet*: snapshot the map, emit each arm against
+        // its own copy, then keep only entries both arms agree on (and
+        // entries neither touched). Disagreements are dropped, so the
+        // post-merge `LetGet` falls back to the runtime switch (always
+        // correct). Straight-line shapes like W18 are unaffected.
+        let known_closure_snapshot = self.known_closure_let_slots.clone();
+
         // Then arm.
         self.builder.position_at_end(then_bb);
         for (ip, tagged) in then_body.iter().enumerate() {
             self.lower_op(ip, tagged)?;
         }
         let then_result = self.pop(ip_hint).ok();
+        let then_known_closures = std::mem::replace(
+            &mut self.known_closure_let_slots,
+            known_closure_snapshot.clone(),
+        );
         let then_end_bb = self.builder.get_insert_block().unwrap();
         let then_terminated = then_end_bb.get_terminator().is_some();
         if !then_terminated {
@@ -3223,12 +3524,14 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 .map_err(|e| LlvmError::Codegen(format!("If then->merge: {e}")))?;
         }
 
-        // Else arm.
+        // Else arm (starts from the pre-If snapshot, restored above).
         self.builder.position_at_end(else_bb);
         for (ip, tagged) in else_body.iter().enumerate() {
             self.lower_op(ip, tagged)?;
         }
         let else_result = self.pop(ip_hint).ok();
+        let else_known_closures =
+            std::mem::replace(&mut self.known_closure_let_slots, known_closure_snapshot);
         let else_end_bb = self.builder.get_insert_block().unwrap();
         let else_terminated = else_end_bb.get_terminator().is_some();
         if !else_terminated {
@@ -3236,6 +3539,20 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 .build_unconditional_branch(merge_bb)
                 .map_err(|e| LlvmError::Codegen(format!("If else->merge: {e}")))?;
         }
+        // Meet: keep a `KnownClosure` slot only when both arms reached
+        // the merge with the SAME known target. A slot only one arm
+        // touched, or that the arms disagree on, is dropped. An arm that
+        // terminated (e.g. `Return`) cannot reach the merge, so the
+        // surviving arm's view governs the slots it owns.
+        self.known_closure_let_slots = match (then_terminated, else_terminated) {
+            (true, true) => std::collections::HashMap::new(),
+            (true, false) => else_known_closures,
+            (false, true) => then_known_closures,
+            (false, false) => then_known_closures
+                .iter()
+                .filter_map(|(&k, &v)| (else_known_closures.get(&k) == Some(&v)).then_some((k, v)))
+                .collect(),
+        };
 
         // Merge phi if both arms terminated normally.
         self.builder.position_at_end(merge_bb);
@@ -4044,8 +4361,22 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             }
         }
 
-        // Step 6: push the handle_ptr.
-        self.push(handle_ptr, IrType::Closure);
+        // Step 6: push the handle_ptr, tagged with the compile-time
+        // `fn_table_idx` we just stored at `handle_ptr + 0`. The handle
+        // is a real, fully-populated arena record (captures_ptr live at
+        // `+4`), so a later `CallClosure` that consumes *this exact
+        // value* can skip the runtime `switch i32 %cc_fn_idx` — its
+        // selector is provably this constant — and emit a direct call
+        // while still loading the real captures_ptr. Devirtualisation
+        // fires only when the value reaches the call site unmodified
+        // (tracked through `LetSet`/`LetGet` + inline-frame param binds);
+        // any reassignment drops the provenance and the slow-path switch
+        // returns. See [`Provenance::KnownClosure`].
+        self.push_with_prov(
+            handle_ptr,
+            IrType::Closure,
+            Provenance::KnownClosure { fn_table_idx },
+        );
         Ok(())
     }
 
@@ -4164,6 +4495,75 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                     param_tys,
                     ret_ty,
                 );
+            }
+        }
+
+        // Devirtualisation (W18): the handle came from a literal
+        // `MakeClosure` whose `fn_table_idx` is a compile-time constant
+        // and the value reached this call site unmodified (tracked
+        // through the `KnownClosure` provenance across `LetSet`/`LetGet`
+        // and inline-frame argument binds). The runtime
+        // `switch i32 %cc_fn_idx` would therefore *always* select
+        // `closure_fn_table[fn_table_idx]`, so emit a direct call to it
+        // — LLVM then inlines the callee, folding the per-element
+        // dispatch out of the hot loop. We still load the *real*
+        // captures_ptr from `handle + 4` (this closure may capture
+        // free variables — e.g. the W18 predicate captures `is_prime`),
+        // so capture semantics are byte-identical to the switch path;
+        // only the dead `fn_idx` load + switch are removed.
+        //
+        // Correctness guard: devirtualise ONLY when the resolved
+        // callee's signature (arity + return width) matches this call
+        // site, exactly as the switch's per-case `signature_compatible`
+        // check requires. A module may host several lambdas; if the
+        // statically-resolved target somehow disagrees with the call
+        // shape we keep the switch (its matching case fires at runtime),
+        // never emitting an ill-typed direct call.
+        if let Provenance::KnownClosure { fn_table_idx } = handle_prov {
+            let slot = fn_table_idx as usize;
+            if slot < self.closure_fn_table.len() {
+                let callee = self.closure_fn_table[slot];
+                let want_arity = 2 + user_args.len();
+                let want_ret_llvm = match ret_ty {
+                    IrType::Null => None,
+                    other => Some(self.ir_ty_to_llvm_int(other)?.get_bit_width()),
+                };
+                let have_ret_llvm = callee.get_type().get_return_type().and_then(|t| match t {
+                    inkwell::types::BasicTypeEnum::IntType(it) => Some(it.get_bit_width()),
+                    _ => None,
+                });
+                let signature_compatible =
+                    callee.count_params() as usize == want_arity && have_ret_llvm == want_ret_llvm;
+                if signature_compatible {
+                    // Load the real captures_ptr from `handle + 4`; the
+                    // closure's captured environment must be passed
+                    // verbatim (unchanged from the slow path).
+                    let i32_t = self.ctx.i32_type();
+                    let four = i32_t.const_int(4, false);
+                    let handle_plus_4 = self
+                        .builder
+                        .build_int_add(handle_ptr, four, "ccd_handle_plus_4")
+                        .map_err(|e| {
+                            LlvmError::Codegen(format!("CallClosure(known) handle+4: {e}"))
+                        })?;
+                    let cap_ptr_addr = self.arena_addr_i32(handle_plus_4)?;
+                    let captures_ptr_name = self.next_name("ccd_captures_ptr");
+                    let captures_ptr = self
+                        .builder
+                        .build_load(i32_t, cap_ptr_addr, &captures_ptr_name)
+                        .map_err(|e| {
+                            LlvmError::Codegen(format!("CallClosure(known) captures load: {e}"))
+                        })?
+                        .into_int_value();
+                    return self.emit_call_closure_direct(
+                        callee,
+                        state_ptr,
+                        captures_ptr,
+                        user_args,
+                        param_tys,
+                        ret_ty,
+                    );
+                }
             }
         }
 
@@ -5549,5 +5949,161 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         let fn_ty = i32_t.fn_type(&[ptr_t.into(), ptr_t.into()], false);
         self.module
             .add_function(sym, fn_ty, Some(Linkage::External))
+    }
+}
+
+#[cfg(test)]
+mod devirt_tests {
+    //! Soundness unit tests for the W18 closure-devirtualisation
+    //! capture analysis. These exercise the IR-scan that decides which
+    //! captures may be stamped `KnownClosure` (→ direct call) vs left as
+    //! a genuinely-dynamic dispatch (→ runtime switch). Getting this
+    //! wrong is a silent miscompile, so the analysis is pinned here
+    //! independent of any end-to-end source.
+    use super::*;
+    use relon_ir::ir::{ClosureCapture, Func, IrType, Op, TaggedOp};
+    use relon_parser::TokenRange;
+
+    fn op(o: Op) -> TaggedOp {
+        TaggedOp {
+            op: o,
+            range: TokenRange::default(),
+        }
+    }
+
+    fn make_closure(fn_table_idx: u32, captures: Vec<ClosureCapture>) -> Op {
+        let captures_size = captures.iter().map(|c| c.offset + 8).max().unwrap_or(0);
+        Op::MakeClosure {
+            fn_table_idx,
+            captures,
+            captures_size,
+        }
+    }
+
+    fn cap(let_idx: u32, offset: u32) -> ClosureCapture {
+        ClosureCapture {
+            let_idx,
+            ty: IrType::Closure,
+            offset,
+        }
+    }
+
+    fn entry_with_body(body: Vec<TaggedOp>) -> Func {
+        Func {
+            name: "run_main".into(),
+            params: vec![IrType::I32],
+            ret: IrType::I32,
+            body,
+            range: TokenRange::default(),
+        }
+    }
+
+    /// A capture of a *known, non-self* closure is recorded so the
+    /// capturing lambda's body can devirtualise the call against it.
+    /// Mirrors the W18 predicate `(k) => is_prime(k, 2)` capturing the
+    /// `is_prime` closure (`fn_table_idx=0`).
+    #[test]
+    fn records_known_non_self_capture() {
+        // let0 := MakeClosure(K=0)  ; the `is_prime` binding
+        // MakeClosure(L=1) capturing let0 at offset 0 ; the predicate
+        let body = vec![
+            op(make_closure(0, vec![cap(0, 0)])), // is_prime self-capture
+            op(Op::LetSet {
+                idx: 0,
+                ty: IrType::Closure,
+            }),
+            op(make_closure(1, vec![cap(0, 0)])), // predicate captures is_prime
+            op(Op::Call {
+                fn_index: 14,
+                arg_count: 2,
+                param_tys: vec![IrType::ListInt, IrType::Closure],
+                ret_ty: IrType::ListInt,
+            }),
+        ];
+        let entry = entry_with_body(body);
+        let table = build_known_capture_table(&entry, &[], &[]);
+        // Lambda L=1 (the predicate) captures known closure K=0 at
+        // offset 0.
+        assert_eq!(
+            table.get(&1).map(Vec::as_slice),
+            Some(&[(0u32, 0u32)][..]),
+            "predicate (L=1) must record its is_prime (K=0) capture as known"
+        );
+        // L=0 is_prime's own capture is a SELF capture (K==L==0) — it
+        // must NOT appear here (the self-capture table owns it, and its
+        // captures_ptr-reuse direct path is strictly better).
+        assert!(
+            !table.contains_key(&0),
+            "self-capture (K==L) must be excluded from the known-capture table"
+        );
+    }
+
+    /// When a closure let-slot is reassigned to a value that is NOT a
+    /// literal `MakeClosure` (a genuinely-dynamic closure), the capture
+    /// must NOT be recorded — the body keeps the runtime switch. This is
+    /// the correctness red line: devirtualise only a provably-unique
+    /// callee.
+    #[test]
+    fn drops_reassigned_dynamic_closure_slot() {
+        // let0 := MakeClosure(0)        ; known
+        // let0 := <some other Closure>  ; reassigned, now dynamic
+        // MakeClosure(2) capturing let0 ; must NOT be recorded
+        let body = vec![
+            op(make_closure(0, vec![cap(0, 0)])),
+            op(Op::LetSet {
+                idx: 0,
+                ty: IrType::Closure,
+            }),
+            // A bare `LetSet { Closure }` NOT preceded by a MakeClosure —
+            // models a closure that arrived from somewhere unprovable
+            // (a param, a phi, a different binding).
+            op(Op::LetGet {
+                idx: 5,
+                ty: IrType::Closure,
+            }),
+            op(Op::LetSet {
+                idx: 0,
+                ty: IrType::Closure,
+            }),
+            op(make_closure(2, vec![cap(0, 0)])),
+            op(Op::LetSet {
+                idx: 9,
+                ty: IrType::Closure,
+            }),
+        ];
+        let entry = entry_with_body(body);
+        let table = build_known_capture_table(&entry, &[], &[]);
+        assert!(
+            !table.contains_key(&2),
+            "a capture of a reassigned (dynamic) closure slot must NOT be \
+             recorded — the call must keep the runtime switch"
+        );
+    }
+
+    /// The binding `LetSet` that immediately follows a known
+    /// `MakeClosure` must NOT clear the slot it just established (the
+    /// ordering bug fixed during development). A later capture of that
+    /// slot is still recorded.
+    #[test]
+    fn binding_letset_does_not_clear_its_own_slot() {
+        let body = vec![
+            op(make_closure(3, vec![])),
+            op(Op::LetSet {
+                idx: 7,
+                ty: IrType::Closure,
+            }),
+            op(make_closure(4, vec![cap(7, 0)])),
+            op(Op::LetSet {
+                idx: 8,
+                ty: IrType::Closure,
+            }),
+        ];
+        let entry = entry_with_body(body);
+        let table = build_known_capture_table(&entry, &[], &[]);
+        assert_eq!(
+            table.get(&4).map(Vec::as_slice),
+            Some(&[(0u32, 3u32)][..]),
+            "L=4 must record its capture of known closure K=3 at offset 0"
+        );
     }
 }

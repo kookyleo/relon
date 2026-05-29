@@ -129,3 +129,49 @@ fn even_count_materialize_filter_length_matches_oracle() {
         );
     }
 }
+
+/// CODEGEN-QUALITY mechanistic proof: the W18 per-element closure
+/// dispatch is devirtualised. The `_list_filter` predicate is a literal
+/// `MakeClosure` with a statically-known `fn_table_idx`, and the
+/// predicate's `is_prime` call is a capture of another known closure, so
+/// both `Op::CallClosure`s route through `emit_call_closure_direct`
+/// instead of the runtime `switch i32 %cc_fn_idx`. The post-O3 IR must
+/// therefore contain NO closure-dispatch switch in the hot loop — LLVM
+/// inlines the direct calls, leaving straight-line primality math.
+///
+/// This pins the mechanism the perf work targets: pre-change the hot
+/// loop did TWO `switch i32 %cc_fn_idx` dispatches per element (filter →
+/// predicate, then predicate → is_prime) before any arithmetic.
+#[test]
+fn w18_per_element_closure_dispatch_is_devirtualized() {
+    let ev = LlvmAotEvaluator::from_source(W18_SRC).expect("W18 compiles via LLVM AOT");
+    let dump = ev.emit_ir_dump();
+    // The closure-dispatch slow path names its loaded selector
+    // `cc_fn_idx` and the dispatch `switch i32 %cc_fn_idx`. Devirtualised
+    // calls instead emit `ccd_call` (direct) with no selector load.
+    assert!(
+        !dump.contains("cc_fn_idx"),
+        "W18 post-O3 IR still loads a closure `cc_fn_idx` selector — \
+         the per-element dispatch did NOT devirtualise:\n{dump}"
+    );
+    assert!(
+        !dump.contains("switch i32"),
+        "W18 post-O3 IR still contains a `switch i32` closure dispatch — \
+         devirtualisation did not fire:\n{dump}"
+    );
+}
+
+/// Mechanistic proof for the no-capture predicate (the even-count
+/// filter `(k) => k % 2 == 0`): a literal `MakeClosure` passed straight
+/// into `_list_filter` must still devirtualise even though the predicate
+/// captures nothing. Guards the inline-frame-param provenance hop.
+#[test]
+fn even_count_predicate_dispatch_is_devirtualized() {
+    let ev = LlvmAotEvaluator::from_source(EVEN_COUNT_SRC).expect("even-count compiles");
+    let dump = ev.emit_ir_dump();
+    assert!(
+        !dump.contains("cc_fn_idx"),
+        "even-count post-O3 IR still loads a closure `cc_fn_idx` selector — \
+         the filter predicate dispatch did NOT devirtualise:\n{dump}"
+    );
+}
