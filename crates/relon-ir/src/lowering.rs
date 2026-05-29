@@ -2391,6 +2391,22 @@ fn lower_fn_call(
     // (`range(n).map((i) => "a").reduce("", (acc, s) => acc + s)`)
     // by emitting the same scalar pipeline loop with a string
     // accumulator stashed in a let-binding.
+    // AOT-2: doubly-nested `range.map(range.map(...))` reduced
+    // cell-by-cell. The canonical caller is the W19 matmul kernel
+    // shape — `range(size).map((i) => range(size).map((j) => <cell>))
+    // .reduce(0, (row_acc, row) => row_acc + <fold-of-row>)`. The
+    // outer map's body is itself a *bare* inner `range(...).map(...)`
+    // producing a `List<Int>` row; the outer reduce folds each row
+    // cell-by-cell. This MUST run before `try_lower_range_chain_reduce`
+    // — that single-level peephole would otherwise match the outer
+    // `range(...).map(...).reduce(...)` and then choke lowering the
+    // list-valued map body (the inner bare `range(...)` surfaces as an
+    // `UnknownStdlibMethod`; `range` is a tree-walker host fn, not an
+    // IR stdlib entry). This peephole emits a doubly-nested i64
+    // accumulator loop with NO intermediate list materialised.
+    if let Some(()) = try_lower_nested_range_map_reduce(path, args, range, ctx)? {
+        return Ok(());
+    }
     if let Some(()) = try_lower_range_chain_reduce(path, args, range, ctx)? {
         return Ok(());
     }
@@ -2744,6 +2760,738 @@ fn try_lower_range_chain_reduce(
         ctx,
     )?;
     Ok(Some(()))
+}
+
+/// AOT-2: a single recognised `range(start, end)[. map((p) => body)]`
+/// chain whose final stage produces a *list-valued* row. Distilled
+/// from a `match_range_chain` result whose terminal map body is itself
+/// a bare inner `range(...).map(...)` chain. Used by
+/// [`try_lower_nested_range_map_reduce`] to drive the inner accumulator
+/// loop without materialising the row list.
+struct NestedRangeShape<'a> {
+    /// Outer `range(...)` bounds (the `i` loop).
+    outer_range_args: &'a [relon_parser::CallArg],
+    /// Outer map closure param (`i`).
+    outer_param: &'a ClosureParam,
+    /// Inner `range(...)` bounds (the `j` loop). Captures into the
+    /// outer counter resolve through the normal let-table walk.
+    inner_range_args: &'a [relon_parser::CallArg],
+    /// Inner map closure param (`j`).
+    inner_param: &'a ClosureParam,
+    /// Inner map body — the per-cell expression (`(i * size + j) % 100`
+    /// in W19). Must lower to an `I64`.
+    cell_body: &'a Node,
+}
+
+/// Recognise the outer chain of a doubly-nested
+/// `range(...).map((i) => range(...).map((j) => <cell>))` so the
+/// caller can fuse it into two integer loops. Returns `None` for any
+/// shape outside the single-outer-map / single-inner-map form (the
+/// caller falls through to the regular diagnostic).
+fn match_nested_range_map(expr: &Expr) -> Option<NestedRangeShape<'_>> {
+    // The outer receiver must be a one-stage `range(...).map(<closure>)`.
+    let outer_chain = match_range_chain(expr)?;
+    if outer_chain.stages.len() != 1 {
+        return None;
+    }
+    let outer_stage = &outer_chain.stages[0];
+    if outer_stage.method != "map" || outer_stage.closure_params.len() != 1 {
+        return None;
+    }
+    // The outer map's body must itself be a bare one-stage
+    // `range(...).map(<closure>)` — the inner row generator.
+    let inner_chain = match_range_chain(&outer_stage.closure_body.expr)?;
+    if inner_chain.stages.len() != 1 {
+        return None;
+    }
+    let inner_stage = &inner_chain.stages[0];
+    if inner_stage.method != "map" || inner_stage.closure_params.len() != 1 {
+        return None;
+    }
+    Some(NestedRangeShape {
+        outer_range_args: outer_chain.range_args,
+        outer_param: &outer_stage.closure_params[0],
+        inner_range_args: inner_chain.range_args,
+        inner_param: &inner_stage.closure_params[0],
+        cell_body: inner_stage.closure_body,
+    })
+}
+
+/// How the outer reduce closure folds each (list-valued) row into the
+/// running accumulator. The matmul shape sums every cell of the row,
+/// so the inner fold is itself an i64 sum/reduce over the row.
+enum RowFold<'a> {
+    /// `list.sum(row)` — sum the row's cells.
+    Sum,
+    /// `row.reduce(<init>, (cell_acc, cell) => cell_acc + cell)` — a
+    /// user-supplied i64 reduce over the row. `init` lowers to the
+    /// inner accumulator seed; `acc_param` / `cell_param` bind the
+    /// closure's two params; `body` updates the accumulator per cell.
+    Reduce {
+        init: &'a Node,
+        acc_param: &'a ClosureParam,
+        cell_param: &'a ClosureParam,
+        body: &'a Node,
+    },
+}
+
+/// Decompose the outer reduce body into a combine operator plus the
+/// inner row-fold. Recognises `row_acc <op> <fold(row)>` and the
+/// commuted `<fold(row)> <op> row_acc`.
+struct OuterCombine<'a> {
+    /// The binary operator joining the running accumulator with the
+    /// row fold (`+` for W19's cell-sum).
+    op: Operator,
+    /// `true` when the running-accumulator term is the LHS of `op`
+    /// (`row_acc + fold`); `false` for the commuted `fold + row_acc`.
+    acc_is_lhs: bool,
+    /// The inner row fold extracted from the non-accumulator term.
+    fold: RowFold<'a>,
+}
+
+/// Recognise `list.sum(<row>)` or `<row>.reduce(<init>, (a, c) =>
+/// <body>)` where `<row>` is the bare outer reduce param named
+/// `row_name`. Returns the inner fold descriptor, or `None` if the
+/// expression isn't a recognised single-row fold.
+fn match_row_fold<'a>(expr: &'a Expr, row_name: &str) -> Option<RowFold<'a>> {
+    let Expr::FnCall { path, args } = expr else {
+        return None;
+    };
+    // `list.sum(row)` — path == [list, sum], single positional arg
+    // that is the bare `row` variable.
+    if path.len() == 2 {
+        let head_is_list = matches!(&path[0], TokenKey::String(s, _, _) if s == "list");
+        let tail_is_sum = matches!(&path[1], TokenKey::String(s, _, _) if s == "sum");
+        if head_is_list && tail_is_sum && args.len() == 1 && args[0].name.is_none() {
+            if expr_is_bare_var(&args[0].value.expr, row_name) {
+                return Some(RowFold::Sum);
+            }
+            return None;
+        }
+    }
+    // `row.reduce(init, (acc, cell) => body)` — method call whose
+    // receiver is the bare `row` variable. The parser encodes a
+    // bare-identifier receiver as `path[0] = String(row)` (a
+    // multi-segment Variable-style path) rather than the
+    // `Dynamic(...)` wrapper it uses for sub-expression receivers, so
+    // accept both encodings.
+    if path.len() == 2 && args.len() == 2 && args.iter().all(|a| a.name.is_none()) {
+        let TokenKey::String(method_name, _, _) = &path[1] else {
+            return None;
+        };
+        if method_name.as_str() != "reduce" {
+            return None;
+        }
+        let receiver_is_row = match &path[0] {
+            TokenKey::String(s, _, _) => s == row_name,
+            TokenKey::Dynamic(receiver_node, _) => expr_is_bare_var(&receiver_node.expr, row_name),
+            _ => false,
+        };
+        if !receiver_is_row {
+            return None;
+        }
+        let Expr::Closure {
+            params,
+            body,
+            return_type: _,
+        } = &*args[1].value.expr
+        else {
+            return None;
+        };
+        if params.len() != 2 {
+            return None;
+        }
+        return Some(RowFold::Reduce {
+            init: &args[0].value,
+            acc_param: &params[0],
+            cell_param: &params[1],
+            body,
+        });
+    }
+    None
+}
+
+/// `true` when `expr` is a single-segment `Variable` naming `name`.
+fn expr_is_bare_var(expr: &Expr, name: &str) -> bool {
+    matches!(expr, Expr::Variable(segs)
+        if segs.len() == 1
+            && matches!(&segs[0], TokenKey::String(s, _, _) if s == name))
+}
+
+/// Decompose `row_acc <op> <fold(row)>` (or commuted). The accumulator
+/// term is a bare reference to `acc_name`, and the other term is a
+/// recognised [`RowFold`] over `row_name`.
+fn match_outer_combine<'a>(
+    body: &'a Expr,
+    acc_name: &str,
+    row_name: &str,
+) -> Option<OuterCombine<'a>> {
+    let Expr::Binary(op, lhs, rhs) = body else {
+        return None;
+    };
+    // `row_acc + fold(row)`
+    if expr_is_bare_var(&lhs.expr, acc_name) {
+        let fold = match_row_fold(&rhs.expr, row_name)?;
+        return Some(OuterCombine {
+            op: *op,
+            acc_is_lhs: true,
+            fold,
+        });
+    }
+    // `fold(row) + row_acc`
+    if expr_is_bare_var(&rhs.expr, acc_name) {
+        let fold = match_row_fold(&lhs.expr, row_name)?;
+        return Some(OuterCombine {
+            op: *op,
+            acc_is_lhs: false,
+            fold,
+        });
+    }
+    None
+}
+
+/// AOT-2: lower a doubly-nested `range.map(range.map(...))` reduced
+/// cell-by-cell into a pair of nested i64 accumulator loops with NO
+/// intermediate list materialised. The canonical caller is the W19
+/// matrix-multiply kernel:
+///
+/// ```text
+/// range(size).map((i) => range(size).map((j) => (i * size + j) % 100))
+///   .reduce(0, (row_acc, row) => row_acc + row.reduce(0, (c_acc, c) => c_acc + c))
+/// ```
+///
+/// Returns `Ok(Some(()))` on a successful desugar (vstack carries one
+/// `I64` after return), `Ok(None)` when the pattern didn't match
+/// (caller falls through to the regular diagnostic), `Err` when an
+/// inner expression failed to lower.
+fn try_lower_nested_range_map_reduce(
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    // Outer call shape: `<receiver>.reduce(<init>, <closure>)`.
+    if path.len() != 2 || args.len() != 2 {
+        return Ok(None);
+    }
+    if args.iter().any(|a| a.name.is_some()) {
+        return Ok(None);
+    }
+    let TokenKey::Dynamic(receiver_node, _) = &path[0] else {
+        return Ok(None);
+    };
+    let TokenKey::String(method_name, _, _) = &path[1] else {
+        return Ok(None);
+    };
+    if method_name.as_str() != "reduce" {
+        return Ok(None);
+    }
+    let init_node = &args[0].value;
+    let Expr::Closure {
+        params,
+        body,
+        return_type: _,
+    } = &*args[1].value.expr
+    else {
+        return Ok(None);
+    };
+    if params.len() != 2 {
+        return Ok(None);
+    }
+    let row_acc_name = params[0].name.as_str();
+    let row_name = params[1].name.as_str();
+
+    // The receiver must be a doubly-nested `range.map(range.map(...))`.
+    let Some(shape) = match_nested_range_map(&receiver_node.expr) else {
+        return Ok(None);
+    };
+    // The reduce body must fold the (list-valued) row cell-by-cell.
+    let Some(combine) = match_outer_combine(&body.expr, row_acc_name, row_name) else {
+        return Ok(None);
+    };
+
+    emit_nested_range_map_reduce(&shape, init_node, &combine, range, ctx)?;
+    Ok(Some(()))
+}
+
+/// Emit the doubly-nested i64 accumulator loop for the recognised
+/// matmul reduction. Pre-condition: the caller matched the outer chain
+/// via [`match_nested_range_map`] and the reduce body via
+/// [`match_outer_combine`].
+///
+/// Control-flow shape (mirrors [`emit_range_pipeline_loop`] but with an
+/// inner loop nested inside the outer iteration body):
+///
+/// ```text
+/// outer_acc = <init>
+/// i = outer_start
+/// block (outer-exit) {
+///   loop {
+///     if i >= outer_end { br 1 }
+///     row_acc = <inner-init>
+///     j = inner_start
+///     block (inner-exit) {
+///       loop {
+///         if j >= inner_end { br 1 }
+///         <cell = cell_body(i, j)>      // I64
+///         <row_acc fold-update cell>    // inner fold
+///         j += 1
+///         br 0
+///       }
+///     }
+///     outer_acc = outer_acc <op> row_acc
+///     i += 1
+///     br 0
+///   }
+/// }
+/// push outer_acc
+/// ```
+fn emit_nested_range_map_reduce(
+    shape: &NestedRangeShape<'_>,
+    init_node: &Node,
+    combine: &OuterCombine<'_>,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    // Allocate the outer loop counters + accumulator.
+    let outer_start_i = ctx.next_let_idx;
+    let outer_end_i = ctx.next_let_idx + 1;
+    let outer_acc_i = ctx.next_let_idx + 2;
+    ctx.next_let_idx += 3;
+
+    // outer_start
+    emit_range_bound(shape.outer_range_args, true, outer_start_i, range, ctx)?;
+    // outer_end
+    emit_range_bound(shape.outer_range_args, false, outer_end_i, range, ctx)?;
+
+    // outer_acc = <init> (must lower to I64 for the matmul shape).
+    lower_expr(&init_node.expr, init_node.range, ctx)?;
+    expect_int_top(ctx, init_node.range)?;
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: outer_acc_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // ---- outer loop body sub-buffer -------------------------------
+    let saved_outer = std::mem::take(&mut ctx.out);
+
+    // if i >= outer_end -> br 1 (exit outer-exit block)
+    emit_ge_brif(outer_start_i, outer_end_i, 1, range, ctx);
+
+    // Bind the outer map param (`i`) to the loop counter so the inner
+    // range bounds + cell body resolve captures through the walker.
+    let outer_param_let = ctx.next_let_idx;
+    ctx.next_let_idx += 1;
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: outer_start_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: outer_param_let,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.lets.push(LetBinding {
+        name: shape.outer_param.name.clone(),
+        idx: outer_param_let,
+        ty: IrType::I64,
+        schema_brand: None,
+    });
+
+    // ---- inner row fold: allocate counters + accumulator ----------
+    let inner_start_i = ctx.next_let_idx;
+    let inner_end_i = ctx.next_let_idx + 1;
+    let row_acc_i = ctx.next_let_idx + 2;
+    ctx.next_let_idx += 3;
+
+    emit_range_bound(shape.inner_range_args, true, inner_start_i, range, ctx)?;
+    emit_range_bound(shape.inner_range_args, false, inner_end_i, range, ctx)?;
+
+    // row_acc = <inner-init>. `Sum` seeds 0; `Reduce` lowers the user
+    // init expression (must be I64).
+    match &combine.fold {
+        RowFold::Sum => {
+            ctx.out.push(TaggedOp {
+                op: Op::ConstI64(0),
+                range,
+            });
+            ctx.tstack.push(IrType::I64);
+        }
+        RowFold::Reduce { init, .. } => {
+            lower_expr(&init.expr, init.range, ctx)?;
+            expect_int_top(ctx, init.range)?;
+        }
+    }
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: row_acc_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // ---- inner loop body sub-buffer -------------------------------
+    let saved_inner = std::mem::take(&mut ctx.out);
+
+    // if j >= inner_end -> br 1 (exit inner-exit block)
+    emit_ge_brif(inner_start_i, inner_end_i, 1, range, ctx);
+
+    // Bind the inner map param (`j`) to the inner counter.
+    let inner_param_let = ctx.next_let_idx;
+    ctx.next_let_idx += 1;
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: inner_start_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: inner_param_let,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.lets.push(LetBinding {
+        name: shape.inner_param.name.clone(),
+        idx: inner_param_let,
+        ty: IrType::I64,
+        schema_brand: None,
+    });
+
+    // cell = <cell_body(i, j)> — must be I64.
+    lower_expr(&shape.cell_body.expr, shape.cell_body.range, ctx)?;
+    expect_int_top(ctx, shape.cell_body.range)?;
+    let cell_let = ctx.next_let_idx;
+    ctx.next_let_idx += 1;
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: cell_let,
+            ty: IrType::I64,
+        },
+        range: shape.cell_body.range,
+    });
+    ctx.tstack.pop();
+    ctx.lets.pop(); // drop the inner `j` binding before the fold body
+
+    // ---- per-cell fold update ------------------------------------
+    match &combine.fold {
+        RowFold::Sum => {
+            // row_acc += cell
+            emit_acc_add_cell(row_acc_i, cell_let, range, ctx);
+        }
+        RowFold::Reduce {
+            acc_param,
+            cell_param,
+            body,
+            ..
+        } => {
+            // Bind acc / cell params and lower the user fold body; its
+            // i64 result becomes the new row_acc.
+            let acc_param_let = ctx.next_let_idx;
+            ctx.next_let_idx += 1;
+            ctx.out.push(TaggedOp {
+                op: Op::LetGet {
+                    idx: row_acc_i,
+                    ty: IrType::I64,
+                },
+                range,
+            });
+            ctx.out.push(TaggedOp {
+                op: Op::LetSet {
+                    idx: acc_param_let,
+                    ty: IrType::I64,
+                },
+                range,
+            });
+            ctx.lets.push(LetBinding {
+                name: acc_param.name.clone(),
+                idx: acc_param_let,
+                ty: IrType::I64,
+                schema_brand: None,
+            });
+            ctx.lets.push(LetBinding {
+                name: cell_param.name.clone(),
+                idx: cell_let,
+                ty: IrType::I64,
+                schema_brand: None,
+            });
+            lower_expr(&body.expr, body.range, ctx)?;
+            expect_int_top(ctx, body.range)?;
+            ctx.lets.pop(); // cell
+            ctx.lets.pop(); // acc
+            ctx.out.push(TaggedOp {
+                op: Op::LetSet {
+                    idx: row_acc_i,
+                    ty: IrType::I64,
+                },
+                range,
+            });
+            ctx.tstack.pop();
+        }
+    }
+
+    // j += 1; br 0 (back to inner loop header)
+    emit_incr_and_loop(inner_start_i, range, ctx);
+
+    // Pop the inner loop body and wrap in Block { Loop { ... } }.
+    let inner_body = std::mem::replace(&mut ctx.out, saved_inner);
+    ctx.out.push(TaggedOp {
+        op: Op::Block {
+            result_ty: None,
+            body: vec![TaggedOp {
+                op: Op::Loop {
+                    result_ty: None,
+                    body: inner_body,
+                },
+                range,
+            }],
+        },
+        range,
+    });
+
+    // ---- combine row_acc into the outer accumulator ---------------
+    // outer_acc = outer_acc <op> row_acc (or commuted). Both terms
+    // are I64; the result stays I64 for the i64 accumulator slot.
+    if combine.acc_is_lhs {
+        ctx.out.push(TaggedOp {
+            op: Op::LetGet {
+                idx: outer_acc_i,
+                ty: IrType::I64,
+            },
+            range,
+        });
+        ctx.out.push(TaggedOp {
+            op: Op::LetGet {
+                idx: row_acc_i,
+                ty: IrType::I64,
+            },
+            range,
+        });
+    } else {
+        ctx.out.push(TaggedOp {
+            op: Op::LetGet {
+                idx: row_acc_i,
+                ty: IrType::I64,
+            },
+            range,
+        });
+        ctx.out.push(TaggedOp {
+            op: Op::LetGet {
+                idx: outer_acc_i,
+                ty: IrType::I64,
+            },
+            range,
+        });
+    }
+    ctx.tstack.push(IrType::I64);
+    ctx.tstack.push(IrType::I64);
+    let combine_op = combine_operator_to_op(combine.op, range)?;
+    ctx.out.push(TaggedOp {
+        op: combine_op,
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: outer_acc_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // Drop the outer `i` binding now that its body region is emitted.
+    ctx.lets.pop();
+
+    // i += 1; br 0 (back to outer loop header)
+    emit_incr_and_loop(outer_start_i, range, ctx);
+
+    // Pop the outer loop body and wrap in Block { Loop { ... } }.
+    let outer_body = std::mem::replace(&mut ctx.out, saved_outer);
+    ctx.out.push(TaggedOp {
+        op: Op::Block {
+            result_ty: None,
+            body: vec![TaggedOp {
+                op: Op::Loop {
+                    result_ty: None,
+                    body: outer_body,
+                },
+                range,
+            }],
+        },
+        range,
+    });
+
+    // Push the final accumulator so the consumer sees an I64 on top.
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: outer_acc_i,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I64);
+    Ok(())
+}
+
+/// Lower one `range(start, end)` bound into a let slot. `is_start`
+/// selects the start arg (defaulting to `0` for the single-arg
+/// `range(n)` form) or the end arg. The lowered value must be I64.
+fn emit_range_bound(
+    range_args: &[relon_parser::CallArg],
+    is_start: bool,
+    target_let: u32,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    if is_start {
+        if range_args.len() == 2 {
+            lower_expr(&range_args[0].value.expr, range_args[0].value.range, ctx)?;
+            expect_int_top(ctx, range)?;
+        } else {
+            ctx.out.push(TaggedOp {
+                op: Op::ConstI64(0),
+                range,
+            });
+            ctx.tstack.push(IrType::I64);
+        }
+    } else {
+        let end_arg = &range_args[range_args.len() - 1];
+        lower_expr(&end_arg.value.expr, end_arg.value.range, ctx)?;
+        expect_int_top(ctx, range)?;
+    }
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: target_let,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+    Ok(())
+}
+
+/// Emit `if let[start] >= let[end] { br <label_depth> }` (the loop-exit
+/// guard). The comparison leaves a Bool that `BrIf` consumes.
+fn emit_ge_brif(
+    start_let: u32,
+    end_let: u32,
+    label_depth: u32,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) {
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: start_let,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: end_let,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::Ge(IrType::I64),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::BrIf { label_depth },
+        range,
+    });
+}
+
+/// Emit `acc += cell` for two i64 let slots, storing back into `acc`.
+fn emit_acc_add_cell(acc_let: u32, cell_let: u32, range: TokenRange, ctx: &mut LowerCtx<'_>) {
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: acc_let,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: cell_let,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I64),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: acc_let,
+            ty: IrType::I64,
+        },
+        range,
+    });
+}
+
+/// Emit `counter += 1; br 0` — advance the loop counter and branch
+/// back to the loop header.
+fn emit_incr_and_loop(counter_let: u32, range: TokenRange, ctx: &mut LowerCtx<'_>) {
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: counter_let,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI64(1),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I64),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: counter_let,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::Br { label_depth: 0 },
+        range,
+    });
+}
+
+/// Map the recognised combine `Operator` onto its i64 `Op`. The matmul
+/// reduction only uses `+`, but `*` / `-` are accepted for symmetry so
+/// the same emitter covers product / difference cell folds.
+fn combine_operator_to_op(op: Operator, range: TokenRange) -> Result<Op, LoweringError> {
+    match op {
+        Operator::Add => Ok(Op::Add(IrType::I64)),
+        Operator::Sub => Ok(Op::Sub(IrType::I64)),
+        Operator::Mul => Ok(Op::Mul(IrType::I64)),
+        other => Err(LoweringError::UnsupportedExpr {
+            kind: format!(
+                "nested range.map reduce: unsupported combine operator {:?}",
+                other
+            ),
+            range,
+        }),
+    }
 }
 
 /// One stage in a `range(...).chain(...)` pipeline. Each stage takes
@@ -5873,6 +6621,74 @@ mod range_pipeline_tests {
                 assert_ne!(*fn_index, stdlib_list_int_sum);
             }
         }
+    }
+
+    /// AOT-2 — the W19 matmul cell-reduction shape lowers to a
+    /// doubly-nested integer accumulator loop with NO list
+    /// materialised. None of the buffer-protocol list-builder stdlib
+    /// bodies (`list_int_map` / `list_int_sum` / `list_int_fold`) may
+    /// survive — every one would force the bytecode scalar envelope to
+    /// bail and would keep the shape off the LLVM AOT tier.
+    #[test]
+    fn nested_range_map_reduce_desugars_to_double_loop() {
+        let src = "#unstrict\n\
+                   #import list from \"std/list\"\n\
+                   #main(Int n) -> Int\n\
+                   range(n).map((i) => range(n).map((j) => (i * n + j) % 100))\n\
+                     .reduce(0, (row_acc, row) => row_acc + row.reduce(0, (cell_acc, cell) => cell_acc + cell))";
+        let ops = lower_and_flatten(src);
+        let banned = ["list_int_map", "list_int_sum", "list_int_fold"];
+        for op in &ops {
+            if let Op::Call { fn_index, .. } = op {
+                for name in banned.iter() {
+                    if let Some(idx) = stdlib_function_index(name) {
+                        assert_ne!(
+                            *fn_index, idx,
+                            "expected `{name}` to be inlined by the nested peephole"
+                        );
+                    }
+                }
+            }
+        }
+        // Two nested loops (outer `i`, inner `j`) and two Block wrappers
+        // (one loop-exit guard per loop). No third loop / list builder.
+        let blocks = ops
+            .iter()
+            .filter(|op| matches!(op, Op::Block { .. }))
+            .count();
+        let loops = ops
+            .iter()
+            .filter(|op| matches!(op, Op::Loop { .. }))
+            .count();
+        assert_eq!(loops, 2, "expected two nested Loops, got {loops}");
+        assert_eq!(blocks, 2, "expected one Block per loop, got {blocks}");
+    }
+
+    /// The `list.sum(row)` inner-fold form lowers to the same
+    /// doubly-nested loop with no list materialised.
+    #[test]
+    fn nested_range_map_list_sum_desugars_to_double_loop() {
+        let src = "#unstrict\n\
+                   #import list from \"std/list\"\n\
+                   #main(Int n) -> Int\n\
+                   range(n).map((i) => range(n).map((j) => (i + j) % 100))\n\
+                     .reduce(0, (acc, row) => acc + list.sum(row))";
+        let ops = lower_and_flatten(src);
+        let banned = ["list_int_map", "list_int_sum", "list_int_fold"];
+        for op in &ops {
+            if let Op::Call { fn_index, .. } = op {
+                for name in banned.iter() {
+                    if let Some(idx) = stdlib_function_index(name) {
+                        assert_ne!(*fn_index, idx);
+                    }
+                }
+            }
+        }
+        let loops = ops
+            .iter()
+            .filter(|op| matches!(op, Op::Loop { .. }))
+            .count();
+        assert_eq!(loops, 2, "expected two nested Loops, got {loops}");
     }
 }
 
