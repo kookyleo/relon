@@ -4479,19 +4479,22 @@ fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
         "W18_prime_count_trial_div" => Some(w18_relon_src()),
         // Panel expansion 2026-05-28 (Tier 3 numeric-kernel W19):
         // production source materialises two 16x16 `List<List<Int>>`
-        // matrices via nested `range(size).map(...).map(...)` chains.
-        // The LLVM AOT envelope today rejects nested-list construction
-        // (`Op::AllocListInt` does not chain through `Op::MakeClosure`
-        // for the outer map's return-list shape — the bytecode VM /
-        // cranelift / LLVM emitters surface as `unknown stdlib method
-        // range` because the lowering pipeline rejects the 2D shape
-        // before it reaches the codegen). An inlined variant that
-        // skips list materialisation (e.g. `sum_{i,j,k} ((i*size+k)
-        // %100) * ((k+j)%100)`) would be a paper-win per audit #318 —
-        // the LuaJIT row walks the materialised arrays and pays the
-        // table-load cost; collapsing both `a[i][k]` and `b[k][j]`
-        // to inline arithmetic skips the load.
-        "W19_matrix_multiply" => None,
+        // matrices via nested `range(size).map(...).map(...)` chains
+        // + cell-by-cell `Σ_k a[i][k]*b[k][j]` with random cross-row
+        // indexing. The AOT-4 W19 slice (2026-05-30) added 2D
+        // List<List<Int>> materialization (nested arena records) +
+        // generalized N-D inline indexing + reduce-over-materialized-
+        // list lowering, so the verbatim production source now
+        // compiles + runs through `LlvmAotEvaluator::from_source`
+        // (proven against the tree-walker oracle at the production
+        // size=16 by `crates/relon-codegen-llvm/tests/llvm_w19_matmul.rs`).
+        // The matrices are GENUINELY materialised + double-indexed
+        // (the eliding single-pass nested-range peephole cannot serve
+        // random cross-row `a[i][k]`/`b[k][j]`), and the mod-100 cell
+        // generators defeat closed-form fold — so this is NOT the
+        // audit #318 paper-win shape (no inlined-arithmetic collapse).
+        // Same algorithm / code path / I/O shape as tree_walk + luajit.
+        "W19_matrix_multiply" => Some(w19_relon_src()),
         // Panel expansion 2026-05-28 (Tier 3 numeric-kernel W20):
         // production source uses Float arithmetic + first-class
         // closure values (`step` / `accel` / `pair_force` defined
