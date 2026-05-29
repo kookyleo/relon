@@ -144,7 +144,7 @@ fn f64_sub_mul_div() {
 /// and (2) the emitted LLVM IR carries the `llvm.trap` guard (it
 /// survives -O3 because the divisor is a runtime arg, not a constant).
 #[test]
-fn f64_div_by_zero_is_inf_not_trap() {
+fn f64_div_by_zero_traps() {
     let src = "#main(Float x, Float y) -> Float\nx / y";
 
     // Oracle: a Float divide-by-zero is a runtime error, not ±inf.
@@ -194,7 +194,8 @@ fn f64_cmp_ordering() {
     assert_eq!(assert_bool_matches_oracle(ge, 1.0, 2.0), 0);
 }
 
-/// `==` / `!=` route to OEQ / UNE.
+/// `==` / `!=` follow `OrderedFloat` equality (OEQ OR'd with a both-NaN
+/// test), not raw IEEE OEQ / UNE — see `f64_nan_ne` for the NaN pin.
 #[test]
 fn f64_eq_ne() {
     let eq = "#main(Float x, Float y) -> Bool\nx == y";
