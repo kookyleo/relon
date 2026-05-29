@@ -4439,15 +4439,21 @@ fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
         "W14_schema_validate" => None,
         "W15_conditional_field" => None,
         // Panel expansion 2026-05-28 (Tier 2 industry-standard W16):
-        // production source uses a `where`-clause recursive helper
-        // (`sum_qs`) + first-class closure values via `_list_filter`.
-        // LLVM AOT envelope today rejects both shapes (recursive
-        // closure widening from Phase F.W7 applies only to the
-        // Dict-bodied W7 form). Returning `None` keeps the row
-        // honest until the envelope widens — no inlined "iterative
-        // rewrite" variant because the iterative form would defeat
-        // the algorithm-substitution honesty rule (W7 history).
-        "W16_quicksort" => None,
+        // production source is a partition-quicksort sum — a `where`
+        // recursive helper `sum_qs` + three `_list_filter` partitions
+        // over a runtime-materialised PRNG-shuffled `range(n).map(...)`
+        // list. AOT-3 (where-bound recursive closure lifting) + the
+        // AOT-4 W16 slice (1D List<Int> index + filter + recursion) +
+        // the MCJIT MAP_32BIT fix (2026-05-30, so the >=4-closure
+        // dispatch jump table resolves under CodeModel::Small) make
+        // the verbatim production source compile + run through
+        // LlvmAotEvaluator::from_source, proven against the tree-walker
+        // oracle by llvm_w16_quicksort / llvm_w16_inline3_repro. The
+        // PRNG shuffle keeps depth O(log n) and total scratch O(n log n)
+        // (~80 KiB at n=1000, under the 1 MiB arena). Same algorithm /
+        // code path / I/O shape as the tree_walk + luajit rows; the
+        // partition recursion is data-dependent (no closed-form fold).
+        "W16_quicksort" => Some(w16_relon_src()),
         // Panel expansion 2026-05-28 (Tier 2 industry-standard W17):
         // production source uses a `where`-clause recursive helper
         // `bs(lo, hi, t)`. AOT-3 (2026-05-30) generalised the W7
