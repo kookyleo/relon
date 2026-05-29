@@ -16,7 +16,7 @@
 //! [`Op`] variant fails the build until a matching `visit_*` method
 //! lands.
 
-use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{I32, I64};
 use cranelift_codegen::ir::InstBuilder;
 use ordered_float::OrderedFloat;
@@ -61,8 +61,10 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         Ok(())
     }
 
-    fn visit_const_f64(&mut self, _v: OrderedFloat<f64>) -> Result<(), CraneliftError> {
-        unsupported("ConstF64")
+    fn visit_const_f64(&mut self, v: OrderedFloat<f64>) -> Result<(), CraneliftError> {
+        let val = self.builder.ins().f64const(v.into_inner());
+        self.push(val);
+        Ok(())
     }
 
     fn visit_const_string(&mut self, idx: u32, _value: &str) -> Result<(), CraneliftError> {
@@ -151,6 +153,7 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         match ty {
             IrType::I64 => self.emit_add_i64(),
             IrType::I32 => self.emit_add_i32(),
+            IrType::F64 => self.emit_add_f64(),
             // F-D7-D: `Op::Add(IrType::String)` routes through the
             // bundled stdlib `concat` body via the existing
             // emit_call_stdlib inlining path — same operand-stack
@@ -183,6 +186,7 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         match ty {
             IrType::I64 => self.emit_sub_i64(),
             IrType::I32 => self.emit_sub_i32(),
+            IrType::F64 => self.emit_sub_f64(),
             _ => unsupported("Sub"),
         }
     }
@@ -191,6 +195,7 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         match ty {
             IrType::I64 => self.emit_mul_i64(),
             IrType::I32 => self.emit_mul_i32(),
+            IrType::F64 => self.emit_mul_f64(),
             _ => unsupported("Mul"),
         }
     }
@@ -199,6 +204,7 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         match ty {
             IrType::I64 => self.emit_div_i64(),
             IrType::I32 => self.emit_div_i32(),
+            IrType::F64 => self.emit_div_f64(),
             _ => unsupported("Div"),
         }
     }
@@ -224,6 +230,7 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         match ty {
             IrType::I64 => self.emit_cmp(IntCC::Equal),
             IrType::I32 | IrType::Bool => self.emit_cmp_i32(IntCC::Equal),
+            IrType::F64 => self.emit_fcmp(FloatCC::Equal),
             _ => unsupported("Eq"),
         }
     }
@@ -232,6 +239,7 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         match ty {
             IrType::I64 => self.emit_cmp(IntCC::NotEqual),
             IrType::I32 | IrType::Bool => self.emit_cmp_i32(IntCC::NotEqual),
+            IrType::F64 => self.emit_fcmp(FloatCC::NotEqual),
             _ => unsupported("Ne"),
         }
     }
@@ -240,6 +248,7 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         match ty {
             IrType::I64 => self.emit_cmp(IntCC::SignedLessThan),
             IrType::I32 => self.emit_cmp_i32(IntCC::SignedLessThan),
+            IrType::F64 => self.emit_fcmp(FloatCC::LessThan),
             _ => unsupported("Lt"),
         }
     }
@@ -248,6 +257,7 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         match ty {
             IrType::I64 => self.emit_cmp(IntCC::SignedLessThanOrEqual),
             IrType::I32 => self.emit_cmp_i32(IntCC::SignedLessThanOrEqual),
+            IrType::F64 => self.emit_fcmp(FloatCC::LessThanOrEqual),
             _ => unsupported("Le"),
         }
     }
@@ -256,6 +266,7 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         match ty {
             IrType::I64 => self.emit_cmp(IntCC::SignedGreaterThan),
             IrType::I32 => self.emit_cmp_i32(IntCC::SignedGreaterThan),
+            IrType::F64 => self.emit_fcmp(FloatCC::GreaterThan),
             _ => unsupported("Gt"),
         }
     }
@@ -264,6 +275,7 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         match ty {
             IrType::I64 => self.emit_cmp(IntCC::SignedGreaterThanOrEqual),
             IrType::I32 => self.emit_cmp_i32(IntCC::SignedGreaterThanOrEqual),
+            IrType::F64 => self.emit_fcmp(FloatCC::GreaterThanOrEqual),
             _ => unsupported("Ge"),
         }
     }

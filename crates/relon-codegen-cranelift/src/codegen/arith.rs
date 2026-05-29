@@ -14,7 +14,7 @@
 //! `push`) remain on [`super::Codegen`] because they touch broader
 //! state.
 
-use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{I32, I64};
 use cranelift_codegen::ir::InstBuilder;
 
@@ -183,6 +183,62 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         let b = self.pop()?;
         let a = self.pop()?;
         let r = self.builder.ins().band(a, b);
+        self.push(r);
+        Ok(())
+    }
+
+    /// `Op::Add(IrType::F64)` — IEEE-754 `fadd`. No overflow trap:
+    /// Float arithmetic saturates to ±inf rather than trapping, matching
+    /// the tree-walker (`lhs + rhs`) and the bytecode VM's `AddF64`.
+    pub(super) fn emit_add_f64(&mut self) -> Result<(), CraneliftError> {
+        let b = self.pop()?;
+        let a = self.pop()?;
+        let r = self.builder.ins().fadd(a, b);
+        self.push(r);
+        Ok(())
+    }
+
+    /// `Op::Sub(IrType::F64)` — IEEE-754 `fsub`.
+    pub(super) fn emit_sub_f64(&mut self) -> Result<(), CraneliftError> {
+        let b = self.pop()?;
+        let a = self.pop()?;
+        let r = self.builder.ins().fsub(a, b);
+        self.push(r);
+        Ok(())
+    }
+
+    /// `Op::Mul(IrType::F64)` — IEEE-754 `fmul`.
+    pub(super) fn emit_mul_f64(&mut self) -> Result<(), CraneliftError> {
+        let b = self.pop()?;
+        let a = self.pop()?;
+        let r = self.builder.ins().fmul(a, b);
+        self.push(r);
+        Ok(())
+    }
+
+    /// `Op::Div(IrType::F64)` — IEEE-754 `fdiv`. No division-by-zero
+    /// guard: Float division by zero yields ±inf / NaN per IEEE-754,
+    /// matching the tree-walker (`lhs / rhs`) and the bytecode VM's
+    /// `DivF64`. The integer `DivisionByZero` trap deliberately does not
+    /// apply here.
+    pub(super) fn emit_div_f64(&mut self) -> Result<(), CraneliftError> {
+        let b = self.pop()?;
+        let a = self.pop()?;
+        let r = self.builder.ins().fdiv(a, b);
+        self.push(r);
+        Ok(())
+    }
+
+    /// Pop `[b, a]` and push `a fcmp(cc) b` widened to the IR's `Bool`
+    /// slot (cranelift `i32`). Float comparisons use the *ordered*
+    /// predicates so NaN operands compare `false` for `<`/`<=`/`>`/`>=`
+    /// /`==` and `true` only for `!=`, matching Rust's `f64` operators
+    /// the tree-walker + bytecode VM use.
+    pub(super) fn emit_fcmp(&mut self, cc: FloatCC) -> Result<(), CraneliftError> {
+        let b = self.pop()?;
+        let a = self.pop()?;
+        let r = self.builder.ins().fcmp(cc, a, b);
+        let r = self.builder.ins().uextend(I32, r);
         self.push(r);
         Ok(())
     }
