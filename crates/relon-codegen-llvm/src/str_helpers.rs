@@ -371,8 +371,32 @@ mod tests {
         (buf, h_off, n_off)
     }
 
+    /// Serialize + reset the process-global `STR_CONTAINS_ARENA_IC` for the
+    /// duration of an IC-touching test. The IC is a single-slot static, so
+    /// concurrently-running sibling tests can clobber the slot between two
+    /// calls of the same test (breaking the cache-hit tests) or hand a
+    /// reused buffer address a stale cached result (breaking the miss
+    /// tests). Holding the guard for the whole test serializes IC access;
+    /// the reset clears any entry a prior test left behind.
+    fn lock_and_reset_ic() -> std::sync::MutexGuard<'static, ()> {
+        use core::sync::atomic::Ordering;
+        static IC_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = IC_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        STR_CONTAINS_ARENA_IC
+            .last_haystack
+            .store(core::ptr::null_mut(), Ordering::Relaxed);
+        STR_CONTAINS_ARENA_IC
+            .last_needle
+            .store(core::ptr::null_mut(), Ordering::Relaxed);
+        STR_CONTAINS_ARENA_IC
+            .last_result
+            .store(0, Ordering::Relaxed);
+        guard
+    }
+
     #[test]
     fn matches_short_needle() {
+        let _ic = lock_and_reset_ic();
         let (buf, h_off, n_off) = build_two_records(b"axb", b"x");
         let h_ptr = unsafe { buf.as_ptr().add(h_off) };
         let n_ptr = unsafe { buf.as_ptr().add(n_off) };
@@ -384,6 +408,7 @@ mod tests {
 
     #[test]
     fn misses_when_needle_absent() {
+        let _ic = lock_and_reset_ic();
         let (buf, h_off, n_off) = build_two_records(b"abc", b"z");
         let h_ptr = unsafe { buf.as_ptr().add(h_off) };
         let n_ptr = unsafe { buf.as_ptr().add(n_off) };
@@ -395,6 +420,7 @@ mod tests {
     fn matches_long_haystack_tail_needle() {
         // 256-byte haystack with a single `x` at the tail — mirrors the
         // W4_long cmp_lua row exactly.
+        let _ic = lock_and_reset_ic();
         let mut haystack = vec![b'a'; 255];
         haystack.push(b'x');
         let (buf, h_off, n_off) = build_two_records(&haystack, b"x");
@@ -406,6 +432,7 @@ mod tests {
 
     #[test]
     fn empty_needle_always_matches() {
+        let _ic = lock_and_reset_ic();
         let (buf, h_off, n_off) = build_two_records(b"anything", b"");
         let h_ptr = unsafe { buf.as_ptr().add(h_off) };
         let n_ptr = unsafe { buf.as_ptr().add(n_off) };
@@ -415,6 +442,7 @@ mod tests {
 
     #[test]
     fn empty_haystack_nonempty_needle_misses() {
+        let _ic = lock_and_reset_ic();
         let (buf, h_off, n_off) = build_two_records(b"", b"x");
         let h_ptr = unsafe { buf.as_ptr().add(h_off) };
         let n_ptr = unsafe { buf.as_ptr().add(n_off) };
@@ -431,6 +459,7 @@ mod tests {
     #[test]
     fn multibyte_utf8_needle() {
         // 4-byte UTF-8 emoji as needle inside a mixed haystack.
+        let _ic = lock_and_reset_ic();
         let haystack = "hello 🦀 world".as_bytes();
         let needle = "🦀".as_bytes();
         let (buf, h_off, n_off) = build_two_records(haystack, needle);
@@ -457,6 +486,7 @@ mod tests {
     /// instrumentation hooks.
     #[test]
     fn ic_returns_cached_result_on_repeated_call() {
+        let _ic = lock_and_reset_ic();
         let (mut buf, h_off, n_off) = build_two_records(b"axb", b"x");
         let h_ptr = unsafe { buf.as_ptr().add(h_off) };
         let n_ptr = unsafe { buf.as_ptr().add(n_off) };
@@ -482,6 +512,7 @@ mod tests {
     /// hands us a different `(haystack, needle)` pair.
     #[test]
     fn ic_misses_on_distinct_pointers() {
+        let _ic = lock_and_reset_ic();
         let (buf_a, h_off_a, n_off_a) = build_two_records(b"axb", b"x");
         let (buf_b, h_off_b, n_off_b) = build_two_records(b"qqq", b"z");
         let h_a = unsafe { buf_a.as_ptr().add(h_off_a) };
