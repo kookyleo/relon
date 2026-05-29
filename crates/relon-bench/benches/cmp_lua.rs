@@ -445,6 +445,31 @@ fn paper_win_brand_dispatch_label(label: &str) -> bool {
     matches!(label, "W21_match_dispatch")
 }
 
+/// Tier 4 Phase 2 (panel expansion 2026-05-29): label gate for the
+/// container-construction-sugar rows. Initial entry: W23 dict spread;
+/// W24 / W25 join in their respective Phase 2 commits.
+///
+/// Per-workload rationale:
+///
+/// * **W23** — Rust-side `HashMap::clone() + insert()` replaces the
+///   tree-walker's `Value::Dict` allocator + key-hash + spread
+///   codepath with the host allocator. Booking that under a
+///   `rust_native` label against a LuaJIT row that walks the
+///   production source is a paper-win per the /perf "Same code path?"
+///   rule — the host-allocator dict copy is not the same code path
+///   the tree-walker / LuaJIT runs.
+///
+/// The label IS retained in `canonical_panel` because the
+/// `relon_jit` row legitimately routes the production source through
+/// `JitEvaluator::run_main` (falls through to the tree-walker today);
+/// the wasm / llvm_aot / cranelift_aot rows already gate out via
+/// `llvm_aot_source_for` / `try_build_*` returning None; and the
+/// dedicated tree_walk + luajit rows above carry the row headlines.
+/// The `rust_native` row is suppressed end-to-end via this gate.
+fn paper_win_container_sugar_label(label: &str) -> bool {
+    matches!(label, "W23_dict_spread")
+}
+
 // Honesty cleanup #309 (2026-05-28): the previous
 // `try_build_jit_with_fixture` helper lived here. It installed a
 // `relon::TraceFixture` pre-built from `wN_recorder_body()` plus a
@@ -2807,6 +2832,127 @@ fn w21_expected() -> i64 {
 }
 
 // =====================================================================
+// =====  W23 — dict spread copy per iter  =============================
+// =====================================================================
+//
+// Tier 4 Relon-flavour workload (panel expansion 2026-05-29, Phase 2
+// "Group B — container construction sugar"). Mirrors the
+// `fixtures/data_structures.relon` showcase `...&sibling.base` spread
+// shape: each reduce iter builds a fresh dict that copies the four
+// `base` entries via `{ ...base, e: 5 }` and adds a fifth key. The
+// per-iter `_len(...)` projection forces materialisation — without it,
+// the analyzer could fold the spread away as dead.
+//
+// **HONESTY checklist** (per `HONESTY_POLICY.md`):
+// * Source path: `w23_relon_src()` is the production source. The W22
+//   audit (2026-05-29) showed that `&root.base` / `&sibling.base`
+//   inside a reduce closure trips the evaluator's circular-reference
+//   guard (`crates/relon-evaluator/src/reference.rs:777-786`) because
+//   the owning dict's path is still in `evaluating_paths` when the
+//   closure body runs. The plan §1 W23 spec already anticipated this
+//   and listed "pre-resolve base via `where { base: ... }` and spread
+//   from `base` directly (no `&root`)" as the canonical fallback —
+//   that is exactly what `w23_relon_src()` does. The `where`-bound
+//   `base` is a fully materialised dict by the time the closure runs;
+//   the spread reads it as a plain identifier reference, not a `&ref`,
+//   so the circular-guard check never fires. The per-iter cost
+//   (dict copy of 4 keys + 1 key insert + `_len`) is preserved.
+// * Algorithm complexity preserved: O(n) reduce, each iter is one
+//   dict copy of 4 entries + 1 key insert + 1 `_len` projection +
+//   1 Int add. No closed-form fold — the per-iter result depends on
+//   the materialised dict shape, which is rebuilt each iter.
+// * Time-math sanity: `_len({ ...base, e: 5 })` is 5 for every iter
+//   (four base keys + the appended `e`). Over n iters the reduce
+//   sum is `n * 5`. For n=10 000 → 50 000.
+// * I/O shape: `#main(Int n) -> Int`. Returned Int matches the W6 /
+//   W18 scalar shape; Lua row returns the scalar Int directly. Both
+//   flow through `assert_relon_lua_consistent` for an exact-equal
+//   cross-check.
+// * Backend coverage: tree_walk + luajit. Bytecode envelope rejects
+//   (`Op::Dict` + spread lowering both outside the M2-A scalar
+//   envelope today, probed via `try_build_bytecode`); the row logs
+//   `n/a (UnsupportedOp: <reason>)`. LLVM AOT / Cranelift AOT / wasm
+//   reject (same Dict / spread surface — outside the Phase E typed
+//   envelope and the Z.4 wasm-walker scope). The canonical-panel
+//   `relon_jit` row routes the production source through
+//   `JitEvaluator::run_main`, which falls through to the tree-walker
+//   for the dict-spread closure. `rust_native` is NOT applicable: a
+//   Rust-side `HashMap::clone()` + `insert()` would skip the
+//   tree-walker's per-iter `Value::Dict` allocator path + key-hash
+//   work; the per-iter "cost of dict spread copy" is the load-bearing
+//   measurement here. The row is gated out by adding the label to
+//   `paper_win_container_sugar_label` below.
+
+/// W23 scale — n = 10 000 reduce iters. Same scale as W21 / W13 / W14.
+/// The per-iter dict copy is heavier than W21's brand-compare so the
+/// tree-walker wall-clock per run lands in low-ms territory (~ 500
+/// ns/iter × 10k = 5 ms / run), still inside the 5 s measurement
+/// budget with 100 samples + warmup.
+const W23_N: i64 = 10_000;
+
+fn w23_relon_src() -> &'static str {
+    // Production source. The `where` clause pre-resolves `base` to a
+    // fully materialised dict before the reduce closure runs (no
+    // `&root` / `&sibling` deref inside the closure), bypassing the
+    // W22 circular-guard blocker. Inside the closure body, `...base`
+    // is an identifier reference (not a `&ref`), which the tree-
+    // walker copies via the dict-spread codepath. `_len(...)` forces
+    // the spread result to materialise rather than being constant-
+    // folded out by the analyzer; the per-iter result is the integer
+    // 5 (four base keys + the appended `e`), the reduce folds to
+    // `n * 5`.
+    //
+    // `#unstrict` is required because the reduce closure params
+    // (`acc`, `_`) are untyped — same constraint W21 hit.
+    "#unstrict\n\
+     #main(Int n) -> Int\n\
+     range(n).reduce(0, (acc, _) =>\n\
+       acc + _len({ ...base, e: 5 }))\n\
+     where {\n\
+       base: { a: 1, b: 2, c: 3, d: 4 }\n\
+     }"
+}
+
+fn w23_lua_src() -> String {
+    // Lua side mirrors the per-iter dict copy + key insert + len. Lua
+    // has no `table.unpack`-style spread inside a table literal; the
+    // canonical equivalent is a shallow `for k,v in pairs(base) do
+    // copy[k] = v end` pre-amble plus the appended key. We unroll
+    // the 4-key copy into 4 direct assignments — keeps the per-iter
+    // work shape-equivalent (4 table inserts + 1 key insert + 1 len)
+    // without paying the `pairs()` iterator boundary cost on every
+    // iter, which would dwarf the dict-spread cost being measured.
+    // `#t` on a Lua table reports the sequence length, not the dict
+    // size, so we count keys via a small helper that walks `pairs`
+    // once — matches Relon `_len` semantics on dicts.
+    format!(
+        r#"return function()
+            local n = {n}
+            local base = {{ a = 1, b = 2, c = 3, d = 4 }}
+            local function dictlen(t)
+                local c = 0
+                for _ in pairs(t) do c = c + 1 end
+                return c
+            end
+            local acc = 0
+            for _ = 0, n - 1 do
+                local copy = {{ a = base.a, b = base.b, c = base.c, d = base.d, e = 5 }}
+                acc = acc + dictlen(copy)
+            end
+            return acc
+        end"#,
+        n = W23_N
+    )
+}
+
+fn w23_expected() -> i64 {
+    // Analytic check: every iter spreads 4 base keys and adds 1 more,
+    // so `_len({ ...base, e: 5 }) == 5` for every i. The reduce
+    // accumulates `n * 5` over n iters. For n=10 000 → 50 000.
+    W23_N * 5
+}
+
+// =====================================================================
 // =====  consistency assertions  ======================================
 // =====================================================================
 
@@ -3529,6 +3675,15 @@ fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
         // brand-string compare that IS the load-bearing per-iter
         // cost being measured.
         "W21_match_dispatch" => None,
+        // Panel expansion 2026-05-29 (Tier 4 Phase 2 — Group B container
+        // construction sugar W23): production source uses an anon `Dict`
+        // return shape + spread operator outside the Phase E typed
+        // envelope. No inlined variant — a HashMap-clone Rust lowering
+        // would substitute a host-allocator path for the tree-walker's
+        // `Value::Dict` allocator + key-hash codepath (paper-win per
+        // `paper_win_container_sugar_label`). Returning `None` keeps
+        // the row honest.
+        "W23_dict_spread" => None,
         _ => None,
     }
 }
@@ -5531,6 +5686,74 @@ fn bench_cmp_lua(c: &mut Criterion) {
         }
     }
 
+    // ----- W23 dict spread copy per iter -----
+    //
+    // Panel expansion 2026-05-29 (Tier 4 Phase 2 — Group B container
+    // construction sugar). See the top-of-file W23 doc-comment for
+    // the HONESTY checklist. Backend coverage: tree_walk + luajit
+    // only. Bytecode envelope rejects (`Op::Dict` + spread lowering
+    // both outside the M2-A scalar envelope today); the row is
+    // suppressed by `try_build_bytecode` returning None and logs
+    // `n/a` to stderr. LLVM AOT / Cranelift AOT / wasm reject (same
+    // Dict / spread surface). The canonical-panel `relon_jit` row
+    // routes the production source through `JitEvaluator::run_main`,
+    // which falls through to the tree-walker.
+    {
+        let (walker, scope) = build_tree_walker(w23_relon_src());
+        let lua_fn_w23 = lua_fn(&lua, &w23_lua_src());
+
+        let relon_v = relon_int_result("W23", walker.run_main(&scope, args_w_n(W23_N)).unwrap());
+        let lua_v: i64 = lua_fn_w23.call(()).unwrap();
+        assert_relon_lua_consistent("W23", relon_v, lua_v, w23_expected());
+
+        // Throughput is the number of reduce iters (`n`) — each iter
+        // performs one dict copy of 4 keys + 1 key insert + 1 `_len`
+        // projection + 1 Int add, the dominant per-iter work unit.
+        group.throughput(Throughput::Elements(W23_N as u64));
+        group.bench_function(
+            BenchmarkId::new("W23_dict_spread", "relon_tree_walk"),
+            |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(W23_N);
+                    timed_with_warmup(iters, || {
+                        let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            },
+        );
+        group.bench_function(BenchmarkId::new("W23_dict_spread", "luajit"), |b| {
+            b.iter_custom(|iters| {
+                timed_with_warmup(iters, || {
+                    let v: i64 = lua_fn_w23.call(()).unwrap();
+                    black_box(v);
+                })
+            });
+        });
+        // Bytecode row — honest try. Dict + spread surface is outside
+        // the M2-A scalar envelope today; `try_build_bytecode`
+        // returns None and the row is omitted.
+        if let Some(ev) = try_build_bytecode(w23_relon_src(), "W23_dict_spread") {
+            let v = ev.run_main(args_w_n(W23_N)).expect("W23 bytecode run_main");
+            let got = relon_int_result("W23", v);
+            assert_eq!(
+                got,
+                w23_expected(),
+                "W23 bytecode result mismatch: got {got}, expected {}",
+                w23_expected()
+            );
+            group.bench_function(BenchmarkId::new("W23_dict_spread", "relon_bytecode"), |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(W23_N);
+                    timed_with_warmup(iters, || {
+                        let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            });
+        }
+    }
+
     // =================================================================
     // ===== Dart-style canonical panel: relon_jit + relon_aot =========
     // =================================================================
@@ -5752,6 +5975,25 @@ fn bench_cmp_lua(c: &mut Criterion) {
         //   rows.
         ("W21_match_dispatch", w21_relon_src(), W21_N as u64, || {
             args_w_n(W21_N)
+        }),
+        // Panel expansion 2026-05-29 (Tier 4 Phase 2 — Group B container
+        // construction sugar W23):
+        // * relon_jit: runs through `JitEvaluator::run_main`; falls
+        //   through to the tree-walker (`Op::Dict` + spread lowering
+        //   sit outside the M2-A bytecode envelope today).
+        // * relon_aot / relon_llvm_aot: both reject (same Dict / spread
+        //   surface). Returning None from `llvm_aot_source_for`.
+        // * rust_native: gated out by `paper_win_container_sugar_label`.
+        //   A Rust-side `HashMap::clone() + insert()` would skip the
+        //   tree-walker's `Value::Dict` allocator + key-hash work; the
+        //   per-iter "cost of dict spread copy" is the load-bearing
+        //   measurement here.
+        // * relon_wasm_wasmtime: classifier scope-cut (Z.1 program set
+        //   does not include dict-spread lowering).
+        // * Throughput uses reduce iter count `n` so per-iter ns is
+        //   directly comparable across the Tier 1-4 Relon-flavour rows.
+        ("W23_dict_spread", w23_relon_src(), W23_N as u64, || {
+            args_w_n(W23_N)
         }),
     ];
 
@@ -6047,6 +6289,22 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 "[cmp_lua {label}] rust_native row n/a (Rust `enum + match` \
                  collapses the runtime brand-string compare to a compile-time \
                  variant tag dispatch — see paper_win_brand_dispatch_label)"
+            );
+        } else if paper_win_container_sugar_label(label) {
+            // Panel expansion 2026-05-29 (Tier 4 Phase 2 — Group B
+            // container-construction sugar). The rust_native lowering
+            // would either replace a Relon-runtime allocator path with
+            // a host-allocator path (W23 `HashMap::clone()`) or, for
+            // the comprehension / pipe entries added in later Phase 2
+            // commits (W24 / W25), collapse the loop to a closed-form
+            // polynomial at -O3. Both shapes book under a `rust_native`
+            // label against a LuaJIT row that walks the production
+            // source. See `paper_win_container_sugar_label` doc-comment
+            // for the per-workload rationale.
+            eprintln!(
+                "[cmp_lua {label}] rust_native row n/a (Rust kernel either uses \
+                 host-allocator dict copy or LLVM folds the arithmetic-progression \
+                 sum to a closed-form polynomial — see paper_win_container_sugar_label)"
             );
         } else if *label == "W20_n_body_softened" {
             // Panel expansion 2026-05-28 (Tier 3 numeric-kernel W20):
