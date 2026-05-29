@@ -28,6 +28,12 @@ pub enum BcOp {
     /// `[] -> [i32]`. Push a 32-bit boolean / null / i32 slot. Boolean
     /// values are stored as `0` / `1`; `Null` always pushes `0`.
     ConstI32(i32),
+    /// `[] -> [f64]`. Push a 64-bit IEEE-754 literal. The value rides
+    /// the same u64 operand-stack lane as every other slot via
+    /// `f64::to_bits`; the F64 arith / cmp arms read it back with
+    /// `f64::from_bits`. Emitted instead of the old compile-time fold
+    /// so Float literals can feed runtime-dependent arithmetic.
+    ConstF64(f64),
     /// `[] -> [T]`. Push the value of local slot `idx`. The slot
     /// width is `i64` regardless of the IR-level type — comparison
     /// ops down-cast when needed.

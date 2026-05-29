@@ -1973,6 +1973,7 @@ dependencies = [
  "ordered-float",
  "relon-analyzer",
  "relon-eval-api",
+ "relon-evaluator",
  "relon-ir",
  "relon-parser",
  "relon-trace-abi",

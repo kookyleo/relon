@@ -1460,6 +1460,9 @@ impl BytecodeVm {
             BcOp::ConstI32(v) => {
                 stack.push(*v as u32 as u64);
             }
+            BcOp::ConstF64(v) => {
+                stack.push(v.to_bits());
+            }
             BcOp::LocalGet(idx) => {
                 let i = *idx as usize;
                 if i >= locals.len() {

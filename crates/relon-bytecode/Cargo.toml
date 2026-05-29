@@ -32,3 +32,9 @@ thiserror = { workspace = true }
 # `Value::Float(OrderedFloat<f64>)` construction; the f64 slot bits
 # get re-wrapped in `unpack_return`.
 ordered-float = { workspace = true }
+
+[dev-dependencies]
+# Tree-walking reference backend for cross-tier parity tests (e.g.
+# the F64-arithmetic correctness test in `tests/float_arith_parity.rs`).
+# LLVM/cranelift-free, so it does not widen the bytecode build graph.
+relon-evaluator = { workspace = true }

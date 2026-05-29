@@ -703,6 +703,9 @@ impl<'a> CompileState<'a> {
             BcOp::ConstI32(v) => self
                 .current_stack
                 .push(StackOrigin::Const(*v as u32 as u64)),
+            // F64 literals ride the same u64 lane via `to_bits`, so the
+            // resume recipe carries the bit-pattern as a plain `Const`.
+            BcOp::ConstF64(v) => self.current_stack.push(StackOrigin::Const(v.to_bits())),
             BcOp::LocalGet(idx) => self.current_stack.push(StackOrigin::Local(*idx)),
             BcOp::LocalSet(_) => self.pop_n(1),
             // M2-C lever 3: typed arith / cmp ops carry no payload after
@@ -1383,11 +1386,16 @@ impl<'a> OpVisitor for CompileState<'a> {
         Ok(())
     }
 
-    fn visit_const_f64(&mut self, _v: OrderedFloat<f64>) -> Result<(), BcCompileError> {
-        // The bytecode VM operates over i64-shaped slots; F64 literals
-        // arrive only through corpus paths that already bounce to
-        // cranelift before compile.
-        unsupported("ConstF64")
+    fn visit_const_f64(&mut self, v: OrderedFloat<f64>) -> Result<(), BcCompileError> {
+        // Emit a real `BcOp::ConstF64` push instead of folding the
+        // literal away. The value rides the same u64 operand-stack lane
+        // as every other slot (f64 bits via `to_bits`), so the existing
+        // `AddF64` / `SubF64` / … arms consume it directly. Folding it
+        // out used to block any Float program whose arithmetic depends
+        // on runtime data.
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::ConstF64(v.into_inner()), pc);
+        Ok(())
     }
 
     // Bytecode-coverage-expansion B-2: real-handle `ConstString`
