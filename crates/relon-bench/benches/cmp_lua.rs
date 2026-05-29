@@ -447,7 +447,7 @@ fn paper_win_brand_dispatch_label(label: &str) -> bool {
 
 /// Tier 4 Phase 2 (panel expansion 2026-05-29): label gate for the
 /// container-construction-sugar rows. Entries: W23 dict spread; W24
-/// list comprehension. W25 joins in its follow-up commit.
+/// list comprehension; W25 pipe chain.
 ///
 /// Per-workload rationale:
 ///
@@ -465,6 +465,10 @@ fn paper_win_brand_dispatch_label(label: &str) -> bool {
 ///   `paper_win_closed_form_fold_label`). Booking that O(1)
 ///   arithmetic under a `rust_native` label against an O(n) LuaJIT
 ///   loop is a paper-win per the /perf "Same algorithm?" rule.
+/// * **W25** — the pipe `range(n) | map((x) => x + 1) | filter(even)
+///   | sum()` reduces to the sum of even numbers in `[1, n]`. Same
+///   arithmetic-progression closed-form fold as W24 / W6. Same
+///   paper-win pattern.
 ///
 /// The labels ARE retained in `canonical_panel` because the
 /// `relon_jit` row legitimately routes the production source through
@@ -474,7 +478,10 @@ fn paper_win_brand_dispatch_label(label: &str) -> bool {
 /// dedicated tree_walk + luajit rows above carry the row headlines.
 /// The `rust_native` row is suppressed end-to-end via this gate.
 fn paper_win_container_sugar_label(label: &str) -> bool {
-    matches!(label, "W23_dict_spread" | "W24_list_comprehension")
+    matches!(
+        label,
+        "W23_dict_spread" | "W24_list_comprehension" | "W25_pipe_chain"
+    )
 }
 
 // Honesty cleanup #309 (2026-05-28): the previous
@@ -3068,6 +3075,113 @@ fn w24_expected() -> i64 {
 }
 
 // =====================================================================
+// =====  W25 — pipe chain through list.map / list.filter / list.sum  ==
+// =====================================================================
+//
+// Tier 4 Relon-flavour workload (panel expansion 2026-05-29, Phase 2
+// "Group B — container construction sugar"). Mirrors the
+// `fixtures/data_structures.relon` showcase `range(5) | len()` form,
+// extended to a three-stage pipe: `range(n) | list.map(...) |
+// list.filter(...) | list.sum()`. Tests the pipe-operator lowering
+// path, which is distinct from the method-chain form
+// `range(n).map(...).filter(...).sum()` that W6 / W10 cover.
+//
+// **HONESTY checklist** (per `HONESTY_POLICY.md`):
+// * Source path: `w25_relon_src()` IS the spec form — the pipe form
+//   parses and runs through `JitEvaluator::run_main` cleanly (probed
+//   2026-05-29). The fallback function-call form noted in the plan
+//   (`list.sum(list.filter(list.map(...)))`) is NOT used because the
+//   pipe form is the workload's identity; falling back would test
+//   the wrong code path. Tree-walker dispatches each pipe stage as
+//   a separate stdlib call with the previous stage's value
+//   threaded as the first argument.
+// * Algorithm complexity preserved: O(n) iteration over `range(n)`,
+//   each iter is one map closure call (`x + 1`) + one filter
+//   predicate call (`x % 2 == 0`) + one optional sum add. The
+//   per-iter result depends on the predicate hit/miss alternation;
+//   no closed-form fold.
+// * Time-math sanity: map produces `[1, 2, ..., n]`. Filter keeps
+//   even values: `[2, 4, ..., n if n even else n-1]`. For n=10 000
+//   the kept values are `[2, 4, ..., 10000]`, count 5000, sum = `2 *
+//   (1 + 2 + ... + 5000) = 2 * 5000 * 5001 / 2 = 25 005 000`.
+// * I/O shape: `#main(Int n) -> Int`. Returns the Int sum directly;
+//   Lua row returns the scalar Int. Both flow through
+//   `assert_relon_lua_consistent` for an exact-equal cross-check.
+// * Backend coverage: tree_walk + luajit. Bytecode envelope rejects
+//   the pipe operator (`unsupported operator `Pipe`` from the
+//   bytecode lowering pipeline, probed 2026-05-29); LLVM AOT /
+//   Cranelift AOT / wasm reject the same surface (pipe lowering not
+//   in any of the Z.4 / Phase E roadmaps today). The canonical-panel
+//   `relon_jit` row routes the production source through
+//   `JitEvaluator::run_main`, which falls through to the tree-walker.
+//   `rust_native` is NOT applicable: a Rust-side iterator chain
+//   `(0..n).map(|x| x+1).filter(|x| x%2==0).sum()` collapses to a
+//   closed-form polynomial at -O3 (the kept values are an
+//   arithmetic progression, same fold pattern as W6 in
+//   `paper_win_closed_form_fold_label`). Booking that O(1)
+//   arithmetic under a `rust_native` label against the
+//   production-source LuaJIT row would be a paper win per `/perf`
+//   Honesty Rules. The row is gated out via
+//   `paper_win_container_sugar_label` above.
+
+/// W25 scale — n = 10 000 input range. Same scale as W23 / W24. The
+/// per-iter work is a closure call + predicate eval; tree-walker per
+/// run lands a few ms (heavier than W24 because every iter pays a
+/// closure dispatch). Fits in 5 s budget with 100 samples + warmup.
+const W25_N: i64 = 10_000;
+
+fn w25_relon_src() -> &'static str {
+    // Production source: spec form straight from §1 W25 of
+    // `docs/internal/tier4-plan-2026-05-29.md`. The pipe operator
+    // threads each stage's output into the next stage's first
+    // argument. `list.sum()` with no explicit arg takes the piped
+    // input. `#import list from "std/list"` brings the methods in.
+    // `#unstrict` for the untyped closure params.
+    "#unstrict\n\
+     #import list from \"std/list\"\n\
+     #main(Int n) -> Int\n\
+     range(n) | list.map((x) => x + 1) | list.filter((x) => x % 2 == 0) | list.sum()"
+}
+
+fn w25_lua_src() -> String {
+    // Lua row uses the equivalent imperative loop. Lua has no pipe
+    // operator; the canonical equivalent is a single `for` loop that
+    // walks `x ∈ [0, n)`, computes `x + 1`, checks the predicate,
+    // and accumulates. Per-iter work is shape-equivalent: one add +
+    // one mod + one branch + (on hit) one acc add. We do NOT
+    // materialise intermediate `mapped` / `filtered` tables; the
+    // pipe stages are fused to the same loop after the LuaJIT
+    // compiler would inline the closure bodies, so the direct loop
+    // is the honest equivalent baseline.
+    format!(
+        r#"return function()
+            local n = {n}
+            local s = 0
+            for x = 0, n - 1 do
+                local y = x + 1
+                if y % 2 == 0 then
+                    s = s + y
+                end
+            end
+            return s
+        end"#,
+        n = W25_N
+    )
+}
+
+fn w25_expected() -> i64 {
+    // Analytic check: kept values are even `(x+1)` for `x ∈ [0, n)`,
+    // i.e. `{2, 4, ..., n if n even else n-1}`. For n=10 000 even,
+    // last kept = 10 000, count = 5 000, sum = (first + last) *
+    // count / 2 = (2 + 10000) * 5000 / 2 = 25 005 000.
+    let n = W25_N;
+    let last_kept = if n % 2 == 0 { n } else { n - 1 };
+    let count = last_kept / 2;
+    let first_kept = 2;
+    (first_kept + last_kept) * count / 2
+}
+
+// =====================================================================
 // =====  consistency assertions  ======================================
 // =====================================================================
 
@@ -3808,6 +3922,14 @@ fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
         // `paper_win_container_sugar_label`). Returning `None` keeps
         // the row honest.
         "W24_list_comprehension" => None,
+        // Panel expansion 2026-05-29 (Tier 4 Phase 2 — Group B container
+        // construction sugar W25): production source uses the pipe
+        // operator outside the Phase E typed envelope. No inlined
+        // variant — a method-chain rewrite `(0..n).map().filter().
+        // sum()` is the same arithmetic-progression sum (sum of even
+        // numbers in [1, n]) that LLVM -O3 folds to a closed-form
+        // polynomial. Same `paper_win_container_sugar_label` gate.
+        "W25_pipe_chain" => None,
         _ => None,
     }
 }
@@ -5948,6 +6070,68 @@ fn bench_cmp_lua(c: &mut Criterion) {
         }
     }
 
+    // ----- W25 pipe chain through list.map / list.filter / list.sum --
+    //
+    // Panel expansion 2026-05-29 (Tier 4 Phase 2 — Group B container
+    // construction sugar). See the top-of-file W25 doc-comment for
+    // the HONESTY checklist. Backend coverage: tree_walk + luajit
+    // only. Bytecode envelope rejects the pipe operator; LLVM AOT /
+    // Cranelift AOT / wasm reject the same surface. The
+    // canonical-panel `relon_jit` row falls through to the
+    // tree-walker.
+    {
+        let (walker, scope) = build_tree_walker(w25_relon_src());
+        let lua_fn_w25 = lua_fn(&lua, &w25_lua_src());
+
+        let relon_v = relon_int_result("W25", walker.run_main(&scope, args_w_n(W25_N)).unwrap());
+        let lua_v: i64 = lua_fn_w25.call(()).unwrap();
+        assert_relon_lua_consistent("W25", relon_v, lua_v, w25_expected());
+
+        // Throughput is the input range count (`n`) — each input
+        // element walks through map (closure dispatch + add) +
+        // filter (closure dispatch + predicate) + (on hit) sum add.
+        group.throughput(Throughput::Elements(W25_N as u64));
+        group.bench_function(BenchmarkId::new("W25_pipe_chain", "relon_tree_walk"), |b| {
+            b.iter_custom(|iters| {
+                let n_in = black_box(W25_N);
+                timed_with_warmup(iters, || {
+                    let v = walker.run_main(&scope, args_w_n(black_box(n_in))).unwrap();
+                    black_box(v);
+                })
+            });
+        });
+        group.bench_function(BenchmarkId::new("W25_pipe_chain", "luajit"), |b| {
+            b.iter_custom(|iters| {
+                timed_with_warmup(iters, || {
+                    let v: i64 = lua_fn_w25.call(()).unwrap();
+                    black_box(v);
+                })
+            });
+        });
+        // Bytecode row — honest try. Pipe operator sits outside the
+        // M2-A envelope; `try_build_bytecode` returns None and the
+        // row is omitted.
+        if let Some(ev) = try_build_bytecode(w25_relon_src(), "W25_pipe_chain") {
+            let v = ev.run_main(args_w_n(W25_N)).expect("W25 bytecode run_main");
+            let got = relon_int_result("W25", v);
+            assert_eq!(
+                got,
+                w25_expected(),
+                "W25 bytecode result mismatch: got {got}, expected {}",
+                w25_expected()
+            );
+            group.bench_function(BenchmarkId::new("W25_pipe_chain", "relon_bytecode"), |b| {
+                b.iter_custom(|iters| {
+                    let n_in = black_box(W25_N);
+                    timed_with_warmup(iters, || {
+                        let v = ev.run_main(args_w_n(black_box(n_in))).unwrap();
+                        black_box(v);
+                    })
+                });
+            });
+        }
+    }
+
     // =================================================================
     // ===== Dart-style canonical panel: relon_jit + relon_aot =========
     // =================================================================
@@ -6210,6 +6394,23 @@ fn bench_cmp_lua(c: &mut Criterion) {
             W24_N as u64,
             || args_w_n(W24_N),
         ),
+        // Panel expansion 2026-05-29 (Tier 4 Phase 2 — Group B container
+        // construction sugar W25):
+        // * relon_jit: runs through `JitEvaluator::run_main`; falls
+        //   through to the tree-walker (pipe operator sits outside the
+        //   M2-A bytecode envelope — bytecode probe surfaces
+        //   `unsupported operator `Pipe``).
+        // * relon_aot / relon_llvm_aot: both reject. Returning None
+        //   from `llvm_aot_source_for`.
+        // * rust_native: gated out by `paper_win_container_sugar_label`.
+        //   The kept values are even numbers in [1, n] — arithmetic
+        //   progression, LLVM -O3 closed-form fold same as W6.
+        // * relon_wasm_wasmtime: classifier scope-cut.
+        // * Throughput uses input range count `n` so per-element ns is
+        //   directly comparable across the Tier 1-4 Relon-flavour rows.
+        ("W25_pipe_chain", w25_relon_src(), W25_N as u64, || {
+            args_w_n(W25_N)
+        }),
     ];
 
     for (label, src, throughput_n, args_factory) in canonical_panel {

@@ -1,9 +1,6 @@
 //! Quick smoke check for the Tier 4 Phase 2 workload sources
 //! (Group B container construction sugar — W23 / W24 / W25).
 //!
-//! W25 lands in its follow-up commit; this binary covers W23 + W24
-//! today and grows the W25 entry once the workload commits.
-//!
 //! The bench helpers `wN_relon_src()` / `wN_lua_src()` / `wN_expected()`
 //! live in `crates/relon-bench/benches/cmp_lua.rs` (the Criterion
 //! `[[bench]]` binary), so this smoke binary inlines the source strings
@@ -26,6 +23,7 @@ use std::collections::HashMap;
 
 const W23_N: i64 = 10_000;
 const W24_N: i64 = 10_000;
+const W25_N: i64 = 10_000;
 
 fn w23_src() -> &'static str {
     "#unstrict\n\
@@ -42,6 +40,13 @@ fn w24_src() -> &'static str {
      #import list from \"std/list\"\n\
      #main(Int n) -> Int\n\
      list.sum([x * 2 for x in range(n) if x % 3 == 0])"
+}
+
+fn w25_src() -> &'static str {
+    "#unstrict\n\
+     #import list from \"std/list\"\n\
+     #main(Int n) -> Int\n\
+     range(n) | list.map((x) => x + 1) | list.filter((x) => x % 2 == 0) | list.sum()"
 }
 
 fn run_int(label: &str, src: &str, n: i64) -> i64 {
@@ -70,6 +75,14 @@ fn w24_expected() -> i64 {
     2 * sum_kept
 }
 
+fn w25_expected() -> i64 {
+    let n = W25_N;
+    let last_kept = if n % 2 == 0 { n } else { n - 1 };
+    let count = last_kept / 2;
+    let first_kept = 2;
+    (first_kept + last_kept) * count / 2
+}
+
 fn main() {
     let v23 = run_int("W23", w23_src(), W23_N);
     let e23 = w23_expected();
@@ -86,6 +99,11 @@ fn main() {
         v24 == e24
     );
     assert_eq!(v24, e24, "W24 mismatch");
+
+    let v25 = run_int("W25", w25_src(), W25_N);
+    let e25 = w25_expected();
+    println!("W25_pipe_chain: got={v25} expected={e25} ok={}", v25 == e25);
+    assert_eq!(v25, e25, "W25 mismatch");
 
     println!("\nALL Tier 4 Phase 2 smoke checks passed.");
 }
