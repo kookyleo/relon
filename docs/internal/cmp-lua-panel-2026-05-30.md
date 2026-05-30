@@ -135,10 +135,10 @@ trace-JIT data; shown for completeness, excluded from all "beats" counts.
 | W13_deep_dict_access | 3.993 µs | 3.989 ms | — | — | — | — | — | — | 4.086 ms | — |
 | W14_schema_validate | 9.111 µs | 567.96 µs | 4.159 µs | 3.977 µs | — | — | 6.990 µs | 575.4 µs | 3.645 ms | — |
 | W15_conditional_field | 4.525 µs | 259.3 µs | 1.951 µs | 1.755 µs | — | — | 4.589 µs | 258.7 µs | 2.156 ms | — |
-| W16_quicksort | 1.336 ms | 119.4 ms | — | — | **150.1 µs** | — | n/a³ | — | 119.0 ms | 148.1 µs |
-| W17_binary_search | 6.241 µs | 483.0 µs | 12.81 µs | 12.63 µs | 3.439 µs | **3.226 µs** | — | — | 3.863 ms | 2.282 µs |
-| W18_prime_count_trial_div | 2.732 ms | 536.7 ms | — | — | **1.682 ms** | — | — | — | 533.0 ms | 751.0 µs |
-| W19_matrix_multiply | 46.64 µs | 28.69 ms | — | — | **12.58 µs** | — | — | — | 28.55 ms | 10.40 µs |
+| W16_quicksort | 1.336 ms | 119.4 ms | — | — | **77.10 µs**⁵ | — | n/a³ | — | 119.0 ms | 149.8 µs |
+| W17_binary_search | 6.241 µs | 483.0 µs | 12.81 µs | 12.63 µs | 2.451 µs⁵ | **2.269 µs**⁵ | — | — | 3.863 ms | 2.281 µs |
+| W18_prime_count_trial_div | 2.732 ms | 536.7 ms | — | — | 751.7 µs⁵ | **750.6 µs**⁵ | — | — | 533.0 ms | 749.95 µs |
+| W19_matrix_multiply | 46.64 µs | 28.69 ms | — | — | **9.508 µs**⁵ | — | — | — | 28.55 ms | 9.930 µs |
 | W20_n_body_softened | 211.9 µs | 242.7 ms | — | — | — | — | — | — | 241.1 ms | 25.14 µs |
 | W21_match_dispatch | 133.8 µs | 43.88 ms | — | — | — | — | — | — | 45.04 ms | — |
 | W23_dict_spread | 2.860 ms | — | — | — | — | — | — | — | 86.13 ms | — |
@@ -154,7 +154,15 @@ trace-JIT data; shown for completeness, excluded from all "beats" counts.
 backend re-folds the arithmetic-progression sum (the same fold suppressed for LLVM in
 audit #332). Excluded from the headline JIT-beats-LuaJIT count as a paper-win risk.
 ³ W16 cranelift `relon_aot` row n/a — cranelift frontend panic (var3 type mismatch on the
-list-materialize shape; caught → n/a). LLVM AOT path is unaffected (150.1 µs). Follow-up.
+list-materialize shape; caught → n/a). LLVM AOT path is unaffected (77.10 µs). Follow-up.
+
+⁵ The `llvm_aot` / `llvm_aot_fast` columns for W16/W17/W18/W19 (and their `rust_native`)
+are from the host-cpu-fix binary md5 `a907c717…` (post devirtualization + dead-list fusion +
+host target-cpu stamp). All other columns in this table are from md5 `9738c99a…` (backends
+the host-cpu fix does not touch — tree_walk / luajit / wasm / bytecode / relon_jit — and which
+are stable across runs). W7/W12 `llvm_aot` rows are within noise of `a907c717` (no divides),
+left as `9738c99a`. The current per-kernel AOT-vs-Rust scorecard is the FINAL scorecard at the
+top of this doc.
 
 ### Re-derived honest "beats" scorecard (from the surviving real rows above)
 
@@ -170,16 +178,17 @@ fill), not a pure codegen ratio — noted, not a headline.
 | Workload | best llvm_aot | rust_native | ratio | verdict |
 |---|---|---|---|---|
 | W12_p99_tail | 2.89 ns | 4.82 ns | **0.60×** | beats Rust |
-| W7_fib | 84.99 µs | 84.96 µs | **1.00×** | parity |
-| W16_quicksort | 150.1 µs | 148.1 µs | **1.013×** | parity |
-| W19_matrix_multiply | 12.58 µs | 10.40 µs | **1.21×** | near |
-| W17_binary_search | 3.226 µs | 2.282 µs | **1.41×** | close |
-| W18_prime_count_trial_div | 1.682 ms | 751.0 µs | **2.24×** | outlier (closure-dispatch gap, #354) |
+| W7_fib | 84.98 µs | 85.02 µs | **1.00×** | parity |
+| W16_quicksort | 77.10 µs | 149.8 µs | **0.515×** | beats (devirt; ⚠ naive Vec::new baseline) |
+| W19_matrix_multiply | 9.508 µs | 9.930 µs | **0.96×** | beats Rust |
+| W17_binary_search | 2.269 µs | 2.281 µs | **0.99×** | parity |
+| W18_prime_count_trial_div | 750.6 µs | 749.95 µs | **1.00×** | parity (host-cpu fix; was 2.24×) |
 
-→ AOT 比肩 Rust: MET on 5 of 6 (≤1.41×; 3 at/below parity); W18 the lone outlier at
-2.24×, a localized per-element closure-dispatch codegen gap (#354), not list-materialization
-(W16 proves that competitive). W20 (n-body) has a Rust baseline (25.14 µs) but no llvm_aot
-row yet — Float + List<Float> + float-closure track, deferred.
+→ AOT 比肩 Rust: MET on 6 of 6 — all at parity or beating Rust after the host-cpu fix
+(W7/W17/W18 parity, W12/W19 beat Rust, W16 beats with a ⚠ naive-`Vec::new` baseline caveat).
+The earlier W18 2.24× / W17 1.41× was a MCJIT-targets-generic-x86-64 miss (dropped idiv→divl),
+NOT a codegen deficiency — see the FINAL scorecard at the top. W20 (n-body) has a Rust baseline
+(25.14 µs) but no llvm_aot row yet — Float + List<Float> + float-closure track, deferred.
 
 ## UPDATE (devirt landed; W18/W17 codegen-parity established; placement experiment discarded)
 
