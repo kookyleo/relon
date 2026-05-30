@@ -431,6 +431,20 @@ impl LlvmAotEvaluator {
             .verify()
             .map_err(|e| LlvmError::Codegen(format!("LLVM verifier rejected module: {e}")))?;
 
+        // Pin every function to the RUNTIME host CPU before MCJIT
+        // codegen. The MCJIT engine builders take no MCPU, so without
+        // this the X86 backend lowers for generic x86-64 and drops the
+        // host `SlowDivide64` narrowing — every i64 `%` / `/` becomes a
+        // bare microcoded `idivq` instead of the host `shrq $32; je;
+        // divl` fast path. The O3 pipeline and the static object-emit
+        // path already target the host; this brings the JIT backend in
+        // line. Stamping `target-cpu` / `target-features` (host-queried,
+        // never hard-coded) is the lever inkwell 0.9 / MCJIT exposes.
+        // Results are byte-identical to the generic lowering — this is a
+        // codegen-quality / instruction-selection fix, not a semantics
+        // change.
+        stamp_host_target_attributes(&module);
+
         // Run LLVM's `-O3` middle-end pipeline on the module before
         // handing it to MCJIT. MCJIT's `OptimizationLevel::Aggressive`
         // controls backend codegen optimizations (regalloc, instr
@@ -755,6 +769,20 @@ impl LlvmAotEvaluator {
     /// Always populated for a successful `from_source` build.
     pub fn entry_runtime_addr(&self) -> usize {
         self.jit.entry_ptr
+    }
+
+    /// The running host's LLVM CPU name (e.g. `broadwell`, `znver3`),
+    /// as queried by `TargetMachine::get_host_cpu_name`. This is the
+    /// exact value stamped as the `"target-cpu"` function attribute on
+    /// every JIT'd function so the MCJIT backend lowers for the CPU it
+    /// runs on (and emits the host idiv-narrowing fast path rather than
+    /// a generic bare `idivq`). Exposed so capability tests can confirm
+    /// the stamp is the runtime host, never a hard-coded literal.
+    pub fn host_target_cpu() -> String {
+        TargetMachine::get_host_cpu_name()
+            .to_str()
+            .unwrap_or("")
+            .to_string()
     }
 
     /// Phase D.1 dispatch-boundary fast path: invoke the typed fast
@@ -1650,6 +1678,13 @@ impl LlvmAotEvaluator {
             LlvmError::Codegen(format!("LLVM verifier rejected object module: {e}"))
         })?;
 
+        // Stamp the host CPU onto every function so the per-function
+        // subtarget matches the host `TargetMachine` used for object
+        // codegen below. The object-emit `create_target_machine` already
+        // carries the host CPU/features, but stamping keeps the AOT and
+        // MCJIT paths consistent (same attributes, same lowering).
+        stamp_host_target_attributes(&module);
+
         // Lay down O3 IR-level passes before backend codegen. Same
         // pipeline the JIT path uses, so the AOT and JIT performance
         // profiles stay comparable.
@@ -1774,6 +1809,78 @@ fn lower_field_descriptors(
         });
     }
     Ok(out)
+}
+
+/// Stamp the runtime host CPU/feature set onto every function in the
+/// module as `"target-cpu"` / `"target-features"` string function
+/// attributes.
+///
+/// ## Why this exists (correctness, not a micro-opt)
+///
+/// The MCJIT execution engine is created without an MCPU/MAttr —
+/// `MCJITCompilerOptions` exposes no CPU field, and inkwell's
+/// `create_*_execution_engine*` builders take only an
+/// [`OptimizationLevel`] (+ a `CodeModel` on the memory-manager
+/// variant). With no CPU pinned, the X86 backend lowers for **generic
+/// x86-64** and drops every host-tuning decision the per-CPU
+/// `SubtargetFeatures` would have enabled. The one that bites hardest:
+/// the `SlowDivide64` tuning that narrows a 64-bit `idivq` whose
+/// operands provably fit in 32 bits into the host `shrq $32; je; divl`
+/// fast path. Generic codegen always emits the bare microcoded
+/// `idivq`, so every i64 `%` / `/` runs the slow divider at runtime.
+///
+/// The `default<O3>` middle-end pipeline already runs against a host
+/// `TargetMachine` (see [`run_default_o3_pipeline`]) and the static
+/// object-emit path bakes the host CPU into its `TargetMachine` too,
+/// so both of those already lower for the host. Only the **MCJIT
+/// backend codegen** was generic. LLVM resolves a function's subtarget
+/// from its `"target-cpu"` / `"target-features"` string attributes
+/// when present, so stamping the host values here makes the MCJIT
+/// backend lower each function for the CPU it will actually run on —
+/// identical results, correct host instruction selection.
+///
+/// The CPU/features are queried from the running host
+/// ([`TargetMachine::get_host_cpu_name`] /
+/// [`TargetMachine::get_host_cpu_features`]) — the SAME source the O3
+/// pipeline uses — so this is correct on any machine and never pins a
+/// hard-coded microarchitecture.
+fn stamp_host_target_attributes(module: &inkwell::module::Module<'_>) {
+    // `get_host_cpu_*` reads the running CPU via LLVM's host
+    // introspection; no native-target init is required for these two
+    // queries, but every caller has already initialised the native
+    // target by this point (verify -> O3 -> engine).
+    let cpu = TargetMachine::get_host_cpu_name();
+    let features = TargetMachine::get_host_cpu_features();
+    let cpu = cpu.to_str().unwrap_or("");
+    let features = features.to_str().unwrap_or("");
+    if cpu.is_empty() {
+        // Host introspection failed; leave the module generic rather
+        // than stamping an empty/bogus CPU. The engine still works,
+        // just without host narrowing (the pre-fix behaviour).
+        return;
+    }
+    let ctx = module.get_context();
+    let cpu_attr = ctx.create_string_attribute("target-cpu", cpu);
+    let features_attr = ctx.create_string_attribute("target-features", features);
+    let mut func = module.get_first_function();
+    while let Some(f) = func {
+        // Only stamp functions with a body. Pure declarations (the
+        // `relon_llvm_str_contains_arena` host shim, intrinsics) have
+        // no IR to lower, and stamping a target-cpu on an external
+        // declaration is harmless but pointless.
+        if f.count_basic_blocks() > 0 {
+            // Idempotent: replace any pre-existing stamp so a re-run
+            // (or an emitter that already set one) lands on the host.
+            f.remove_string_attribute(inkwell::attributes::AttributeLoc::Function, "target-cpu");
+            f.remove_string_attribute(
+                inkwell::attributes::AttributeLoc::Function,
+                "target-features",
+            );
+            f.add_attribute(inkwell::attributes::AttributeLoc::Function, cpu_attr);
+            f.add_attribute(inkwell::attributes::AttributeLoc::Function, features_attr);
+        }
+        func = f.get_next_function();
+    }
 }
 
 fn run_default_o3_pipeline(module: &inkwell::module::Module<'_>) -> Result<(), LlvmError> {
