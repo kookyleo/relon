@@ -82,7 +82,33 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
             let captures_abs = self.arena_addr(captures_ptr, captures_size)?;
             for cap in captures {
                 let mapped_idx = self.remap_let_idx(cap.let_idx);
-                let value = self.get_let(mapped_idx, cap.ty)?;
+                // Determine the captured value. If the let-slot is
+                // already bound, read it (ordinary capture). Otherwise
+                // this is a self-recursive capture: the lowering pass
+                // emits `MakeClosure` before the matching
+                // `LetSet { idx: mapped_idx, ty: Closure }`, so the slot
+                // does not exist yet. The captured value is the closure
+                // handle being built right here — the very value the
+                // upcoming `LetSet` will store — so we stamp
+                // `handle_ptr` into the slot, forming a value cycle
+                // (an i32 arena offset, not a borrow, so it is safe to
+                // self-reference). This mirrors the LLVM backend
+                // (`emitter.rs` `emit_make_closure`). A not-yet-bound
+                // capture is only legal for `Closure`-typed captures
+                // (any other type referring to a not-yet-bound let-local
+                // is an impossible source shape and signals a lowering
+                // bug).
+                let value = if self.let_is_bound(mapped_idx) {
+                    self.get_let(mapped_idx, cap.ty)?
+                } else {
+                    if cap.ty != IrType::Closure {
+                        return Err(CraneliftError::Codegen(format!(
+                            "MakeClosure capture let_idx={mapped_idx} not yet bound but ty={:?} (expected Closure for self-recursion)",
+                            cap.ty
+                        )));
+                    }
+                    handle_ptr
+                };
                 let offset = i32::try_from(cap.offset).map_err(|_| {
                     CraneliftError::Codegen(format!(
                         "MakeClosure capture offset {} exceeds i32 range",

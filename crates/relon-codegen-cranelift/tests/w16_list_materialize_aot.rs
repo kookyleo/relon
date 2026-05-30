@@ -15,30 +15,22 @@
 //! runtime `n`. Both previously aborted with the var-type panic at the
 //! first `LetSet { idx, ty: I32 }` fed an i64 value.
 //!
-//! The third test documents the *remaining* boundary: the full W16
-//! `sum_qs` recurrence lowers the recursive helper as a closure that
-//! captures a handle to itself (`MakeClosure { fn_table_idx: 0 }` with
+//! The third test now exercises the *full* W16 `sum_qs` recurrence end
+//! to end. The recursive helper lowers as a closure that captures a
+//! handle to itself (`MakeClosure { fn_table_idx: 0 }` with
 //! `ClosureCapture { let_idx: 10, ty: Closure }` read before the
-//! matching `LetSet { idx: 10 }`). That self-recursive-closure capture
-//! is a separate, unimplemented cranelift feature (the LLVM backend
-//! handles it via `OwnCaptureHandle` provenance) and is out of scope
-//! for the var-type fix — the test asserts the current, well-defined
-//! `LetGet read before LetSet` lowering error so a future fix flips it
-//! into a green oracle check.
-//!
-//! NOTE (separate, pre-existing cranelift bug, NOT touched here): a
-//! *selective* `_list_filter` (a predicate that drops elements, e.g.
-//! `v < 1000`) returns an empty list through the cranelift backend, so
-//! `list.sum(_list_filter(...))` yields 0 regardless of `n`. The
-//! `list.sum` over the *full* materialised list (and over a
-//! keep-everything filter) is correct — proven below — so the var-type
-//! fix is sound; the selective-filter compaction defect is independent
-//! of the var-type panic and is left for a dedicated lane.
+//! matching `LetSet { idx: 10 }`). The self-recursive-closure capture is
+//! now handled in `emit_make_closure`: when the captured let-slot is not
+//! yet bound, the just-allocated closure handle (a value-based i32 arena
+//! offset, not a borrow, so the value cycle is safe) is stamped into the
+//! capture slot, mirroring the LLVM backend. The test compiles the full
+//! W16 source and asserts bit-identical results against the tree-walker
+//! oracle across several runtime `n`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use relon_codegen_cranelift::{AotEvaluator, CraneliftError};
+use relon_codegen_cranelift::AotEvaluator;
 use relon_eval_api::{Evaluator, Value};
 use relon_evaluator::{Context, Scope, TreeWalkEvaluator};
 use relon_parser::parse_document;
@@ -142,30 +134,44 @@ fn list_materialize_sum_matches_oracle() {
     }
 }
 
-/// The full W16 `sum_qs` recurrence no longer hits the var-type panic,
-/// but currently stops at the self-recursive-closure capture lowering
-/// (`MakeClosure` reads `let_idx 10` before its `LetSet`). Assert that
-/// well-defined `LetGet read before LetSet` error so the boundary is
-/// pinned: when the self-capture lowering lands, this test flips and
-/// should become an oracle check.
+/// The full W16 `sum_qs` recurrence now compiles through cranelift and
+/// matches the tree-walker oracle across several runtime `n`. This is
+/// the regression that the self-recursive-closure capture fix unlocks:
+/// the recursive `sum_qs` helper lowers as a closure that captures a
+/// handle to itself (`MakeClosure` with `ClosureCapture { ty: Closure }`
+/// emitted before the matching `LetSet`). `emit_make_closure` now stamps
+/// the just-allocated closure handle into the not-yet-bound capture
+/// slot (mirroring the LLVM backend) instead of failing with
+/// `LetGet read before LetSet`.
+///
+/// Both the tree-walker oracle and the AOT runtime recurse to depth
+/// `O(n)` here (partition recursion over `range(n)`), so the comparison
+/// runs on a wide-stack thread; the default 2 MiB test-thread stack
+/// overflows the *oracle* well before the AOT does. The runtime `n` is
+/// capped at 200: the AOT scratch arena is a fixed 64 KiB (see
+/// `evaluator.rs` `scratch_size`), and the O(n) partition sublists this
+/// workload materialises exhaust it around n=256 (a graceful
+/// `WasmIndexOutOfBounds` capacity trap, not a miscompile and not
+/// specific to the self-capture fix — the same bound governs every
+/// list-materialising AOT workload). Within the arena budget the AOT
+/// output is bit-identical to the oracle.
 #[test]
-fn w16_full_blocks_on_self_recursive_closure_not_var_type_panic() {
+fn w16_full_matches_oracle_via_self_recursive_closure() {
     let src = w16_relon_src();
-    match AotEvaluator::from_source(src) {
-        Ok(_) => {
-            // If a future change makes the full W16 compile, upgrade
-            // this test to an oracle comparison rather than leaving a
-            // stale assertion.
-            panic!(
-                "full W16 now compiles through cranelift — upgrade this test to an oracle check"
-            );
-        }
-        Err(CraneliftError::Codegen(msg)) => {
-            assert!(
-                msg.contains("LetGet(10) read before LetSet"),
-                "expected the self-recursive-closure capture limitation, got: {msg}"
-            );
-        }
-        Err(other) => panic!("unexpected error compiling full W16: {other:?}"),
-    }
+    // Compile once up front so a compile failure surfaces directly here
+    // (not buried inside the worker thread's panic).
+    AotEvaluator::from_source(src).expect("full W16 must compile through cranelift");
+
+    let handle = std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(|| {
+            let src = w16_relon_src();
+            for n in [0_i64, 1, 2, 5, 17, 64, 128, 200] {
+                let want = oracle(src, n);
+                let got = aot_run(src, n);
+                assert_eq!(got, want, "full W16 oracle mismatch at n={n}");
+            }
+        })
+        .expect("spawn wide-stack worker");
+    handle.join().expect("W16 oracle worker panicked");
 }

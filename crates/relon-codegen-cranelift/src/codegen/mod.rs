@@ -1322,6 +1322,16 @@ impl<'a, 'b> Codegen<'a, 'b> {
         }
     }
 
+    /// Whether the `let`-binding slot `idx` (already `remap_let_idx`-
+    /// mapped) has been declared by a prior `LetSet`. Used by
+    /// `emit_make_closure` to distinguish an ordinary capture (slot
+    /// already bound → read it) from a self-recursive capture (slot not
+    /// yet bound because lowering emits `MakeClosure` before the matching
+    /// `LetSet`).
+    fn let_is_bound(&self, idx: u32) -> bool {
+        self.let_locals.contains_key(&idx)
+    }
+
     /// Resolve / create a `let`-binding slot.
     fn get_let(&mut self, idx: u32, ty: IrType) -> Result<CValue, CraneliftError> {
         let var = match self.let_locals.get(&idx).copied() {
