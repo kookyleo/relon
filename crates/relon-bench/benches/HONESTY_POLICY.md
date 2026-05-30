@@ -211,6 +211,29 @@ that defeats LLVM's induction-variable reduction (or an LLVM emitter
 flag that disables `IndVarSimplify` / `LoopIdiom` / `LoopReduce` on
 the lambda body).
 
+## wasm_fast fold gate (audit #346, 2026-05-29)
+
+The fold gate is NOT LLVM-only. The `relon_wasm_wasmtime_fast` rows
+route the arithmetic-progression kernels through wasmtime's Cranelift
+backend, which performs the same closed-form reduction:
+
+* **W1_int_sum** `Σ_{i<n} i` — smoke ~0.61 ns/iter, below the
+  <1 ns/iter fold gate (see the "Loop-shape sources < 1 ns/iter"
+  rule above). Cranelift folds it to `n*(n-1)/2`.
+* **W2_f64_dot** `Σ_{i<n} (i+1)*(i+2)` — smoke ~1.09 ns/iter,
+  borderline but at/below the realistic per-iter op floor for the
+  cubic body (2 add + 1 mul + accumulate ≈ 4-5 cycles ≈ 1.5 ns at
+  3 GHz), so Cranelift folds the Faulhaber cubic the same way.
+
+Both fast rows are therefore SUPPRESSED in `cmp_lua.rs` by gating
+their emission behind `paper_win_closed_form_fold_label`, mirroring
+the LLVM AOT handling. The non-fast `relon_wasm_wasmtime` rows are
+retained — they pay the per-iter `HashMap`-pack + `Value::Int`-wrap
+boundary cost on each `run_main`, which keeps their measured time
+above the fold gate. The fast rows return once the fast path grows a
+`black_box`-on-acc shape that defeats Cranelift's induction-variable
+reduction.
+
 ## Tier 3 panel expansion (2026-05-28)
 
 The panel grows numeric-kernel workloads to test the codegen quality
@@ -257,8 +280,12 @@ limitation disclosures.
     paper-win)**: the canonical Newtonian gravity kernel uses
     `F = m * dx / r^3` which requires `sqrt(dx^2 + dy^2)` (1D
     reduces to `sqrt(dx^2) = |dx|`, but the algebra still needs
-    `1/r^3`). Relon's `std/math` stdlib exposes only `abs` / `max` /
-    `min` / `clamp` — there is NO `sqrt` / `pow` / `exp` today. The
+    `1/r^3`). Relon's `std/math` stdlib exposes `abs` / `max` /
+    `min` / `clamp` plus `sqrt` / `pow` — but `sqrt` / `pow` exist
+    only in the tree-walker (`stdlib.rs:157-158,163-164` register
+    `MathSqrt` / `MathPow`, with no IR body / no analyzer signature /
+    untested), so an in-line `sqrt` rewrite would be a paper win vs a
+    backend that cannot run it; only `exp` is genuinely absent. The
     source substitutes a softened `1/(r^2 + eps)^2` kernel, which
     is shape-equivalent (per-step cost is 4 mul + 1 add + 1 div per
     pair, same as `dx / r^3`) but mathematically NOT Newtonian

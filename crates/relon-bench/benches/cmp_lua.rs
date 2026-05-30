@@ -2542,9 +2542,13 @@ fn w19_expected() -> i64 {
 // The canonical Verlet kernel uses Newtonian gravity `F = m1*m2 / r^2`
 // (force) → `a = F/m = m / r^2`, which requires a `sqrt(dx^2 + dy^2)`
 // to recover `r` and then `1/r^3` for the per-component acceleration
-// (`a_x = m * dx / r^3`). Relon's stdlib `std/math` exposes only
-// `abs` / `max` / `min` / `clamp` — there is NO `sqrt` / `pow` /
-// `exp` today. The source uses a softened `1/(r^2 + eps)^2`
+// (`a_x = m * dx / r^3`). Relon's stdlib `std/math` exposes
+// `abs` / `max` / `min` / `clamp` plus `sqrt` / `pow` — but `sqrt`
+// and `pow` exist only in the tree-walker (registered in
+// `stdlib.rs:157-158,163-164` as `MathSqrt` / `MathPow`, with no IR
+// body / no analyzer signature / untested), so an in-line `sqrt`
+// rewrite would be a paper win vs a backend that cannot run it; only
+// `exp` is genuinely absent. The source uses a softened `1/(r^2 + eps)^2`
 // substitute (`inv_r3 ≈ 1 / (r^2 + eps)^2`), which is shape-equivalent
 // (per-step cost is 4 mul + 1 add + 1 div per pair, same as
 // `dx / r^3`) but mathematically NOT Newtonian gravity. The bench
@@ -4820,7 +4824,34 @@ fn bench_cmp_lua(c: &mut Criterion) {
             // (`run_main`) for byte-equivalence so the row can't
             // silently drift from the `relon_wasm_wasmtime`
             // measurement above.
-            if wasm.has_fast_path() {
+            //
+            // Honesty fix (audit #346, 2026-05-29): the W1 fast row is
+            // SUPPRESSED. W1's kernel is `list.sum(range(n))` ≡
+            // `Σ_{i<n} i`, the same arithmetic-progression sum
+            // `paper_win_closed_form_fold_label` already gates out of
+            // the LLVM AOT + rust_native columns. The wasmtime/Cranelift
+            // fast path re-folds it: the smoke shows ~0.61 ns/iter
+            // (per-element), below the HONESTY_POLICY.md <1 ns/iter
+            // fold gate (the "Loop-shape sources < 1 ns/iter → almost
+            // certainly closed-form fold" rule, ~line 103). Booking
+            // that O(1) closed-form arithmetic under a `wasmtime_fast`
+            // label against a LuaJIT row that walks the O(n) loop is a
+            // paper win per `/perf` Honesty Rules. The row returns once
+            // the fast path grows a `black_box`-on-acc shape that
+            // defeats Cranelift's induction-variable reduction
+            // (HONESTY_POLICY.md ~line 209), matching the LLVM-fold
+            // gate handling. The non-fast `relon_wasm_wasmtime` row
+            // above is retained: it pays the per-iter
+            // `HashMap`-pack + `Value::Int`-wrap boundary cost, which
+            // keeps its measured time above the fold gate.
+            if paper_win_closed_form_fold_label("W1_int_sum") {
+                eprintln!(
+                    "[cmp_lua W1_int_sum] relon_wasm_wasmtime_fast row n/a \
+                     (wasmtime/Cranelift folds the Σ i arithmetic-progression sum \
+                     to a closed form — <1 ns/iter, below the HONESTY_POLICY fold \
+                     gate; see audit #346)"
+                );
+            } else if wasm.has_fast_path() {
                 let fast_out = wasm
                     .run_main_legacy_i64_fast(&[W1_N])
                     .expect("W1 wasm fast path consistency");
@@ -4935,7 +4966,33 @@ fn bench_cmp_lua(c: &mut Criterion) {
             // pattern. Bypasses the HashMap<String, Value> pack and
             // the Value::Int wrap. Cross-checked against the buffer
             // path before the timed loop.
-            if wasm.has_fast_path() {
+            //
+            // Honesty fix (audit #346, 2026-05-29): the W2 fast row is
+            // SUPPRESSED for the same reason as W1. W2's kernel is
+            // `list.sum(range(n).map((i) => (i + 1) * (i + 2)))` — a
+            // Faulhaber-class cubic that collapses to a closed-form
+            // polynomial (the `/3` modular inverse
+            // `6148914691236517206`), already gated out of the LLVM
+            // AOT + rust_native columns via
+            // `paper_win_closed_form_fold_label`. The spot-check
+            // smoke shows the wasmtime/Cranelift fast path at
+            // ~1.09 ns/iter (per-element) — borderline against the
+            // <1 ns/iter fold gate, but for a 3-op cubic body
+            // (2 add + 1 mul + accumulate) that is at/below the
+            // realistic per-iter op floor (~4-5 cycles ≈ 1.5 ns at
+            // 3 GHz), so Cranelift is folding the progression just
+            // like W1. Gating it keeps the panel consistent with the
+            // LLVM fold handling rather than booking a borderline
+            // closed-form number against the LuaJIT O(n) loop. The
+            // non-fast `relon_wasm_wasmtime` row above is retained.
+            if paper_win_closed_form_fold_label("W2_f64_dot") {
+                eprintln!(
+                    "[cmp_lua W2_f64_dot] relon_wasm_wasmtime_fast row n/a \
+                     (wasmtime/Cranelift folds the Faulhaber-cubic sum to a closed \
+                     form — ~1.09 ns/iter, at/below the per-iter op floor for the \
+                     cubic body; same fold gate as the LLVM AOT row, see audit #346)"
+                );
+            } else if wasm.has_fast_path() {
                 let fast_out = wasm
                     .run_main_legacy_i64_fast(&[W2_N])
                     .expect("W2 wasm fast path consistency");
@@ -7506,23 +7563,44 @@ fn bench_cmp_lua(c: &mut Criterion) {
     for (label, src, throughput_n, args_factory) in canonical_panel {
         group.throughput(Throughput::Elements(*throughput_n));
 
-        // relon_jit row — the canonical user-facing JIT entry. The
-        // wrapper picks its best-available tier (tree-walker /
-        // bytecode + the auto BcOp→IR Op converter) on each
-        // `run_main`. Honesty cleanup #309 (2026-05-28) removed the
-        // earlier `try_build_jit_with_fixture` short-circuit because
-        // it routed W1/W2/W3/W4/W4_long through a hand-built
-        // recorder body + closed-form/iterative fallback closure;
-        // see the comment on `canonical_panel` above for the full
-        // rationale and the followup tracked by #308 Phase J.2.
+        // relon_jit_fallthrough row — the canonical user-facing
+        // `JitEvaluator` entry, but for EVERY label in this panel it
+        // measures the tree-walker / bytecode FALLTHROUGH, not a real
+        // trace-JIT compilation. The wrapper picks its best-available
+        // tier (tree-walker / bytecode + the auto BcOp→IR Op
+        // converter) on each `run_main`; none of W5..W30 escalate to
+        // `active_tier == Trace` because the production-source surface
+        // (Op::If chains, CallClosure, list/dict materialisation) hits
+        // the recorder abort guards (see `trace_jit_production_label_eligible`
+        // for the inverse — only W1/W2 currently reach Trace, and
+        // neither is in `canonical_panel`).
+        //
+        // Honesty rename (audit #346, 2026-05-29): the row label was
+        // `relon_jit`, which read as a trace-JIT measurement when
+        // pasted into the canonical panel. It is renamed
+        // `relon_jit_fallthrough` so the column name no longer implies
+        // trace-JIT data — the number is a real measurement of
+        // `JitEvaluator::run_main` degrading to the tree-walker /
+        // bytecode tier, which is exactly what a host on this surface
+        // observes today. Rows that genuinely reach `active_tier ==
+        // Trace` are emitted separately under the `relon_trace_jit`
+        // column below (gated by `trace_jit_production_label_eligible`,
+        // with a post-warmup `active_tier == Trace` assert).
+        //
+        // Honesty cleanup #309 (2026-05-28) removed the earlier
+        // `try_build_jit_with_fixture` short-circuit because it routed
+        // W1/W2/W3/W4/W4_long through a hand-built recorder body +
+        // closed-form/iterative fallback closure; see the comment on
+        // `canonical_panel` above for the full rationale and the
+        // followup tracked by #308 Phase J.2.
         let jit = build_jit(src, label);
         // Consistency check: drive once before the timed loop. Failure
         // panics so a regression in `JitEvaluator` dispatch surfaces
         // before the bench writes a misleading number.
-        let _ = jit
-            .run_main(args_factory())
-            .unwrap_or_else(|e| panic!("[cmp_lua {label}] relon_jit consistency run failed: {e}"));
-        group.bench_function(BenchmarkId::new(*label, "relon_jit"), |b| {
+        let _ = jit.run_main(args_factory()).unwrap_or_else(|e| {
+            panic!("[cmp_lua {label}] relon_jit_fallthrough consistency run failed: {e}")
+        });
+        group.bench_function(BenchmarkId::new(*label, "relon_jit_fallthrough"), |b| {
             b.iter_custom(|iters| {
                 timed_with_warmup(iters, || {
                     let v = jit.run_main(args_factory()).unwrap();
