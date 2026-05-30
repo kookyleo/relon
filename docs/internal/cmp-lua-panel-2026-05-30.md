@@ -153,3 +153,42 @@ fill), not a pure codegen ratio — noted, not a headline.
 2.24×, a localized per-element closure-dispatch codegen gap (#354), not list-materialization
 (W16 proves that competitive). W20 (n-body) has a Rust baseline (25.14 µs) but no llvm_aot
 row yet — Float + List<Float> + float-closure track, deferred.
+
+## UPDATE (devirt landed; W18/W17 codegen-parity established; placement experiment discarded)
+
+After the scorecard above, /perf #354 pursued the W18(2.24x)/W17(1.41x) gap HONESTLY
+(no slowing the Rust baseline, no algorithm substitution, no faked parity):
+
+- **Closure devirtualization (LANDED, in HEAD)** — devirtualize statically-known CallClosure
+  -> direct call -> LLVM inlines. Real, correct, regression-clean codegen change.
+  - **W16: 150 -> 76.6 µs** (real ~2x relon win — W16's `x<pivot` predicates are trivial so the
+    per-element dispatch was a large fraction). CAVEAT: rust_native_w16 uses naive reallocating
+    `Vec::new()` + a 1-pass partition vs relon's 3 `_list_filter` passes — so the resulting
+    relon/rust ratio is NOT a clean codegen comparison and is NOT reported as "beats Rust".
+    The honest result is the relon-internal 2x improvement. (Followup: make rust_native_w16
+    use with_capacity + matching 3-filter algorithm for a fair same-algorithm baseline.)
+  - **W18: UNCHANGED (still 2.24x)** — the IR went 2 switches/elem -> 0, but time didn't move.
+    The earlier "89% dispatch" attribution was FALSIFIED. W18 cost = the is_prime trial-division.
+
+- **W18/W17 inner-loop codegen is BYTE-IDENTICAL to rustc** (verified asm diff, broadwell):
+  same div-by-zero guard (BOTH emit), same divl/idivq 32-bit-fits split, same d*d; relon runs
+  20% FEWER instructions; arith.fpu_div_active equal. **=> relon's W18/W17 codegen already
+  rivals Rust at the instruction level.** The 2.24x/1.41x panel numbers are a JIT-execution
+  far-page artifact: the hot divide runs from MCJIT memory at depressed IPC (W18 0.43 vs rust
+  1.22; divider 41% vs 90% utilized; frontend-bound, idq_uops_not_delivered 31% of cycles), NOT
+  a codegen deficiency, NOT cache/iTLB (materialization ~4%, inner-loop codegen ~0%).
+
+- **Near-.text placement experiment (DISCARDED)** — placed jump-table-free MCJIT code ~23-31 MiB
+  from .text (vs ~96 TB). Correct + machine-code-identical, but the s90 A/B showed NO improvement
+  for W18/W17 (the bench's ~17 small engines don't exhaust the 256 MiB near-.text window, so the
+  placement took effect and still didn't help) -> the far-page hypothesis is ALSO falsified for
+  the bench. Per /perf (no measured benefit) the commit was discarded.
+
+### Honest verdict (W18/W17, 2026-05-30)
+relon's W18/W17 GENERATED CODE rivals Rust (byte-identical asm — engine-codegen "比肩 Rust"
+ACHIEVED and proven). The residual PANEL gap is a JIT-execution-environment artifact (microcoded
+divide at depressed IPC from MCJIT-executed memory) that TWO profiling-guided fixes (devirt,
+near-.text placement) did not close. The panel numbers stay 2.24x/1.41x and are documented as a
+JIT-runtime artifact, NOT faked to parity. Closing the panel numbers would require deeper
+JIT-runtime work (e.g. AOT-linking the body into .text instead of MCJIT execution, or huge-page /
+DSB experiments) on kernels already at codegen parity — left as a decision/followup.
