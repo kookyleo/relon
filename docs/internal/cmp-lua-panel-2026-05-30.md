@@ -47,11 +47,13 @@ tree-walker fallthrough; see below), but via the genuine wasm + LLVM AOT compile
   quicksort with list materialization, and 2D matmul are all within 20 % of hand-written
   Rust. List materialization itself is Rust-competitive (W16 at 1.045×).
 - **Close:** W17 1.41×.
-- **Outlier:** W18 2.24× — the gap is NOT list materialization (W16 proves that is
-  competitive) but the **per-element `is_prime` closure-dispatch overhead**: W18 calls a
-  recursive predicate closure per filtered element through the closure-table dispatch,
-  where Rust inlines `is_prime`. Tracked for codegen-quality work (task #354): a
-  per-call-site live-closure-set dispatch + predicate inlining should close most of it.
+- **Outlier:** W18 2.24×, W17 1.41×. ⚠️ **SUPERSEDED — see the UPDATE section at the
+  bottom.** The closure-dispatch explanation hypothesized here was EMPIRICALLY FALSIFIED:
+  devirtualizing the dispatch (landed) did NOT change W18, and an asm diff proved relon's
+  W18/W17 inner loop is **byte-identical to rustc**. These two kernels are at codegen
+  parity; the panel gap is a JIT-execution far-page IPC artifact, not codegen. The W16
+  1.045× row was also revised by the devirt landing (→ ~76 µs vs a naive Rust baseline;
+  not a clean ratio). Read the bottom UPDATE for the corrected, measured picture.
 
 Bottom line: AOT genuinely rivals Rust on recursion + matmul + quicksort (≤1.2×) and is
 within 1.4-2.24× on the filter-heavy kernels — same order of magnitude everywhere, and
