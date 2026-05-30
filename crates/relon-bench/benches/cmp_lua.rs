@@ -4551,13 +4551,18 @@ fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
         "W21_match_dispatch" => None,
         // Panel expansion 2026-05-29 (Tier 4 Phase 3 — Group D
         // numeric W28): production source returns Float (`#main
-        // -> Float`); the Phase E typed surface tops out at Int +
-        // String. Float-typed `#main` return tracked for Phase
-        // Z.4.x. No "Int-only collapsed variant" — the workload
-        // exists specifically to exercise Float div / mod / Int→
-        // Float promote shape; dropping the Float would skip the
-        // load-bearing per-iter codepath being measured.
-        "W28_float_mixed_ops" => None,
+        // -> Float`) and mixes Int/Float arithmetic
+        // (`acc + i / 3.0 + i % 7`). #359 added `Op::ConvertI64ToF64`
+        // (sitofp) Int→Float promotion to the IR lowering + every
+        // backend, mirroring the tree-walker's `as_f64()`, so the
+        // mixed body now lowers through the LLVM AOT backend.
+        // Oracle-verified BIT-IDENTICAL (`f64::to_bits`) to the
+        // `TreeWalkEvaluator` on this exact source — see
+        // `relon-codegen-llvm/tests/llvm_w28_float_mixed.rs`. The
+        // source is the unmodified `w28_relon_src()` (no algorithm
+        // substitution), so the row measures the real Float div / mod
+        // / Int→Float-promote per-iter codepath.
+        "W28_float_mixed_ops" => Some(w28_relon_src()),
         // Panel expansion 2026-05-29 (Tier 4 Phase 3 — Group F
         // strict-mode W30): same algorithm as W6 (closed-form
         // polynomial `n*(n+1)/2`); rustc / LLVM at -O3 fold the

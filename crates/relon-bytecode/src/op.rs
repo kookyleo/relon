@@ -81,6 +81,13 @@ pub enum BcOp {
     DivF64,
     /// `[f64, f64] -> [f64]`. IEEE-754 mod (rust `%` semantics).
     ModF64,
+    /// `[i64] -> [f64]`. #359: signed-int → float promotion. Pops the
+    /// i64-lane value, computes `value as f64`, and pushes the result
+    /// through the f64 lane (`to_bits()`). Lowering target for
+    /// `Op::ConvertI64ToF64`, mirroring the tree-walker's
+    /// `NumericValue::as_f64()` Int promotion in mixed `Int`/`Float`
+    /// arithmetic.
+    ConvertI64ToF64,
     /// `[i64, i64] -> [bool]`. Also the lowering target for
     /// `Op::Eq(IrType::I32)`.
     EqI64,

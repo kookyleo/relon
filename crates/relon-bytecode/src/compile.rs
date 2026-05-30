@@ -737,6 +737,12 @@ impl<'a> CompileState<'a> {
                 self.pop_n(2);
                 self.push_snapshot();
             }
+            // #359: unary Int→Float promotion. Pop one operand, push one
+            // snapshot-backed result.
+            BcOp::ConvertI64ToF64 => {
+                self.pop_n(1);
+                self.push_snapshot();
+            }
             BcOp::Jump(_) => {
                 // Unconditional jump: no stack effect at this point.
                 // Branch targets reset their entry recipe via the
@@ -1637,6 +1643,12 @@ impl<'a> OpVisitor for CompileState<'a> {
 
     fn visit_bit_and(&mut self, _ty: IrType) -> Result<(), BcCompileError> {
         unsupported("BitAnd")
+    }
+
+    fn visit_convert_i64_to_f64(&mut self) -> Result<(), BcCompileError> {
+        let pc = self.current_pc;
+        self.emit_with_effect(BcOp::ConvertI64ToF64, pc);
+        Ok(())
     }
 
     fn visit_eq(&mut self, ty: IrType) -> Result<(), BcCompileError> {

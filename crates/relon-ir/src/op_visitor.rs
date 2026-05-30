@@ -121,6 +121,11 @@ pub trait OpVisitor {
     fn visit_div(&mut self, ty: IrType) -> Result<Self::Output, Self::Error>;
     fn visit_mod_(&mut self, ty: IrType) -> Result<Self::Output, Self::Error>;
     fn visit_bit_and(&mut self, ty: IrType) -> Result<Self::Output, Self::Error>;
+    /// #359: signed-int → float promotion (`Op::ConvertI64ToF64`). Pop
+    /// one `I64`-typed value, push its `F64`-typed `sitofp` widening.
+    /// Mirrors the tree-walker's `as_f64()` Int promotion so mixed
+    /// `Int`/`Float` arithmetic compiles bit-identically.
+    fn visit_convert_i64_to_f64(&mut self) -> Result<Self::Output, Self::Error>;
 
     // Comparison.
     fn visit_eq(&mut self, ty: IrType) -> Result<Self::Output, Self::Error>;
@@ -299,6 +304,7 @@ pub fn walk_op<V: OpVisitor>(op: &Op, visitor: &mut V) -> Result<V::Output, V::E
         Op::Div(ty) => visitor.visit_div(*ty),
         Op::Mod(ty) => visitor.visit_mod_(*ty),
         Op::BitAnd(ty) => visitor.visit_bit_and(*ty),
+        Op::ConvertI64ToF64 => visitor.visit_convert_i64_to_f64(),
         Op::Eq(ty) => visitor.visit_eq(*ty),
         Op::Ne(ty) => visitor.visit_ne(*ty),
         Op::Lt(ty) => visitor.visit_lt(*ty),
@@ -544,6 +550,11 @@ mod tests {
         fn visit_bit_and(&mut self, _: IrType) -> Result<(), ()> {
             self.calls += 1;
             self.last = "BitAnd";
+            Ok(())
+        }
+        fn visit_convert_i64_to_f64(&mut self) -> Result<(), ()> {
+            self.calls += 1;
+            self.last = "ConvertI64ToF64";
             Ok(())
         }
         fn visit_eq(&mut self, _: IrType) -> Result<(), ()> {

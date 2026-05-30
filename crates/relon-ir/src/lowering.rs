@@ -6909,16 +6909,68 @@ fn lower_binary(
         return Ok(());
     }
     if let Some(ir_op_ctor) = arithmetic_op_ctor(op) {
+        // Lower the LHS into `ctx.out`, then capture the RHS into a
+        // detached stream so a mixed `Int`/`Float` pair can splice an
+        // `Op::ConvertI64ToF64` promotion onto whichever operand is the
+        // `I64` one — the LHS sits buried under the RHS once both are
+        // emitted, so we cannot append to it after the fact.
         lower_expr(&lhs.expr, lhs.range, ctx)?;
+        let lhs_ty = *ctx
+            .tstack
+            .last()
+            .ok_or(LoweringError::UnsupportedOperator { op, range })?;
+        let saved_out = std::mem::take(&mut ctx.out);
         lower_expr(&rhs.expr, rhs.range, ctx)?;
+        let rhs_ops = std::mem::replace(&mut ctx.out, saved_out);
         let rhs_ty = ctx
             .tstack
             .pop()
             .ok_or(LoweringError::UnsupportedOperator { op, range })?;
-        let lhs_ty = ctx
-            .tstack
+        // Pop the LHS too — the result type tag is recomputed below.
+        ctx.tstack
             .pop()
             .ok_or(LoweringError::UnsupportedOperator { op, range })?;
+        // Int↔Float promotion (#359): mirror the tree-walker's
+        // `NumericValue::as_f64()` — when one operand is `Int` and the
+        // other `Float`, the `Int` operand is widened to `f64` and the
+        // binop runs as `F64`, result `Float`. Only `Add` / `Sub` /
+        // `Mul` / `Div` promote; `Mod` keeps its same-type discipline
+        // (the tree-walker's Int↔Float `%` is not produced by the
+        // targeted programs and `f64` mod is rejected below anyway).
+        let mixed_promote = matches!(
+            (lhs_ty, rhs_ty),
+            (IrType::I64, IrType::F64) | (IrType::F64, IrType::I64)
+        ) && matches!(
+            op,
+            Operator::Add | Operator::Sub | Operator::Mul | Operator::Div
+        );
+        if mixed_promote {
+            if lhs_ty == IrType::I64 {
+                // Promote the LHS (currently on top of `ctx.out`) before
+                // emitting the RHS stream.
+                ctx.out.push(TaggedOp {
+                    op: Op::ConvertI64ToF64,
+                    range: lhs.range,
+                });
+                ctx.out.extend(rhs_ops);
+            } else {
+                // LHS is already `F64`; emit the RHS then promote it.
+                ctx.out.extend(rhs_ops);
+                ctx.out.push(TaggedOp {
+                    op: Op::ConvertI64ToF64,
+                    range: rhs.range,
+                });
+            }
+            ctx.out.push(TaggedOp {
+                op: ir_op_ctor(IrType::F64),
+                range,
+            });
+            ctx.tstack.push(IrType::F64);
+            return Ok(());
+        }
+        // Homogeneous path: re-attach the RHS stream verbatim and fall
+        // through to the same-type checks below.
+        ctx.out.extend(rhs_ops);
         if lhs_ty != rhs_ty {
             return Err(LoweringError::UnsupportedOperator { op, range });
         }

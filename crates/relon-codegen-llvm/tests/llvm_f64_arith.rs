@@ -305,21 +305,42 @@ fn f64_if_phi() {
     assert_eq!(else_bits, (5.0_f64 * 2.0).to_bits());
 }
 
-/// Mixing an Int operand into a Float arithmetic context must surface a
-/// clean lowering error, not a silent miscompile. The IR lowering pass
-/// rejects `lhs_ty != rhs_ty`, so the homogeneity invariant the emitter
-/// relies on is enforced upstream — this test pins that the LLVM
-/// `from_source` path declines rather than emitting `build_int_add` on
-/// f64 bits (or `build_float_add` on an int).
+/// #359: mixing an Int operand into a Float arithmetic context now
+/// COMPILES — the IR lowering inserts an `Op::ConvertI64ToF64` promotion
+/// on the Int operand, mirroring the tree-walker's
+/// `NumericValue::as_f64()` (`value as f64`). This was previously a
+/// reject invariant (`lhs_ty != rhs_ty` bailed); flipping it is
+/// legitimate precisely because the new behaviour matches the
+/// source-of-truth tree-walker bit-for-bit, asserted below.
 #[test]
-fn f64_mixed_int_float_rejected() {
-    // `x` is Float, the literal `1` is Int — `x + 1` is a mixed-type
-    // binary the scalar arithmetic lowering refuses (it requires
-    // matching operand types and does not insert an int->float promote).
+fn f64_mixed_int_float_promotes_and_matches_oracle() {
+    // `x` is Float, the literal `1` is Int. `x + 1` promotes the Int to
+    // f64 (sitofp), runs `fadd`, result Float. Run on the LLVM JIT and
+    // the tree-walker oracle and assert bit-identical f64 results.
     let src = "#main(Float x) -> Float\nx + 1";
-    let result = LlvmAotEvaluator::from_source(src);
-    assert!(
-        result.is_err(),
-        "mixed Int/Float arithmetic should fail to compile, but it succeeded"
-    );
+    for &x in &[0.0_f64, 1.5, -3.25, 41.0, 1e16, -0.0] {
+        let llvm = {
+            let ev = LlvmAotEvaluator::from_source(src)
+                .unwrap_or_else(|e| panic!("LLVM compile failed for:\n{src}\nerror: {e:?}"));
+            let mut args = HashMap::new();
+            args.insert("x".to_string(), Value::Float(x.into()));
+            as_f64(&ev.run_main(args).expect("LLVM run_main"))
+        };
+        let oracle = {
+            let (walker, scope) = build_tree_walker(src);
+            let mut args = HashMap::new();
+            args.insert("x".to_string(), Value::Float(x.into()));
+            as_f64(&walker.run_main(&scope, args).expect("tree-walker run_main"))
+        };
+        assert_eq!(
+            llvm.to_bits(),
+            oracle.to_bits(),
+            "x + 1 (Int promotion) diverged for x={x}: \
+             llvm_bits={:#018x} ({llvm}) oracle_bits={:#018x} ({oracle})",
+            llvm.to_bits(),
+            oracle.to_bits(),
+        );
+        // Closed-form check: x + 1.0.
+        assert_eq!(llvm.to_bits(), (x + 1.0_f64).to_bits());
+    }
 }

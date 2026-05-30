@@ -527,6 +527,9 @@ impl OpVisitor for ConstPool {
     fn visit_bit_and(&mut self, _: IrType) -> Result<(), CraneliftError> {
         Ok(())
     }
+    fn visit_convert_i64_to_f64(&mut self) -> Result<(), CraneliftError> {
+        Ok(())
+    }
     fn visit_eq(&mut self, _: IrType) -> Result<(), CraneliftError> {
         Ok(())
     }

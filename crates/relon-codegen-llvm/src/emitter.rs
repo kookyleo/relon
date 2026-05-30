@@ -2185,6 +2185,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             Op::Div(ty) => self.emit_binop(&ip_hint, *ty, BinOp::Div)?,
             Op::Mod(ty) => self.emit_binop(&ip_hint, *ty, BinOp::Mod)?,
             Op::BitAnd(ty) => self.emit_binop(&ip_hint, *ty, BinOp::BitAnd)?,
+            Op::ConvertI64ToF64 => self.emit_convert_i64_to_f64(&ip_hint)?,
 
             // ---- comparisons ----
             Op::Eq(ty) => self.emit_cmp(&ip_hint, *ty, IntPredicate::EQ)?,
@@ -2874,6 +2875,34 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         }
         .map_err(|e| LlvmError::Codegen(format!("{} build failed: {e}", op.name())))?;
         self.push(r, ty);
+        Ok(())
+    }
+
+    /// #359: lower `Op::ConvertI64ToF64` — signed-int → float promotion.
+    /// The operand-stack `I64` value is a *real* integer (not f64 bits),
+    /// so we `sitofp` it to `double` and then bit-cast the `double` back
+    /// to i64 bits, pushing the result tagged `F64` to match the
+    /// AOT-1 "f64 rides as i64 bits" convention every later F64 op
+    /// (`emit_binop_f64`, `StoreField(F64)`) expects.
+    ///
+    /// This statically reproduces the tree-walker's
+    /// `NumericValue::as_f64()` Int promotion (`value as f64`): LLVM
+    /// `sitofp i64 -> double` is the same round-to-nearest-even widening
+    /// Rust's `i64 as f64` performs, so the resulting `f64::to_bits()`
+    /// matches the oracle bit-for-bit.
+    fn emit_convert_i64_to_f64(&mut self, ip_hint: &str) -> Result<(), LlvmError> {
+        let v = self.pop_int(ip_hint)?;
+        let f64_t = self.ctx.f64_type();
+        let f = self
+            .builder
+            .build_signed_int_to_float(v, f64_t, &self.next_name("sitofp"))
+            .map_err(|e| LlvmError::Codegen(format!("ConvertI64ToF64 sitofp: {e}")))?;
+        let bits = self
+            .builder
+            .build_bit_cast(f, self.ctx.i64_type(), &self.next_name("sitofp_bits"))
+            .map_err(|e| LlvmError::Codegen(format!("ConvertI64ToF64 result bitcast: {e}")))?
+            .into_int_value();
+        self.push(bits, IrType::F64);
         Ok(())
     }
 

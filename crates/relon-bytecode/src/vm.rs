@@ -1546,6 +1546,14 @@ impl BytecodeVm {
                 let lhs = f64::from_bits(pop(stack, bc_idx)?);
                 stack.push((lhs % rhs).to_bits());
             }
+            BcOp::ConvertI64ToF64 => {
+                // #359: signed-int → float promotion. Read the i64 lane,
+                // widen with `as f64` (matches the tree-walker's
+                // `NumericValue::as_f64()`), and push through the f64
+                // lane via `to_bits`.
+                let v = pop(stack, bc_idx)? as i64;
+                stack.push((v as f64).to_bits());
+            }
             BcOp::EqI64 => {
                 let rhs = pop(stack, bc_idx)? as i64;
                 let lhs = pop(stack, bc_idx)? as i64;

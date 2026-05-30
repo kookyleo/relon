@@ -1438,6 +1438,14 @@ impl<'a> EmitState<'a> {
             Op::Div(IrType::I64) => self.insns.push(I::I64DivS),
             Op::Mod(IrType::I64) => self.insns.push(I::I64RemS),
 
+            // #359: signed-int → float promotion (`sitofp`). The wasm
+            // backend still rejects the surrounding F64 arithmetic as a
+            // scope-cut (see the Float-arith arm below), so this is not
+            // reached by a real Relon program today; the op is wired for
+            // parity with the AOT/cranelift backends and surfaces the
+            // native `f64.convert_i64_s` when the Float scope-cut lifts.
+            Op::ConvertI64ToF64 => self.insns.push(I::F64ConvertI64S),
+
             // ----- Comparisons (i64 -> i32 bool) --------------------
             Op::Eq(IrType::I64) => self.insns.push(I::I64Eq),
             Op::Ne(IrType::I64) => self.insns.push(I::I64Ne),

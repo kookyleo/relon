@@ -225,6 +225,10 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         }
     }
 
+    fn visit_convert_i64_to_f64(&mut self) -> Result<(), CraneliftError> {
+        self.emit_convert_i64_to_f64()
+    }
+
     // Comparison.
     fn visit_eq(&mut self, ty: IrType) -> Result<(), CraneliftError> {
         match ty {

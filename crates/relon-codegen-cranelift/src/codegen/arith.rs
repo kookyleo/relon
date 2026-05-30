@@ -15,7 +15,7 @@
 //! state.
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::types::{I32, I64};
+use cranelift_codegen::ir::types::{F64, I32, I64};
 use cranelift_codegen::ir::InstBuilder;
 
 use crate::error::CraneliftError;
@@ -240,6 +240,18 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
             self.cond_trap(cmp, TrapKind::DivisionByZero);
         }
         let r = self.builder.ins().fdiv(a, b);
+        self.push(r);
+        Ok(())
+    }
+
+    /// `Op::ConvertI64ToF64` (#359) — pop one `I64` cranelift value and
+    /// push its `fcvt_from_sint` (`sitofp`) widening as a native `F64`.
+    /// Mirrors the tree-walker's `NumericValue::as_f64()` Int promotion
+    /// (`value as f64`), feeding the mixed-type `fadd` / `fsub` / `fmul`
+    /// / `fdiv` arms that lowering emits as `F64`.
+    pub(super) fn emit_convert_i64_to_f64(&mut self) -> Result<(), CraneliftError> {
+        let a = self.pop()?;
+        let r = self.builder.ins().fcvt_from_sint(F64, a);
         self.push(r);
         Ok(())
     }

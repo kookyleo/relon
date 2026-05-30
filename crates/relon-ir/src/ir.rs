@@ -528,6 +528,22 @@ pub enum Op {
     /// short-circuits); stdlib bodies use it for power-of-two
     /// alignment masks (e.g. `(x + 7) & -8` to round up to 8).
     BitAnd(IrType),
+    /// #359: signed-int → float promotion. Pop one `I64`-typed value,
+    /// push its `F64`-typed `sitofp` widening. Stack: `[I64] -> [F64]`.
+    ///
+    /// Reproduces the tree-walker's `NumericValue::as_f64()` Int→Float
+    /// promotion (`value as f64`) statically: when a mixed `Int`/`Float`
+    /// `Add` / `Sub` / `Mul` / `Div` reaches lowering, the `I64` operand
+    /// is promoted with this op *before* the binop, which then lowers as
+    /// `F64`. The result type tag is `F64`.
+    ///
+    /// Backend lowering: cranelift `fcvt_from_sint`, wasm `f64.convert_i64_s`,
+    /// LLVM `sitofp` then bitcast to i64-bits (the AOT/cranelift/wasm
+    /// f64-rides-on-i64-bits convention), bytecode `(x as i64 as f64).to_bits()`.
+    /// `f64` mod stays rejected at lowering (the tree-walker has no Int↔Float
+    /// `%` in the targeted programs), so this op only feeds the four
+    /// promoting binops.
+    ConvertI64ToF64,
     /// Pop two operands of the tagged type, push the boolean result.
     /// Stack: `[T, T] -> [Bool]`. Lowers to `i64.eq` / `f64.eq` /
     /// `i32.eq` depending on `T`'s wasm slot. `Null == Null` always
@@ -1539,6 +1555,7 @@ impl Op {
             | Op::Div(_)
             | Op::Mod(_)
             | Op::BitAnd(_)
+            | Op::ConvertI64ToF64
             | Op::Eq(_)
             | Op::Ne(_)
             | Op::Lt(_)
