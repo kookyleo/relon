@@ -1417,12 +1417,18 @@ impl AotEvaluator {
         let in_ptr = align_up(const_data_len, 8);
         let out_ptr = align_up(in_ptr + in_len, 8);
         // Reserve a scratch region past the output buffer for the
-        // memory stdlib (`concat` / `substring` / …) to bump-allocate
-        // temporary records. 64 KiB matches the wasm side's typical
-        // growth before it has to grow `memory`. The size is fixed
-        // for now; later v5-γ work can pool / size it from the source
-        // when stdlib usage gets bigger.
-        let scratch_size: u32 = 65_536;
+        // memory stdlib (`concat` / `substring` / …) and list
+        // materialization (`range().map()` / `_list_filter`) to
+        // bump-allocate temporary records. The cursor never resets
+        // within a dispatch, so a recursive list-materializing kernel
+        // (W16 quicksort partitions O(n log n) sublists across its
+        // recursion) needs worst-case headroom. 1 MiB matches the LLVM
+        // AOT backend's figure (evaluator.rs scratch_size) so both
+        // backends compile the same materialize-heavy workloads at the
+        // bench's N (W16_N = 1000); 64 KiB previously trapped past
+        // ~n=256. The size is fixed for now; later work can pool /
+        // size it from the source when usage gets bigger.
+        let scratch_size: u32 = 1_048_576; // 1 MiB
         let scratch_base = align_up(out_ptr + out_cap, 8);
         let arena_size = scratch_base
             .checked_add(scratch_size)

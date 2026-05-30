@@ -144,17 +144,17 @@ fn list_materialize_sum_matches_oracle() {
 /// slot (mirroring the LLVM backend) instead of failing with
 /// `LetGet read before LetSet`.
 ///
-/// Both the tree-walker oracle and the AOT runtime recurse to depth
-/// `O(n)` here (partition recursion over `range(n)`), so the comparison
-/// runs on a wide-stack thread; the default 2 MiB test-thread stack
-/// overflows the *oracle* well before the AOT does. The runtime `n` is
-/// capped at 200: the AOT scratch arena is a fixed 64 KiB (see
-/// `evaluator.rs` `scratch_size`), and the O(n) partition sublists this
-/// workload materialises exhaust it around n=256 (a graceful
-/// `WasmIndexOutOfBounds` capacity trap, not a miscompile and not
-/// specific to the self-capture fix — the same bound governs every
-/// list-materialising AOT workload). Within the arena budget the AOT
-/// output is bit-identical to the oracle.
+/// Both the tree-walker oracle and the AOT runtime recurse here
+/// (partition recursion over `range(n)`), so the comparison runs on a
+/// wide-stack thread; the default 2 MiB test-thread stack overflows the
+/// *oracle* well before the AOT does. The runtime `n` now reaches 1000
+/// — the bench's `W16_N` — because the cranelift scratch arena was
+/// raised to 1 MiB to match the LLVM AOT backend (see `evaluator.rs`
+/// `scratch_size`); at 64 KiB the O(n log n) partition sublists this
+/// workload materialises trapped around n=256 (a graceful
+/// `WasmIndexOutOfBounds`, never a miscompile). The AOT output is
+/// bit-identical to the oracle across the whole range, so cranelift now
+/// produces a real `relon_aot` W16 panel row at the bench `N`.
 #[test]
 fn w16_full_matches_oracle_via_self_recursive_closure() {
     let src = w16_relon_src();
@@ -166,7 +166,9 @@ fn w16_full_matches_oracle_via_self_recursive_closure() {
         .stack_size(512 * 1024 * 1024)
         .spawn(|| {
             let src = w16_relon_src();
-            for n in [0_i64, 1, 2, 5, 17, 64, 128, 200] {
+            // Up to and including the bench N (1000): proves the 1 MiB
+            // arena clears the materialize-heavy quicksort at panel scale.
+            for n in [0_i64, 1, 2, 5, 17, 64, 128, 200, 512, 1000] {
                 let want = oracle(src, n);
                 let got = aot_run(src, n);
                 assert_eq!(got, want, "full W16 oracle mismatch at n={n}");
