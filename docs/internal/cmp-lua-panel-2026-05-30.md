@@ -22,8 +22,10 @@
 > a codegen deficiency. Real wins landed honestly: AOT-3/AOT-4 envelope (all 5 kernels
 > compile through LLVM AOT), devirtualization (W16), dead-list fusion (W18 `_len(_list_filter)`),
 > and the host-target-cpu fix (W17/W18/W19 → parity). No paper-wins, baseline untouched,
-> every result oracle-verified + s90-measured. The tables below are the pre-host-cpu-fix
-> snapshot kept for the audit trail; the scorecard above is current.
+> every result oracle-verified + s90-measured. This scorecard is authoritative. Below: the
+> full 28-row table's `llvm_aot` columns (footnote ⁵) and the "rivals-Rust" scorecard were
+> refreshed to the host-cpu binary and are current; the "Headline" table and "Goal status"
+> prose are the PRE-host-cpu-fix interim, kept as an audit trail and marked as such.
 
 Supersedes `cmp-lua-panel-2026-05-29.md` for the numeric-kernel (W7/W16/W17/W18/W19)
 LLVM AOT rows. The 23 non-numeric-kernel rows are unchanged from the 05-29 snapshot
@@ -34,7 +36,7 @@ Host: s90-bench (192.168.213.90) · taskset -c 2 · quiescent load=0.00 · crite
 Binary md5: `9738c99a57eb4f324d76f0c2aed68a8d`
 Commit: `512bce6d` (W7/W16/W17/W18/W19 llvm_aot rows wired; AOT-3 + AOT-4 + MCJIT MAP_32BIT landed)
 
-## Headline: the 5 Int numeric kernels with valid non-fold Rust baselines
+## Headline (⚠️ PRE-HOST-CPU-FIX INTERIM — historical; current numbers in the FINAL scorecard at top): the 5 Int numeric kernels with valid non-fold Rust baselines
 
 Before this work the panel had **zero** real numeric-kernel AOT rows — W16-W20
 `llvm_aot_source_for` all returned `None` (the production sources used recursion /
@@ -67,7 +69,7 @@ workloads (W1/W2/W4/W6/W14/W15), the "a real compiled tier beats LuaJIT" claim n
 broadly across the panel — not via the trace-JIT (whose `relon_jit` rows remain
 tree-walker fallthrough; see below), but via the genuine wasm + LLVM AOT compiled tiers.
 
-### AOT 比肩 Rust — substantially MET (3/5 at ≤1.2×; one list-filter outlier at 2.24×)
+### AOT 比肩 Rust — ⚠️ PRE-HOST-CPU-FIX INTERIM (historical — see FINAL scorecard at top: all 6 kernels at parity/beating Rust)
 - **Parity / near-parity (≤1.2×):** W7 1.00×, W16 1.045×, W19 1.20× — recursion,
   quicksort with list materialization, and 2D matmul are all within 20 % of hand-written
   Rust. List materialization itself is Rust-competitive (W16 at 1.045×).
