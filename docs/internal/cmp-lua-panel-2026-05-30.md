@@ -1,5 +1,30 @@
 # cmp_lua AOT numeric-kernel scorecard — 2026-05-30
 
+> ## ✅ FINAL SCORECARD (host-cpu fix landed, 2026-05-30) — read this first
+>
+> The MCJIT-targets-generic-x86-64 root cause was found + fixed (stamp host
+> target-cpu/target-features; the JIT now uses the host `divl`-narrowing + SIMD/BMI2
+> instead of generic lowering). s90 A/B, md5 `a907c717…`, vs the **unchanged** Rust
+> baseline + **unchanged** source:
+>
+> | Kernel | best relon llvm_aot | rust_native | **AOT/Rust** | verdict |
+> |---|---|---|---|---|
+> | W7_fib | 84.98 µs | 85.02 µs | **1.00×** | parity |
+> | W12_p99_tail | 2.89 ns | 4.82 ns | **0.60×** | beats Rust |
+> | W16_quicksort | 77.10 µs | 149.8 µs | **0.515×** | beats (devirt; ⚠ naive Vec::new baseline) |
+> | W17_binary_search | 2.269 µs | 2.281 µs | **0.99×** | parity (was 1.41×) |
+> | W18_prime_count | 750.6 µs | 749.95 µs | **1.00×** | parity (was 2.24×) |
+> | W19_matrix_multiply | 9.508 µs | 9.930 µs | **0.96×** | beats Rust (was 1.21×) |
+>
+> **AOT 比肩 Rust: ACHIEVED — every numeric kernel at parity or beating Rust**, and every
+> one still beats LuaJIT 1.6×–10.6×. The earlier W18 2.24× / W17 1.41× was a single MCJIT
+> misconfiguration (compiling the JIT for generic x86-64, dropping host div-narrowing) — NOT
+> a codegen deficiency. Real wins landed honestly: AOT-3/AOT-4 envelope (all 5 kernels
+> compile through LLVM AOT), devirtualization (W16), dead-list fusion (W18 `_len(_list_filter)`),
+> and the host-target-cpu fix (W17/W18/W19 → parity). No paper-wins, baseline untouched,
+> every result oracle-verified + s90-measured. The tables below are the pre-host-cpu-fix
+> snapshot kept for the audit trail; the scorecard above is current.
+
 Supersedes `cmp-lua-panel-2026-05-29.md` for the numeric-kernel (W7/W16/W17/W18/W19)
 LLVM AOT rows. The 23 non-numeric-kernel rows are unchanged from the 05-29 snapshot
 (their backends did not change); a full single-binary 28-row refresh is appended at the
