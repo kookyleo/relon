@@ -636,7 +636,7 @@ fn declare_helper_function<'ctx>(
 ) -> Result<FunctionValue<'ctx>, LlvmError> {
     let mut param_types: Vec<BasicMetadataTypeEnum<'ctx>> = Vec::with_capacity(func.params.len());
     for (i, p) in func.params.iter().enumerate() {
-        let bt = ir_ty_to_llvm_basic(ctx, *p).ok_or_else(|| {
+        let bt = ir_ty_to_llvm_abi(ctx, *p).ok_or_else(|| {
             LlvmError::UnsupportedSignature(format!(
                 "llvm-aot: helper `{}` param #{i} type {p:?} unsupported",
                 func.name
@@ -644,7 +644,7 @@ fn declare_helper_function<'ctx>(
         })?;
         param_types.push(basic_to_metadata(bt));
     }
-    let ret_bt = ir_ty_to_llvm_basic(ctx, func.ret).ok_or_else(|| {
+    let ret_bt = ir_ty_to_llvm_abi(ctx, func.ret).ok_or_else(|| {
         LlvmError::UnsupportedSignature(format!(
             "llvm-aot: helper `{}` return type {:?} unsupported",
             func.name, func.ret
@@ -694,7 +694,7 @@ fn declare_lambda_function<'ctx>(
         Vec::with_capacity(1 + func.params.len());
     param_types.push(ptr_t.into());
     for (i, p) in func.params.iter().enumerate() {
-        let bt = ir_ty_to_llvm_basic(ctx, *p).ok_or_else(|| {
+        let bt = ir_ty_to_llvm_abi(ctx, *p).ok_or_else(|| {
             LlvmError::UnsupportedSignature(format!(
                 "llvm-aot: lambda `{}` param #{i} type {p:?} unsupported",
                 func.name
@@ -702,7 +702,7 @@ fn declare_lambda_function<'ctx>(
         })?;
         param_types.push(basic_to_metadata(bt));
     }
-    let ret_bt = ir_ty_to_llvm_basic(ctx, func.ret).ok_or_else(|| {
+    let ret_bt = ir_ty_to_llvm_abi(ctx, func.ret).ok_or_else(|| {
         LlvmError::UnsupportedSignature(format!(
             "llvm-aot: lambda `{}` return type {:?} unsupported",
             func.name, func.ret
@@ -742,14 +742,21 @@ fn declare_llvm_trap<'ctx>(ctx: &'ctx Context, module: &LlvmModule<'ctx>) -> Fun
     module.add_function("llvm.trap", fn_ty, None)
 }
 
-fn ir_ty_to_llvm_basic<'ctx>(ctx: &'ctx Context, ty: IrType) -> Option<BasicTypeEnum<'ctx>> {
+/// #359 (W20): map an [`IrType`] to the LLVM type used in a helper /
+/// lambda **call ABI** slot. This mirrors the operand-stack
+/// convention where `F64` rides as its 64-bit *bit pattern* in an i64
+/// register: `F64` maps to `i64`, not `double`. Keeping the ABI int-
+/// only means a `CallClosure` / `Op::Call` site never has to bitcast
+/// between the i64-bits stack representation and a native-float
+/// argument / return slot — the value flows through verbatim. The
+/// W20 n-body helpers (`pair_force` / `accel` return `F64`,
+/// `pair_force` takes an `F64` mass) are the first closures with a
+/// Float in their signature; without this they'd declare a `double`
+/// slot that the i64-bits operand stack cannot feed.
+fn ir_ty_to_llvm_abi<'ctx>(ctx: &'ctx Context, ty: IrType) -> Option<BasicTypeEnum<'ctx>> {
     match ty {
-        IrType::I64 => Some(ctx.i64_type().into()),
+        IrType::I64 | IrType::F64 => Some(ctx.i64_type().into()),
         IrType::I32 | IrType::Bool | IrType::Null => Some(ctx.i32_type().into()),
-        IrType::F64 => Some(ctx.f64_type().into()),
-        // Pointer-indirect leaves carry an i32 buffer-relative offset
-        // (matches the cranelift `ir_ty_to_cl` widening). The IR-side
-        // tag is preserved; the LLVM slot is plain i32.
         IrType::String
         | IrType::ListInt
         | IrType::ListFloat
@@ -775,7 +782,7 @@ fn basic_to_metadata(bt: BasicTypeEnum<'_>) -> BasicMetadataTypeEnum<'_> {
 /// Lower a sibling helper's body against its declared LLVM
 /// `FunctionValue`. Mirrors [`emit_legacy_entry`] but without enforcing
 /// the legacy-i64 envelope — helpers may carry any
-/// [`IrType`]-shaped param / return mix that `ir_ty_to_llvm_basic`
+/// [`IrType`]-shaped param / return mix that `ir_ty_to_llvm_abi`
 /// accepts.
 fn emit_helper_body<'ctx>(
     ctx: &'ctx Context,
@@ -2523,8 +2530,12 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         // ret slot when the two widths disagree.
         if let Some(ret_ty) = self.helper_ret_ty {
             let v = self.pop_int(ip_hint)?;
+            // #359 (W20): `F64` joins `I64` on the 64-bit return slot —
+            // it rides as its bit pattern in an i64 register (see
+            // `ir_ty_to_llvm_abi`), so the helper / lambda LLVM ret type
+            // is `i64` and the popped operand is already the f64 bits.
             let want_width = match ret_ty {
-                IrType::I64 => 64,
+                IrType::I64 | IrType::F64 => 64,
                 IrType::I32
                 | IrType::Bool
                 | IrType::Null
@@ -2535,11 +2546,6 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 | IrType::ListString
                 | IrType::ListSchema
                 | IrType::Closure => 32,
-                IrType::F64 => {
-                    return Err(LlvmError::Codegen(
-                        "helper Return: F64 not yet supported in Phase E.2".into(),
-                    ));
-                }
             };
             let have_width = v.get_type().get_bit_width();
             let final_v = if have_width == want_width {

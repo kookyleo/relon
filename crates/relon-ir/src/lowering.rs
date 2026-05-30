@@ -1679,6 +1679,34 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
                     range,
                 });
             }
+            // #359 (W20): a list literal with at least one *computed*
+            // element (the per-step `step(s)` body `[s[0] + s[4]*dt, ..]`)
+            // cannot be interned as a `ConstList*` — materialise it into a
+            // scratch arena and leave a runtime list handle. The element
+            // shape (Float vs Int) is determined by speculatively lowering
+            // the first element and inspecting its IR type (rolled back so
+            // the real materialiser re-lowers from a clean state). W20's
+            // computed list is `List<Float>`; the Int path is supported
+            // symmetrically for completeness. An all-literal list still
+            // flows through the `ConstList*` arm below (consumed by the
+            // wasm / bytecode / cranelift const-pool path); only the
+            // previously-rejected computed shape is diverted here, so no
+            // other backend's behaviour changes.
+            if list_has_computed_element(items) {
+                let elem_ty = probe_expr_ir_ty(&items[0], ctx)?;
+                match elem_ty {
+                    IrType::F64 => return emit_list_float_literal_materialize(items, range, ctx),
+                    other => {
+                        return Err(LoweringError::UnsupportedExpr {
+                            kind: format!(
+                                "List(computed element of type {other:?} — only Float computed \
+                                 list literals are materialised in the AOT envelope)"
+                            ),
+                            range,
+                        })
+                    }
+                }
+            }
             // Detect the shape from the first element.
             let kind = match &*items[0].expr {
                 Expr::Int(_) => ConstListKind::Int,
@@ -4388,6 +4416,28 @@ fn lower_list_int_index(
     range: TokenRange,
     ctx: &mut LowerCtx<'_>,
 ) -> Result<(), LoweringError> {
+    lower_list_index_typed(index_node, IrType::ListInt, range, ctx)
+}
+
+/// #359 (W20): generalised 1D list index — the `List<Int>` body
+/// (`elem_ty = I64`, `LoadI64AtAbsolute`) and the `List<Float>` body
+/// (`elem_ty = F64`, `LoadF64AtAbsolute`) share the identical record
+/// layout (`[len:u32][pad:u32][8-byte elements...]`, payload at
+/// `(base + 11) & -8`, element `i` at `payload + i*8`) — only the
+/// element-load op and the pushed element type differ. Pops the
+/// receiver list handle (tagged `recv_ty`), pushes the element scalar
+/// (`I64` for `ListInt`, `F64` for `ListFloat`).
+fn lower_list_index_typed(
+    index_node: &Node,
+    recv_ty: IrType,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    debug_assert!(matches!(recv_ty, IrType::ListInt | IrType::ListFloat));
+    let (elem_ty, load_op) = match recv_ty {
+        IrType::ListFloat => (IrType::F64, Op::LoadF64AtAbsolute { offset: 0 }),
+        _ => (IrType::I64, Op::LoadI64AtAbsolute { offset: 0 }),
+    };
     // Reserve let slots: `base` (i32 handle) + `idx` (i32 element
     // index). Each slot is single-typed for its lifetime so the LLVM
     // emitter's `ensure_let_slot` aliasing guard stays happy.
@@ -4395,12 +4445,12 @@ fn lower_list_int_index(
     let idx_i = ctx.next_let_idx + 1;
     ctx.next_let_idx += 2;
 
-    // Stash the receiver handle (already on the vstack as ListInt).
+    // Stash the receiver handle (already on the vstack as the list ty).
     let top = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
         kind: "Variable(list-index-empty-stack)".to_string(),
         range,
     })?;
-    debug_assert_eq!(top, IrType::ListInt);
+    debug_assert_eq!(top, recv_ty);
     ctx.out.push(TaggedOp {
         op: Op::LetSet {
             idx: base_i,
@@ -4486,13 +4536,10 @@ fn lower_list_int_index(
     ctx.tstack.pop();
     ctx.tstack.push(IrType::I32);
 
-    // push i64.load(addr)
-    ctx.out.push(TaggedOp {
-        op: Op::LoadI64AtAbsolute { offset: 0 },
-        range,
-    });
+    // push <i64|f64>.load(addr)
+    ctx.out.push(TaggedOp { op: load_op, range });
     ctx.tstack.pop(); // i32 addr
-    ctx.tstack.push(IrType::I64);
+    ctx.tstack.push(elem_ty);
     Ok(())
 }
 
@@ -4540,6 +4587,273 @@ fn match_bare_range(expr: &Expr) -> Option<&[relon_parser::CallArg]> {
 /// } }
 /// push base                                ; ListInt handle
 /// ```
+/// #359 (W20): materialise a `List<Float>` literal `[e0, e1, .., eN]`
+/// (each `ei` a Float-valued expression) into a fresh scratch arena
+/// record and leave its arena-relative handle on the vstack tagged
+/// `IrType::ListFloat`. The record layout is byte-identical to the
+/// `List<Int>` materialiser (`[len: u32 LE][pad: u32][8-byte
+/// elements...]`, payload at `(base + 4 + 7) & -8`) so the shared 1D
+/// index path (`lower_list_index_typed`) reads it unchanged — only the
+/// element store is an `f64` (the value's bit pattern) rather than an
+/// `i64`.
+///
+/// The element count is a compile-time constant (the literal's
+/// length), so the stores are unrolled — no fill loop. This handles
+/// both the W20 `init` 8-element literal and the per-step `step(s)`
+/// body literal (whose elements are computed Float arithmetic over the
+/// previous state's indexed reads). Each element expression is lowered
+/// against the live ctx so a closure body's `s[k]` reads + `dt` / mass
+/// captures resolve through the normal walker.
+fn emit_list_float_literal_materialize(
+    items: &[Node],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    let count = i32::try_from(items.len()).map_err(|_| LoweringError::UnsupportedExpr {
+        kind: "List<Float>(literal too long for i32 count)".to_string(),
+        range,
+    })?;
+    let base_i = ctx.next_let_idx;
+    let payload_i = ctx.next_let_idx + 1;
+    ctx.next_let_idx += 2;
+
+    // record_size = 8 + 8*count (constant). base = AllocScratchDyn(size).
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(8 + 8 * count),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::AllocScratchDyn,
+        range,
+    });
+    // AllocScratchDyn: [i32 size] -> [i32 base]; tstack stays I32.
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: base_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // header: i32.store(base, count)
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: base_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(count),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::StoreI32AtAbsolute { offset: 0 },
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+
+    // payload = (base + 4 + 7) & -8
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: base_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(4 + 7),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I32),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(-8),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::BitAnd(IrType::I32),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: payload_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // Unrolled element stores. For element `i`:
+    //   addr = payload + i*8   (i32)
+    //   value = <lowered ei>   (F64 bits, an i64 on the operand stack)
+    //   f64.store(addr, value)
+    // Stack discipline for StoreF64AtAbsolute mirrors the i64 store:
+    // [addr(i32), value(F64)].
+    for (i, item) in items.iter().enumerate() {
+        // addr = payload + i*8
+        ctx.out.push(TaggedOp {
+            op: Op::LetGet {
+                idx: payload_i,
+                ty: IrType::I32,
+            },
+            range,
+        });
+        ctx.tstack.push(IrType::I32);
+        let byte_off = i32::try_from(i * 8).map_err(|_| LoweringError::UnsupportedExpr {
+            kind: "List<Float>(element offset overflow)".to_string(),
+            range,
+        })?;
+        ctx.out.push(TaggedOp {
+            op: Op::ConstI32(byte_off),
+            range,
+        });
+        ctx.tstack.push(IrType::I32);
+        ctx.out.push(TaggedOp {
+            op: Op::Add(IrType::I32),
+            range,
+        });
+        ctx.tstack.pop();
+        ctx.tstack.pop();
+        ctx.tstack.push(IrType::I32);
+
+        // value = lowered element; coerce Int literals to F64 (mirrors
+        // the runtime Int->Float promotion + the const-list arm's
+        // `[1, 2.0]` widening).
+        lower_expr(&item.expr, item.range, ctx)?;
+        let elem_ty = ctx
+            .tstack
+            .last()
+            .copied()
+            .ok_or_else(|| LoweringError::UnsupportedExpr {
+                kind: "List<Float>(element produced no value)".to_string(),
+                range: item.range,
+            })?;
+        match elem_ty {
+            IrType::F64 => {}
+            IrType::I64 => {
+                ctx.out.push(TaggedOp {
+                    op: Op::ConvertI64ToF64,
+                    range: item.range,
+                });
+                ctx.tstack.pop();
+                ctx.tstack.push(IrType::F64);
+            }
+            other => {
+                return Err(LoweringError::UnsupportedExpr {
+                    kind: format!("List<Float>(element #{i} lowered to {other:?}, expected Float)"),
+                    range: item.range,
+                });
+            }
+        }
+        ctx.out.push(TaggedOp {
+            op: Op::StoreF64AtAbsolute { offset: 0 },
+            range,
+        });
+        ctx.tstack.pop(); // value (F64)
+        ctx.tstack.pop(); // addr (i32)
+    }
+
+    // Push the materialised list handle (base) tagged ListFloat.
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: base_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::ListFloat);
+    Ok(())
+}
+
+/// `true` when the list literal's elements are NOT all simple Float /
+/// Int literals — i.e. at least one element is a computed expression
+/// (the W20 `step(s)` body), so it must be materialised at runtime
+/// rather than interned as a `ConstListFloat`.
+fn list_has_computed_element(items: &[Node]) -> bool {
+    items
+        .iter()
+        .any(|n| !matches!(&*n.expr, Expr::Float(_) | Expr::Int(_)))
+}
+
+/// #359 (W20): speculatively lower `node` against the live ctx, read
+/// the IR type it leaves on top of the vstack, then roll back every
+/// side effect (emitted ops, vstack entries, let-table pushes, the let
+/// counter) so the caller can re-lower from a clean state. Used to
+/// classify a computed list literal's element shape before committing
+/// to the matching materialiser.
+fn probe_expr_ir_ty(node: &Node, ctx: &mut LowerCtx<'_>) -> Result<IrType, LoweringError> {
+    let out_len = ctx.out.len();
+    let tstack_len = ctx.tstack.len();
+    let lets_len = ctx.lets.len();
+    let next_let = ctx.next_let_idx;
+    lower_expr(&node.expr, node.range, ctx)?;
+    let ty = ctx
+        .tstack
+        .last()
+        .copied()
+        .ok_or_else(|| LoweringError::UnsupportedExpr {
+            kind: "List(computed element produced no value during type probe)".to_string(),
+            range: node.range,
+        })?;
+    // Roll back all side effects so the real materialiser re-lowers the
+    // element from scratch (no duplicate ops, no leaked let slots).
+    ctx.out.truncate(out_len);
+    ctx.tstack.truncate(tstack_len);
+    ctx.lets.truncate(lets_len);
+    ctx.next_let_idx = next_let;
+    Ok(ty)
+}
+
+/// `true` when the list literal is Float-shaped: at least one element
+/// is a Float literal, or (for an all-computed list) the first element
+/// is a Float-producing expression shape. Conservative — only used to
+/// route a *computed* list literal to the Float materialiser; an
+/// all-Int-literal list still flows through the `ConstListInt` arm.
+fn list_is_float_shaped(items: &[Node]) -> bool {
+    items.iter().any(|n| matches!(&*n.expr, Expr::Float(_)))
+        || items
+            .first()
+            .is_some_and(|n| expr_looks_float_valued(&n.expr))
+}
+
+/// Structural "does this expression look Float-valued?" check for the
+/// computed-list-literal router. Recognises Float literals, Float
+/// arithmetic, and ternaries with a Float arm. Used only to disambiguate
+/// a computed list's element shape (`step(s)`'s `s[k] + s[k]*dt` is
+/// Float); it never has to be exhaustive — a wrong guess simply falls
+/// through to the existing diagnostic.
+fn expr_looks_float_valued(expr: &Expr) -> bool {
+    match expr {
+        Expr::Float(_) => true,
+        Expr::Binary(op, l, r) => {
+            !operator_yields_bool(*op)
+                && (expr_looks_float_valued(&l.expr) || expr_looks_float_valued(&r.expr))
+        }
+        Expr::Unary(_, n) => expr_looks_float_valued(&n.expr),
+        Expr::Ternary { then, els, .. } => {
+            expr_looks_float_valued(&then.expr) || expr_looks_float_valued(&els.expr)
+        }
+        _ => false,
+    }
+}
+
 fn emit_range_materialize(
     range_args: &[relon_parser::CallArg],
     range: TokenRange,
@@ -6535,6 +6849,270 @@ fn infer_closure_body_ret_ty(expr: &Expr) -> IrType {
     }
 }
 
+/// #359 (W20): ctx-aware closure body return-type inference. Extends
+/// [`infer_closure_body_ret_ty`] (Bool / Int) to also resolve `F64`
+/// and `ListFloat`:
+///
+///   * a `[...]` list literal whose first element is Float-valued
+///     (a Float literal, a list-typed param index, or Float arith)
+///     -> `ListFloat` (W20 `step` returns an 8-element `List<Float>`);
+///   * a Float literal / Float-typed where-binding / index into a
+///     `ListFloat` param / a call into a sibling closure that returns
+///     `F64` / arithmetic over any of those -> `F64` (W20 `pair_force`
+///     and `accel`);
+///   * everything else falls back to the structural Bool / Int walk.
+///
+/// `param_irts` / `params` describe THIS closure's own params (so an
+/// indexed `s[k]` on a `ListFloat` param resolves to a Float element);
+/// `ctx` supplies sibling closure signatures + outer where-bound let
+/// types.
+fn infer_closure_body_ret_ty_ctx(
+    expr: &Expr,
+    param_irts: &[IrType],
+    params: &[ClosureParam],
+    ctx: &LowerCtx<'_>,
+) -> IrType {
+    // List literal -> ListInt / ListFloat based on the first element.
+    if let Expr::List(items) = expr {
+        if let Some(first) = items.first() {
+            return match infer_scalar_expr_ir_ty(&first.expr, param_irts, params, ctx) {
+                Some(IrType::F64) => IrType::ListFloat,
+                Some(IrType::I64) => IrType::ListInt,
+                _ => IrType::ListInt,
+            };
+        }
+        return IrType::ListInt;
+    }
+    // Scalar / Float resolution first (so a Float ternary like
+    // `i == j ? 0.0 : <float arith>` reports F64 rather than the
+    // structural Int default).
+    if let Some(t) = infer_scalar_expr_ir_ty(expr, param_irts, params, ctx) {
+        if t == IrType::F64 {
+            return IrType::F64;
+        }
+    }
+    // Fall back to the original structural Bool / Int walk.
+    infer_closure_body_ret_ty(expr)
+}
+
+/// #359 (W20): best-effort scalar IR-type inference for a closure body
+/// sub-expression, resolving `F64` vs `I64` (other shapes return
+/// `None`). Used by the ctx-aware return-type / list-literal inference.
+/// Conservative: only commits when the shape is unambiguous.
+fn infer_scalar_expr_ir_ty(
+    expr: &Expr,
+    param_irts: &[IrType],
+    params: &[ClosureParam],
+    ctx: &LowerCtx<'_>,
+) -> Option<IrType> {
+    match expr {
+        Expr::Float(_) => Some(IrType::F64),
+        Expr::Int(_) => Some(IrType::I64),
+        Expr::Variable(path) | Expr::Reference { path, .. } => {
+            // Bare name: a where-bound let or a sibling param.
+            if let [TokenKey::String(name, _, _)] = path.as_slice() {
+                if let Some(b) = ctx.lets.iter().rev().find(|b| &b.name == name) {
+                    return scalar_of(b.ty);
+                }
+                if let Some(pos) = params.iter().position(|p| &p.name == name) {
+                    return scalar_of(param_irts[pos]);
+                }
+                return None;
+            }
+            // `s[k]` index on a list-typed param -> element scalar type.
+            if path.len() == 2 {
+                if let (TokenKey::String(name, _, _), TokenKey::Dynamic(_, _)) =
+                    (&path[0], &path[1])
+                {
+                    if let Some(pos) = params.iter().position(|p| &p.name == name) {
+                        return match param_irts[pos] {
+                            IrType::ListFloat => Some(IrType::F64),
+                            IrType::ListInt => Some(IrType::I64),
+                            _ => None,
+                        };
+                    }
+                }
+            }
+            None
+        }
+        Expr::FnCall { path, .. } => {
+            // A call into a sibling where-bound closure adopts its
+            // declared return type.
+            if let [TokenKey::String(name, _, _)] = path.as_slice() {
+                if let Some(b) = ctx.lets.iter().rev().find(|b| &b.name == name) {
+                    if b.ty == IrType::Closure {
+                        if let Some((_, ret)) = ctx.closure_let_signatures.get(&b.idx) {
+                            return scalar_of(*ret);
+                        }
+                    }
+                }
+            }
+            None
+        }
+        Expr::Binary(op, l, r) => {
+            if operator_yields_bool(*op) {
+                return Some(IrType::Bool);
+            }
+            let lt = infer_scalar_expr_ir_ty(&l.expr, param_irts, params, ctx);
+            let rt = infer_scalar_expr_ir_ty(&r.expr, param_irts, params, ctx);
+            match (lt, rt) {
+                // Float dominates (mirrors the runtime Int->Float
+                // promotion the Part A `ConvertI64ToF64` op implements).
+                (Some(IrType::F64), _) | (_, Some(IrType::F64)) => Some(IrType::F64),
+                (Some(IrType::I64), Some(IrType::I64)) => Some(IrType::I64),
+                _ => None,
+            }
+        }
+        Expr::Ternary { then, els, .. } => {
+            let tt = infer_scalar_expr_ir_ty(&then.expr, param_irts, params, ctx);
+            let et = infer_scalar_expr_ir_ty(&els.expr, param_irts, params, ctx);
+            match (tt, et) {
+                (Some(IrType::F64), _) | (_, Some(IrType::F64)) => Some(IrType::F64),
+                (Some(IrType::I64), Some(IrType::I64)) => Some(IrType::I64),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Narrow an [`IrType`] to its scalar `F64` / `I64` form for the
+/// inference helpers; other shapes are `None` (not scalar-relevant).
+fn scalar_of(t: IrType) -> Option<IrType> {
+    match t {
+        IrType::F64 => Some(IrType::F64),
+        IrType::I64 => Some(IrType::I64),
+        _ => None,
+    }
+}
+
+/// #359 (W20): infer a closure param's IR type from how a sibling
+/// where-bound closure call uses it. When the body contains a call
+/// `f(.., name, ..)` where `f` is a previously-bound closure whose
+/// declared param at that position is a List* / scalar type, the
+/// param `name` adopts that type. Drives `accel(s, i)`'s `s` to
+/// `ListFloat` (it passes `s` as `pair_force`'s first arg without ever
+/// indexing it directly). Returns `None` when no such call pins it.
+fn infer_param_from_sibling_call(name: &str, body: &Expr, ctx: &LowerCtx<'_>) -> Option<IrType> {
+    fn walk(name: &str, expr: &Expr, ctx: &LowerCtx<'_>) -> Option<IrType> {
+        match expr {
+            Expr::FnCall { path, args } => {
+                if let [TokenKey::String(callee, _, _)] = path.as_slice() {
+                    if let Some(b) = ctx.lets.iter().rev().find(|b| &b.name == callee) {
+                        if b.ty == IrType::Closure {
+                            if let Some((param_tys, _)) = ctx.closure_let_signatures.get(&b.idx) {
+                                for (i, a) in args.iter().enumerate() {
+                                    if a.name.is_none() && expr_is_bare_named(&a.value.expr, name) {
+                                        if let Some(t) = param_tys.get(i) {
+                                            return Some(*t);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Recurse into args for nested calls.
+                args.iter().find_map(|a| walk(name, &a.value.expr, ctx))
+            }
+            Expr::Binary(_, l, r) => walk(name, &l.expr, ctx).or_else(|| walk(name, &r.expr, ctx)),
+            Expr::Unary(_, n) => walk(name, &n.expr, ctx),
+            Expr::Ternary { cond, then, els } => walk(name, &cond.expr, ctx)
+                .or_else(|| walk(name, &then.expr, ctx))
+                .or_else(|| walk(name, &els.expr, ctx)),
+            Expr::List(items) => items.iter().find_map(|n| walk(name, &n.expr, ctx)),
+            _ => None,
+        }
+    }
+    walk(name, body, ctx)
+}
+
+/// `true` when `expr` is the bare variable `name` (a single-segment
+/// `Variable([String(name)])`).
+fn expr_is_bare_named(expr: &Expr, name: &str) -> bool {
+    matches!(expr, Expr::Variable(path)
+        if path.len() == 1
+            && matches!(&path[0], TokenKey::String(s, _, _) if s == name))
+}
+
+/// #359 (W20): infer that a closure param named `name` is a
+/// `List<Float>` from how the body uses it: an index access
+/// `name[...]` whose result flows into Float arithmetic, OR the body
+/// otherwise pairs the index with a Float literal / Float where-
+/// binding. Conservative — only fires when the body contains a Float
+/// literal alongside an index on `name`, so a `List<Int>` param (whose
+/// body is pure-Int) is never mis-inferred. This runs only after
+/// [`infer_param_from_sibling_call`] declines, so the precise
+/// propagation always wins.
+fn closure_param_used_as_list_float(name: &str, expr: &Expr) -> bool {
+    closure_param_used_as_list_int(name, expr) && expr_contains_float_literal(expr)
+}
+
+/// #359 (W20): infer that a scalar closure param named `name` is a
+/// `Float` from its use as a bare operand in a Float-shaped arithmetic
+/// expression. Drives `pair_force`'s `mj` mass param (used in
+/// `(s[j] - s[i]) * mj * (1.0 / ..)`) to `F64`. Conservative: fires only
+/// when `name` appears as a direct (non-bool) Binary operand AND the
+/// closure body somewhere carries a Float literal — a pure-Int scalar
+/// param (e.g. `pair_force`'s `i` / `j` index args, which only appear
+/// inside `s[..]` brackets and `i == j` comparisons, never as a bare
+/// arithmetic operand) is never mis-tagged.
+fn closure_param_used_as_float(name: &str, body: &Expr) -> bool {
+    expr_contains_float_literal(body) && param_is_bare_arith_operand(name, body)
+}
+
+/// `true` when `name` appears as a direct operand of a non-bool Binary
+/// (or Unary) arithmetic op anywhere in `expr`.
+fn param_is_bare_arith_operand(name: &str, expr: &Expr) -> bool {
+    match expr {
+        Expr::Binary(op, l, r) => {
+            if !operator_yields_bool(*op)
+                && (expr_is_bare_named(&l.expr, name) || expr_is_bare_named(&r.expr, name))
+            {
+                return true;
+            }
+            param_is_bare_arith_operand(name, &l.expr) || param_is_bare_arith_operand(name, &r.expr)
+        }
+        Expr::Unary(op, n) => {
+            (!matches!(op, Operator::Not) && expr_is_bare_named(&n.expr, name))
+                || param_is_bare_arith_operand(name, &n.expr)
+        }
+        Expr::Ternary { cond, then, els } => {
+            param_is_bare_arith_operand(name, &cond.expr)
+                || param_is_bare_arith_operand(name, &then.expr)
+                || param_is_bare_arith_operand(name, &els.expr)
+        }
+        Expr::List(items) => items
+            .iter()
+            .any(|n| param_is_bare_arith_operand(name, &n.expr)),
+        Expr::FnCall { args, .. } => args
+            .iter()
+            .any(|a| param_is_bare_arith_operand(name, &a.value.expr)),
+        _ => false,
+    }
+}
+
+/// `true` when `expr` contains a Float literal anywhere in its tree.
+fn expr_contains_float_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Float(_) => true,
+        Expr::Binary(_, l, r) => {
+            expr_contains_float_literal(&l.expr) || expr_contains_float_literal(&r.expr)
+        }
+        Expr::Unary(_, n) => expr_contains_float_literal(&n.expr),
+        Expr::Ternary { cond, then, els } => {
+            expr_contains_float_literal(&cond.expr)
+                || expr_contains_float_literal(&then.expr)
+                || expr_contains_float_literal(&els.expr)
+        }
+        Expr::List(items) => items.iter().any(|n| expr_contains_float_literal(&n.expr)),
+        Expr::FnCall { args, .. } => args
+            .iter()
+            .any(|a| expr_contains_float_literal(&a.value.expr)),
+        _ => false,
+    }
+}
+
 /// AOT-4 (W16 slice): infer that a closure param named `name` is a
 /// `List<Int>` from how the body uses it. Returns `true` when the body
 /// contains an index access `name[...]`, a `_len(name)` / `len(name)`,
@@ -6697,8 +7275,29 @@ fn lower_where(
                     .and_then(type_node_to_canonical)
                     .and_then(|r| type_repr_to_ir_type(&r).ok());
                 let irt = annotated.unwrap_or_else(|| {
-                    if closure_param_used_as_list_int(&p.name, &closure_body.expr) {
+                    // #359 (W20): a param passed positionally into a
+                    // sibling where-bound closure adopts that closure's
+                    // declared param type (so `accel(s, i)`'s `s` picks up
+                    // `ListFloat` from `pair_force`'s first param even
+                    // though `accel` never indexes `s` directly). This
+                    // runs first because it is a precise propagation, not
+                    // a structural guess.
+                    if let Some(t) = infer_param_from_sibling_call(&p.name, &closure_body.expr, ctx)
+                    {
+                        t
+                    } else if closure_param_used_as_list_float(&p.name, &closure_body.expr) {
+                        // Indexed param whose element flows into Float
+                        // arithmetic (W20 `step` / `pair_force` read
+                        // `s[k]` then combine with `dt` / `soft` / a
+                        // mass) is a `List<Float>`.
+                        IrType::ListFloat
+                    } else if closure_param_used_as_list_int(&p.name, &closure_body.expr) {
                         IrType::ListInt
+                    } else if closure_param_used_as_float(&p.name, &closure_body.expr) {
+                        // Scalar param used as a bare operand in Float
+                        // arithmetic (W20 `pair_force`'s `mj` mass:
+                        // `(s[j] - s[i]) * mj * (1.0 / ..)`) is a `Float`.
+                        IrType::F64
                     } else {
                         IrType::I64
                     }
@@ -6713,11 +7312,19 @@ fn lower_where(
             // I64 default surfaces an `IfBranchTypeMismatch`. The
             // inference is a cheap structural walk (ternary branches /
             // comparison + logical ops -> Bool, otherwise Int).
+            //
+            // #359 (W20): the ctx-aware variant additionally resolves
+            // `F64` (Float literal / Float arith / a call into a sibling
+            // closure that returns `F64`) and `ListFloat` (a `[...]`
+            // list literal of Float-valued elements) — `pair_force` /
+            // `accel` return `F64`, `step` returns a `List<Float>`.
             let ret_ty = return_type
                 .as_ref()
                 .and_then(type_node_to_canonical)
                 .and_then(|r| type_repr_to_ir_type(&r).ok())
-                .unwrap_or_else(|| infer_closure_body_ret_ty(&closure_body.expr));
+                .unwrap_or_else(|| {
+                    infer_closure_body_ret_ty_ctx(&closure_body.expr, &param_irts, params, ctx)
+                });
 
             // Pre-allocate the let-idx the closure handle lands in and
             // register both the binding and its signature before the
@@ -6790,6 +7397,42 @@ fn lower_where(
                 schema_brand: None,
             });
             continue;
+        }
+        // #359 (W20): a where-binding whose value is a Float-shaped list
+        // literal (the n-body `init: [0.0, 1.0, ..]`) materialises into a
+        // scratch `List<Float>` arena record so a downstream consumer (the
+        // `range(n).reduce(init, ..)` accumulator) carries a runtime
+        // handle, and `init[k]` / `s[k]` index it as `f64`. The bare
+        // `Expr::List` arm would otherwise intern a `ConstListFloat` the
+        // LLVM AOT envelope cannot materialise; routing the where-bound
+        // literal through the scratch materialiser keeps the accumulator
+        // a live arena handle (only the LLVM AOT path reaches this — the
+        // tree-walker resolves `init` directly).
+        if let Expr::List(items) = &*value.expr {
+            if !items.is_empty() && list_is_float_shaped(items) {
+                emit_list_float_literal_materialize(items, value.range, ctx)?;
+                let value_ty = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
+                    kind: "Where(float-list-materialize-empty-stack)".to_string(),
+                    range: value.range,
+                })?;
+                debug_assert_eq!(value_ty, IrType::ListFloat);
+                let idx = ctx.next_let_idx;
+                ctx.next_let_idx += 1;
+                ctx.out.push(TaggedOp {
+                    op: Op::LetSet {
+                        idx,
+                        ty: IrType::ListFloat,
+                    },
+                    range: value.range,
+                });
+                ctx.lets.push(LetBinding {
+                    name,
+                    idx,
+                    ty: IrType::ListFloat,
+                    schema_brand: None,
+                });
+                continue;
+            }
         }
         lower_expr(&value.expr, value.range, ctx)?;
         let value_ty = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
@@ -8225,7 +8868,27 @@ fn lower_variable(
             }
             return Ok(());
         }
-        // A `Dynamic` segment on a non-`List<Int>` receiver is not a
+        // #359 (W20): 1D `s[k]` index on a `List<Float>` receiver — the
+        // n-body state list (`init` / `final_state` / the reducer's `s`
+        // param). The record layout is identical to `List<Int>` (8-byte
+        // elements); only the element load is `f64` and the result rides
+        // as `F64`. A `List<Float>`-of-`List<Float>` does not occur in
+        // W20, so only the single trailing-index form is accepted here.
+        if receiver_ty == Some(IrType::ListFloat) && path.len() == 2 {
+            let TokenKey::Dynamic(index_node, optional) = &path[1] else {
+                unreachable!("guarded by the all-Dynamic check above");
+            };
+            if *optional {
+                return Err(LoweringError::UnsupportedExpr {
+                    kind: "Variable(optional-list-index unsupported)".to_string(),
+                    range,
+                });
+            }
+            // Pops the `ListFloat` receiver, pushes the f64 element.
+            lower_list_index_typed(index_node, IrType::ListFloat, range, ctx)?;
+            return Ok(());
+        }
+        // A `Dynamic` segment on a non-list receiver is not a
         // materialised-list index — fall through to the generic
         // diagnostic below so the rejection message stays precise.
     }
@@ -9454,6 +10117,132 @@ mod range_pipeline_tests {
         assert!(
             ops.iter().any(|op| matches!(op, Op::Loop { .. })),
             "expected the fused counting Op::Loop"
+        );
+    }
+
+    /// #359 (W20): the softened n-body kernel lowers with a `List<Float>`
+    /// accumulator. Pins the envelope additions at the IR level: the
+    /// list-literal materialiser (`AllocScratchDyn` + `StoreF64AtAbsolute`
+    /// element stores), the `List<Float>` 1D index (`LoadF64AtAbsolute`),
+    /// the list-valued reduce carry (the accumulator let rides
+    /// `ListFloat`), and the closures lifted to `MakeClosure` (no leftover
+    /// stdlib indirection). The exact numeric parity is pinned separately
+    /// by the LLVM oracle test `llvm_w20_n_body.rs`.
+    #[test]
+    fn w20_n_body_lowers_with_list_float_reduce_accumulator() {
+        let src = "#unstrict\n\
+             #main(Int n) -> Float\n\
+             final_state[0] * 1.0 + final_state[1] * 2.0 + final_state[2] * 3.0 + final_state[3] * 4.0\n\
+               + final_state[4] * 5.0 + final_state[5] * 6.0 + final_state[6] * 7.0 + final_state[7] * 8.0\n\
+             where {\n\
+               dt: 0.01,\n\
+               soft: 0.1,\n\
+               m0: 1.0, m1: 2.0, m2: 0.5, m3: 3.0,\n\
+               init: [0.0, 1.0, 2.5, 4.0, 0.1, 0.0, 0.0, 0.2],\n\
+               pair_force(s, i, j, mj):\n\
+                 i == j ? 0.0 :\n\
+                   (s[j] - s[i]) * mj * (1.0 / (((s[j] - s[i]) * (s[j] - s[i]) + soft) * ((s[j] - s[i]) * (s[j] - s[i]) + soft))),\n\
+               accel(s, i): pair_force(s, i, 0, m0) + pair_force(s, i, 1, m1) + pair_force(s, i, 2, m2) + pair_force(s, i, 3, m3),\n\
+               step(s): [\n\
+                 s[0] + s[4] * dt,\n\
+                 s[1] + s[5] * dt,\n\
+                 s[2] + s[6] * dt,\n\
+                 s[3] + s[7] * dt,\n\
+                 s[4] + accel(s, 0) * dt,\n\
+                 s[5] + accel(s, 1) * dt,\n\
+                 s[6] + accel(s, 2) * dt,\n\
+                 s[7] + accel(s, 3) * dt\n\
+               ],\n\
+               final_state: range(n).reduce(init, (s, _step) => step(s))\n\
+             }";
+        let module = intern_tests::test_helpers_lower_source(src);
+        let entry = &module.funcs[module.entry_func_index.expect("entry")];
+
+        // The `init` literal materialises into a scratch arena: an
+        // `AllocScratchDyn` + 8 `StoreF64AtAbsolute` element stores
+        // appear in the entry body (the `step` body's literal stores
+        // live in the lambda func, not the entry).
+        let entry_f64_stores = entry
+            .body
+            .iter()
+            .filter(|t| matches!(t.op, Op::StoreF64AtAbsolute { .. }))
+            .count();
+        assert_eq!(
+            entry_f64_stores, 8,
+            "expected the `init` 8-element List<Float> literal to emit 8 f64 stores, \
+             got {entry_f64_stores}"
+        );
+
+        // The reduce body carries the `List<Float>` accumulator: a
+        // `LetSet { ty: ListFloat }` appears (the accumulator slot).
+        let has_listfloat_let = {
+            fn walk(body: &[TaggedOp]) -> bool {
+                body.iter().any(|t| match &t.op {
+                    Op::LetSet {
+                        ty: IrType::ListFloat,
+                        ..
+                    } => true,
+                    Op::Block { body, .. } | Op::Loop { body, .. } => walk(body),
+                    Op::If {
+                        then_body,
+                        else_body,
+                        ..
+                    } => walk(then_body) || walk(else_body),
+                    _ => false,
+                })
+            }
+            walk(&entry.body)
+        };
+        assert!(
+            has_listfloat_let,
+            "expected a ListFloat-typed let (the reduce accumulator carry)"
+        );
+
+        // `final_state[k]` indexes the List<Float> -> `LoadF64AtAbsolute`.
+        let has_f64_load = {
+            fn walk(body: &[TaggedOp]) -> bool {
+                body.iter().any(|t| match &t.op {
+                    Op::LoadF64AtAbsolute { .. } => true,
+                    Op::Block { body, .. } | Op::Loop { body, .. } => walk(body),
+                    Op::If {
+                        then_body,
+                        else_body,
+                        ..
+                    } => walk(then_body) || walk(else_body),
+                    _ => false,
+                })
+            }
+            walk(&entry.body)
+        };
+        assert!(
+            has_f64_load,
+            "expected a LoadF64AtAbsolute for the `final_state[k]` index reads"
+        );
+
+        // The where-bound closures `pair_force` / `accel` / `step` lift
+        // to lambdas in the closure table (3 entries).
+        assert_eq!(
+            module.closure_table.len(),
+            3,
+            "expected pair_force + accel + step lambdas, got {}",
+            module.closure_table.len()
+        );
+
+        // `step` returns a `List<Float>` handle: its lambda func's
+        // declared return type is ListFloat.
+        let step_lambda = module
+            .funcs
+            .iter()
+            .find(|f| f.ret == IrType::ListFloat)
+            .expect("expected a lambda returning ListFloat (the `step` closure)");
+        assert!(
+            step_lambda
+                .body
+                .iter()
+                .filter(|t| matches!(t.op, Op::StoreF64AtAbsolute { .. }))
+                .count()
+                == 8,
+            "expected `step`'s body to materialise an 8-element List<Float> via 8 f64 stores"
         );
     }
 }

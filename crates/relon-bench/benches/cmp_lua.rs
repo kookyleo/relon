@@ -4528,16 +4528,23 @@ fn llvm_aot_source_for(label: &str) -> Option<&'static str> {
         // `List<String>` (no closed-form replacement that keeps
         // the per-iter alloc cost the workload measures).
         "W27_stdlib_dict" => None,
-        // - First-class closures in non-higher-order position
-        //   surface as `closure value cannot cross the wasm module
-        //   boundary` (same envelope check that rejects W2 / W16 /
-        //   W17 / W18 closure shapes).
-        // No "inlined no-closure" variant — the algorithm structure
-        // requires the per-step state to flow through the pair-force
-        // accumulator; flattening into a single big arithmetic
-        // expression would be a paper-win loss of the per-step
-        // feedback shape (canonical Verlet integration step).
-        "W20_n_body_softened" => None,
+        // #359 Part B: the softened 4-body Verlet kernel now lowers
+        // through the LLVM AOT backend. Its reduce accumulator is a
+        // `List<Float>` — the envelope additions are a `List<Float>`
+        // literal materialised into a scratch arena (`init` + the
+        // per-step `step(s)` body that builds a fresh 8-element list), a
+        // list-VALUED reduce that carries the `List<Float>` handle across
+        // `n` iterations, `List<Float>` 1D index `s[k]` -> f64, and
+        // where-bound closures `pair_force` / `accel` returning `Float`
+        // (the helper/lambda ABI rides `F64` as i64 bits). The source is
+        // the unmodified `w20_relon_src()` — NO algorithm substitution,
+        // the per-step state still flows through the pair-force
+        // accumulator (canonical Verlet feedback shape). Oracle-verified
+        // BIT-IDENTICAL (`f64::to_bits`) to the `TreeWalkEvaluator` on
+        // this exact source for n = 0..=1000 — see
+        // `relon-codegen-llvm/tests/llvm_w20_n_body.rs` (n=0 returns the
+        // init-state weighted checksum unchanged).
+        "W20_n_body_softened" => Some(w20_relon_src()),
         // Panel expansion 2026-05-29 (Tier 4 Phase 1 — Group A runtime
         // dispatch W21): production source uses `#brand` +
         // `#schema` + `match` arm-table dispatch. The LLVM AOT
