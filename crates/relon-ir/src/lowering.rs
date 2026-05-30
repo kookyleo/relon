@@ -4028,20 +4028,52 @@ fn combine_operator_to_op(op: Operator, range: TokenRange) -> Result<Op, Lowerin
     }
 }
 
-/// AOT-4 (W18 slice): recognise `_len(_list_filter(range(a, b),
-/// (x) => <pred>))` and lower it to: materialise `range(a, b)` into a
-/// `List<Int>` scratch record, call the bundled `list_int_filter`
-/// body, then read the survivor count via `Op::ReadStringLen` (the
-/// shared `[len: u32 LE]` record prefix).
+/// CODEGEN-QUALITY (W18 slice): recognise `_len(_list_filter(range(a,
+/// b), (x) => <pred>))` — where the filtered list is *dead* (only
+/// `_len` consumes it) — and fuse it to a pure i64 counting loop that
+/// never materialises the filtered list:
+///
+/// ```text
+/// count = 0
+/// for k in [a, b):
+///   if <pred>(k) { count += 1 }
+/// push count
+/// ```
+///
+/// This is a dead-list-elimination / stream-fusion rewrite, NOT an
+/// algorithm substitution: the algorithm (count the range elements
+/// satisfying `<pred>`) is unchanged; only the intermediate
+/// `List<Int>` is elided — exactly as `rust_native` counts in
+/// registers. The survivor *count* is bit-for-bit identical to the
+/// materialise-then-`_len` path (same predicate, same range, same
+/// `start >= end` empty-range edge), so the W18 prime-count oracle
+/// still matches.
+///
+/// Mechanism: the predicate closure becomes the single `filter` stage
+/// of a [`RangeChain`], and [`emit_range_pipeline_loop`] with
+/// [`RangeConsumer::Len`] emits the counter loop — the same battle-
+/// tested skeleton the `range(...).filter(...).len()` peephole uses.
+/// The predicate body is inlined into the loop (its `is_prime(k, 2)`
+/// call lowers as a direct call, devirtualised), so the post-O3 hot
+/// loop carries NO `AllocScratchDyn` for the filter output, NO
+/// `list_int_filter` `Op::Call`, and NO per-element arena load/store
+/// round-trip — just a counter increment under the predicate.
 ///
 /// `_len` and `_list_filter` are the underscore intrinsics the
 /// tree-walker registers (`relon-evaluator::stdlib::register_to`);
 /// they have no bundled IR stdlib slot keyed under those exact names,
 /// so the default `lower_fn_call` dispatch would surface an
 /// `UnknownStdlibMethod`. This peephole maps the W18 shape onto the
-/// already-LLVM-runnable `list_int_filter` + `ReadStringLen` ops.
+/// scalar counter loop.
 ///
-/// Returns `Ok(Some(()))` on a successful desugar (vstack carries one
+/// The fusion fires ONLY for the `_len(_list_filter(range, pred))`
+/// shape where the list is dead (its single consumer is the outer
+/// `_len`). When the filtered list is fed to another consumer (e.g.
+/// indexed, re-filtered, or summed — W16 / W19) the `_list_filter`
+/// surfaces under a different parent and this peephole never matches,
+/// so those workloads keep their real materialised list.
+///
+/// Returns `Ok(Some(()))` on a successful fusion (vstack carries one
 /// `I64` survivor count after return), `Ok(None)` when the pattern
 /// didn't match (caller falls through to the regular dispatch), `Err`
 /// when an inner expression failed to lower.
@@ -4080,75 +4112,32 @@ fn try_lower_len_filter_range(
     let Some(range_args) = match_bare_range(&inner_args[0].value.expr) else {
         return Ok(None);
     };
-    let Expr::Closure { params, .. } = &*inner_args[1].value.expr else {
+    let Expr::Closure {
+        params,
+        body: pred_body,
+        ..
+    } = &*inner_args[1].value.expr
+    else {
         return Ok(None);
     };
     if params.len() != 1 {
         return Ok(None);
     }
 
-    // Resolve the bundled `list_int_filter` slot up front so a missing
-    // registry entry surfaces as a hard error rather than a silent
-    // fall-through to the (now-failing) default dispatch.
-    let filter_idx = stdlib_function_index("list_int_filter").ok_or_else(|| {
-        LoweringError::UnknownStdlibMethod {
-            name: "list_int_filter".to_string(),
-            arity: 2,
-            range,
-        }
-    })?;
-    let filter_meta = builtin_stdlib().get(filter_idx as usize).ok_or_else(|| {
-        LoweringError::UnknownStdlibMethod {
-            name: "list_int_filter".to_string(),
-            arity: 2,
-            range,
-        }
-    })?;
-    let filter_params = filter_meta.params.clone();
-    let filter_ret = filter_meta.ret;
-
-    // 1. Materialise `range(a, b)` -> List<Int> handle on the vstack.
-    emit_range_materialize(range_args, range, ctx)?;
-    // 2. Lower the predicate closure as the filter's second arg. The
-    //    closure surface matches `stdlib_closure_arg_signature`'s
-    //    `("list_int_filter", 1)` entry (`(I64) -> Bool`).
-    let (param_tys_c, ret_ty_c) =
-        stdlib_closure_arg_signature("list_int_filter", 1).ok_or_else(|| {
-            LoweringError::UnsupportedExpr {
-                kind: "list_int_filter closure signature missing".to_string(),
-                range,
-            }
-        })?;
-    lower_closure_as_value(
-        &inner_args[1].value.expr,
-        inner_args[1].value.range,
-        &param_tys_c,
-        ret_ty_c,
-        ctx,
-    )?;
-    // 3. Op::Call(list_int_filter) — consumes [ListInt, Closure],
-    //    produces a fresh `List<Int>` handle.
-    ctx.tstack.pop(); // closure
-    ctx.tstack.pop(); // materialised list handle
-    ctx.out.push(TaggedOp {
-        op: Op::Call {
-            fn_index: filter_idx,
-            arg_count: 2,
-            param_tys: filter_params,
-            ret_ty: filter_ret,
-        },
-        range,
-    });
-    ctx.tstack.push(filter_ret);
-    // 4. `_len(<filtered>)` -> read the leading `[len: u32 LE]` prefix
-    //    of the survivor record and widen to I64 (matches the
-    //    tree-walker `_len` which returns the element count as Int).
-    ctx.out.push(TaggedOp {
-        op: Op::ReadStringLen,
-        range,
-    });
-    ctx.tstack.pop(); // filtered list handle
-    ctx.tstack.push(IrType::I64);
+    // Build a single-`filter` `RangeChain` from the predicate closure
+    // and emit the shared `range(...).filter(...).len()` counter loop.
+    // The predicate body must return `Bool`; the pipeline emitter
+    // checks that and short-circuits the `count += 1` update when the
+    // predicate is false. No `List<Int>` is allocated.
+    let chain = RangeChain {
+        range_args,
+        stages: vec![ChainStage {
+            method: "filter",
+            closure_params: params.as_slice(),
+            closure_body: pred_body,
+        }],
+    };
+    emit_range_pipeline_loop(&chain, RangeConsumer::Len, range, ctx)?;
     Ok(Some(()))
 }
 
@@ -9303,77 +9292,90 @@ mod range_pipeline_tests {
         assert_eq!(loops, 2, "expected two nested Loops, got {loops}");
     }
 
-    /// AOT-4 (W18 slice): `_len(_list_filter(range(2, n), (k) => ...))`
-    /// materialises the runtime range into a `List<Int>` scratch
-    /// record (`AllocScratchDyn` + `StoreI32` header + a fill `Loop`
-    /// of `StoreI64` per element), then routes the list through the
-    /// bundled `list_int_filter` body via a real `Op::Call`, and reads
-    /// the survivor count with `Op::ReadStringLen`.
+    /// CODEGEN-QUALITY (W18 slice): `_len(_list_filter(range(2, n),
+    /// (k) => ...))` — where the filtered list is dead (only `_len`
+    /// consumes it) — FUSES to a pure i64 counting loop that never
+    /// materialises the filtered list. The fused shape emits NO
+    /// `list_int_filter` `Op::Call` and NO `AllocScratchDyn` for the
+    /// filter output; instead the predicate is inlined under an
+    /// `Op::Loop` and a counter is incremented per survivor.
     ///
-    /// This is the materialise path — NOT an eliding peephole: the
-    /// filter's `Op::Call(list_int_filter)` MUST survive (the survivor
-    /// subset is data-dependent and cannot be folded into a scalar
-    /// counter the way `range(n).filter(c).len()` is).
+    /// This is dead-list-elimination / stream fusion — the count is
+    /// identical to the materialise-then-`_len` path (same predicate,
+    /// same range), only the intermediate `List<Int>` is elided. It is
+    /// NOT an algorithm substitution.
     #[test]
-    fn len_filter_range_materializes_and_calls_list_int_filter() {
+    fn len_filter_range_fuses_to_counting_loop_no_materialize() {
         let src = "#unstrict\n\
                    #main(Int n) -> Int\n\
                    _len(_list_filter(range(2, n), (k) => k % 2 == 0))";
         let ops = lower_and_flatten(src);
 
-        // The materialise path emits a dynamic scratch allocation for
-        // the range record.
-        let alloc_dyn = ops
-            .iter()
-            .filter(|op| matches!(op, Op::AllocScratchDyn))
-            .count();
-        assert!(
-            alloc_dyn >= 1,
-            "expected at least one AllocScratchDyn for the materialised range, got {alloc_dyn}"
-        );
-
-        // The filtered list flows through the bundled `list_int_filter`
-        // body via a real Op::Call (NOT inlined / elided).
+        // No `list_int_filter` `Op::Call` survives — the filter is
+        // fused into the counter loop, not dispatched to the bundled
+        // stdlib body.
         let filter_idx = stdlib_function_index("list_int_filter").unwrap();
         let filter_calls = ops
             .iter()
             .filter(|op| matches!(op, Op::Call { fn_index, .. } if *fn_index == filter_idx))
             .count();
         assert_eq!(
-            filter_calls, 1,
-            "expected exactly one Op::Call(list_int_filter), got {filter_calls}"
+            filter_calls, 0,
+            "fused shape must NOT call list_int_filter, got {filter_calls} calls"
         );
 
-        // `_len` reads the survivor record's leading length prefix.
-        let read_len = ops
+        // No filter-output `AllocScratchDyn` — nothing is materialised.
+        // (The eliding range counter loop allocates no scratch record.)
+        let alloc_dyn = ops
             .iter()
-            .filter(|op| matches!(op, Op::ReadStringLen))
+            .filter(|op| matches!(op, Op::AllocScratchDyn))
             .count();
-        assert!(
-            read_len >= 1,
-            "expected ReadStringLen for the `_len` survivor count, got {read_len}"
+        assert_eq!(
+            alloc_dyn, 0,
+            "fused shape must NOT materialise any List<Int> (got {alloc_dyn} AllocScratchDyn)"
         );
 
-        // The eliding `range(...).len()` peephole must NOT have fired:
-        // it would inline the filter into a scalar counter loop and
-        // leave no `list_int_filter` Op::Call (asserted above) — this
-        // guard pins the materialise vs elide distinction explicitly.
+        // No per-element arena store fills a materialised payload.
         let store_i64 = ops
             .iter()
             .filter(|op| matches!(op, Op::StoreI64AtAbsolute { .. }))
             .count();
+        assert_eq!(
+            store_i64, 0,
+            "fused shape must NOT store list elements to an arena (got {store_i64})"
+        );
+
+        // No `ReadStringLen` survivor-record read — the count comes
+        // straight from the loop accumulator.
+        let read_len = ops
+            .iter()
+            .filter(|op| matches!(op, Op::ReadStringLen))
+            .count();
+        assert_eq!(
+            read_len, 0,
+            "fused shape reads no length prefix; the counter is the result (got {read_len})"
+        );
+
+        // The fusion emits a counting `Op::Loop` with an i64 increment
+        // (`Op::Add(I64)` of the accumulator) under the predicate.
+        let loops = ops
+            .iter()
+            .filter(|op| matches!(op, Op::Loop { .. }))
+            .count();
+        assert!(loops >= 1, "expected a counting Op::Loop, got {loops}");
         assert!(
-            store_i64 >= 1,
-            "expected at least one StoreI64AtAbsolute filling the materialised payload, got {store_i64}"
+            ops.iter().any(|op| matches!(op, Op::Add(IrType::I64))),
+            "expected an i64 counter increment in the fused loop"
         );
     }
 
-    /// AOT-4: the full W18 production shape — a `where`-bound recursive
-    /// `is_prime` helper called from the filter predicate — lowers
-    /// cleanly (the AOT-3 where-bound recursive lift composes with the
-    /// materialise + filter + length path).
+    /// CODEGEN-QUALITY: the full W18 production shape — a `where`-bound
+    /// recursive `is_prime` helper called from the filter predicate —
+    /// also fuses to the counting loop (no `list_int_filter` call, no
+    /// materialised list). The predicate body, including the recursive
+    /// `is_prime(k, 2)` call, is inlined under the loop.
     #[test]
-    fn w18_prime_count_shape_lowers() {
+    fn w18_prime_count_shape_fuses_no_filter_call() {
         let src = "#unstrict\n\
                    #main(Int n) -> Int\n\
                    _len(_list_filter(range(2, n), (k) => is_prime(k, 2)))\n\
@@ -9386,14 +9388,20 @@ mod range_pipeline_tests {
             ops.iter()
                 .filter(|op| matches!(op, Op::Call { fn_index, .. } if *fn_index == filter_idx))
                 .count(),
-            1,
-            "W18 shape must route the materialised range through list_int_filter"
+            0,
+            "W18 fused shape must NOT route through list_int_filter"
         );
-        // The lifted `is_prime` recursive helper produces a closure
-        // (MakeClosure) and a self-recursive CallClosure.
+        assert_eq!(
+            ops.iter()
+                .filter(|op| matches!(op, Op::AllocScratchDyn))
+                .count(),
+            0,
+            "W18 fused shape must NOT materialise the filtered list"
+        );
+        // The counting loop is present.
         assert!(
-            ops.iter().any(|op| matches!(op, Op::MakeClosure { .. })),
-            "expected the where-bound `is_prime` helper to lift to a closure"
+            ops.iter().any(|op| matches!(op, Op::Loop { .. })),
+            "expected the fused counting Op::Loop"
         );
     }
 }
