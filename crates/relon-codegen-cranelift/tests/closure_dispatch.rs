@@ -5,10 +5,13 @@
 //! constructs a closure via `Op::MakeClosure` and invokes it via
 //! `Op::CallClosure`. The cranelift backend compiles every lambda
 //! to its own cranelift function with signature
-//! `(state, captures_ptr, params...) -> ret`; the per-evaluator
-//! closure table holds the resolved host-fn pointers; the call
-//! site dereferences the table at runtime to materialise the host
-//! pointer for `call_indirect`.
+//! `(state, ...lambda.params) -> ret`, where the IR lowering pass
+//! (`lower_closure_as_value`) prepends the `captures_ptr: i32` as
+//! `lambda.params[0]` — so the body's `LocalGet(0)` reads the captures
+//! pointer and `LocalGet(1..)` read the user args (matching the LLVM
+//! backend). The per-evaluator closure table holds the resolved
+//! host-fn pointers; the call site dereferences the table at runtime
+//! to materialise the host pointer for `call_indirect`.
 
 use std::collections::HashMap;
 
@@ -136,12 +139,23 @@ fn closure_module_compiles_without_codegen_error() {
 fn closure_with_capture_compiles_cleanly() {
     // Lambda `|x| x + cap` where `cap` is captured from the enclosing
     // scope at byte offset 0 in the captures struct.
+    //
+    // Param ABI matches the production IR lowering
+    // (`lower_closure_as_value`) and the LLVM backend: the captures_ptr
+    // is the FIRST param (`IrType::I32`), so `LocalGet(0)` reads the
+    // captures pointer and `LocalGet(1)` reads the user arg `x`. The
+    // lambda signature is therefore `(state, captures_ptr, x)`; the
+    // capture is loaded by composing `captures_ptr + offset`
+    // (`Op::LoadField` against the captures base in lambda mode).
     let lambda = Func {
         name: "__closure_0".into(),
-        params: vec![IrType::I64],
+        params: vec![IrType::I32, IrType::I64],
         ret: IrType::I64,
         body: vec![
-            t(Op::LocalGet(0)),
+            // Push the user arg `x` (LocalGet(1)), then load the capture
+            // at offset 0 (LoadField resolves the captures base from the
+            // lambda's captures_ptr == param[0] in lambda mode), then add.
+            t(Op::LocalGet(1)),
             t(Op::LoadField {
                 offset: 0,
                 ty: IrType::I64,

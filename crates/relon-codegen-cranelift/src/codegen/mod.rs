@@ -519,9 +519,22 @@ fn lower_module_into<M: CrModule>(
                 ir.funcs.len()
             ))
         })?;
+        // Lambda signature: `(state, ...lambda.params) -> ret`. The IR
+        // lowering pass (`lower_closure_as_value`) already prepends the
+        // `captures_ptr: i32` as `lambda.params[0]`, so the captures
+        // pointer is the FIRST element of `lambda.params` — we must NOT
+        // push a second synthetic captures param. Doing so widened the
+        // signature by one slot (`(state, captures, captures, ...args)`),
+        // shifting every user arg right by one: the `Op::CallClosure`
+        // call site (which correctly passes `(state, captures, ...args)`)
+        // then landed each user arg in the previous param's register and
+        // left the real value slot uninitialised. For a filter predicate
+        // `(v) => v < K` this meant `v` read garbage, so the predicate
+        // returned an arbitrary constant for the whole run — selective
+        // filters silently dropped everything (or kept everything). This
+        // mirrors the LLVM backend's `(state, ...lambda.params)` shape.
         let mut sig = Signature::new(CallConv::SystemV);
         sig.params.push(AbiParam::new(pointer_ty)); // state pointer
-        sig.params.push(AbiParam::new(I32)); // captures_ptr
         for p in &lambda.params {
             sig.params.push(AbiParam::new(ir_ty_to_cl(*p)?));
         }
@@ -678,10 +691,18 @@ fn lower_module_into<M: CrModule>(
             builder.switch_to_block(entry_block);
             builder.seal_block(entry_block);
 
+            // Block-param layout matches the signature
+            // `(state, ...lambda.params)` where `lambda.params[0]` is the
+            // captures pointer the IR prepended. So:
+            //   * block_params[0] — state pointer
+            //   * block_params[1] — captures_ptr (== lambda.params[0])
+            //   * block_params[1..] — the IR-visible params, indexed by
+            //     `LocalGet(idx)` (LocalGet(0) == captures_ptr,
+            //     LocalGet(1) == first user arg, ...).
             let block_params: Vec<_> = builder.block_params(entry_block).to_vec();
             let lambda_state_ptr = block_params[0];
             let captures_ptr = block_params[1];
-            let lambda_arg_values: Vec<CValue> = block_params[2..].to_vec();
+            let lambda_arg_values: Vec<CValue> = block_params[1..].to_vec();
 
             // v5-γ stage 2: import the capability vtable as a
             // GlobalValue on this lambda. Each helper call indirects
