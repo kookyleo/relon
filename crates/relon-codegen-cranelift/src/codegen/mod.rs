@@ -1316,20 +1316,60 @@ impl<'a, 'b> Codegen<'a, 'b> {
     }
 
     fn set_let(&mut self, idx: u32, ty: IrType, value: CValue) {
+        // The let-slot's declared cranelift type comes from the
+        // IR-declared slot `ty` (string/list/closure are i32 arena
+        // offsets, not i64 pointers). Falling back to I64 here
+        // previously panicked `FunctionBuilder::def_var` when a
+        // `LetSet` carrying a String slot landed in the AOT path
+        // (W4 pipeline).
+        let cr_ty = ir_ty_to_cl(ty).unwrap_or(I64);
         let var = if let Some(v) = self.let_locals.get(&idx).copied() {
             v
         } else {
-            // Use the same IR -> Cranelift type map the rest of codegen
-            // uses (string/list/closure are i32 arena offsets, not i64
-            // pointers). Falling back to I64 here previously panicked
-            // `FunctionBuilder::def_var` when a `LetSet` carrying a
-            // String slot landed in the AOT path (W4 pipeline).
-            let cr_ty = ir_ty_to_cl(ty).unwrap_or(I64);
             let v = self.builder.declare_var(cr_ty);
             self.let_locals.insert(idx, v);
             v
         };
-        self.builder.def_var(var, value);
+        // Coerce the operand-stack value to the slot's declared width
+        // before `def_var`. The IR can hand an `I64`-typed value to a
+        // slot the lowering pass declared `I32` (e.g. the W16 list-
+        // materialise path: `If { result_ty: I64 }` computes the
+        // `range(n)` element count, then `LetSet { ty: I32 }` stores it
+        // into the i32 length slot). Without this coercion cranelift's
+        // SSA frontend panics with `declared type of variable varN
+        // doesn't match type of value vM`. This mirrors the LLVM AOT
+        // emitter's `coerce_to_let_ty` (zero-extend when narrower,
+        // truncate when wider) so the two backends agree on the stored
+        // width. Float slots only ever receive `F64` values, so the
+        // integer narrow/widen path is unreachable for them.
+        let stored = self.coerce_to_cl_ty(value, cr_ty);
+        self.builder.def_var(var, stored);
+    }
+
+    /// Coerce an operand-stack value to a target cranelift type so it
+    /// can flow into a `def_var` / typed slot whose declared width may
+    /// differ from the value's. Only integer narrow/widen is performed
+    /// (`ireduce` / `uextend`, matching the LLVM backend's
+    /// zero-extend-on-widen semantics); any other shape (already
+    /// matching, or a non-integer mismatch we don't model) is returned
+    /// unchanged so a genuine type error still surfaces as the
+    /// frontend's `def_var` panic rather than being silently masked.
+    fn coerce_to_cl_ty(&mut self, value: CValue, target: cranelift_codegen::ir::Type) -> CValue {
+        let actual = self.builder.func.dfg.value_type(value);
+        if actual == target {
+            return value;
+        }
+        // Only reconcile integer-width mismatches; leave float / vector
+        // / reference shapes to the frontend's own type check.
+        if actual.is_int() && target.is_int() {
+            if target.bits() < actual.bits() {
+                return self.builder.ins().ireduce(target, value);
+            }
+            if target.bits() > actual.bits() {
+                return self.builder.ins().uextend(target, value);
+            }
+        }
+        value
     }
 
     fn push(&mut self, v: CValue) {
