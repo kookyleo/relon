@@ -11,6 +11,13 @@ use wasmtime::{Caller, Linker};
 
 use crate::host_state::HostState;
 
+/// Project an `anyhow::Error` from the arena / memory / record helpers
+/// onto a `wasmtime::Error` for the host-import trap surface. Used via
+/// `.map_err(anyhow_to_wasmtime)` so each call site stays a single line.
+fn anyhow_to_wasmtime(e: anyhow::Error) -> wasmtime::Error {
+    wasmtime::Error::msg(e.to_string())
+}
+
 /// Register the §4 host imports on the supplied linker. Returns an
 /// error only if the wasmtime `Linker::func_wrap` plumbing rejects a
 /// signature, which would indicate a freeze-table mismatch.
@@ -26,7 +33,7 @@ pub(crate) fn register_host_imports(linker: &mut Linker<HostState>) -> anyhow::R
             let ptr = caller
                 .data_mut()
                 .arena_alloc(size as u32, align as u32)
-                .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+                .map_err(anyhow_to_wasmtime)?;
             Ok(ptr as i32)
         },
     )?;
@@ -411,23 +418,19 @@ fn range_alloc(
     let handle = caller
         .data_mut()
         .arena_alloc(total_bytes, 8)
-        .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        .map_err(anyhow_to_wasmtime)?;
 
     // Borrow memory now that the arena bump is done.
-    let mem = caller
-        .data()
-        .memory()
-        .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+    let mem = caller.data().memory().map_err(anyhow_to_wasmtime)?;
     let mem_view = mem.data_mut(caller);
-    write_u32(mem_view, handle, len as u32).map_err(|e| wasmtime::Error::msg(e.to_string()))?;
-    write_u32(mem_view, handle + 4, len as u32).map_err(|e| wasmtime::Error::msg(e.to_string()))?;
-    write_u32(mem_view, handle + 8, /* tag = 1 (i64) */ 1)
-        .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
-    write_u32(mem_view, handle + 12, 0).map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+    write_u32(mem_view, handle, len as u32).map_err(anyhow_to_wasmtime)?;
+    write_u32(mem_view, handle + 4, len as u32).map_err(anyhow_to_wasmtime)?;
+    write_u32(mem_view, handle + 8, /* tag = 1 (i64) */ 1).map_err(anyhow_to_wasmtime)?;
+    write_u32(mem_view, handle + 12, 0).map_err(anyhow_to_wasmtime)?;
     for i in 0..(len as u32) {
         let elem_off = handle + LIST_HEADER_BYTES + i * LIST_ELEM_BYTES;
         let value = start + i as i64;
-        write_i64(mem_view, elem_off, value).map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        write_i64(mem_view, elem_off, value).map_err(anyhow_to_wasmtime)?;
     }
     Ok(handle as i32)
 }
@@ -436,12 +439,9 @@ fn list_header_len(
     caller: &mut Caller<'_, HostState>,
     handle: i32,
 ) -> Result<i64, wasmtime::Error> {
-    let mem = caller
-        .data()
-        .memory()
-        .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+    let mem = caller.data().memory().map_err(anyhow_to_wasmtime)?;
     let view = mem.data(caller);
-    let len = read_u32(view, handle as u32).map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+    let len = read_u32(view, handle as u32).map_err(anyhow_to_wasmtime)?;
     Ok(len as i64)
 }
 
@@ -450,33 +450,27 @@ fn list_get_i64(
     handle: i32,
     idx: i64,
 ) -> Result<i64, wasmtime::Error> {
-    let mem = caller
-        .data()
-        .memory()
-        .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+    let mem = caller.data().memory().map_err(anyhow_to_wasmtime)?;
     let view = mem.data(caller);
-    let len = read_u32(view, handle as u32).map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+    let len = read_u32(view, handle as u32).map_err(anyhow_to_wasmtime)?;
     if idx < 0 || (idx as u64) >= len as u64 {
         return Err(wasmtime::Error::msg(format!(
             "__relon_list_get_i64: idx {idx} out of range [0, {len})"
         )));
     }
     let off = handle as u32 + LIST_HEADER_BYTES + (idx as u32) * LIST_ELEM_BYTES;
-    let value = read_i64(view, off).map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+    let value = read_i64(view, off).map_err(anyhow_to_wasmtime)?;
     Ok(value)
 }
 
 fn list_sum_i64(caller: &mut Caller<'_, HostState>, handle: i32) -> Result<i64, wasmtime::Error> {
-    let mem = caller
-        .data()
-        .memory()
-        .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+    let mem = caller.data().memory().map_err(anyhow_to_wasmtime)?;
     let view = mem.data(caller);
-    let len = read_u32(view, handle as u32).map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+    let len = read_u32(view, handle as u32).map_err(anyhow_to_wasmtime)?;
     let mut acc: i64 = 0;
     for i in 0..len {
         let off = handle as u32 + LIST_HEADER_BYTES + i * LIST_ELEM_BYTES;
-        let value = read_i64(view, off).map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+        let value = read_i64(view, off).map_err(anyhow_to_wasmtime)?;
         acc = acc.checked_add(value).ok_or_else(|| {
             wasmtime::Error::msg(format!("__relon_list_sum_i64: overflow at idx {i}"))
         })?;
@@ -506,10 +500,7 @@ fn str_contains(
     haystack_handle: i32,
     needle_handle: i32,
 ) -> Result<i32, wasmtime::Error> {
-    let mem = caller
-        .data()
-        .memory()
-        .map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+    let mem = caller.data().memory().map_err(anyhow_to_wasmtime)?;
     let view = mem.data(caller);
     let haystack = read_str_record(view, haystack_handle as u32)?;
     let needle = read_str_record(view, needle_handle as u32)?;
@@ -521,7 +512,7 @@ fn str_contains(
 /// (length-checked against linear memory) so the caller can byte-
 /// scan without an extra bounds check.
 fn read_str_record(view: &[u8], handle: u32) -> Result<&[u8], wasmtime::Error> {
-    let len = read_u32(view, handle).map_err(|e| wasmtime::Error::msg(e.to_string()))?;
+    let len = read_u32(view, handle).map_err(anyhow_to_wasmtime)?;
     let payload_start = handle as usize + 4;
     let payload_end = payload_start
         .checked_add(len as usize)

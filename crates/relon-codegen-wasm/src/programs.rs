@@ -372,10 +372,8 @@ pub(crate) const W5_TABLE_ENTRIES: usize = 10;
 /// 8-byte alignment so the next arena bump can land on a list-header
 /// boundary without an extra align pass.
 fn w4_const_segment_end(long: bool) -> u32 {
-    let hay = w4_haystack_bytes(long);
     let needle_record_off = w4_needle_record_offset(long);
     let raw_end = needle_record_off + 4 + W4_NEEDLE.len() as u32;
-    let _ = hay; // consumed via w4_needle_record_offset
     (raw_end + 7) & !7
 }
 
@@ -826,14 +824,6 @@ fn emit_w6_list_sum_plus_one() -> Vec<u8> {
     // return acc
     func.instruction(&Instruction::LocalGet(1));
     func.instruction(&Instruction::End); // function
-
-    // Make use of the `memarg` import to silence the unused symbol —
-    // future workloads will need it.
-    let _ = MemArg {
-        offset: 0,
-        align: 0,
-        memory_index: 0,
-    };
 
     finalize_module(prelude, func, &[])
 }

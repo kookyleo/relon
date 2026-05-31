@@ -124,10 +124,11 @@ struct JitOwned {
 }
 
 // SAFETY: the inkwell ExecutionEngine + Context pair is not `Sync`
-// by default — LLVM's `LLVMContextRef` is per-thread. The evaluator
-// owns a `Mutex` around per-call mutable state so `run_main` can be
-// driven from multiple threads safely (each blocks on the same JIT
-// — Phase C will explore per-thread engine pools).
+// by default — LLVM's `LLVMContextRef` is per-thread. We mark the
+// pair Send/Sync because `run_main` only reaches back into the JIT
+// through the cached function pointers (`entry_ptr`, `fast_entry_ptr`),
+// which are immutable after construction; the only per-call mutable
+// state is the thread-local `LLVM_ARENA_POOL`, which needs no lock.
 unsafe impl Send for JitOwned {}
 unsafe impl Sync for JitOwned {}
 

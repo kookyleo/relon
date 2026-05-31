@@ -55,9 +55,9 @@ use std::path::{Path, PathBuf};
 use relon_codegen_llvm::{EmittedEntryShape, EmittedField, EmittedFieldType, LlvmAotEvaluator};
 
 /// Optimisation level requested from the LLVM backend. Phase 1 always
-/// runs the same `-O3` middle-end pipeline regardless of this value
-/// — the field is recorded for future use when the backend grows a
-/// per-emit knob.
+/// runs the same `-O3` middle-end pipeline regardless of this value;
+/// the type exists so the [`Compiler::opt_level`] setter can express
+/// intent today and gain effect when the backend grows a per-emit knob.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum OptLevel {
     /// Default `-O3` pipeline. The only level Phase 1 supports.
@@ -86,7 +86,6 @@ struct SourceEntry {
 #[derive(Debug, Default)]
 pub struct Compiler {
     sources: Vec<SourceEntry>,
-    opt_level: OptLevel,
 }
 
 /// Result of a successful [`Compiler::emit_all`] call. Lists every
@@ -176,7 +175,6 @@ impl Compiler {
         // Phase 1 ignores the value (pipeline is hard-wired to -O3).
         // The signature accepts a generic level so callers can write
         // `.opt_level(3)` without worrying about the enum surface.
-        self.opt_level = OptLevel::Aggressive;
         self
     }
 
@@ -425,11 +423,8 @@ fn render_one_fast_int(out: &mut String, m: &BindingModule) {
         .iter()
         .map(|n| format!("{}: i64", sanitize_param(n)))
         .collect();
-    let extern_params: Vec<String> = m
-        .param_names
-        .iter()
-        .map(|n| format!("{}: i64", sanitize_param(n)))
-        .collect();
+    // The extern declaration and the Rust shim share the same `i64`
+    // param list, so render it once and reuse for both.
     let extern_args: Vec<String> = m.param_names.iter().map(|n| sanitize_param(n)).collect();
 
     debug_assert_eq!(rust_params.len(), m.arity);
@@ -438,7 +433,7 @@ fn render_one_fast_int(out: &mut String, m: &BindingModule) {
         out.push_str(&format!(
             "extern \"C\" {{\n    fn {sym}({eparams}) -> i64;\n}}\n",
             sym = m.symbol,
-            eparams = extern_params.join(", "),
+            eparams = rust_params.join(", "),
         ));
         out.push_str(&format!(
             "/// Safe shim for the AOT-compiled Relon `#main` defined in this source.\n\
@@ -467,7 +462,7 @@ fn render_one_fast_int(out: &mut String, m: &BindingModule) {
              }}\n\n",
             alias = m.alias,
             sym = m.symbol,
-            eparams = extern_params.join(", "),
+            eparams = rust_params.join(", "),
             rparams = rust_params.join(", "),
             eargs = extern_args.join(", "),
         ));
@@ -636,9 +631,6 @@ fn render_field_slice(fields: &[EmittedField]) -> String {
 /// large blobs while round-tripping through `rustc`'s string-literal
 /// parser without UTF-8 validation issues.
 fn render_byte_slice(bytes: &[u8]) -> String {
-    if bytes.is_empty() {
-        return "[]".to_string();
-    }
     let mut out = String::with_capacity(bytes.len() * 4 + 16);
     out.push('[');
     for (i, b) in bytes.iter().enumerate() {

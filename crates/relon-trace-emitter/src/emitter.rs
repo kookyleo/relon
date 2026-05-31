@@ -258,7 +258,7 @@ impl TraceEmitter {
         entry_call_conv: CallConv,
     ) -> Result<(), EmitError> {
         let signature = TRACE_ENTRY_SIG.to_cranelift(pointer_ty, entry_call_conv);
-        ctx.func = Function::with_name_signature(UserFuncName::user(0, 0), signature.clone());
+        ctx.func = Function::with_name_signature(UserFuncName::user(0, 0), signature);
 
         let mut builder_ctx = FunctionBuilderContext::new();
         let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);

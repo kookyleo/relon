@@ -835,7 +835,7 @@ fn decode_list_int_record(record_base: u32, view: &[u8]) -> Result<Value, Runtim
     let len = u32::from_le_bytes(
         view[header_start..header_start + 4]
             .try_into()
-            .expect("8-byte header slice"),
+            .expect("4-byte header slice"),
     ) as usize;
     // The 4-byte pad lives at `view[header_start+4 .. header_start+8]`; we
     // skip it and read the i64 payload starting at `header_start + 8`.

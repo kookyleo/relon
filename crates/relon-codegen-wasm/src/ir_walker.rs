@@ -444,7 +444,7 @@ pub fn lower_ir_module(lowered: &LoweredEntry) -> Result<Vec<u8>, LowerError> {
     let closure_table = &lowered.module.closure_table;
     let mut lambda_emits: Vec<(LambdaInfo, EmitState<'_>)> =
         Vec::with_capacity(closure_table.len());
-    for (slot, ir_fn_idx) in closure_table.iter().enumerate() {
+    for ir_fn_idx in closure_table.iter() {
         let lambda_fn =
             lowered
                 .module
@@ -463,7 +463,6 @@ pub fn lower_ir_module(lowered: &LoweredEntry) -> Result<Vec<u8>, LowerError> {
             ));
         }
         let info = LambdaInfo {
-            slot: slot as u32,
             params: lambda_fn.params.clone(),
             ret_ty: lambda_fn.ret,
         };
@@ -759,10 +758,6 @@ fn encode_const_list_int_record(entry: &ConstListIntEntry) -> Vec<u8> {
 /// sections.
 #[derive(Debug, Clone)]
 struct LambdaInfo {
-    /// Closure-table slot (0-based, source order). Matches
-    /// `Op::MakeClosure { fn_table_idx }`.
-    #[allow(dead_code)]
-    slot: u32,
     /// IR-side wasm parameter types — `params[0]` is always
     /// captures_ptr (i32), `params[1..]` are the user-visible args.
     params: Vec<IrType>,
