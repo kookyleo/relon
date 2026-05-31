@@ -79,3 +79,29 @@
 - 经检查并非真 win 的(如某些 clone 在 success 路径本就只一次)被正确保留。
 
 这些都需要决定共享 util 的归属 crate;不属本轮「单 crate 安全简化」范围,故留下。
+
+---
+
+## correctness 修复(DONE,2026-05-31)— verify-then-fix
+
+对上面 15 项 correctness/security 逐项 verify-then-fix(4 个 worktree lane + 对抗审查全 accept,
+每个真修都带「去掉就 fail」的行为证明测试)。**关键:先核实真伪,真 bug 才改,非 bug 诚实保留。**
+
+### 真 bug,已修(4 个 commit,均 kookyleo,零 AI)
+
+| commit | finding | 修复 |
+|---|---|---|
+| `3e711044` | cli `--trust` 对 **bytecode** 后端失效(#1 的一半) | 经 `BytecodeEvaluator::with_capability_gate(Arc<dyn CapabilityGate>)` 安装(`--trust`→all_granted,否则 zero-trust);2 测试:零信任下 CheckCap 入口被 `WasmCapabilityDenied` 拒、`--trust` 下放行 |
+| `527f8c76` | cranelift `sandbox_matches` 漏 `trace_jit_fn_id`(#2) | **确认真 bug**:该字段在 `codegen/mod.rs:598` gate HotCounter prologue→改变 artifact;补 `&& a.trace_jit_fn_id == b.trace_jit_fn_id`,回归测试(去掉即 fail) |
+| `b76289bc` | bench `bench_stats` INFINITY 哨兵 NaN sort panic(#6) | **真 bug**(div-by-zero 哨兵污染分布):改非有限过滤,全零样本返回 `Empty` 错误;测试零迭代不 panic + 全零报空 |
+| `5d05e23b` | trace-emitter LocalGet slot offset 溢出静默归 0(#7a) | **真 silent 误编译**:slot≥2²⁸ 时 `i32::try_from(off).unwrap_or(0)` 静默 load slot-0;改 checked 转换→`Malformed` 错误(两条 emit 路径),4 测试(溢出拒 + 边界 in-range 通过) |
+
+### 核实后判定为「非 bug」,诚实保留(未强改)
+
+- **cli `--trust` 对 cranelift-aot 后端**(#1 另一半):cranelift 用 host-fn **存在性**(`CapabilityVtable` cap_bit→HostFnPtr)gate `#native`;唯一 install 路径需**已填充**的 vtable(grant==注册 host fn)。CLI 不带 host-fn registry,且其路由到 cranelift 的标量 `#main` 源 lower 后**无 CallNative/CheckCap op**——装个 all_granted-but-empty vtable 改变不了任何行为=**假修**。删了死计算 + 修了 Auto 路径的误导注释;真正支持需 host-fn registry + gate-driven vtable builder(跨 crate API,留作 followup)。
+- **object-cache `try_into().unwrap()`**(#3):**provably unreachable**——每处对定宽 `bytes[a..a+4]` 窗口操作,上游长度已 guard;不会 panic。正确保留,另加防御性 malformed-blob 测试(确认只 Err 不 panic)。
+- **llvm `get_insert_block().unwrap()`**(#4):非 bug——inkwell 仅在 builder 无插入块时返 None,而这些点紧跟控制流 lowering、不变量保证有块;内部 codegen 不变量,不可达。
+- **trace-emitter dict `record_len` 默认 0**(#7b):非 bug——文档化的 benign fallback,下游 trace 干净处理。
+- **parser `integrity_algo.take().unwrap()`**(#5):非 bug——`else if is_some() && saw_colon` 在同一栈帧查了 is_some(),不变量成立。
+
+> followup(未做):cli cranelift-aot 的 `--trust`(需 host-fn registry + gate-driven vtable,或 `from_source_with_config` 放宽 `SandboxConfig.capability_check`)——跨 crate API,待立项。
