@@ -583,18 +583,15 @@ fn collect_dict_reorder_edits_cst(
     }
 
     // Stable bucket sort by tier — preserves source-relative order
-    // within each tier. Iterate the four tiers in ascending order
-    // (PrivateMethod → PublicMethod → PrivateField → PublicField).
-    let pieces: Vec<&str> = [
-        PairTier::PrivateMethod,
-        PairTier::PublicMethod,
-        PairTier::PrivateField,
-        PairTier::PublicField,
-    ]
-    .iter()
-    .flat_map(|tier| classified.iter().filter(move |(t, _)| t == tier))
-    .map(|(_, f)| source[dict_field_span(f.syntax())].trim())
-    .collect();
+    // within each tier. Single pass partitions fields into the four
+    // tier buckets (indexed by the PairTier discriminant), then the
+    // buckets are concatenated in ascending tier order (PrivateMethod
+    // → PublicMethod → PrivateField → PublicField).
+    let mut buckets: [Vec<&str>; 4] = Default::default();
+    for (tier, f) in &classified {
+        buckets[*tier as usize].push(source[dict_field_span(f.syntax())].trim());
+    }
+    let pieces: Vec<&str> = buckets.into_iter().flatten().collect();
     let new_body = format!("\n{}\n", pieces.join(",\n"));
     edits.push(SourceEdit {
         range: body_range,
