@@ -242,6 +242,50 @@ impl RecorderState {
         self.next_external_pc = self.next_external_pc.wrapping_add(1);
     }
 
+    /// True while the recorder is still accepting ops — neither
+    /// aborted nor terminated. The recorder is a sticky state machine,
+    /// so once either flag latches this returns `false` for the
+    /// remaining lifetime. Used by the `emit_*` guard checks to bail
+    /// on the sticky state without touching the buffer.
+    fn is_recording(&self) -> bool {
+        self.aborted.is_none() && !self.terminated
+    }
+
+    /// Capacity guard shared by the `emit_*` API surfaces: returns
+    /// `true` (and latches `aborted = TraceTooLong`) when appending one
+    /// more op would exceed the per-trace `capacity` ceiling. Callers
+    /// translate the `true` result into their own early-return value.
+    fn capacity_exceeded(&mut self) -> bool {
+        if self.buffer.op_count() >= self.capacity {
+            self.aborted = Some(AbortReason::TraceTooLong);
+            return true;
+        }
+        false
+    }
+
+    /// Sticky-state + capacity preamble shared by `record_op` and
+    /// `record_op_with_call_effect`. Returns `Some(RecordResult::Abort(..))`
+    /// when the recorder must bail before lowering — already aborted,
+    /// terminated (post-terminator op), or at the per-trace capacity
+    /// ceiling (which latches `aborted = TraceTooLong`). Returns `None`
+    /// on the happy path.
+    fn check_record_preconditions(&mut self) -> Option<RecordResult> {
+        // Short-circuit terminated / aborted state without touching
+        // the buffer. The recorder is a sticky state machine.
+        if let Some(reason) = self.aborted {
+            return Some(RecordResult::Abort(reason));
+        }
+        if self.terminated {
+            return Some(RecordResult::Abort(AbortReason::UnsupportedOp(
+                "PostTerminator",
+            )));
+        }
+        if self.capacity_exceeded() {
+            return Some(RecordResult::Abort(AbortReason::TraceTooLong));
+        }
+        None
+    }
+
     /// Emit a branch-direction guard against `cond_ssa`.
     ///
     /// v6-γ M5: the trace-recording IR walker decides at recording
@@ -263,7 +307,7 @@ impl RecorderState {
         cond_ssa: SsaVar,
         _taken_truthy: bool,
     ) -> Option<GuardKind> {
-        if self.aborted.is_some() || self.terminated {
+        if !self.is_recording() {
             return None;
         }
         if cond_ssa == SsaVar::NONE {
@@ -287,7 +331,7 @@ impl RecorderState {
     /// Returns `Some(GuardKind::IsZero(cond_ssa))` on the happy path,
     /// `None` if the recorder is already aborted / terminated.
     pub fn emit_branch_falsy_guard(&mut self, cond_ssa: SsaVar) -> Option<GuardKind> {
-        if self.aborted.is_some() || self.terminated {
+        if !self.is_recording() {
             return None;
         }
         if cond_ssa == SsaVar::NONE {
@@ -372,11 +416,7 @@ impl RecorderState {
     /// Returns the destination SSA, or `None` if the recorder is in a
     /// sticky abort/terminated state.
     pub fn emit_list_get(&mut self, list_ssa: SsaVar, idx_ssa: SsaVar) -> Option<SsaVar> {
-        if self.aborted.is_some() || self.terminated {
-            return None;
-        }
-        if self.buffer.op_count() >= self.capacity {
-            self.aborted = Some(AbortReason::TraceTooLong);
+        if !self.is_recording() || self.capacity_exceeded() {
             return None;
         }
         self.bump_external_pc();
@@ -454,11 +494,7 @@ impl RecorderState {
         entry_count_hint: Option<u32>,
         record_len_hint: Option<u32>,
     ) -> Option<SsaVar> {
-        if self.aborted.is_some() || self.terminated {
-            return None;
-        }
-        if self.buffer.op_count() >= self.capacity {
-            self.aborted = Some(AbortReason::TraceTooLong);
+        if !self.is_recording() || self.capacity_exceeded() {
             return None;
         }
         self.bump_external_pc();
@@ -501,11 +537,7 @@ impl RecorderState {
     /// Returns the destination SSA, or `None` if the recorder is in a
     /// sticky abort / terminated state.
     pub fn emit_str_concat(&mut self, lhs: SsaVar, rhs: SsaVar) -> Option<SsaVar> {
-        if self.aborted.is_some() || self.terminated {
-            return None;
-        }
-        if self.buffer.op_count() >= self.capacity {
-            self.aborted = Some(AbortReason::TraceTooLong);
+        if !self.is_recording() || self.capacity_exceeded() {
             return None;
         }
         self.bump_external_pc();
@@ -555,11 +587,7 @@ impl RecorderState {
         needle: SsaVar,
         needle_bytes: Option<Vec<u8>>,
     ) -> Option<SsaVar> {
-        if self.aborted.is_some() || self.terminated {
-            return None;
-        }
-        if self.buffer.op_count() >= self.capacity {
-            self.aborted = Some(AbortReason::TraceTooLong);
+        if !self.is_recording() || self.capacity_exceeded() {
             return None;
         }
         self.bump_external_pc();
@@ -615,11 +643,7 @@ impl RecorderState {
     /// silent no-op and returns an empty vec — the caller's walker
     /// already saw the sticky state on the prior op.
     pub fn begin_loop(&mut self, carries: &[LoopCarry]) -> Vec<SsaVar> {
-        if self.aborted.is_some() || self.terminated {
-            return Vec::new();
-        }
-        if self.buffer.op_count() >= self.capacity {
-            self.aborted = Some(AbortReason::TraceTooLong);
+        if !self.is_recording() || self.capacity_exceeded() {
             return Vec::new();
         }
 
@@ -699,7 +723,7 @@ impl RecorderState {
     /// sticky aborted/terminated state or there is no open loop frame.
     /// Mismatched length aborts the recorder with `UnsupportedOp`.
     pub fn end_loop(&mut self, next_values: &[SsaVar]) -> bool {
-        if self.aborted.is_some() || self.terminated {
+        if !self.is_recording() {
             return false;
         }
         let loop_id = match self.open_loops.pop() {
@@ -709,8 +733,7 @@ impl RecorderState {
                 return false;
             }
         };
-        if self.buffer.op_count() >= self.capacity {
-            self.aborted = Some(AbortReason::TraceTooLong);
+        if self.capacity_exceeded() {
             return false;
         }
         self.buffer.append(TraceOp::MarkLoopBack {
@@ -757,17 +780,8 @@ impl RecorderState {
         inputs: &[SsaVar],
         observed: Option<ObservedType>,
     ) -> RecordResult {
-        // Short-circuit terminated / aborted state without touching
-        // the buffer. The recorder is a sticky state machine.
-        if let Some(reason) = self.aborted {
-            return RecordResult::Abort(reason);
-        }
-        if self.terminated {
-            return RecordResult::Abort(AbortReason::UnsupportedOp("PostTerminator"));
-        }
-        if self.buffer.op_count() >= self.capacity {
-            self.aborted = Some(AbortReason::TraceTooLong);
-            return RecordResult::Abort(AbortReason::TraceTooLong);
+        if let Some(abort) = self.check_record_preconditions() {
+            return abort;
         }
 
         // v6-δ M2-B: bump the IR-side PC so any guard the lowering
@@ -792,15 +806,8 @@ impl RecorderState {
         observed: Option<ObservedType>,
         call_effect: TraceEffect,
     ) -> RecordResult {
-        if let Some(reason) = self.aborted {
-            return RecordResult::Abort(reason);
-        }
-        if self.terminated {
-            return RecordResult::Abort(AbortReason::UnsupportedOp("PostTerminator"));
-        }
-        if self.buffer.op_count() >= self.capacity {
-            self.aborted = Some(AbortReason::TraceTooLong);
-            return RecordResult::Abort(AbortReason::TraceTooLong);
+        if let Some(abort) = self.check_record_preconditions() {
+            return abort;
         }
 
         let fresh_dst = self.ssa.alloc();
@@ -1113,7 +1120,7 @@ impl RecorderState {
     /// would push past the per-trace `capacity` ceiling we set
     /// `aborted = TraceTooLong` and bail without touching the buffer.
     fn inject_str_payload_loads(&mut self, haystack: SsaVar) {
-        if self.aborted.is_some() || self.terminated {
+        if !self.is_recording() {
             return;
         }
         if self.buffer.str_payload.contains_key(&haystack) {

@@ -31,7 +31,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::elf_check::{is_et_dyn, parse_elf_type, ElfType};
+use crate::elf_check::{parse_elf_type, ElfType};
 use crate::error::LinkError;
 
 /// Subprocess linker. Reusable: one [`SubprocLinker::new`] discovers
@@ -179,8 +179,11 @@ impl SubprocLinker {
             _ => LinkError::Io(e),
         })?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            // `from_utf8_lossy` borrows the child output (no allocation
+            // unless the bytes contain invalid UTF-8); the owning
+            // conversion is no longer needed since we only read it here.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
             let mut msg = format!("{} exited {}", self.ld_path.display(), output.status);
             if !stderr.is_empty() {
                 msg.push_str("\nstderr:\n");
@@ -199,9 +202,14 @@ impl SubprocLinker {
         drop(in_path);
         drop(out_path);
 
-        if !is_et_dyn(&bytes) {
-            let t = parse_elf_type(&bytes).unwrap_or(ElfType::Other);
-            return Err(LinkError::NotEtDyn(t));
+        // Parse the header once: `is_et_dyn` would re-parse internally,
+        // so match on the type directly and reuse the result for the
+        // error diagnostic. A parse failure keeps the previous
+        // `NotEtDyn(Other)` mapping rather than surfacing `InvalidElf`.
+        match parse_elf_type(&bytes) {
+            Ok(ElfType::Dyn) => {}
+            Ok(other) => return Err(LinkError::NotEtDyn(other)),
+            Err(_) => return Err(LinkError::NotEtDyn(ElfType::Other)),
         }
         Ok(bytes)
     }
