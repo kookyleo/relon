@@ -145,3 +145,29 @@ byte-identical / behavior-preserving 的 7 项。
 2. **align_up / is_valid_rust_ident 跨 crate 去重**:需决定共享 util crate 的归属(可能新建 crate)。
 
 这两项都需要架构/安全层面的人工决定,不宜 unattended 改动。
+
+---
+
+## 架构/安全决策项闭环(DONE,2026-05-31)
+
+上一节「仍未做」的两项,经与用户确认后落地:
+
+### 1. cli `--trust` footgun —— 不再静默无效(`fix(relon-cli)`)
+原状:`--trust` 被 tree-walk + bytecode honor,但 cranelift-AOT 路径(无 host-fn registry 可授权)
+**静默吃掉**该 flag —— 用户敲 `relon run --trust --backend cranelift-aot` 期待打开沙箱却被无声忽略,是 footgun。
+**决策**:不删 flag(它对 tree-walk/bytecode 真有意义),而是让它在不 honor 的后端上**不再静默** ——
+传 `--trust` 且解析到 cranelift-AOT 路径(显式 `--backend cranelift-aot` 或 auto 非平凡路由)时,
+stderr 显式警告「--trust has no effect on the cranelift-AOT backend ...,用 tree-walk/bytecode」,run 仍成功。
+测试:cranelift-aot+`--trust`→出警告且仍跑出正确值;tree-walk+`--trust`→不出警告(它真 honor)。
+> 真正让 cranelift honor `--trust` 仍需 host-fn registry + gate-driven vtable(对当前 CLI 标量 #main moot,
+> 无 native 调用可 gate);留待真有 native-call-on-cranelift 需求时随真实需求设计。
+
+### 2. 跨 crate 去重 —— 新建 `relon-util` leaf crate(`refactor:`)
+`align_up(u32,u32)->u32` 的 3 份字节相同副本(cranelift/llvm/rs-shims)+ `is_valid_rust_ident` 的 2 份
+(rs-build/rs-macro)收口到新的 **leaf crate `relon-util`**(空 `[dependencies]`、无任何 relon-* 依赖 →
+`cargo tree` 证无 cycle)。5 个消费方改依赖、删本地副本;6 个新单测(align 边界 + ident accept/reject 含非 ASCII)。
+异语义同名函数刻意未碰:eval-api `align_up(usize)->Option`、analyzer `validate_identifier`、evaluator
+`is_valid_identifier`(校验 RELON 标识符,规则不同)。proc-macro crate relon-rs-macro 依赖普通 lib crate,构建通过。
+
+至此本轮审计带出的全部可落地项(safe 简化 / correctness / moderate / 跨 crate 去重 / trust footgun)均已处理或
+诚实记录;剩余仅「真正 wire cranelift `--trust`」一项,明确为需真实 native-fn 需求驱动的未来工作。
