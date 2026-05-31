@@ -545,7 +545,10 @@ impl BytecodeEvaluator {
     /// [`relon_codegen_cranelift::trace_install::RecordingRegistration`]
     /// for the recorder.
     pub fn with_fn_id(mut self, fn_id: u32) -> Self {
-        self.func = self.func.clone().with_fn_id(fn_id);
+        // `self.func` is owned here, so stamp the id in place instead of
+        // deep-cloning the whole `BcFunction` just to set one field
+        // (mirrors `BcFunction::with_fn_id`, which only assigns `fn_id`).
+        self.func.fn_id = Some(fn_id);
         self
     }
 

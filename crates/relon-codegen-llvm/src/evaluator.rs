@@ -804,7 +804,13 @@ impl LlvmAotEvaluator {
                     "llvm-aot: fast entry not available; source not Int-only or fast-emit failed"
                         .into(),
             })?;
-        let arity = self.fast_path_arity.unwrap_or(0);
+        // Construction invariant (see the `(Some, None)` arm at the
+        // `fast_entry_ptr`/`fast_path_arity` resolution site): the two
+        // fields are always populated together, so a live
+        // `fast_entry_ptr` guarantees a live `fast_path_arity`.
+        let arity = self
+            .fast_path_arity
+            .expect("fast_entry_ptr is Some, so fast_path_arity must be Some by construction");
         if args.len() != arity {
             return Err(RuntimeError::Unsupported {
                 reason: format!(
@@ -884,7 +890,12 @@ impl LlvmAotEvaluator {
         if self.jit.fast_entry_ptr.is_none() {
             return Ok(None);
         }
-        let arity = self.fast_path_arity.unwrap_or(0);
+        // Construction invariant: `fast_entry_ptr` and `fast_path_arity`
+        // are always populated together, so reaching here (entry ptr is
+        // Some) guarantees the arity is Some as well.
+        let arity = self
+            .fast_path_arity
+            .expect("fast_entry_ptr is Some, so fast_path_arity must be Some by construction");
         if arity != self.param_names.len() {
             // Schema arity mismatch — shouldn't happen if
             // `build_fast_path_profile` agreed, but be defensive.
