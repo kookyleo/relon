@@ -244,6 +244,41 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         Ok(())
     }
 
+    /// `Op::Mod(IrType::F64)` — IEEE-754 float remainder via a libc
+    /// `fmod` call, with the same `DivisionByZero` guard as
+    /// [`Self::emit_div_f64`] (gated by `sandbox.div_check`).
+    ///
+    /// Cranelift has no native float-remainder instruction (x86 has no
+    /// `frem`; LLVM itself lowers `frem` to an `fmod` libcall), so the
+    /// #362 graceful reject is upgraded to a real call against the
+    /// module-declared external `fmod` (`FuncRef` imported per body in
+    /// `lower_module_into`). The JIT path pins that symbol to a Rust
+    /// `a % b` shim (`compile_module_with`); the cranelift-object path
+    /// binds it to process libc at `dlopen`. Both deliver IEEE-754
+    /// truncated remainder — bit-identical to the tree-walker oracle
+    /// (`a.as_f64() % b.as_f64()`) and the LLVM AOT `frem`.
+    ///
+    /// The zero-divisor guard mirrors `emit_div_f64` exactly: the
+    /// tree-walker raises `RuntimeError::DivisionByZero` whenever
+    /// `right.as_f64() == 0.0` *before* the operation, so a Float
+    /// mod-by-zero must trap rather than return NaN. The
+    /// ordered-equal predicate (`FloatCC::Equal`) matches both `+0.0`
+    /// and `-0.0` and declines for NaN, and `cond_trap` routes the
+    /// branch through the typed trap block ahead of the `fmod` call.
+    pub(super) fn emit_mod_f64(&mut self) -> Result<(), CraneliftError> {
+        let b = self.pop()?;
+        let a = self.pop()?;
+        if self.sandbox.div_check {
+            let zero = self.builder.ins().f64const(0.0);
+            let cmp = self.builder.ins().fcmp(FloatCC::Equal, b, zero);
+            self.cond_trap(cmp, TrapKind::DivisionByZero);
+        }
+        let call = self.builder.ins().call(self.fmod_func_ref, &[a, b]);
+        let r = self.builder.inst_results(call)[0];
+        self.push(r);
+        Ok(())
+    }
+
     /// `Op::ConvertI64ToF64` (#359) — pop one `I64` cranelift value and
     /// push its `fcvt_from_sint` (`sitofp`) widening as a native `F64`.
     /// Mirrors the tree-walker's `NumericValue::as_f64()` Int promotion

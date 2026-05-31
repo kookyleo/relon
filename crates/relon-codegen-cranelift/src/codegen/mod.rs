@@ -32,8 +32,8 @@ use std::collections::HashMap;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types::{I32, I64};
 use cranelift_codegen::ir::{
-    AbiParam, Function, GlobalValue, Inst, InstBuilder, MemFlags, SigRef, Signature, UserFuncName,
-    Value as CValue,
+    AbiParam, FuncRef, Function, GlobalValue, Inst, InstBuilder, MemFlags, SigRef, Signature,
+    UserFuncName, Value as CValue,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_codegen::settings::{self, Configurable};
@@ -63,7 +63,7 @@ mod record;
 
 use const_pool::ConstPool;
 use guard::{
-    declare_vtable_data, emit_indirect_host_call, make_cap_lookup_signature,
+    declare_vtable_data, emit_indirect_host_call, make_cap_lookup_signature, make_fmod_signature,
     make_glob_match_signature, make_now_signature, make_raise_trap_signature,
 };
 use hot_counter::emit_hot_counter_inject;
@@ -130,6 +130,20 @@ pub enum EntryShape {
     /// wasm-AOT side. Loads + stores against the in/out buffer go
     /// through the `arena_base + buf_ptr + offset` formula.
     BufferProtocol,
+}
+
+/// `extern "C"` shim the JIT path registers as the `fmod` symbol so
+/// `Op::Mod(IrType::F64)` resolves to Rust's `f64::rem` (`a % b`)
+/// rather than the process libc `fmod` that `dlsym` would otherwise
+/// pick up. Rust's `%` on `f64` already has IEEE-754 fmod semantics
+/// (truncated remainder, sign of the dividend), so this is the exact
+/// same operation the tree-walker oracle runs
+/// (`a.as_f64() % b.as_f64()`) — guaranteeing a bit-identical result.
+/// The `#[no_mangle]`-free naming is fine because the JIT binds the
+/// symbol by the explicit `JITBuilder::symbol("fmod", ...)` address,
+/// not by linker name.
+extern "C" fn relon_fmod(a: f64, b: f64) -> f64 {
+    a % b
 }
 
 /// IR param signature that triggers [`EntryShape::BufferProtocol`].
@@ -259,6 +273,13 @@ pub fn compile_module_with(
     let mut jit_builder =
         JITBuilder::with_isa(isa.clone(), cranelift_module::default_libcall_names());
     crate::trace_install::register_trace_runtime_symbols(&mut jit_builder);
+    // Resolve the `fmod` external symbol referenced by `Op::Mod(F64)`
+    // lowering to a Rust `a % b` shim. The JIT's internal symbol table
+    // is consulted *before* the `dlsym` fallback, so this pins the
+    // result to Rust's `f64::rem` — bit-identical to the tree-walker
+    // oracle (`a.as_f64() % b.as_f64()`) rather than depending on which
+    // libc `fmod` `dlsym(RTLD_DEFAULT, ...)` happens to find.
+    jit_builder.symbol("fmod", relon_fmod as *const u8);
     let mut module = JITModule::new(jit_builder);
 
     let LoweredArtifacts {
@@ -466,6 +487,18 @@ fn lower_module_into<M: CrModule>(
     let cap_lookup_sig = make_cap_lookup_signature(module.target_config().pointer_type());
     let glob_match_sig = make_glob_match_signature(module.target_config().pointer_type());
 
+    // `Op::Mod(IrType::F64)` lowers to a libc `fmod` call — cranelift
+    // has no native float-remainder instruction. Declare the external
+    // `fmod` symbol once on the module (`Linkage::Import`); each
+    // function body imports a `FuncRef` against it (see the per-body
+    // `declare_func_in_func` calls below) and `emit_mod_f64` emits the
+    // direct call. The JIT path registers the `fmod` symbol address in
+    // `compile_module_with`; the cranelift-object path leaves it as an
+    // undefined ELF import bound to process libc at `dlopen`.
+    let fmod_func_id = module
+        .declare_function("fmod", Linkage::Import, &make_fmod_signature())
+        .map_err(|e| CraneliftError::ModuleDefine(format!("declare fmod: {e}")))?;
+
     // Build the entry signature. The exact shape depends on
     // `entry_shape`: legacy IR carries `I64...` user args, while the
     // buffer-protocol IR carries the four wasm handshake i32 slots +
@@ -587,6 +620,11 @@ fn lower_module_into<M: CrModule>(
         let now_sig_ref = builder.import_signature(now_sig.clone());
         let cap_lookup_sig_ref = builder.import_signature(cap_lookup_sig.clone());
         let glob_match_sig_ref = builder.import_signature(glob_match_sig.clone());
+        // Import the `fmod` FuncRef into this body so `emit_mod_f64`
+        // can emit a direct call. Unreferenced when the body has no
+        // `Op::Mod(F64)` — cranelift drops the dead FuncRef and never
+        // looks up the symbol.
+        let fmod_func_ref = module.declare_func_in_func(fmod_func_id, builder.func);
 
         // Pre-allocate the trap block + a block param that carries
         // the i64 trap code. Every guard branches here with its
@@ -608,6 +646,7 @@ fn lower_module_into<M: CrModule>(
             now_sig_ref,
             cap_lookup_sig_ref,
             glob_match_sig_ref,
+            fmod_func_ref,
             pointer_ty,
             frontend_config: module.target_config(),
             entry_shape,
@@ -713,6 +752,10 @@ fn lower_module_into<M: CrModule>(
             let now_sig_ref = builder.import_signature(now_sig.clone());
             let cap_lookup_sig_ref = builder.import_signature(cap_lookup_sig.clone());
             let glob_match_sig_ref = builder.import_signature(glob_match_sig.clone());
+            // Import `fmod` into the lambda body too — a closure
+            // predicate (e.g. a `filter` lambda) may contain a Float
+            // `%`. Dead-stripped when unreferenced.
+            let fmod_func_ref = module.declare_func_in_func(fmod_func_id, builder.func);
 
             let trap_block = builder.create_block();
             builder.append_block_param(trap_block, I64);
@@ -736,6 +779,7 @@ fn lower_module_into<M: CrModule>(
                 now_sig_ref,
                 cap_lookup_sig_ref,
                 glob_match_sig_ref,
+                fmod_func_ref,
                 pointer_ty,
                 frontend_config: module.target_config(),
                 // Lambdas use the LegacyI64Args entry shape for
@@ -954,6 +998,11 @@ struct Codegen<'a, 'b> {
     /// `glob_match` stdlib slot through the vtable rather than
     /// inlining the trap-sentinel IR body.
     glob_match_sig_ref: SigRef,
+    /// `FuncRef` for the libc `fmod` external function, imported into
+    /// the current function body. [`Self::emit_mod_f64`] emits a
+    /// direct `call(fmod_func_ref, [a, b])` to lower
+    /// `Op::Mod(IrType::F64)` — cranelift has no native `frem`.
+    fmod_func_ref: FuncRef,
     pointer_ty: cranelift_codegen::ir::Type,
     /// Target frontend config (pointer width / default call conv).
     /// Threaded through so helpers that call `call_memcpy` get the

@@ -213,13 +213,13 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         match ty {
             IrType::I64 => self.emit_mod_i64(),
             IrType::I32 => self.emit_mod_i32(),
-            // #362: cranelift has no `frem` instruction and no fmod
-            // libcall wired here, so `F64 %` is gracefully rejected —
-            // a clean codegen error, never a panic or a wrong answer.
-            // The LLVM AOT backend handles `Op::Mod(F64)` via `frem`.
-            IrType::F64 => Err(CraneliftError::Codegen(
-                "F64 Mod needs an fmod libcall, unsupported in the cranelift backend".to_string(),
-            )),
+            // Cranelift has no native `frem` instruction (x86 has no
+            // hardware float-remainder; LLVM lowers `frem` to an
+            // `fmod` libcall too). The #362 graceful reject is now a
+            // real call against the module-declared external `fmod`,
+            // guarded by the same Float zero-divisor trap as Float
+            // `/`. See `emit_mod_f64`.
+            IrType::F64 => self.emit_mod_f64(),
             _ => unsupported("Mod"),
         }
     }

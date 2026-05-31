@@ -20,7 +20,7 @@
 //! of the monolithic file so the next phase can iterate on each
 //! independently.
 
-use cranelift_codegen::ir::types::{I32, I64};
+use cranelift_codegen::ir::types::{F64, I32, I64};
 use cranelift_codegen::ir::{
     AbiParam, GlobalValue, Inst, InstBuilder, MemFlags, SigRef, Signature, TrapCode,
     Value as CValue,
@@ -97,6 +97,25 @@ pub(super) fn make_glob_match_signature(pointer_ty: cranelift_codegen::ir::Type)
     sig.params.push(AbiParam::new(I32));
     sig.params.push(AbiParam::new(I32));
     sig.returns.push(AbiParam::new(I32));
+    sig
+}
+
+/// Build the cranelift signature for the libc `fmod` libcall:
+/// `extern "C" fn(a: f64, b: f64) -> f64` (the SysV C ABI). The
+/// cranelift backend has no native float-remainder instruction (x86
+/// has no `frem`; LLVM itself lowers `frem` to this same `fmod`
+/// libcall), so `Op::Mod(IrType::F64)` lowers to a call against this
+/// signature. The JIT path resolves the `fmod` symbol to a Rust
+/// `a % b` shim (see `compile_module_with`) so the result is
+/// bit-identical to the tree-walker's `a.as_f64() % b.as_f64()`; the
+/// cranelift-object path leaves `fmod` as an undefined ELF import the
+/// dynamic linker binds to the process libc at `dlopen` (same IEEE-754
+/// remainder, identical bits).
+pub(super) fn make_fmod_signature() -> Signature {
+    let mut sig = Signature::new(CallConv::SystemV);
+    sig.params.push(AbiParam::new(F64));
+    sig.params.push(AbiParam::new(F64));
+    sig.returns.push(AbiParam::new(F64));
     sig
 }
 
