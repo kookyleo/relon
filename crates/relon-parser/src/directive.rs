@@ -107,3 +107,14 @@ pub fn directive_shape(name: &str) -> Option<DirectiveShape> {
         .iter()
         .find_map(|(n, s)| (*n == name).then_some(*s))
 }
+
+/// True when an `#import` path looks like a URL the remote resolver
+/// chain knows how to handle (`http://` / `https://`). Centralized
+/// here so every layer that classifies import paths — the analyzer's
+/// `--require-hash` scoping, the evaluator's `RemoteHttpResolver`
+/// gating, and the facade's sandboxed-posture short-circuit (including
+/// the wasm32 build, which never links the resolver) — agrees on the
+/// exact same prefix set.
+pub fn is_remote_url(path: &str) -> bool {
+    path.starts_with("https://") || path.starts_with("http://")
+}

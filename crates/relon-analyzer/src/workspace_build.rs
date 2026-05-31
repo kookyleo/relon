@@ -448,7 +448,10 @@ fn prelude_import<L: ModuleLoader>(
     // an unrelated workspace error. Local-path imports are exempt:
     // the supply-chain threat model targets the network, and forcing
     // hashes on every `./util.relon` would penalize day-to-day iteration.
-    if options.require_hash && item.integrity.is_none() && looks_remote(&item.raw_path) {
+    if options.require_hash
+        && item.integrity.is_none()
+        && relon_parser::directive::is_remote_url(&item.raw_path)
+    {
         ws.workspace_diagnostics
             .push(WorkspaceDiagnostic::ImportHashRequired {
                 path: item.raw_path.clone(),
@@ -660,14 +663,6 @@ fn merge_analyzed(
             ws.import_graph.insert(canonical_id, Vec::new());
         }
     }
-}
-
-/// True for paths that resolve via the network resolver chain. Used by
-/// `--require-hash` to scope the enforcement to remote `#import`s; the
-/// local-path supply-chain story is the source repository itself, not
-/// inline pins.
-fn looks_remote(path: &str) -> bool {
-    path.starts_with("https://") || path.starts_with("http://")
 }
 
 /// Compute the hex-encoded digest of `bytes` under `algo`. Centralised

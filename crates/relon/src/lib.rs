@@ -37,6 +37,7 @@ use relon_analyzer::{
 use relon_evaluator::module::RemoteHttpResolver;
 use relon_evaluator::module::{FilesystemModuleResolver, ModuleResolver, StdModuleResolver};
 use relon_evaluator::{Capabilities, Context, TreeWalkEvaluator};
+use relon_parser::directive::is_remote_url;
 use relon_parser::parse_document;
 use relon_parser::TokenRange;
 use serde::de::DeserializeOwned;
@@ -381,14 +382,6 @@ impl ResolverChainLoader {
             has_remote,
         }
     }
-}
-
-/// True when `path` looks like an URL the remote resolver knows how to
-/// handle. Mirrors `RemoteHttpResolver::is_url` but lives here so the
-/// wasm32 build (which never links the resolver) can still classify
-/// paths.
-fn is_remote_url(path: &str) -> bool {
-    path.starts_with("https://") || path.starts_with("http://")
 }
 
 impl ModuleLoader for ResolverChainLoader {

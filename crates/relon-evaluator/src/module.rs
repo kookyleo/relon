@@ -569,7 +569,7 @@ mod remote_http {
         /// emit a clean `RemoteImportDenied` *before* this resolver
         /// gets a chance to fetch.
         pub fn is_url(path: &str) -> bool {
-            path.starts_with("https://") || path.starts_with("http://")
+            relon_parser::directive::is_remote_url(path)
         }
 
         fn fetch(&self, url: &str, range: TokenRange) -> Result<String, RuntimeError> {
