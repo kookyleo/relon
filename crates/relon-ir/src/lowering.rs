@@ -1696,11 +1696,12 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
                 let elem_ty = probe_expr_ir_ty(&items[0], ctx)?;
                 match elem_ty {
                     IrType::F64 => return emit_list_float_literal_materialize(items, range, ctx),
+                    IrType::I64 => return emit_list_int_literal_materialize(items, range, ctx),
                     other => {
                         return Err(LoweringError::UnsupportedExpr {
                             kind: format!(
-                                "List(computed element of type {other:?} — only Float computed \
-                                 list literals are materialised in the AOT envelope)"
+                                "List(computed element of type {other:?} — only Float / Int \
+                                 computed list literals are materialised in the AOT envelope)"
                             ),
                             range,
                         })
@@ -4779,6 +4780,193 @@ fn emit_list_float_literal_materialize(
         range,
     });
     ctx.tstack.push(IrType::ListFloat);
+    Ok(())
+}
+
+/// Symmetric to `emit_list_float_literal_materialize`: materialise a
+/// computed `List<Int>` literal `[e0, e1, .., eN]` (each `ei` an
+/// Int-valued expression that is not a plain literal — so it cannot be
+/// interned as a `ConstListInt`) into a fresh scratch arena record and
+/// leave its arena-relative handle on the vstack tagged
+/// `IrType::ListInt`.
+///
+/// The record layout is byte-identical to the const / range-map
+/// `List<Int>` materialisers (`[len: u32 LE][pad: u32][8-byte
+/// elements...]`, payload at `(base + 4 + 7) & -8`, 8-byte stride), so
+/// the shared 1D index path (`lower_list_int_index` /
+/// `lower_list_index_typed`) and `list.sum` read it unchanged. The only
+/// difference from the Float materialiser is the element store op
+/// (`StoreI64AtAbsolute` instead of `StoreF64AtAbsolute`) and the
+/// element-value coercion (Int stays I64; no I64->F64 conversion).
+///
+/// The element count is a compile-time constant (the literal's length),
+/// so the stores are unrolled — no fill loop. Each element expression is
+/// lowered against the live ctx so closure-body indexed reads / captures
+/// resolve through the normal walker, mirroring the Float path.
+fn emit_list_int_literal_materialize(
+    items: &[Node],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    let count = i32::try_from(items.len()).map_err(|_| LoweringError::UnsupportedExpr {
+        kind: "List<Int>(literal too long for i32 count)".to_string(),
+        range,
+    })?;
+    let base_i = ctx.next_let_idx;
+    let payload_i = ctx.next_let_idx + 1;
+    ctx.next_let_idx += 2;
+
+    // record_size = 8 + 8*count (constant). base = AllocScratchDyn(size).
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(8 + 8 * count),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::AllocScratchDyn,
+        range,
+    });
+    // AllocScratchDyn: [i32 size] -> [i32 base]; tstack stays I32.
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: base_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // header: i32.store(base, count)
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: base_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(count),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::StoreI32AtAbsolute { offset: 0 },
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+
+    // payload = (base + 4 + 7) & -8
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: base_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(4 + 7),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I32),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(-8),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::BitAnd(IrType::I32),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: payload_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // Unrolled element stores. For element `i`:
+    //   addr = payload + i*8   (i32)
+    //   value = <lowered ei>   (i64 on the operand stack)
+    //   i64.store(addr, value)
+    // Stack discipline for StoreI64AtAbsolute: [addr(i32), value(I64)].
+    for (i, item) in items.iter().enumerate() {
+        // addr = payload + i*8
+        ctx.out.push(TaggedOp {
+            op: Op::LetGet {
+                idx: payload_i,
+                ty: IrType::I32,
+            },
+            range,
+        });
+        ctx.tstack.push(IrType::I32);
+        let byte_off = i32::try_from(i * 8).map_err(|_| LoweringError::UnsupportedExpr {
+            kind: "List<Int>(element offset overflow)".to_string(),
+            range,
+        })?;
+        ctx.out.push(TaggedOp {
+            op: Op::ConstI32(byte_off),
+            range,
+        });
+        ctx.tstack.push(IrType::I32);
+        ctx.out.push(TaggedOp {
+            op: Op::Add(IrType::I32),
+            range,
+        });
+        ctx.tstack.pop();
+        ctx.tstack.pop();
+        ctx.tstack.push(IrType::I32);
+
+        // value = lowered element; require it to be Int-shaped (I64).
+        lower_expr(&item.expr, item.range, ctx)?;
+        let elem_ty = ctx
+            .tstack
+            .last()
+            .copied()
+            .ok_or_else(|| LoweringError::UnsupportedExpr {
+                kind: "List<Int>(element produced no value)".to_string(),
+                range: item.range,
+            })?;
+        match elem_ty {
+            IrType::I64 => {}
+            other => {
+                return Err(LoweringError::UnsupportedExpr {
+                    kind: format!("List<Int>(element #{i} lowered to {other:?}, expected Int)"),
+                    range: item.range,
+                });
+            }
+        }
+        ctx.out.push(TaggedOp {
+            op: Op::StoreI64AtAbsolute { offset: 0 },
+            range,
+        });
+        ctx.tstack.pop(); // value (I64)
+        ctx.tstack.pop(); // addr (i32)
+    }
+
+    // Push the materialised list handle (base) tagged ListInt.
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: base_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::ListInt);
     Ok(())
 }
 
@@ -10248,6 +10436,92 @@ mod range_pipeline_tests {
                 .count()
                 == 8,
             "expected `step`'s body to materialise an 8-element List<Float> via 8 f64 stores"
+        );
+    }
+
+    /// Symmetric to the W20 Float lowering shape: a COMPUTED `List<Int>`
+    /// literal `[n, n+1, n*2, n%3+7]` (each element a non-literal Int
+    /// expression over the `#main` arg) must materialise through
+    /// `emit_list_int_literal_materialize` — an `AllocScratchDyn` + an
+    /// i32 length header (`StoreI32AtAbsolute`) + one
+    /// `StoreI64AtAbsolute` PER ELEMENT — and MUST NOT intern as a
+    /// `ConstListInt` (which the LLVM AOT envelope cannot materialise).
+    /// The where-bound list is passed to a closure so the analyzer's
+    /// tuple-index inference doesn't reject it; the exact numeric parity
+    /// against the tree-walker is pinned by the LLVM oracle test
+    /// `llvm_computed_int_list.rs`.
+    #[test]
+    fn computed_int_list_literal_lowers_via_scratch_materialize() {
+        let src = "#unstrict\n\
+             #main(Int n) -> Int\n\
+             f(xs) where {\n\
+               xs: [n, n + 1, n * 2, n % 3 + 7],\n\
+               f(ys): ys[0] + ys[1] + ys[3]\n\
+             }";
+        let module = intern_tests::test_helpers_lower_source(src);
+        let entry = &module.funcs[module.entry_func_index.expect("entry")];
+
+        // The computed `xs` literal materialises in the entry body: at
+        // least one `AllocScratchDyn` (the 4-element record) and exactly
+        // 4 `StoreI64AtAbsolute` element stores (one per element).
+        let alloc_dyn = entry
+            .body
+            .iter()
+            .filter(|t| matches!(t.op, Op::AllocScratchDyn))
+            .count();
+        assert!(
+            alloc_dyn >= 1,
+            "expected the computed List<Int> literal to emit an AllocScratchDyn record, \
+             got {alloc_dyn}"
+        );
+        let i64_stores = entry
+            .body
+            .iter()
+            .filter(|t| matches!(t.op, Op::StoreI64AtAbsolute { .. }))
+            .count();
+        assert_eq!(
+            i64_stores, 4,
+            "expected the 4-element computed List<Int> literal to emit 4 i64 element stores, \
+             got {i64_stores}"
+        );
+        // The i32 length header is stored.
+        let i32_stores = entry
+            .body
+            .iter()
+            .filter(|t| matches!(t.op, Op::StoreI32AtAbsolute { .. }))
+            .count();
+        assert!(
+            i32_stores >= 1,
+            "expected an i32 length header store for the materialised record, got {i32_stores}"
+        );
+
+        // The whole module must NOT contain a `ConstListInt` for this
+        // computed literal — that would mean the const-intern path swallowed
+        // it (the AOT envelope cannot materialise an interned const list).
+        let has_const_list_int = module.funcs.iter().any(|f| {
+            f.body
+                .iter()
+                .any(|t| matches!(t.op, Op::ConstListInt { .. }))
+        });
+        assert!(
+            !has_const_list_int,
+            "computed List<Int> literal must materialise, not intern as ConstListInt"
+        );
+
+        // The materialised handle is tagged ListInt: a `LetSet { ty:
+        // ListInt }` appears (the where-binding slot for `xs`).
+        let has_listint_let = entry.body.iter().any(|t| {
+            matches!(
+                &t.op,
+                Op::LetSet {
+                    ty: IrType::ListInt,
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_listint_let,
+            "expected a ListInt-typed let (the `xs` where-binding carry)"
         );
     }
 }
