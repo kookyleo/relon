@@ -462,8 +462,11 @@ impl<'a> BufferBuilder<'a> {
         // lands. The header itself is 4-byte aligned.
         self.pad_to(4);
         let header_offset = self.bytes.len();
-        self.bytes
-            .extend_from_slice(&u32::try_from(count).unwrap().to_le_bytes());
+        self.bytes.extend_from_slice(
+            &u32::try_from(count)
+                .expect("count already checked <= u32::MAX")
+                .to_le_bytes(),
+        );
         let entries_start = self.bytes.len();
         self.bytes.resize(entries_start + count * 4, 0);
         // Append each String tail record, capturing its offset.

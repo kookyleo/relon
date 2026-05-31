@@ -55,18 +55,18 @@ impl OptimizerPass for ConstFold {
         // the runtime trap path is preserved.
 
         for idx in 0..trace.ops.len() {
-            let op = trace.ops[idx].clone();
-            match op {
+            match &trace.ops[idx] {
                 TraceOp::ConstI32 { dst, value } => {
-                    known.insert(dst, TraceConst::I32(value));
+                    known.insert(*dst, TraceConst::I32(*value));
                 }
                 TraceOp::ConstI64 { dst, value } => {
-                    known.insert(dst, TraceConst::I64(value));
+                    known.insert(*dst, TraceConst::I64(*value));
                 }
                 TraceOp::Add { dst, lhs, rhs }
                 | TraceOp::Sub { dst, lhs, rhs }
                 | TraceOp::Mul { dst, lhs, rhs }
                 | TraceOp::Mod { dst, lhs, rhs } => {
+                    let (dst, lhs, rhs) = (*dst, *lhs, *rhs);
                     if let (Some(ka), Some(kb)) = (known.get(&lhs), known.get(&rhs)) {
                         if let Some(folded) = fold_arith(&trace.ops[idx], *ka, *kb) {
                             apply_fold(trace, &mut known, idx, dst, folded);
@@ -80,6 +80,7 @@ impl OptimizerPass for ConstFold {
                     lhs,
                     rhs,
                 } => {
+                    let (kind, dst, lhs, rhs) = (*kind, *dst, *lhs, *rhs);
                     if let (Some(ka), Some(kb)) = (known.get(&lhs), known.get(&rhs)) {
                         if let Some(result) = fold_cmp(kind, *ka, *kb) {
                             let folded = TraceConst::I32(if result { 1 } else { 0 });

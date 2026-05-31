@@ -207,10 +207,9 @@ impl LoadedObject {
             return Err(LoaderError::Dlopen(msg));
         }
 
-        // Resolve every requested symbol up front. We collect them
-        // even if a later one fails so the diagnostic message names
-        // the first missing symbol, not the last successfully-bound
-        // one.
+        // Resolve every requested symbol up front. Return immediately
+        // upon the first missing symbol so the diagnostic names the
+        // first failure rather than continuing to bind later ones.
         let mut fn_pointers = HashMap::with_capacity(expected_symbols.len());
         for &sym in expected_symbols {
             let cname = CString::new(sym)

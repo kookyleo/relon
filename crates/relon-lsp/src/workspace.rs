@@ -277,19 +277,13 @@ fn attach_workspace_diag(
                     start: offset_to_position(source, range.0),
                     end: offset_to_position(source, range.1),
                 };
-                out.entry(uri.clone()).or_default().push(LspDiagnostic {
-                    range: lsp_range,
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    code: Some(NumberOrString::String(
-                        "relon::workspace::circular_import".to_string(),
-                    )),
-                    code_description: None,
-                    source: Some("relon".to_string()),
-                    message: diag.to_string(),
-                    related_information: None,
-                    tags: None,
-                    data: None,
-                });
+                out.entry(uri.clone())
+                    .or_default()
+                    .push(build_ws_diagnostic(
+                        lsp_range,
+                        "relon::workspace::circular_import",
+                        diag.to_string(),
+                    ));
             }
         }
         WorkspaceDiagnostic::ModuleNotFound { .. }
@@ -340,18 +334,28 @@ fn attach_workspace_diag(
                 }
                 _ => unreachable!(),
             };
-            out.entry(uri.clone()).or_default().push(LspDiagnostic {
-                range: lsp_range,
-                severity: Some(DiagnosticSeverity::ERROR),
-                code: Some(NumberOrString::String(code.to_string())),
-                code_description: None,
-                source: Some("relon".to_string()),
-                message: diag.to_string(),
-                related_information: None,
-                tags: None,
-                data: None,
-            });
+            out.entry(uri.clone())
+                .or_default()
+                .push(build_ws_diagnostic(lsp_range, code, diag.to_string()));
         }
+    }
+}
+
+/// Build an ERROR-severity workspace `LspDiagnostic`, filling in the
+/// constant fields (`source = "relon"`, no code description / related
+/// info / tags / data) so the call sites only supply the parts that
+/// vary per diagnostic variant.
+fn build_ws_diagnostic(range: lsp_types::Range, code: &str, message: String) -> LspDiagnostic {
+    LspDiagnostic {
+        range,
+        severity: Some(DiagnosticSeverity::ERROR),
+        code: Some(NumberOrString::String(code.to_string())),
+        code_description: None,
+        source: Some("relon".to_string()),
+        message,
+        related_information: None,
+        tags: None,
+        data: None,
     }
 }
 

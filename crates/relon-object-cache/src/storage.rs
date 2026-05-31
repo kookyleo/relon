@@ -106,21 +106,10 @@ pub struct CacheEntry {
     pub metadata: Metadata,
 }
 
-/// Lower-case hex encoding of a SHA-256 digest, no `0x` prefix.
-fn hex_lower(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        // `write!` into `String` is infallible so the result is
-        // ignored intentionally.
-        use std::fmt::Write as _;
-        let _ = write!(&mut out, "{:02x}", b);
-    }
-    out
-}
-
 /// Compose the canonical path: `<cache_dir>/<sha_hex><SUFFIX>`.
 pub fn cache_path_for(cache_dir: &Path, source_sha256: [u8; 32]) -> PathBuf {
-    let mut name = hex_lower(&source_sha256);
+    // Lower-case hex encoding of the SHA-256 digest, no `0x` prefix.
+    let mut name = hex::encode(source_sha256);
     name.push_str(CACHE_FILE_SUFFIX);
     cache_dir.join(name)
 }

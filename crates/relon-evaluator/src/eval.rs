@@ -2159,7 +2159,7 @@ impl TreeWalkEvaluator {
     fn eval_closure(
         &self,
         params: &[String],
-        body: &Node,
+        body: &Arc<Node>,
         args: Vec<EvaluatedArg>,
         captured_env: &Arc<Scope>,
         range: TokenRange,
@@ -2223,7 +2223,7 @@ impl TreeWalkEvaluator {
             root_ref: captured_env.root_ref.clone(),
             ..Default::default()
         });
-        let body_arc = Arc::new(body.clone());
+        let body_arc = Arc::clone(body);
         let body_scope = Arc::new(Scope {
             parent: Some(Arc::clone(&bindings_scope)),
             current_dir: bindings_scope.current_dir.clone(),

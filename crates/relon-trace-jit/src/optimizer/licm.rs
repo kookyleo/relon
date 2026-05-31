@@ -125,8 +125,6 @@ impl OptimizerPass for LICM {
 struct LoopRange {
     head_pc: usize,
     back_pc: usize,
-    #[allow(dead_code)]
-    loop_id: u32,
     /// Nesting depth (0 = outermost). Used so we can prefer innermost
     /// loops first.
     depth: usize,
@@ -145,12 +143,11 @@ fn collect_loops(ops: &[TraceOp]) -> Vec<LoopRange> {
             // (the recorder is buggy but we don't want to crash a
             // pipeline run).
             if let Some(pos) = stack.iter().rposition(|(sid, _)| *sid == id) {
-                let (loop_id, head_pc) = stack.remove(pos);
+                let (_, head_pc) = stack.remove(pos);
                 let depth = stack.len(); // depth after pop = nesting under any remaining heads
                 out.push(LoopRange {
                     head_pc,
                     back_pc: pc,
-                    loop_id,
                     depth,
                 });
             }

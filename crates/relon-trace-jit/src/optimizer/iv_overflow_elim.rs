@@ -249,8 +249,6 @@ fn mod_overflow_provably_safe(trace: &TraceBuffer, v: SsaVar) -> bool {
 struct LoopRange {
     head_pc: usize,
     back_pc: usize,
-    #[allow(dead_code)]
-    loop_id: u32,
 }
 
 fn collect_loops(ops: &[TraceOp]) -> Vec<LoopRange> {
@@ -261,11 +259,10 @@ fn collect_loops(ops: &[TraceOp]) -> Vec<LoopRange> {
             stack.push((id, pc));
         } else if let Some(id) = op.loop_back_id() {
             if let Some(pos) = stack.iter().rposition(|(sid, _)| *sid == id) {
-                let (loop_id, head_pc) = stack.remove(pos);
+                let (_, head_pc) = stack.remove(pos);
                 out.push(LoopRange {
                     head_pc,
                     back_pc: pc,
-                    loop_id,
                 });
             }
         }

@@ -28,6 +28,9 @@ hmac = "0.12"
 libc = "0.2"
 # Cryptographically-secure source for the per-installation HMAC key.
 getrandom = "0.2"
+# Lower-case hex encoding of SHA-256 digests for cache file names.
+# Workspace-pinned; same crate relon-evaluator / relon-analyzer use.
+hex = { workspace = true }
 
 [dev-dependencies]
 # Tests build a tiny `.o` with cranelift-object to exercise the
