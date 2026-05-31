@@ -313,9 +313,10 @@ fn main() -> miette::Result<()> {
 /// the backends that act on `--trust`.
 const TRUST_UNSUPPORTED_ON_AOT: &str =
     "[relon-cli] warning: --trust has no effect on the cranelift-AOT backend \
-     (it has no host-fn registry to grant capabilities from); use \
-     --backend tree-walk or --backend bytecode if your program needs \
-     capability-gated native functions.";
+     (single file, no host-fn registry): it grants no runtime native-fn \
+     capability, and the `#import` paths --trust would open are not stitched \
+     by this backend. Use --backend tree-walk or --backend bytecode if your \
+     program relies on --trust.";
 
 fn warn_trust_unsupported_on_aot() {
     eprintln!("{TRUST_UNSUPPORTED_ON_AOT}");
