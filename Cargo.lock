@@ -2024,6 +2024,7 @@ dependencies = [
  "relon-trace-emitter",
  "relon-trace-jit",
  "relon-trace-recorder",
+ "relon-util",
  "serde",
  "serde_json",
  "sha2",
@@ -2046,6 +2047,7 @@ dependencies = [
  "relon-evaluator",
  "relon-ir",
  "relon-parser",
+ "relon-util",
  "thiserror 2.0.18",
 ]
 
@@ -2189,6 +2191,7 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "relon-codegen-llvm",
+ "relon-util",
  "sha2",
 ]
 
@@ -2207,6 +2210,7 @@ version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
+ "relon-util",
  "syn",
 ]
 
@@ -2215,6 +2219,7 @@ name = "relon-rs-shims"
 version = "0.1.0"
 dependencies = [
  "relon-eval-api",
+ "relon-util",
 ]
 
 [[package]]
@@ -2279,6 +2284,10 @@ dependencies = [
  "relon-trace-jit",
  "rustc-hash 1.1.0",
 ]
+
+[[package]]
+name = "relon-util"
+version = "0.1.0"
 
 [[package]]
 name = "relon-wasm-bindings"

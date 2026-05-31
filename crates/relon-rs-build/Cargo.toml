@@ -16,5 +16,7 @@ categories = ["compilers", "development-tools::build-utils"]
 # callers must have LLVM 18 dev headers on the host (env
 # `LLVM_SYS_181_PREFIX`).
 relon-codegen-llvm = { workspace = true }
+# Leaf util: shared `is_valid_rust_ident` identifier check.
+relon-util = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }

@@ -17,6 +17,8 @@ categories = ["compilers"]
 # cranelift crate for now — they'll move down once Phase B widens the
 # LLVM emitter past the legacy-i64 envelope.
 [dependencies]
+# Leaf util: shared `align_up` arena-layout helper.
+relon-util = { workspace = true }
 # IR input
 relon-ir = { workspace = true }
 # Trait Evaluator + shared value types + RuntimeError surface

@@ -78,7 +78,7 @@ pub fn include_relon(input: TokenStream) -> TokenStream {
             }
         },
     };
-    if !is_valid_rust_ident(&alias) {
+    if !relon_util::is_valid_rust_ident(&alias) {
         return syn::Error::new(
             Span::call_site(),
             format!("`{alias}` is not a valid Rust identifier"),
@@ -114,15 +114,4 @@ fn derive_alias_from_path(path: &str) -> Result<String, String> {
         return Err(format!("could not derive identifier from `{path}`"));
     }
     Ok(stem.to_string())
-}
-
-fn is_valid_rust_ident(s: &str) -> bool {
-    let mut chars = s.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return false;
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }

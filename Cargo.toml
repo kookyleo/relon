@@ -114,6 +114,11 @@ relon-test-harness = { path = "crates/relon-test-harness", version = "0.1.0" }
 relon-rs-shims = { path = "crates/relon-rs-shims", version = "0.1.0" }
 relon-rs-build = { path = "crates/relon-rs-build", version = "0.1.0" }
 relon-rs-macro = { path = "crates/relon-rs-macro", version = "0.1.0" }
+# Leaf utility crate: byte-identical helpers (alignment math, Rust
+# identifier checks) deduped out of the codegen / ABI / build crates.
+# Depends on no other relon-* crate so it stays at the bottom of the
+# dep graph.
+relon-util = { path = "crates/relon-util", version = "0.1.0" }
 
 # Default release profile — throughput-tuned. Fat LTO + single
 # codegen unit so the optimizer sees the whole program; downstream

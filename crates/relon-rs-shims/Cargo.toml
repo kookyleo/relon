@@ -22,3 +22,5 @@ categories = ["compilers"]
 # share one writer/reader implementation.
 [dependencies]
 relon-eval-api = { workspace = true }
+# Leaf util: shared `align_up` arena-layout helper.
+relon-util = { workspace = true }

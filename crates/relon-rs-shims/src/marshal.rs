@@ -261,12 +261,12 @@ pub fn call_buffer_entry(
     let in_len = in_bytes.len() as u32;
     let out_root_size = return_root_size;
     let tail_cap: u32 = if return_has_tail { 65_536 } else { 0 };
-    let out_cap = align_up(out_root_size.max(8) + tail_cap + 16, 8);
+    let out_cap = relon_util::align_up(out_root_size.max(8) + tail_cap + 16, 8);
     let const_data_len = u32::try_from(const_data.len())
         .map_err(|_| BufferEntryError::Buffer("const-data section exceeds u32 range".into()))?;
-    let in_ptr = align_up(const_data_len, 8);
-    let out_ptr = align_up(in_ptr + in_len, 8);
-    let scratch_base = align_up(out_ptr + out_cap, 8);
+    let in_ptr = relon_util::align_up(const_data_len, 8);
+    let out_ptr = relon_util::align_up(in_ptr + in_len, 8);
+    let scratch_base = relon_util::align_up(out_ptr + out_cap, 8);
     // 1 MiB scratch matches the LLVM evaluator's figure.
     let scratch_size: u32 = 1_048_576;
     let arena_size = (scratch_base + scratch_size) as usize;
@@ -415,15 +415,6 @@ fn arg_variant_name(arg: &ArgValue<'_>) -> &'static str {
         ArgValue::Bool(_) => "Bool",
         ArgValue::Null => "Null",
         ArgValue::String(_) => "String",
-    }
-}
-
-fn align_up(value: u32, align: u32) -> u32 {
-    let rem = value % align;
-    if rem == 0 {
-        value
-    } else {
-        value + (align - rem)
     }
 }
 

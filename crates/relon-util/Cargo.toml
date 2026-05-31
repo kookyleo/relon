@@ -1,0 +1,18 @@
+[package]
+name = "relon-util"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Leaf utility helpers shared across Relon crates (alignment math, Rust identifier checks)."
+authors = ["kookyleo <kookyleo@gmail.com>"]
+keywords = ["relon", "util"]
+categories = ["compilers"]
+
+# Deliberately depends on **no other** `relon-*` crate so it sits at the
+# very bottom of the workspace dep graph — a true leaf. Adding a relon-*
+# dep here would risk a dependency cycle the moment a consumer wires it
+# back in; reviewers should reject any such change.
+[dependencies]

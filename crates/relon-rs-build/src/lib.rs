@@ -197,7 +197,7 @@ impl Compiler {
                 Some(a) => a.clone(),
                 None => file_stem_or_err(&canonical_path)?,
             };
-            if !is_valid_rust_ident(&alias) {
+            if !relon_util::is_valid_rust_ident(&alias) {
                 return Err(BuildError::InvalidPath(
                     canonical_path,
                     format!("derived identifier `{alias}` is not a valid Rust identifier"),
@@ -347,21 +347,6 @@ fn file_stem_or_err(path: &Path) -> Result<String, BuildError> {
         BuildError::InvalidPath(path.to_path_buf(), "missing file stem".to_string())
     })?;
     Ok(stem.to_string())
-}
-
-/// Lightweight check that a string is a valid Rust identifier
-/// (`[A-Za-z_][A-Za-z0-9_]*`). Phase 1 doesn't reject Rust keywords —
-/// the generated `mod foo { ... }` shape will surface the conflict at
-/// compile time, which is loud enough for the trivial demo path.
-fn is_valid_rust_ident(s: &str) -> bool {
-    let mut chars = s.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return false;
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Compute a stable 8-hex-char prefix mixing the alias + the source

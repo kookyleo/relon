@@ -985,13 +985,13 @@ impl LlvmAotEvaluator {
         } else {
             0
         };
-        let out_cap = align_up(out_root_size.max(8) + tail_cap + 16, 8);
+        let out_cap = relon_util::align_up(out_root_size.max(8) + tail_cap + 16, 8);
         let const_data_len = u32::try_from(self.const_data.len()).map_err(|_| {
             RuntimeError::IoError("llvm const-data section exceeds u32 range".into())
         })?;
-        let in_ptr = align_up(const_data_len, 8);
-        let out_ptr = align_up(in_ptr + in_len, 8);
-        let scratch_base = align_up(out_ptr + out_cap, 8);
+        let in_ptr = relon_util::align_up(const_data_len, 8);
+        let out_ptr = relon_util::align_up(in_ptr + in_len, 8);
+        let scratch_base = relon_util::align_up(out_ptr + out_cap, 8);
         // Scratch region size: 64 KiB matches the cranelift backend's
         // figure; the W3 hot-loop concat writes ~3*N bytes total but
         // the scratch cursor never resets within a dispatch (each
@@ -1380,15 +1380,6 @@ fn build_fast_path_profile(schema: &BufferSchema) -> Result<FastPathProfile, ()>
         arg_offsets,
         ret_offset,
     })
-}
-
-fn align_up(value: u32, align: u32) -> u32 {
-    let rem = value % align;
-    if rem == 0 {
-        value
-    } else {
-        value + (align - rem)
-    }
 }
 
 /// Run LLVM's `-O3` middle-end pipeline on `module`. The host-side

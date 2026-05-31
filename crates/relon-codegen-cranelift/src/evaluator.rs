@@ -1392,13 +1392,13 @@ impl AotEvaluator {
         let in_len = in_bytes.len() as u32;
         let out_cap_min = bs.return_layout.root_size as u32;
         let out_cap_cushion: u32 = 1024;
-        let out_cap = align_up(out_cap_min.max(64) + out_cap_cushion, 8);
+        let out_cap = relon_util::align_up(out_cap_min.max(64) + out_cap_cushion, 8);
 
         let const_data_len = u32::try_from(self.const_data.len()).map_err(|_| {
             RuntimeError::IoError("cranelift const-data section exceeds u32 range".into())
         })?;
-        let in_ptr = align_up(const_data_len, 8);
-        let out_ptr = align_up(in_ptr + in_len, 8);
+        let in_ptr = relon_util::align_up(const_data_len, 8);
+        let out_ptr = relon_util::align_up(in_ptr + in_len, 8);
         // Reserve a scratch region past the output buffer for the
         // memory stdlib (`concat` / `substring` / …) and list
         // materialization (`range().map()` / `_list_filter`) to
@@ -1412,7 +1412,7 @@ impl AotEvaluator {
         // ~n=256. The size is fixed for now; later work can pool /
         // size it from the source when usage gets bigger.
         let scratch_size: u32 = 1_048_576; // 1 MiB
-        let scratch_base = align_up(out_ptr + out_cap, 8);
+        let scratch_base = relon_util::align_up(out_ptr + out_cap, 8);
         let arena_size = scratch_base
             .checked_add(scratch_size)
             .ok_or_else(|| RuntimeError::IoError("cranelift arena size overflow".into()))?;
@@ -1674,17 +1674,6 @@ impl Evaluator for AotEvaluator {
             reason: "cranelift-native AOT backend: first-class closures land in v5-beta-2"
                 .to_string(),
         })
-    }
-}
-
-/// Round `value` up to the next multiple of `align`. `align` is
-/// expected to be a power of two.
-fn align_up(value: u32, align: u32) -> u32 {
-    let rem = value % align;
-    if rem == 0 {
-        value
-    } else {
-        value + (align - rem)
     }
 }
 

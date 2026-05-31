@@ -21,3 +21,7 @@ proc-macro = true
 syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
+# Leaf util: shared `is_valid_rust_ident` identifier check. A
+# proc-macro crate can depend on a normal lib crate for compile-time
+# helpers.
+relon-util = { workspace = true }
