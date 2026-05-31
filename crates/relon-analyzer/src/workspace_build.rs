@@ -260,26 +260,20 @@ fn resolve_cross_module_references(ws: &mut WorkspaceTree) {
     // pass after the borrow tree settles.
     let importer_ids: Vec<String> = ws.modules.keys().cloned().collect();
     for importer_id in importer_ids {
-        let pending = {
+        let (pending, imports) = {
             let Some(tree) = ws.modules.get(&importer_id) else {
                 continue;
             };
             if tree.pending_cross_module_refs.is_empty() {
                 continue;
             }
-            tree.pending_cross_module_refs.clone()
+            (tree.pending_cross_module_refs.clone(), tree.imports.clone())
         };
         let edges = ws
             .import_graph
             .get(&importer_id)
             .cloned()
             .unwrap_or_default();
-        let imports = {
-            let Some(tree) = ws.modules.get(&importer_id) else {
-                continue;
-            };
-            tree.imports.clone()
-        };
 
         let mut resolved: Vec<(relon_parser::NodeId, CrossModuleRef)> = Vec::new();
         for pending_ref in &pending {

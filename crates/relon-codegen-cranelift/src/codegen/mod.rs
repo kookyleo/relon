@@ -162,6 +162,38 @@ fn is_buffer_protocol_signature(params: &[IrType], ret: IrType) -> bool {
     ) && matches!(ret, IrType::I32)
 }
 
+/// Classify an entry function's signature into the shape the lowering
+/// driver should emit. v5-β-2 supports two:
+///   - Buffer-protocol `(I32, I32, I32, I32, I64) -> I32` — what
+///     `lower_workspace_single` synthesises for every user source.
+///   - Legacy `(I64, ..., I64) -> I64` — direct-IR test path.
+///
+/// Anything else surfaces as `UnsupportedSignature` so the host can
+/// pick a different backend.
+///
+/// Shared by [`compile_module_with`] (JIT) and
+/// [`compile_module_to_object_bytes`] (object cache) so the
+/// shape-detection semantics can't drift between the two paths.
+fn detect_entry_shape(params: &[IrType], ret: IrType) -> Result<EntryShape, CraneliftError> {
+    if is_buffer_protocol_signature(params, ret) {
+        return Ok(EntryShape::BufferProtocol);
+    }
+    // Legacy validation: every param must be I64, return must be I64.
+    for (i, param) in params.iter().enumerate() {
+        if !matches!(param, IrType::I64) {
+            return Err(CraneliftError::UnsupportedSignature(format!(
+                "cranelift-native: param #{i} is {param:?} (expected I64 or buffer-protocol shape)"
+            )));
+        }
+    }
+    if !matches!(ret, IrType::I64) {
+        return Err(CraneliftError::UnsupportedSignature(format!(
+            "cranelift-native: return is {ret:?} (expected I64 or buffer-protocol I32)"
+        )));
+    }
+    Ok(EntryShape::LegacyI64Args)
+}
+
 /// Build a cranelift JIT module and lower the IR's entry function
 /// into it. v5-beta-1 only emits one function (the `#main` entry);
 /// auxiliary stdlib bodies the IR references are lowered as inline
@@ -201,33 +233,7 @@ pub fn compile_module_with(
     // each invocation.
     let const_pool = ConstPool::from_module(ir)?;
 
-    // Detect the entry shape. v5-β-2 supports two:
-    //   - Legacy `(I64, ..., I64) -> I64` — direct-IR test path.
-    //   - Buffer-protocol `(I32, I32, I32, I32, I64) -> I32` — what
-    //     `lower_workspace_single` synthesises for every user source.
-    // Anything else falls back to the legacy-shape gate and surfaces
-    // as `UnsupportedSignature` so the host can pick a different
-    // backend.
-    let entry_shape = if is_buffer_protocol_signature(&entry.params, entry.ret) {
-        EntryShape::BufferProtocol
-    } else {
-        // Legacy validation: every param must be I64, return must be
-        // I64.
-        for (i, param) in entry.params.iter().enumerate() {
-            if !matches!(param, IrType::I64) {
-                return Err(CraneliftError::UnsupportedSignature(format!(
-                    "cranelift-native: param #{i} is {param:?} (expected I64 or buffer-protocol shape)"
-                )));
-            }
-        }
-        if !matches!(entry.ret, IrType::I64) {
-            return Err(CraneliftError::UnsupportedSignature(format!(
-                "cranelift-native: return is {:?} (expected I64 or buffer-protocol I32)",
-                entry.ret
-            )));
-        }
-        EntryShape::LegacyI64Args
-    };
+    let entry_shape = detect_entry_shape(&entry.params, entry.ret)?;
 
     // Cranelift ISA + flag setup. We pin `is_pic = false` because the
     // JIT loads code into heap-allocated executable pages and never
@@ -363,24 +369,7 @@ pub fn compile_module_to_object_bytes(
     let entry = &ir.funcs[entry_idx];
     let const_pool = ConstPool::from_module(ir)?;
 
-    let entry_shape = if is_buffer_protocol_signature(&entry.params, entry.ret) {
-        EntryShape::BufferProtocol
-    } else {
-        for (i, param) in entry.params.iter().enumerate() {
-            if !matches!(param, IrType::I64) {
-                return Err(CraneliftError::UnsupportedSignature(format!(
-                    "cranelift-native: param #{i} is {param:?} (expected I64 or buffer-protocol shape)"
-                )));
-            }
-        }
-        if !matches!(entry.ret, IrType::I64) {
-            return Err(CraneliftError::UnsupportedSignature(format!(
-                "cranelift-native: return is {:?} (expected I64 or buffer-protocol I32)",
-                entry.ret
-            )));
-        }
-        EntryShape::LegacyI64Args
-    };
+    let entry_shape = detect_entry_shape(&entry.params, entry.ret)?;
 
     // `is_pic = true` is required for ELF SHARED objects — the dynamic
     // linker `ld.so` refuses to load non-PIC `.so` files. The verifier

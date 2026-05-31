@@ -203,11 +203,11 @@ pub fn format_source(source: &str) -> Result<String, Error> {
     let break_offsets = if edited != source {
         let doc2 = parse_strict(&edited)?;
         let mut out = BTreeSet::new();
-        walk_for_break_offsets_root(&doc2, &edited, &mut out);
+        walk_for_break_offsets_root(&doc2, &mut out);
         out
     } else {
         let mut out = BTreeSet::new();
-        walk_for_break_offsets_root(&doc, source, &mut out);
+        walk_for_break_offsets_root(&doc, &mut out);
         out
     };
 
@@ -518,6 +518,23 @@ fn collect_dict_reorder_edits_root(doc: &Document, source: &str, edits: &mut Vec
     }
 }
 
+/// Thread the directive-body flag down to `child_kind`:
+///   - DIRECTIVE children stay in declaration mode (their inner Dict
+///     is a schema body / main params, whose pair order is semantic).
+///   - DECORATOR args go back to non-directive mode.
+///   - Everything else inherits the current flag.
+///
+/// Shared by [`collect_dict_reorder_edits_cst`] and
+/// [`walk_for_break_offsets_cst`] so the two recursive walkers can't
+/// drift apart.
+fn next_directive_flag(child_kind: SyntaxKind, in_directive_body: bool) -> bool {
+    match child_kind {
+        SyntaxKind::DIRECTIVE => true,
+        SyntaxKind::DECORATOR => false,
+        _ => in_directive_body,
+    }
+}
+
 /// Recursive walker: descends into `node`'s children and emits a
 /// reorder edit for any DICT whose pair tiers aren't already sorted
 /// (and whose body holds no comments — comment placement is brittle
@@ -528,17 +545,10 @@ fn collect_dict_reorder_edits_cst(
     source: &str,
     edits: &mut Vec<SourceEdit>,
 ) {
-    // Recurse into every child, threading the directive-body flag:
-    //   - DIRECTIVE children of `node` stay in declaration mode
-    //     (their inner Dict is a schema body / main params).
-    //   - Decorator args go back to non-directive mode.
-    //   - Everything else inherits the current flag.
+    // Recurse into every child, threading the directive-body flag
+    // (see [`next_directive_flag`]).
     for child in node.children() {
-        let nested_in_dir = match child.kind() {
-            SyntaxKind::DIRECTIVE => true,
-            SyntaxKind::DECORATOR => false,
-            _ => in_directive_body,
-        };
+        let nested_in_dir = next_directive_flag(child.kind(), in_directive_body);
         collect_dict_reorder_edits_cst(&child, nested_in_dir, source, edits);
     }
 
@@ -620,26 +630,21 @@ fn pairs_tier_sorted(classified: &[(PairTier, &ast::DictField)]) -> bool {
 /// [`collect_dict_reorder_edits_root`] in shape: each top-level
 /// directive contributes its declaration-shaped body (which never
 /// produces break offsets); the rest of the document walks normally.
-fn walk_for_break_offsets_root(doc: &Document, source: &str, out: &mut BTreeSet<usize>) {
+fn walk_for_break_offsets_root(doc: &Document, out: &mut BTreeSet<usize>) {
     for child in doc.syntax().children() {
         let in_dir = child.kind() == SyntaxKind::DIRECTIVE;
-        walk_for_break_offsets_cst(&child, in_dir, source, out);
+        walk_for_break_offsets_cst(&child, in_dir, out);
     }
 }
 
 fn walk_for_break_offsets_cst(
     node: &SyntaxNode,
     in_directive_body: bool,
-    source: &str,
     out: &mut BTreeSet<usize>,
 ) {
     for child in node.children() {
-        let nested_in_dir = match child.kind() {
-            SyntaxKind::DIRECTIVE => true,
-            SyntaxKind::DECORATOR => false,
-            _ => in_directive_body,
-        };
-        walk_for_break_offsets_cst(&child, nested_in_dir, source, out);
+        let nested_in_dir = next_directive_flag(child.kind(), in_directive_body);
+        walk_for_break_offsets_cst(&child, nested_in_dir, out);
     }
 
     if in_directive_body {
@@ -667,7 +672,6 @@ fn walk_for_break_offsets_cst(
             out.insert(span.start);
         }
     }
-    let _ = source;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

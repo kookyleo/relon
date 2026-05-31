@@ -792,36 +792,7 @@ impl AotEvaluator {
         // Schema cache write is best-effort, but its absence forces a
         // fallback so we surface failures at `info`.
         let schema_path = crate::schema_cache::schema_cache_path_for(cache_dir, source_hash);
-        if let Err(e) = std::fs::create_dir_all(cache_dir) {
-            tracing::warn!(
-                target: "relon::object_cache",
-                "schema cache create_dir_all failed: {e}"
-            );
-            return;
-        }
-        let tmp = schema_path.with_extension(format!(
-            "tmp.{}.{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ));
-        if let Err(e) = std::fs::write(&tmp, &schema_bytes) {
-            tracing::warn!(
-                target: "relon::object_cache",
-                "schema cache tmp write failed: {e}"
-            );
-            let _ = std::fs::remove_file(&tmp);
-            return;
-        }
-        if let Err(e) = std::fs::rename(&tmp, &schema_path) {
-            tracing::warn!(
-                target: "relon::object_cache",
-                "schema cache rename failed: {e}"
-            );
-            let _ = std::fs::remove_file(&tmp);
-        } else {
+        if Self::atomic_cache_write("schema cache", cache_dir, &schema_path, &schema_bytes) {
             tracing::debug!(
                 target: "relon::object_cache",
                 "schema cache wrote {} bytes to {}",
@@ -831,19 +802,21 @@ impl AotEvaluator {
         }
     }
 
-    /// Fallback path: persist just the IR-cache half when the
-    /// cranelift-object emit step fails. Same atomic-rename
-    /// behaviour as the integration layer.
-    fn write_ir_only(cache_dir: &Path, source_hash: [u8; 32], ir_bytes: &[u8]) {
-        let path = cache_int::ir_cache_path_for(cache_dir, source_hash);
+    /// Best-effort atomic write of `bytes` to `dest`: `create_dir_all`
+    /// the parent `cache_dir`, write to a per-process `tmp.{pid}.{nanos}`
+    /// sidecar, then `rename` into place so a concurrent reader never
+    /// observes a torn file. On any failure the sidecar is removed and a
+    /// `warn!` is emitted prefixed with `label`. Returns `true` iff the
+    /// rename landed.
+    fn atomic_cache_write(label: &str, cache_dir: &Path, dest: &Path, bytes: &[u8]) -> bool {
         if let Err(e) = std::fs::create_dir_all(cache_dir) {
             tracing::warn!(
                 target: "relon::object_cache",
-                "ir-cache-only create_dir_all failed: {e}"
+                "{label} create_dir_all failed: {e}"
             );
-            return;
+            return false;
         }
-        let tmp = path.with_extension(format!(
+        let tmp = dest.with_extension(format!(
             "tmp.{}.{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -851,21 +824,31 @@ impl AotEvaluator {
                 .map(|d| d.subsec_nanos())
                 .unwrap_or(0)
         ));
-        if let Err(e) = std::fs::write(&tmp, ir_bytes) {
+        if let Err(e) = std::fs::write(&tmp, bytes) {
             tracing::warn!(
                 target: "relon::object_cache",
-                "ir-cache-only tmp write failed: {e}"
+                "{label} tmp write failed: {e}"
             );
             let _ = std::fs::remove_file(&tmp);
-            return;
+            return false;
         }
-        if let Err(e) = std::fs::rename(&tmp, &path) {
+        if let Err(e) = std::fs::rename(&tmp, dest) {
             tracing::warn!(
                 target: "relon::object_cache",
-                "ir-cache-only rename failed: {e}"
+                "{label} rename failed: {e}"
             );
             let _ = std::fs::remove_file(&tmp);
+            return false;
         }
+        true
+    }
+
+    /// Fallback path: persist just the IR-cache half when the
+    /// cranelift-object emit step fails. Same atomic-rename
+    /// behaviour as the integration layer.
+    fn write_ir_only(cache_dir: &Path, source_hash: [u8; 32], ir_bytes: &[u8]) {
+        let path = cache_int::ir_cache_path_for(cache_dir, source_hash);
+        Self::atomic_cache_write("ir-cache-only", cache_dir, &path, ir_bytes);
     }
 
     /// Internal helper: lower a source string into an IR module and

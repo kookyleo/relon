@@ -101,22 +101,19 @@ pub fn collect_extends(root: &Node, tree: &mut AnalyzedTree) {
         // Detect conflicts against already-recorded methods (which
         // includes the schema's own `with { ... }` block, prior
         // `#extend` blocks earlier in the file, etc.). Source order
-        // determines which is "first".
-        let mut existing: HashMap<String, TokenRange> = HashMap::new();
-        for m in entry.iter() {
-            existing.entry(m.name.clone()).or_insert(m.name_range);
-        }
+        // determines which is "first", so we scan `entry` itself —
+        // newly accepted methods are pushed below, becoming part of
+        // the in-scope set for the rest of this block.
         for parsed in methods {
-            if let Some(prev_range) = existing.get(&parsed.name) {
+            if let Some(prev) = entry.iter().find(|m| m.name == parsed.name) {
                 tree.diagnostics.push(Diagnostic::MethodNameConflict {
                     schema: name.clone(),
                     method: parsed.name.clone(),
-                    first: span_of(*prev_range),
+                    first: span_of(prev.name_range),
                     second: span_of(parsed.name_range),
                 });
                 continue;
             }
-            existing.insert(parsed.name.clone(), parsed.name_range);
             entry.push(method_info_from_parser(parsed));
         }
     }

@@ -135,6 +135,17 @@ pub mod ratchet {
         claim.contains(&backend)
     }
 
+    /// Build a [`RatchetViolation`], centralising the `case_name` /
+    /// `reason` ownership conversion repeated across every soft-pass
+    /// arm of the `check_*` walkers.
+    fn make_violation(case_name: &str, backend: BackendKind, reason: &str) -> RatchetViolation {
+        RatchetViolation {
+            case: case_name.to_string(),
+            backend,
+            reason: reason.to_string(),
+        }
+    }
+
     /// Validate a two-way [`DiffOutcome`] against the case's
     /// `supported_by` claim list. Returns the single backend that
     /// regressed, or `None` when the outcome matches every claim.
@@ -147,11 +158,7 @@ pub mod ratchet {
             DiffOutcome::MatchOk | DiffOutcome::MatchTrap => None,
             DiffOutcome::CraneliftUnsupported { reason, .. } => {
                 if claims(claim, BackendKind::CraneliftAot) {
-                    Some(RatchetViolation {
-                        case: case_name.to_string(),
-                        backend: BackendKind::CraneliftAot,
-                        reason: reason.clone(),
-                    })
+                    Some(make_violation(case_name, BackendKind::CraneliftAot, reason))
                 } else {
                     None
                 }
@@ -165,11 +172,11 @@ pub mod ratchet {
                 // real reference-impl regression. If the case claims
                 // tree-walk support, treat it as a violation.
                 if claims(claim, BackendKind::TreeWalk) {
-                    Some(RatchetViolation {
-                        case: case_name.to_string(),
-                        backend: BackendKind::TreeWalk,
-                        reason: tree_walk_error.clone(),
-                    })
+                    Some(make_violation(
+                        case_name,
+                        BackendKind::TreeWalk,
+                        tree_walk_error,
+                    ))
                 } else {
                     None
                 }
@@ -189,22 +196,14 @@ pub mod ratchet {
             ThreeWayResult::AllAgree(_) | ThreeWayResult::AllTrap => None,
             ThreeWayResult::TraceJitNotApplicable { reason, .. } => {
                 if claims(claim, BackendKind::TraceJit) {
-                    Some(RatchetViolation {
-                        case: case_name.to_string(),
-                        backend: BackendKind::TraceJit,
-                        reason: reason.clone(),
-                    })
+                    Some(make_violation(case_name, BackendKind::TraceJit, reason))
                 } else {
                     None
                 }
             }
             ThreeWayResult::CraneliftUnsupported { reason, .. } => {
                 if claims(claim, BackendKind::CraneliftAot) {
-                    Some(RatchetViolation {
-                        case: case_name.to_string(),
-                        backend: BackendKind::CraneliftAot,
-                        reason: reason.clone(),
-                    })
+                    Some(make_violation(case_name, BackendKind::CraneliftAot, reason))
                 } else {
                     None
                 }
@@ -213,11 +212,11 @@ pub mod ratchet {
                 tree_walk_error, ..
             } => {
                 if claims(claim, BackendKind::TreeWalk) {
-                    Some(RatchetViolation {
-                        case: case_name.to_string(),
-                        backend: BackendKind::TreeWalk,
-                        reason: tree_walk_error.clone(),
-                    })
+                    Some(make_violation(
+                        case_name,
+                        BackendKind::TreeWalk,
+                        tree_walk_error,
+                    ))
                 } else {
                     None
                 }
@@ -253,35 +252,31 @@ pub mod ratchet {
                 if trace_skip_reason.starts_with("cranelift_unsupported")
                     && claims(claim, BackendKind::CraneliftAot)
                 {
-                    out.push(RatchetViolation {
-                        case: case_name.to_string(),
-                        backend: BackendKind::CraneliftAot,
-                        reason: trace_skip_reason.clone(),
-                    });
+                    out.push(make_violation(
+                        case_name,
+                        BackendKind::CraneliftAot,
+                        trace_skip_reason,
+                    ));
                 } else if trace_skip_reason.starts_with("tree_walk_missing_stdlib_surface")
                     && claims(claim, BackendKind::TreeWalk)
                 {
-                    out.push(RatchetViolation {
-                        case: case_name.to_string(),
-                        backend: BackendKind::TreeWalk,
-                        reason: trace_skip_reason.clone(),
-                    });
+                    out.push(make_violation(
+                        case_name,
+                        BackendKind::TreeWalk,
+                        trace_skip_reason,
+                    ));
                 } else if claims(claim, BackendKind::TraceJit) {
                     // Generic "trace-JIT skipped" branch.
-                    out.push(RatchetViolation {
-                        case: case_name.to_string(),
-                        backend: BackendKind::TraceJit,
-                        reason: trace_skip_reason.clone(),
-                    });
+                    out.push(make_violation(
+                        case_name,
+                        BackendKind::TraceJit,
+                        trace_skip_reason,
+                    ));
                 }
             }
             FourWayResult::BytecodeUnsupported { baseline, reason } => {
                 if claims(claim, BackendKind::Bytecode) {
-                    out.push(RatchetViolation {
-                        case: case_name.to_string(),
-                        backend: BackendKind::Bytecode,
-                        reason: reason.clone(),
-                    });
+                    out.push(make_violation(case_name, BackendKind::Bytecode, reason));
                 }
                 // Plus whatever the embedded three-way says.
                 if let Some(v) = check_three_way(case_name, baseline, claim) {

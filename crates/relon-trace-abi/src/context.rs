@@ -262,16 +262,24 @@ pub struct TraceContext {
 }
 
 impl TraceContext {
-    /// Allocate a context with `slot_count` SSA slots zeroed.
-    pub fn with_capacity(slot_count: usize) -> Self {
+    /// Shared field initialiser for [`Self::with_capacity`] and
+    /// [`Self::with_hooks`]. Allocates `slot_count` zeroed SSA slots
+    /// and installs the supplied [`HostHookTable`]; every other field
+    /// starts at its empty/default sentinel.
+    fn init_with_hooks(slot_count: usize, host_hooks: HostHookTable) -> Self {
         Self {
             ssa_slots: vec![0u64; slot_count].into_boxed_slice(),
             result_slot: 0,
             deopt_state: None,
-            host_hooks: HostHookTable::default(),
+            host_hooks,
             pending_recoverable_writes: Vec::new(),
             dict_lookup_ic: [DictIcSlot::default(); DICT_LOOKUP_IC_SLOT_COUNT],
         }
+    }
+
+    /// Allocate a context with `slot_count` SSA slots zeroed.
+    pub fn with_capacity(slot_count: usize) -> Self {
+        Self::init_with_hooks(slot_count, HostHookTable::default())
     }
 
     /// Allocate a context with `slot_count` slots and the supplied
@@ -286,14 +294,7 @@ impl TraceContext {
     /// revisions that prefer indirect dispatch through the context
     /// can drop the symbol-resolution step without an ABI break.
     pub fn with_hooks(slot_count: usize, host_hooks: HostHookTable) -> Self {
-        Self {
-            ssa_slots: vec![0u64; slot_count].into_boxed_slice(),
-            result_slot: 0,
-            deopt_state: None,
-            host_hooks,
-            pending_recoverable_writes: Vec::new(),
-            dict_lookup_ic: [DictIcSlot::default(); DICT_LOOKUP_IC_SLOT_COUNT],
-        }
+        Self::init_with_hooks(slot_count, host_hooks)
     }
 
     /// Clear all [`DICT_LOOKUP_IC_SLOT_COUNT`] dict-lookup IC slots
