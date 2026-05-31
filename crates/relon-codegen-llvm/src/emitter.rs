@@ -2916,15 +2916,20 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// i64 bit patterns; we bit-cast to `double`, run the matching
     /// `build_float_*`, and bit-cast the result back to i64 bits so the
     /// virtual stack stays integer-typed (Option B — no enum StackVal
-    /// rewrite). `Mod` has no float analogue and is rejected here
-    /// (lowering already declines `%` on F64, so this is defence in
-    /// depth rather than a reachable path).
+    /// rewrite).
     ///
-    /// `Div` carries a float-zero trap guard: the tree-walker oracle
-    /// raises `DivisionByZero` whenever the divisor compares equal to
-    /// `0.0` (which `OEQ` matches for both `+0.0` and `-0.0`, and
-    /// declines for `NaN`), so the JIT must trap on the same operands
-    /// rather than producing IEEE ±inf.
+    /// #362: `Mod` lowers to `frem`, which on every supported target
+    /// lowers to the C `fmod` (truncated remainder, sign of the
+    /// dividend) — bit-identical to Rust's `f64 %`, i.e. the
+    /// tree-walker's `a.as_f64() % b.as_f64()`.
+    ///
+    /// Both `Div` and `Mod` carry a float-zero trap guard: the
+    /// tree-walker oracle (`eval_numeric_division`) raises
+    /// `DivisionByZero` whenever the divisor compares equal to `0.0`
+    /// *before* the `/` or `%` runs (which `OEQ` matches for both
+    /// `+0.0` and `-0.0`, and declines for `NaN`), so the JIT must trap
+    /// on the same operands rather than producing IEEE ±inf (`/`) or
+    /// `NaN` (`%`).
     fn emit_binop_f64(
         &mut self,
         op: BinOp,
@@ -2942,7 +2947,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .build_bit_cast(b, f64_t, &self.next_name("fbin_b"))
             .map_err(|e| LlvmError::Codegen(format!("{} f64 rhs bitcast: {e}", op.name())))?
             .into_float_value();
-        if matches!(op, BinOp::Div) {
+        if matches!(op, BinOp::Div | BinOp::Mod) {
             let zero = f64_t.const_zero();
             let cmp_name = self.next_name("fdivz_cmp");
             let is_zero = self
@@ -2955,7 +2960,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 .build_conditional_branch(is_zero, trap_bb, cont_bb)
                 .map_err(|e| LlvmError::Codegen(format!("f64 divz branch: {e}")))?;
             self.builder.position_at_end(trap_bb);
-            self.emit_llvm_trap_call("fdiv")?;
+            self.emit_llvm_trap_call(op.name())?;
             self.builder
                 .build_unreachable()
                 .map_err(|e| LlvmError::Codegen(format!("f64 divz unreachable: {e}")))?;
@@ -2967,7 +2972,10 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             BinOp::Sub => self.builder.build_float_sub(af, bf, &name),
             BinOp::Mul => self.builder.build_float_mul(af, bf, &name),
             BinOp::Div => self.builder.build_float_div(af, bf, &name),
-            BinOp::Mod | BinOp::BitAnd => {
+            // #362: `frem` lowers to `fmod` (truncated remainder, sign
+            // of the dividend) — bit-identical to Rust's `f64 %`.
+            BinOp::Mod => self.builder.build_float_rem(af, bf, &name),
+            BinOp::BitAnd => {
                 return Err(LlvmError::Codegen(format!(
                     "{} not defined for F64 operands",
                     op.name()

@@ -7573,19 +7573,21 @@ fn lower_binary(
         ctx.tstack
             .pop()
             .ok_or(LoweringError::UnsupportedOperator { op, range })?;
-        // Int↔Float promotion (#359): mirror the tree-walker's
+        // Int↔Float promotion (#359 / #362): mirror the tree-walker's
         // `NumericValue::as_f64()` — when one operand is `Int` and the
         // other `Float`, the `Int` operand is widened to `f64` and the
-        // binop runs as `F64`, result `Float`. Only `Add` / `Sub` /
-        // `Mul` / `Div` promote; `Mod` keeps its same-type discipline
-        // (the tree-walker's Int↔Float `%` is not produced by the
-        // targeted programs and `f64` mod is rejected below anyway).
+        // binop runs as `F64`, result `Float`. `Add` / `Sub` / `Mul` /
+        // `Div` / `Mod` all promote: the tree-walker's
+        // `eval_numeric_division` computes `a.as_f64() % b.as_f64()`
+        // (Rust f64 `%` = `fmod`, truncated remainder, sign of the
+        // dividend) for any non-`Int`/`Int` `%`, so mixed `Int`/`Float`
+        // `%` widens here and lowers to `Op::Mod(F64)` below.
         let mixed_promote = matches!(
             (lhs_ty, rhs_ty),
             (IrType::I64, IrType::F64) | (IrType::F64, IrType::I64)
         ) && matches!(
             op,
-            Operator::Add | Operator::Sub | Operator::Mul | Operator::Div
+            Operator::Add | Operator::Sub | Operator::Mul | Operator::Div | Operator::Mod
         );
         if mixed_promote {
             if lhs_ty == IrType::I64 {
@@ -7642,10 +7644,13 @@ fn lower_binary(
         if !matches!(lhs_ty, IrType::I64 | IrType::F64) {
             return Err(LoweringError::UnsupportedOperator { op, range });
         }
-        // Mod on F64 is unsupported (wasm has no `f64.rem`).
-        if lhs_ty == IrType::F64 && matches!(op, Operator::Mod) {
-            return Err(LoweringError::UnsupportedOperator { op, range });
-        }
+        // #362: `F64 % F64` lowers to `Op::Mod(F64)` (and so does the
+        // promoted-mixed `%` above) to match the tree-walker, which
+        // computes `a.as_f64() % b.as_f64()`. Backends that lack a
+        // native float remainder (wasm has no `f64.rem`; cranelift has
+        // no `frem` and no fmod libcall wired) gracefully reject
+        // `Op::Mod(F64)` at codegen — never a panic, never a wrong
+        // answer. The LLVM AOT lowers it to `frem` (= `fmod`).
         ctx.out.push(TaggedOp {
             op: ir_op_ctor(lhs_ty),
             range,

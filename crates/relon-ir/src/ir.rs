@@ -516,9 +516,14 @@ pub enum Op {
     /// `I64` lowers to `i64.div_s` (signed); `F64` lowers to `f64.div`.
     Div(IrType),
     /// Pop two operands of the tagged type, push the remainder.
-    /// `I64` lowers to `i64.rem_s` (signed); `F64` is rejected at
-    /// lowering — wasm has no `f64.rem`, so `LoweringError::UnsupportedOperator`
-    /// fires before this variant is even constructed for floats.
+    /// `I64` lowers to `i64.rem_s` (signed). #362: `F64` lowers to the
+    /// LLVM `frem` (= C `fmod`, truncated remainder, sign of the
+    /// dividend — bit-identical to Rust's `f64 %`, i.e. the
+    /// tree-walker). Backends without a native float remainder — wasm
+    /// (no `f64.rem`) and cranelift (no `frem` / no fmod libcall wired)
+    /// — gracefully reject `Op::Mod(F64)` at codegen (a clean
+    /// `UnsupportedOp` / `CraneliftError::Codegen`, never a panic or a
+    /// wrong answer).
     Mod(IrType),
     /// Phase 4.c-2: bitwise AND on two operands of the tagged type.
     /// Stack effect: `[T, T] -> [T]`. Only `I32` / `I64` are valid;
@@ -540,9 +545,11 @@ pub enum Op {
     /// Backend lowering: cranelift `fcvt_from_sint`, wasm `f64.convert_i64_s`,
     /// LLVM `sitofp` then bitcast to i64-bits (the AOT/cranelift/wasm
     /// f64-rides-on-i64-bits convention), bytecode `(x as i64 as f64).to_bits()`.
-    /// `f64` mod stays rejected at lowering (the tree-walker has no Int↔Float
-    /// `%` in the targeted programs), so this op only feeds the four
-    /// promoting binops.
+    /// #362: `%` joins `Add` / `Sub` / `Mul` / `Div` as a promoting binop
+    /// (mixed `Int`/`Float` `%` widens the `Int` operand here and lowers to
+    /// `Op::Mod(F64)`); LLVM emits `frem` (`fmod`), while cranelift / wasm —
+    /// which have no native float remainder — gracefully reject `Op::Mod(F64)`
+    /// at codegen.
     ConvertI64ToF64,
     /// Pop two operands of the tagged type, push the boolean result.
     /// Stack: `[T, T] -> [Bool]`. Lowers to `i64.eq` / `f64.eq` /

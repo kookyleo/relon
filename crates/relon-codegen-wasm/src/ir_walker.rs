@@ -1973,10 +1973,15 @@ impl<'a> EmitState<'a> {
             }
 
             // ----- Scope-cut: Float arithmetic -----------------------
+            // #362: `Op::Mod(F64)` joins the cut explicitly. wasm has no
+            // `f64.rem` instruction (and no fmod libcall wired), so it is
+            // gracefully rejected like the rest of F64 arithmetic — a
+            // clean `UnsupportedOp`, never a panic or a wrong answer.
             Op::Add(IrType::F64)
             | Op::Sub(IrType::F64)
             | Op::Mul(IrType::F64)
             | Op::Div(IrType::F64)
+            | Op::Mod(IrType::F64)
             | Op::Eq(IrType::F64)
             | Op::Ne(IrType::F64)
             | Op::Lt(IrType::F64)
