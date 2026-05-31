@@ -73,6 +73,63 @@ fn backends_produce_identical_output() {
     assert_eq!(tw, aot, "tree-walk vs cranelift-aot output differs");
 }
 
+/// `--trust` is honoured by tree-walk + bytecode but is a no-op on the
+/// cranelift-AOT backend (no host-fn registry to grant capabilities
+/// from). It must NOT be silently dropped: the CLI warns on stderr so
+/// the operator is not misled, while the run still succeeds. tree-walk,
+/// which DOES honour `--trust`, must not emit that warning.
+#[test]
+fn trust_on_cranelift_aot_warns_but_still_runs() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-trust-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(&path, "#main(Int x) -> Int\nx * 2\n").expect("write fixture");
+
+    let run = |backend: &str| -> (String, String) {
+        let out = Command::new(BINARY)
+            .arg("run")
+            .arg(&path)
+            .arg("--trust")
+            .arg("--backend")
+            .arg(backend)
+            .arg("--args")
+            .arg(r#"{"x": 21}"#)
+            .output()
+            .expect("spawn relon CLI");
+        assert!(
+            out.status.success(),
+            "CLI exited non-zero for {backend} --trust: stderr={}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        (
+            String::from_utf8(out.stdout).expect("utf-8 stdout"),
+            String::from_utf8(out.stderr).expect("utf-8 stderr"),
+        )
+    };
+
+    let (aot_out, aot_err) = run("cranelift-aot");
+    assert_eq!(
+        aot_out.trim(),
+        "42",
+        "cranelift-aot --trust still runs: {aot_out:?}"
+    );
+    assert!(
+        aot_err.contains("--trust has no effect on the cranelift-AOT backend"),
+        "cranelift-aot must warn that --trust is a no-op; stderr was: {aot_err:?}"
+    );
+
+    let (tw_out, tw_err) = run("tree-walk");
+    assert_eq!(tw_out.trim(), "42", "tree-walk --trust runs: {tw_out:?}");
+    assert!(
+        !tw_err.contains("--trust has no effect"),
+        "tree-walk honours --trust and must not emit the no-op warning; stderr: {tw_err:?}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
 /// v6-fix-D2 cold-start: `--lite` forces tree-walk and skips the
 /// core-carrier analyzer pass. For a `#main(Int x) -> Int : x * 2`
 /// shape the answer must match the default path exactly. This is a

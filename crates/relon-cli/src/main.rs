@@ -306,6 +306,21 @@ fn main() -> miette::Result<()> {
 /// further by phase). Returns `Err` for any operator-facing failure
 /// (parse / analyze / runtime / IO) — `main` propagates straight
 /// through.
+/// Warning emitted when `--trust` is passed but the resolved execution
+/// path is the cranelift-AOT backend, which the CLI cannot honour it on
+/// (no host-fn registry to grant capabilities from). Surfacing this
+/// keeps the flag from being a silent no-op: tree-walk and bytecode are
+/// the backends that act on `--trust`.
+const TRUST_UNSUPPORTED_ON_AOT: &str =
+    "[relon-cli] warning: --trust has no effect on the cranelift-AOT backend \
+     (it has no host-fn registry to grant capabilities from); use \
+     --backend tree-walk or --backend bytecode if your program needs \
+     capability-gated native functions.";
+
+fn warn_trust_unsupported_on_aot() {
+    eprintln!("{TRUST_UNSUPPORTED_ON_AOT}");
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_run(
     file: PathBuf,
@@ -781,6 +796,12 @@ fn cmd_run(
                         ))
                     })?
                 } else {
+                    // Non-trivial `auto` routes through cranelift-AOT,
+                    // which does not honour `--trust` (see the
+                    // `CraneliftAot` arm) — warn rather than silently drop.
+                    if trust {
+                        warn_trust_unsupported_on_aot();
+                    }
                     let cache_dir = relon_codegen_cranelift::default_cache_dir();
                     // Cache-hit fast path: pull a matching
                     // pair off disk if present. Any soft
@@ -860,6 +881,10 @@ fn cmd_run(
                 // change no behaviour. The bytecode backend below
                 // does honour `--trust` because its policy boundary
                 // (`with_capability_gate`) accepts a gate directly.
+                // Surface the no-op rather than silently dropping the flag.
+                if trust {
+                    warn_trust_unsupported_on_aot();
+                }
                 let aot = AotEvaluator::from_source(&content).map_err(|e| {
                     miette::miette!("cranelift-aot backend setup: {e}")
                         .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
