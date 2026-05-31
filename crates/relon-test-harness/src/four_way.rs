@@ -14,7 +14,9 @@ use std::collections::HashMap;
 use relon::{new_evaluator, Backend, BackendError};
 use relon_eval_api::{RuntimeError, Value};
 
-use crate::three_way::{diff_test_3way, ThreeWayError, ThreeWayResult};
+use crate::three_way::{
+    diff_test_3way, ThreeWayError, ThreeWayResult, REASON_TRACE_JIT_SKIPPED_TRAP,
+};
 
 /// Outcome of one 4-way diff invocation.
 #[derive(Debug)]
@@ -151,7 +153,7 @@ fn classify_four_way(
         // VM trapped too, count this as AllTrap — three real
         // backends agreed on a trap envelope.
         (ThreeWayResult::TraceJitNotApplicable { reason, .. }, Err(_))
-            if reason.starts_with("trace_jit_skipped_trap") =>
+            if reason.starts_with(REASON_TRACE_JIT_SKIPPED_TRAP) =>
         {
             FourWayResult::AllTrap
         }

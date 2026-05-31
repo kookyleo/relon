@@ -78,9 +78,11 @@ impl ExternalSlot {
     /// payload base first, then indexes off of it using this value.
     pub fn byte_offset(self) -> i32 {
         // 32-bit slot id * 8 bytes per slot; trace lengths are bounded
-        // far below 2^28 so the multiplication can never overflow
-        // i32 in practice. We cast through i64 defensively.
-        ((self.0 as i64) * (Self::SLOT_WIDTH_BYTES as i64)) as i32
+        // far below 2^28 so the multiplication can never overflow i32
+        // in practice. `wrapping_mul` keeps the low 32 bits, matching the
+        // truncating `as i32` of an i64 product bit-for-bit, and
+        // self-documents that wrapping is safe here.
+        (self.0 as i32).wrapping_mul(Self::SLOT_WIDTH_BYTES)
     }
 
     /// Recover the raw u32 index, e.g. for serialisation.

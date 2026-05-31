@@ -35,6 +35,13 @@ use relon_eval_api::{RuntimeError, Value};
 use relon_ir::{IrType, Op, TaggedOp};
 use relon_parser::TokenRange;
 
+/// Reason-string prefix stamped onto [`ThreeWayResult::TraceJitNotApplicable`]
+/// when tree-walk + cranelift both trapped equivalently but the trace-JIT
+/// synthesised a value. [`crate::four_way`] keys the trap-on-trap envelope
+/// off this prefix, so the two sites must agree — sharing the const keeps
+/// the producer/consumer in lockstep.
+pub(crate) const REASON_TRACE_JIT_SKIPPED_TRAP: &str = "trace_jit_skipped_trap";
+
 /// Outcome of one three-way diff_test_3way invocation.
 #[derive(Debug)]
 pub enum ThreeWayResult {
@@ -163,7 +170,7 @@ pub fn diff_test_3way(
                     Ok(_) => Ok(ThreeWayResult::TraceJitNotApplicable {
                         baseline: Value::Null,
                         reason: format!(
-                            "trace_jit_skipped_trap: tw={tw_err:?} cr={cr_err:?} trace={:?}",
+                            "{REASON_TRACE_JIT_SKIPPED_TRAP}: tw={tw_err:?} cr={cr_err:?} trace={:?}",
                             trace_outcome.as_ref().ok()
                         ),
                     }),
