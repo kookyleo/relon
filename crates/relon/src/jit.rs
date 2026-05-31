@@ -71,7 +71,7 @@
 //! through tiers as the workload turns out to be hot."
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[cfg(feature = "cranelift-aot")]
 use relon_codegen_cranelift::TraceContext;
@@ -315,7 +315,7 @@ struct TraceFixtureInstalled {
     /// Bundles the packed-args buffer alongside the context so the same
     /// lock acquire covers both the `pack` writeback and the trace
     /// invoke — host-side glue stays one CAS per `run_main`.
-    state: Mutex<TraceFixtureCallState>,
+    state: std::sync::Mutex<TraceFixtureCallState>,
     pack: TraceFixturePackFn,
     fallback: TraceFixtureFallbackFn,
     decode: TraceFixtureDecodeFn,
@@ -457,7 +457,7 @@ impl JitEvaluator {
         self.fixture = Some(TraceFixtureInstalled {
             fn_id,
             slot_count: fixture.slot_count,
-            state: Mutex::new(TraceFixtureCallState { ctx, packed }),
+            state: std::sync::Mutex::new(TraceFixtureCallState { ctx, packed }),
             pack: fixture.pack,
             fallback: fixture.fallback,
             decode: fixture.decode,
