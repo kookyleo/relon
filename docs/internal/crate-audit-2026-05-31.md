@@ -105,3 +105,43 @@
 - **parser `integrity_algo.take().unwrap()`**(#5):非 bug——`else if is_some() && saw_colon` 在同一栈帧查了 is_some(),不变量成立。
 
 > followup(未做):cli cranelift-aot 的 `--trust`(需 host-fn registry + gate-driven vtable,或 `from_source_with_config` 放宽 `SandboxConfig.capability_check`)——跨 crate API,待立项。
+
+---
+
+## moderate/risky + cross-crate dedup 轮(DONE,2026-05-31)— verify-then-fix
+
+对 26 项 moderate/risky 简化 finding + 跨 crate 去重逐项 verify-then-fix(5 lane + 对抗审查全 accept)。
+**moderate-risk 多数被正确保守跳过**(跨 crate 结构改 / public API / 行为改变 / 推测性重构);只落地经核实
+byte-identical / behavior-preserving 的 7 项。
+
+### 已落地(4 commit;M2 lane 核实后零提交 = 正确)
+
+| commit | 内容 |
+|---|---|
+| `7a908521` | bytecode `with_fn_id` 去 `BcFunction` 深拷(直接赋 `fn_id` 字段);llvm fast-path arity `unwrap_or(0)`→`.expect` 标注共populate 不变量 |
+| `8012e3c8` | relon-fmt dict reorder tier 分桶 4 遍 flat_map→单遍 partition(依赖既有 `PairTier` discriminant,输出 byte-identical) |
+| `19a75f46` | test-harness trap-reason magic string 抽 `pub(crate) const` 去重;trace-abi slot `byte_offset` i64-cast 链→`wrapping_mul`(bit-identical) |
+| `2b81c70f` | `is_remote_url`(http(s) 前缀检测)收口到 **relon-parser**(relon/analyzer/evaluator 三调用方均已 dep,无新 dep 边、无 cycle),替换 3 处重复 |
+
+### 核实后保守跳过(不强改,记录原因)
+
+- **eval-api/evaluator 的 `Scope` Locals/Thunks `Mutex<HashMap>`→`Arc<Mutex>` CoW**(M2,4 项):core `Scope`
+  类型的跨 crate 结构改;`child()`/`list_element_scope` 刻意建空 map 以隔离父子写 + 支撑 `&prev/&next`
+  兄弟解析,Arc-share 会改 aliasing 语义 —— **非 behavior-preserving**。
+- **eval-api `RuntimeError` 变体形状改**(risky):public API + 文档声明双surface 是有意的。
+- **bytecode `compile.rs` stack-recipe/branch-stack 快照 clone**(M1,2 项):deopt/resume PC-对齐的承重数据,
+  Cow/sparse 重写是推测性算法重构、corruption 风险高、仅编译期、收益不明。
+- **codegen-wasm bench-corpus emit_w* 抽取**:那 6 个函数是 bench workload(W1/W2/W6/W8/W9/W10)带 honesty
+  不变量,reuse 重构会改被测 bytecode —— 零收益。
+- **object-link triple 校验收紧 / target-lexicon 升 prod dep**:刻意改 accept/reject 集 = 行为改变,
+  现启发式是有意的 CI 政策。
+- **align_up / is_valid_rust_ident 去重**:无 clean 共享 home(需新建 crate 或有 cycle 风险)——
+  与下方 followup 同,留作结构决策。
+
+### 仍未做(需架构/安全决策,非自动化范围)
+
+1. **cli cranelift-aot `--trust`**:需 host-fn registry + gate-driven vtable(或 `from_source_with_config`
+   放宽 `SandboxConfig.capability_check`);且对 CLI 当前标量 `#main`(无 native 调用)而言 moot —— 安全敏感,需设计决策。
+2. **align_up / is_valid_rust_ident 跨 crate 去重**:需决定共享 util crate 的归属(可能新建 crate)。
+
+这两项都需要架构/安全层面的人工决定,不宜 unattended 改动。
