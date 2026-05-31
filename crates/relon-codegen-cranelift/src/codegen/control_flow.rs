@@ -443,16 +443,13 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         let else_block = self.builder.create_block();
         let join_block = self.builder.create_block();
 
-        let cr_ty = match result_ty {
-            IrType::I64 => I64,
-            IrType::I32 | IrType::Bool | IrType::Null => I32,
-            _ => {
-                return Err(CraneliftError::Codegen(format!(
-                    "If result_ty {:?} unsupported in v5-beta-1",
-                    result_ty
-                )))
-            }
-        };
+        // Mirror `emit_block`'s widened type map: native `F64` joins,
+        // i64/i32 scalars, and the i32 arena-handle leaves (String /
+        // List* / Closure). W20's `pair_force`/`accel` ternaries yield
+        // native `F64`; the list-valued reduce body yields a `ListFloat`
+        // i32 handle. The shared `ir_ty_to_cl` is the single source of
+        // truth for the IR-type -> clif-type mapping.
+        let cr_ty = ir_ty_to_cl(result_ty)?;
         self.builder.append_block_param(join_block, cr_ty);
 
         self.builder
