@@ -734,9 +734,11 @@ fn cmd_run(
         // cranelift cold-start at all). The second `relon
         // run` of the same source therefore lands on the
         // dlopen path — closing the lap on
-        // `--lite`'s tree-walker time. Trust is honoured by
-        // capability bitmap flipping inside the cranelift
-        // evaluator.
+        // `--lite`'s tree-walker time. Note: `--trust` does not
+        // affect the cranelift-AOT leg of this path (see the
+        // `BackendArg::CraneliftAot` arm for why); the only
+        // trivial-scalar sources routed here carry no guarded
+        // `#native` op, so trust is a no-op on those shapes.
         //
         // v6-fix-D2: `--lite` forces tree-walk for the
         // `#main(...)` path too. The lower / JIT path
@@ -838,18 +840,26 @@ fn cmd_run(
                 // workspace-aware multi-file imports remain
                 // a v5-γ target for the cranelift backend.
                 //
-                // `--trust` flips the capability bitmap from
-                // the zero-trust default to `Capabilities::
-                // all_granted` so guarded `#native` calls
-                // pass the codegen-emitted `check_cap`
-                // prologue. Without it the prologue traps
-                // with `WasmCapabilityDenied { cap_bit }`,
-                // matching the tree-walker's sandbox shape.
-                let _caps = if trust {
-                    relon_eval_api::Capabilities::all_granted()
-                } else {
-                    relon_eval_api::Capabilities::default()
-                };
+                // `--trust` cannot be honoured on this backend
+                // yet: cranelift gates a guarded `#native` call by
+                // looking the host fn up in the `CapabilityVtable`
+                // (a `cap_bit → HostFnPtr` map) and trapping
+                // `WasmCapabilityDenied` on a null slot. Granting a
+                // capability therefore means *registering a host
+                // fn* via `install_capabilities_mut` /
+                // `register_via_gate`, and the CLI ships no host-fn
+                // registry — so there is nothing to grant. The
+                // scalar `#main` envelope the CLI routes here also
+                // lowers to no `CallNative` / `CheckCap` op, so the
+                // gate never fires regardless of the trust flag.
+                // Wiring `--trust` through requires a host-fn
+                // registry plus a gate-driven vtable builder (a
+                // cross-crate API addition tracked separately); we
+                // deliberately do not fabricate an all-granted but
+                // empty vtable here because installing it would
+                // change no behaviour. The bytecode backend below
+                // does honour `--trust` because its policy boundary
+                // (`with_capability_gate`) accepts a gate directly.
                 let aot = AotEvaluator::from_source(&content).map_err(|e| {
                     miette::miette!("cranelift-aot backend setup: {e}")
                         .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
@@ -864,15 +874,35 @@ fn cmd_run(
                 // interpreter — handles the scalar `#main`
                 // envelope (Int / Bool / Float / Null);
                 // anything else surfaces as a setup error.
-                let _caps = if trust {
-                    relon_eval_api::Capabilities::all_granted()
+                //
+                // `--trust` flips the capability posture from the
+                // zero-trust default to `all_granted`. The
+                // `Capabilities` snapshot implements
+                // [`relon_eval_api::CapabilityGate`], so we install
+                // it through the bytecode VM's unified policy
+                // boundary (`with_capability_gate`). The dispatch
+                // path consults this gate for every declared bit
+                // ahead of any capability-sensitive op
+                // (`CheckCap` / `CallNative`); without the grant a
+                // guarded op trips `WasmCapabilityDenied`, matching
+                // the tree-walker's sandbox shape. The current
+                // scalar `from_source` envelope emits no sensitive
+                // ops, so the gate is inert on those sources — but
+                // wiring it here means the trust flag takes effect
+                // the moment guarded ops land instead of being
+                // silently dropped.
+                let caps: Arc<dyn relon_eval_api::CapabilityGate> = if trust {
+                    Arc::new(relon_eval_api::Capabilities::all_granted())
                 } else {
-                    relon_eval_api::Capabilities::default()
+                    Arc::new(relon_eval_api::Capabilities::default())
                 };
-                let bc = relon_bytecode::BytecodeEvaluator::from_source(&content).map_err(|e| {
-                    miette::miette!("bytecode VM backend setup: {e}")
-                        .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
-                })?;
+                let bc = relon_bytecode::BytecodeEvaluator::from_source(&content)
+                    .map_err(|e| {
+                        miette::miette!("bytecode VM backend setup: {e}").with_source_code(
+                            NamedSource::new(file.to_string_lossy(), content.clone()),
+                        )
+                    })?
+                    .with_capability_gate(caps);
                 EvaluatorTrait::run_main(&bc, args_map).map_err(|e| {
                     Report::new(e)
                         .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))

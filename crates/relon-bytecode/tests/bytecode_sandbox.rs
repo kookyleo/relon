@@ -2720,3 +2720,98 @@ fn call_native_inline_cache_resets_between_invokes() {
         "first host fn must not be re-invoked from a stale cache slot"
     );
 }
+
+// -- relon-cli `--trust` wiring: gate install via the public
+//    `with_capability_gate` path -----------------------------------
+//
+// The CLI's bytecode backend builds the evaluator and then installs a
+// `relon_eval_api::Capabilities` snapshot as the capability gate:
+// `all_granted` under `--trust`, the zero-trust `default` otherwise
+// (mirroring the tree-walker's `ctx.capabilities` flip). These tests
+// pin that the install actually changes behaviour on a
+// capability-sensitive entry — the regression guard for the bug where
+// the computed caps were dropped (`let _caps = ...`) so `--trust` had
+// no effect on this backend.
+//
+// We drive a `from_ir_legacy` module whose body carries a
+// `CheckCap { cap_bit: Network }` op. The compile pass flags it
+// `requires_cap_consult`, so the dispatch prologue sweeps every
+// declared bit through the installed gate before the first op runs.
+
+/// Build a `#main(Int x) -> Int` IR module that pre-flights a
+/// capability check (`Network`) and then returns its argument
+/// unchanged. The `CheckCap` op makes the compiled function
+/// capability-sensitive.
+fn gated_identity_module() -> relon_ir::ir::Module {
+    let func = Func {
+        name: "f".into(),
+        params: vec![IrType::I64],
+        ret: IrType::I64,
+        body: vec![
+            TaggedOp {
+                op: Op::CheckCap {
+                    cap_bit: relon_eval_api::CapabilityBit::Network.bit_index(),
+                },
+                range: TokenRange::default(),
+            },
+            TaggedOp {
+                op: Op::LocalGet(0),
+                range: TokenRange::default(),
+            },
+            TaggedOp {
+                op: Op::Return,
+                range: TokenRange::default(),
+            },
+        ],
+        range: TokenRange::default(),
+    };
+    relon_ir::ir::Module {
+        funcs: vec![func],
+        entry_func_index: Some(0),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn cli_trust_gate_denies_capability_under_zero_trust() {
+    use std::sync::Arc;
+
+    // No `--trust`: the CLI installs `Capabilities::default()` (every
+    // bit denied). The guarded entry must trip `WasmCapabilityDenied`
+    // before returning.
+    let gate: Arc<dyn relon_eval_api::CapabilityGate> =
+        Arc::new(relon_eval_api::Capabilities::default());
+    let ev = BytecodeEvaluator::from_ir_legacy(gated_identity_module(), vec!["x".into()])
+        .unwrap()
+        .with_capability_gate(gate);
+
+    let mut args = HashMap::new();
+    args.insert("x".to_string(), Value::Int(99));
+    let err = ev.run_main(args).expect_err("zero-trust gate must deny");
+    assert!(
+        matches!(err, RuntimeError::WasmCapabilityDenied { .. }),
+        "expected WasmCapabilityDenied under zero-trust, got {err:?}"
+    );
+}
+
+#[test]
+fn cli_trust_gate_allows_capability_when_trusted() {
+    use std::sync::Arc;
+
+    // `--trust`: the CLI installs `Capabilities::all_granted()` (every
+    // bit granted). The same guarded entry now runs to completion and
+    // returns its argument. This is the corrected behaviour the bug
+    // suppressed by dropping the computed caps.
+    let gate: Arc<dyn relon_eval_api::CapabilityGate> =
+        Arc::new(relon_eval_api::Capabilities::all_granted());
+    let ev = BytecodeEvaluator::from_ir_legacy(gated_identity_module(), vec!["x".into()])
+        .unwrap()
+        .with_capability_gate(gate);
+
+    let mut args = HashMap::new();
+    args.insert("x".to_string(), Value::Int(99));
+    let value = ev
+        .run_main(args)
+        .expect("all-granted gate must permit the guarded entry");
+    assert_eq!(value, Value::Int(99));
+}
