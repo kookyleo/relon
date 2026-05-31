@@ -366,5 +366,20 @@ W20 的 pair_force/accel 三元返回原生 F64、list-reduce body join 一个 L
 每步列表物化即如此。这是**能力达成**(cranelift 现能编译 + 正确运行 W20),**不是性能胜出**;不计入 JIT>LuaJIT
 (W20 的最佳编译层仍是 llvm_aot 54µs,已计)。cranelift 参与数 5 → 6。
 
-`¹⁰` W20 cranelift n/a→332.10µs(#361)。followup(未做):mixed-Mod 提升、computed ListInt 字面量、
+`¹⁰` W20 cranelift n/a→332.10µs(#361)。followup(未做):computed ListInt 字面量、
 n>>14k 的 per-iter scratch reset。
+
+### #362 — mixed-Mod Int→Float 提升(tree-walker parity,无 panel 行变化)
+`feat(ir): extend Int->Float promotion to Mod for tree-walker parity`(`ec13f9b5`)。把 #359 Part A 的
+Int→Float 提升扩到 `%`:lowering 把混合 {I64,F64} Mod 的 I64 操作数经 `ConvertI64ToF64` 提升、并移除
+`lhs_ty==F64 && Mod` 拒绝,使混合 Int%Float 与 F64%F64 都 lower 成 `Op::Mod(F64)`。后端:LLVM AOT
+`build_float_rem`(frem=fmod,截断取余、符号随被除数,**bit-identical Rust f64 `%`**);bytecode `BcOp::ModF64`
+(早已接);cranelift/wasm **无原生 frem → 优雅拒绝**(clean error,非 panic、非误算);trace-JIT clean abort。
+oracle bit-exact 测试 4 kernel(mixed / F64%F64 / 负被除数 / 运行时除数)× 9 个 n。
+
+> **诚实更正**:原 spec 误以为 f64 mod-by-zero 返回 NaN(不 trap)。实测 tree-walker(`arithmetic.rs:603-605`
+> 在 match 前对 Div+Mod 都查 zero-divisor)**会 trap `DivisionByZero`**。故 F64 Mod 与 F64 Div 一样 **trap**
+> (OEQ-against-0.0 guard),这才是真 parity —— 返回 NaN 才是 bug。reviewer 跑 probe(`5.0 % 0.0`→Err)独立确认。
+> 无 panel workload 用 mixed Mod(W28 的 `i%7` 是 Int%Int),故**无 panel 行变化、无需 s90**;纯完整性/parity。
+> followup(未做,#359 起既存、对称):bytecode `BcOp::DivF64`/`ModF64` 不 trap zero-divisor(IEEE NaN/inf),
+> 与 tree-walker/LLVM AOT 背离——若 bytecode 被当 f64 div/mod-by-zero 的 oracle 才需补 `==0.0` guard。
