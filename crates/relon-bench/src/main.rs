@@ -48,15 +48,10 @@ fn bench_once(source: &str) -> (Duration, Duration) {
     let parse_time = start_parse.elapsed();
 
     let start_eval = Instant::now();
-    let ctx = {
-        let mut ctx = Context::new().with_root(ast.clone());
-        ctx.prepend_module_resolver(Arc::new(relon_evaluator::StdModuleResolver));
-        Arc::new({
-            let mut ctx = ctx;
-            relon_evaluator::TreeWalkEvaluator::prepare_in_place(&mut ctx);
-            ctx
-        })
-    };
+    let mut ctx = Context::new().with_root(ast.clone());
+    ctx.prepend_module_resolver(Arc::new(relon_evaluator::StdModuleResolver));
+    relon_evaluator::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+    let ctx = Arc::new(ctx);
     let eval = TreeWalkEvaluator::new(Arc::clone(&ctx));
     let _result = eval
         .eval(&ast, &Arc::new(Scope::default()))

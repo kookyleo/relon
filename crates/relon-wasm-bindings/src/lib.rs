@@ -506,23 +506,12 @@ fn evaluate_internal(
         })?,
     };
 
-    relon::to_json_value(value).map_err(|err| match err {
-        relon::Error::NonFiniteFloat(_)
-        | relon::Error::UnsupportedClosure
-        | relon::Error::UnsupportedSchema => ErrorReport {
-            kind: ErrorKind::ProjectionError,
-            message: err.to_string(),
-            spans: Vec::new(),
-            help: None,
-            code: None,
-        },
-        other => ErrorReport {
-            kind: ErrorKind::ProjectionError,
-            message: other.to_string(),
-            spans: Vec::new(),
-            help: None,
-            code: None,
-        },
+    relon::to_json_value(value).map_err(|err| ErrorReport {
+        kind: ErrorKind::ProjectionError,
+        message: err.to_string(),
+        spans: Vec::new(),
+        help: None,
+        code: None,
     })
 }
 

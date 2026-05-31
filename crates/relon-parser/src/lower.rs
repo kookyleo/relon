@@ -662,7 +662,7 @@ fn walk_path_tokens(node: &SyntaxNode, source: &str, is_reference: bool) -> Opti
                     head_done = true;
                     continue;
                 }
-                if let Some(inner) = ast::Expr::cast(n.clone()) {
+                if let Some(inner) = ast::Expr::cast(n) {
                     let inner_node = lower_expr_v2(&inner, source)?;
                     path.push(TokenKey::Dynamic(inner_node, pending_optional));
                     pending_optional = false;
@@ -1120,7 +1120,7 @@ fn split_schema_colon_directive(node: &SyntaxNode, source: &str) -> Option<Schem
             rowan::NodeOrToken::Node(n) => {
                 if n.kind() == SyntaxKind::SCHEMA_WITH {
                     saw_schema_with = true;
-                } else if let Some(e) = ast::Expr::cast(n.clone()) {
+                } else if let Some(e) = ast::Expr::cast(n) {
                     if body_expr.is_none() {
                         body_expr = Some(e);
                     }
@@ -1257,7 +1257,7 @@ fn lower_directive_name_body(node: &SyntaxNode, source: &str) -> Option<crate::D
             rowan::NodeOrToken::Node(n) => match n.kind() {
                 SyntaxKind::SCHEMA_WITH => schema_with = Some(n),
                 _ => {
-                    if let Some(e) = ast::Expr::cast(n.clone()) {
+                    if let Some(e) = ast::Expr::cast(n) {
                         if body_expr_ast.is_none() {
                             body_expr_ast = Some(e);
                         }
@@ -1473,7 +1473,7 @@ fn lower_schema_method(
                 }
                 _ => {
                     if after_body_colon {
-                        if let Some(e) = ast::Expr::cast(n.clone()) {
+                        if let Some(e) = ast::Expr::cast(n) {
                             if body_after_colon_ast.is_none() {
                                 body_after_colon_ast = Some(e);
                             }
@@ -1992,7 +1992,7 @@ fn walk_call_arg_node(node: &SyntaxNode, source: &str) -> Option<Vec<crate::Call
                 _ => continue,
             },
             rowan::NodeOrToken::Node(n) => {
-                if let Some(expr) = ast::Expr::cast(n.clone()) {
+                if let Some(expr) = ast::Expr::cast(n) {
                     let value = lower_expr_v2(&expr, source)?;
                     args.push(crate::CallArg {
                         name: pending_name.take(),
@@ -2278,7 +2278,7 @@ fn lower_dict_field(node: &SyntaxNode, source: &str) -> Option<DictFieldOut> {
                     spread_node = Some(n);
                 }
                 SyntaxKind::DECORATOR => {
-                    if let Some(dec) = ast::Decorator::cast(n.clone()) {
+                    if let Some(dec) = ast::Decorator::cast(n) {
                         decorators_before.push(lower_decorator_v2(&dec, source)?);
                     }
                 }
@@ -2327,7 +2327,7 @@ fn lower_dict_field(node: &SyntaxNode, source: &str) -> Option<DictFieldOut> {
                         // TYPE_NODE in value position (`key: SomeType`
                         // or `key: Enum<...>`). Cast as an Expr::Type-
                         // shaped value.
-                        if let Some(e) = ast::Expr::cast(n.clone()) {
+                        if let Some(e) = ast::Expr::cast(n) {
                             value_expr_ast = Some(e);
                         }
                     }
@@ -2350,7 +2350,7 @@ fn lower_dict_field(node: &SyntaxNode, source: &str) -> Option<DictFieldOut> {
                     // CLOSURE as a normal value Expr.
                     if saw_dict_field_colon {
                         if value_expr_ast.is_none() && !in_brack {
-                            if let Some(e) = ast::Expr::cast(n.clone()) {
+                            if let Some(e) = ast::Expr::cast(n) {
                                 value_expr_ast = Some(e);
                             }
                         }
@@ -2361,7 +2361,7 @@ fn lower_dict_field(node: &SyntaxNode, source: &str) -> Option<DictFieldOut> {
                 _ => {
                     // Any other expression node — could be the dynamic-key
                     // inner expression (if in_brack) or the value.
-                    if let Some(e) = ast::Expr::cast(n.clone()) {
+                    if let Some(e) = ast::Expr::cast(n) {
                         if in_brack && dynamic_key_node.is_none() {
                             dynamic_key_node = Some(e.syntax().clone());
                         } else if value_expr_ast.is_none() && !in_brack {
@@ -2403,7 +2403,7 @@ fn lower_dict_field(node: &SyntaxNode, source: &str) -> Option<DictFieldOut> {
                 rowan::NodeOrToken::Node(n) => {
                     if n.kind() == SyntaxKind::TYPE_NODE && saw_lt {
                         inner_type = Some(lower_type_node_from_cst(&n, source)?);
-                    } else if let Some(e) = ast::Expr::cast(n.clone()) {
+                    } else if let Some(e) = ast::Expr::cast(n) {
                         if inner_expr_ast.is_none() {
                             inner_expr_ast = Some(e);
                         }
@@ -2909,7 +2909,7 @@ fn lower_closure_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
                     return_type = Some(lower_type_node_from_cst(&n, source)?);
                 }
                 _ => {
-                    if let Some(e) = ast::Expr::cast(n.clone()) {
+                    if let Some(e) = ast::Expr::cast(n) {
                         if body_ast.is_none() {
                             body_ast = Some(e);
                         }

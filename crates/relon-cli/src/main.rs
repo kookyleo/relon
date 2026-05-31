@@ -779,11 +779,6 @@ fn cmd_run(
                         ))
                     })?
                 } else {
-                    let _caps = if trust {
-                        relon_eval_api::Capabilities::all_granted()
-                    } else {
-                        relon_eval_api::Capabilities::default()
-                    };
                     let cache_dir = relon_codegen_cranelift::default_cache_dir();
                     // Cache-hit fast path: pull a matching
                     // pair off disk if present. Any soft

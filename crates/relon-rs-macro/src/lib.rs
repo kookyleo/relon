@@ -3,12 +3,17 @@
 //!
 //! ## Forms
 //!
+//! The macro itself only emits an `include!(...)` of the bindings file
+//! (see below); the `// effective form:` snippets show the *final*
+//! shape once that included file is stitched in by `rustc`, not what
+//! this macro literally produces.
+//!
 //! ```ignore
 //! relon_rs_macro::include_relon!("src/foo.relon");
-//! // expands to: pub mod foo { pub fn main(&SandboxState, i64) -> i64 { ... } }
+//! // effective form: pub mod foo { pub fn main(&SandboxState, i64) -> i64 { ... } }
 //!
 //! relon_rs_macro::include_relon!("src/foo.relon" as compute);
-//! // expands to: pub fn compute(&SandboxState, i64) -> i64 { ... }
+//! // effective form: pub fn compute(&SandboxState, i64) -> i64 { ... }
 //! ```
 //!
 //! The macro resolves the path to a file stem (or honours the
