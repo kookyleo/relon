@@ -119,13 +119,29 @@ impl RowStats {
         if parsed.iters.is_empty() {
             return Err(BenchStatsError::Empty(path.to_path_buf()));
         }
+        // Compute per-sample per-iter ns and drop any non-finite value.
+        // A zero (or negative) `iters[i]` would otherwise divide to
+        // ±inf / NaN and either poison every percentile downstream or
+        // panic the comparator below (NaN has no total order). Criterion
+        // never emits such a sample, but `sample.json` is a file on disk
+        // that may be truncated, hand-edited, or written by a future
+        // criterion version, so we filter defensively rather than trust.
         let mut per_sample_ns: Vec<f64> = parsed
             .times
             .iter()
             .zip(parsed.iters.iter())
-            .map(|(t, n)| if *n > 0.0 { *t / *n } else { f64::INFINITY })
+            .map(|(t, n)| t / n)
+            .filter(|v| v.is_finite())
             .collect();
-        per_sample_ns.sort_by(|a, b| a.partial_cmp(b).expect("times are finite per criterion"));
+        if per_sample_ns.is_empty() {
+            // Every sample was non-finite (e.g. all-zero `iters`); there
+            // is no usable distribution, so surface the same typed error
+            // as a structurally empty file rather than a NaN-filled row.
+            return Err(BenchStatsError::Empty(path.to_path_buf()));
+        }
+        // `total_cmp` is a total order over all f64 (including any NaN
+        // that slips through), so the sort can never panic.
+        per_sample_ns.sort_by(f64::total_cmp);
         Ok(Self {
             row: row.into(),
             per_sample_ns,
@@ -368,6 +384,42 @@ mod tests {
         assert_eq!(stats[0].row, "backend/row_a");
         assert!((stats[0].percentile(0.0) - 10.0).abs() < 1e-6);
         assert!((stats[0].percentile(1.0) - 20.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn zero_iters_sample_does_not_panic_and_is_dropped() {
+        // Regression: a `iters[i] == 0` sample used to map to
+        // `f64::INFINITY` and poison the percentile tail (and the
+        // comparator `expect`ed every value to be finite). The decode
+        // must now skip the bad sample, keep the finite ones, and never
+        // panic.
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("sample.json");
+        // Two healthy samples (1 ns/iter and 2 ns/iter) plus one with a
+        // zero iteration count.
+        write_sample(&p, &[10.0, 0.0, 5.0], &[10.0, 1234.0, 10.0]);
+        let stats = RowStats::from_sample_json("dim/row", &p).unwrap();
+        // Only the two finite samples survive (1.0 and 2.0 ns/iter).
+        assert_eq!(stats.per_sample_ns.len(), 2);
+        assert!(stats.per_sample_ns.iter().all(|v| v.is_finite()));
+        assert!(
+            (stats.percentile(1.0) - 2.0).abs() < 1e-6,
+            "max = 2.0, got {}",
+            stats.percentile(1.0)
+        );
+    }
+
+    #[test]
+    fn all_zero_iters_surfaces_empty_error() {
+        // If every sample is non-finite there is no distribution left;
+        // we must return the typed `Empty` error rather than build a
+        // NaN-filled row or panic.
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("sample.json");
+        write_sample(&p, &[0.0, 0.0], &[10.0, 20.0]);
+        let err = RowStats::from_sample_json("dim/row", &p)
+            .expect_err("all-zero iters must surface a typed error");
+        assert!(matches!(err, BenchStatsError::Empty(_)), "got {err:?}");
     }
 
     #[test]

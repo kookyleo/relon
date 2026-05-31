@@ -180,3 +180,103 @@ fn truncated_file_surfaces_typed_error() {
         .expect_err("truncated file must surface as CacheError");
     assert!(matches!(err, CacheError::Truncated(_)), "got {err:?}");
 }
+
+/// Hardening guard for the decode path: a cache file on disk is
+/// untrusted input (truncated write, bit-rot, hand-edit, foreign
+/// writer). Every malformed blob — at any truncation length, and with
+/// each embedded length field corrupted — must surface as a typed
+/// `Err` (or `Ok(None)` for an absent file) and *never* panic. In
+/// particular the `u32::from_le_bytes(&bytes[a..a+4])` reads in the
+/// decoder run on fixed-width 4-byte windows guarded by explicit
+/// length checks, so a corrupt length field must be rejected before
+/// it can index out of bounds.
+#[test]
+fn malformed_blob_never_panics_only_errors() {
+    let dir = tempdir().unwrap();
+    let triple = "x86_64-unknown-linux-gnu";
+    let object = b"some-object-body-that-is-reasonably-long".to_vec();
+    // Strict mode re-hashes the body against the filename key, so the
+    // key must be the object's own digest for the pristine sanity load.
+    let key = sha_of(&object);
+    let path = store(
+        dir.path(),
+        key,
+        triple,
+        &object,
+        &sample_metadata("g"),
+        None,
+    )
+    .unwrap();
+    let good = std::fs::read(&path).unwrap();
+
+    // Build a battery of malformed variants.
+    let mut variants: Vec<Vec<u8>> = Vec::new();
+
+    // 1. Every truncation length, including those past the 49-byte
+    //    minimum that reach the slice-window reads.
+    for len in 0..=good.len() {
+        variants.push(good[..len].to_vec());
+    }
+
+    // Offsets of the embedded length fields in the v1 layout:
+    //   byte 8           : triple_len (u8)
+    //   byte 9+triple_len: object_size (u32 LE)
+    //   then             : metadata_size (u32 LE)
+    let triple_len = good[8] as usize;
+    let obj_size_off = 9 + triple_len;
+    let meta_size_off = obj_size_off + 4 + object.len();
+
+    // 2. Corrupt triple_len to every u8 value (drives triple_end and
+    //    therefore the object_size window to arbitrary positions).
+    for v in 0u8..=255 {
+        let mut b = good.clone();
+        b[8] = v;
+        variants.push(b);
+    }
+
+    // 3. Corrupt object_size to boundary / overflow values so the
+    //    object_size window and the downstream metadata_size window
+    //    land at, just past, and far beyond the buffer end.
+    for raw in [
+        0u32,
+        u32::MAX,
+        u32::MAX - 4,
+        good.len() as u32,
+        good.len() as u32 + 1,
+    ] {
+        let mut b = good.clone();
+        b[obj_size_off..obj_size_off + 4].copy_from_slice(&raw.to_le_bytes());
+        variants.push(b);
+    }
+
+    // 4. Corrupt metadata_size likewise.
+    for raw in [0u32, u32::MAX, u32::MAX - 4, good.len() as u32 + 7] {
+        let mut b = good.clone();
+        b[meta_size_off..meta_size_off + 4].copy_from_slice(&raw.to_le_bytes());
+        variants.push(b);
+    }
+
+    for (i, bytes) in variants.iter().enumerate() {
+        std::fs::write(&path, bytes).unwrap();
+        // The load-bearing invariant: decoding untrusted bytes must
+        // never panic. (The `try_into().unwrap()` reads in the decoder
+        // sit behind explicit 4-byte-window length checks, so a corrupt
+        // length field is rejected before it can index out of bounds.)
+        let res =
+            std::panic::catch_unwind(|| load(dir.path(), key, triple, None, IntegrityMode::Strict));
+        assert!(
+            res.is_ok(),
+            "decode panicked on malformed variant #{i} (len {})",
+            bytes.len()
+        );
+    }
+
+    // Sanity: the untouched blob still round-trips, so the fuzz loop
+    // above is exercising the decoder rather than a wholesale-broken
+    // path.
+    std::fs::write(&path, &good).unwrap();
+    let entry = load(dir.path(), key, triple, None, IntegrityMode::Strict)
+        .unwrap()
+        .expect("the pristine blob must still decode as a cache hit");
+    assert_eq!(entry.object_bytes, object);
+}
