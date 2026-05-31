@@ -110,6 +110,14 @@ pub trait OpLowerer {
     /// `ssub_overflow` / `smul_overflow` keyed on the arith op's
     /// destination SSA. Read later by `Guard(ArithOverflow(dst))`.
     fn record_overflow_bit(&mut self, dst: SsaVar, bit: ir::Value);
+
+    /// Construct the path-specific "malformed buffer" error for a
+    /// `LocalGet(_, slot_idx)` whose byte offset (`slot_idx * 8`)
+    /// does not fit cranelift's i32 memory-load offset. The recorder
+    /// never produces such a slot for a well-formed trace, so this is
+    /// a defensive reject that lets the install pipeline fall back to
+    /// a non-trace tier instead of silently loading the wrong slot.
+    fn slot_offset_overflow(&self, slot_idx: u32) -> Self::Err;
 }
 
 /// Convenience: widen a freshly-built value to i64 width via
@@ -351,8 +359,15 @@ pub fn lower_local_get<L: OpLowerer + ?Sized>(
     dst: SsaVar,
     slot_idx: u32,
 ) -> Result<(), L::Err> {
-    let off = (slot_idx as i64).wrapping_mul(8);
-    let off_i32 = i32::try_from(off).unwrap_or(0);
+    let off = i64::from(slot_idx) * 8;
+    // The cranelift `load` offset is an i32 (`Offset32`). A slot that
+    // overflows it cannot be addressed with a simple base+offset load;
+    // silently clamping to 0 would load slot 0 instead — a miscompile.
+    // Reject the malformed slot so the caller can fall back cleanly.
+    let off_i32 = match i32::try_from(off) {
+        Ok(v) => v,
+        Err(_) => return Err(this.slot_offset_overflow(slot_idx)),
+    };
     let args_ptr = this.input_args_ptr();
     let v = this.with_builder(|b| b.ins().load(I64, MemFlags::trusted(), args_ptr, off_i32));
     this.bind(dst, v);

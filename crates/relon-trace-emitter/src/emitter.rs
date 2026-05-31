@@ -678,6 +678,12 @@ impl OpLowerer for TraceEmitterState<'_, '_> {
     fn record_overflow_bit(&mut self, dst: SsaVar, bit: ir::Value) {
         self.overflow_bits.insert(dst, bit);
     }
+
+    fn slot_offset_overflow(&self, slot_idx: u32) -> EmitError {
+        EmitError::Malformed(format!(
+            "TraceOp::LocalGet slot_idx={slot_idx} overflows the i32 load offset (slot_idx * 8)"
+        ))
+    }
 }
 
 impl<'a, 'b> TraceEmitterState<'a, 'b> {
@@ -2389,6 +2395,46 @@ mod tests {
         let mut ctx = CodegenContext::new();
         let err = TraceEmitter::emit(&trace, &mut ctx).unwrap_err();
         assert!(matches!(err, EmitError::UnboundSsa(_)));
+    }
+
+    #[test]
+    fn local_get_slot_offset_overflow_rejected() {
+        // `slot_idx * 8` must fit cranelift's i32 load offset. A slot
+        // of `1 << 28` overflows it (8 * 2^28 = 2^31 > i32::MAX). The
+        // old `unwrap_or(0)` silently loaded slot 0 — a miscompile.
+        // It must now surface a clean Malformed reject so the install
+        // pipeline can fall back to a non-trace tier.
+        let mut b = TraceBuffer::new();
+        let dst = b.fresh_ssa();
+        b.append(TraceOp::LocalGet {
+            dst,
+            slot_idx: 1 << 28,
+        });
+        b.append(TraceOp::Return { value: dst });
+        let trace = b.into_optimized();
+        let mut ctx = CodegenContext::new();
+        let err = TraceEmitter::emit(&trace, &mut ctx).unwrap_err();
+        assert!(
+            matches!(err, EmitError::Malformed(_)),
+            "expected Malformed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn local_get_max_in_range_slot_lowers() {
+        // The largest in-range slot (byte offset == i32::MAX rounded
+        // down to a multiple of 8) must still lower cleanly.
+        let max_slot = (i32::MAX as u32) / 8;
+        let mut b = TraceBuffer::new();
+        let dst = b.fresh_ssa();
+        b.append(TraceOp::LocalGet {
+            dst,
+            slot_idx: max_slot,
+        });
+        b.append(TraceOp::Return { value: dst });
+        let trace = b.into_optimized();
+        let mut ctx = CodegenContext::new();
+        TraceEmitter::emit(&trace, &mut ctx).expect("in-range slot must emit");
     }
 
     #[test]

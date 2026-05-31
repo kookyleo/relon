@@ -121,6 +121,12 @@ pub enum InlineEmitError {
     /// cranelift module pipeline). Caller should fall back to the
     /// trampoline-call path.
     CallNotSupportedInInline,
+    /// Catch-all for malformed-buffer rejects the shared per-op
+    /// lowering helpers raise (e.g. a `TraceOp::LocalGet` slot whose
+    /// byte offset overflows the i32 cranelift load offset). The
+    /// caller falls back to a non-inline tier rather than emit a load
+    /// off the wrong slot.
+    Malformed(String),
 }
 
 impl std::fmt::Display for InlineEmitError {
@@ -149,6 +155,7 @@ impl std::fmt::Display for InlineEmitError {
                 f,
                 "inline emit rejects TraceOp::Call; fall back to trampoline-call path"
             ),
+            InlineEmitError::Malformed(s) => write!(f, "inline malformed trace op: {s}"),
         }
     }
 }
@@ -295,6 +302,12 @@ impl OpLowerer for InlineEmitterState<'_, '_> {
 
     fn record_overflow_bit(&mut self, dst: SsaVar, bit: ir::Value) {
         self.overflow_bits.insert(dst, bit);
+    }
+
+    fn slot_offset_overflow(&self, slot_idx: u32) -> InlineEmitError {
+        InlineEmitError::Malformed(format!(
+            "TraceOp::LocalGet slot_idx={slot_idx} overflows the i32 load offset (slot_idx * 8)"
+        ))
     }
 }
 
@@ -655,5 +668,44 @@ mod tests {
         let trace = b.into_optimized();
         let err = host_fn_with_inline_trace(trace).expect_err("must error");
         assert!(matches!(err, InlineEmitError::MissingReturn));
+    }
+
+    #[test]
+    fn inline_rejects_local_get_slot_offset_overflow() {
+        // `slot_idx * 8` must fit cranelift's i32 load offset. The
+        // smallest slot that overflows it is `1 << 28` (8 * 2^28 =
+        // 2^31 > i32::MAX). The old code silently clamped to offset 0,
+        // loading slot 0 instead — a miscompile. It must now reject.
+        let overflow_slot = 1u32 << 28;
+        let mut b = TraceBuffer::new();
+        let dst = b.fresh_ssa();
+        b.append(TraceOp::LocalGet {
+            dst,
+            slot_idx: overflow_slot,
+        });
+        b.append(TraceOp::Return { value: dst });
+        let trace = b.into_optimized();
+        let err = host_fn_with_inline_trace(trace).expect_err("overflow slot must reject");
+        assert!(
+            matches!(err, InlineEmitError::Malformed(_)),
+            "expected Malformed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn inline_accepts_max_in_range_local_get_slot() {
+        // The largest slot whose byte offset still fits i32 is
+        // `(2^31 - 1) / 8` = 268_435_455. It must lower cleanly.
+        let max_slot = (i32::MAX as u32) / 8;
+        let mut b = TraceBuffer::new();
+        let dst = b.fresh_ssa();
+        b.append(TraceOp::LocalGet {
+            dst,
+            slot_idx: max_slot,
+        });
+        b.append(TraceOp::Return { value: dst });
+        let trace = b.into_optimized();
+        let ir = host_fn_with_inline_trace(trace).expect("in-range slot must emit");
+        assert!(ir.contains("load"), "LocalGet must lower to a load");
     }
 }
