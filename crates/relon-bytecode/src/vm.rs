@@ -1539,11 +1539,26 @@ impl BytecodeVm {
             BcOp::DivF64 => {
                 let rhs = f64::from_bits(pop(stack, bc_idx)?);
                 let lhs = f64::from_bits(pop(stack, bc_idx)?);
+                // Parity with the tree-walker (arithmetic.rs: `right.as_f64()
+                // == 0.0` traps before the divide) and the LLVM AOT backend
+                // (OEQ-against-0.0 guard): an f64 divide-by-zero is a
+                // `DivisionByZero` trap, not an IEEE inf/NaN. `rhs == 0.0`
+                // matches both `+0.0` and `-0.0` (and not NaN), exactly as
+                // the tree-walker's `== 0.0` does.
+                if rhs == 0.0 {
+                    return Err(BcVmError::DivisionByZero);
+                }
                 stack.push((lhs / rhs).to_bits());
             }
             BcOp::ModF64 => {
                 let rhs = f64::from_bits(pop(stack, bc_idx)?);
                 let lhs = f64::from_bits(pop(stack, bc_idx)?);
+                // Same zero-divisor trap as `DivF64` — the tree-walker routes
+                // f64 `%` through the same `right.as_f64() == 0.0` guard, so a
+                // mod-by-zero traps rather than producing a NaN.
+                if rhs == 0.0 {
+                    return Err(BcVmError::DivisionByZero);
+                }
                 stack.push((lhs % rhs).to_bits());
             }
             BcOp::ConvertI64ToF64 => {
