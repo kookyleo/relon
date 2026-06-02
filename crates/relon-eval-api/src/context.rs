@@ -82,52 +82,19 @@ impl Capabilities {
             max_value_elements: None,
         }
     }
-
-    /// Encode this grant set as the bitmap the wasm-AOT backend hands
-    /// to the imported `relon_caps_avail` global. Bit positions follow
-    /// [`CapabilityBit`] — each variant's discriminant is the bit
-    /// index `i` such that the bitmap has `1 << i` set iff the
-    /// corresponding boolean field is `true`. Hosts that need to wire
-    /// their own runtime should consult [`CapabilityBit`] directly
-    /// rather than depending on field order here.
-    pub fn to_cap_bitmap(&self) -> u64 {
-        let mut bits: u64 = 0;
-        if self.reads_fs {
-            bits |= 1u64 << CapabilityBit::ReadsFs as u32;
-        }
-        if self.writes_fs {
-            bits |= 1u64 << CapabilityBit::WritesFs as u32;
-        }
-        if self.network {
-            bits |= 1u64 << CapabilityBit::Network as u32;
-        }
-        if self.reads_clock {
-            bits |= 1u64 << CapabilityBit::ReadsClock as u32;
-        }
-        if self.reads_env {
-            bits |= 1u64 << CapabilityBit::ReadsEnv as u32;
-        }
-        if self.uses_rng {
-            bits |= 1u64 << CapabilityBit::UsesRng as u32;
-        }
-        bits
-    }
 }
 
-/// Canonical assignment of capability bits to bit positions in the
-/// `relon_caps_avail` u64 bitmap the wasm-AOT backend imports and
-/// codegen reads in the `check_cap` prologue. Hosts registering a
-/// `#native` function tag the registration with the same bit so the
-/// codegen-emitted bit-test lines up with the host's grant set.
+/// Canonical assignment of capability bits to stable bit positions.
+///
+/// Each variant's discriminant is the bit index the compiled backends
+/// key on: the cranelift `CapabilityVtable` slots a host fn at
+/// `cap_bit`, the bytecode VM consults the same index, and the wasm
+/// `__relon_check_cap` import receives it. Hosts registering a
+/// `#native` function tag the registration with the matching bit.
 ///
 /// Discriminants are stable: adding a new capability appends a new
-/// variant rather than reshuffling existing values, so older modules
-/// keep validating against the same bit positions.
-///
-/// `i64::MAX` (all bits set) keeps backwards compatibility with the
-/// pre-9.b-2 host that wrote `i64::MAX` unconditionally — every
-/// declared `CapabilityBit` lives well inside the lower 32 bits, so
-/// the same constant still grants every bit defined here.
+/// variant rather than reshuffling existing values, so previously
+/// emitted modules keep validating against the same bit positions.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapabilityBit {
@@ -152,14 +119,11 @@ pub enum CapabilityBit {
 }
 
 impl CapabilityBit {
-    /// Bit index this capability claims inside the u64 bitmap.
+    /// Stable bit index this capability claims. Used by the cranelift
+    /// vtable, the bytecode VM consult, and the wasm `__relon_check_cap`
+    /// import to key the same capability across backends.
     pub fn bit_index(self) -> u32 {
         self as u32
-    }
-
-    /// Single-bit mask for this capability.
-    pub fn mask(self) -> u64 {
-        1u64 << (self as u32)
     }
 }
 
@@ -583,68 +547,15 @@ mod cap_bit_tests {
     use super::*;
 
     #[test]
-    fn default_capabilities_yield_zero_bitmap() {
-        // Zero-trust default: no fields set means no bits set.
-        let caps = Capabilities::default();
-        assert_eq!(caps.to_cap_bitmap(), 0);
-    }
-
-    #[test]
-    fn all_granted_sets_every_declared_bit() {
-        // Every declared CapabilityBit lights up under all_granted.
-        let caps = Capabilities::all_granted();
-        let bitmap = caps.to_cap_bitmap();
-        for bit in [
-            CapabilityBit::ReadsFs,
-            CapabilityBit::WritesFs,
-            CapabilityBit::Network,
-            CapabilityBit::ReadsClock,
-            CapabilityBit::ReadsEnv,
-            CapabilityBit::UsesRng,
-        ] {
-            assert_ne!(
-                bitmap & bit.mask(),
-                0,
-                "expected bit {:?} ({}) set in {:#b}",
-                bit,
-                bit.bit_index(),
-                bitmap
-            );
-        }
-    }
-
-    #[test]
-    fn single_field_grants_single_bit() {
-        // Setting only `reads_fs` flips only the corresponding bit.
-        let caps = Capabilities {
-            reads_fs: true,
-            ..Capabilities::default()
-        };
-        assert_eq!(caps.to_cap_bitmap(), CapabilityBit::ReadsFs.mask());
-        // Other bits must stay zero.
-        assert_eq!(caps.to_cap_bitmap() & CapabilityBit::WritesFs.mask(), 0);
-        assert_eq!(caps.to_cap_bitmap() & CapabilityBit::Network.mask(), 0);
-    }
-
-    #[test]
     fn cap_bit_indices_are_stable() {
-        // Stability contract: discriminants don't shift around, so
-        // wasm modules emitted against an older codegen still match
-        // the host's bitmap layout.
+        // Stability contract: discriminants don't shift around, so a
+        // module emitted against an older codegen still keys the same
+        // capability bit the host's gate / vtable expects.
         assert_eq!(CapabilityBit::ReadsFs.bit_index(), 0);
         assert_eq!(CapabilityBit::WritesFs.bit_index(), 1);
         assert_eq!(CapabilityBit::Network.bit_index(), 2);
         assert_eq!(CapabilityBit::ReadsClock.bit_index(), 3);
         assert_eq!(CapabilityBit::ReadsEnv.bit_index(), 4);
         assert_eq!(CapabilityBit::UsesRng.bit_index(), 5);
-    }
-
-    #[test]
-    fn all_granted_bitmap_is_subset_of_i64_max() {
-        // Pre-9.b-2 host wrote i64::MAX. Every declared bit must lie
-        // within that mask so the upgrade is backwards-compatible.
-        let caps = Capabilities::all_granted();
-        let bitmap = caps.to_cap_bitmap();
-        assert_eq!(bitmap & !(i64::MAX as u64), 0);
     }
 }

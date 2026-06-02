@@ -172,7 +172,7 @@ fn partial_resume_bounds_explicit_trap_replays() {
     let baseline_err = ev.run_main(args.clone()).unwrap_err();
     assert!(matches!(
         baseline_err,
-        RuntimeError::WasmIndexOutOfBounds { .. }
+        RuntimeError::IndexOutOfBounds { .. }
     ));
 
     let func = ev.function();
@@ -193,8 +193,8 @@ fn partial_resume_bounds_explicit_trap_replays() {
         .resume_from_snapshot(args.clone(), &snapshot)
         .unwrap_err();
     assert!(
-        matches!(resumed, RuntimeError::WasmIndexOutOfBounds { .. }),
-        "expected WasmIndexOutOfBounds on resume, got {resumed:?}"
+        matches!(resumed, RuntimeError::IndexOutOfBounds { .. }),
+        "expected IndexOutOfBounds on resume, got {resumed:?}"
     );
 }
 
@@ -290,7 +290,7 @@ fn partial_resume_resource_step_limit_retraps_then_completes() {
     let baseline_err = ev.run_main(args.clone()).unwrap_err();
     assert!(matches!(
         baseline_err,
-        RuntimeError::WasmStepLimitExceeded { .. }
+        RuntimeError::StepLimitExceeded { .. }
     ));
 
     // Resume from bc=0 with the same exhausted-limit config — re-traps
@@ -306,7 +306,7 @@ fn partial_resume_resource_step_limit_retraps_then_completes() {
         .resume_from_snapshot(args.clone(), &snapshot)
         .unwrap_err();
     assert!(
-        matches!(retrap, RuntimeError::WasmStepLimitExceeded { .. }),
+        matches!(retrap, RuntimeError::StepLimitExceeded { .. }),
         "expected re-trap on resume with same step-limit, got {retrap:?}"
     );
 

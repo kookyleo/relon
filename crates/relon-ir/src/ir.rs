@@ -881,24 +881,22 @@ pub enum Op {
         cap_bit: u32,
     },
 
-    /// Phase 6 capability guard.
+    /// Capability guard: assert that `cap_bit` is granted, else trap
+    /// with the capability path (surfacing as
+    /// `RuntimeError::CapabilityDenied`).
     ///
-    /// Emits the wasm sequence
-    /// `global.get $relon_caps_avail; i64.const (1 << cap_bit);
-    /// i64.and; i64.eqz; if; unreachable; end`. The `unreachable`
-    /// trap fires when the requested bit is not set in the host's
-    /// granted bitmap, surfacing as a `CapabilityDenied` runtime
-    /// error after Phase 7 wires the trap-translate path.
+    /// The cranelift backend lowers this by resolving the bit's slot in
+    /// the per-call `CapabilityVtable` (`cap_lookup`) and trapping on a
+    /// null slot — the same machinery that guards `Op::CallNative`.
     ///
     /// Stack effect: `[] -> []`. Normally lowering inlines the check
     /// into `Op::CallNative` (cheaper to emit + tighter src-map
     /// locality), but the dedicated op stays available for callers
     /// that want to assert capability without performing a call —
-    /// e.g. an analyzer that pre-flights a `cap_grants` snapshot.
+    /// e.g. an analyzer that pre-flights a grant snapshot.
     CheckCap {
-        /// Bit position in the `relon_caps_avail` u64 bitmap.
-        /// [`NO_CAPABILITY_BIT`] is a no-op (codegen elides the
-        /// prologue).
+        /// Capability bit this guard requires. [`NO_CAPABILITY_BIT`]
+        /// is a no-op (codegen elides the prologue).
         cap_bit: u32,
     },
 
@@ -1010,7 +1008,8 @@ pub enum Op {
     /// memory.size_in_bytes` bounds check before bumping; overflow
     /// surfaces as a wasm `unreachable` recorded as
     /// `UnreachableKind::ScratchOOM` so the trap translator can
-    /// produce a `RuntimeError::WasmScratchOOM`.
+    /// surface a resource-exhaustion error (the dedicated wasm scratch
+    /// variant was retired with the wasm-AOT trap surface).
     ///
     /// The scratch region is owned by the wasm module — host SDKs
     /// do not need to allocate it, and the region is reset to the
@@ -1182,7 +1181,7 @@ pub enum Op {
     /// `relon.uctab` entry tags the trap kind. Codegen routes the
     /// runtime trap through `WasmModule::translate_trap` so the
     /// surfaced [`relon_eval_api::RuntimeError`] picks up the
-    /// matching tag (`WasmIndexOutOfBounds`, `WasmEmptyList`).
+    /// matching tag (e.g. `IndexOutOfBounds`, `EmptyList`).
     /// Stack effect: `[] -> [...]` — the wasm verifier treats every
     /// op after a `Trap` as unreachable.
     ///

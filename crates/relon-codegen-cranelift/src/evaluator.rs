@@ -974,9 +974,9 @@ impl AotEvaluator {
             .map(|fid| module.get_finalized_function(*fid) as usize)
             .collect();
 
-        // cap_bit width 64 mirrors the wasm-AOT side's
-        // `relon_caps_avail` u64 bitmap shape. Hosts that register a
-        // higher cap_bit cause `register` to grow the vector.
+        // 64 slots cover every declared CapabilityBit with headroom;
+        // hosts that register a higher cap_bit cause `register` to grow
+        // the vector.
         let capabilities = Arc::new(CapabilityVtable::with_capacity(64));
         let sandbox_shared = Arc::new(SandboxShared::new(capabilities));
         // closure_table is Box-allocated and lives on the evaluator;

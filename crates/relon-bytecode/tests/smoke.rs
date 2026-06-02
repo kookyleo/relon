@@ -198,7 +198,7 @@ fn run_main_min_max_inlined() {
 #[test]
 fn step_limit_trips_resource_prong() {
     // Tight max_steps on a never-fail program: the VM has to fire
-    // `WasmStepLimitExceeded` before it returns.
+    // `StepLimitExceeded` before it returns.
     let ev = BytecodeEvaluator::from_source("#main(Int x, Int y) -> Int\nx + y")
         .unwrap()
         .with_config(BcVmConfig {
@@ -207,7 +207,7 @@ fn step_limit_trips_resource_prong() {
         });
     let err = ev.run_main(args_xy(1, 2)).unwrap_err();
     assert!(
-        matches!(err, RuntimeError::WasmStepLimitExceeded { .. }),
+        matches!(err, RuntimeError::StepLimitExceeded { .. }),
         "{err:?}"
     );
 }

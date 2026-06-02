@@ -493,18 +493,9 @@ pub fn trap_equivalent(a: &RuntimeError, b: &RuntimeError) -> bool {
     match (a, b) {
         (DivisionByZero(_), DivisionByZero(_)) => true,
         (NumericOverflow(_), NumericOverflow(_)) => true,
-        (
-            WasmIndexOutOfBounds { .. } | IndexOutOfBounds { .. },
-            WasmIndexOutOfBounds { .. } | IndexOutOfBounds { .. },
-        ) => true,
-        (
-            WasmStepLimitExceeded { .. } | StepLimitExceeded { .. },
-            WasmStepLimitExceeded { .. } | StepLimitExceeded { .. },
-        ) => true,
-        (
-            WasmCapabilityDenied { .. } | CapabilityDenied { .. },
-            WasmCapabilityDenied { .. } | CapabilityDenied { .. },
-        ) => true,
+        (IndexOutOfBounds { .. }, IndexOutOfBounds { .. }) => true,
+        (StepLimitExceeded { .. }, StepLimitExceeded { .. }) => true,
+        (CapabilityDenied { .. }, CapabilityDenied { .. }) => true,
         (TypeMismatch { .. }, TypeMismatch { .. }) => true,
         (MissingMainArg { name: a, .. }, MissingMainArg { name: b, .. }) => a == b,
         (

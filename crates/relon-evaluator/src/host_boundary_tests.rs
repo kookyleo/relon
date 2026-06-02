@@ -141,7 +141,7 @@ fn host_receives_step_limit_exceeded() {
     let RuntimeError::StepLimitExceeded { limit, range } = &err else {
         panic!("expected StepLimitExceeded, got {err:?}");
     };
-    assert_eq!(*limit, 20);
+    assert_eq!(*limit, Some(20));
     assert_range_pinned(*range, "StepLimitExceeded");
     render_does_not_panic(&err);
 }
@@ -198,10 +198,10 @@ fn host_receives_capability_denied() {
     .eval_root(&Arc::new(Scope::default()));
 
     let err = result.expect_err("should error");
-    let RuntimeError::CapabilityDenied { name, range, .. } = &err else {
+    let RuntimeError::CapabilityDenied { reason, range, .. } = &err else {
         panic!("expected CapabilityDenied, got {err:?}");
     };
-    assert_eq!(name, "read_file");
+    assert!(reason.contains("read_file"), "reason: {reason}");
     assert_range_pinned(*range, "CapabilityDenied");
     render_does_not_panic(&err);
 }
@@ -416,10 +416,13 @@ fn host_receives_capability_denied_for_each_new_bit() {
         }))
         .eval_root(&Arc::new(Scope::default()));
         let err = result.expect_err(&format!("bit `{bit}` should error"));
-        let RuntimeError::CapabilityDenied { name, reason, .. } = &err else {
+        let RuntimeError::CapabilityDenied { reason, .. } = &err else {
             panic!("bit `{bit}`: expected CapabilityDenied, got {err:?}");
         };
-        assert_eq!(name, "f", "bit `{bit}`: name");
+        assert!(
+            reason.contains("`f`"),
+            "bit `{bit}`: reason should name the fn, got `{reason}`"
+        );
         assert!(
             reason.contains(bit),
             "bit `{bit}`: reason should mention `{bit}`, got `{reason}`"

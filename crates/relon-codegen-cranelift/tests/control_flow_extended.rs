@@ -523,7 +523,7 @@ fn loop_traps_when_deadline_elapses_during_iteration() {
     args.insert("unused".to_string(), Value::Int(0));
     let err = evaluator.run_main(args).expect_err("must trap on deadline");
     assert!(
-        matches!(err, RuntimeError::WasmStepLimitExceeded { .. }),
-        "expected WasmStepLimitExceeded, got {err:?}"
+        matches!(err, RuntimeError::StepLimitExceeded { .. }),
+        "expected StepLimitExceeded, got {err:?}"
     );
 }

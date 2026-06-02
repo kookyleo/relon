@@ -269,7 +269,7 @@ fn deopt_handoff_mixed_workload_routes_each_outcome() {
 // snapshot's `external_pc` routes the resume to a bytecode index whose
 // operand-stack recipe expects a `String`-handle stack while the trace
 // snapshot carries integer SSA values. The result is a downstream
-// `WasmIndexOutOfBounds` at the post-resume `StrConcat`.
+// `IndexOutOfBounds` at the post-resume `StrConcat`.
 //
 // Aligning the trace recording with the bytecode's own IR (so the PCs
 // share semantics) is the right long-term fix but is outside this
@@ -664,7 +664,7 @@ fn resume_from_snapshot_string_at_return_lifts_final_strings() {
     // would have allocated this if the dispatch loop had run. Since
     // we skip everything, the arena is empty when `Return` lifts.
     // The test instead drops to checking the structural plumbing:
-    // resume-from-Return runs without WasmIndexOutOfBounds and lifts
+    // resume-from-Return runs without IndexOutOfBounds and lifts
     // the empty handle as the empty string.
     let snapshot = relon_trace_abi::DeoptStateSnapshot::with_value_stack(
         /*guard_pc=*/ 0,

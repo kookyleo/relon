@@ -48,7 +48,7 @@ pub mod scope;
 pub mod smol_str;
 pub mod value;
 
-pub use capability::{CapabilityError, CapabilityGate, DenyReason};
+pub use capability::CapabilityGate;
 pub use context::{
     Capabilities, CapabilityBit, Context, GatedNativeFn, LoadingModuleGuard, NativeFnGate,
 };

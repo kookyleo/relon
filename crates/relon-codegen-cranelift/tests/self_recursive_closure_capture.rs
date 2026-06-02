@@ -109,7 +109,7 @@ fn self_recursive_int_matches_oracle() {
 /// only removes duplicates of the head each step, the (mostly distinct)
 /// LCG values barely shrink, so each recursion level materialises a
 /// near-full-size copy and the fixed 64 KiB AOT scratch arena is the
-/// binding limit: it traps with `WasmIndexOutOfBounds` between n=112 and
+/// binding limit: it traps with `IndexOutOfBounds` between n=112 and
 /// n=128 (a capacity bound, not a miscompile). `n` is capped at 112,
 /// where every result is bit-identical to the oracle.
 #[test]

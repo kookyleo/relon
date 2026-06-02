@@ -79,10 +79,10 @@ fn sandbox_bounds_explicit_trap_op() {
     let mut args = HashMap::new();
     args.insert("x".to_string(), Value::Int(0));
     let err = ev.run_main(args).unwrap_err();
-    // Bytecode VM lifts IndexOutOfBounds through WasmIndexOutOfBounds.
+    // Bytecode VM lifts IndexOutOfBounds through IndexOutOfBounds.
     assert!(
-        matches!(err, RuntimeError::WasmIndexOutOfBounds { .. }),
-        "expected WasmIndexOutOfBounds, got {err:?}"
+        matches!(err, RuntimeError::IndexOutOfBounds { .. }),
+        "expected IndexOutOfBounds, got {err:?}"
     );
 }
 
@@ -176,8 +176,8 @@ fn sandbox_resource_step_limit() {
     args.insert("y".to_string(), Value::Int(2));
     let err = ev.run_main(args).unwrap_err();
     assert!(
-        matches!(err, RuntimeError::WasmStepLimitExceeded { .. }),
-        "expected WasmStepLimitExceeded, got {err:?}"
+        matches!(err, RuntimeError::StepLimitExceeded { .. }),
+        "expected StepLimitExceeded, got {err:?}"
     );
 }
 
@@ -199,11 +199,11 @@ fn sandbox_resource_deadline_exceeded() {
     args.insert("x".to_string(), Value::Int(1));
     args.insert("y".to_string(), Value::Int(2));
     let err = ev.run_main(args).unwrap_err();
-    // Deadline lifts through WasmStepLimitExceeded (same prong, no
+    // Deadline lifts through StepLimitExceeded (same prong, no
     // separate RuntimeError shape today).
     assert!(
-        matches!(err, RuntimeError::WasmStepLimitExceeded { .. }),
-        "expected WasmStepLimitExceeded (deadline), got {err:?}"
+        matches!(err, RuntimeError::StepLimitExceeded { .. }),
+        "expected StepLimitExceeded (deadline), got {err:?}"
     );
 }
 
@@ -328,12 +328,12 @@ impl relon_eval_api::CapabilityGate for CountingGate {
     fn check(
         &self,
         cap: relon_eval_api::CapabilityBit,
-    ) -> Result<(), relon_eval_api::CapabilityError> {
+    ) -> Result<(), relon_eval_api::CapabilityBit> {
         self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.granted.contains(&cap.bit_index()) {
             Ok(())
         } else {
-            Err(relon_eval_api::CapabilityError::not_granted(cap))
+            Err(cap)
         }
     }
 }
@@ -547,10 +547,13 @@ fn capability_gate_denial_lifts_to_runtime_error() {
     let err = outcome.error.expect("must trap");
     let lifted = err.into_runtime_error(relon_parser::TokenRange::default());
     match lifted {
-        RuntimeError::WasmCapabilityDenied { cap_bit, .. } => {
-            assert_eq!(cap_bit, relon_eval_api::CapabilityBit::WritesFs.bit_index());
+        RuntimeError::CapabilityDenied { cap_bit, .. } => {
+            assert_eq!(
+                cap_bit,
+                Some(relon_eval_api::CapabilityBit::WritesFs.bit_index())
+            );
         }
-        other => panic!("expected WasmCapabilityDenied, got {other:?}"),
+        other => panic!("expected CapabilityDenied, got {other:?}"),
     }
 }
 
@@ -1772,7 +1775,7 @@ fn list_get_int_out_of_range_traps() {
         // Lift cleanly through the public surface.
         let lifted = err.into_runtime_error(relon_parser::TokenRange::default());
         assert!(
-            matches!(lifted, RuntimeError::WasmIndexOutOfBounds { .. }),
+            matches!(lifted, RuntimeError::IndexOutOfBounds { .. }),
             "lift envelope: idx {idx} -> {lifted:?}"
         );
     }
@@ -2777,7 +2780,7 @@ fn cli_trust_gate_denies_capability_under_zero_trust() {
     use std::sync::Arc;
 
     // No `--trust`: the CLI installs `Capabilities::default()` (every
-    // bit denied). The guarded entry must trip `WasmCapabilityDenied`
+    // bit denied). The guarded entry must trip `CapabilityDenied`
     // before returning.
     let gate: Arc<dyn relon_eval_api::CapabilityGate> =
         Arc::new(relon_eval_api::Capabilities::default());
@@ -2789,8 +2792,8 @@ fn cli_trust_gate_denies_capability_under_zero_trust() {
     args.insert("x".to_string(), Value::Int(99));
     let err = ev.run_main(args).expect_err("zero-trust gate must deny");
     assert!(
-        matches!(err, RuntimeError::WasmCapabilityDenied { .. }),
-        "expected WasmCapabilityDenied under zero-trust, got {err:?}"
+        matches!(err, RuntimeError::CapabilityDenied { .. }),
+        "expected CapabilityDenied under zero-trust, got {err:?}"
     );
 }
 

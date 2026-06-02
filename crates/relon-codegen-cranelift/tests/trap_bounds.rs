@@ -67,12 +67,12 @@ fn build_loop_module() -> IrModule {
 fn trap_kind_bounds_violation_maps_to_wasm_index_out_of_bounds() {
     // Mechanism check: the same `raise_trap` host helper that the
     // bounds-check guard uses must translate
-    // `TrapKind::BoundsViolation` into `RuntimeError::WasmIndexOutOfBounds`.
+    // `TrapKind::BoundsViolation` into `RuntimeError::IndexOutOfBounds`.
     // This guarantees v5-beta-2's `LoadField` lowering will land on
     // a correctly typed error variant when the bounds check trips.
     let range = TokenRange::default();
     let err = TrapKind::BoundsViolation.to_runtime_error(range);
-    assert!(matches!(err, RuntimeError::WasmIndexOutOfBounds { .. }));
+    assert!(matches!(err, RuntimeError::IndexOutOfBounds { .. }));
 }
 
 #[test]
@@ -120,8 +120,8 @@ fn deadline_guard_proves_cond_trap_plumbing_works_end_to_end() {
     args.insert("y".to_string(), Value::Int(7));
     let err = evaluator.run_main(args).expect_err("must trap");
     assert!(
-        matches!(err, RuntimeError::WasmStepLimitExceeded { .. }),
-        "expected WasmStepLimitExceeded, got {err:?}"
+        matches!(err, RuntimeError::StepLimitExceeded { .. }),
+        "expected StepLimitExceeded, got {err:?}"
     );
 }
 

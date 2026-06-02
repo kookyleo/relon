@@ -48,7 +48,7 @@ fn sandboxed_context_rejects_default_filesystem_imports() {
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
-        matches!(&result, Err(RuntimeError::CapabilityDenied { name, .. }) if name.contains("#import")),
+        matches!(&result, Err(RuntimeError::CapabilityDenied { reason, .. }) if reason.contains("#import")),
         "expected CapabilityDenied, got {result:?}"
     );
 }
@@ -177,7 +177,10 @@ fn max_steps_aborts_runaway_recursion() {
     assert!(
         matches!(
             result,
-            Err(RuntimeError::StepLimitExceeded { limit: 100, .. })
+            Err(RuntimeError::StepLimitExceeded {
+                limit: Some(100),
+                ..
+            })
         ),
         "expected StepLimitExceeded, got {result:?}"
     );
@@ -210,7 +213,10 @@ fn max_steps_aborts_long_list_map() {
     assert!(
         matches!(
             result,
-            Err(RuntimeError::StepLimitExceeded { limit: 100, .. })
+            Err(RuntimeError::StepLimitExceeded {
+                limit: Some(100),
+                ..
+            })
         ),
         "expected StepLimitExceeded(limit=100) from ticked list_map, got {result:?}"
     );
@@ -230,7 +236,10 @@ fn max_steps_aborts_range_collection() {
     assert!(
         matches!(
             result,
-            Err(RuntimeError::StepLimitExceeded { limit: 100, .. })
+            Err(RuntimeError::StepLimitExceeded {
+                limit: Some(100),
+                ..
+            })
         ),
         "expected StepLimitExceeded from range tick, got {result:?}"
     );
@@ -609,7 +618,7 @@ fn gated_fn_rejected_in_sandbox_without_allowlist() {
     );
     let result = eval_with(ctx, r#"{ "data": fs.read() }"#);
     assert!(
-        matches!(&result, Err(RuntimeError::CapabilityDenied { name, .. }) if name == "fs.read"),
+        matches!(&result, Err(RuntimeError::CapabilityDenied { reason, .. }) if reason.contains("fs.read")),
         "expected CapabilityDenied, got {result:?}"
     );
 }

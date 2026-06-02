@@ -8,7 +8,7 @@
 //!    emitted by the codegen lowering is guarded by an explicit
 //!    `icmp_ult` comparison against the linear-memory byte length.
 //!    The fault path branches to a dedicated trap stub that converts
-//!    to [`RuntimeError::WasmIndexOutOfBounds`] before unwinding back
+//!    to [`RuntimeError::IndexOutOfBounds`] before unwinding back
 //!    to the host through the JIT entry's `catch_unwind` boundary.
 //!
 //! 2. **Trap handler** — the JIT-compiled entry runs inside
@@ -176,14 +176,15 @@ impl TrapKind {
     pub fn to_runtime_error(self, range: TokenRange) -> RuntimeError {
         match self {
             TrapKind::DivisionByZero => RuntimeError::DivisionByZero(range),
-            TrapKind::BoundsViolation => RuntimeError::WasmIndexOutOfBounds { range },
-            TrapKind::CapabilityDenied => RuntimeError::WasmCapabilityDenied {
-                cap_bit: u32::MAX,
+            TrapKind::BoundsViolation => RuntimeError::IndexOutOfBounds { range },
+            TrapKind::CapabilityDenied => RuntimeError::CapabilityDenied {
+                // The trap path carries no bit (the null vtable slot is
+                // the only signal), so the host gets a generic reason.
+                cap_bit: None,
+                reason: "cranelift-native: host-fn call denied by capability gate".to_string(),
                 range,
             },
-            TrapKind::ResourceExhausted => {
-                RuntimeError::WasmStepLimitExceeded { range: Some(range) }
-            }
+            TrapKind::ResourceExhausted => RuntimeError::StepLimitExceeded { limit: None, range },
             TrapKind::Unreachable => RuntimeError::Unsupported {
                 reason: "cranelift-native: lowered IR contained an unreachable op".to_string(),
             },
@@ -193,10 +194,10 @@ impl TrapKind {
 }
 
 /// Function pointer signature for host-fn dispatch through the
-/// capability vtable. The cranelift entry pushes `args_ptr / args_len
-/// / caps_avail` then performs `call_indirect` against the slot — the
-/// host fn returns one `i64` payload (the only return shape v5-beta-1
-/// supports for `#native` imports).
+/// capability vtable. The cranelift entry resolves the slot via
+/// `cap_lookup`, null-checks it, then performs `call_indirect` — the
+/// host fn takes one `i64` arg and returns one `i64` payload (the only
+/// shape v5-beta-1 supports for `#native` imports).
 pub type HostFnPtr = unsafe extern "C" fn(i64) -> i64;
 
 /// Per-call vtable indexed by cap_bit. Slots holding `None` cause the
@@ -214,8 +215,8 @@ pub struct CapabilityVtable {
 
 impl CapabilityVtable {
     /// Build a fixed-size vtable. The slot count must accommodate
-    /// every `cap_bit` the lowered IR references; v5-beta-1 uses 64
-    /// (matches the wasm-AOT side's `relon_caps_avail` bit width).
+    /// every `cap_bit` the lowered IR references; v5-beta-1 uses 64,
+    /// which covers every declared `CapabilityBit` with ample headroom.
     pub fn with_capacity(n: usize) -> Self {
         Self {
             slots: vec![None; n],
@@ -887,11 +888,11 @@ mod tests {
         let err = TrapKind::DivisionByZero.to_runtime_error(range);
         assert!(matches!(err, RuntimeError::DivisionByZero(_)));
         let err = TrapKind::BoundsViolation.to_runtime_error(range);
-        assert!(matches!(err, RuntimeError::WasmIndexOutOfBounds { .. }));
+        assert!(matches!(err, RuntimeError::IndexOutOfBounds { .. }));
         let err = TrapKind::CapabilityDenied.to_runtime_error(range);
-        assert!(matches!(err, RuntimeError::WasmCapabilityDenied { .. }));
+        assert!(matches!(err, RuntimeError::CapabilityDenied { .. }));
         let err = TrapKind::ResourceExhausted.to_runtime_error(range);
-        assert!(matches!(err, RuntimeError::WasmStepLimitExceeded { .. }));
+        assert!(matches!(err, RuntimeError::StepLimitExceeded { .. }));
     }
 
     #[test]

@@ -44,7 +44,7 @@
 //! - **trap**: `DivisionByZero`, `NumericOverflow` lift through the
 //!   same `RuntimeError` variants the tree-walker emits.
 //! - **capability**: a [`vm::CapabilityVtable`] indexed by `cap_bit`; an
-//!   absent slot trips [`relon_eval_api::RuntimeError::WasmCapabilityDenied`] without
+//!   absent slot trips [`relon_eval_api::RuntimeError::CapabilityDenied`] without
 //!   ever calling the host fn. v6-δ M2-A only carries the surface —
 //!   the cranelift-AOT capability vtable is the canonical lookup
 //!   path today, so the VM's vtable starts empty.
@@ -80,7 +80,7 @@
 //!   call site. The full op-table surface lives in [`crate::op`].
 //! - **resource**: an instruction counter (`BcVmConfig::max_steps`)
 //!   plus a per-call deadline. Ticks once per bytecode op so the
-//!   tree-walker's `WasmStepLimitExceeded` shape is reachable.
+//!   tree-walker's `StepLimitExceeded` shape is reachable.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]

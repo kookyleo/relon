@@ -152,7 +152,7 @@ fn list_materialize_sum_matches_oracle() {
 /// raised to 1 MiB to match the LLVM AOT backend (see `evaluator.rs`
 /// `scratch_size`); at 64 KiB the O(n log n) partition sublists this
 /// workload materialises trapped around n=256 (a graceful
-/// `WasmIndexOutOfBounds`, never a miscompile). The AOT output is
+/// `IndexOutOfBounds`, never a miscompile). The AOT output is
 /// bit-identical to the oracle across the whole range, so cranelift now
 /// produces a real `relon_aot` W16 panel row at the bench `N`.
 #[test]

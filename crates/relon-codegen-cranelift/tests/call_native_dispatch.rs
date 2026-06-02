@@ -197,8 +197,8 @@ fn call_native_traps_when_capability_slot_is_empty() {
     args.insert("x".to_string(), Value::Int(1));
     let err = evaluator.run_main(args).expect_err("must trap");
     assert!(
-        matches!(err, RuntimeError::WasmCapabilityDenied { .. }),
-        "expected WasmCapabilityDenied, got {err:?}"
+        matches!(err, RuntimeError::CapabilityDenied { .. }),
+        "expected CapabilityDenied, got {err:?}"
     );
 }
 

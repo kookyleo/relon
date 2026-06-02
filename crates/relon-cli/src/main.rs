@@ -866,7 +866,7 @@ fn cmd_run(
                 // yet: cranelift gates a guarded `#native` call by
                 // looking the host fn up in the `CapabilityVtable`
                 // (a `cap_bit → HostFnPtr` map) and trapping
-                // `WasmCapabilityDenied` on a null slot. Granting a
+                // `CapabilityDenied` on a null slot. Granting a
                 // capability therefore means *registering a host
                 // fn* via `install_capabilities_mut` /
                 // `register_via_gate`, and the CLI ships no host-fn
@@ -910,7 +910,7 @@ fn cmd_run(
                 // path consults this gate for every declared bit
                 // ahead of any capability-sensitive op
                 // (`CheckCap` / `CallNative`); without the grant a
-                // guarded op trips `WasmCapabilityDenied`, matching
+                // guarded op trips `CapabilityDenied`, matching
                 // the tree-walker's sandbox shape. The current
                 // scalar `from_source` envelope emits no sensitive
                 // ops, so the gate is inert on those sources — but

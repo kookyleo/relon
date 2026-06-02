@@ -99,13 +99,20 @@ pub enum RuntimeError {
     #[diagnostic(code(relon::eval::numeric_overflow))]
     NumericOverflow(#[label("overflowed here")] TokenRange),
 
-    #[error("Step limit exceeded ({limit} evaluation steps)")]
+    /// Step / resource budget exhausted. The tree-walker fills `limit`
+    /// with the configured `max_steps`; the compiled backends
+    /// (cranelift deadline, bytecode step / deadline) trap with the
+    /// numeric tag only and leave `limit` as `None`.
+    #[error("Step limit exceeded")]
     #[diagnostic(
         code(relon::eval::step_limit_exceeded),
-        help("The script ran longer than the configured `max_steps` budget. Raise `Capabilities::max_steps` or refactor recursive / iterative work.")
+        help("The script ran longer than the configured `max_steps` / deadline budget. Raise `Capabilities::max_steps` or refactor recursive / iterative work.")
     )]
     StepLimitExceeded {
-        limit: u64,
+        /// The `max_steps` budget that was crossed, when the denying
+        /// backend carries it (tree-walk). `None` on the compiled trap
+        /// path, which only knows that the budget was exceeded.
+        limit: Option<u64>,
         #[label("budget exhausted here")]
         range: TokenRange,
     },
@@ -164,13 +171,25 @@ pub enum RuntimeError {
         range: TokenRange,
     },
 
-    #[error("Capability denied: native function `{name}` ({reason})")]
+    /// A guarded native-fn / `#import` was denied because the host did
+    /// not grant a required capability. Produced by every backend: the
+    /// tree-walker fills a descriptive `reason` (and the bit, when it
+    /// has one); the compiled cranelift / bytecode trap paths carry
+    /// only the numeric `cap_bit` and a generic `reason`.
+    #[error("Capability denied: {reason}")]
     #[diagnostic(
         code(relon::eval::capability_denied),
         help("This Context is sandboxed. Grant the capability declared on the fn's gate (e.g. `caps.reads_fs = true`) to permit it.")
     )]
     CapabilityDenied {
-        name: String,
+        /// Capability bit index that was denied, when the denying
+        /// backend carries it (compiled trap path; tree-walk native-fn
+        /// dispatch). `None` for FS-resolver denials that map to no
+        /// single bit, or when the compiled trap lost the bit.
+        cap_bit: Option<u32>,
+        /// Human-readable reason. Tree-walk fills the native-fn /
+        /// import detail; compiled backends fill "host-fn requires
+        /// capability bit N".
         reason: String,
         #[label("call rejected by sandbox")]
         range: TokenRange,
@@ -227,199 +246,6 @@ pub enum RuntimeError {
         found: String,
         #[label("declared here")]
         range: TokenRange,
-    },
-
-    // -----------------------------------------------------------------
-    // Wasm-AOT trap surface (Phase 7).
-    //
-    // These variants are produced exclusively by the wasm backend's
-    // `WasmModule::translate_trap`. The tree-walker emits
-    // `CapabilityDenied { name, reason, range }` / `ValueTooLarge {
-    // limit, actual, range }`; the wasm path loses the names/limits
-    // because the trap fires under a hot-path guard that only carries
-    // a numeric `cap_bit` or buffer size. Keeping the two surfaces
-    // distinct lets the Phase 8 facade route diagnostics correctly
-    // without forcing the wasm backend to fabricate placeholder names.
-    /// Phase 7: wasm trap fired because the granted-capabilities
-    /// bitmap lacks the bit a host-fn call requires. The bit index
-    /// matches the wasm module's `relon.host_fns` entry; the source
-    /// range resolves to the `#native fn` call site via srcmap.
-    #[error("Capability denied: wasm host-fn requires capability bit {cap_bit}")]
-    #[diagnostic(
-        code(relon::eval::wasm_capability_denied),
-        help("The wasm module's `check_cap` prologue tripped because the host's `cap_grants` bitmap did not include this bit. Grant the matching capability before instantiation.")
-    )]
-    WasmCapabilityDenied {
-        /// Bit index in the `relon_caps_avail` bitmap whose absence
-        /// triggered the trap. Mirrors the `cap_bit` on the wasm
-        /// module's host-fn entry.
-        cap_bit: u32,
-        #[label("capability check tripped here")]
-        range: TokenRange,
-    },
-
-    /// Phase 7: wasm trap fired in the entry function's `out_cap`
-    /// guard because the caller's output buffer is smaller than the
-    /// return schema's fixed-area root size. The `needed` field is
-    /// the minimum the wasm module expected; the actual `out_cap` is
-    /// not preserved at the trap site (the guard fires before the
-    /// runtime can capture it, so callers must reconstruct it from
-    /// their own call args if they want a `got` value to report).
-    #[error("output buffer too small: wasm entry expects at least {needed} bytes")]
-    #[diagnostic(
-        code(relon::eval::wasm_out_buf_too_small),
-        help("Raise the `out_cap` you pass to `run_main` to at least the return schema's fixed-area root size (plus any tail-record overhead).")
-    )]
-    WasmOutBufTooSmall {
-        /// Minimum bytes the wasm module's guard required.
-        needed: u32,
-        #[label("entry-function out_cap guard")]
-        range: TokenRange,
-    },
-
-    /// Phase 7: wasm trap fired in the entry function's `in_len`
-    /// guard because the caller's input buffer is smaller than the
-    /// `#main` param schema's fixed-area root size. Mirrors
-    /// `WasmOutBufTooSmall` on the input side.
-    #[error("input buffer too small: wasm entry expects at least {needed} bytes")]
-    #[diagnostic(
-        code(relon::eval::wasm_in_buf_too_small),
-        help("Make sure the `in_buf` you pass to `run_main` was populated by `BufferBuilder` against the same schema the wasm module was compiled for.")
-    )]
-    WasmInBufTooSmall {
-        /// Minimum bytes the wasm module's guard required.
-        needed: u32,
-        #[label("entry-function in_len guard")]
-        range: TokenRange,
-    },
-
-    /// Phase 7: wasm trap fired in a tail-record bounds check
-    /// (`StoreField` of `String` / `List<Int>`, or a sub-record
-    /// `AllocSubRecord`) because the value to be written wouldn't
-    /// fit between the current `tail_cursor` and the caller's
-    /// `out_cap`. The `kind` tag tells the host which shape ran
-    /// over: `"String"`, `"ListInt"`, or `"Record"`.
-    #[error("value too large: wasm tail-cursor overran `out_cap` while writing a {kind}")]
-    #[diagnostic(
-        code(relon::eval::wasm_value_too_large),
-        help("The aggregate return ran past the caller's `out_cap`. Raise the buffer capacity or shrink the produced value.")
-    )]
-    WasmValueTooLarge {
-        /// Static tag identifying the tail-record shape that overran.
-        kind: &'static str,
-        #[label("tail-cursor bounds check tripped here")]
-        range: TokenRange,
-    },
-
-    /// Phase 4.c-2: wasm trap fired in a stdlib bounds check
-    /// (`substring(s, start, len)` and similar) because the requested
-    /// slice walks past the receiver's end. Mirrors
-    /// [`Self::IndexOutOfBounds`] but is emitted from the wasm
-    /// translate_trap path so the wasm srcmap can decorate the call
-    /// site.
-    #[error("wasm trap: index walked past receiver length")]
-    #[diagnostic(
-        code(relon::eval::wasm_index_out_of_bounds),
-        help(
-            "Check the bounds you pass to substring / slice stdlib helpers before invoking them."
-        )
-    )]
-    WasmIndexOutOfBounds {
-        #[label("index out of bounds here")]
-        range: TokenRange,
-    },
-
-    /// Phase 4.c-2: wasm trap fired in a reducer body that requires
-    /// at least one element (`list_int_max`) when invoked on an
-    /// empty list. Mirrors [`Self::EmptyList`] on the wasm side.
-    #[error("wasm trap: reducer invoked on an empty list")]
-    #[diagnostic(
-        code(relon::eval::wasm_empty_list),
-        help("Guard the reducer call with a non-emptiness check, or pick a stdlib variant that accepts an explicit fallback.")
-    )]
-    WasmEmptyList {
-        #[label("empty list reducer tripped here")]
-        range: TokenRange,
-    },
-
-    /// v3+ a-4: wasm trap fired inside the Unicode-aware `upper` /
-    /// `lower` stdlib bodies because the receiver String contained a
-    /// byte sequence that does not decode as valid UTF-8 (a truncated
-    /// trailing continuation byte, a lone continuation byte, or a
-    /// leading byte with an illegal high-bit pattern).
-    ///
-    /// In production the host SDK's `BufferBuilder::write_string`
-    /// rejects non-UTF-8 inputs at write time so this trap is mostly
-    /// a defensive surface — it can still fire when a host hand-
-    /// crafts a String record into linear memory and skips the
-    /// builder. Routing through a dedicated variant lets the host
-    /// distinguish "invalid encoding" from "ran out of memory" or
-    /// "tail-cursor overrun".
-    #[error("wasm trap: stdlib walker hit invalid UTF-8 in the input string")]
-    #[diagnostic(
-        code(relon::eval::wasm_invalid_utf8),
-        help("Use `BufferBuilder::write_string` (or another validated path) to populate String fields the wasm module reads — that path rejects ill-formed UTF-8 before the trap can fire.")
-    )]
-    WasmInvalidUtf8 {
-        #[label("invalid UTF-8 byte sequence")]
-        range: TokenRange,
-    },
-
-    /// Phase 4.c-1: wasm trap fired because the scratch bump allocator
-    /// (`Op::AllocScratch` / `Op::AllocScratchDyn`) would have pushed
-    /// the `relon_scratch_cursor` global past the end of wasm linear
-    /// memory. The `needed` field is the byte count the failing alloc
-    /// requested when the size was statically known; the dynamic-size
-    /// variant reports `0` because the operand-stack size is consumed
-    /// by the bump check before the trap fires.
-    #[error("wasm scratch heap exhausted (alloc requested {needed} bytes)")]
-    #[diagnostic(
-        code(relon::eval::wasm_scratch_oom),
-        help("The wasm module's internal bump scratch overran linear memory. Pass a larger `out_cap` to leave room for stdlib scratch, or split the request into smaller chunks.")
-    )]
-    WasmScratchOOM {
-        /// Byte count the trapping alloc requested. `0` when the
-        /// size came from the operand stack (dynamic variant).
-        needed: u32,
-        #[label("scratch bump tripped here")]
-        range: TokenRange,
-    },
-
-    /// Phase 7 placeholder: wasm step-limit / fuel exhaustion. The
-    /// v1 AOT backend does not emit a step counter, but the variant
-    /// is reserved so Phase 8+ can wire wasmtime's `OutOfFuel` trap
-    /// without churning the enum surface.
-    #[error("wasm step / fuel limit exhausted")]
-    #[diagnostic(
-        code(relon::eval::wasm_step_limit_exceeded),
-        help("The wasm runtime stopped executing because the host's fuel budget hit zero.")
-    )]
-    WasmStepLimitExceeded {
-        #[label("budget exhausted here")]
-        range: Option<TokenRange>,
-    },
-
-    /// Phase 7 catch-all: a wasm trap that doesn't match any
-    /// known Relon-emitted guard. Surfaces the wasmtime trap code
-    /// stringified plus the module-absolute pc so a host can still
-    /// produce a meaningful diagnostic for unexpected shapes
-    /// (memory OOB, stack overflow, indirect-call type mismatch,
-    /// ...). `range` is best-effort — `None` when the trap pc
-    /// falls outside the srcmap's entry table.
-    #[error("unclassified wasm trap `{trap_code}` at pc {pc:#x}")]
-    #[diagnostic(
-        code(relon::eval::wasm_trap_unclassified),
-        help("The wasm runtime reported a trap shape this backend doesn't recognise. Inspect the trap_code and re-run with a debug build for more context.")
-    )]
-    WasmTrapUnclassified {
-        /// Stringified wasmtime trap code (e.g. `"MemoryOutOfBounds"`).
-        trap_code: String,
-        /// Module-absolute byte offset of the trapping instruction,
-        /// or `0` when the runtime didn't surface a pc.
-        pc: u32,
-        /// Source range — `Some` when the srcmap covers `pc`,
-        /// `None` for stdlib / synthetic / out-of-range pcs.
-        range: Option<TokenRange>,
     },
 
     /// Phase 8: the active backend cannot satisfy the requested

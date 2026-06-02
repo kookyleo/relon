@@ -15,8 +15,7 @@ use std::time::Instant;
 
 use ordered_float::OrderedFloat;
 use relon_eval_api::{
-    CapabilityBit, CapabilityError, CapabilityGate, NativeArgs, NativeFnCaps, RelonFunction,
-    RuntimeError, Value,
+    CapabilityBit, CapabilityGate, NativeArgs, NativeFnCaps, RelonFunction, RuntimeError, Value,
 };
 use relon_ir::IrType;
 use relon_parser::TokenRange;
@@ -220,7 +219,7 @@ impl CapabilityVtable {
     ///   the only check), OR
     /// - the gate explicitly grants the bit.
     ///
-    /// Returns `Err(CapabilityError)` when the gate denies the bit.
+    /// Returns `Err(CapabilityBit)` when the gate denies the bit.
     /// `cap_bit` outside the [`CapabilityBit`] enum's lower range is
     /// also treated as "no gate authority" — the legacy host-supplied
     /// `BcOp::Trap(CapabilityDenied)` carries `u32::MAX` which falls
@@ -231,7 +230,7 @@ impl CapabilityVtable {
     /// future `BcOp::CallNative` / `BcOp::CheckCap` ops will use; it
     /// also drives the pre-dispatch `consult_all_granted_bits` sweep
     /// run from [`BytecodeVm::invoke_from_with_stack`].
-    pub fn consult_gate(&self, cap_bit: u32) -> Result<(), CapabilityError> {
+    pub fn consult_gate(&self, cap_bit: u32) -> Result<(), CapabilityBit> {
         let Some(gate) = self.gate.as_ref() else {
             return Ok(());
         };
@@ -274,7 +273,7 @@ impl CapabilityVtable {
     /// `grant` and `invoke`) trips the capability prong before any
     /// guarded op runs. No-op when no gate is installed; no-op when no
     /// bits are granted (the scaffold's default-empty-vtable case).
-    pub fn consult_all_granted_bits(&self) -> Result<(), CapabilityError> {
+    pub fn consult_all_granted_bits(&self) -> Result<(), CapabilityBit> {
         if self.gate.is_none() {
             return Ok(());
         }
@@ -293,8 +292,8 @@ impl CapabilityVtable {
     /// bits the host explicitly granted on the grant-bool vector), this
     /// sweep asks about every bit the API knows about — `ReadsFs`,
     /// `WritesFs`, `Network`, `ReadsClock`, `ReadsEnv`, `UsesRng`. The
-    /// first denial short-circuits with the corresponding
-    /// [`CapabilityError`].
+    /// first denial short-circuits, returning the denied
+    /// [`CapabilityBit`].
     ///
     /// Used as the entry-time consult for functions whose op stream
     /// contains a capability-sensitive op (`BcOp::CallNative` /
@@ -308,7 +307,7 @@ impl CapabilityVtable {
     /// sweep is the activation point for the future widening).
     ///
     /// No-op when no gate is installed.
-    pub fn consult_all_declared_bits(&self) -> Result<(), CapabilityError> {
+    pub fn consult_all_declared_bits(&self) -> Result<(), CapabilityBit> {
         let Some(gate) = self.gate.as_ref() else {
             return Ok(());
         };
@@ -479,7 +478,7 @@ fn decode_cap_bit(cap_bit: u32) -> Option<CapabilityBit> {
 pub enum BcVmError {
     /// Resource-prong trip: instruction count exceeded
     /// `BcVmConfig::max_steps`. Mirrors
-    /// `RuntimeError::WasmStepLimitExceeded`.
+    /// `RuntimeError::StepLimitExceeded`.
     #[error("bytecode VM step limit exceeded after {steps} ops")]
     StepLimitExceeded {
         /// Total ops dispatched before the trip.
@@ -580,22 +579,33 @@ impl BcVmError {
     /// attach.
     pub fn into_runtime_error(self, entry_range: TokenRange) -> RuntimeError {
         match self {
-            BcVmError::StepLimitExceeded { .. } => RuntimeError::WasmStepLimitExceeded {
-                range: Some(entry_range),
+            BcVmError::StepLimitExceeded { .. } => RuntimeError::StepLimitExceeded {
+                limit: None,
+                range: entry_range,
             },
-            BcVmError::DeadlineExceeded => RuntimeError::WasmStepLimitExceeded {
-                range: Some(entry_range),
+            BcVmError::DeadlineExceeded => RuntimeError::StepLimitExceeded {
+                limit: None,
+                range: entry_range,
             },
             BcVmError::DivisionByZero => RuntimeError::DivisionByZero(entry_range),
             BcVmError::NumericOverflow => RuntimeError::NumericOverflow(entry_range),
             BcVmError::JumpOutOfRange { .. }
             | BcVmError::IndexOutOfBounds
             | BcVmError::EmptyList
-            | BcVmError::InvalidUtf8 => RuntimeError::WasmIndexOutOfBounds { range: entry_range },
-            BcVmError::CapabilityDenied { cap_bit } => RuntimeError::WasmCapabilityDenied {
-                cap_bit,
-                range: entry_range,
-            },
+            | BcVmError::InvalidUtf8 => RuntimeError::IndexOutOfBounds { range: entry_range },
+            BcVmError::CapabilityDenied { cap_bit } => {
+                // `u32::MAX` is the legacy "untagged" sentinel — surface
+                // it as a bit-less denial rather than a bogus bit index.
+                let known = (cap_bit != u32::MAX).then_some(cap_bit);
+                RuntimeError::CapabilityDenied {
+                    cap_bit: known,
+                    reason: match known {
+                        Some(b) => format!("host-fn requires capability bit {b}"),
+                        None => "host-fn call denied by capability gate".to_string(),
+                    },
+                    range: entry_range,
+                }
+            }
             BcVmError::StackUnderflow { bc_idx } => RuntimeError::Unsupported {
                 reason: format!("bytecode VM stack underflow at bc_idx {bc_idx}"),
             },
@@ -781,7 +791,7 @@ impl BytecodeVm {
     /// VM so callers that hold a [`BytecodeVm`] can opt into the
     /// pre-check without reaching into the config. Returns `Ok(())`
     /// when no gate is installed or every granted bit passes.
-    pub fn consult_capability_gate(&self) -> Result<(), CapabilityError> {
+    pub fn consult_capability_gate(&self) -> Result<(), CapabilityBit> {
         self.config.cap_vtable.consult_all_granted_bits()
     }
 
@@ -799,13 +809,13 @@ impl BytecodeVm {
     fn precheck_capabilities(&self, func: &BcFunction) -> Result<(), BcVmError> {
         if let Err(err) = self.config.cap_vtable.consult_all_granted_bits() {
             return Err(BcVmError::CapabilityDenied {
-                cap_bit: err.cap.bit_index(),
+                cap_bit: err.bit_index(),
             });
         }
         if func.requires_cap_consult {
             if let Err(err) = self.config.cap_vtable.consult_all_declared_bits() {
                 return Err(BcVmError::CapabilityDenied {
-                    cap_bit: err.cap.bit_index(),
+                    cap_bit: err.bit_index(),
                 });
             }
         }
@@ -1082,7 +1092,7 @@ impl BytecodeVm {
         // bits get the consult for free.
         //
         // Note: this is enforcement, not advisory — a denial here
-        // surfaces as `RuntimeError::WasmCapabilityDenied` exactly
+        // surfaces as `RuntimeError::CapabilityDenied` exactly
         // like a `BcOp::Trap(CapabilityDenied)` would. Phase 3 IR
         // coverage expansion will widen this into per-call-site
         // consults via the new `BcOp::CheckCap` / `BcOp::CallNative`
@@ -1672,7 +1682,7 @@ impl BytecodeVm {
                 if *cap_bit != u32::MAX {
                     if let Err(err) = self.config.cap_vtable.consult_gate(*cap_bit) {
                         return Err(BcVmError::CapabilityDenied {
-                            cap_bit: err.cap.bit_index(),
+                            cap_bit: err.bit_index(),
                         });
                     }
                     // Belt-and-braces: when no gate is installed the
@@ -1769,7 +1779,7 @@ impl BytecodeVm {
                 if *cap_bit != u32::MAX {
                     if let Err(err) = self.config.cap_vtable.consult_gate(*cap_bit) {
                         return Err(BcVmError::CapabilityDenied {
-                            cap_bit: err.cap.bit_index(),
+                            cap_bit: err.bit_index(),
                         });
                     }
                     if self.config.cap_vtable.gate().is_none()
@@ -2206,7 +2216,7 @@ fn pop(stack: &mut Vec<VmValue>, bc_idx: usize) -> Result<VmValue, BcVmError> {
 /// [`BcVmError`]. `OutOfRange` (compiler bug — handle the arena never
 /// minted) maps to the same `IndexOutOfBounds` envelope as
 /// `ElementOutOfRange` for now; both surface as
-/// `RuntimeError::WasmIndexOutOfBounds` after the lift, which keeps
+/// `RuntimeError::IndexOutOfBounds` after the lift, which keeps
 /// the four-way differential harness's bounce shape stable. Phase
 /// 4b-continuation can widen the carrier if we ever want to
 /// distinguish "compiler bug" from "runtime trap" at the public

@@ -473,7 +473,7 @@ impl TreeWalkEvaluator {
             let prev = self.context.step_counter.fetch_add(1, Ordering::Relaxed);
             if prev >= limit {
                 return Err(RuntimeError::StepLimitExceeded {
-                    limit,
+                    limit: Some(limit),
                     range: node.range,
                 });
             }
@@ -2099,9 +2099,9 @@ impl TreeWalkEvaluator {
         use relon_eval_api::CapabilityGate;
         match self.context.capabilities.check_gate(&entry.gate) {
             Ok(()) => Ok(()),
-            Err(err) => Err(RuntimeError::CapabilityDenied {
-                name: name.to_string(),
-                reason: err.reason.label(err.cap),
+            Err(bit) => Err(RuntimeError::CapabilityDenied {
+                cap_bit: Some(bit.bit_index()),
+                reason: format!("native function `{name}`: {}", bit.deny_message()),
                 range,
             }),
         }
@@ -2619,7 +2619,10 @@ impl NativeFnCaps for EvaluatorCaps {
         // the budget is fully consumed, with a one-step grace at the
         // boundary inherited from the existing check).
         if prev.saturating_add(n) > limit {
-            return Err(RuntimeError::StepLimitExceeded { limit, range });
+            return Err(RuntimeError::StepLimitExceeded {
+                limit: Some(limit),
+                range,
+            });
         }
         Ok(())
     }

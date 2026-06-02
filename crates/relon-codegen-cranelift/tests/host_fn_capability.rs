@@ -4,7 +4,7 @@
 //!
 //! * succeeds (no trap) when the host has registered a host fn at
 //!   that cap_bit;
-//! * traps with `WasmCapabilityDenied` when the slot is empty.
+//! * traps with `CapabilityDenied` when the slot is empty.
 //!
 //! Covers HelloWorld scenario #3 from the brief.
 
@@ -66,8 +66,8 @@ fn check_cap_traps_when_capability_unregistered() {
     args.insert("x".to_string(), Value::Int(99));
     let err = evaluator.run_main(args).expect_err("must trap");
     assert!(
-        matches!(err, RuntimeError::WasmCapabilityDenied { .. }),
-        "expected WasmCapabilityDenied, got {err:?}"
+        matches!(err, RuntimeError::CapabilityDenied { .. }),
+        "expected CapabilityDenied, got {err:?}"
     );
 }
 
@@ -124,5 +124,5 @@ fn unrelated_cap_bit_does_not_satisfy_a_different_gate() {
     let mut args = HashMap::new();
     args.insert("x".to_string(), Value::Int(99));
     let err = evaluator.run_main(args).expect_err("must trap");
-    assert!(matches!(err, RuntimeError::WasmCapabilityDenied { .. }));
+    assert!(matches!(err, RuntimeError::CapabilityDenied { .. }));
 }
