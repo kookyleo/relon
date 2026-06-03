@@ -167,6 +167,23 @@ pub struct LlvmAotEvaluator {
     /// every dispatch so the JIT-emitted `iconst(I32, offset)` lands
     /// on the right record.
     const_data: Vec<u8>,
+    /// Phase 0b: the module's `#native` imports in `import_idx` order.
+    /// Carried so [`Self::with_host_fns`] can match a host-supplied
+    /// `Arc<dyn RelonFunction>` (keyed by source-level name) to the
+    /// `import_idx` the lowering pass assigned.
+    native_imports: Vec<relon_ir::ir::NativeImport>,
+    /// Phase 0b: host-fn registry installed on every per-call
+    /// `ArenaState` so a source-lowered `Op::CallNative` dispatches
+    /// through `relon_llvm_call_native`. Behind an `Arc` so the
+    /// registry outlives every dispatch without per-call clones; rebuilt
+    /// by [`Self::with_host_fns`]. Empty by default — an unregistered
+    /// gated call then traps after passing the `CheckCap` gate.
+    host_fns: Arc<crate::state::HostFnRegistry>,
+    /// Phase 0b: capability bitmask passed as the buffer entry's
+    /// trailing `i64 caps` param. The source-lowered `Op::CheckCap`
+    /// gate tests bit `cap_bit` of this word; `0` denies every gated
+    /// call. Set via [`Self::with_granted_cap`] / [`Self::with_caps`].
+    caps_mask: i64,
 }
 
 thread_local! {
@@ -209,7 +226,34 @@ impl LlvmAotEvaluator {
     /// past peephole, schema-method dispatch, stdlib calls, …) fail
     /// at the LLVM emit step with `LlvmError::Codegen`.
     pub fn from_source(src: &str) -> Result<Self, LlvmError> {
-        let (ir, main_schema, return_schema) = Self::lower_source(src)?;
+        Self::from_source_with_options_inner(src, None)
+    }
+
+    /// Like [`Self::from_source`] but with caller-supplied analyzer
+    /// options — the entry point for host-registered `#native` fns.
+    /// The host populates `options.host_fn_names` /
+    /// `host_fn_signatures` / `host_fn_gates` / `caps` so the analyzer
+    /// resolves the calls, runs the single-file capability-reachability
+    /// check (a gated call without the statically-granted cap fails the
+    /// build here), and the lowering pass emits the `Op::CheckCap`-
+    /// guarded `Op::CallNative`.
+    ///
+    /// The returned evaluator carries an empty host-fn registry and a
+    /// zero capability mask; chain [`Self::with_host_fns`] +
+    /// [`Self::with_granted_cap`] to wire the runtime dispatch + grant.
+    /// Mirrors the cranelift backend's `from_source_with_options`.
+    pub fn from_source_with_options(
+        src: &str,
+        options: &relon_analyzer::AnalyzeOptions,
+    ) -> Result<Self, LlvmError> {
+        Self::from_source_with_options_inner(src, Some(options))
+    }
+
+    fn from_source_with_options_inner(
+        src: &str,
+        options: Option<&relon_analyzer::AnalyzeOptions>,
+    ) -> Result<Self, LlvmError> {
+        let (ir, main_schema, return_schema) = Self::lower_source_with_options(src, options)?;
         let main_layout = relon_eval_api::layout::SchemaLayout::offsets_for(&main_schema)
             .map_err(|e| LlvmError::Codegen(format!("main schema layout: {e}")))?;
         let return_layout = relon_eval_api::layout::SchemaLayout::offsets_for(&return_schema)
@@ -224,8 +268,9 @@ impl LlvmAotEvaluator {
         Self::from_ir_inner(ir, param_names, Some(schema))
     }
 
-    fn lower_source(
+    fn lower_source_with_options(
         src: &str,
+        options: Option<&relon_analyzer::AnalyzeOptions>,
     ) -> Result<
         (
             relon_ir::ir::Module,
@@ -247,15 +292,38 @@ impl LlvmAotEvaluator {
         // severity diagnostics under non-strict mode and still gate the
         // build below. Unlike the bytecode / cranelift tiers, the LLVM
         // backend does NOT force `standalone_capability_check`.
-        let options = relon_analyzer::AnalyzeOptions {
-            strict_mode: false,
-            ..Default::default()
+        //
+        // Phase 0b: a caller-supplied `options` (host `#native` fns)
+        // takes precedence — the host already sets `strict_mode: false`
+        // on it (see the cranelift `host_options` fixture). We force
+        // `strict_mode: false` regardless so the closure surface stays
+        // unblocked even if a host left it default-true.
+        let owned;
+        let options: &relon_analyzer::AnalyzeOptions = match options {
+            Some(o) => {
+                if o.strict_mode {
+                    owned = relon_analyzer::AnalyzeOptions {
+                        strict_mode: false,
+                        ..o.clone()
+                    };
+                    &owned
+                } else {
+                    o
+                }
+            }
+            None => {
+                owned = relon_analyzer::AnalyzeOptions {
+                    strict_mode: false,
+                    ..Default::default()
+                };
+                &owned
+            }
         };
         // Map the shared frontend pipeline error onto this backend's
         // surface: Parse → Parse, Analyze(n) → Analyze(n), and Lowering
         // → Codegen with the historical `lower_workspace_single:` prefix
         // (the LLVM backend has no dedicated `Lowering` variant).
-        let lowered = relon_ir::frontend::compile(src, &options).map_err(|e| match e {
+        let lowered = relon_ir::frontend::compile(src, options).map_err(|e| match e {
             relon_ir::FrontendError::Parse(msg) => LlvmError::Parse(msg),
             relon_ir::FrontendError::Analyze(n) => LlvmError::Analyze(n),
             relon_ir::FrontendError::Lowering(msg) => {
@@ -382,6 +450,7 @@ impl LlvmAotEvaluator {
             Some(&helper_ir_indices),
             &lambdas,
             &ir.closure_table,
+            &ir.imports,
         )?;
 
         // Phase D.1 / D.2: attempt to emit the typed fast-path entry
@@ -578,9 +647,17 @@ impl LlvmAotEvaluator {
         // its presence means "this module has at least one extern
         // call site that needs `add_global_mapping` after engine
         // creation".
+        // Phase 0b: the native-dispatch helper is also a host-resident
+        // extern (it lives in this crate's `.text`, not the JIT arena),
+        // so a module that references it must stay on the default JIT
+        // builder (Large CodeModel) for the same ±2 GB-relocation reason
+        // the `str.contains` shim does.
         let uses_extern_shim = module
             .get_function(crate::str_helpers::RELON_LLVM_STR_CONTAINS_ARENA_SYMBOL)
-            .is_some();
+            .is_some()
+            || module
+                .get_function(crate::state::RELON_LLVM_CALL_NATIVE_SYMBOL)
+                .is_some();
         let force_default_mcjit = std::env::var_os("RELON_LLVM_FORCE_DEFAULT_MCJIT").is_some();
         let engine = if uses_extern_shim || force_default_mcjit {
             module
@@ -618,6 +695,16 @@ impl LlvmAotEvaluator {
                 &shim_fn,
                 crate::str_helpers::relon_llvm_str_contains_arena_addr(),
             );
+        }
+
+        // Phase 0b: map the native-dispatch helper symbol to its host
+        // address so an emitted `call @relon_llvm_call_native` resolves.
+        // The default MCJIT resolver (`dlsym`) cannot see the static
+        // from inside this dylib's section layout — same constraint as
+        // the `str.contains` shim. No-op when the module never emitted
+        // a `CallNative` (the symbol is absent).
+        if let Some(cn_fn) = module.get_function(crate::state::RELON_LLVM_CALL_NATIVE_SYMBOL) {
+            engine.add_global_mapping(&cn_fn, crate::state::relon_llvm_call_native_addr());
         }
 
         let entry_ptr = engine.get_function_address(ENTRY_SYMBOL).map_err(|e| {
@@ -660,6 +747,9 @@ impl LlvmAotEvaluator {
             buffer_schema,
             fast_path_arity,
             const_data: const_pool.bytes,
+            native_imports: ir.imports.clone(),
+            host_fns: Arc::new(crate::state::HostFnRegistry::new()),
+            caps_mask: 0,
         })
     }
 
@@ -675,6 +765,66 @@ impl LlvmAotEvaluator {
     /// Names of the declared `#main` parameters in declaration order.
     pub fn param_names(&self) -> &[String] {
         &self.param_names
+    }
+
+    /// Phase 0b: the `#native` imports the lowering pass interned for
+    /// this module, in `import_idx` order. Lets a host map fn names to
+    /// the slots [`Self::with_host_fns`] fills. Mirrors the cranelift
+    /// backend's `native_imports`.
+    pub fn native_imports(&self) -> &[relon_ir::ir::NativeImport] {
+        &self.native_imports
+    }
+
+    /// Phase 0b: register the host's `Arc<dyn RelonFunction>` callables
+    /// for source-lowered native-fn dispatch. Each entry is keyed by the
+    /// source-level fn name; this matches the name to the `import_idx`
+    /// the lowering pass assigned (via [`Self::native_imports`]) and
+    /// installs the callable in the evaluator's `import_idx`-keyed
+    /// registry. A source-lowered `Op::CallNative` then dispatches to it
+    /// through the `relon_llvm_call_native` helper. Names with no
+    /// matching `#native` import are skipped. Mirrors the cranelift
+    /// backend's `with_host_fns`.
+    ///
+    /// The capability *guard* is enforced independently by the
+    /// `Op::CheckCap` prologue against the granted `caps` mask
+    /// ([`Self::with_granted_cap`]) — registering a callable does not
+    /// grant its capability.
+    pub fn with_host_fns(
+        mut self,
+        host_fns: &std::collections::HashMap<String, Arc<dyn relon_eval_api::RelonFunction>>,
+    ) -> Self {
+        let mut registry = crate::state::HostFnRegistry::new();
+        for (idx, imp) in self.native_imports.iter().enumerate() {
+            if let Some(func) = host_fns.get(&imp.name) {
+                registry.register(idx as u32, Arc::clone(func));
+            }
+        }
+        self.host_fns = Arc::new(registry);
+        self
+    }
+
+    /// Phase 0b: grant a capability bit so the source-lowered
+    /// `Op::CheckCap` prologue passes at runtime. Sets bit `bit` in the
+    /// `caps` bitmask the buffer entry receives as its trailing `i64`
+    /// param. Decoupled from the analyze-time `caps`: a host can grant
+    /// statically (build passes the reachability check) yet withhold
+    /// here to exercise a stricter runtime posture (the gated call then
+    /// traps `CapabilityDenied`). Mirrors the cranelift backend's
+    /// `with_granted_cap` outcome class.
+    pub fn with_granted_cap(mut self, bit: u32) -> Self {
+        if bit < 64 {
+            self.caps_mask |= 1i64 << bit;
+        }
+        self
+    }
+
+    /// Phase 0b: set the full `caps` bitmask wholesale (the trailing
+    /// `i64` param the buffer entry's `Op::CheckCap` gate tests).
+    /// Companion to [`Self::with_granted_cap`] for hosts that already
+    /// hold a packed mask.
+    pub fn with_caps(mut self, caps_mask: i64) -> Self {
+        self.caps_mask = caps_mask;
+        self
     }
 
     /// Fast-path entry mirroring `AotEvaluator::run_main_legacy_i64`:
@@ -1070,6 +1220,16 @@ impl LlvmAotEvaluator {
 
         let live_arena = &mut arena[..arena_size];
         let state = ArenaState::new(live_arena, scratch_base);
+        // Phase 0b: point the per-call state at the host-fn registry so
+        // a source-lowered `Op::CallNative` resolves through
+        // `relon_llvm_call_native`. The registry lives on the evaluator
+        // behind an `Arc` and outlives this dispatch.
+        // SAFETY: `self.host_fns` is kept alive for the whole call (and
+        // the evaluator's lifetime); the per-call state is the sole
+        // owner of the `UnsafeCell` for the dispatch's duration.
+        unsafe {
+            state.install_host_fns(Arc::as_ptr(&self.host_fns));
+        }
         let state_ptr: *const ArenaState = &state;
 
         // SAFETY: same pattern as the cranelift backend's
@@ -1086,7 +1246,7 @@ impl LlvmAotEvaluator {
                     in_len as i32,
                     out_ptr as i32,
                     out_cap as i32,
-                    /*caps=*/ 0,
+                    /*caps=*/ self.caps_mask,
                 )
             }))
             .map_err(|_| RuntimeError::Unsupported {
@@ -1094,6 +1254,15 @@ impl LlvmAotEvaluator {
             })?
         };
 
+        // Phase 0b: a `CheckCap` deny or a failed `CallNative` dispatch
+        // returns the negative sentinel and records the precise cause in
+        // `state.trap_code`. Lift it to a typed `RuntimeError` (the same
+        // outcome class the cranelift backend surfaces) before the
+        // generic negative-bytes_written path.
+        let trap_code = state.trap_code();
+        if trap_code != 0 {
+            return Err(crate::state::NativeTrap::runtime_error_from_code(trap_code));
+        }
         if bytes_written < 0 {
             return Err(RuntimeError::IoError(format!(
                 "llvm-aot run_main reported negative bytes_written: {bytes_written}"
@@ -1608,7 +1777,7 @@ impl LlvmAotEvaluator {
         entry_symbol: &str,
         out_path: &Path,
     ) -> Result<EmitObjectInfo, LlvmError> {
-        let (ir, main_schema, return_schema) = Self::lower_source(src)?;
+        let (ir, main_schema, return_schema) = Self::lower_source_with_options(src, None)?;
         let main_layout = relon_eval_api::layout::SchemaLayout::offsets_for(&main_schema)
             .map_err(|e| LlvmError::Codegen(format!("main schema layout: {e}")))?;
         let return_layout = relon_eval_api::layout::SchemaLayout::offsets_for(&return_schema)
@@ -1722,6 +1891,7 @@ impl LlvmAotEvaluator {
                     Some(&helper_ir_indices),
                     &lambdas,
                     &ir.closure_table,
+                    &ir.imports,
                 )?;
                 // Rename the canonical buffer entry to the build.rs-
                 // supplied symbol and force external linkage so the

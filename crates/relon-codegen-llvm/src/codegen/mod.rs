@@ -379,6 +379,7 @@ pub(crate) fn emit_module_funcs<'ctx>(
     helper_ir_indices: Option<&[u32]>,
     lambdas: &[&Func],
     closure_table: &[u32],
+    imports: &[relon_ir::ir::NativeImport],
 ) -> Result<
     (
         FunctionValue<'ctx>,
@@ -445,6 +446,7 @@ pub(crate) fn emit_module_funcs<'ctx>(
             const_pool,
             &helper_table,
             &closure_fn_table,
+            imports,
         )?;
         (fv, EntryShape::Buffer)
     } else {
@@ -843,6 +845,40 @@ fn declare_llvm_trap<'ctx>(ctx: &'ctx Context, module: &LlvmModule<'ctx>) -> Fun
     let void_t = ctx.void_type();
     let fn_ty = void_t.fn_type(&[], false);
     module.add_function("llvm.trap", fn_ty, None)
+}
+
+/// Phase 0b: declare the `relon_llvm_call_native` host-dispatch helper
+/// on `module` if absent. Signature mirrors the Rust helper:
+///
+/// ```text
+/// i64 relon_llvm_call_native(ptr state, i32 import_idx,
+///                            ptr args_ptr, i32 arg_count)
+/// ```
+///
+/// `Linkage::External` so MCJIT resolves it to the host address the
+/// evaluator registers via `add_global_mapping` (the default resolver
+/// can't see the static from inside the host dylib's section layout —
+/// same constraint as the `str.contains` shim). Idempotent so repeated
+/// emit passes don't duplicate the declaration.
+fn declare_call_native<'ctx>(
+    ctx: &'ctx Context,
+    module: &LlvmModule<'ctx>,
+) -> FunctionValue<'ctx> {
+    if let Some(f) = module.get_function(crate::state::RELON_LLVM_CALL_NATIVE_SYMBOL) {
+        return f;
+    }
+    let i64_t = ctx.i64_type();
+    let i32_t = ctx.i32_type();
+    let ptr_t = ctx.ptr_type(AddressSpace::default());
+    let fn_ty = i64_t.fn_type(
+        &[ptr_t.into(), i32_t.into(), ptr_t.into(), i32_t.into()],
+        false,
+    );
+    module.add_function(
+        crate::state::RELON_LLVM_CALL_NATIVE_SYMBOL,
+        fn_ty,
+        Some(Linkage::External),
+    )
 }
 
 /// #359 (W20): map an [`IrType`] to the LLVM type used in a helper /
@@ -1245,6 +1281,7 @@ fn emit_buffer_entry_with_helpers<'ctx>(
         const_pool,
         Some(helper_table),
         &[],
+        &[],
     )
 }
 
@@ -1252,14 +1289,16 @@ fn emit_buffer_entry_with_helpers<'ctx>(
 /// also threads the closure function-pointer table into the entry's
 /// `Emit` so the body's `Op::MakeClosure` lowering can stamp the
 /// matching `fn_table_idx` into the closure handle.
-fn emit_buffer_entry_with_helpers_and_closures<'ctx>(
+#[allow(clippy::too_many_arguments)]
+fn emit_buffer_entry_with_helpers_and_closures<'ctx, 'cp>(
     ctx: &'ctx Context,
     module: &LlvmModule<'ctx>,
     func: &Func,
     buffer_return_size: u32,
-    const_pool: &ConstPool,
+    const_pool: &'cp ConstPool,
     helper_table: &HashMap<u32, FunctionValue<'ctx>>,
     closure_fn_table: &[FunctionValue<'ctx>],
+    imports: &'cp [relon_ir::ir::NativeImport],
 ) -> Result<FunctionValue<'ctx>, LlvmError> {
     emit_buffer_entry_impl(
         ctx,
@@ -1269,6 +1308,7 @@ fn emit_buffer_entry_with_helpers_and_closures<'ctx>(
         const_pool,
         Some(helper_table),
         closure_fn_table,
+        imports,
     )
 }
 
@@ -1276,14 +1316,16 @@ fn emit_buffer_entry_with_helpers_and_closures<'ctx>(
 /// equivalent lives in `relon-codegen-cranelift::codegen::mod.rs` —
 /// signature mirrored here so a host that holds either evaluator
 /// can dispatch through the same `(state, in_ptr, …)` argv shape.
-fn emit_buffer_entry_impl<'ctx>(
+#[allow(clippy::too_many_arguments)]
+fn emit_buffer_entry_impl<'ctx, 'cp>(
     ctx: &'ctx Context,
     module: &LlvmModule<'ctx>,
     func: &Func,
     buffer_return_size: u32,
-    const_pool: &ConstPool,
+    const_pool: &'cp ConstPool,
     helper_table: Option<&HashMap<u32, FunctionValue<'ctx>>>,
     closure_fn_table: &[FunctionValue<'ctx>],
+    imports: &'cp [relon_ir::ir::NativeImport],
 ) -> Result<FunctionValue<'ctx>, LlvmError> {
     let i32_t = ctx.i32_type();
     let i64_t = ctx.i64_type();
@@ -1384,6 +1426,10 @@ fn emit_buffer_entry_impl<'ctx>(
     }
     emit.closure_fn_table = closure_fn_table.to_vec();
     emit.llvm_trap_fn = Some(declare_llvm_trap(ctx, module));
+    // Phase 0b: thread the `#native` import table + the dynamic-dispatch
+    // helper through so `Op::CallNative` can validate + emit the call.
+    emit.imports = imports;
+    emit.call_native_fn = Some(declare_call_native(ctx, module));
     emit.lower_body(&func.body)?;
 
     Ok(llvm_fn)
@@ -1596,6 +1642,19 @@ pub(crate) struct Emit<'ctx, 'b, 'cp> {
     /// [`build_known_capture_table`]; empty when emitting the entry /
     /// helpers or a lambda with no such captures.
     pub(crate) known_capture_offsets: Vec<(u32, u32)>,
+    /// Phase 0b native dispatch: the module's `#native` imports, in
+    /// `import_idx` order. `Op::CallNative` validates the call's
+    /// `import_idx` / param-shape / ret-ty against this table before
+    /// emitting the dispatch (mirrors cranelift's `self.ir.imports`
+    /// check). Empty for hand-built fixtures / fast / helper / lambda
+    /// emits — those never carry a `CallNative`, so the validation arm
+    /// surfaces a precise `Codegen` error if one slips through.
+    pub(crate) imports: &'cp [relon_ir::ir::NativeImport],
+    /// Phase 0b native dispatch: the declared `relon_llvm_call_native`
+    /// helper `FunctionValue`. `Op::CallNative` emits a `call` against
+    /// it. `None` outside the buffer-protocol entry (the only shape
+    /// that carries a `*state` pointer to thread through).
+    pub(crate) call_native_fn: Option<FunctionValue<'ctx>>,
 }
 
 /// Phase E.1: per-call inline-frame state. One entry per active
@@ -1819,6 +1878,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             const_string_let_slots: std::collections::HashMap::new(),
             known_closure_let_slots: std::collections::HashMap::new(),
             known_capture_offsets: Vec::new(),
+            imports: &[],
+            call_native_fn: None,
         }
     }
 
