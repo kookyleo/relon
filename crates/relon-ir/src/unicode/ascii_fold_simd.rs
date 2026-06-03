@@ -383,11 +383,10 @@ pub fn fold_ascii_prefix(
 /// pre-pass and go straight to the byte-wise mask + xor body.
 ///
 /// This is the entry point that `case_fold` / `to_lower` / `to_upper`
-/// stdlib bodies reach when the input's record header carries the
-/// [`relon_trace_abi::STRING_RECORD_ASCII_FLAG_BIT`] — the producer
-/// (`build_string_record` or the evaluator's intern path) paid the
-/// per-byte ASCII check once at record-build time, so per-call hot
-/// paths drop the SIMD scan entirely.
+/// stdlib bodies reach when the caller has already proven the input is
+/// pure ASCII (e.g. via a record-header ASCII flag stamped once at
+/// record-build time), so per-call hot paths drop the SIMD scan
+/// entirely.
 ///
 /// Saves ~3 cycles / byte vs [`fold_ascii_prefix`] on the auto-vec
 /// scan + mask + xor sequence — the scan alone is one of the three

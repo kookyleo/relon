@@ -24,6 +24,7 @@
 //! See `docs/internal/wasm-crate-structure-2026-05-16.md` for the
 //! IR-first crate split rationale.
 
+pub mod effect;
 pub mod error;
 pub mod frontend;
 pub mod glob;

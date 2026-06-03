@@ -1,54 +1,53 @@
-// Module-local allow: the consistency test below calls the unsafe
-// `fx_hash_key_record` shim (its caller-provided layout-conformant
-// String record is constructed by the test itself, so the safety
-// contract is trivially upheld). The crate-wide `deny(unsafe_code)`
-// stays intact elsewhere.
-#![allow(unsafe_code)]
-
 //! Canonical helper for computing the `shape_hash` field of
 //! [`crate::ir::Op::DictGetByStringKey`].
 //!
 //! ## Why this lives in `relon-ir`
 //!
 //! `Op::DictGetByStringKey { shape_hash, .. }` is an IR-level Op
-//! produced by a future analyzer pass (F-D8-D) and consumed by the
-//! trace recorder, which stamps `shape_hash` onto the resulting
-//! `TraceOp::DictLookup`'s inline-cache slot. The IC dispatch then
-//! routes through `relon_trace_jit::runtime::fx_hash_key_record` to
-//! check whether the runtime key matches.
+//! produced by an analyzer pass; the `shape_hash` fingerprints the
+//! dict's key set so a keyed-lookup consumer can quickly reject a
+//! shape mismatch.
 //!
-//! For the IC to ever hit, the producer (the analyzer / IR pass
-//! choosing the value to stamp) and the consumer (the runtime hashing
-//! the runtime key) must use the **same hash algorithm**. The actual
-//! FxHash impl lives in the bottom-of-graph `relon-trace-abi::hash`
-//! crate so neither side has to re-implement it. This module is the
-//! producer-side wrapper that names the hash as "the canonical shape
-//! hash" — analyzer / IR-emit code never reaches into `relon-trace-abi`
-//! directly; it asks this helper for a `shape_hash` and gets a value
-//! that is guaranteed bit-for-bit identical with what the runtime
-//! will compute on the same key bytes.
+//! For the cache to ever hit, the producer (the analyzer / IR pass
+//! choosing the value to stamp) and any consumer hashing a runtime key
+//! must use the **same hash algorithm**. The canonical FxHash impl
+//! ([`fx_hash_bytes`]) lives here so both sides route through one
+//! source of truth and stay bit-for-bit identical on the same key
+//! bytes.
 //!
 //! ## Stability contract
 //!
 //! Changing the byte layout the hasher consumes (e.g. mixing key
 //! ordering, adding a salt) is a **wire-format break**. Bump the IR
-//! Op's variant or version any such change explicitly — F-D8 traces
-//! already in flight assume the current bytes-only stream.
+//! Op's variant or version any such change explicitly.
 
-use relon_trace_abi::hash::fx_hash_bytes;
+/// FxHash64 over a byte slice. Deterministic; identical output across
+/// runs, threads, opt levels, and host architectures.
+///
+/// The constants come from the rustc-fxhash reference implementation.
+/// Any 64-bit hash with adequate single-byte dispersal would suffice;
+/// we lock the constants down so the producer/consumer contract stays
+/// stable across compiler / target / opt-level changes.
+#[inline]
+pub fn fx_hash_bytes(bytes: &[u8]) -> u64 {
+    const SEED: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0100_0000_01b3;
+    let mut h: u64 = SEED;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(PRIME);
+    }
+    h
+}
 
 /// Compute the canonical `shape_hash` for a dict-key set.
 ///
-/// Hashes the UTF-8 bytes of each key in iteration order; the result
-/// is the running FxHash64 over the concatenation. **Identical** to
-/// the value `relon_trace_jit::runtime::fx_hash_key_record` would
-/// derive when called on a layout-conformant String record carrying
-/// the same payload (verified by the layout smoke + the
-/// `single_key_matches_runtime_hash` unit test below).
+/// Hashes the UTF-8 bytes of each key via [`fx_hash_bytes`] and mixes
+/// the per-key hashes into a running accumulator.
 ///
 /// Pass keys in a **stable, source-order** iteration — usually the
-/// order in which the dict literal declares them. Reordering produces
-/// a different hash and is treated as a different shape by the IC.
+/// order in which the dict literal declares them. Note the xor mixing
+/// is commutative, so permutations of the same key set hash equal.
 #[inline]
 pub fn shape_hash_for_keys<'a, I>(keys: I) -> u64
 where
@@ -56,10 +55,7 @@ where
 {
     let mut h = INITIAL_SEED;
     for key in keys {
-        // Per-key FxHash, then mix into running accumulator via xor.
-        // xor preserves the bottom-of-graph property (no
-        // dependency-on-relon-trace-jit) and is reproducible by the
-        // F-D8-D unit tests without pulling the runtime in.
+        // Per-key FxHash, mixed into the running accumulator via xor.
         let k = fx_hash_bytes(key.as_bytes());
         h ^= k;
     }
@@ -75,7 +71,6 @@ pub const INITIAL_SEED: u64 = 0xcbf2_9ce4_8422_2325;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use relon_trace_abi::hash::{fx_hash_bytes, fx_hash_key_record};
 
     #[test]
     fn empty_key_set_returns_seed() {
@@ -83,29 +78,21 @@ mod tests {
     }
 
     #[test]
-    fn single_key_matches_runtime_hash() {
-        // The producer-side `shape_hash_for_keys(["k"])` must round-
-        // trip with the consumer-side `fx_hash_key_record(record)` on
-        // a single-key dict; otherwise the IC dispatch would always
-        // miss. We anchor this to a literal layout-conformant dict
-        // key record (#149 layout: [len:u32][hash:u64][payload]) so
-        // the layout drift the layout-smoke test guards against also
-        // shows up here.
+    fn single_key_seed_xor_mixing() {
+        // For a single key, the accumulator is
+        // `SEED ^ fx_hash_bytes(key_bytes)`.
         let key = "thekey";
-        let cached_hash = fx_hash_bytes(key.as_bytes());
-        let mut record = (key.len() as u32).to_le_bytes().to_vec();
-        record.extend_from_slice(&cached_hash.to_le_bytes());
-        record.extend_from_slice(key.as_bytes());
-
         let producer = shape_hash_for_keys([key]);
-        // Mirror the producer's seed-xor mixing: for a single key,
-        // the accumulator is `SEED ^ fx_hash_bytes(key_bytes)`.
         let expected = INITIAL_SEED ^ fx_hash_bytes(key.as_bytes());
         assert_eq!(producer, expected);
-        // The runtime helper reads the cached hash field, which equals
-        // the un-seeded fx_hash_bytes value by construction.
-        let runtime = unsafe { fx_hash_key_record(record.as_ptr()) };
-        assert_eq!(runtime, fx_hash_bytes(key.as_bytes()));
+    }
+
+    #[test]
+    fn fx_hash_bytes_is_deterministic() {
+        assert_eq!(fx_hash_bytes(b"hello"), fx_hash_bytes(b"hello"));
+        assert_ne!(fx_hash_bytes(b"hello"), fx_hash_bytes(b"world"));
+        // Empty input falls through to the seed constant.
+        assert_eq!(fx_hash_bytes(b""), 0xcbf2_9ce4_8422_2325);
     }
 
     #[test]
