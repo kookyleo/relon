@@ -149,3 +149,23 @@ Stage 1 + Stage 2 全部 lane 已并入 main、`cargo build/test/clippy --worksp
 - `String s -> s` 恒等被另一处 String 参编组 seam 挡(G2 发现的既有小 seam,非 codegen 拷贝问题)。
 - ListFloat/Bool(前端拒)、ListGet/DictGet/ConstListString/schema-method dispatch(cranelift 亦不支持)—— 沿 0b。
 - LTO 文本 IR 前向兼容仍是经验性(外部二进制依赖已去);长期可考虑同 llvm-sys 出 bitcode。
+
+---
+
+## 7. P3(wasm)实施结果(2026-06-04,核心+parity+WASI 完成、全绿、已推送)
+
+| lane | 结果 | 关键 |
+|---|---|---|
+| **S3.X wasm32 retarget** | ✅ | `CodegenTarget{Native,Wasm32}`;`emit_object_for_target` 参数化 TargetMachine(wasm32-wasi triple、DataLayout `p:32:32` 从 get_target_data)。LLVM→wasm32 object(`\0asm`)→ `wasm-ld`(`wasm_link.rs`)→ wasmtime,9 workload 值对齐 native oracle。arena 体未改(width-agnostic)。`emit_object` 仍是 Native thin wrapper(字节等价) |
+| **parity 覆盖矩阵** | ✅ | 旧 WasmEvaluator 全语料过新路径:13 FastInt(w1/2/5/6/8/9/10/12 等)+ String/const-string/List<Int>/多字段 Dict buffer 返回**全对齐**;3 个发射 gap 诚实标 ❌(见下) |
+| **WASI effectful host** | ✅ | `wasi_host::emit_call_native_wasi`:effectful `#native` 在 wasm32 降成 `(import env <name>)`,wasmtime host 提供。CallNative 分流:ClosedWorld→inline(native)/ Wasm32→import / OpenWorld-native→`relon_llvm_call_native`。`clock_add(35)=42` 经 import 跑出(hit-counter==1 证跨边界),对齐 native |
+
+**P3 现状**:同一 `relon-IR→LLVM-IR` 发射器经 target 切换出 native **或** wasm32;wasm 经 wasm-ld→wasmtime 跑、值对齐 native(native 是 oracle);effectful host 过 WASI import。**已退役 trace-JIT/bytecode 后,codegen 线收成 cranelift(P1 运行时)+ llvm(P2 native / P3 wasm 共用一个发射器)**。
+
+**3 个 wasm32 发射 gap(诚实,parity 测试钉为 unsupported)**:w4 `.contains` filter(wasm32 ConstString const-pool 布局)· w5 production 嵌套 Dict 字段(anon-dict-return 不收嵌套)· w7 递归闭包(`MakeClosure` —— object-emit native+wasm **共有**预存限制,非 wasm 专属)。
+
+**退役决策(S3.Y,待用户拍板,本 loop 不擅删)**:
+- `relon-codegen-wasm` + `relon-wasm-evaluator`:**接近可退役**(新路径覆盖 FastInt 全语料 + String/List/Dict 返回);差 w4/w5 两真实 gap(w7 共有)。补齐这俩即 100% parity,或接受这 3 workload 不经 AOT-wasm、由 parity 测试 + native 接管 oracle。
+- `relon-wasm-bindings`:**不可退役** —— 浏览器解释器(tree-walk via wasm-bindgen)+ LSP(format/hover/goto/complete/rename/inlay),与 AOT codegen **正交**,新路径无替代、也不打算替代。
+
+**Backend::WasmAot**:不加回(`relon/src/lib.rs` 已主动退役该变体)。wasm 是**构建期 emit 产物**(像 native .o),非进程内运行时 backend —— 与架构一致。
