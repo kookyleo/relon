@@ -12,6 +12,8 @@ fn main() {
         .source("src/foo.relon")
         .source("src/bar.relon")
         .source("src/baz.relon")
+        .source("src/qux.relon")
+        .source("src/quux.relon")
         .opt_level(3)
         .emit_all(&out_dir)
         .expect("relon-rs-build: compile demo sources");

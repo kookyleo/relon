@@ -11,7 +11,7 @@
 //! entry, decode the return record, expose host shim symbols the JIT
 //! body calls back into — is implemented here.
 //!
-//! ## Phase 2 envelope
+//! ## Entry shapes
 //!
 //! Two entry shapes flow through this crate:
 //!
@@ -21,11 +21,15 @@
 //!   beyond the placeholder [`SandboxState`] threaded through the
 //!   signature for forward compatibility. Matches the Phase 1 trivial
 //!   demo path.
-//! - **Buffer-protocol (`Buffer`)** — every other supported shape
-//!   (`String` params, helper / stdlib calls, etc.). The binding
-//!   builds an [`ArgValue`] vector from typed Rust args, hands it to
-//!   [`call_buffer_entry`], which packs the arena, dispatches the JIT,
-//!   and decodes the return record into a [`RetValue`].
+//! - **Buffer-protocol (`Buffer`)** — every other supported shape.
+//!   The accepted leaf types are `Int`, `Float`, `Bool`, `Null`,
+//!   `String`, and `List<Int>` (mirrored by the [`EmittedFieldType`]
+//!   enum). The binding builds an [`ArgValue`] vector from typed Rust
+//!   args, hands it to [`call_buffer_entry`], which packs the arena,
+//!   dispatches the JIT, and decodes the return record into a
+//!   [`RetValue`]. `f64` params/returns ride an 8-byte inline slot;
+//!   `&str` / `&[i64]` are copied into the arena's pointer-indirect
+//!   tail region.
 //!
 //! ## Host shim symbols
 //!
@@ -37,9 +41,13 @@
 //!
 //! ## What's deferred to Phase 3
 //!
-//! - `List<T>` argument / return marshalling
-//! - `Float` argument / return marshalling
+//! - `List<Float>` / `List<List<…>>` / nested-`Schema` argument /
+//!   return marshalling (`Int` / `Float` / `Bool` / `Null` / `String` /
+//!   `List<Int>` are wired today)
 //! - Closure-valued returns
+//! - Capability threading on the buffer path — `call_buffer_entry`
+//!   hard-codes `caps = 0`, so `#native` / `Op::CheckCap`-gated bodies
+//!   aren't yet reachable through this crate
 //! - Structured trap propagation (today a Relon-side trap surfaces as
 //!   a Rust panic; Phase 3 will catch + return a typed `Result`)
 //! - Cross-platform host shim coverage (macOS / Windows AOT linking)

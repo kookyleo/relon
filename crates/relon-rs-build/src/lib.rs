@@ -7,14 +7,22 @@
 //! the consuming source then `include_relon!`s the matching binding
 //! file (`relon-rs-macro`) to import the typed Rust wrapper.
 //!
-//! ## Phase 1 envelope
+//! ## Supported signature surface
 //!
-//! Only `#main(Int...) -> Int` shapes are accepted. Each `.relon`
-//! source contributes:
+//! The accepted leaf types for `#main` parameters and the return slot
+//! are `Int`, `Float`, `Bool`, `Null`, `String`, and `List<Int>` (the
+//! [`rust_type_for`] table is the authoritative list — a new
+//! codegen-llvm leaf variant fails the exhaustive `match` until a row
+//! is added). Each `.relon` source contributes:
 //!
 //! - One relocatable ELF object file under `out_dir`, exporting a
-//!   single extern symbol `__relon_<hash>_main` with signature
-//!   `extern "C" fn(i64, ...) -> i64`.
+//!   single extern symbol `__relon_<hash>_main`. The signature depends
+//!   on the entry shape: an Int-only `#main(Int...) -> Int` qualifies
+//!   for the fast path (`extern "C" fn(i64, ...) -> i64`); every other
+//!   accepted shape carries the canonical buffer-protocol signature
+//!   (`extern "C" fn(*const ArenaState, i32, i32, i32, i32, i64) ->
+//!   i32`) and marshals its typed args through
+//!   `relon-rs-shims::call_buffer_entry`.
 //! - One generated `.rs` binding file that names the safe Rust shim
 //!   (module-scoped by default, or aliased via `.source_as` /
 //!   `include_relon!("... " as alias)`).

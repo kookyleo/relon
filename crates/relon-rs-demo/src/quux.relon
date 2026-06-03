@@ -1,0 +1,2 @@
+#main(Int n) -> List<Int>
+[n, n + 1, 7]
