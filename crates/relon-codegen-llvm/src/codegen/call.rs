@@ -1,14 +1,32 @@
 //! `Op`-family: call dispatch.
 //!
 //! User-defined `Call` (direct LLVM call), bundled-stdlib inline `Call`,
-//! and the `llvm.trap` guard call. `CallNative` / `CheckCap` stay in the
-//! `unsupported` set in `super::lower_op` for Phase 0b.
+//! and the `llvm.trap` guard call.
+//!
+//! Phase 0b widens the family with two source-trap / capability ops:
+//!
+//! - [`Op::CheckCap`] — the capability gate. The buffer-protocol entry
+//!   carries the host-granted capability set as its trailing `i64 caps`
+//!   bitmask param (IR `LocalGet(4)` / LLVM param 5). `Op::CheckCap {
+//!   cap_bit }` tests bit `cap_bit` of that mask and traps when it is
+//!   clear. This mirrors the wasm backend's bitmask convention — the
+//!   `cap_bit` value is a `CapabilityBit::bit_index()` (0..=5), the same
+//!   numeric bit the cranelift backend reuses as a `cap_lookup` vtable
+//!   slot key, so all three backends gate on the same numeric bit.
+//! - [`Op::Trap`] — an unconditional `llvm.trap` + `unreachable`,
+//!   mirroring cranelift's `emit_trap` (unconditional `cond_trap`).
+//!
+//! `Op::CallNative` stays a `Codegen` stub: the LLVM-side native
+//! dispatch needs MCJIT symbol wiring + a host-fn registry that lives
+//! outside this file (see the module-level note in the Phase 0b report
+//! and the `unsupported_call_native` helper below).
 
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValueEnum,
 };
+use inkwell::IntPredicate;
 
-use relon_ir::ir::{IrType, Op};
+use relon_ir::ir::{IrType, Op, TrapKind, NO_CAPABILITY_BIT};
 
 use crate::error::LlvmError;
 
@@ -17,17 +35,145 @@ use super::*;
 impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// Phase 0b seam: native dispatch + capability gate + trap
     /// (`CallNative`, `CheckCap`, `Trap`). Dispatched from
-    /// `super::lower_op`. Port from `relon-codegen-cranelift`'s
-    /// `call.rs` / `guard.rs` (and the `relon_call_native` host helper +
-    /// `VtableSlot::RelonCallNative` wiring) and align three-way.
+    /// `super::lower_op`.
+    ///
+    /// `CheckCap` + `Trap` are lowered here in full; `CallNative` stays
+    /// a `Codegen` error pending the cross-file MCJIT host-dispatch
+    /// wiring (see [`Self::unsupported_call_native`]).
     pub(crate) fn lower_call_rest(
         &mut self,
         ip: usize,
         _ip_hint: &str,
         op: &Op,
     ) -> Result<(), LlvmError> {
+        match op {
+            Op::CheckCap { cap_bit } => self.emit_check_cap(*cap_bit),
+            Op::Trap { kind } => self.emit_trap(*kind),
+            Op::CallNative {
+                import_idx,
+                ret_ty,
+                ..
+            } => self.unsupported_call_native(*import_idx, *ret_ty),
+            other => Err(LlvmError::Codegen(format!(
+                "lower_call_rest reached non-call op {other:?} at ip={ip}"
+            ))),
+        }
+    }
+
+    /// Capability gate: `Op::CheckCap { cap_bit }`.
+    ///
+    /// The buffer-protocol entry's trailing `i64 caps` param (IR
+    /// `LocalGet(4)`, LLVM param `param_base + 4`) is the host-granted
+    /// capability bitmask. The gate tests bit `cap_bit`; a clear bit
+    /// routes to an `llvm.trap` + `unreachable` trap block, mirroring
+    /// cranelift's `cond_trap(fn_ptr == null, CapabilityDenied)`. The
+    /// numeric `cap_bit` is a [`relon_cap::CapabilityBit::bit_index`]
+    /// (0..=5) — identical across the three backends; only the lookup
+    /// mechanism (bitmask here, `cap_lookup` vtable slot on cranelift)
+    /// differs. (`bit_index` is `relon_cap::CapabilityBit::bit_index`.)
+    ///
+    /// `NO_CAPABILITY_BIT` elides the gate (cranelift / source lowering
+    /// use the sentinel for "no capability required").
+    ///
+    /// The gate is only meaningful under the buffer-protocol entry shape
+    /// — the legacy-i64 `(I64...) -> I64` entry has no `caps` slot, so a
+    /// `CheckCap` there surfaces as a `Codegen` error rather than
+    /// silently reading an out-of-range param.
+    pub(crate) fn emit_check_cap(&mut self, cap_bit: u32) -> Result<(), LlvmError> {
+        if cap_bit == NO_CAPABILITY_BIT {
+            return Ok(());
+        }
+        if !matches!(self.shape, EntryShape::Buffer) {
+            return Err(LlvmError::Codegen(format!(
+                "Op::CheckCap {{ cap_bit: {cap_bit} }} requires the buffer-protocol entry \
+                 (the legacy-i64 entry carries no `caps` slot)"
+            )));
+        }
+        if cap_bit >= 64 {
+            return Err(LlvmError::Codegen(format!(
+                "Op::CheckCap cap_bit {cap_bit} out of range for the i64 caps bitmask"
+            )));
+        }
+
+        // The `caps` bitmask is IR local 4 (buffer entry handshake slots
+        // are LocalGet(0..=3); LocalGet(4) is the i64 caps word).
+        let caps = self.lookup_param(4)?;
+        if caps.get_type().get_bit_width() != 64 {
+            return Err(LlvmError::Codegen(format!(
+                "Op::CheckCap: caps param is i{} not i64; buffer entry shape changed?",
+                caps.get_type().get_bit_width()
+            )));
+        }
+        let i64_t = self.ctx.i64_type();
+        // mask = 1 << cap_bit ; granted = (caps & mask) != 0.
+        let mask = i64_t.const_int(1u64 << cap_bit, false);
+        let masked = self
+            .builder
+            .build_and(caps, mask, &self.next_name("cap_mask"))
+            .map_err(|e| LlvmError::Codegen(format!("CheckCap and: {e}")))?;
+        let zero = i64_t.const_zero();
+        let denied = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, masked, zero, &self.next_name("cap_denied"))
+            .map_err(|e| LlvmError::Codegen(format!("CheckCap cmp: {e}")))?;
+
+        let trap_bb = self.ctx.append_basic_block(self.func, "cap_denied_trap");
+        let cont_bb = self.ctx.append_basic_block(self.func, "cap_granted");
+        self.builder
+            .build_conditional_branch(denied, trap_bb, cont_bb)
+            .map_err(|e| LlvmError::Codegen(format!("CheckCap branch: {e}")))?;
+
+        // Trap arm: shared `llvm.trap` then `unreachable`.
+        self.builder.position_at_end(trap_bb);
+        self.emit_llvm_trap_call("CheckCap")?;
+        self.builder
+            .build_unreachable()
+            .map_err(|e| LlvmError::Codegen(format!("CheckCap unreachable: {e}")))?;
+
+        // Continue codegen on the granted path.
+        self.builder.position_at_end(cont_bb);
+        Ok(())
+    }
+
+    /// Lower `Op::Trap { kind }`: an unconditional `llvm.trap` +
+    /// `unreachable`. Mirrors cranelift's `emit_trap`
+    /// (`cond_trap(iconst 1, kind)`) — the source lowering emits this
+    /// for `IndexOutOfBounds` / `EmptyList` sentinels. The `kind` is
+    /// diagnostic only on the LLVM path: `llvm.trap` lowers to a single
+    /// `ud2`, so the host observes one undifferentiated trap regardless
+    /// of `kind` (matching the divmod guard's behaviour).
+    ///
+    /// After the terminator we open a fresh dead continuation block so
+    /// any trailing ops the body emits (the IR marks post-`Trap` ops
+    /// unreachable, but a stray `ConstBool` for a typed `If` arm can
+    /// still appear) have somewhere valid to land. Mirrors the
+    /// post-`Return` / post-`Br` dummy-block pattern in `control.rs`.
+    pub(crate) fn emit_trap(&mut self, kind: TrapKind) -> Result<(), LlvmError> {
+        let _ = kind;
+        self.emit_llvm_trap_call("Trap")?;
+        self.builder
+            .build_unreachable()
+            .map_err(|e| LlvmError::Codegen(format!("Op::Trap unreachable: {e}")))?;
+        let cont = self.ctx.append_basic_block(self.func, "after_trap_cont");
+        self.builder.position_at_end(cont);
+        Ok(())
+    }
+
+    /// `Op::CallNative` LLVM stub. The native dispatch needs the host-fn
+    /// registry + MCJIT symbol resolution wired through the evaluator
+    /// (out of this file); see the Phase 0b report's integration notes.
+    /// Surfacing a precise `Codegen` error lets the host fall back to a
+    /// tree-walk / cranelift tier rather than miscompiling the call.
+    fn unsupported_call_native(
+        &self,
+        import_idx: u32,
+        ret_ty: IrType,
+    ) -> Result<(), LlvmError> {
         Err(LlvmError::Codegen(format!(
-            "unsupported op (Phase 0b call seam): {op:?} at ip={ip}"
+            "Op::CallNative (import_idx={import_idx}, ret_ty={ret_ty:?}) not yet supported on the \
+             LLVM AOT backend: native dispatch needs the host-fn registry + MCJIT symbol wiring \
+             (cranelift's `relon_call_native` helper / `RelonCallNative` vtable slot), which lives \
+             outside the per-family codegen module"
         )))
     }
 
