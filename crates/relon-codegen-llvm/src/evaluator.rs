@@ -40,7 +40,7 @@ use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
 use relon_parser::Node;
 
 use crate::codegen::{
-    emit_fast_entry, emit_module_funcs, emit_module_funcs_closed_world,
+    emit_fast_entry, emit_module_funcs, emit_module_funcs_closed_world, emit_module_funcs_wasm,
     is_buffer_protocol_signature, ConstPool, EntryShape, FastPathProfile, WorldMode, ENTRY_SYMBOL,
     ENTRY_SYMBOL_FAST,
 };
@@ -2206,6 +2206,14 @@ impl LlvmAotEvaluator {
         // lowering rejects. Force buffer mode for closed-world.
         let fast_profile = match world_mode {
             WorldMode::ClosedWorld => None,
+            // P3 §2.2: a module that calls a `#native` host fn must take
+            // the buffer entry even when its `#main` schema is Int-only
+            // and would otherwise match the fast profile — `Op::CallNative`
+            // / the preceding `Op::CheckCap` need the `*state` pointer and
+            // the trailing `caps` slot only the buffer entry threads (the
+            // fast `(i64..)->i64` entry has neither). Same reasoning the
+            // closed-world arm uses to force buffer mode.
+            WorldMode::OpenWorld if !ir.imports.is_empty() => None,
             WorldMode::OpenWorld => build_fast_path_profile(&schema).ok(),
         };
 
@@ -2271,14 +2279,19 @@ impl LlvmAotEvaluator {
                     .iter()
                     .map(|&ir_idx| &ir.funcs[ir_idx as usize])
                     .collect();
-                // Stage 2.⑤: pick the dispatch emitter by world mode.
-                // Open-world (default / rs-build today) keeps the
-                // dynamic `relon_llvm_call_native` hop; closed-world
-                // lowers `Op::CallNative` to a direct `call @<host>`
-                // that the host-bitcode link + inline below folds away.
-                let emit = match world_mode {
-                    WorldMode::OpenWorld => emit_module_funcs,
-                    WorldMode::ClosedWorld => emit_module_funcs_closed_world,
+                // Stage 2.⑤ / P3 §2.2: pick the dispatch emitter by world
+                // mode + target. Native open-world (default / rs-build
+                // today) keeps the dynamic `relon_llvm_call_native` hop;
+                // closed-world lowers `Op::CallNative` to a direct
+                // `call @<host>` that the host-bitcode link + inline below
+                // folds away. wasm32 (always open-world — closed-world is
+                // rejected up top) lowers `Op::CallNative` to a **wasm
+                // import** call (`crate::wasi_host`), since the native
+                // MCJIT helper is unreachable inside the sandbox.
+                let emit = match (world_mode, target) {
+                    (WorldMode::OpenWorld, CodegenTarget::Wasm32) => emit_module_funcs_wasm,
+                    (WorldMode::OpenWorld, CodegenTarget::Native) => emit_module_funcs,
+                    (WorldMode::ClosedWorld, _) => emit_module_funcs_closed_world,
                 };
                 let (llvm_fn, _entry_shape, _helper_table, _closure_fn_table) = emit(
                     &ctx,

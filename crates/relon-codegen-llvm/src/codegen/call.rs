@@ -269,6 +269,18 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             return self.emit_call_native_direct(import_idx, param_tys.len(), ret_ty);
         }
 
+        // P3 §2.2: on wasm32 the open-world dynamic helper
+        // (`relon_llvm_call_native`) is unreachable — there is no MCJIT
+        // engine behind a `wasm-ld` linked module to patch the symbol in.
+        // An **effectful** host fn must cross the sandbox boundary back
+        // out to the trusted host, so we lower the call to a **wasm
+        // import** (declared external, kept unresolved by
+        // `wasm-ld --allow-undefined`, satisfied by wasmtime's `Linker`).
+        // See `crate::wasi_host`.
+        if matches!(self.target, crate::CodegenTarget::Wasm32) {
+            return self.emit_call_native_wasi(import_idx, param_tys.len(), ret_ty);
+        }
+
         let call_native_fn = self.call_native_fn.ok_or_else(|| {
             LlvmError::Codegen(
                 "Op::CallNative: relon_llvm_call_native helper not declared (emit_module_funcs \

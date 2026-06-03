@@ -428,6 +428,49 @@ pub(crate) fn emit_module_funcs<'ctx>(
         closure_table,
         imports,
         WorldMode::OpenWorld,
+        crate::CodegenTarget::Native,
+    )
+}
+
+/// P3 §2.2 wasm32 entry point. Same open-world dispatch as
+/// [`emit_module_funcs`] but targets wasm32 so an `Op::CallNative`
+/// lowers to a **wasm import** call ([`crate::wasi_host`]) instead of the
+/// native `relon_llvm_call_native` MCJIT helper. Used only by the
+/// `emit_object_for_target(.., CodegenTarget::Wasm32)` object-emit path.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn emit_module_funcs_wasm<'ctx>(
+    ctx: &'ctx Context,
+    module: &LlvmModule<'ctx>,
+    entry: &Func,
+    buffer_return_size: u32,
+    const_pool: &ConstPool,
+    helpers: &[&Func],
+    helper_ir_indices: Option<&[u32]>,
+    lambdas: &[&Func],
+    closure_table: &[u32],
+    imports: &[relon_ir::ir::NativeImport],
+) -> Result<
+    (
+        FunctionValue<'ctx>,
+        EntryShape,
+        HashMap<u32, FunctionValue<'ctx>>,
+        Vec<FunctionValue<'ctx>>,
+    ),
+    LlvmError,
+> {
+    emit_module_funcs_impl(
+        ctx,
+        module,
+        entry,
+        buffer_return_size,
+        const_pool,
+        helpers,
+        helper_ir_indices,
+        lambdas,
+        closure_table,
+        imports,
+        WorldMode::OpenWorld,
+        crate::CodegenTarget::Wasm32,
     )
 }
 
@@ -468,6 +511,7 @@ pub(crate) fn emit_module_funcs_closed_world<'ctx>(
         closure_table,
         imports,
         WorldMode::ClosedWorld,
+        crate::CodegenTarget::Native,
     )
 }
 
@@ -484,6 +528,7 @@ fn emit_module_funcs_impl<'ctx>(
     closure_table: &[u32],
     imports: &[relon_ir::ir::NativeImport],
     world_mode: WorldMode,
+    target: crate::CodegenTarget,
 ) -> Result<
     (
         FunctionValue<'ctx>,
@@ -552,6 +597,7 @@ fn emit_module_funcs_impl<'ctx>(
             &closure_fn_table,
             imports,
             world_mode,
+            target,
         )?;
         (fv, EntryShape::Buffer)
     } else {
@@ -1433,6 +1479,7 @@ fn emit_buffer_entry_with_helpers<'ctx>(
         &[],
         &[],
         WorldMode::OpenWorld,
+        crate::CodegenTarget::Native,
     )
 }
 
@@ -1451,6 +1498,7 @@ fn emit_buffer_entry_with_helpers_and_closures<'ctx, 'cp>(
     closure_fn_table: &[FunctionValue<'ctx>],
     imports: &'cp [relon_ir::ir::NativeImport],
     world_mode: WorldMode,
+    target: crate::CodegenTarget,
 ) -> Result<FunctionValue<'ctx>, LlvmError> {
     emit_buffer_entry_impl(
         ctx,
@@ -1462,6 +1510,7 @@ fn emit_buffer_entry_with_helpers_and_closures<'ctx, 'cp>(
         closure_fn_table,
         imports,
         world_mode,
+        target,
     )
 }
 
@@ -1480,6 +1529,7 @@ fn emit_buffer_entry_impl<'ctx, 'cp>(
     closure_fn_table: &[FunctionValue<'ctx>],
     imports: &'cp [relon_ir::ir::NativeImport],
     world_mode: WorldMode,
+    target: crate::CodegenTarget,
 ) -> Result<FunctionValue<'ctx>, LlvmError> {
     let i32_t = ctx.i32_type();
     let i64_t = ctx.i64_type();
@@ -1584,10 +1634,21 @@ fn emit_buffer_entry_impl<'ctx, 'cp>(
     // `Op::CallNative` can validate the call shape.
     emit.imports = imports;
     emit.world_mode = world_mode;
+    emit.target = target;
     match world_mode {
         // Open-world (MCJIT / from_source): declare the dynamic-dispatch
         // helper so `Op::CallNative` emits a `call @relon_llvm_call_native`
         // that `add_global_mapping` later resolves to the host address.
+        //
+        // P3 §2.2: the wasm32 target has no MCJIT engine to patch the
+        // helper symbol in — declaring it would leave an unresolvable
+        // native import. The wasm path instead lowers each
+        // `Op::CallNative` to a direct **wasm import** call
+        // (`emit_call_native_wasi`), declaring the import lazily at the
+        // call site, so we skip the helper declaration here.
+        WorldMode::OpenWorld if matches!(target, crate::CodegenTarget::Wasm32) => {
+            emit.call_native_fn = None;
+        }
         WorldMode::OpenWorld => {
             emit.call_native_fn = Some(declare_call_native(ctx, module));
         }
@@ -1833,6 +1894,13 @@ pub(crate) struct Emit<'ctx, 'b, 'cp> {
     /// [`WorldMode::OpenWorld`] so MCJIT / `from_source` are untouched;
     /// only `crate::cocompile` flips it to `ClosedWorld`.
     pub(crate) world_mode: WorldMode,
+    /// P3 §2.2: the codegen target. Defaults to
+    /// [`CodegenTarget::Native`]; only the wasm32 object-emit path flips
+    /// it to [`CodegenTarget::Wasm32`]. On wasm32 an open-world
+    /// `Op::CallNative` lowers to a **wasm import** call (see
+    /// [`crate::wasi_host`]) instead of the native MCJIT
+    /// `relon_llvm_call_native` helper, which the sandbox cannot reach.
+    pub(crate) target: crate::CodegenTarget,
 }
 
 /// Phase E.1: per-call inline-frame state. One entry per active
@@ -2059,6 +2127,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             imports: &[],
             call_native_fn: None,
             world_mode: WorldMode::OpenWorld,
+            target: crate::CodegenTarget::Native,
         }
     }
 
