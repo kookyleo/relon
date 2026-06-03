@@ -2806,6 +2806,133 @@ fn lower_list_index_typed(
     Ok(())
 }
 
+/// W5-P2: lower a 1D `keys[i]` index on a `List<String>` receiver
+/// (tagged `IrType::ListString`, pushed by [`lower_variable`]'s head
+/// load). A `List<String>` record is a *pointer array*, NOT the inline
+/// 8-byte-element shape `lower_list_index_typed` handles:
+///
+/// ```text
+/// [len: u32 LE][off_0: u32 LE][off_1: u32 LE]...[off_{N-1}: u32 LE]
+/// ```
+///
+/// `off_i` is the arena-relative byte offset of the i-th String record
+/// (`[slen: u32 LE][utf8]`) — the exact same handle representation
+/// `Op::ConstString` pushes. The header has NO 8-byte pad (every slot
+/// is u32), so element `i` sits at `base + 4 + i*4`. Indexing therefore
+/// loads the `u32` slot and leaves it on the vstack tagged
+/// `IrType::String` — a downstream String-return tail-record copy
+/// (`EmitTailRecordFromAbsoluteAddr { ty: String }`) then resolves the
+/// `[slen][utf8]` record through that handle exactly as it would for a
+/// `ConstString`.
+///
+/// Addressing (mirrors `lower_list_index_typed`'s let-stash discipline
+/// but with a 4-byte stride and no align mask):
+///
+/// ```text
+/// base = <ListString handle on vstack>      ; i32, stashed in a let
+/// idx  = <index expr>                        ; i64 -> truncated to i32
+/// addr = base + 4 + idx*4                     ; i32
+/// push i32.load(addr)                         ; LoadI32AtAbsolute{0}
+/// ```
+///
+/// No bounds branch — same in-bounds rationale as the int/float path
+/// (`keys[i % 10]` is provably within a 10-element list).
+fn lower_list_string_index(
+    index_node: &Node,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    let base_i = ctx.next_let_idx;
+    let idx_i = ctx.next_let_idx + 1;
+    ctx.next_let_idx += 2;
+
+    // Stash the receiver handle (a `ListString` arena offset, i32).
+    let top = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
+        kind: "Variable(list-string-index-empty-stack)".to_string(),
+        range,
+    })?;
+    debug_assert_eq!(top, IrType::ListString);
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: base_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+
+    // Lower the index expression; require an Int (I64), truncate into
+    // the i32 `idx` slot.
+    lower_expr(&index_node.expr, index_node.range, ctx)?;
+    expect_int_top(ctx, range)?;
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: idx_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.pop();
+
+    // addr = base + 4 + idx*4
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: base_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(4),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I32),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: idx_i,
+            ty: IrType::I32,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(4),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::Mul(IrType::I32),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I32),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+
+    // push i32.load(addr) -> the String handle (arena offset).
+    ctx.out.push(TaggedOp {
+        op: Op::LoadI32AtAbsolute { offset: 0 },
+        range,
+    });
+    ctx.tstack.pop(); // i32 addr
+    ctx.tstack.push(IrType::String);
+    Ok(())
+}
+
 /// Pop the current vstack head and require it to be `I64`.  Used by
 /// the `list.sum(range(...))` desugar to defend against the inner
 /// argument exprs lowering to a non-i64 slot — analyzer typing should
@@ -5206,6 +5333,32 @@ fn lower_variable(
             }
             // Pops the `ListFloat` receiver, pushes the f64 element.
             lower_list_index_typed(index_node, IrType::ListFloat, range, ctx)?;
+            return Ok(());
+        }
+        // W5-P2: 1D `keys[i]` index on a `List<String>` receiver — the
+        // dict-probe `keys[i % 10]` workload, plus the standalone
+        // `["a", .., "j"][i]` form. A `List<String>` record is a
+        // *pointer array*: `[len: u32][off_0: u32]...[off_{N-1}: u32]`
+        // header whose `off_i` is the arena-relative byte offset of the
+        // i-th String record (`[slen: u32][utf8]`). Indexing it loads
+        // the `u32` slot — which IS a `String` handle (the same i32
+        // arena offset `ConstString` pushes) — so the result rides on
+        // the vstack tagged `String` and any downstream consumer (the
+        // String-return tail-record copy) sees a normal String value.
+        // Only the single trailing-index form is accepted (no
+        // `List<List<String>>` in scope).
+        if receiver_ty == Some(IrType::ListString) && path.len() == 2 {
+            let TokenKey::Dynamic(index_node, optional) = &path[1] else {
+                unreachable!("guarded by the all-Dynamic check above");
+            };
+            if *optional {
+                return Err(LoweringError::UnsupportedExpr {
+                    kind: "Variable(optional-list-index unsupported)".to_string(),
+                    range,
+                });
+            }
+            // Pops the `ListString` receiver, pushes the String handle.
+            lower_list_string_index(index_node, range, ctx)?;
             return Ok(());
         }
         // A `Dynamic` segment on a non-list receiver is not a

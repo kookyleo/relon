@@ -27,6 +27,8 @@ pub(super) enum ConstValueKind {
     ListInt,
     ListFloat,
     ListBool,
+    /// W5-P2: arena `List<String>` pointer-array header record.
+    ListString,
     /// W5-P1: arena `{String -> Int}` dict record.
     Dict,
 }
@@ -79,6 +81,10 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
             ConstValueKind::ListBool => (
                 self.const_pool.list_bool_offsets.get(&idx).copied(),
                 "ConstListBool",
+            ),
+            ConstValueKind::ListString => (
+                self.const_pool.list_string_offsets.get(&idx).copied(),
+                "ConstListString",
             ),
             ConstValueKind::Dict => {
                 (self.const_pool.dict_offsets.get(&idx).copied(), "ConstDict")

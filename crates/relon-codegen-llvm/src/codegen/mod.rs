@@ -195,6 +195,13 @@ pub struct ConstPool {
     /// `List<Bool>` pool: `idx -> byte offset`. Record layout is
     /// `[len: u32 LE][u8 booleans]` (tightly packed), aligned to 4.
     pub list_bool_offsets: std::collections::HashMap<u32, u32>,
+    /// W5-P2: `List<String>` pointer-array pool: `idx -> header byte
+    /// offset`. Record layout (byte-identical to cranelift's
+    /// `visit_const_list_string`): each element's `[slen: u32 LE][utf8]`
+    /// String record is emitted first (4-aligned), then the header
+    /// `[len: u32 LE][off_0: u32 LE]...[off_{N-1}: u32 LE]` whose
+    /// `off_i` is the arena-relative offset of String record `i`.
+    pub list_string_offsets: std::collections::HashMap<u32, u32>,
     /// Materialised bytes in record order. The host trampoline copies
     /// these verbatim to `arena[..bytes.len()]` before every dispatch.
     pub bytes: Vec<u8>,
@@ -225,6 +232,7 @@ impl ConstPool {
             Op::ConstListInt { idx, elements } => self.add_list_int(*idx, elements),
             Op::ConstListFloat { idx, elements } => self.add_list_float(*idx, elements),
             Op::ConstListBool { idx, elements } => self.add_list_bool(*idx, elements),
+            Op::ConstListString { idx, elements } => self.add_list_string(*idx, elements),
             Op::Block { body, .. } | Op::Loop { body, .. } => self.collect_body(body),
             Op::If {
                 then_body,
@@ -336,6 +344,44 @@ impl ConstPool {
             self.bytes.push(if *e { 1 } else { 0 });
         }
         self.list_bool_offsets.insert(idx, off);
+        Ok(())
+    }
+
+    /// W5-P2: lay out a `List<String>` pointer-array record. Each
+    /// element's `[slen: u32 LE][utf8]` String record is emitted first
+    /// (4-aligned), then the header `[len: u32 LE][off_0: u32 LE]...`
+    /// whose `off_i` is the arena-relative offset of String record `i`.
+    /// Byte-identical to cranelift's `visit_const_list_string` (cross-
+    /// backend arena data contract); the `idx -> header offset` map is
+    /// what `Op::ConstListString` resolves to.
+    fn add_list_string(&mut self, idx: u32, elements: &[String]) -> Result<(), LlvmError> {
+        if self.list_string_offsets.contains_key(&idx) {
+            return Ok(());
+        }
+        self.align_to(4);
+        let mut str_offsets: Vec<u32> = Vec::with_capacity(elements.len());
+        for s in elements {
+            self.align_to(4);
+            let s_off = u32::try_from(self.bytes.len()).map_err(|_| {
+                LlvmError::Codegen("ConstListString string offset exceeds u32".into())
+            })?;
+            let slen = u32::try_from(s.len()).map_err(|_| {
+                LlvmError::Codegen("ConstListString element length exceeds u32".into())
+            })?;
+            self.bytes.extend_from_slice(&slen.to_le_bytes());
+            self.bytes.extend_from_slice(s.as_bytes());
+            str_offsets.push(s_off);
+        }
+        self.align_to(4);
+        let header_off = u32::try_from(self.bytes.len())
+            .map_err(|_| LlvmError::Codegen("ConstListString header offset exceeds u32".into()))?;
+        let len = u32::try_from(elements.len())
+            .map_err(|_| LlvmError::Codegen("ConstListString length exceeds u32".into()))?;
+        self.bytes.extend_from_slice(&len.to_le_bytes());
+        for off in &str_offsets {
+            self.bytes.extend_from_slice(&off.to_le_bytes());
+        }
+        self.list_string_offsets.insert(idx, header_off);
         Ok(())
     }
 }
@@ -3168,6 +3214,39 @@ mod const_pool_tests {
         assert_eq!(pool.list_int_offsets.get(&1).copied(), Some(8));
         assert_eq!(&pool.bytes[8..12], &1u32.to_le_bytes());
         assert_eq!(&pool.bytes[16..24], &42i64.to_le_bytes());
+    }
+
+    #[test]
+    fn const_list_string_byte_layout() {
+        // W5-P2 pointer-array layout. Elements "a","bb","ccc":
+        //   String records first (4-aligned):
+        //     off 0:  [slen=1]["a"]            -> 5 bytes, pad to 8
+        //     off 8:  [slen=2]["bb"]           -> 6 bytes, pad to 16
+        //     off 16: [slen=3]["ccc"]          -> 7 bytes, pad to 24
+        //   header at off 24:
+        //     [len=3][off_0=0][off_1=8][off_2=16]
+        let pool = ConstPool::from_module(&synth_module(vec![tagged(Op::ConstListString {
+            idx: 0,
+            elements: vec!["a".into(), "bb".into(), "ccc".into()],
+        })]))
+        .unwrap();
+        // String record "a" at offset 0.
+        assert_eq!(&pool.bytes[0..4], &1u32.to_le_bytes());
+        assert_eq!(&pool.bytes[4..5], b"a");
+        // "bb" at offset 8 (4-aligned after the 5-byte "a" record).
+        assert_eq!(&pool.bytes[8..12], &2u32.to_le_bytes());
+        assert_eq!(&pool.bytes[12..14], b"bb");
+        // "ccc" at offset 16.
+        assert_eq!(&pool.bytes[16..20], &3u32.to_le_bytes());
+        assert_eq!(&pool.bytes[20..23], b"ccc");
+        // Header at offset 24.
+        let h = pool.list_string_offsets.get(&0).copied();
+        assert_eq!(h, Some(24));
+        assert_eq!(&pool.bytes[24..28], &3u32.to_le_bytes());
+        assert_eq!(&pool.bytes[28..32], &0u32.to_le_bytes());
+        assert_eq!(&pool.bytes[32..36], &8u32.to_le_bytes());
+        assert_eq!(&pool.bytes[36..40], &16u32.to_le_bytes());
+        assert_eq!(pool.bytes.len(), 40);
     }
 
     #[test]

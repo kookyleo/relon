@@ -97,10 +97,14 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
 
     fn visit_const_list_string(
         &mut self,
-        _idx: u32,
+        idx: u32,
         _elements: &[String],
     ) -> Result<(), CraneliftError> {
-        unsupported("ConstListString")
+        // W5-P2: push the arena-relative pointer to the pointer-array
+        // header the const pool laid out for this idx. A `keys[i]`
+        // consumer indexes it as `[len][off_0]...[off_{N-1}]`.
+        self.emit_const_value(idx, ConstValueKind::ListString)?;
+        Ok(())
     }
 
     fn visit_const_dict(

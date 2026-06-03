@@ -38,10 +38,14 @@
 //!    store), so the op is provably wired rather than a silent no-op.
 //!
 //! The const-list family (`ConstListInt` / `ConstListFloat` /
-//! `ConstListBool` / `ConstListString`) and the subscript ops
-//! (`ListGetByIntIdx` / `DictGetByStringKey`) stay `unsupported` — see
-//! the module-doc on `lower_collections_rest` for the reasons
-//! (cross-family `ConstPool` widening / no cranelift golden oracle).
+//! `ConstListBool` / `ConstListString`) is now wired (the last was
+//! closed by W5-P2 — see `tests/w5_p2_list_string.rs`). `DictGetByStringKey`
+//! stays `unsupported` (lands in W5-P3); `ListGetByIntIdx` stays
+//! trace-recorder-only (static `List<String>` indexing lowers to inline
+//! `LoadI32AtAbsolute` addressing, never that op). The assertion below
+//! pins that THESE TWO sources (a nested branded dict + a string
+//! subrecord) do not themselves smuggle any of those ops — it is not a
+//! statement about global backend support.
 
 use relon_codegen_cranelift::AotEvaluator;
 use relon_codegen_llvm::LlvmAotEvaluator;
