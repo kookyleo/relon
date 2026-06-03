@@ -8,13 +8,29 @@ use inkwell::values::{
     BasicMetadataValueEnum, BasicValueEnum,
 };
 
-use relon_ir::ir::IrType;
+use relon_ir::ir::{IrType, Op};
 
 use crate::error::LlvmError;
 
 use super::*;
 
 impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
+    /// Phase 0b seam: native dispatch + capability gate + trap
+    /// (`CallNative`, `CheckCap`, `Trap`). Dispatched from
+    /// `super::lower_op`. Port from `relon-codegen-cranelift`'s
+    /// `call.rs` / `guard.rs` (and the `relon_call_native` host helper +
+    /// `VtableSlot::RelonCallNative` wiring) and align three-way.
+    pub(crate) fn lower_call_rest(
+        &mut self,
+        ip: usize,
+        _ip_hint: &str,
+        op: &Op,
+    ) -> Result<(), LlvmError> {
+        Err(LlvmError::Codegen(format!(
+            "unsupported op (Phase 0b call seam): {op:?} at ip={ip}"
+        )))
+    }
+
     /// Phase E.2 multi-function dispatch: lower `Op::Call`.
     ///
     /// The IR's `fn_index` is split as `[0..stdlib_count) = bundled

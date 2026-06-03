@@ -8,7 +8,7 @@ use inkwell::values::{
 };
 use inkwell::IntPredicate;
 
-use relon_ir::ir::{IrType, TaggedOp};
+use relon_ir::ir::{IrType, Op, TaggedOp};
 
 use crate::error::LlvmError;
 use crate::state::ARENA_STATE_OFFSET_TAIL_CURSOR;
@@ -16,6 +16,20 @@ use crate::state::ARENA_STATE_OFFSET_TAIL_CURSOR;
 use super::*;
 
 impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
+    /// Phase 0b seam: multi-way / select control flow (`Select`,
+    /// `BrTable`). Dispatched from `super::lower_op`. Port from
+    /// `relon-codegen-cranelift`'s `control_flow.rs` and align three-way.
+    pub(crate) fn lower_control_rest(
+        &mut self,
+        ip: usize,
+        _ip_hint: &str,
+        op: &Op,
+    ) -> Result<(), LlvmError> {
+        Err(LlvmError::Codegen(format!(
+            "unsupported op (Phase 0b control seam): {op:?} at ip={ip}"
+        )))
+    }
+
     /// Lower `Op::Return`. The shape decides what flows back:
     ///
     /// - Legacy-i64: pop the top of the operand stack and `ret v`.

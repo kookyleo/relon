@@ -2460,17 +2460,19 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 self.emit_call_closure(&ip_hint, param_tys, *ret_ty)?
             }
 
-            // ---- not yet lowered by the LLVM AOT backend ----
-            // These variants are intentionally unsupported in the
-            // current envelope (Phase E.1 covers scalar arith + control
-            // flow + the raw-memory / closure / buffer primitives the
-            // bundled bodies need). They are listed EXPLICITLY rather
-            // than swept up by a `_ =>` wildcard so that adding a new
-            // `Op` variant fails to compile here — forcing a deliberate
-            // decision (lower it, or add it to this unsupported set)
-            // instead of silently surfacing as a runtime codegen error.
-            // The behaviour is identical to the previous catch-all: a
-            // `LlvmError::Codegen` that lets the host fall back.
+            // ---- Phase 0b family seams ----
+            // The ops below are not yet lowered by the LLVM AOT backend.
+            // They are listed EXPLICITLY (no `_ =>` wildcard) so that
+            // adding a new `Op` variant fails to compile here — forcing a
+            // deliberate decision instead of a silent runtime codegen
+            // error. Each group delegates to a thin per-family entry
+            // point living in that family's `codegen/<family>.rs` file,
+            // so Phase 0b agents fill one family file each WITHOUT
+            // touching this shared dispatch (zero merge conflicts). The
+            // stubs return the same `LlvmError::Codegen` the catch-all
+            // used to, so today's fallback behaviour is unchanged.
+
+            // collections.rs — list/dict/sub-record construction
             Op::ConstListInt { .. }
             | Op::ConstListFloat { .. }
             | Op::ConstListBool { .. }
@@ -2479,15 +2481,30 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             | Op::ListGetByIntIdx { .. }
             | Op::AllocSubRecord { .. }
             | Op::PushRecordBase { .. }
-            | Op::EmitTailRecordFromAbsoluteAddr { .. }
-            | Op::Select { .. }
-            | Op::LoadFieldAtAbsolute { .. }
-            | Op::LoadSchemaPtr { .. }
-            | Op::CallNative { .. }
-            | Op::CheckCap { .. }
-            | Op::BrTable { .. }
-            | Op::Trap { .. }
-            | Op::CaseFoldTableAddr { .. }
+            | Op::EmitTailRecordFromAbsoluteAddr { .. } => {
+                self.lower_collections_rest(ip, &ip_hint, &tagged.op)?
+            }
+
+            // control.rs — multi-way / select control flow
+            Op::Select { .. } | Op::BrTable { .. } => {
+                self.lower_control_rest(ip, &ip_hint, &tagged.op)?
+            }
+
+            // mem.rs — absolute-addressed field load
+            Op::LoadFieldAtAbsolute { .. } => {
+                self.lower_mem_rest(ip, &ip_hint, &tagged.op)?
+            }
+
+            // call.rs — native dispatch + capability gate + trap
+            Op::CallNative { .. } | Op::CheckCap { .. } | Op::Trap { .. } => {
+                self.lower_call_rest(ip, &ip_hint, &tagged.op)?
+            }
+
+            // schema.rs — schema pointer / method dispatch
+            Op::LoadSchemaPtr { .. } => self.lower_schema_rest(ip, &ip_hint, &tagged.op)?,
+
+            // unicode.rs — *TableAddr long tail
+            Op::CaseFoldTableAddr { .. }
             | Op::CombiningMarkRangesAddr
             | Op::WhitespaceRangesAddr
             | Op::DecompTableAddr { .. }
@@ -2497,10 +2514,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             | Op::CasedRangesAddr
             | Op::CaseIgnorableRangesAddr
             | Op::TurkishCaseFoldTableAddr { .. } => {
-                return Err(LlvmError::Codegen(format!(
-                    "unsupported op (Phase E.1 envelope): {:?} at ip={ip}",
-                    tagged.op
-                )));
+                self.lower_unicode_rest(ip, &ip_hint, &tagged.op)?
             }
         }
         Ok(())

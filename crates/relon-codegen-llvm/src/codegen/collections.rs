@@ -7,13 +7,27 @@
 
 use inkwell::values::PointerValue;
 
-use relon_ir::ir::IrType;
+use relon_ir::ir::{IrType, Op};
 
 use crate::error::LlvmError;
 
 use super::*;
 
 impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
+    /// Phase 0b seam: list / dict / sub-record construction ops.
+    /// Dispatched from `super::lower_op`. Fill the arms here, porting
+    /// from `relon-codegen-cranelift`'s `record.rs` / const-pool list
+    /// lowering and aligning three-way (tree-walk / cranelift / llvm).
+    pub(crate) fn lower_collections_rest(
+        &mut self,
+        ip: usize,
+        _ip_hint: &str,
+        op: &Op,
+    ) -> Result<(), LlvmError> {
+        Err(LlvmError::Codegen(format!(
+            "unsupported op (Phase 0b collections seam): {op:?} at ip={ip}"
+        )))
+    }
     /// Resolve / create the i32 alloca backing an
     /// `Op::AllocRootRecord` / `Op::AllocSubRecord` record-local
     /// index. Each variable holds an out_ptr-relative i32 offset.

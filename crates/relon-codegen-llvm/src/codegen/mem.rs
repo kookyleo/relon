@@ -9,7 +9,7 @@ use inkwell::values::{
     BasicValueEnum, IntValue, PointerValue,
 };
 
-use relon_ir::ir::IrType;
+use relon_ir::ir::{IrType, Op};
 
 use crate::error::LlvmError;
 use crate::state::{
@@ -38,6 +38,20 @@ pub(crate) enum AbsStore {
 }
 
 impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
+    /// Phase 0b seam: absolute-addressed field load
+    /// (`LoadFieldAtAbsolute`). Dispatched from `super::lower_op`. Port
+    /// from `relon-codegen-cranelift`'s `field.rs` and align three-way.
+    pub(crate) fn lower_mem_rest(
+        &mut self,
+        ip: usize,
+        _ip_hint: &str,
+        op: &Op,
+    ) -> Result<(), LlvmError> {
+        Err(LlvmError::Codegen(format!(
+            "unsupported op (Phase 0b mem seam): {op:?} at ip={ip}"
+        )))
+    }
+
     /// Emit a LoadField — buffer-protocol only. The LLVM IR loads
     /// `arena_base + in_ptr + offset` for a value of `ty`. Phase D.1
     /// fast-path mode short-circuits this into a direct LLVM param
