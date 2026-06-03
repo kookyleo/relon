@@ -25,6 +25,7 @@
 //! IR-first crate split rationale.
 
 pub mod error;
+pub mod frontend;
 pub mod glob;
 pub mod intern;
 pub mod ir;
@@ -50,6 +51,7 @@ pub use crate::unicode::normalization_data;
 pub use crate::unicode::whitespace;
 
 pub use error::LoweringError;
+pub use frontend::{compile, FrontendError};
 pub use ir::{
     ClosureCapture, EffectClass, Func, IrType, Module, NativeImport, Op, TaggedOp, TrapKind,
     NO_CAPABILITY_BIT,

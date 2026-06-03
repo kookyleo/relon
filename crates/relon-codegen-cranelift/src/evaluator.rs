@@ -898,25 +898,13 @@ impl AotEvaluator {
         src: &str,
         options: &relon_analyzer::AnalyzeOptions,
     ) -> Result<(relon_ir::ir::Module, Schema, Schema), CraneliftError> {
-        let ast =
-            relon_parser::parse_document(src).map_err(|e| CraneliftError::Parse(e.to_string()))?;
         // Compiled backend = standalone analyze (no workspace pass), so
         // force the single-file capability-reachability check on.
         let options = relon_analyzer::AnalyzeOptions {
             standalone_capability_check: true,
             ..options.clone()
         };
-        let analyzed = relon_analyzer::analyze_with_options(&ast, &options);
-        if analyzed.has_errors() {
-            let err_count = analyzed
-                .diagnostics
-                .iter()
-                .filter(|d| d.severity() == relon_analyzer::Severity::Error)
-                .count();
-            return Err(CraneliftError::Analyze(err_count));
-        }
-        let lowered = relon_ir::lower_workspace_single(&analyzed, &ast)
-            .map_err(|e| CraneliftError::Lowering(e.to_string()))?;
+        let lowered = relon_ir::frontend::compile(src, &options)?;
         Ok((lowered.module, lowered.main_schema, lowered.return_schema))
     }
 

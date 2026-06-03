@@ -70,6 +70,19 @@ pub enum BytecodeError {
     },
 }
 
+impl From<relon_ir::FrontendError> for BytecodeError {
+    /// Map the shared frontend pipeline error onto this backend's
+    /// equivalent variant. Each arm preserves the exact message /
+    /// payload the open-coded parse → analyze → lower path produced.
+    fn from(e: relon_ir::FrontendError) -> Self {
+        match e {
+            relon_ir::FrontendError::Parse(msg) => BytecodeError::Parse(msg),
+            relon_ir::FrontendError::Analyze(n) => BytecodeError::Analyze(n),
+            relon_ir::FrontendError::Lowering(msg) => BytecodeError::Lowering(msg),
+        }
+    }
+}
+
 /// PC-alignment follow-up #3: bundle of IR data a host needs to drive
 /// the trace recorder against the **same** IR the bytecode compile
 /// pass consumed.
@@ -278,8 +291,6 @@ impl BytecodeEvaluator {
         src: &str,
         options: &relon_analyzer::AnalyzeOptions,
     ) -> Result<Self, BytecodeError> {
-        let ast =
-            relon_parser::parse_document(src).map_err(|e| BytecodeError::Parse(e.to_string()))?;
         // Compiled backends analyze per-file with no workspace pass, so
         // force the single-file capability-reachability check on: a
         // gated native call without the granted cap must fail the build
@@ -288,17 +299,7 @@ impl BytecodeEvaluator {
             standalone_capability_check: true,
             ..options.clone()
         };
-        let analyzed = relon_analyzer::analyze_with_options(&ast, &options);
-        if analyzed.has_errors() {
-            let err_count = analyzed
-                .diagnostics
-                .iter()
-                .filter(|d| d.severity() == relon_analyzer::Severity::Error)
-                .count();
-            return Err(BytecodeError::Analyze(err_count));
-        }
-        let lowered = relon_ir::lower_workspace_single(&analyzed, &ast)
-            .map_err(|e| BytecodeError::Lowering(e.to_string()))?;
+        let lowered = relon_ir::frontend::compile(src, &options)?;
         let main_schema = lowered.main_schema;
         let return_schema = lowered.return_schema;
 
