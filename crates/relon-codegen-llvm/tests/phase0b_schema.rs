@@ -15,13 +15,14 @@
 //! canonical reference for the end-to-end value is therefore the
 //! tree-walker (`reference_tree_walk_value`).
 //!
-//! Likewise the llvm side cannot run a *full* schema-field workload
-//! yet: with `LoadSchemaPtr` now lowered, `from_source` advances past
-//! it and stops at `LoadFieldAtAbsolute` — which lives in the `mem`
-//! family (`mem.rs::lower_mem_rest`), still a Phase 0b stub and out of
-//! scope for this task. `llvm_lowers_load_schema_ptr_blocks_on_field`
-//! pins that the failure has moved off `LoadSchemaPtr`, proving this
-//! seam is implemented.
+//! With both `LoadSchemaPtr` (this seam) and `LoadFieldAtAbsolute` (the
+//! `mem` family) now lowered, the schema-field workload *compiles*:
+//! `from_source` succeeds. The end-to-end *run* is still blocked, but
+//! downstream of codegen — in the shared Phase-B host arg marshaller
+//! (`evaluator.rs::write_value_into_builder` has only scalar arms, no
+//! Schema-typed `#main` param support). `llvm_schema_field_compiles_blocked_on_arg_marshalling`
+//! pins that boundary: build OK, run fails at the marshalling envelope
+//! with no unsupported-op error.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -93,30 +94,28 @@ fn cranelift_declines_load_schema_ptr() {
     );
 }
 
-/// The llvm seam now lowers `LoadSchemaPtr` (ip=0): `from_source`
-/// advances past it and fails on the next op, `LoadFieldAtAbsolute`
-/// (the `mem` family stub, out of scope here). The failure moving off
-/// `LoadSchemaPtr` is the positive signal that this seam is wired.
+/// With `LoadSchemaPtr` (this seam) and `LoadFieldAtAbsolute` (mem
+/// family) both lowered, the schema-field workload compiles —
+/// `from_source` succeeds, proving this seam is wired. The end-to-end
+/// run is blocked solely by the shared Phase-B arg marshaller (no
+/// Schema-typed `#main` param arm). Asserts that boundary: build OK,
+/// run fails at marshalling, no unsupported-op error. When Phase 1
+/// wires schema-arg marshalling this must upgrade to
+/// `assert_eq!(out, Value::Int(7))` (the tree-walk reference above).
 #[test]
-fn llvm_lowers_load_schema_ptr_blocks_on_field() {
-    let err = match LlvmAotEvaluator::from_source(SCHEMA_FIELD_SRC) {
-        Ok(_) => {
-            // If a future change lands `LoadFieldAtAbsolute` too, the
-            // build succeeds — then assert the end-to-end value matches
-            // the tree-walk reference instead.
-            let ev = LlvmAotEvaluator::from_source(SCHEMA_FIELD_SRC).expect("rebuild");
-            let out = ev.run_main(point_arg(3, 4)).expect("llvm run_main");
-            assert_eq!(out, Value::Int(7), "llvm schema-field value mismatch");
-            return;
-        }
-        Err(e) => e.to_string(),
-    };
+fn llvm_schema_field_compiles_blocked_on_arg_marshalling() {
+    let ev = LlvmAotEvaluator::from_source(SCHEMA_FIELD_SRC)
+        .expect("LoadSchemaPtr + LoadFieldAtAbsolute both lower: must compile");
+    let err = ev
+        .run_main(point_arg(3, 4))
+        .expect_err("schema-typed #main arg is not marshalled in Phase B yet");
+    let msg = err.to_string();
     assert!(
-        !err.contains("LoadSchemaPtr"),
-        "LoadSchemaPtr should be lowered now; failure must have moved past it: {err}"
+        msg.contains("schema expects Schema"),
+        "block must be the arg-marshalling envelope, not codegen: {msg}"
     );
     assert!(
-        err.contains("LoadFieldAtAbsolute"),
-        "expected the residual block to be LoadFieldAtAbsolute (mem-family stub), got: {err}"
+        !msg.contains("LoadSchemaPtr") && !msg.contains("LoadFieldAtAbsolute"),
+        "neither op may surface as unsupported anymore: {msg}"
     );
 }

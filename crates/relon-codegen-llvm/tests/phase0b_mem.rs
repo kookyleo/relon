@@ -36,16 +36,18 @@
 //!   prerequisite). So the op cannot be exercised in isolation through
 //!   the public surface.
 //!
-//! What this test therefore pins is the **reachability boundary**: a
-//! schema program that needs `LoadFieldAtAbsolute` now fails — if at
-//! all — on the still-unimplemented `LoadSchemaPtr` prerequisite, and
-//! NOT on `LoadFieldAtAbsolute`. That guards the `mem`-seam wiring: the
-//! op is dispatched into `lower_mem_rest` and emitted rather than
-//! hitting the unsupported stub. Once the `schema` family lands
-//! `LoadSchemaPtr`, this same program should compile and run, at which
-//! point a follow-up can add the tree-walker differential. The cross-
-//! check below keeps the tree-walker oracle wired so that follow-up is
-//! a one-line flip.
+//! What this test therefore pins is the **codegen reachability**: with
+//! the `schema` family now also landed (`LoadSchemaPtr`), a schema
+//! program that needs `LoadFieldAtAbsolute` *compiles* — `from_source`
+//! succeeds, proving both ops lower. The end-to-end *run* is still
+//! blocked, but the block is now downstream of codegen, in the shared
+//! Phase-B host arg marshaller (`evaluator.rs::write_value_into_builder`
+//! only has scalar Int/Float/Bool/Null arms — no Schema-typed `#main`
+//! param support yet), NOT in either family's op lowering. The test
+//! asserts exactly that boundary: build OK, run fails at the marshalling
+//! envelope with no unsupported-op error. When Phase 1 wires schema-arg
+//! marshalling, run_main will succeed and this test must be upgraded to
+//! assert the tree-walk value (`Int(42)`).
 
 use std::collections::HashMap;
 
@@ -72,41 +74,35 @@ fn nested_field_args(v: i64) -> HashMap<String, Value> {
 
 /// Regression guard for the `mem`-family seam wiring.
 ///
-/// `LoadFieldAtAbsolute` is now routed through `lower_mem_rest` and
-/// emitted, so it must NOT be the op that blocks compilation. The only
-/// remaining blocker on this source is the out-of-scope `LoadSchemaPtr`
-/// prerequisite (schema family). When that lands, the `Ok` arm fires
-/// and the result must equal the field value.
+/// With both `schema` (`LoadSchemaPtr`) and `mem` (`LoadFieldAtAbsolute`)
+/// landed, the nested-field program now *compiles*: `from_source`
+/// succeeds, proving `LoadFieldAtAbsolute` lowers (it is dispatched into
+/// `lower_mem_rest` and emitted, not hitting the unsupported stub). The
+/// end-to-end run is still blocked — but downstream of codegen, in the
+/// shared Phase-B host arg marshaller, which has no Schema-typed `#main`
+/// param arm yet. We assert that exact boundary: build OK; run fails at
+/// the marshalling envelope (`schema expects Schema`), with NO
+/// unsupported-op error for either family's op.
 #[test]
-fn load_field_at_absolute_is_wired_not_the_blocker() {
-    let build = LlvmAotEvaluator::from_source(NESTED_FIELD_SRC);
-    match build {
-        Ok(ev) => {
-            // schema family already landed `LoadSchemaPtr`: the program
-            // compiles, so the whole chain — including our
-            // `LoadFieldAtAbsolute` lowering — must produce the field
-            // value. Tree-walker would be the differential oracle here.
-            let got = ev
-                .run_main(nested_field_args(42))
-                .expect("run_main on nested-field program");
-            assert_eq!(
-                got,
-                Value::Int(42),
-                "LoadFieldAtAbsolute miscomputed the nested field"
-            );
-        }
-        Err(e) => {
-            let msg = format!("{e:?}");
-            assert!(
-                msg.contains("LoadSchemaPtr"),
-                "the only acceptable compile blocker is the out-of-scope \
-                 LoadSchemaPtr prerequisite; LoadFieldAtAbsolute must be \
-                 wired through lower_mem_rest. got: {msg}"
-            );
-            assert!(
-                !msg.contains("LoadFieldAtAbsolute"),
-                "LoadFieldAtAbsolute must no longer surface as unsupported: {msg}"
-            );
-        }
-    }
+fn load_field_at_absolute_is_wired_blocked_only_by_arg_marshalling() {
+    let ev = LlvmAotEvaluator::from_source(NESTED_FIELD_SRC).expect(
+        "schema (LoadSchemaPtr) + mem (LoadFieldAtAbsolute) both lower: \
+         the nested-field program must compile",
+    );
+    // The run is blocked solely by the shared Phase-B arg marshaller
+    // (no Schema-typed #main param support). When Phase 1 wires schema-
+    // arg marshalling, this returns Ok and the assertion below must be
+    // upgraded to `assert_eq!(got, Value::Int(42))`.
+    let err = ev
+        .run_main(nested_field_args(42))
+        .expect_err("schema-typed #main arg is not marshalled in Phase B yet");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("schema expects Schema"),
+        "block must be the arg-marshalling envelope, not codegen: {msg}"
+    );
+    assert!(
+        !msg.contains("LoadFieldAtAbsolute") && !msg.contains("LoadSchemaPtr"),
+        "neither family op may surface as unsupported anymore: {msg}"
+    );
 }
