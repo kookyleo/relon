@@ -1835,6 +1835,63 @@ fn read_record_into_map(
 /// `#main(...) -> Dict` whose anon-record lowering collapsed to one
 /// `Int` field (Phase D.2 — W7's `{ result: Int }` is the motivating
 /// shape). Returns the `FastPathProfile` mapping param-declaration
+/// Whether the typed `(i64..) -> i64` fast entry can lower `entry`'s
+/// body. The fast entry runs with **no `*state` pointer and an empty
+/// const-pool** (see `emit_fast_entry`), so any op that resolves
+/// against the arena-prefix const-pool — `Op::ConstString` and the
+/// `Op::ConstList*` family — cannot be materialised on it. Such a body
+/// must take the buffer entry even when its `#main` schema is otherwise
+/// fast-eligible (W4: `Int -> Int` schema over a `"axb"` string
+/// literal). Returns `false` if any reachable op references the pool.
+///
+/// This is the object-emit analogue of MCJIT's
+/// emit-fast-then-roll-back-on-failure dance: rather than emit a fast
+/// entry, watch it fail, and delete it, we predict the failure here and
+/// route straight to the buffer entry (the object module has no second
+/// "buffer entry also present" fallback to fall onto).
+fn fast_entry_emittable(entry: &relon_ir::ir::Func) -> bool {
+    !body_references_const_pool(&entry.body)
+}
+
+fn body_references_const_pool(body: &[relon_ir::ir::TaggedOp]) -> bool {
+    use relon_ir::ir::Op;
+    for tagged in body {
+        let hit = match &tagged.op {
+            Op::ConstString { .. }
+            | Op::ConstListInt { .. }
+            | Op::ConstListFloat { .. }
+            | Op::ConstListBool { .. }
+            | Op::ConstListString { .. } => true,
+            Op::Block { body, .. } | Op::Loop { body, .. } => body_references_const_pool(body),
+            Op::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                body_references_const_pool(then_body)
+                    || body_references_const_pool(else_body)
+            }
+            // `Op::Call` inlines a bundled-stdlib body whose own const-
+            // pool ops would resolve against the same (empty, on the fast
+            // entry) pool. Mirror `ConstPool::collect_op`'s stdlib
+            // recursion so a stdlib body that bakes a literal also forces
+            // the buffer entry.
+            Op::Call { fn_index, .. } => {
+                let stdlib = relon_ir::stdlib::builtin_stdlib();
+                stdlib
+                    .get(*fn_index as usize)
+                    .map(|callee| body_references_const_pool(&callee.body_owned()))
+                    .unwrap_or(false)
+            }
+            _ => false,
+        };
+        if hit {
+            return true;
+        }
+    }
+    false
+}
+
 /// order to buffer offsets when eligible.
 fn build_fast_path_profile(schema: &BufferSchema) -> Result<FastPathProfile, ()> {
     use relon_eval_api::schema_canonical::TypeRepr;
@@ -2225,6 +2282,29 @@ impl LlvmAotEvaluator {
         // doesn't reference the pool (Int-only bodies have no
         // ConstString ops) so the blob ends up empty in that branch.
         let const_pool = ConstPool::from_module(&ir)?;
+
+        // Phase D fast-entry eligibility is decided from the `#main`
+        // schema alone (Int args, single-Int return). That envelope is
+        // necessary but not sufficient: a fast-qualifying schema can
+        // still wrap a body that touches ops the `(i64..) -> i64` fast
+        // entry can't lower — most notably `Op::ConstString` /
+        // `Op::ConstList*`, which resolve against the arena-prefix
+        // const-pool the fast entry has no state pointer to reach (it
+        // emits with an empty pool). W4
+        // (`range(n).map(=>"axb").filter(s.contains("x")).len()`) is the
+        // canonical case: an `Int -> Int` schema over a string-literal
+        // body. The in-process MCJIT path (`from_ir_inner_world`) emits
+        // the buffer entry first and treats a failed fast-entry emit as
+        // a soft "no fast path", rolling the fast entry back and keeping
+        // the buffer entry. The object-emit path historically emitted
+        // *only* the fast entry, so the same body hard-failed here with
+        // a `missing const-pool entry`. Mirror MCJIT: try the fast entry
+        // first, and on emit failure fall through to the buffer entry
+        // (which lowers `Op::ConstString` against the real const-pool).
+        let fast_profile = match fast_profile {
+            Some(profile) if fast_entry_emittable(entry) => Some(profile),
+            _ => None,
+        };
 
         let (shape, references_str_contains_shim) = match fast_profile {
             Some(ref profile) => {
