@@ -101,3 +101,32 @@ Stage 1(serial-foundational seam)      Stage 2(并行 fan-out)          Stage 3(
 | **W1-C = S2.③ cap/sandbox**(即起) | NEW codegen-llvm/src/sandbox.rs + src/vtable.rs;只读 state.rs | 移植 cranelift sandbox/vtable;链接后二进制验能力三态 |
 
 三者文件零共享(evaluator/marshal/rs-build vs call/mod/cocompile vs 全新 sandbox/vtable)。①②④ 等 W1-A;⑤ 等 W1-B;③ 即 W1-C。
+
+---
+
+## 5. Phase 1(P2)实施结果(2026-06-03,已完成、全绿)
+
+Stage 1 + Stage 2 全部 lane 已并入 main、`cargo build/test/clippy --workspace` 全绿、worktree 全清。
+
+| lane | 结果 | 关键证据 |
+|---|---|---|
+| **S1.A** marshal seam | ✅ | `EmittedFieldType` 三元组拆 per-variant 助手 + 编译期穷尽 round-trip 护栏(防三 crate 漂移) |
+| **S1.B** LTO co-compile 脊梁 | ✅ | 闭世界 CallNative 直调;**bitcode skew(rustc-LLVM22 vs 系统 LLVM18)经 `--emit=llvm-ir`+`llvm-as-18` 文本桥解**;post-O3 host fn 完全 inline |
+| **S2.①** Float | ✅ | 原生 `.o` 描述符 + 值层 bit-identical 三方(tree-walk/cranelift/llvm) |
+| **S2.②** ListInt | ✅ | **List 返回解码缺口关闭**(const + 参数派生),三方对齐 |
+| **S2.③** Phase C sandbox/vtable | ✅ | sandbox.rs/vtable.rs 移植;能力门 IR 烤进原生对象;object e2e 经 S2.⑤ 的 emit_object options 解锁 |
+| **S2.④** relon-rs 集成 | ✅ | **真·原生 link-and-run demo**:Float→11.5、Int→List=[10,11,7] 等 6 形态全对(真 .o 链接 + typed 调用 + 正确解码值) |
+| **S2.⑤** 源码驱动闭世界 buffer + emit_object options | ✅ | `from_source_closed_world` JIT buffer entry:post-O3 **零 `relon_llvm_call_native`、零 `call @<host>`**、inline 留存、值 == 开世界 == cranelift 锚;`emit_object_with_options` 解析 `#native`(旧签名保留) |
+
+**P2 现状达成**:
+- **原生签名面**:Int/Float/Bool/Null/String/Schema(参)/ListInt —— 远超原「仅 Int」封套。
+- **co-compile LTO 脊梁(marquee)**:CallNative 单元内直调,源码驱动的 buffer 程序 host fn post-O3 完全 inline,值正确锚 cranelift。GraalVM 式闭世界**已打通**。
+- **Phase C 能力门**:`Op::CheckCap` 烤进原生对象,sandbox/vtable 移植到位,object emit e2e 解锁。
+
+**剩余 unsupported / 诚实缺口(留作已知边界)**:
+- **ListFloat/ListBool**:relon-ir 前端拒这些字段(不可达,非后端缺口)。
+- **List 参→List 返值路径**:frozen JIT codegen 不跨 arena 拷贝记录(仅描述符层验证)。
+- **relon-rs crate 内的 cap/`#native` e2e**:codegen-llvm 的 object 路径现已能 emit+解析 `#native`(S2.⑤),但 relon-rs 运行时 shim 层 `call_buffer_entry` 硬编 caps=0 + 无 `#native` 分发表 —— 从链接后二进制调带门 `#native` 尚未接(relon-rs-shims/marshal 残留)。
+- **LTO bitcode 桥**:现用 `llvm-as-18` 文本桥(版本 skew),前向兼容是经验性;长期稳妥 = 用同 llvm-sys 出 host bitcode(W1-B 标注,deferred)。
+- **ListGet/DictGet/ConstListString/schema-method dispatch**:沿 0b,cranelift 亦不支持或无源级路径。
+- **Stage 3 perf**:S2.⑤ 已做基础 inline 深化;独立的 LTO inline 深度调优未单独追。
