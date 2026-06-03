@@ -161,6 +161,17 @@ pub struct ConstPool {
     /// `idx -> byte offset within `bytes`. The emitter materialises
     /// `Op::ConstString { idx }` as `iconst(I32, string_offsets[idx])`.
     pub string_offsets: std::collections::HashMap<u32, u32>,
+    /// `List<Int>` pool: `idx -> byte offset`. Mirrors cranelift's
+    /// `ConstPool::list_int_offsets`; record layout is
+    /// `[len: u32 LE][pad: u32][i64 elements LE]`, aligned to 8.
+    pub list_int_offsets: std::collections::HashMap<u32, u32>,
+    /// `List<Float>` pool: `idx -> byte offset`. Same layout as
+    /// `list_int_offsets` (f64 elements stored as their u64 LE
+    /// bit-pattern), aligned to 8.
+    pub list_float_offsets: std::collections::HashMap<u32, u32>,
+    /// `List<Bool>` pool: `idx -> byte offset`. Record layout is
+    /// `[len: u32 LE][u8 booleans]` (tightly packed), aligned to 4.
+    pub list_bool_offsets: std::collections::HashMap<u32, u32>,
     /// Materialised bytes in record order. The host trampoline copies
     /// these verbatim to `arena[..bytes.len()]` before every dispatch.
     pub bytes: Vec<u8>,
@@ -188,6 +199,9 @@ impl ConstPool {
     fn collect_op(&mut self, op: &Op) -> Result<(), LlvmError> {
         match op {
             Op::ConstString { idx, value } => self.add_string(*idx, value),
+            Op::ConstListInt { idx, elements } => self.add_list_int(*idx, elements),
+            Op::ConstListFloat { idx, elements } => self.add_list_float(*idx, elements),
+            Op::ConstListBool { idx, elements } => self.add_list_bool(*idx, elements),
             Op::Block { body, .. } | Op::Loop { body, .. } => self.collect_body(body),
             Op::If {
                 then_body,
@@ -219,10 +233,7 @@ impl ConstPool {
         // Align to 4 so the `[len: u32]` header lands on a 4-byte
         // boundary — i32 loads through the JIT use `align=4` and we
         // don't want an unaligned trap on hosts where it matters.
-        let rem = self.bytes.len() % 4;
-        if rem != 0 {
-            self.bytes.resize(self.bytes.len() + (4 - rem), 0);
-        }
+        self.align_to(4);
         let off = u32::try_from(self.bytes.len())
             .map_err(|_| LlvmError::Codegen("llvm const pool exceeds u32 range".into()))?;
         let len = u32::try_from(value.len())
@@ -230,6 +241,78 @@ impl ConstPool {
         self.bytes.extend_from_slice(&len.to_le_bytes());
         self.bytes.extend_from_slice(value.as_bytes());
         self.string_offsets.insert(idx, off);
+        Ok(())
+    }
+
+    /// Pad `bytes` up to the next `align` boundary with zero fill.
+    /// Mirrors cranelift's `ConstPool::align_to`.
+    fn align_to(&mut self, align: usize) {
+        let rem = self.bytes.len() % align;
+        if rem != 0 {
+            self.bytes.resize(self.bytes.len() + (align - rem), 0);
+        }
+    }
+
+    /// Lay out a `List<Int>` record. Byte layout
+    /// `[len: u32 LE][pad: u32 zero][i64 elements LE]`, aligned to 8 —
+    /// byte-identical to cranelift's `visit_const_list_int` (cross-
+    /// backend arena data contract).
+    fn add_list_int(&mut self, idx: u32, elements: &[i64]) -> Result<(), LlvmError> {
+        if self.list_int_offsets.contains_key(&idx) {
+            return Ok(());
+        }
+        self.align_to(8);
+        let off = u32::try_from(self.bytes.len())
+            .map_err(|_| LlvmError::Codegen("llvm const pool exceeds u32 range".into()))?;
+        let len = u32::try_from(elements.len())
+            .map_err(|_| LlvmError::Codegen("ConstListInt length exceeds u32 range".into()))?;
+        self.bytes.extend_from_slice(&len.to_le_bytes());
+        self.bytes.extend_from_slice(&[0u8; 4]); // pad to 8
+        for e in elements {
+            self.bytes.extend_from_slice(&e.to_le_bytes());
+        }
+        self.list_int_offsets.insert(idx, off);
+        Ok(())
+    }
+
+    /// Lay out a `List<Float>` record. Same layout as `add_list_int`
+    /// (f64 elements stored as their u64 LE bit-pattern), aligned to 8 —
+    /// byte-identical to cranelift's `visit_const_list_float`.
+    fn add_list_float(&mut self, idx: u32, elements: &[u64]) -> Result<(), LlvmError> {
+        if self.list_float_offsets.contains_key(&idx) {
+            return Ok(());
+        }
+        self.align_to(8);
+        let off = u32::try_from(self.bytes.len())
+            .map_err(|_| LlvmError::Codegen("llvm const pool exceeds u32 range".into()))?;
+        let len = u32::try_from(elements.len())
+            .map_err(|_| LlvmError::Codegen("ConstListFloat length exceeds u32 range".into()))?;
+        self.bytes.extend_from_slice(&len.to_le_bytes());
+        self.bytes.extend_from_slice(&[0u8; 4]); // pad to 8
+        for e in elements {
+            self.bytes.extend_from_slice(&e.to_le_bytes());
+        }
+        self.list_float_offsets.insert(idx, off);
+        Ok(())
+    }
+
+    /// Lay out a `List<Bool>` record. Byte layout
+    /// `[len: u32 LE][u8 booleans]` (tightly packed), aligned to 4 —
+    /// byte-identical to cranelift's `visit_const_list_bool`.
+    fn add_list_bool(&mut self, idx: u32, elements: &[bool]) -> Result<(), LlvmError> {
+        if self.list_bool_offsets.contains_key(&idx) {
+            return Ok(());
+        }
+        self.align_to(4);
+        let off = u32::try_from(self.bytes.len())
+            .map_err(|_| LlvmError::Codegen("llvm const pool exceeds u32 range".into()))?;
+        let len = u32::try_from(elements.len())
+            .map_err(|_| LlvmError::Codegen("ConstListBool length exceeds u32 range".into()))?;
+        self.bytes.extend_from_slice(&len.to_le_bytes());
+        for e in elements {
+            self.bytes.push(if *e { 1 } else { 0 });
+        }
+        self.list_bool_offsets.insert(idx, off);
         Ok(())
     }
 }
@@ -2655,6 +2738,139 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
 
 
 
+}
+
+#[cfg(test)]
+mod const_pool_tests {
+    //! Byte-level layout pins for the `ConstList*` const-pool records.
+    //!
+    //! These are the cross-backend arena data contract: the bytes the
+    //! LLVM `ConstPool` lays out for `ConstListInt` / `ConstListFloat`
+    //! / `ConstListBool` must be byte-identical to what
+    //! `relon_codegen_cranelift`'s `ConstPool::visit_const_list_*`
+    //! produces (both backends copy the same blob into the arena
+    //! prefix; a layout drift on one side silently corrupts the other's
+    //! cached ET_REL). Both ConstPools are crate-private, so the
+    //! parity is pinned here against the documented wire layout the
+    //! cranelift `visit_const_list_*` port was matched to:
+    //!
+    //! * int / float: align 8, `[len: u32 LE][pad: u32 zero][i64/f64 LE]`
+    //! * bool:        align 4, `[len: u32 LE][u8 0/1 tightly packed]`
+    use super::*;
+    use relon_ir::ir::{Func, Op, TaggedOp};
+    use relon_parser::TokenRange;
+
+    fn tagged(op: Op) -> TaggedOp {
+        TaggedOp {
+            op,
+            range: TokenRange::default(),
+        }
+    }
+
+    fn synth_module(body: Vec<TaggedOp>) -> IrModule {
+        IrModule {
+            funcs: vec![Func {
+                name: "run_main".into(),
+                params: vec![],
+                ret: IrType::I64,
+                body,
+                range: TokenRange::default(),
+            }],
+            entry_func_index: Some(0),
+            imports: vec![],
+            closure_table: vec![],
+        }
+    }
+
+    #[test]
+    fn const_list_int_byte_layout() {
+        let pool = ConstPool::from_module(&synth_module(vec![tagged(Op::ConstListInt {
+            idx: 0,
+            elements: vec![10, 20, 30],
+        })]))
+        .unwrap();
+        assert_eq!(pool.list_int_offsets.get(&0).copied(), Some(0));
+        // [len:u32=3][pad:4 zero][i64 x3 LE]
+        assert_eq!(&pool.bytes[0..4], &3u32.to_le_bytes());
+        assert_eq!(&pool.bytes[4..8], &[0u8; 4]);
+        assert_eq!(&pool.bytes[8..16], &10i64.to_le_bytes());
+        assert_eq!(&pool.bytes[16..24], &20i64.to_le_bytes());
+        assert_eq!(&pool.bytes[24..32], &30i64.to_le_bytes());
+        assert_eq!(pool.bytes.len(), 32);
+    }
+
+    #[test]
+    fn const_list_float_byte_layout() {
+        // f64 elements carried as their u64 LE bit-pattern (matches the
+        // IR's `ConstListFloat { elements: Vec<u64> }` representation).
+        let f0 = 1.5f64.to_bits();
+        let f1 = (-2.0f64).to_bits();
+        let pool = ConstPool::from_module(&synth_module(vec![tagged(Op::ConstListFloat {
+            idx: 0,
+            elements: vec![f0, f1],
+        })]))
+        .unwrap();
+        assert_eq!(pool.list_float_offsets.get(&0).copied(), Some(0));
+        assert_eq!(&pool.bytes[0..4], &2u32.to_le_bytes());
+        assert_eq!(&pool.bytes[4..8], &[0u8; 4]);
+        assert_eq!(&pool.bytes[8..16], &f0.to_le_bytes());
+        assert_eq!(&pool.bytes[16..24], &f1.to_le_bytes());
+        assert_eq!(pool.bytes.len(), 24);
+    }
+
+    #[test]
+    fn const_list_bool_byte_layout() {
+        let pool = ConstPool::from_module(&synth_module(vec![tagged(Op::ConstListBool {
+            idx: 0,
+            elements: vec![true, false, true],
+        })]))
+        .unwrap();
+        assert_eq!(pool.list_bool_offsets.get(&0).copied(), Some(0));
+        // [len:u32=3][1,0,1] tightly packed, no padding between bytes
+        assert_eq!(&pool.bytes[0..4], &3u32.to_le_bytes());
+        assert_eq!(&pool.bytes[4..7], &[1u8, 0, 1]);
+        assert_eq!(pool.bytes.len(), 7);
+    }
+
+    #[test]
+    fn const_list_alignment_across_records() {
+        // A bool record (len 4 + 3 = 7 bytes, align-4 padding to 8)
+        // followed by an int record must land the int header on an
+        // 8-byte boundary so the i64 payload is 8-aligned.
+        let pool = ConstPool::from_module(&synth_module(vec![
+            tagged(Op::ConstListBool {
+                idx: 0,
+                elements: vec![true, false, true],
+            }),
+            tagged(Op::ConstListInt {
+                idx: 1,
+                elements: vec![42],
+            }),
+        ]))
+        .unwrap();
+        assert_eq!(pool.list_bool_offsets.get(&0).copied(), Some(0));
+        // 7 bytes used → align_to(8) pads to offset 8 for the int record.
+        assert_eq!(pool.list_int_offsets.get(&1).copied(), Some(8));
+        assert_eq!(&pool.bytes[8..12], &1u32.to_le_bytes());
+        assert_eq!(&pool.bytes[16..24], &42i64.to_le_bytes());
+    }
+
+    #[test]
+    fn duplicate_const_list_idx_is_noop() {
+        let pool = ConstPool::from_module(&synth_module(vec![
+            tagged(Op::ConstListInt {
+                idx: 0,
+                elements: vec![1, 2],
+            }),
+            tagged(Op::ConstListInt {
+                idx: 0,
+                elements: vec![1, 2],
+            }),
+        ]))
+        .unwrap();
+        // One record only: 8 header + 2*8 payload = 24.
+        assert_eq!(pool.bytes.len(), 24);
+    }
 }
 
 #[cfg(test)]
