@@ -21,10 +21,12 @@
 //! it directly.
 //!
 //! The bridge that works: emit **textual** IR (`rustc --emit=llvm-ir`)
-//! and re-assemble it with the system `llvm-as-18`. LLVM's textual IR
-//! is forward-compatible enough across this skew that the 18.1.3
-//! assembler accepts rustc-22's `.ll`, yielding LLVM-18 bitcode the
-//! inkwell module links cleanly. The host fn is then marked
+//! and parse it **in-process** with inkwell's LLVM-18 parser
+//! (`Context::create_module_from_ir`). LLVM's textual IR is
+//! forward-compatible enough across this skew that the 18.1.3 parser
+//! accepts rustc-22's `.ll`, yielding an LLVM-18 module the inkwell
+//! module links cleanly — no external `llvm-as-18` binary required.
+//! The host fn is then marked
 //! `alwaysinline` so the O3 pipeline fully inlines it (the rustc
 //! default attribute set — `probe-stack` / `target-cpu` — otherwise
 //! makes the cost-model decline even a trivial single-use call).
@@ -32,12 +34,12 @@
 //! Everything here is gated behind explicit calls; the open-world
 //! MCJIT path (`evaluator.rs`) is untouched and remains the default.
 
-use std::path::Path;
 use std::process::Command;
 
 use inkwell::attributes::AttributeLoc;
 use inkwell::context::Context;
 use inkwell::execution_engine::ExecutionEngine;
+use inkwell::memory_buffer::MemoryBuffer;
 use inkwell::module::Module as LlvmModule;
 use inkwell::targets::{
     CodeModel, InitializationConfig, RelocMode, Target, TargetMachine, TargetTriple,
@@ -94,8 +96,8 @@ impl CocompiledModule {
 /// 1. emit the Relon module with `WorldMode::ClosedWorld` so
 ///    `Op::CallNative` lowers to a direct `call @<host_symbol>`;
 /// 2. compile `host_shim_src` (a `#[no_mangle] extern "C"` host fn
-///    crate) to LLVM-18 bitcode via the textual-IR bridge;
-/// 3. `link_in_module` the host bitcode into the Relon module;
+///    crate) to textual IR, parsed in-process as an LLVM-18 module;
+/// 3. `link_in_module` the host module into the Relon module;
 /// 4. mark every linked host fn `alwaysinline`;
 /// 5. run the same `default<O3>` pipeline the MCJIT path uses, then
 ///    JIT the module.
@@ -153,7 +155,7 @@ pub fn cocompile_legacy_i64(
 
     let ir_before_link = module.print_to_string().to_string();
 
-    // Compile + link the host bitcode for every imported host fn, then
+    // Compile + link the host module for every imported host fn, then
     // force-inline. Shared with the source-driven `emit_object` buffer
     // path (`evaluator.rs`).
     link_and_inline_host_shim(&module, host_shim_src, &ir.imports)?;
@@ -173,7 +175,7 @@ pub fn cocompile_legacy_i64(
     })
 }
 
-/// Link a host shim crate's bitcode into `module` and force-inline
+/// Link a host shim crate's IR into `module` and force-inline
 /// every host fn the `imports` table names.
 ///
 /// Shared by both closed-world producers:
@@ -181,8 +183,8 @@ pub fn cocompile_legacy_i64(
 /// - `LlvmAotEvaluator::emit_object_with_options` (the source-driven
 ///   buffer-protocol object path).
 ///
-/// 1. compile `host_shim_src` to LLVM-18-compatible bitcode via the
-///    textual-IR / `llvm-as-18` skew bridge (see module docs);
+/// 1. compile `host_shim_src` to textual LLVM IR and parse it in-process
+///    with inkwell (LLVM-18) — the skew bridge (see module docs);
 /// 2. `link_in_module` it into `module`;
 /// 3. stamp `alwaysinline` on every imported host fn that arrived with
 ///    a body, so the subsequent O3 pass folds the direct
@@ -199,9 +201,16 @@ pub(crate) fn link_and_inline_host_shim(
     imports: &[relon_ir::ir::NativeImport],
 ) -> Result<(), LlvmError> {
     let ctx = module.get_context();
-    let host_bc = compile_host_shim_to_bitcode(host_shim_src)?;
-    let host_module = LlvmModule::parse_bitcode_from_path(&host_bc, ctx)
-        .map_err(|e| LlvmError::Codegen(format!("cocompile: parse host bitcode: {e}")))?;
+    let host_ll = compile_host_shim_to_textual_ir(host_shim_src)?;
+    // In-process LLVM-18 parse of rustc's textual IR: no external
+    // `llvm-as-18` binary, no rustc-bitcode summary-version skew. LLVM's
+    // textual IR is forward-compatible enough across the rustc/system
+    // LLVM major gap that the 18.1.3 parser accepts rustc's `.ll`.
+    let buffer = MemoryBuffer::create_from_file(&host_ll)
+        .map_err(|e| LlvmError::Codegen(format!("cocompile: read host .ll: {e}")))?;
+    let host_module = ctx
+        .create_module_from_ir(buffer)
+        .map_err(|e| LlvmError::Codegen(format!("cocompile: parse host textual IR: {e}")))?;
     module
         .link_in_module(host_module)
         .map_err(|e| LlvmError::Codegen(format!("cocompile: link_in_module: {e}")))?;
@@ -220,12 +229,15 @@ pub(crate) fn link_and_inline_host_shim(
     Ok(())
 }
 
-/// Compile a host shim Rust source to LLVM-18-compatible bitcode.
+/// Compile a host shim Rust source to textual LLVM IR.
 ///
-/// The skew bridge (see module docs): emit textual IR with rustc, then
-/// re-assemble it with the system `llvm-as-18`. The returned path is a
-/// `.bc` the inkwell (LLVM-18) module can `parse_bitcode_from_path`.
-fn compile_host_shim_to_bitcode(host_shim_src: &str) -> Result<std::path::PathBuf, LlvmError> {
+/// The skew bridge (see module docs): emit textual IR with rustc and
+/// hand it straight to inkwell's in-process LLVM-18 parser
+/// (`Context::create_module_from_ir`). Textual IR is forward-compatible
+/// enough across the rustc/system-LLVM major gap that the 18.1.3 parser
+/// accepts it — no external assembler, no bitcode summary-version skew.
+/// The returned path is a `.ll` the caller reads via `MemoryBuffer`.
+fn compile_host_shim_to_textual_ir(host_shim_src: &str) -> Result<std::path::PathBuf, LlvmError> {
     // Per-invocation unique dir: PID alone collides when two
     // co-compiles run on the same process (concurrent test threads, or
     // a JIT + object emit in one build), racing on `host_shim.ll`.
@@ -239,7 +251,6 @@ fn compile_host_shim_to_bitcode(host_shim_src: &str) -> Result<std::path::PathBu
         .map_err(|e| LlvmError::Codegen(format!("cocompile: mkdir tmp: {e}")))?;
     let rs_path = dir.join("host_shim.rs");
     let ll_path = dir.join("host_shim.ll");
-    let bc_path = dir.join("host_shim.bc");
     std::fs::write(&rs_path, host_shim_src)
         .map_err(|e| LlvmError::Codegen(format!("cocompile: write shim: {e}")))?;
 
@@ -267,37 +278,9 @@ fn compile_host_shim_to_bitcode(host_shim_src: &str) -> Result<std::path::PathBu
         )));
     }
 
-    // 2. llvm-as-18 (system LLVM): assemble the textual IR into
-    //    LLVM-18 bitcode. Probe a couple of common binary names.
-    assemble_with_system_llvm(&ll_path, &bc_path)?;
-
-    Ok(bc_path)
-}
-
-/// Assemble textual IR into bitcode with the system LLVM-18 assembler.
-/// Tries the versioned `llvm-as-18` first (matches the inkwell
-/// `llvm18-1` feature), then the unversioned `llvm-as`.
-fn assemble_with_system_llvm(ll: &Path, bc: &Path) -> Result<(), LlvmError> {
-    let candidates = ["llvm-as-18", "llvm-as"];
-    let mut last_err = String::new();
-    for tool in candidates {
-        match Command::new(tool)
-            .arg(ll.to_str().unwrap())
-            .arg("-o")
-            .arg(bc.to_str().unwrap())
-            .output()
-        {
-            Ok(out) if out.status.success() => return Ok(()),
-            Ok(out) => {
-                last_err = format!("{tool}: {}", String::from_utf8_lossy(&out.stderr).trim());
-            }
-            Err(e) => last_err = format!("{tool}: spawn failed: {e}"),
-        }
-    }
-    Err(LlvmError::Codegen(format!(
-        "cocompile: no working system llvm-as (need LLVM-18 to match the inkwell feature); \
-         last error: {last_err}"
-    )))
+    // The textual `.ll` is consumed in-process by inkwell's LLVM-18
+    // parser; no external `llvm-as-18` assembly step.
+    Ok(ll_path)
 }
 
 /// Run the same `default<O3>` middle-end pipeline the MCJIT path uses
