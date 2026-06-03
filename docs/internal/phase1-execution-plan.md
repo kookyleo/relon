@@ -130,3 +130,22 @@ Stage 1 + Stage 2 全部 lane 已并入 main、`cargo build/test/clippy --worksp
 - **LTO bitcode 桥**:现用 `llvm-as-18` 文本桥(版本 skew),前向兼容是经验性;长期稳妥 = 用同 llvm-sys 出 host bitcode(W1-B 标注,deferred)。
 - **ListGet/DictGet/ConstListString/schema-method dispatch**:沿 0b,cranelift 亦不支持或无源级路径。
 - **Stage 3 perf**:S2.⑤ 已做基础 inline 深化;独立的 LTO inline 深度调优未单独追。
+
+---
+
+## 6. P2 收口(2026-06-03,已完成、全绿、已推送)
+
+§5 列的三个残留缺口已收口(三 lane 并行,文件不相交;首轮撞 session limit、重置后从干净 main 重跑):
+
+| 缺口 | 结果 | 关键 |
+|---|---|---|
+| **G1 cap/`#native` e2e** | ✅ **链接后原生二进制端到端** | `Compiler::source_with_native_fns` + `NativeHostFn`:门控源闭世界编译、host 体内联进 `.o`;`SandboxState` 带授权 caps 位掩码(原硬编 0)作 buffer entry 第 6 个 `i64 caps` 实参;deny 经 `trap_code` 升类型化 `CapabilityDenied`(无 SIGILL)。**demo 实证两态**:`secret::main(grant,42)=Ok(1700000042)` / `(deny,42)=Err(CapabilityDenied)` |
+| **G2 List 参→返跨 arena 拷贝** | ✅ 修复(根因纯 codegen-llvm,非 IR) | mem.rs 两缺陷:① 指针-indirect 参 load 推的是 input-buffer 相对偏移而下游按 arena 相对(补 `+in_ptr`)② 单次 memcpy 拖错源记录 `[len][pad]` 几何到 8-对齐输出槽(payload 错位 4 字节)→ 头与 payload 分别拷、各自 `align_up`。`xs->xs` 多用例三方对齐 tree-walk |
+| **G3 去 llvm-as-18 外部依赖** | ✅ 进程内 inkwell 解析 | `rustc --emit=llvm-ir` → `MemoryBuffer::create_from_file` + `Context::create_module_from_ir`(免外部 `llvm-as-18` 二进制);cocompile_inline/buffer 仍全绿(等价) |
+
+**P2 现状(收口后)**:原生签名面 Int/Float/Bool/Null/String/Schema(参)/ListInt(含 List 参→返);**co-compile LTO 闭世界 + 能力门 `#native` 在链接后原生二进制端到端**(grant/deny 两态实证);LTO 桥无外部二进制依赖。
+
+**收口后仍存的已知边界**:
+- `String s -> s` 恒等被另一处 String 参编组 seam 挡(G2 发现的既有小 seam,非 codegen 拷贝问题)。
+- ListFloat/Bool(前端拒)、ListGet/DictGet/ConstListString/schema-method dispatch(cranelift 亦不支持)—— 沿 0b。
+- LTO 文本 IR 前向兼容仍是经验性(外部二进制依赖已去);长期可考虑同 llvm-sys 出 bitcode。
