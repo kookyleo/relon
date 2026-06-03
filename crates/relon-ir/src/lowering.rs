@@ -36,7 +36,9 @@ use std::rc::Rc;
 
 use crate::error::LoweringError;
 use crate::intern::ConstInternTables;
-use crate::ir::{ClosureCapture, Func, IrType, Module, Op, TaggedOp};
+use crate::ir::{
+    ClosureCapture, Func, IrType, Module, NativeImport, Op, TaggedOp, NO_CAPABILITY_BIT,
+};
 use crate::stdlib::{
     builtin_stdlib, stdlib_closure_arg_signature, stdlib_function_count, stdlib_function_index,
     stdlib_method_index,
@@ -132,6 +134,13 @@ struct LowerCtx<'a> {
     /// The signature is the **user-visible** surface (no implicit
     /// captures_ptr) — same convention as `Op::CallClosure`.
     closure_let_signatures: HashMap<u32, (Vec<IrType>, IrType)>,
+    /// Module-wide `#native` import accumulator. Shared across the
+    /// entry body, schema-method bodies, and lambda bodies so a native
+    /// call from any of them interns into one [`Module::imports`]
+    /// table. Empty `resolved` map (the common case, and every
+    /// host-fn-free source) means [`lower_fn_call`] never resolves a
+    /// native call and the free-call path keeps its prior behaviour.
+    native_imports: Rc<RefCell<NativeImportBuilder>>,
 }
 
 /// Information the lowering walker needs when handling `self`-prefixed
@@ -268,6 +277,7 @@ impl<'a> LowerCtx<'a> {
         schema_resolver: SchemaResolver<'a>,
         method_registry: SchemaMethodRegistry,
         const_intern: Rc<RefCell<ConstInternTables>>,
+        native_imports: Rc<RefCell<NativeImportBuilder>>,
     ) -> Self {
         Self {
             params,
@@ -283,6 +293,7 @@ impl<'a> LowerCtx<'a> {
             method_params: Vec::new(),
             lambda_table: Rc::new(RefCell::new(Vec::new())),
             closure_let_signatures: HashMap::new(),
+            native_imports,
         }
     }
 
@@ -297,6 +308,7 @@ impl<'a> LowerCtx<'a> {
         self_binding: SelfBinding,
         method_params: Vec<MethodParam>,
         const_intern: Rc<RefCell<ConstInternTables>>,
+        native_imports: Rc<RefCell<NativeImportBuilder>>,
     ) -> Self {
         Self {
             params,
@@ -312,6 +324,7 @@ impl<'a> LowerCtx<'a> {
             method_params,
             lambda_table: Rc::new(RefCell::new(Vec::new())),
             closure_let_signatures: HashMap::new(),
+            native_imports,
         }
     }
 
@@ -344,6 +357,13 @@ impl<'a> LowerCtx<'a> {
     /// participate in the same module-wide idx space.
     fn intern_handle(&self) -> Rc<RefCell<ConstInternTables>> {
         Rc::clone(&self.const_intern)
+    }
+
+    /// Clone the shared module-wide native-import accumulator for a
+    /// nested `LowerCtx` (lambda body) so a native call inside it
+    /// interns into the same [`Module::imports`] table.
+    fn native_imports_handle(&self) -> Rc<RefCell<NativeImportBuilder>> {
+        Rc::clone(&self.native_imports)
     }
 
     /// Allocate a fresh per-function record-local index used by
@@ -713,19 +733,35 @@ fn lower_entry_with_resolver<'a>(
     // at idx 0.
     let const_intern = ConstInternTables::shared();
 
+    // Module-wide `#native` import accumulator. Built from the
+    // analyzer's host-fn metadata (empty for host-fn-free sources) and
+    // shared across the method bodies + entry body + lambdas so every
+    // native call interns into one [`Module::imports`] table.
+    let native_imports = Rc::new(RefCell::new(NativeImportBuilder::from_tree(tree)));
+
     // Phase 5: enumerate every user-declared schema method, assign
     // IR-side indices (and through them combined wasm-level
     // function indices), then lower each method body into a `Func`.
     // The entry body is appended last so it can resolve
     // `obj.method()` calls against the populated registry.
-    let (method_funcs, method_registry) =
-        lower_schema_methods(tree, &resolver, Rc::clone(&const_intern))?;
+    let (method_funcs, method_registry) = lower_schema_methods(
+        tree,
+        &resolver,
+        Rc::clone(&const_intern),
+        Rc::clone(&native_imports),
+    )?;
     let entry_ir_idx = method_funcs.len();
 
     // Walk the body into a single op stream + virtual stack via the
     // per-function lowering context. Phase 3.a's let-bindings + const
     // literals piggy-back on `LowerCtx` for their counters.
-    let mut ctx = LowerCtx::new(&locals, resolver, method_registry, const_intern);
+    let mut ctx = LowerCtx::new(
+        &locals,
+        resolver,
+        method_registry,
+        const_intern,
+        Rc::clone(&native_imports),
+    );
 
     if let Some(ref user_schema) = user_return_schema {
         // Branded dict-return path: emit `AllocRootRecord` + the
@@ -878,9 +914,15 @@ fn lower_entry_with_resolver<'a>(
         .map(|i| (entry_funcs_len as u32) + i)
         .collect();
 
+    // Native imports interned by `lower_fn_call`'s native path across
+    // every body sharing `native_imports`. Empty when the source never
+    // calls a host-registered fn. Extracted before the struct literal
+    // so the `Ref` borrow doesn't outlive the temporary.
+    let imports = native_imports.borrow().imports.clone();
+
     Ok(LoweredEntry {
         module: Module {
-            imports: Vec::new(),
+            imports,
             funcs,
             entry_func_index: Some(entry_ir_idx),
             closure_table,
@@ -1526,6 +1568,132 @@ fn type_repr_to_ir_type(t: &TypeRepr) -> Result<IrType, LoweringError> {
     }
 }
 
+/// Map a host-fn signature's [`TypeNode`] onto the IR scalar/list
+/// type lattice. Returns `None` for any shape outside the native-call
+/// envelope (nested schemas, dicts, closures, enums) — the caller
+/// treats `None` as "not lowerable as a native import" and lets the
+/// name fall through to the stdlib-unknown error, so an unsupported
+/// host-fn signature never silently mis-types a call.
+fn type_node_to_ir_type(t: &TypeNode) -> Option<IrType> {
+    let name = t.path.last()?.as_str();
+    Some(match name {
+        "Int" => IrType::I64,
+        "Float" => IrType::F64,
+        "Bool" => IrType::Bool,
+        "Null" => IrType::Null,
+        "String" => IrType::String,
+        "List" => {
+            let elem = t.generics.first()?;
+            match elem.path.last()?.as_str() {
+                "Int" => IrType::ListInt,
+                "Float" => IrType::ListFloat,
+                "Bool" => IrType::ListBool,
+                "String" => IrType::ListString,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// A host-registered native fn resolved into IR-ready shape: the
+/// param/return IR types plus the capability bit indices its gate
+/// requires (declaration order). Built once per module from the
+/// analyzer's `host_fn_signatures` + `host_fn_gates`.
+#[derive(Debug, Clone)]
+struct HostFnEntry {
+    param_tys: Vec<IrType>,
+    ret_ty: IrType,
+    required_bits: Vec<u32>,
+}
+
+/// Module-wide accumulator for `#native` imports. Shared (via
+/// `Rc<RefCell<…>>`) across the entry body, every schema-method body,
+/// and every lambda body so a native call anywhere in the module
+/// interns into one [`Module::imports`] table with stable
+/// `import_idx`es. Mirrors the sharing discipline of
+/// [`ConstInternTables`] and the lambda slot table.
+#[derive(Debug, Default)]
+struct NativeImportBuilder {
+    /// Name → resolved signature/gate. Immutable after construction;
+    /// populated only when the analyzer supplied host-fn metadata
+    /// (the legacy single-file `analyze` path leaves it empty, so
+    /// no source ever resolves a native call there).
+    resolved: HashMap<String, HostFnEntry>,
+    /// Emitted imports in `import_idx` order.
+    imports: Vec<NativeImport>,
+    /// Name → already-assigned `import_idx` (dedup across call sites).
+    index_of: HashMap<String, u32>,
+}
+
+impl NativeImportBuilder {
+    /// Resolve every host-fn signature the analyzer attached to `tree`
+    /// into IR-ready form. Signatures outside the native-call type
+    /// envelope (see [`type_node_to_ir_type`]) are dropped so a call
+    /// to such a name still surfaces the stdlib-unknown error rather
+    /// than a mis-typed import.
+    fn from_tree(tree: &AnalyzedTree) -> Self {
+        let mut resolved = HashMap::new();
+        for (name, sig) in &tree.host_fn_signatures {
+            let mut param_tys = Vec::with_capacity(sig.params.len());
+            let mut ok = true;
+            for p in &sig.params {
+                match type_node_to_ir_type(&p.ty) {
+                    Some(ty) => param_tys.push(ty),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let Some(ret_ty) = type_node_to_ir_type(&sig.return_type) else {
+                continue;
+            };
+            let required_bits = tree
+                .host_fn_gates
+                .get(name)
+                .map(|g| g.required_bit_indices())
+                .unwrap_or_default();
+            resolved.insert(
+                name.clone(),
+                HostFnEntry {
+                    param_tys,
+                    ret_ty,
+                    required_bits,
+                },
+            );
+        }
+        Self {
+            resolved,
+            imports: Vec::new(),
+            index_of: HashMap::new(),
+        }
+    }
+
+    /// Get-or-assign the `import_idx` for `name`. The import carries
+    /// [`NO_CAPABILITY_BIT`]: the capability guard is emitted as
+    /// dedicated `Op::CheckCap` ops (one per required bit) ahead of the
+    /// call, so the cranelift backend keys the host-fn slot off
+    /// `import_idx` and a multi-bit gate needs no single-bit encoding.
+    fn intern(&mut self, name: &str, entry: &HostFnEntry) -> u32 {
+        if let Some(idx) = self.index_of.get(name) {
+            return *idx;
+        }
+        let idx = self.imports.len() as u32;
+        self.imports.push(NativeImport {
+            name: name.to_string(),
+            param_tys: entry.param_tys.clone(),
+            ret_ty: entry.ret_ty,
+            cap_bit: NO_CAPABILITY_BIT,
+        });
+        self.index_of.insert(name.to_string(), idx);
+        idx
+    }
+}
+
 /// One entry in the `#main` parameter index: `(name, ir_type,
 /// field_offset)`. The body walk uses this to lower `Variable(x)`
 /// into a typed [`Op::LoadField`].
@@ -2146,6 +2314,7 @@ fn lower_closure_as_value(
         ctx.schema_resolver.clone(),
         ctx.method_registry.clone(),
         ctx.intern_handle(),
+        ctx.native_imports_handle(),
     );
     inner.lambda_table = ctx.lambda_table_handle();
 
@@ -2408,6 +2577,99 @@ fn try_lower_local_closure_call(
 /// Any other name / arity surfaces as
 /// [`LoweringError::UnknownStdlibMethod`]; argument-type mismatches
 /// surface as [`LoweringError::StdlibArgTypeMismatch`].
+/// Free-call native-fn lowering. Returns `Ok(true)` when `name`
+/// resolved to a host-registered native fn and the guarded call was
+/// emitted; `Ok(false)` when the name is not a native fn (so the
+/// caller falls through to its stdlib-unknown error).
+///
+/// Emitted shape, in order:
+///   1. one `Op::CheckCap { cap_bit }` per capability bit the fn's
+///      gate requires (declaration order) — fires the runtime consult
+///      before any argument is evaluated, so a denial traps before the
+///      host fn observes state;
+///   2. each argument expression, left-to-right;
+///   3. `Op::CallNative { import_idx, param_tys, ret_ty, cap_bit:
+///      NO_CAPABILITY_BIT }` — the cap guard lives in the CheckCap
+///      prologue, so the call itself carries the no-cap sentinel and
+///      both backends key the host-fn slot off `import_idx`.
+///
+/// The analyzer has already arity- and type-checked the call (and the
+/// capability reachability check has run against the static grant), so
+/// an arity mismatch here means the host registered a signature the
+/// analyzer never saw — bail to `Ok(false)` and let the unknown-method
+/// error surface rather than emit a malformed call.
+fn try_lower_native_call(
+    name: &str,
+    args: &[relon_parser::CallArg],
+    arity: u32,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<bool, LoweringError> {
+    let entry = match ctx.native_imports.borrow().resolved.get(name) {
+        Some(e) => e.clone(),
+        None => return Ok(false),
+    };
+    if entry.param_tys.len() as u32 != arity {
+        return Ok(false);
+    }
+    // Native fns take positional args only; a keyword arg means the
+    // call doesn't match the host signature.
+    for call_arg in args {
+        if call_arg.name.is_some() {
+            return Err(LoweringError::UnsupportedExpr {
+                kind: format!("FnCall(named-arg `{name}` for native fn)"),
+                range,
+            });
+        }
+    }
+
+    // 1. Capability prologue: one CheckCap per required bit, before
+    //    any argument side effect.
+    for bit in &entry.required_bits {
+        ctx.out.push(TaggedOp {
+            op: Op::CheckCap { cap_bit: *bit },
+            range,
+        });
+    }
+
+    // 2. Arguments, left-to-right. Each must land on the operand stack
+    //    with the IR type the import declares.
+    for (i, call_arg) in args.iter().enumerate() {
+        lower_expr(&call_arg.value.expr, call_arg.value.range, ctx)?;
+        let pushed = ctx
+            .tstack
+            .pop()
+            .ok_or_else(|| LoweringError::UnsupportedExpr {
+                kind: format!("FnCall(native arg{i}-stack-empty for `{name}`)"),
+                range,
+            })?;
+        let expected = entry.param_tys[i];
+        if pushed != expected {
+            return Err(LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "FnCall(`{name}`) native arg {i} type mismatch: expected {expected:?}, got {pushed:?}"
+                ),
+                range,
+            });
+        }
+    }
+
+    // 3. Intern the import + emit the call. Sentinel cap_bit: the
+    //    guard already fired via the CheckCap prologue.
+    let import_idx = ctx.native_imports.borrow_mut().intern(name, &entry);
+    ctx.out.push(TaggedOp {
+        op: Op::CallNative {
+            import_idx,
+            param_tys: entry.param_tys.clone(),
+            ret_ty: entry.ret_ty,
+            cap_bit: NO_CAPABILITY_BIT,
+        },
+        range,
+    });
+    ctx.tstack.push(entry.ret_ty);
+    Ok(true)
+}
+
 fn lower_fn_call(
     path: &[TokenKey],
     args: &[relon_parser::CallArg],
@@ -2586,6 +2848,14 @@ fn lower_fn_call(
     if receiver_segments.is_empty() {
         // Free-call form.
         let Some(fn_index) = stdlib_function_index(method_name) else {
+            // Not a stdlib builtin — try a host-registered native fn.
+            // Stdlib wins on a name clash (builtins stay first-class);
+            // a name the host registered that shadows no builtin
+            // resolves here into an `Op::CheckCap`-guarded
+            // `Op::CallNative`.
+            if try_lower_native_call(method_name, args, arity, range, ctx)? {
+                return Ok(());
+            }
             return Err(LoweringError::UnknownStdlibMethod {
                 name: method_name.to_string(),
                 arity,
@@ -9230,6 +9500,7 @@ fn lower_schema_methods<'a>(
     tree: &'a AnalyzedTree,
     resolver: &SchemaResolver<'a>,
     const_intern: Rc<RefCell<ConstInternTables>>,
+    native_imports: Rc<RefCell<NativeImportBuilder>>,
 ) -> Result<(Vec<Func>, SchemaMethodRegistry), LoweringError> {
     let enumerated = enumerate_methods(tree, resolver)?;
     let stdlib_offset = stdlib_function_count();
@@ -9254,7 +9525,14 @@ fn lower_schema_methods<'a>(
     // entry body.
     let mut funcs: Vec<Func> = Vec::with_capacity(enumerated.len());
     for (m, sig) in enumerated.iter().zip(method_sigs) {
-        let func = lower_one_method(m, &sig, resolver, &registry, Rc::clone(&const_intern))?;
+        let func = lower_one_method(
+            m,
+            &sig,
+            resolver,
+            &registry,
+            Rc::clone(&const_intern),
+            Rc::clone(&native_imports),
+        )?;
         funcs.push(func);
     }
     Ok((funcs, registry))
@@ -9348,6 +9626,7 @@ fn lower_one_method<'a>(
     resolver: &SchemaResolver<'a>,
     registry: &SchemaMethodRegistry,
     const_intern: Rc<RefCell<ConstInternTables>>,
+    native_imports: Rc<RefCell<NativeImportBuilder>>,
 ) -> Result<Func, LoweringError> {
     let MethodSig {
         param_tys,
@@ -9394,6 +9673,7 @@ fn lower_one_method<'a>(
         self_binding,
         method_params,
         const_intern,
+        native_imports,
     );
     lower_expr(&body_node.expr, body_node.range, &mut ctx)?;
     // Validate the body left exactly one value of the declared

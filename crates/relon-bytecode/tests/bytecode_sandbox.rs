@@ -2818,3 +2818,229 @@ fn cli_trust_gate_allows_capability_when_trusted() {
         .expect("all-granted gate must permit the guarded entry");
     assert_eq!(value, Value::Int(99));
 }
+
+// -- v5-β-2 stage 5: source-level native-call lowering + enforcement --
+//
+// These pin the producer half of the capability/trust model: an
+// `Op::CheckCap`-guarded `Op::CallNative` reachable from Relon source
+// (not just hand-built IR). The lowering pass resolves a free-call
+// against the host-fn table the analyzer attached, interns a
+// `#native` import, and emits the guarded call; the compiled backend
+// then enforces + dispatches it. Together with the analyzer's static
+// `CapabilityRequired` check this closes the §9.2 "no producer" gap.
+
+/// Build `AnalyzeOptions` describing one host-registered native fn —
+/// its name, positional param types, return type, capability gate, and
+/// the static grant the analyzer checks against.
+fn host_options(
+    name: &str,
+    params: &[&str],
+    ret: &str,
+    gate: relon_analyzer::NativeFnGate,
+    caps: relon_analyzer::Capabilities,
+) -> relon_analyzer::AnalyzeOptions {
+    use std::collections::HashSet;
+    let sig = relon_analyzer::FnSignature {
+        name: name.to_string(),
+        generics: Vec::new(),
+        params: params
+            .iter()
+            .map(|p| relon_analyzer::FnParam {
+                name: "_".to_string(),
+                ty: relon_analyzer::type_node_simple(p),
+                optional: false,
+            })
+            .collect(),
+        return_type: relon_analyzer::type_node_simple(ret),
+        variadic_tail: None,
+    };
+    let mut signatures = HashMap::new();
+    signatures.insert(name.to_string(), sig);
+    let mut gates = HashMap::new();
+    gates.insert(name.to_string(), gate);
+    let mut names = HashSet::new();
+    names.insert(name.to_string());
+    relon_analyzer::AnalyzeOptions {
+        host_fn_names: names,
+        host_fn_signatures: signatures,
+        host_fn_gates: gates,
+        caps,
+        strict_mode: false,
+        ..Default::default()
+    }
+}
+
+/// A native fn that adds 7 to its single Int arg. Counts invocations so
+/// a denied call can be proven to never reach the host body.
+struct AddSeven {
+    hits: std::sync::atomic::AtomicU64,
+}
+
+impl AddSeven {
+    fn new() -> Self {
+        Self {
+            hits: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl relon_eval_api::RelonFunction for AddSeven {
+    fn call(
+        &self,
+        args: relon_eval_api::NativeArgs,
+        _range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        self.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match args.positional.first() {
+            Some(Value::Int(x)) => Ok(Value::Int(x.wrapping_add(7))),
+            other => Err(RuntimeError::Unsupported {
+                reason: format!("AddSeven expects Int, got {other:?}"),
+            }),
+        }
+    }
+}
+
+fn reads_clock_gate() -> relon_analyzer::NativeFnGate {
+    // `NativeFnGate` is `#[non_exhaustive]`: build via default + set.
+    let mut gate = relon_analyzer::NativeFnGate::default();
+    gate.reads_clock = true;
+    gate
+}
+
+fn reads_clock_caps() -> relon_analyzer::Capabilities {
+    // `Capabilities` is `#[non_exhaustive]`: build via default + set.
+    let mut caps = relon_analyzer::Capabilities::default();
+    caps.reads_clock = true;
+    caps
+}
+
+#[test]
+fn native_call_lowers_to_guarded_op_from_source() {
+    // The lowering pass must intern a `#native` import for `clock_add`
+    // and emit a `BcOp::CheckCap` (reads_clock) + `BcOp::CallNative`
+    // in the compiled stream. Grant the cap so analysis passes.
+    let caps = reads_clock_caps();
+    let opts = host_options("clock_add", &["Int"], "Int", reads_clock_gate(), caps);
+    let ev =
+        BytecodeEvaluator::from_source_with_options("#main(Int x) -> Int\nclock_add(x)", &opts)
+            .expect("source with a granted native call must build");
+
+    // One import interned, named after the source-level call.
+    assert_eq!(ev.native_imports().len(), 1);
+    assert_eq!(ev.native_imports()[0].name, "clock_add");
+
+    // Guarded shape present in the compiled bytecode.
+    use relon_bytecode::op::BcOp;
+    let ops = &ev.function().ops;
+    assert!(
+        ops.iter().any(|o| matches!(
+            o,
+            BcOp::CheckCap { cap_bit }
+                if *cap_bit == relon_eval_api::CapabilityBit::ReadsClock.bit_index()
+        )),
+        "expected a CheckCap(reads_clock) in {ops:?}"
+    );
+    assert!(
+        ops.iter()
+            .any(|o| matches!(o, BcOp::CallNative { import_idx: 0, .. })),
+        "expected a CallNative(import 0) in {ops:?}"
+    );
+}
+
+#[test]
+fn native_call_static_check_rejects_ungranted_cap_from_source() {
+    use std::collections::HashMap as Map;
+    // Zero-trust analyze caps: the static capability-reachability check
+    // must flag the gated `clock_add` call as `CapabilityRequired`
+    // (Error severity), so the bytecode build fails before any op runs.
+    let opts = host_options(
+        "clock_add",
+        &["Int"],
+        "Int",
+        reads_clock_gate(),
+        relon_analyzer::Capabilities::default(),
+    );
+    let host_fns: Map<String, std::sync::Arc<dyn relon_eval_api::RelonFunction>> = Map::new();
+    let _ = &host_fns;
+    let result =
+        BytecodeEvaluator::from_source_with_options("#main(Int x) -> Int\nclock_add(x)", &opts);
+    assert!(
+        matches!(result, Err(relon_bytecode::BytecodeError::Analyze(_))),
+        "ungranted gated native call must fail the static check, got {result:?}"
+    );
+}
+
+#[test]
+fn native_call_dispatches_to_host_fn_when_granted_at_runtime() {
+    use std::collections::HashMap as Map;
+    use std::sync::Arc;
+
+    // Static caps grant reads_clock so the build passes; the runtime
+    // vtable grants the same bit and the host fn is registered, so the
+    // call dispatches and returns `x + 7`.
+    let caps = reads_clock_caps();
+    let opts = host_options("clock_add", &["Int"], "Int", reads_clock_gate(), caps);
+    let native = Arc::new(AddSeven::new());
+    let native_dyn: Arc<dyn relon_eval_api::RelonFunction> = native.clone();
+    let mut host_fns: Map<String, Arc<dyn relon_eval_api::RelonFunction>> = Map::new();
+    host_fns.insert("clock_add".to_string(), native_dyn);
+
+    let ev =
+        BytecodeEvaluator::from_source_with_options("#main(Int x) -> Int\nclock_add(x)", &opts)
+            .unwrap()
+            .with_host_fns(&host_fns)
+            .with_granted_cap(relon_eval_api::CapabilityBit::ReadsClock.bit_index());
+
+    let mut args = HashMap::new();
+    args.insert("x".to_string(), Value::Int(35));
+    let value = ev
+        .run_main(args)
+        .expect("granted native call must dispatch");
+    assert_eq!(value, Value::Int(42));
+    assert_eq!(
+        native.hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "host fn invoked exactly once"
+    );
+}
+
+#[test]
+fn native_call_runtime_deny_traps_before_host_fn() {
+    use std::collections::HashMap as Map;
+    use std::sync::Arc;
+
+    // Static caps grant reads_clock (build passes + lowers the guarded
+    // call), but the runtime vtable withholds the grant — a stricter
+    // runtime posture. The `Op::CheckCap` prologue must trap
+    // `CapabilityDenied` before the host fn observes any argument.
+    let caps = reads_clock_caps();
+    let opts = host_options("clock_add", &["Int"], "Int", reads_clock_gate(), caps);
+    let native = Arc::new(AddSeven::new());
+    let native_dyn: Arc<dyn relon_eval_api::RelonFunction> = native.clone();
+    let mut host_fns: Map<String, Arc<dyn relon_eval_api::RelonFunction>> = Map::new();
+    host_fns.insert("clock_add".to_string(), native_dyn);
+
+    // No `with_granted_cap` — the runtime grant is withheld.
+    let ev =
+        BytecodeEvaluator::from_source_with_options("#main(Int x) -> Int\nclock_add(x)", &opts)
+            .unwrap()
+            .with_host_fns(&host_fns);
+
+    let mut args = HashMap::new();
+    args.insert("x".to_string(), Value::Int(35));
+    let err = ev.run_main(args).unwrap_err();
+    match err {
+        RuntimeError::CapabilityDenied { cap_bit, .. } => {
+            assert_eq!(
+                cap_bit,
+                Some(relon_eval_api::CapabilityBit::ReadsClock.bit_index())
+            );
+        }
+        other => panic!("expected CapabilityDenied, got {other:?}"),
+    }
+    assert_eq!(
+        native.hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "host fn must not run when the capability prong fires"
+    );
+}

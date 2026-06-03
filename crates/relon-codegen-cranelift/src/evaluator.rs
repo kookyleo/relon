@@ -261,7 +261,30 @@ impl AotEvaluator {
     /// buffers through the same `BufferBuilder` / `BufferReader`
     /// helpers the wasm-AOT backend uses.
     pub fn from_source(src: &str) -> Result<Self, CraneliftError> {
-        let (ir_module, main_schema, return_schema) = Self::lower_source(src)?;
+        Self::from_source_with_options(src, &relon_analyzer::AnalyzeOptions::default())
+    }
+
+    /// Like [`Self::from_source`] but with caller-supplied analyzer
+    /// options — the entry point for host-registered native fns. The
+    /// host populates `options.host_fn_names` / `host_fn_signatures` /
+    /// `host_fn_gates` / `caps` so the analyzer resolves the calls,
+    /// runs the single-file capability-reachability check (a gated call
+    /// without the granted cap fails the build here), and the lowering
+    /// pass emits the `Op::CheckCap`-guarded `Op::CallNative`.
+    ///
+    /// The capability *guard* is enforced end-to-end: a `CheckCap`
+    /// against an unregistered cap slot traps `CapabilityDenied` at
+    /// runtime. Full host-fn *dispatch* on this backend additionally
+    /// needs an `Arc<dyn RelonFunction>` → `extern "C"` thunk and a
+    /// vtable that separates the import-slot namespace from the
+    /// cap-bit namespace — tracked as a follow-up; see the
+    /// capability/trust model doc §9.2.
+    pub fn from_source_with_options(
+        src: &str,
+        options: &relon_analyzer::AnalyzeOptions,
+    ) -> Result<Self, CraneliftError> {
+        let (ir_module, main_schema, return_schema) =
+            Self::lower_source_with_options(src, options)?;
         let main_layout = SchemaLayout::offsets_for(&main_schema)
             .map_err(|e| CraneliftError::Lowering(format!("main schema layout: {e}")))?;
         let return_layout = SchemaLayout::offsets_for(&return_schema)
@@ -856,9 +879,22 @@ impl AotEvaluator {
     /// protocol talks against. Mirrors
     /// `relon_codegen_wasm::WasmAotEvaluator::compile_source`.
     fn lower_source(src: &str) -> Result<(relon_ir::ir::Module, Schema, Schema), CraneliftError> {
+        Self::lower_source_with_options(src, &relon_analyzer::AnalyzeOptions::default())
+    }
+
+    fn lower_source_with_options(
+        src: &str,
+        options: &relon_analyzer::AnalyzeOptions,
+    ) -> Result<(relon_ir::ir::Module, Schema, Schema), CraneliftError> {
         let ast =
             relon_parser::parse_document(src).map_err(|e| CraneliftError::Parse(e.to_string()))?;
-        let analyzed = relon_analyzer::analyze(&ast);
+        // Compiled backend = standalone analyze (no workspace pass), so
+        // force the single-file capability-reachability check on.
+        let options = relon_analyzer::AnalyzeOptions {
+            standalone_capability_check: true,
+            ..options.clone()
+        };
+        let analyzed = relon_analyzer::analyze_with_options(&ast, &options);
         if analyzed.has_errors() {
             let err_count = analyzed
                 .diagnostics

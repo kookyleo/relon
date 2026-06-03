@@ -35,6 +35,7 @@
 use crate::cap::{Capabilities, NativeFnGate};
 use crate::const_fold::{self, ConstValue};
 use crate::diagnostic::Diagnostic;
+use crate::tree::AnalyzedTree;
 use crate::workspace::WorkspaceTree;
 use miette::SourceSpan;
 use relon_parser::{child_nodes, Expr, Node, NodeId, Operator, TokenKey};
@@ -84,23 +85,7 @@ pub(crate) fn run(workspace: &mut WorkspaceTree) {
     // continue to fire; pruning those is a v1.2+ decision (see #41).
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
     for tree in workspace.modules.values() {
-        let mut dead_ids: FxHashSet<NodeId> = FxHashSet::default();
-        let mut fn_calls: Vec<&Node> = Vec::new();
-        let mut fold_cache: FxHashMap<NodeId, Option<ConstValue>> = FxHashMap::default();
-        for node in tree.node_index.values() {
-            if matches!(node.expr.as_ref(), Expr::FnCall { .. }) {
-                fn_calls.push(node);
-            }
-            if let Some(dead) = dead_branch_of_cached(node, &mut fold_cache) {
-                collect_descendant_ids(dead, &mut dead_ids);
-            }
-        }
-        for node in fn_calls {
-            if dead_ids.contains(&node.id) {
-                continue;
-            }
-            check_node(node, &caps, &gates, &mut diagnostics);
-        }
+        walk_tree_for_gated_calls(tree, &caps, &gates, &mut diagnostics);
     }
 
     if diagnostics.is_empty() {
@@ -115,6 +100,58 @@ pub(crate) fn run(workspace: &mut WorkspaceTree) {
         if let Some(tree) = Arc::get_mut(arc_tree) {
             tree.diagnostics.extend(diagnostics);
         }
+    }
+}
+
+/// Single-tree reachability check. The compiled backends
+/// (bytecode / cranelift / llvm) drive analysis through the per-file
+/// [`crate::analyze_with_options`] entry, which has no
+/// [`WorkspaceTree`] — so [`run`]'s workspace walk never reaches them
+/// and a gated native call would otherwise compile with the static
+/// guard silently skipped. This runs the same walk over one tree's
+/// own `node_index`, using its `caps` + `host_fn_gates`, and appends
+/// any [`Diagnostic::CapabilityRequired`] (Error severity) to the
+/// tree's own diagnostics so the build fails before lowering.
+pub(crate) fn run_single(tree: &mut AnalyzedTree) {
+    // No gates → nothing to enforce; zero overhead for pure-fn hosts
+    // and every host-fn-free source.
+    if tree.host_fn_gates.is_empty() {
+        return;
+    }
+    let caps = tree.caps.clone();
+    let gates = tree.host_fn_gates.clone();
+    let mut diagnostics: Vec<Diagnostic> = Vec::new();
+    walk_tree_for_gated_calls(tree, &caps, &gates, &mut diagnostics);
+    tree.diagnostics.extend(diagnostics);
+}
+
+/// Shared per-tree walk: queue every `FnCall` and every
+/// statically-dead-branch id in one pass over `node_index`, then emit
+/// a diagnostic for each reachable gated call whose cap isn't granted.
+/// Used by both the workspace [`run`] and the single-tree
+/// [`run_single`].
+fn walk_tree_for_gated_calls(
+    tree: &AnalyzedTree,
+    caps: &Capabilities,
+    gates: &HashMap<String, NativeFnGate>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut dead_ids: FxHashSet<NodeId> = FxHashSet::default();
+    let mut fn_calls: Vec<&Node> = Vec::new();
+    let mut fold_cache: FxHashMap<NodeId, Option<ConstValue>> = FxHashMap::default();
+    for node in tree.node_index.values() {
+        if matches!(node.expr.as_ref(), Expr::FnCall { .. }) {
+            fn_calls.push(node);
+        }
+        if let Some(dead) = dead_branch_of_cached(node, &mut fold_cache) {
+            collect_descendant_ids(dead, &mut dead_ids);
+        }
+    }
+    for node in fn_calls {
+        if dead_ids.contains(&node.id) {
+            continue;
+        }
+        check_node(node, caps, gates, diagnostics);
     }
 }
 

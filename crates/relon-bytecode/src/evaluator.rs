@@ -23,9 +23,11 @@ use std::sync::Arc;
 use relon_eval_api::layout::SchemaLayout;
 use relon_eval_api::schema_canonical::Schema;
 use relon_eval_api::{
-    CapabilityGate, ClosureData, Evaluator, RuntimeError, Scope, SmolStr, Thunk, Value,
+    CapabilityGate, ClosureData, Evaluator, RelonFunction, RuntimeError, Scope, SmolStr, Thunk,
+    Value,
 };
 use relon_ir::ir::Module as IrModule;
+use relon_ir::ir::NativeImport;
 use relon_ir::{IrType, TaggedOp};
 use relon_parser::{Node, TokenRange};
 use thiserror::Error;
@@ -194,6 +196,12 @@ pub struct BytecodeEvaluator {
     /// was built via the legacy `from_ir_legacy` path (where the IR
     /// uses synthetic `Op::LocalGet(idx)` directly).
     field_offset_to_local: std::collections::BTreeMap<u32, u32>,
+    /// `#native` imports the lowering pass interned for this module, in
+    /// `import_idx` order. Carried so [`Self::with_host_fns`] can match
+    /// a host-supplied `Arc<dyn RelonFunction>` to the slot the
+    /// `BcOp::CallNative` op references by index. Empty for every
+    /// host-fn-free source (the common case).
+    native_imports: Vec<NativeImport>,
 }
 
 /// M2-C lever 5: pre-computed return-shape classification used by the
@@ -234,8 +242,6 @@ impl BytecodeEvaluator {
     /// Drive the full pipeline: parse → analyze → IR lower → bytecode
     /// compile.
     pub fn from_source(src: &str) -> Result<Self, BytecodeError> {
-        let ast =
-            relon_parser::parse_document(src).map_err(|e| BytecodeError::Parse(e.to_string()))?;
         // Open follow-up #2: run the analyzer with `strict_mode: false`
         // so the v1.5 / v1.6 type-surface bans (`ClosureParamTypeMissing`,
         // `ClosureReturnTypeUnknown`, `ExpressionTypeUnknown`, untyped
@@ -250,13 +256,39 @@ impl BytecodeEvaluator {
         // surface as errors under non-strict mode and still gate the
         // build; this relaxation only drops the strict-mode-only soft
         // checks that the tree-walker also tolerates.
-        let analyzed = relon_analyzer::analyze_with_options(
-            &ast,
-            &relon_analyzer::AnalyzeOptions {
-                strict_mode: false,
-                ..Default::default()
-            },
-        );
+        let options = relon_analyzer::AnalyzeOptions {
+            strict_mode: false,
+            ..Default::default()
+        };
+        Self::from_source_with_options(src, &options)
+    }
+
+    /// Like [`Self::from_source`] but with caller-supplied analyzer
+    /// options. This is the entry point for host-registered native
+    /// fns: the host populates `options.host_fn_names` /
+    /// `host_fn_signatures` / `host_fn_gates` / `caps` so the analyzer
+    /// resolves the calls, runs the static capability-reachability
+    /// check (a gated call without the granted cap fails the build
+    /// here, before any bytecode runs), and the IR lowering pass emits
+    /// the `Op::CheckCap`-guarded `Op::CallNative`. Pair with
+    /// [`Self::with_host_fns`] to register the `Arc<dyn RelonFunction>`
+    /// callables the dispatcher invokes, and [`Self::with_granted_cap`]
+    /// to set the runtime grant the per-call consult checks.
+    pub fn from_source_with_options(
+        src: &str,
+        options: &relon_analyzer::AnalyzeOptions,
+    ) -> Result<Self, BytecodeError> {
+        let ast =
+            relon_parser::parse_document(src).map_err(|e| BytecodeError::Parse(e.to_string()))?;
+        // Compiled backends analyze per-file with no workspace pass, so
+        // force the single-file capability-reachability check on: a
+        // gated native call without the granted cap must fail the build
+        // here, not slip through to a runtime-only trap.
+        let options = relon_analyzer::AnalyzeOptions {
+            standalone_capability_check: true,
+            ..options.clone()
+        };
+        let analyzed = relon_analyzer::analyze_with_options(&ast, &options);
         if analyzed.has_errors() {
             let err_count = analyzed
                 .diagnostics
@@ -359,6 +391,7 @@ impl BytecodeEvaluator {
         let empty = std::collections::BTreeMap::new();
         let compiled = compile_function(func, &in_map, &empty)?;
         let cached_param_count = param_names.len();
+        let native_imports = module.imports.clone();
         Ok(Self {
             func: compiled,
             entry_range,
@@ -374,6 +407,7 @@ impl BytecodeEvaluator {
             // Legacy IR uses `Op::LocalGet(idx)` directly, so the
             // recorder walker doesn't need an offset→slot rewrite.
             field_offset_to_local: std::collections::BTreeMap::new(),
+            native_imports,
         })
     }
 
@@ -387,6 +421,7 @@ impl BytecodeEvaluator {
         out_map: &std::collections::BTreeMap<u32, u32>,
     ) -> Result<Self, BytecodeError> {
         let entry_idx = module.entry_func_index.ok_or(BytecodeError::NoEntry)?;
+        let native_imports = module.imports.clone();
         let func = &module.funcs[entry_idx];
         let entry_range = func.range;
         // PC-alignment follow-up #3: clone the body so the recorder
@@ -425,6 +460,7 @@ impl BytecodeEvaluator {
             cached_param_count,
             entry_body,
             field_offset_to_local: in_map.clone(),
+            native_imports,
         })
     }
 
@@ -505,6 +541,53 @@ impl BytecodeEvaluator {
             .cap_vtable
             .set_gate(gate);
         self
+    }
+
+    /// Register the host's `Arc<dyn RelonFunction>` callables for
+    /// native-fn dispatch. Each entry is keyed by the source-level fn
+    /// name; this method matches the name to the `import_idx` the
+    /// lowering pass assigned (via [`Self::native_imports`]) and
+    /// installs the callable at that slot in the VM's capability
+    /// vtable. Names with no matching `#native` import in the compiled
+    /// module are silently skipped — a registered fn the source never
+    /// calls simply isn't lowered, so it has no slot to fill.
+    ///
+    /// The capability guard is enforced independently by the
+    /// `Op::CheckCap` prologue against the grant set via
+    /// [`Self::with_granted_cap`] / the installed gate — registering a
+    /// callable does **not** grant its capability.
+    pub fn with_host_fns(mut self, host_fns: &HashMap<String, Arc<dyn RelonFunction>>) -> Self {
+        let slots: Vec<(u32, Arc<dyn RelonFunction>)> = self
+            .native_imports
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, imp)| host_fns.get(&imp.name).map(|f| (idx as u32, Arc::clone(f))))
+            .collect();
+        let cfg = Arc::make_mut(&mut self.default_config);
+        for (idx, func) in slots {
+            cfg.cap_vtable.register_host_fn(idx, func);
+        }
+        self
+    }
+
+    /// Grant a capability bit on the evaluator's default VM config so
+    /// the per-call `Op::CheckCap` / `Op::CallNative` consult passes at
+    /// runtime. Decoupled from the analyze-time `caps`: a host can
+    /// grant the bit statically (so the build passes the reachability
+    /// check) yet withhold it here to exercise a stricter runtime
+    /// posture (the call then traps `CapabilityDenied`).
+    pub fn with_granted_cap(mut self, bit: u32) -> Self {
+        Arc::make_mut(&mut self.default_config)
+            .cap_vtable
+            .grant(bit);
+        self
+    }
+
+    /// The `#native` imports the lowering pass interned for this
+    /// module, in `import_idx` order. Lets a host map fn names to the
+    /// slots [`Self::with_host_fns`] fills.
+    pub fn native_imports(&self) -> &[NativeImport] {
+        &self.native_imports
     }
 
     /// M2-B phase 4c: install the trace-JIT hot-counter trigger on the

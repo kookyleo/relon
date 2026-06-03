@@ -329,6 +329,18 @@ pub fn analyze_with_options(root: &Node, options: &AnalyzeOptions) -> AnalyzedTr
     modules::collect_imports(root, &mut tree);
     resolve::resolve_references(root, &mut tree);
     typecheck_and_main_return(root, &mut tree);
+    // Stage 4 (single-file): run the capability-reachability check over
+    // this tree's own `node_index` when the caller opts in. The
+    // workspace build pass leaves the flag off and runs the
+    // cross-module `capability_check::run` itself; the compiled
+    // backends analyze per-file with no workspace pass, so they set
+    // the flag to keep the static guard reachable — a gated native
+    // call without the granted cap then fails the build here rather
+    // than slipping through to a runtime-only trap. No-op when no host
+    // gate is registered.
+    if options.standalone_capability_check {
+        capability_check::run_single(&mut tree);
+    }
     tree
 }
 
@@ -489,6 +501,17 @@ pub struct AnalyzeOptions {
     ///
     /// Default `false` preserves the pre-H behavior.
     pub trivial_main_fast_path: bool,
+    /// Stage 4 (single-file): when `true`, [`analyze_with_options`]
+    /// runs the capability-reachability check over this tree's own
+    /// `node_index` (via `capability_check::run_single`). The workspace
+    /// build pass leaves this `false` and runs the cross-module
+    /// `capability_check::run` itself — flipping it on there would
+    /// double-flag every gated call. The compiled backends
+    /// (bytecode / cranelift / llvm) analyze per-file with no workspace
+    /// pass, so they set this to keep the static guard reachable.
+    ///
+    /// Default `false` preserves the workspace-driven behavior.
+    pub standalone_capability_check: bool,
 }
 
 impl Default for AnalyzeOptions {
@@ -502,6 +525,7 @@ impl Default for AnalyzeOptions {
             require_hash: false,
             skip_core_schemas: false,
             trivial_main_fast_path: false,
+            standalone_capability_check: false,
         }
     }
 }

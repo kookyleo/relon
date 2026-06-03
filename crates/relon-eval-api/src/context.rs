@@ -182,6 +182,37 @@ impl NativeFnGate {
         }
         out
     }
+
+    /// Capability bit indices this gate requires, in field-declaration
+    /// order, **regardless of any grant**. The IR lowering pass emits
+    /// one [`crate::CapabilityBit`]-tagged `Op::CheckCap` per entry
+    /// ahead of the guarded `Op::CallNative`, so the runtime consult
+    /// fires on every required bit (the grant is checked at dispatch
+    /// time, not here). Mirrors [`Self::missing_bits`]'s ordering but
+    /// drops the grant filter — lowering doesn't know the host's
+    /// runtime posture, only the static requirement.
+    pub fn required_bit_indices(&self) -> Vec<u32> {
+        let mut out = Vec::with_capacity(6);
+        if self.reads_fs {
+            out.push(CapabilityBit::ReadsFs.bit_index());
+        }
+        if self.writes_fs {
+            out.push(CapabilityBit::WritesFs.bit_index());
+        }
+        if self.network {
+            out.push(CapabilityBit::Network.bit_index());
+        }
+        if self.reads_clock {
+            out.push(CapabilityBit::ReadsClock.bit_index());
+        }
+        if self.reads_env {
+            out.push(CapabilityBit::ReadsEnv.bit_index());
+        }
+        if self.uses_rng {
+            out.push(CapabilityBit::UsesRng.bit_index());
+        }
+        out
+    }
 }
 
 /// Internal helper: a registered native function with its capability gate.

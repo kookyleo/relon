@@ -65,6 +65,36 @@ impl NativeFnGate {
         }
         out
     }
+
+    /// Capability bit indices this gate requires, in field-declaration
+    /// order, regardless of any grant. The indices match
+    /// `relon_eval_api::CapabilityBit::bit_index()` (ReadsFs=0 …
+    /// UsesRng=5) — the same canonical order this mirror duplicates
+    /// field-for-field. Consumed by the IR lowering pass to emit one
+    /// capability-tagged `Op::CheckCap` per required bit ahead of an
+    /// `Op::CallNative`.
+    pub fn required_bit_indices(&self) -> Vec<u32> {
+        let mut out = Vec::new();
+        if self.reads_fs {
+            out.push(0);
+        }
+        if self.writes_fs {
+            out.push(1);
+        }
+        if self.network {
+            out.push(2);
+        }
+        if self.reads_clock {
+            out.push(3);
+        }
+        if self.reads_env {
+            out.push(4);
+        }
+        if self.uses_rng {
+            out.push(5);
+        }
+        out
+    }
 }
 
 /// Context-wide grant the host hands the evaluator. Mirrors the bit
