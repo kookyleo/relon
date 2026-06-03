@@ -1,33 +1,64 @@
 //! `Op`-family: record / collection construction.
 //!
 //! AllocRootRecord / StoreFieldAtRecord and their record-local backing.
-//! ConstList* / ListGetByIntIdx / DictGetByStringKey / AllocSubRecord /
-//! PushRecordBase / EmitTailRecordFromAbsoluteAddr are still in the
-//! `unsupported` set in `super::lower_op` — Phase 0b fills them here.
+//! ConstList* / ListGetByIntIdx / DictGetByStringKey are still in the
+//! `unsupported` set in `super::lower_op` — see the per-op notes in
+//! [`Emit::lower_collections_rest`]. Phase 0b fills the record-local
+//! sub-record / tail-record arms here.
 
-use inkwell::values::PointerValue;
+use inkwell::values::{IntValue, PointerValue};
 
 use relon_ir::ir::{IrType, Op};
 
 use crate::error::LlvmError;
+use crate::state::ARENA_STATE_OFFSET_TAIL_CURSOR;
 
 use super::*;
 
 impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// Phase 0b seam: list / dict / sub-record construction ops.
-    /// Dispatched from `super::lower_op`. Fill the arms here, porting
-    /// from `relon-codegen-cranelift`'s `record.rs` / const-pool list
-    /// lowering and aligning three-way (tree-walk / cranelift / llvm).
+    /// Dispatched from `super::lower_op`. The record-local ops
+    /// (`AllocSubRecord` / `PushRecordBase` /
+    /// `EmitTailRecordFromAbsoluteAddr`) are ported from
+    /// `relon-codegen-cranelift`'s `record.rs`. The const-list and
+    /// subscript arms stay `unsupported`:
+    ///
+    /// * `ConstListInt` / `ConstListFloat` / `ConstListBool` need a
+    ///   per-list byte-layout + `idx -> offset` map on the shared
+    ///   [`super::ConstPool`] (mirroring cranelift's
+    ///   `list_int_offsets` / `list_float_offsets` / `list_bool_offsets`).
+    ///   The LLVM-side `ConstPool` in `mod.rs` only carries
+    ///   `string_offsets`; widening it is a cross-family change the
+    ///   integration phase owns.
+    /// * `ConstListString` is unsupported on the cranelift golden side
+    ///   too (pointer-array materialisation is not wired anywhere yet).
+    /// * `ListGetByIntIdx` / `DictGetByStringKey` are unsupported on
+    ///   the cranelift golden side, so there is no semantic oracle to
+    ///   port against.
     pub(crate) fn lower_collections_rest(
         &mut self,
         ip: usize,
-        _ip_hint: &str,
+        ip_hint: &str,
         op: &Op,
     ) -> Result<(), LlvmError> {
-        Err(LlvmError::Codegen(format!(
-            "unsupported op (Phase 0b collections seam): {op:?} at ip={ip}"
-        )))
+        match op {
+            Op::AllocSubRecord {
+                record_local_idx,
+                root_size,
+                root_align,
+            } => self.emit_alloc_sub_record(*record_local_idx, *root_size, *root_align),
+            Op::PushRecordBase { record_local_idx } => {
+                self.emit_push_record_base(*record_local_idx)
+            }
+            Op::EmitTailRecordFromAbsoluteAddr { ty } => {
+                self.emit_tail_record_from_absolute(ip_hint, *ty)
+            }
+            _ => Err(LlvmError::Codegen(format!(
+                "unsupported op (Phase 0b collections seam): {op:?} at ip={ip}"
+            ))),
+        }
     }
+
     /// Resolve / create the i32 alloca backing an
     /// `Op::AllocRootRecord` / `Op::AllocSubRecord` record-local
     /// index. Each variable holds an out_ptr-relative i32 offset.
@@ -66,6 +97,195 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         self.builder
             .build_store(slot, zero)
             .map_err(|e| LlvmError::Codegen(format!("AllocRootRecord store: {e}")))?;
+        Ok(())
+    }
+
+    /// Read `state.tail_cursor`, align it up to `align`, bump it by
+    /// `record_size`, store the new cursor back, and return the
+    /// pre-bump aligned cursor (= the buffer-relative offset of the
+    /// freshly-reserved tail record). Shared by the sub-record and
+    /// tail-record arms; mirrors cranelift's `emit_tail_alloc` policy
+    /// (bump-allocate inside the output buffer's tail region). Sets
+    /// `needs_tail_cursor` so the buffer-protocol epilogue returns the
+    /// post-bump cursor rather than the static `buffer_return_size`.
+    ///
+    /// `record_size` is an `i32` value (compile-time const for
+    /// `AllocSubRecord`, runtime-computed for the tail-record copy).
+    fn emit_tail_alloc(
+        &mut self,
+        record_size: IntValue<'ctx>,
+        align: u32,
+    ) -> Result<IntValue<'ctx>, LlvmError> {
+        let state_ptr = self.state_ptr.ok_or_else(|| {
+            LlvmError::Codegen("tail alloc outside buffer-protocol entry shape (no state ptr)".into())
+        })?;
+        let i32_t = self.ctx.i32_type();
+        let i8_t = self.ctx.i8_type();
+        let tail_gep = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    state_ptr,
+                    &[i32_t.const_int(u64::from(ARENA_STATE_OFFSET_TAIL_CURSOR), false)],
+                    "tail_cursor_gep",
+                )
+                .map_err(|e| LlvmError::Codegen(format!("tail_cursor GEP: {e}")))?
+        };
+        let cur = self
+            .builder
+            .build_load(i32_t, tail_gep, "tail_cursor_pre")
+            .map_err(|e| LlvmError::Codegen(format!("tail_cursor load: {e}")))?
+            .into_int_value();
+        let aligned = if align <= 1 {
+            cur
+        } else {
+            let add = i32_t.const_int(u64::from(align - 1), false);
+            let mask = i32_t.const_int(u64::from(!(align - 1)), false);
+            let sum = self
+                .builder
+                .build_int_add(cur, add, "tail_align_sum")
+                .map_err(|e| LlvmError::Codegen(format!("tail align add: {e}")))?;
+            self.builder
+                .build_and(sum, mask, "tail_align_and")
+                .map_err(|e| LlvmError::Codegen(format!("tail align and: {e}")))?
+        };
+        let new_cur = self
+            .builder
+            .build_int_add(aligned, record_size, "tail_cursor_post")
+            .map_err(|e| LlvmError::Codegen(format!("tail cur bump: {e}")))?;
+        self.builder
+            .build_store(tail_gep, new_cur)
+            .map_err(|e| LlvmError::Codegen(format!("tail cursor store: {e}")))?;
+        self.needs_tail_cursor = true;
+        Ok(aligned)
+    }
+
+    /// Lower `Op::AllocSubRecord { record_local_idx, root_size,
+    /// root_align }`. Bump-allocates `root_size` bytes in the output
+    /// buffer's tail area (aligned up to `root_align`), binds the
+    /// record-local to the pre-bump cursor (a buffer-relative offset),
+    /// and bumps the cursor past the reserved record. Mirrors
+    /// cranelift's `emit_alloc_sub_record`.
+    pub(crate) fn emit_alloc_sub_record(
+        &mut self,
+        idx: u32,
+        root_size: u32,
+        root_align: u32,
+    ) -> Result<(), LlvmError> {
+        let size_v = self.ctx.i32_type().const_int(u64::from(root_size), false);
+        let pre_cursor = self.emit_tail_alloc(size_v, root_align)?;
+        let slot = self.get_or_create_record_local(idx)?;
+        self.builder
+            .build_store(slot, pre_cursor)
+            .map_err(|e| LlvmError::Codegen(format!("AllocSubRecord store: {e}")))?;
+        Ok(())
+    }
+
+    /// Lower `Op::PushRecordBase { record_local_idx }`. Reads the
+    /// record-local and pushes its current value onto the operand
+    /// stack so the surrounding parent record can store the
+    /// sub-record's base offset into its pointer slot. Mirrors
+    /// cranelift's `emit_push_record_base`.
+    pub(crate) fn emit_push_record_base(&mut self, idx: u32) -> Result<(), LlvmError> {
+        let slot = self.record_locals.get(&idx).copied().ok_or_else(|| {
+            LlvmError::Codegen(format!(
+                "PushRecordBase({idx}) before matching AllocRootRecord / AllocSubRecord"
+            ))
+        })?;
+        let v = self
+            .builder
+            .build_load(self.ctx.i32_type(), slot, "record_base")
+            .map_err(|e| LlvmError::Codegen(format!("PushRecordBase load: {e}")))?
+            .into_int_value();
+        self.push(v, IrType::I32);
+        Ok(())
+    }
+
+    /// Lower `Op::EmitTailRecordFromAbsoluteAddr { ty }`. Pops an
+    /// arena-relative source pointer (an `i32` offset where a
+    /// `[len:u32 LE][payload]` record lives), copies that record into
+    /// the output buffer's tail area at the aligned tail cursor, bumps
+    /// the cursor past it, and pushes the pre-bump cursor (= the
+    /// buffer-relative offset of the just-written record) onto the
+    /// operand stack as an `i32`. The pushed value is what subsequent
+    /// `Op::StoreFieldAtRecord { ty: String / ListInt / ... }` stores
+    /// into a parent record's pointer slot. Mirrors cranelift's
+    /// `emit_tail_record_from_absolute`.
+    pub(crate) fn emit_tail_record_from_absolute(
+        &mut self,
+        ip_hint: &str,
+        ty: IrType,
+    ) -> Result<(), LlvmError> {
+        let src_off_i32 = self.pop_int(ip_hint)?;
+        let i32_t = self.ctx.i32_type();
+        // Read the record's leading `[len: u32]` header to size the
+        // copy. `arena_addr_i32` resolves `arena_base + src_off`.
+        let src_abs = self.arena_addr_i32(src_off_i32)?;
+        let len_i32 = self
+            .builder
+            .build_load(i32_t, src_abs, "tail_rec_len")
+            .map_err(|e| LlvmError::Codegen(format!("EmitTailRecord len load: {e}")))?
+            .into_int_value();
+        // record_size by type:
+        //   String / ListBool : 4 + len  (len = byte / element count)
+        //   ListInt / ListFloat : 8 + 8 * len  (8-byte header + i64/f64)
+        let record_size = match ty {
+            IrType::String | IrType::ListBool => {
+                let four = i32_t.const_int(4, false);
+                self.builder
+                    .build_int_add(len_i32, four, "tail_rec_size4")
+                    .map_err(|e| LlvmError::Codegen(format!("EmitTailRecord size4: {e}")))?
+            }
+            IrType::ListInt | IrType::ListFloat => {
+                let three = i32_t.const_int(3, false);
+                let shifted = self
+                    .builder
+                    .build_left_shift(len_i32, three, "tail_rec_shl")
+                    .map_err(|e| LlvmError::Codegen(format!("EmitTailRecord shl: {e}")))?;
+                let eight = i32_t.const_int(8, false);
+                self.builder
+                    .build_int_add(shifted, eight, "tail_rec_size8")
+                    .map_err(|e| LlvmError::Codegen(format!("EmitTailRecord size8: {e}")))?
+            }
+            IrType::ListString | IrType::ListSchema => {
+                return Err(LlvmError::Codegen(format!(
+                    "EmitTailRecordFromAbsoluteAddr {ty:?} (pointer-array) not yet supported"
+                )));
+            }
+            _ => {
+                return Err(LlvmError::Codegen(format!(
+                    "EmitTailRecordFromAbsoluteAddr unsupported {ty:?}"
+                )));
+            }
+        };
+        let align: u32 = match ty {
+            IrType::String | IrType::ListBool => 4,
+            IrType::ListInt | IrType::ListFloat => 8,
+            _ => unreachable!("record_size match already rejected non-pointer-indirect types"),
+        };
+        let pre_cursor = self.emit_tail_alloc(record_size, align)?;
+        // dest = arena_base + out_ptr + pre_cursor.
+        let out_ptr_i32 = self.lookup_param(2)?; // IR LocalGet(2) == out_ptr
+        let dst_off = self
+            .builder
+            .build_int_add(out_ptr_i32, pre_cursor, "tail_rec_dst_off")
+            .map_err(|e| LlvmError::Codegen(format!("EmitTailRecord dst off: {e}")))?;
+        let dst_ptr = self.arena_addr_i32(dst_off)?;
+        // The earlier `src_abs` GEP is still valid — both source and
+        // destination pointers are pure address arithmetic off the
+        // cached `arena_base_ptr`, no aliasing constraint between them.
+        let i64_t = self.ctx.i64_type();
+        let rec64 = self
+            .builder
+            .build_int_z_extend(record_size, i64_t, "tail_rec_size64")
+            .map_err(|e| LlvmError::Codegen(format!("EmitTailRecord size zext: {e}")))?;
+        self.builder
+            .build_memcpy(dst_ptr, align, src_abs, 1, rec64)
+            .map_err(|e| LlvmError::Codegen(format!("EmitTailRecord memcpy: {e}")))?;
+        // Push the pre-bump cursor (buffer-relative offset of the
+        // just-written record) as an i32. Mirrors cranelift's
+        // post-copy `self.push(pre_cursor)`.
+        self.push(pre_cursor, IrType::I32);
         Ok(())
     }
 
