@@ -305,6 +305,48 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
 
+    /// Build a [`NativeFnGate`] from per-bit flags. `NativeFnGate` is
+    /// `#[non_exhaustive]` and now lives in the `relon-cap` leaf crate,
+    /// so a struct literal isn't usable from this crate's tests; this
+    /// helper sets the requested bits on top of the all-zero default.
+    fn gate_bits(
+        reads_fs: bool,
+        writes_fs: bool,
+        network: bool,
+        reads_clock: bool,
+        reads_env: bool,
+        uses_rng: bool,
+    ) -> NativeFnGate {
+        let mut g = NativeFnGate::default();
+        g.reads_fs = reads_fs;
+        g.writes_fs = writes_fs;
+        g.network = network;
+        g.reads_clock = reads_clock;
+        g.reads_env = reads_env;
+        g.uses_rng = uses_rng;
+        g
+    }
+
+    /// Build a [`Capabilities`] grant from per-bit flags, same rationale
+    /// as [`gate_bits`].
+    fn caps_bits(
+        reads_fs: bool,
+        writes_fs: bool,
+        network: bool,
+        reads_clock: bool,
+        reads_env: bool,
+        uses_rng: bool,
+    ) -> Capabilities {
+        let mut c = Capabilities::default();
+        c.reads_fs = reads_fs;
+        c.writes_fs = writes_fs;
+        c.network = network;
+        c.reads_clock = reads_clock;
+        c.reads_env = reads_env;
+        c.uses_rng = uses_rng;
+        c
+    }
+
     /// In-memory loader: same shape as the one in `workspace_build::tests`,
     /// duplicated here so this module can run independently.
     struct MapLoader {
@@ -340,10 +382,7 @@ mod tests {
     fn options_with_read_file_gate(caps: Capabilities) -> AnalyzeOptions {
         options_with_gate(
             "read_file",
-            NativeFnGate {
-                reads_fs: true,
-                ..NativeFnGate::default()
-            },
+            gate_bits(true, false, false, false, false, false),
             caps,
         )
     }
@@ -463,10 +502,7 @@ mod tests {
     // 5. caps.reads_fs grants the cap → silent.
     #[test]
     fn reads_fs_grant_silences_diagnostic() {
-        let caps = Capabilities {
-            reads_fs: true,
-            ..Capabilities::default()
-        };
+        let caps = caps_bits(true, false, false, false, false, false);
         let opts = options_with_read_file_gate(caps);
         let mut loader = MapLoader::new();
         let ws = build_with_options(
@@ -680,41 +716,11 @@ mod tests {
     #[test]
     fn each_new_capability_bit_flagged_independently() {
         let cases: Vec<(&str, NativeFnGate)> = vec![
-            (
-                "writes_fs",
-                NativeFnGate {
-                    writes_fs: true,
-                    ..NativeFnGate::default()
-                },
-            ),
-            (
-                "network",
-                NativeFnGate {
-                    network: true,
-                    ..NativeFnGate::default()
-                },
-            ),
-            (
-                "reads_clock",
-                NativeFnGate {
-                    reads_clock: true,
-                    ..NativeFnGate::default()
-                },
-            ),
-            (
-                "reads_env",
-                NativeFnGate {
-                    reads_env: true,
-                    ..NativeFnGate::default()
-                },
-            ),
-            (
-                "uses_rng",
-                NativeFnGate {
-                    uses_rng: true,
-                    ..NativeFnGate::default()
-                },
-            ),
+            ("writes_fs", gate_bits(false, true, false, false, false, false)),
+            ("network", gate_bits(false, false, true, false, false, false)),
+            ("reads_clock", gate_bits(false, false, false, true, false, false)),
+            ("reads_env", gate_bits(false, false, false, false, true, false)),
+            ("uses_rng", gate_bits(false, false, false, false, false, true)),
         ];
         for (bit, gate) in cases {
             let opts = options_with_gate("f", gate, Capabilities::default());
@@ -738,11 +744,7 @@ mod tests {
     //     order in `NativeFnGate`.
     #[test]
     fn multiple_missing_bits_emit_multiple_diagnostics() {
-        let gate = NativeFnGate {
-            reads_fs: true,
-            network: true,
-            ..NativeFnGate::default()
-        };
+        let gate = gate_bits(true, false, true, false, false, false);
         let opts = options_with_gate("fetch", gate, Capabilities::default());
         let mut loader = MapLoader::new();
         let ws = build_with_options("/abs/entry", r#"{ x: fetch() }"#, &mut loader, &opts);
@@ -765,14 +767,7 @@ mod tests {
     #[test]
     fn explicit_per_bit_grants_silence_check() {
         let caps = Capabilities::all_granted();
-        let gate = NativeFnGate {
-            reads_fs: true,
-            writes_fs: true,
-            network: true,
-            reads_clock: true,
-            reads_env: true,
-            uses_rng: true,
-        };
+        let gate = gate_bits(true, true, true, true, true, true);
         let opts = options_with_gate("everything", gate, caps);
         let mut loader = MapLoader::new();
         let ws = build_with_options("/abs/entry", r#"{ x: everything() }"#, &mut loader, &opts);

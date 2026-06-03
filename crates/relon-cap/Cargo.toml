@@ -1,0 +1,21 @@
+[package]
+name = "relon-cap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Leaf crate holding Relon's canonical capability data types (CapabilityBit / NativeFnGate / Capabilities)."
+authors = ["kookyleo <kookyleo@gmail.com>"]
+keywords = ["relon", "capability", "sandbox"]
+categories = ["compilers"]
+
+# Deliberately depends on **no other** `relon-*` crate (and no third-party
+# crate) so it sits at the very bottom of the workspace dep graph — a true
+# leaf. Both `relon-eval-api` and `relon-analyzer` depend on it and
+# re-export its types at their historical public paths, replacing the
+# field-for-field mirror the analyzer used to carry. Adding a relon-* dep
+# here would re-introduce the dependency cycle this crate exists to break;
+# reviewers should reject any such change.
+[dependencies]

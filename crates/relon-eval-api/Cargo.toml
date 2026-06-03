@@ -12,6 +12,7 @@ categories = ["compilers", "config"]
 [dependencies]
 relon-parser = { workspace = true }
 relon-analyzer = { workspace = true }
+relon-cap = { workspace = true }
 ordered-float.workspace = true
 # `rc` enables serde derive support for the Arc-wrapped `Value::List` /
 # `Value::Dict` payloads (see `value.rs` for the design rationale).

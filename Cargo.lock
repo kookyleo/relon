@@ -1928,6 +1928,7 @@ dependencies = [
  "hex",
  "miette",
  "rayon",
+ "relon-cap",
  "relon-parser",
  "rustc-hash 1.1.0",
  "sha2",
@@ -1979,6 +1980,10 @@ dependencies = [
  "relon-trace-abi",
  "thiserror 2.0.18",
 ]
+
+[[package]]
+name = "relon-cap"
+version = "0.1.0"
 
 [[package]]
 name = "relon-cli"
@@ -2072,6 +2077,7 @@ dependencies = [
  "miette",
  "ordered-float",
  "relon-analyzer",
+ "relon-cap",
  "relon-parser",
  "serde",
  "serde_json",
