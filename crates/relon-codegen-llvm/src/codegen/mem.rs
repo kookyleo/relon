@@ -3,7 +3,8 @@
 //! LoadField/StoreField (scalar buffer slots), the pointer-indirect
 //! param loads, raw `Load*/Store*AtAbsolute`, memcpy, scratch alloc, and
 //! the arena-relative address composition helpers. `LoadFieldAtAbsolute`
-//! stays in `super::lower_op`'s `unsupported` set for Phase 0b.
+//! (the dynamic-base schema-field load) is lowered here too via
+//! `lower_mem_rest` (Phase 0b).
 
 use inkwell::values::{
     BasicValueEnum, IntValue, PointerValue,
@@ -39,17 +40,89 @@ pub(crate) enum AbsStore {
 
 impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// Phase 0b seam: absolute-addressed field load
-    /// (`LoadFieldAtAbsolute`). Dispatched from `super::lower_op`. Port
-    /// from `relon-codegen-cranelift`'s `field.rs` and align three-way.
+    /// (`LoadFieldAtAbsolute`). Dispatched from `super::lower_op`.
+    ///
+    /// Semantics (see `relon_ir::ir::Op::LoadFieldAtAbsolute`): pop an
+    /// i32 arena-relative address pointing at the first byte of a
+    /// schema instance's fixed area, then push the field at `offset`
+    /// of type `ty`. This is the dynamic-base sibling of
+    /// [`Self::emit_load_field`] — instead of implicitly reading the
+    /// `in_ptr` handshake slot, the base address rides the operand
+    /// stack. The address composition (`arena_base + addr + offset`)
+    /// reuses [`Self::compose_abs_addr`], which keeps the i32-arena
+    /// offset width-agnostic (zext to i64 then GEP from the i8*
+    /// `arena_base`), so no 64-bit pointer width is baked in — see the
+    /// `TODO(P3-wasm32)` note this file already carries.
     pub(crate) fn lower_mem_rest(
         &mut self,
         ip: usize,
-        _ip_hint: &str,
+        ip_hint: &str,
         op: &Op,
     ) -> Result<(), LlvmError> {
-        Err(LlvmError::Codegen(format!(
-            "unsupported op (Phase 0b mem seam): {op:?} at ip={ip}"
-        )))
+        match op {
+            Op::LoadFieldAtAbsolute { offset, ty } => {
+                self.emit_load_field_at_absolute(ip_hint, *offset, *ty)
+            }
+            _ => Err(LlvmError::Codegen(format!(
+                "unsupported op (Phase 0b mem seam): {op:?} at ip={ip}"
+            ))),
+        }
+    }
+
+    /// Lower `Op::LoadFieldAtAbsolute { offset, ty }`. Stack:
+    /// `[i32 addr] -> [T]`. Pops the arena-relative base address,
+    /// composes `arena_base + addr + offset`, loads `ty`, and pushes
+    /// the result on the int-typed virtual stack. The per-type load /
+    /// widen logic mirrors [`Self::emit_load_field`]: F64 loads a
+    /// `double` then bit-casts to i64 bits so the operand stack stays
+    /// integer-typed, and Bool / Null (i8 on the wire) zero-extend to
+    /// i32 to match the IR's virtual-stack convention.
+    ///
+    /// No bounds check — same "trust the IR + LLVM trap on UB" stance
+    /// the rest of the `*AtAbsolute` family takes (Phase 3 wires the
+    /// trap-propagation work).
+    pub(crate) fn emit_load_field_at_absolute(
+        &mut self,
+        ip_hint: &str,
+        offset: u32,
+        ty: IrType,
+    ) -> Result<(), LlvmError> {
+        let base = self.pop_int(ip_hint)?;
+        let addr = self.compose_abs_addr(base, offset)?;
+        if ty == IrType::F64 {
+            let name = self.next_name("loadfa_f64");
+            let f = self
+                .builder
+                .build_load(self.ctx.f64_type(), addr, &name)
+                .map_err(|e| LlvmError::Codegen(format!("LoadFieldAtAbsolute f64 load: {e}")))?;
+            let bits = self
+                .builder
+                .build_bit_cast(f, self.ctx.i64_type(), &self.next_name("loadfa_f64_bits"))
+                .map_err(|e| {
+                    LlvmError::Codegen(format!("LoadFieldAtAbsolute f64 bitcast: {e}"))
+                })?
+                .into_int_value();
+            self.push(bits, IrType::F64);
+            return Ok(());
+        }
+        let (llvm_ty, push_ty) = self.field_load_kind(ty)?;
+        let name = self.next_name("loadfa");
+        let raw = self
+            .builder
+            .build_load(llvm_ty, addr, &name)
+            .map_err(|e| LlvmError::Codegen(format!("LoadFieldAtAbsolute load: {e}")))?
+            .into_int_value();
+        let widened = match push_ty {
+            IrType::Bool | IrType::Null => {
+                let name = self.next_name("loadfa_zext");
+                self.builder
+                    .build_int_z_extend(raw, self.ctx.i32_type(), &name)
+                    .map_err(|e| LlvmError::Codegen(format!("LoadFieldAtAbsolute zext: {e}")))?
+            }
+            _ => raw,
+        };
+        self.push(widened, push_ty);
+        Ok(())
     }
 
     /// Emit a LoadField — buffer-protocol only. The LLVM IR loads
