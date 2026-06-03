@@ -2436,9 +2436,46 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 self.emit_call_closure(&ip_hint, param_tys, *ret_ty)?
             }
 
-            other => {
+            // ---- not yet lowered by the LLVM AOT backend ----
+            // These variants are intentionally unsupported in the
+            // current envelope (Phase E.1 covers scalar arith + control
+            // flow + the raw-memory / closure / buffer primitives the
+            // bundled bodies need). They are listed EXPLICITLY rather
+            // than swept up by a `_ =>` wildcard so that adding a new
+            // `Op` variant fails to compile here — forcing a deliberate
+            // decision (lower it, or add it to this unsupported set)
+            // instead of silently surfacing as a runtime codegen error.
+            // The behaviour is identical to the previous catch-all: a
+            // `LlvmError::Codegen` that lets the host fall back.
+            Op::ConstListInt { .. }
+            | Op::ConstListFloat { .. }
+            | Op::ConstListBool { .. }
+            | Op::ConstListString { .. }
+            | Op::DictGetByStringKey { .. }
+            | Op::ListGetByIntIdx { .. }
+            | Op::AllocSubRecord { .. }
+            | Op::PushRecordBase { .. }
+            | Op::EmitTailRecordFromAbsoluteAddr { .. }
+            | Op::Select { .. }
+            | Op::LoadFieldAtAbsolute { .. }
+            | Op::LoadSchemaPtr { .. }
+            | Op::CallNative { .. }
+            | Op::CheckCap { .. }
+            | Op::BrTable { .. }
+            | Op::Trap { .. }
+            | Op::CaseFoldTableAddr { .. }
+            | Op::CombiningMarkRangesAddr
+            | Op::WhitespaceRangesAddr
+            | Op::DecompTableAddr { .. }
+            | Op::CccTableAddr
+            | Op::CompositionTableAddr
+            | Op::FullCaseFoldTableAddr { .. }
+            | Op::CasedRangesAddr
+            | Op::CaseIgnorableRangesAddr
+            | Op::TurkishCaseFoldTableAddr { .. } => {
                 return Err(LlvmError::Codegen(format!(
-                    "unsupported op (Phase E.1 envelope): {other:?} at ip={ip}"
+                    "unsupported op (Phase E.1 envelope): {:?} at ip={ip}",
+                    tagged.op
                 )));
             }
         }
