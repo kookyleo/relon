@@ -87,6 +87,8 @@ pub struct EmittedField {
 pub enum EmittedFieldType {
     /// `i64` (Inline 8/8).
     Int,
+    /// `f64` (Inline 8/8, 8 LE bytes IEEE-754).
+    Float,
     /// `bool` (Inline 1/1).
     Bool,
     /// `()` (Inline 1/1, always zero).
@@ -108,6 +110,8 @@ pub enum EmittedFieldType {
 pub enum ArgValue<'a> {
     /// `i64` argument bound to an `EmittedFieldType::Int` slot.
     Int(i64),
+    /// `f64` argument bound to an `EmittedFieldType::Float` slot.
+    Float(f64),
     /// `bool` argument bound to an `EmittedFieldType::Bool` slot.
     Bool(bool),
     /// `Null` argument bound to an `EmittedFieldType::Null` slot.
@@ -130,6 +134,8 @@ pub enum ArgValue<'a> {
 pub enum RetValue {
     /// `i64` return decoded from an `EmittedFieldType::Int` slot.
     Int(i64),
+    /// `f64` return decoded from an `EmittedFieldType::Float` slot.
+    Float(f64),
     /// `bool` return decoded from an `EmittedFieldType::Bool` slot.
     Bool(bool),
     /// `Null` return — present so a `#main(...) -> Null` shape
@@ -406,6 +412,7 @@ fn pack_arg(
 ) -> Result<(), BufferEntryError> {
     match (field.ty, arg) {
         (EmittedFieldType::Int, ArgValue::Int(v)) => pack_int(builder, field.name, *v),
+        (EmittedFieldType::Float, ArgValue::Float(v)) => pack_float(builder, field.name, *v),
         (EmittedFieldType::Bool, ArgValue::Bool(v)) => pack_bool(builder, field.name, *v),
         (EmittedFieldType::Null, ArgValue::Null) => pack_null(builder, field.name),
         (EmittedFieldType::String, ArgValue::String(s)) => pack_string(builder, field.name, s),
@@ -421,6 +428,12 @@ fn pack_arg(
 fn pack_int(builder: &mut BufferBuilder<'_>, name: &str, v: i64) -> Result<(), BufferEntryError> {
     builder
         .write_int(name, v)
+        .map_err(|e| BufferEntryError::Buffer(format!("{e}")))
+}
+
+fn pack_float(builder: &mut BufferBuilder<'_>, name: &str, v: f64) -> Result<(), BufferEntryError> {
+    builder
+        .write_float(name, v)
         .map_err(|e| BufferEntryError::Buffer(format!("{e}")))
 }
 
@@ -450,6 +463,7 @@ fn unpack_ret(
 ) -> Result<RetValue, BufferEntryError> {
     match field.ty {
         EmittedFieldType::Int => unpack_int(reader, field.name),
+        EmittedFieldType::Float => unpack_float(reader, field.name),
         EmittedFieldType::Bool => unpack_bool(reader, field.name),
         EmittedFieldType::Null => unpack_null(reader, field.name),
         EmittedFieldType::String => unpack_string(reader, field.name),
@@ -461,6 +475,13 @@ fn unpack_int(reader: &BufferReader<'_>, name: &str) -> Result<RetValue, BufferE
     reader
         .read_int(name)
         .map(RetValue::Int)
+        .map_err(|e| BufferEntryError::Buffer(format!("{e}")))
+}
+
+fn unpack_float(reader: &BufferReader<'_>, name: &str) -> Result<RetValue, BufferEntryError> {
+    reader
+        .read_float(name)
+        .map(RetValue::Float)
         .map_err(|e| BufferEntryError::Buffer(format!("{e}")))
 }
 
@@ -488,6 +509,7 @@ fn unpack_string(reader: &BufferReader<'_>, name: &str) -> Result<RetValue, Buff
 fn arg_variant_name(arg: &ArgValue<'_>) -> &'static str {
     match arg {
         ArgValue::Int(_) => "Int",
+        ArgValue::Float(_) => "Float",
         ArgValue::Bool(_) => "Bool",
         ArgValue::Null => "Null",
         ArgValue::String(_) => "String",
@@ -497,6 +519,7 @@ fn arg_variant_name(arg: &ArgValue<'_>) -> &'static str {
 fn ty_to_repr(ty: EmittedFieldType) -> TypeRepr {
     match ty {
         EmittedFieldType::Int => TypeRepr::Int,
+        EmittedFieldType::Float => TypeRepr::Float,
         EmittedFieldType::Bool => TypeRepr::Bool,
         EmittedFieldType::Null => TypeRepr::Null,
         EmittedFieldType::String => TypeRepr::String,
@@ -534,6 +557,7 @@ fn synthesise_layout(fields: &[EmittedField], root_size: u32) -> OffsetTable {
     for f in fields {
         let (size, align, kind) = match f.ty {
             EmittedFieldType::Int => (8, 8, FieldKind::Inline { size: 8, align: 8 }),
+            EmittedFieldType::Float => (8, 8, FieldKind::Inline { size: 8, align: 8 }),
             EmittedFieldType::Bool => (1, 1, FieldKind::Inline { size: 1, align: 1 }),
             EmittedFieldType::Null => (1, 1, FieldKind::Inline { size: 1, align: 1 }),
             EmittedFieldType::String => (4, 4, FieldKind::PointerIndirect { tail_alignment: 1 }),

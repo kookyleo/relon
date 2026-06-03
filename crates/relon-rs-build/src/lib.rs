@@ -637,6 +637,13 @@ fn rust_type_for(ty: EmittedFieldType) -> RustTypeMap {
             ret_rust_ty: "i64",
             ret_match_arm: "RetValue::Int(v) => v",
         },
+        EmittedFieldType::Float => RustTypeMap {
+            tag_path: "EmittedFieldType::Float",
+            arg_rust_ty: "f64",
+            arg_value_expr: |p| format!("ArgValue::Float({p})"),
+            ret_rust_ty: "f64",
+            ret_match_arm: "RetValue::Float(v) => v",
+        },
         EmittedFieldType::Bool => RustTypeMap {
             tag_path: "EmittedFieldType::Bool",
             arg_rust_ty: "bool",

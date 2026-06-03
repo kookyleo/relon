@@ -58,6 +58,13 @@ fn expected_encoding(ty: EmittedFieldType) -> Encoding {
             ret_rust_ty: "i64",
             ret_value_ctor: "RetValue::Int",
         },
+        EmittedFieldType::Float => Encoding {
+            tag_path: "EmittedFieldType::Float",
+            arg_rust_ty: "f64",
+            arg_value_ctor: "ArgValue::Float",
+            ret_rust_ty: "f64",
+            ret_value_ctor: "RetValue::Float",
+        },
         EmittedFieldType::Bool => Encoding {
             tag_path: "EmittedFieldType::Bool",
             arg_rust_ty: "bool",
@@ -89,6 +96,7 @@ fn expected_encoding(ty: EmittedFieldType) -> Encoding {
 /// exhaustiveness check in `expected_encoding` until then).
 const ALL_VARIANTS: &[EmittedFieldType] = &[
     EmittedFieldType::Int,
+    EmittedFieldType::Float,
     EmittedFieldType::Bool,
     EmittedFieldType::Null,
     EmittedFieldType::String,
@@ -139,7 +147,7 @@ fn all_variants_have_encoding() {
     // If a new variant is added without appending it here, the
     // exhaustive `match` in `expected_encoding` is the gate; this count
     // assertion is the reminder to also extend `ALL_VARIANTS`.
-    assert_eq!(ALL_VARIANTS.len(), 4, "update ALL_VARIANTS for new tag");
+    assert_eq!(ALL_VARIANTS.len(), 5, "update ALL_VARIANTS for new tag");
 }
 
 /// `Int` arg + `Int` return: assert the binding carries the
@@ -198,6 +206,47 @@ fn string_arg_int_ret_triple_consistent() {
         binding.contains(&squeeze(ret.ret_value_ctor)),
         "Int return must unpack via `{}`",
         ret.ret_value_ctor
+    );
+}
+
+/// `Float` arg + `Float` return forces the buffer-protocol path, so the
+/// full Float triple (const tag + `f64` Rust type + `ArgValue`/`RetValue`
+/// constructors) is observable in one binding.
+#[test]
+fn float_roundtrip_triple_consistent() {
+    let binding = squeeze(&compile_binding(
+        "float_rt",
+        "#main(Float x) -> Float\nx * 2.0\n",
+    ));
+    let e = expected_encoding(EmittedFieldType::Float);
+
+    // Build-side Rust surface type for the `f64` param + return.
+    assert!(
+        binding.contains(&squeeze(&format!("x: {}", e.arg_rust_ty))),
+        "Float arg must surface as `{}`; binding=\n{binding}",
+        e.arg_rust_ty
+    );
+    assert!(
+        binding.contains(&squeeze(&format!("-> {}", e.ret_rust_ty))),
+        "Float return must surface as `{}`",
+        e.ret_rust_ty
+    );
+    // Codegen-side const tag for the Float slot.
+    assert!(
+        binding.contains(&squeeze(e.tag_path)),
+        "Float slot must stamp `{}` into the field table",
+        e.tag_path
+    );
+    // Shim-side ArgValue / RetValue glue.
+    assert!(
+        binding.contains(&squeeze(e.arg_value_ctor)),
+        "Float arg must pack via `{}`",
+        e.arg_value_ctor
+    );
+    assert!(
+        binding.contains(&squeeze(e.ret_value_ctor)),
+        "Float return must unpack via `{}`",
+        e.ret_value_ctor
     );
 }
 

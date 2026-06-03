@@ -1801,6 +1801,8 @@ pub struct EmittedField {
 pub enum EmittedFieldType {
     /// `i64`. Inline slot at offset, 8/8.
     Int,
+    /// `f64`. Inline slot at offset, 8/8 (8 LE bytes, IEEE-754).
+    Float,
     /// `bool`. Inline slot at offset, 1/1.
     Bool,
     /// `()`. Inline slot at offset, 1/1 (always reads as zero).
@@ -2185,6 +2187,7 @@ fn emitted_field_type_for(
     use relon_eval_api::schema_canonical::TypeRepr;
     match ty {
         TypeRepr::Int => Some(EmittedFieldType::Int),
+        TypeRepr::Float => Some(EmittedFieldType::Float),
         TypeRepr::Bool => Some(EmittedFieldType::Bool),
         TypeRepr::Null => Some(EmittedFieldType::Null),
         TypeRepr::String => Some(EmittedFieldType::String),

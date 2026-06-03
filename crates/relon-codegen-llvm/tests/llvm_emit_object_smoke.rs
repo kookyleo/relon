@@ -125,15 +125,21 @@ fn bool_return_decodes_correctly() {
 }
 
 #[test]
-fn float_param_rejected_with_unsupported() {
-    // Float marshalling is Phase 3 — surface a clear error before
-    // the binding generator ever sees the metadata.
-    let src = "#main(Float x) -> Int\n1\n";
-    let err = emit_to_tmp("float_param", src).expect_err("Float param should be rejected");
-    assert!(
-        err.contains("UnsupportedSignature") || err.contains("not yet wired"),
-        "expected UnsupportedSignature error, got: {err}"
-    );
+fn float_param_lowers_to_buffer() {
+    // Float marshalling landed in Phase 1 Stage 2.① — a Float-typed
+    // `#main` param routes through the buffer protocol with an
+    // 8/8-inline f64 slot, mirroring the MCJIT-side marshaller.
+    let src = "#main(Float x) -> Float\nx * 2.0\n";
+    let info = emit_to_tmp("float_param", src).expect("Float param now supported");
+    assert_eq!(info.shape, EmittedEntryShape::Buffer);
+    assert_eq!(info.entry_arity, 1);
+    assert_eq!(info.main_fields.len(), 1);
+    assert_eq!(info.main_fields[0].name, "x");
+    assert_eq!(info.main_fields[0].ty, EmittedFieldType::Float);
+    assert_eq!(info.return_fields.len(), 1);
+    assert_eq!(info.return_fields[0].ty, EmittedFieldType::Float);
+    assert!(info.main_root_size > 0);
+    assert!(info.return_root_size > 0);
 }
 
 #[test]
