@@ -56,7 +56,6 @@ mod const_pool_emit;
 mod control_flow;
 mod field;
 mod guard;
-mod hot_counter;
 mod memory;
 mod op_visitor;
 mod record;
@@ -67,7 +66,6 @@ use guard::{
     make_cap_lookup_signature, make_fmod_signature, make_glob_match_signature, make_now_signature,
     make_raise_trap_signature,
 };
-use hot_counter::emit_hot_counter_inject;
 
 /// Output of a successful compile: a JIT module plus the entry's
 /// function ID so the host can resolve a raw function pointer through
@@ -269,17 +267,8 @@ pub fn compile_module_with(
     // post-finalize step (in `evaluator.rs`) writes the live host fn
     // pointers into the table.
     //
-    // v6-γ M2/M3: in addition we pre-register the four trace JIT
-    // runtime helpers (`__relon_trace_save_deopt`,
-    // `__relon_trace_resolve_call`, `__relon_trace_inline_cache_lookup`
-    // and the codegen-cranelift-side `__relon_jump_to_recorder`) so that
-    // (a) HotCounter prologues injected into entry functions can call
-    // into the recorder helper and (b) JIT-installed trace fns can
-    // call the trace runtime helpers without a separate symbol
-    // resolution step.
     let mut jit_builder =
         JITBuilder::with_isa(isa.clone(), cranelift_module::default_libcall_names());
-    crate::trace_install::register_trace_runtime_symbols(&mut jit_builder);
     // Resolve the `fmod` external symbol referenced by `Op::Mod(F64)`
     // lowering to a Rust `a % b` shim. The JIT's internal symbol table
     // is consulted *before* the `dlsym` fallback, so this pins the
@@ -590,16 +579,6 @@ fn lower_module_into<M: CrModule>(
         let block_params: Vec<_> = builder.block_params(entry_block).to_vec();
         let state_ptr = block_params[0];
         let arg_values: Vec<CValue> = block_params[1..].to_vec();
-
-        // v6-γ M2: optionally emit a HotCounter prologue. The helper
-        // creates two new blocks (`hot_block` / `normal_block`),
-        // branches between them, fills the hot path with a
-        // `__relon_jump_to_recorder` call + sentinel return, and
-        // leaves the builder positioned on `normal_block` so the rest
-        // of the entry codegen flows unchanged.
-        if let Some(fn_id) = sandbox.trace_jit_fn_id {
-            emit_hot_counter_inject(&mut builder, pointer_ty, entry_shape, fn_id, &arg_values);
-        }
 
         // v5-γ stage 2: import the capability vtable as a GlobalValue
         // on the current function. Every host-helper call indirects

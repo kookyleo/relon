@@ -106,7 +106,6 @@ fn cache_preserves_sandbox_config_flags() {
             deadline_check: false,
             capability_check: true,
             div_check: false,
-            trace_jit_fn_id: None,
         },
     };
     let bytes = serialize_cache(&entry).expect("serialize");

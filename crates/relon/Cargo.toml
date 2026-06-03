@@ -46,17 +46,6 @@ relon-codegen-cranelift = { workspace = true, optional = true }
 # feature). Pulled in only when the host has LLVM 18 dev headers on
 # the build box — see the feature comment above.
 relon-codegen-llvm = { workspace = true, optional = true }
-# v6-δ M2-A: stack-based bytecode VM as a third evaluator backend.
-# Always-on (no feature gate) because the crate has no native-only
-# dependencies and the wasm32 build needs it for `Backend::Bytecode`
-# regression coverage.
-relon-bytecode = { workspace = true }
-# JitEvaluator tier escalation (open follow-up #1) re-lowers the same
-# source the bytecode tier consumed so it can hand the IR op stream
-# to the trace recorder via `register_recording`. The crate-level
-# dep stays unconditional (no native-only items pulled in); the
-# actual trace install path is gated behind `cranelift-aot`.
-relon-ir = { workspace = true }
 relon-eval-api = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

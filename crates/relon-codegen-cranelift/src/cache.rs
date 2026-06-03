@@ -53,13 +53,6 @@ fn unpack_sandbox(bits: u32) -> SandboxConfig {
         deadline_check: (bits & 0b0010) != 0,
         capability_check: (bits & 0b0100) != 0,
         div_check: (bits & 0b1000) != 0,
-        // v6-γ M2: not persisted — trace JIT injection is a per-run
-        // decision tied to the live evaluator's HotCounter table. The
-        // cache restore path resets this to `None` so cached modules
-        // never accidentally enable tracing on a host that disabled
-        // it; hosts that want tracing re-set the flag before invoking
-        // the codegen path.
-        trace_jit_fn_id: None,
     }
 }
 

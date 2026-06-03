@@ -60,7 +60,6 @@ use relon::{new_evaluator, Backend, BackendError};
 use relon_eval_api::{Evaluator, RuntimeError, Value};
 
 pub mod corpus;
-pub mod four_way;
 pub mod three_way;
 
 /// Backend tier identifiers used by the corpus support-claim ratchet.
@@ -122,12 +121,10 @@ impl std::fmt::Display for RatchetViolation {
 }
 
 /// Ratchet utilities — turn the soft-pass variants of [`DiffOutcome`]
-/// / [`three_way::ThreeWayResult`] / [`four_way::FourWayResult`] into
-/// hard failures when a backend in `claim` claimed to support the
-/// case but bounced anyway.
+/// / [`three_way::ThreeWayResult`] into hard failures when a backend
+/// in `claim` claimed to support the case but bounced anyway.
 pub mod ratchet {
     use super::{BackendKind, DiffOutcome, RatchetViolation};
-    use crate::four_way::FourWayResult;
     use crate::three_way::ThreeWayResult;
 
     /// True iff `claim` lists `backend` as a supporter for the case.
@@ -230,65 +227,6 @@ pub mod ratchet {
         }
     }
 
-    /// Validate a four-way [`FourWayResult`] against the claim list.
-    /// Walks the embedded three-way result first, then the bytecode
-    /// claim.
-    pub fn check_four_way(
-        case_name: &str,
-        outcome: &FourWayResult,
-        claim: &[BackendKind],
-    ) -> Vec<RatchetViolation> {
-        let mut out = Vec::new();
-        match outcome {
-            FourWayResult::AllAgree(_) | FourWayResult::AllTrap => {}
-            FourWayResult::BytecodeMatchesBaseline {
-                trace_skip_reason, ..
-            } => {
-                // Bytecode produced the right value but the trace-JIT
-                // / cranelift path bounced. The reason string carries
-                // which tier soft-passed; we surface a ratchet
-                // violation only when *that* tier is in `claim`.
-                // Heuristic: parse the reason prefix.
-                if trace_skip_reason.starts_with("cranelift_unsupported")
-                    && claims(claim, BackendKind::CraneliftAot)
-                {
-                    out.push(make_violation(
-                        case_name,
-                        BackendKind::CraneliftAot,
-                        trace_skip_reason,
-                    ));
-                } else if trace_skip_reason.starts_with("tree_walk_missing_stdlib_surface")
-                    && claims(claim, BackendKind::TreeWalk)
-                {
-                    out.push(make_violation(
-                        case_name,
-                        BackendKind::TreeWalk,
-                        trace_skip_reason,
-                    ));
-                } else if claims(claim, BackendKind::TraceJit) {
-                    // Generic "trace-JIT skipped" branch.
-                    out.push(make_violation(
-                        case_name,
-                        BackendKind::TraceJit,
-                        trace_skip_reason,
-                    ));
-                }
-            }
-            FourWayResult::BytecodeUnsupported { baseline, reason } => {
-                if claims(claim, BackendKind::Bytecode) {
-                    out.push(make_violation(case_name, BackendKind::Bytecode, reason));
-                }
-                // Plus whatever the embedded three-way says.
-                if let Some(v) = check_three_way(case_name, baseline, claim) {
-                    out.push(v);
-                }
-            }
-            FourWayResult::Mismatch { .. } => {
-                // Mismatch handled by the driver's hard assertion.
-            }
-        }
-        out
-    }
 }
 
 /// Outcome of one differential test run.
