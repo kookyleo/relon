@@ -79,7 +79,6 @@ relon-eval-api = { path = "crates/relon-eval-api", version = "0.1.0" }
 relon-evaluator = { path = "crates/relon-evaluator", version = "0.1.0" }
 relon-fmt = { path = "crates/relon-fmt", version = "0.1.0" }
 relon-ir = { path = "crates/relon-ir", version = "0.1.0" }
-relon-bytecode = { path = "crates/relon-bytecode", version = "0.1.0" }
 relon-codegen-cranelift = { path = "crates/relon-codegen-cranelift", version = "0.1.0" }
 # Phase A bootstrap: LLVM-backed AOT backend (inkwell + llvm-sys 18.1
 # pinned to the system LLVM 18.1.3 install). Lives in a separate
@@ -89,10 +88,6 @@ relon-codegen-cranelift = { path = "crates/relon-codegen-cranelift", version = "
 relon-codegen-llvm = { path = "crates/relon-codegen-llvm", version = "0.1.0" }
 relon-object-cache = { path = "crates/relon-object-cache", version = "0.1.0" }
 relon-object-link = { path = "crates/relon-object-link", version = "0.1.0" }
-relon-trace-abi = { path = "crates/relon-trace-abi", version = "0.1.0" }
-relon-trace-jit = { path = "crates/relon-trace-jit", version = "0.1.0" }
-relon-trace-recorder = { path = "crates/relon-trace-recorder", version = "0.1.0" }
-relon-trace-emitter = { path = "crates/relon-trace-emitter", version = "0.1.0" }
 relon-lsp = { path = "crates/relon-lsp", version = "0.1.0" }
 relon-wasm-bindings = { path = "crates/relon-wasm-bindings", version = "0.1.0" }
 # Phase Z (2026-05-28): WASM canonical lowered form. New `relon-codegen-wasm`

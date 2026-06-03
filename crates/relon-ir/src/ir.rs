@@ -427,11 +427,9 @@ pub enum Op {
         /// FxHash fingerprint of the dict's key set. **Producers MUST
         /// derive this via [`crate::shape_hash::shape_hash_for_keys`]**
         /// — the helper routes through the canonical FxHash impl in
-        /// `relon-trace-abi::hash::fx_hash_bytes`, which is the same
-        /// function `relon_trace_jit::runtime::dict_list` calls at
-        /// dispatch time to compute the runtime key's hash. Any
-        /// independent re-implementation of the algorithm would
-        /// silently turn every IC lookup into a miss.
+        /// [`crate::shape_hash::fx_hash_bytes`]. Any independent
+        /// re-implementation of the algorithm would silently turn every
+        /// keyed lookup into a miss.
         ///
         /// Carried inline so the recorder can stamp it onto the
         /// resulting `TraceOp::DictLookup`'s IC slot without
@@ -1519,17 +1517,15 @@ pub enum TrapKind {
     InvalidUtf8,
 }
 
-/// v5-β-2 + v6-γ trace JIT hook: per-Op effect classification.
+/// Per-Op effect classification.
 ///
-/// Re-exported from [`relon_trace_abi::EffectClass`] — single source
-/// of truth for the IR side, the recorder, and the runtime. Each
-/// `Op` variant returns one of these so the v6-γ trace recorder can
-/// decide whether to keep recording, ABORT the trace, or schedule a
-/// side-effect replay in the deopt path. The classification is
-/// conservative: when uncertain, surface the stricter class (a
-/// `Pure` op miscategorised as `Unrecoverable` only loses
-/// optimization opportunity; the reverse risks correctness).
-pub use relon_trace_abi::EffectClass;
+/// Re-exported from [`crate::effect::EffectClass`]. Each `Op` variant
+/// returns one of these so const-folding / dead-store passes can decide
+/// what they may legally fold, reorder, or elide. The classification is
+/// conservative: when uncertain, surface the stricter class (a `Pure`
+/// op miscategorised as `Unrecoverable` only loses optimization
+/// opportunity; the reverse risks correctness).
+pub use crate::effect::EffectClass;
 
 impl Op {
     /// Return the [`EffectClass`] of this op. Conservative when in

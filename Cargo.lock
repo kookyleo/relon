@@ -75,12 +75,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arrayvec"
-version = "0.7.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
-
-[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1956,20 +1950,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "relon-bytecode"
-version = "0.1.0"
-dependencies = [
- "ordered-float",
- "relon-analyzer",
- "relon-eval-api",
- "relon-evaluator",
- "relon-ir",
- "relon-parser",
- "relon-trace-abi",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "relon-cap"
 version = "0.1.0"
 
@@ -2106,7 +2086,6 @@ dependencies = [
  "relon-analyzer",
  "relon-eval-api",
  "relon-parser",
- "relon-trace-abi",
  "thiserror 2.0.18",
 ]
 
@@ -2223,49 +2202,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
-]
-
-[[package]]
-name = "relon-trace-abi"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "serde",
-]
-
-[[package]]
-name = "relon-trace-emitter"
-version = "0.1.0"
-dependencies = [
- "cranelift-codegen",
- "cranelift-frontend",
- "relon-trace-abi",
- "relon-trace-jit",
- "rustc-hash 1.1.0",
-]
-
-[[package]]
-name = "relon-trace-jit"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "proptest",
- "relon-trace-abi",
- "rustc-hash 1.1.0",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "relon-trace-recorder"
-version = "0.1.0"
-dependencies = [
- "arrayvec",
- "ordered-float",
- "relon-eval-api",
- "relon-ir",
- "relon-trace-jit",
- "rustc-hash 1.1.0",
 ]
 
 [[package]]
