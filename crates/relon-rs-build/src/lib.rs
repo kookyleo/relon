@@ -477,27 +477,22 @@ fn render_one_buffer(out: &mut String, m: &BindingModule) {
     let mut arg_value_exprs: Vec<String> = Vec::with_capacity(m.main_fields.len());
     for f in &m.main_fields {
         let pname = sanitize_param(&f.name);
-        let (rust_ty, arg_expr) = match f.ty {
-            EmittedFieldType::Int => ("i64", format!("ArgValue::Int({pname})")),
-            EmittedFieldType::Bool => ("bool", format!("ArgValue::Bool({pname})")),
-            EmittedFieldType::Null => ("()", "ArgValue::Null".to_string()),
-            EmittedFieldType::String => ("&str", format!("ArgValue::String({pname})")),
-        };
-        rust_params.push(format!("{pname}: {rust_ty}"));
-        arg_value_exprs.push(arg_expr);
+        let map = rust_type_for(f.ty);
+        rust_params.push(format!("{pname}: {}", map.arg_rust_ty));
+        arg_value_exprs.push((map.arg_value_expr)(&pname));
     }
 
     // Return type: under Phase 2 the buffer wrapper always boxes the
     // return into a single-field `Ret { value: T }`. We surface T
-    // directly to the caller.
-    let return_field = m.return_fields.first();
-    let (rust_ret_ty, ret_match_arm) = match return_field.map(|f| f.ty) {
-        Some(EmittedFieldType::Int) => ("i64", "RetValue::Int(v) => v"),
-        Some(EmittedFieldType::Bool) => ("bool", "RetValue::Bool(v) => v"),
-        Some(EmittedFieldType::Null) => ("()", "RetValue::Null => ()"),
-        Some(EmittedFieldType::String) => ("String", "RetValue::String(v) => v"),
-        None => ("()", "RetValue::Null => ()"),
-    };
+    // directly to the caller. A `None` return (no return field) maps to
+    // the same shape as a `Null` slot.
+    let return_map = m
+        .return_fields
+        .first()
+        .map(|f| rust_type_for(f.ty))
+        .unwrap_or_else(|| rust_type_for(EmittedFieldType::Null));
+    let rust_ret_ty = return_map.ret_rust_ty;
+    let ret_match_arm = return_map.ret_match_arm;
 
     let main_fields_lit = render_field_slice(&m.main_fields);
     let return_fields_lit = render_field_slice(&m.return_fields);
@@ -594,21 +589,77 @@ fn render_one_buffer(out: &mut String, m: &BindingModule) {
 fn render_field_slice(fields: &[EmittedField]) -> String {
     let mut out = String::from("[\n");
     for f in fields {
-        let ty = match f.ty {
-            EmittedFieldType::Int => "EmittedFieldType::Int",
-            EmittedFieldType::Bool => "EmittedFieldType::Bool",
-            EmittedFieldType::Null => "EmittedFieldType::Null",
-            EmittedFieldType::String => "EmittedFieldType::String",
-        };
         out.push_str(&format!(
             "        EmittedField {{ name: {name:?}, offset: {offset}, ty: {ty} }},\n",
             name = f.name,
             offset = f.offset,
-            ty = ty,
+            ty = rust_type_for(f.ty).tag_path,
         ));
     }
     out.push_str("    ]");
     out
+}
+
+/// Per-variant Rust-side projection of one [`EmittedFieldType`] tag —
+/// the build-generator end of the three-crate marshalling triple.
+///
+/// Gathers everything the binding generator needs for a single leaf
+/// type in one place: the `EmittedFieldType::*` literal path, the Rust
+/// parameter / return surface types, and the `ArgValue` / `RetValue`
+/// glue. See `relon_codegen_llvm::EmittedFieldType`'s docs for the
+/// master triple contract.
+struct RustTypeMap {
+    /// `EmittedFieldType::*` literal path stamped into the generated
+    /// `static MAIN_FIELDS` / `RETURN_FIELDS` slices.
+    tag_path: &'static str,
+    /// Rust type for a `#main` parameter of this leaf type.
+    arg_rust_ty: &'static str,
+    /// Builds the `ArgValue::*` constructor expression for a given
+    /// (already-sanitised) parameter name.
+    arg_value_expr: fn(&str) -> String,
+    /// Rust type the `#main` return slot surfaces to the caller.
+    ret_rust_ty: &'static str,
+    /// `match` arm decoding the `RetValue::*` payload back to
+    /// `ret_rust_ty`.
+    ret_match_arm: &'static str,
+}
+
+/// Table mapping one [`EmittedFieldType`] tag to its Rust-side
+/// projection. To widen the AOT signature surface (Float / List lanes),
+/// add the matching arm here — the exhaustive `match` makes a new
+/// codegen-llvm variant a compile error until this table is extended.
+fn rust_type_for(ty: EmittedFieldType) -> RustTypeMap {
+    match ty {
+        EmittedFieldType::Int => RustTypeMap {
+            tag_path: "EmittedFieldType::Int",
+            arg_rust_ty: "i64",
+            arg_value_expr: |p| format!("ArgValue::Int({p})"),
+            ret_rust_ty: "i64",
+            ret_match_arm: "RetValue::Int(v) => v",
+        },
+        EmittedFieldType::Bool => RustTypeMap {
+            tag_path: "EmittedFieldType::Bool",
+            arg_rust_ty: "bool",
+            arg_value_expr: |p| format!("ArgValue::Bool({p})"),
+            ret_rust_ty: "bool",
+            ret_match_arm: "RetValue::Bool(v) => v",
+        },
+        EmittedFieldType::Null => RustTypeMap {
+            tag_path: "EmittedFieldType::Null",
+            arg_rust_ty: "()",
+            arg_value_expr: |_p| "ArgValue::Null".to_string(),
+            ret_rust_ty: "()",
+            ret_match_arm: "RetValue::Null => ()",
+        },
+        EmittedFieldType::String => RustTypeMap {
+            tag_path: "EmittedFieldType::String",
+            arg_rust_ty: "&str",
+            arg_value_expr: |p| format!("ArgValue::String({p})"),
+            ret_rust_ty: "String",
+            ret_match_arm: "RetValue::String(v) => v",
+        },
+        // ----- add new leaf type row above this line -----
+    }
 }
 
 /// Render a `&[u8]` literal for the const-pool blob. Uses a hex-escape
