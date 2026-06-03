@@ -239,7 +239,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 | IrType::ListBool
                 | IrType::ListString
                 | IrType::ListSchema
-                | IrType::Closure => 32,
+                | IrType::Closure
+                | IrType::Dict => 32,
             };
             let have_width = v.get_type().get_bit_width();
             let final_v = if have_width == want_width {

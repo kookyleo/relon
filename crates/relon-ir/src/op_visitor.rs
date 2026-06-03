@@ -83,6 +83,13 @@ pub trait OpVisitor {
         idx: u32,
         elements: &[String],
     ) -> Result<Self::Output, Self::Error>;
+    /// W5-P1: const `{String -> Int}` dict record. `entries` is in
+    /// source declaration order; the layout pass sorts by key bytes.
+    fn visit_const_dict(
+        &mut self,
+        idx: u32,
+        entries: &[(String, i64)],
+    ) -> Result<Self::Output, Self::Error>;
 
     // Locals + let-locals.
     fn visit_local_get(&mut self, idx: u32) -> Result<Self::Output, Self::Error>;
@@ -280,6 +287,7 @@ pub fn walk_op<V: OpVisitor>(op: &Op, visitor: &mut V) -> Result<V::Output, V::E
         Op::ConstListFloat { idx, elements } => visitor.visit_const_list_float(*idx, elements),
         Op::ConstListBool { idx, elements } => visitor.visit_const_list_bool(*idx, elements),
         Op::ConstListString { idx, elements } => visitor.visit_const_list_string(*idx, elements),
+        Op::ConstDict { idx, entries } => visitor.visit_const_dict(*idx, entries),
         Op::LocalGet(idx) => visitor.visit_local_get(*idx),
         Op::LetGet { idx, ty } => visitor.visit_let_get(*idx, *ty),
         Op::LetSet { idx, ty } => visitor.visit_let_set(*idx, *ty),
@@ -474,6 +482,11 @@ mod tests {
         fn visit_const_list_string(&mut self, _: u32, _: &[String]) -> Result<(), ()> {
             self.calls += 1;
             self.last = "ConstListString";
+            Ok(())
+        }
+        fn visit_const_dict(&mut self, _: u32, _: &[(String, i64)]) -> Result<(), ()> {
+            self.calls += 1;
+            self.last = "ConstDict";
             Ok(())
         }
         fn visit_local_get(&mut self, _: u32) -> Result<(), ()> {

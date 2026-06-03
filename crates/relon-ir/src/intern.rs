@@ -68,6 +68,8 @@ pub struct ConstInternTables {
     pub list_float_next: u32,
     pub list_bool_next: u32,
     pub list_string_next: u32,
+    /// W5-P1: next idx to mint for an `Op::ConstDict` record.
+    pub dict_next: u32,
 }
 
 impl ConstInternTables {
@@ -100,6 +102,12 @@ impl ConstInternTables {
     pub fn alloc_list_string_idx(&mut self) -> u32 {
         let idx = self.list_string_next;
         self.list_string_next += 1;
+        idx
+    }
+    /// W5-P1: mint a fresh module-unique idx for an `Op::ConstDict`.
+    pub fn alloc_dict_idx(&mut self) -> u32 {
+        let idx = self.dict_next;
+        self.dict_next += 1;
         idx
     }
 }

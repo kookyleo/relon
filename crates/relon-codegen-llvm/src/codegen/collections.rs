@@ -424,7 +424,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             | IrType::ListBool
             | IrType::ListString
             | IrType::ListSchema
-            | IrType::Closure => {
+            | IrType::Closure
+            | IrType::Dict => {
                 self.builder
                     .build_store(addr, value)
                     .map_err(|e| LlvmError::Codegen(format!("StoreFieldAtRecord I32: {e}")))?;

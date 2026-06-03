@@ -783,7 +783,8 @@ fn ir_ty_to_wasm_param_valtype(ty: IrType) -> Result<ValType, LowerError> {
         | IrType::ListFloat
         | IrType::ListBool
         | IrType::ListString
-        | IrType::ListSchema => Ok(ValType::I32),
+        | IrType::ListSchema
+        | IrType::Dict => Ok(ValType::I32),
     }
 }
 
@@ -1752,6 +1753,17 @@ impl<'a> EmitState<'a> {
                     UnsupportedOpReason::DictReturn,
                 ));
             }
+            // W5-P1: dict-value construction is materialised on the
+            // compiled-AOT path (cranelift const pool). The legacy
+            // wasm IR walker does not lay down arena dict records, so
+            // it scope-cuts here — w5 stays on the tree-walker until
+            // the P4 collapse, matching the existing scope-cut surface.
+            Op::ConstDict { .. } => {
+                return Err(LowerError::UnsupportedOp(
+                    "const_dict",
+                    UnsupportedOpReason::DictReturn,
+                ));
+            }
 
             // ----- Z.4.3 — Closure-as-value construction -------------
             //
@@ -1894,7 +1906,8 @@ impl<'a> EmitState<'a> {
                             | IrType::ListBool
                             | IrType::ListString
                             | IrType::ListSchema
-                            | IrType::Closure => {
+                            | IrType::Closure
+                            | IrType::Dict => {
                                 self.insns.push(I::I32Store(MemArg {
                                     offset: u64::from(cap.offset),
                                     align: 2,
@@ -2226,7 +2239,8 @@ impl<'a> EmitState<'a> {
                     | IrType::ListFloat
                     | IrType::ListBool
                     | IrType::ListString
-                    | IrType::ListSchema => ValType::I32,
+                    | IrType::ListSchema
+                    | IrType::Dict => ValType::I32,
                 },
                 AuxLocal::RecordBase => ValType::I32,
                 AuxLocal::ScratchI64 => ValType::I64,
@@ -2242,7 +2256,8 @@ impl<'a> EmitState<'a> {
                     | IrType::ListFloat
                     | IrType::ListBool
                     | IrType::ListString
-                    | IrType::ListSchema => ValType::I32,
+                    | IrType::ListSchema
+                    | IrType::Dict => ValType::I32,
                 },
             };
             push_group(vt, &mut groups);

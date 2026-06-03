@@ -103,6 +103,18 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         unsupported("ConstListString")
     }
 
+    fn visit_const_dict(
+        &mut self,
+        idx: u32,
+        _entries: &[(String, i64)],
+    ) -> Result<(), CraneliftError> {
+        // W5-P1: push the arena-relative pointer to the dict record the
+        // const pool laid out for this idx. The construction is value-
+        // only here; the read half (`DictGetByStringKey`) lands in P3.
+        self.emit_const_value(idx, ConstValueKind::Dict)?;
+        Ok(())
+    }
+
     // Locals + let-locals.
     fn visit_local_get(&mut self, idx: u32) -> Result<(), CraneliftError> {
         let v = self.get_local(idx)?;
