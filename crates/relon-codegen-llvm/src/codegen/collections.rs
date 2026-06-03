@@ -20,16 +20,12 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// Dispatched from `super::lower_op`. The record-local ops
     /// (`AllocSubRecord` / `PushRecordBase` /
     /// `EmitTailRecordFromAbsoluteAddr`) are ported from
-    /// `relon-codegen-cranelift`'s `record.rs`. The const-list and
-    /// subscript arms stay `unsupported`:
+    /// `relon-codegen-cranelift`'s `record.rs`. The `ConstList*` scalar
+    /// arms resolve a const-pool offset (laid out by
+    /// [`super::ConstPool`]) and push it as an `i32` — mirroring
+    /// cranelift's `const_pool_emit::emit_const_value`. The remaining
+    /// arms stay `unsupported`:
     ///
-    /// * `ConstListInt` / `ConstListFloat` / `ConstListBool` need a
-    ///   per-list byte-layout + `idx -> offset` map on the shared
-    ///   [`super::ConstPool`] (mirroring cranelift's
-    ///   `list_int_offsets` / `list_float_offsets` / `list_bool_offsets`).
-    ///   The LLVM-side `ConstPool` in `mod.rs` only carries
-    ///   `string_offsets`; widening it is a cross-family change the
-    ///   integration phase owns.
     /// * `ConstListString` is unsupported on the cranelift golden side
     ///   too (pointer-array materialisation is not wired anywhere yet).
     /// * `ListGetByIntIdx` / `DictGetByStringKey` are unsupported on
@@ -42,6 +38,9 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         op: &Op,
     ) -> Result<(), LlvmError> {
         match op {
+            Op::ConstListInt { idx, .. } => self.emit_const_list(*idx, IrType::ListInt),
+            Op::ConstListFloat { idx, .. } => self.emit_const_list(*idx, IrType::ListFloat),
+            Op::ConstListBool { idx, .. } => self.emit_const_list(*idx, IrType::ListBool),
             Op::AllocSubRecord {
                 record_local_idx,
                 root_size,
@@ -57,6 +56,35 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 "unsupported op (Phase 0b collections seam): {op:?} at ip={ip}"
             ))),
         }
+    }
+
+    /// Lower `Op::ConstListInt` / `ConstListFloat` / `ConstListBool`.
+    /// Resolves the record's byte offset (laid out by
+    /// [`super::ConstPool`] when the module was scanned), materialises
+    /// it as an `i32` const, and pushes it as the matching `List*`
+    /// stack value — the buffer-relative address the host's arena-
+    /// prefix copy resolves at runtime. Mirrors cranelift's
+    /// `const_pool_emit::emit_const_value`.
+    fn emit_const_list(&mut self, idx: u32, ty: IrType) -> Result<(), LlvmError> {
+        let (offset, label) = match ty {
+            IrType::ListInt => (self.const_pool.list_int_offsets.get(&idx), "ConstListInt"),
+            IrType::ListFloat => (
+                self.const_pool.list_float_offsets.get(&idx),
+                "ConstListFloat",
+            ),
+            IrType::ListBool => (self.const_pool.list_bool_offsets.get(&idx), "ConstListBool"),
+            other => {
+                return Err(LlvmError::Codegen(format!(
+                    "emit_const_list: unexpected list type {other:?}"
+                )));
+            }
+        };
+        let off = offset.copied().ok_or_else(|| {
+            LlvmError::Codegen(format!("{label} idx {idx} not in pre-computed const pool"))
+        })?;
+        let c = self.ctx.i32_type().const_int(u64::from(off), false);
+        self.push(c, ty);
+        Ok(())
     }
 
     /// Resolve / create the i32 alloca backing an
