@@ -52,6 +52,10 @@ pub(super) struct ConstPool {
     pub(super) list_float_offsets: HashMap<u32, u32>,
     /// List<Bool> pool.
     pub(super) list_bool_offsets: HashMap<u32, u32>,
+    /// W5-P2: List<String> pointer-array pool. Maps each
+    /// `Op::ConstListString` `idx` to the byte offset of its header
+    /// record (`[len: u32][off_i: u32]...`).
+    pub(super) list_string_offsets: HashMap<u32, u32>,
     /// W5-P1: `{String -> Int}` dict pool. Maps each `Op::ConstDict`
     /// `idx` to the byte offset of its arena dict record.
     pub(super) dict_offsets: HashMap<u32, u32>,
@@ -449,12 +453,56 @@ impl OpVisitor for ConstPool {
     fn visit_const_f64(&mut self, _: OrderedFloat<f64>) -> Result<(), CraneliftError> {
         Ok(())
     }
-    fn visit_const_list_string(&mut self, _: u32, _: &[String]) -> Result<(), CraneliftError> {
-        // The IR carries this variant but the cranelift backend has
-        // not yet wired pointer-array materialisation into the const
-        // pool. Stays a no-op until pointer-array support widens
-        // (mirrors the pre-OpVisitor behaviour where the legacy
-        // `match` skipped the variant via the catch-all arm).
+    fn visit_const_list_string(
+        &mut self,
+        idx: u32,
+        elements: &[String],
+    ) -> Result<(), CraneliftError> {
+        if self.list_string_offsets.contains_key(&idx) {
+            return Ok(());
+        }
+        // W5-P2 pointer-array record. Two-part layout, both 4-aligned:
+        //
+        //   1. Each element's String record `[slen: u32 LE][utf8]` is
+        //      emitted first, in element order. Its arena-relative byte
+        //      offset is captured.
+        //   2. The header `[len: u32 LE][off_0: u32 LE]...[off_{N-1}:
+        //      u32 LE]` is emitted afterwards; each `off_i` is the
+        //      arena-relative offset of String record `i` captured in
+        //      step 1 (the same handle representation `ConstString`
+        //      pushes). `idx -> header offset` is the value the
+        //      `Op::ConstListString` push resolves to.
+        //
+        // Indexing (`keys[i]`) loads `off_i` from `header + 4 + i*4` —
+        // a ready-made String handle. The String records sit BEFORE the
+        // header so a `keys[i]` consumer never reads past the header
+        // into payload it didn't ask for.
+        self.align_to(4);
+        let mut str_offsets: Vec<u32> = Vec::with_capacity(elements.len());
+        for s in elements {
+            self.align_to(4);
+            let s_off = u32::try_from(self.bytes.len()).map_err(|_| {
+                CraneliftError::Codegen("ConstListString string offset exceeds u32".into())
+            })?;
+            let slen = u32::try_from(s.len()).map_err(|_| {
+                CraneliftError::Codegen("ConstListString element length exceeds u32".into())
+            })?;
+            self.bytes.extend_from_slice(&slen.to_le_bytes());
+            self.bytes.extend_from_slice(s.as_bytes());
+            str_offsets.push(s_off);
+        }
+        self.align_to(4);
+        let header_off = u32::try_from(self.bytes.len()).map_err(|_| {
+            CraneliftError::Codegen("ConstListString header offset exceeds u32".into())
+        })?;
+        let len = u32::try_from(elements.len()).map_err(|_| {
+            CraneliftError::Codegen("ConstListString length exceeds u32".into())
+        })?;
+        self.bytes.extend_from_slice(&len.to_le_bytes());
+        for off in &str_offsets {
+            self.bytes.extend_from_slice(&off.to_le_bytes());
+        }
+        self.list_string_offsets.insert(idx, header_off);
         Ok(())
     }
     fn visit_const_dict(
@@ -892,6 +940,60 @@ mod tests {
                 u32::from_le_bytes(b[entry_base + 4..entry_base + 8].try_into().unwrap()) as usize;
             assert_eq!(&b[off..off + len], k.as_bytes(), "key {i} payload slice");
         }
+    }
+
+    /// W5-P2 wire-format gate: pin the exact arena byte layout of a
+    /// `List<String>` pointer-array record. MUST stay byte-identical to
+    /// the LLVM side's `const_list_string_byte_layout` (cross-backend
+    /// arena data contract — both pools copy the same blob into the
+    /// arena prefix; a drift on either side silently corrupts the
+    /// other's cached ET_REL). The element String records sit first
+    /// (4-aligned), then the `[len][off_i...]` header whose `off_i` is
+    /// the arena-relative offset of String record `i`.
+    #[test]
+    fn const_list_string_pointer_array_is_byte_exact() {
+        let module = synth_module(vec![tagged(Op::ConstListString {
+            idx: 0,
+            elements: vec!["a".into(), "bb".into(), "ccc".into()],
+        })]);
+        let pool = ConstPool::from_module(&module).unwrap();
+        let b = &pool.bytes;
+        // String record "a" at offset 0: [slen=1]["a"], pad to 8.
+        assert_eq!(&b[0..4], &1u32.to_le_bytes());
+        assert_eq!(&b[4..5], b"a");
+        // "bb" at offset 8: [slen=2]["bb"], pad to 16.
+        assert_eq!(&b[8..12], &2u32.to_le_bytes());
+        assert_eq!(&b[12..14], b"bb");
+        // "ccc" at offset 16: [slen=3]["ccc"], pad to 24.
+        assert_eq!(&b[16..20], &3u32.to_le_bytes());
+        assert_eq!(&b[20..23], b"ccc");
+        // Header at offset 24: [len=3][off_0=0][off_1=8][off_2=16].
+        assert_eq!(pool.list_string_offsets.get(&0).copied(), Some(24));
+        assert_eq!(&b[24..28], &3u32.to_le_bytes());
+        assert_eq!(&b[28..32], &0u32.to_le_bytes());
+        assert_eq!(&b[32..36], &8u32.to_le_bytes());
+        assert_eq!(&b[36..40], &16u32.to_le_bytes());
+        assert_eq!(b.len(), 40);
+    }
+
+    /// W5-P2: duplicate `ConstListString` idx is a no-op (idempotent
+    /// layout, mirroring the other const-list guards).
+    #[test]
+    fn duplicate_const_list_string_idx_does_not_grow_pool() {
+        let module = synth_module(vec![
+            tagged(Op::ConstListString {
+                idx: 0,
+                elements: vec!["x".into()],
+            }),
+            tagged(Op::ConstListString {
+                idx: 0,
+                elements: vec!["x".into()],
+            }),
+        ]);
+        let pool = ConstPool::from_module(&module).unwrap();
+        // String record "x": 4 + 1 = 5, pad to 8; header [len=1][off=0]
+        // = 8 bytes → total 16, laid once.
+        assert_eq!(pool.bytes.len(), 16);
     }
 
     /// W5-P1: duplicate `ConstDict` idx is a no-op (idempotent layout,

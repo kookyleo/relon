@@ -2094,14 +2094,23 @@ pub(super) fn emit_list_int_literal_materialize(
     Ok(())
 }
 
-/// `true` when the list literal's elements are NOT all simple Float /
-/// Int literals — i.e. at least one element is a computed expression
-/// (the W20 `step(s)` body), so it must be materialised at runtime
-/// rather than interned as a `ConstListFloat`.
+/// `true` when the list literal's elements are NOT all simple scalar
+/// literals — i.e. at least one element is a computed expression (the
+/// W20 `step(s)` body), so it must be materialised at runtime rather
+/// than interned as a `ConstList*`.
+///
+/// W5-P2: `String` and `Bool` literals are simple constants too —
+/// `["a", "b"]` interns straight into a `ConstListString` record, so
+/// they belong on the non-computed side. Routing them through the
+/// runtime materialiser (which only knows Float / Int) would
+/// mis-reject an all-literal `List<String>` / `List<Bool>`.
 pub(super) fn list_has_computed_element(items: &[Node]) -> bool {
-    items
-        .iter()
-        .any(|n| !matches!(&*n.expr, Expr::Float(_) | Expr::Int(_)))
+    items.iter().any(|n| {
+        !matches!(
+            &*n.expr,
+            Expr::Float(_) | Expr::Int(_) | Expr::String(_) | Expr::Bool(_)
+        )
+    })
 }
 
 /// #359 (W20): speculatively lower `node` against the live ctx, read

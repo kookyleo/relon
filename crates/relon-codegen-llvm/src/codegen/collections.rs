@@ -41,6 +41,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             Op::ConstListInt { idx, .. } => self.emit_const_list(*idx, IrType::ListInt),
             Op::ConstListFloat { idx, .. } => self.emit_const_list(*idx, IrType::ListFloat),
             Op::ConstListBool { idx, .. } => self.emit_const_list(*idx, IrType::ListBool),
+            Op::ConstListString { idx, .. } => self.emit_const_list(*idx, IrType::ListString),
             Op::AllocSubRecord {
                 record_local_idx,
                 root_size,
@@ -58,8 +59,12 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         }
     }
 
-    /// Lower `Op::ConstListInt` / `ConstListFloat` / `ConstListBool`.
-    /// Resolves the record's byte offset (laid out by
+    /// Lower `Op::ConstListInt` / `ConstListFloat` / `ConstListBool` /
+    /// `ConstListString`. For the scalar-element lists the pushed
+    /// `ListInt/Float/Bool` value is the buffer-relative address of the
+    /// `[len][payload]` record; for `ConstListString` it is the address
+    /// of the pointer-array header (`[len][off_i...]`) a `keys[i]`
+    /// consumer indexes. Resolves the record's byte offset (laid out by
     /// [`super::ConstPool`] when the module was scanned), materialises
     /// it as an `i32` const, and pushes it as the matching `List*`
     /// stack value — the buffer-relative address the host's arena-
@@ -73,6 +78,10 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 "ConstListFloat",
             ),
             IrType::ListBool => (self.const_pool.list_bool_offsets.get(&idx), "ConstListBool"),
+            IrType::ListString => (
+                self.const_pool.list_string_offsets.get(&idx),
+                "ConstListString",
+            ),
             other => {
                 return Err(LlvmError::Codegen(format!(
                     "emit_const_list: unexpected list type {other:?}"
