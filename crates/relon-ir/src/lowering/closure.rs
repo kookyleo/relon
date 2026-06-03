@@ -347,7 +347,8 @@ pub(super) fn lower_closure_as_value(
             | IrType::ListBool
             | IrType::ListString
             | IrType::ListSchema
-            | IrType::Closure => inner.out.push(TaggedOp {
+            | IrType::Closure
+            | IrType::Dict => inner.out.push(TaggedOp {
                 op: Op::LoadI32AtAbsolute { offset: *offset },
                 range: lambda_body.range,
             }),

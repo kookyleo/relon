@@ -1082,7 +1082,8 @@ fn ir_ty_to_llvm_abi<'ctx>(ctx: &'ctx Context, ty: IrType) -> Option<BasicTypeEn
         | IrType::ListBool
         | IrType::ListString
         | IrType::ListSchema
-        | IrType::Closure => Some(ctx.i32_type().into()),
+        | IrType::Closure
+        | IrType::Dict => Some(ctx.i32_type().into()),
     }
 }
 
@@ -2277,7 +2278,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             | IrType::ListBool
             | IrType::ListString
             | IrType::ListSchema
-            | IrType::Closure => self.ctx.i32_type().into(),
+            | IrType::Closure
+            | IrType::Dict => self.ctx.i32_type().into(),
         };
         let name = format!("let_{idx}");
         let ptr = self
@@ -2515,7 +2517,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                     | IrType::ListBool
                     | IrType::ListString
                     | IrType::ListSchema
-                    | IrType::Closure => self.ctx.i32_type().into(),
+                    | IrType::Closure
+                    | IrType::Dict => self.ctx.i32_type().into(),
                 };
                 let name = self.next_name("letget");
                 let v = self
@@ -2869,6 +2872,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             | Op::ConstListFloat { .. }
             | Op::ConstListBool { .. }
             | Op::ConstListString { .. }
+            | Op::ConstDict { .. }
             | Op::DictGetByStringKey { .. }
             | Op::ListGetByIntIdx { .. }
             | Op::AllocSubRecord { .. }
@@ -2947,7 +2951,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             | IrType::ListBool
             | IrType::ListString
             | IrType::ListSchema
-            | IrType::Closure => 32,
+            | IrType::Closure
+            | IrType::Dict => 32,
         };
         let have_width = tv.val.get_type().get_bit_width();
         if have_width == want_width {
@@ -3034,7 +3039,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             | IrType::ListBool
             | IrType::ListString
             | IrType::ListSchema
-            | IrType::Closure => Ok(self.ctx.i32_type()),
+            | IrType::Closure
+            | IrType::Dict => Ok(self.ctx.i32_type()),
         }
     }
 

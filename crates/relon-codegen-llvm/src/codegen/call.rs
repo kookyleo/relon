@@ -689,7 +689,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 | IrType::ListBool
                 | IrType::ListString
                 | IrType::ListSchema
-                | IrType::Closure => 32,
+                | IrType::Closure
+                | IrType::Dict => 32,
                 IrType::F64 => {
                     return Err(LlvmError::Codegen(format!(
                         "Op::Call arg #{i}: F64 param not yet supported in Phase E.2"

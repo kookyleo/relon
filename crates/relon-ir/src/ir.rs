@@ -86,6 +86,21 @@ pub enum IrType {
     /// (`xs.map(|x| ...)`) and codegen can route them through
     /// `call_indirect`.
     Closure,
+    /// W5-P1: pointer to an arena-materialised `{String -> Int}` dict
+    /// record. Same wasm-side representation as the other pointer tags
+    /// (an `i32` arena-relative pointer), but tagged separately so the
+    /// lowering / codegen pass can route dict-valued captures (and, in
+    /// W5-P3, `DictGetByStringKey` key probes) onto the dict record
+    /// layout rather than a list / string envelope.
+    ///
+    /// Record layout (see [`crate::ir::Op::ConstDict`]):
+    /// `[entry_count: u32 LE][shape_hash: u64 LE]` header, then an
+    /// `entry_count`-long table of `[key_off: u32 LE][key_len: u32 LE]
+    /// [value: i64 LE]` entries sorted by key bytes, then the
+    /// concatenated UTF-8 key payload (`key_off` is record-relative).
+    /// The sorted entry table + inline key offsets are what the
+    /// W5-P3 static dict-probe will binary-search.
+    Dict,
 }
 
 impl IrType {
@@ -106,7 +121,8 @@ impl IrType {
             | IrType::ListBool
             | IrType::ListString
             | IrType::ListSchema
-            | IrType::Closure => IrType::I32,
+            | IrType::Closure
+            | IrType::Dict => IrType::I32,
         }
     }
 
@@ -343,6 +359,36 @@ pub enum Op {
         /// own data-section record (no dedup with `ConstString`
         /// occurrences in v1, kept simple).
         elements: Vec<String>,
+    },
+    /// W5-P1: push an absolute arena-relative pointer to a constant
+    /// `{String -> Int}` dict record. Stack: `[] -> [Dict]`.
+    ///
+    /// This is the dict-value analog of [`Op::ConstListString`]: the
+    /// dict literal's `{str: int}` entry set is materialised into the
+    /// const-data pool at compile time and the op pushes the record's
+    /// arena-relative address. It is the construction half of the W5
+    /// dict-value surface — `DictGetByStringKey` (the read half) stays
+    /// a separate op and is not emitted by this lowering path in P1.
+    ///
+    /// Record layout produced by the const pool:
+    /// `[entry_count: u32 LE][shape_hash: u64 LE]` header, then an
+    /// `entry_count`-long entry table of
+    /// `[key_off: u32 LE][key_len: u32 LE][value: i64 LE]` (sorted by
+    /// key bytes so the layout is deterministic and the W5-P3 probe can
+    /// binary-search), then the concatenated UTF-8 key bytes
+    /// (`key_off` record-relative). `shape_hash` is the canonical
+    /// [`crate::shape_hash::shape_hash_for_keys`] over the sorted key
+    /// set so a later `DictGetByStringKey` consumer can fingerprint the
+    /// record without re-deriving the algorithm.
+    ConstDict {
+        /// Per-module identifier the codegen layout pass uses to look
+        /// up the record's arena byte offset.
+        idx: u32,
+        /// The `{str: int}` entries in **source declaration order**.
+        /// The const-pool layout sorts a copy by key bytes when it
+        /// materialises the record; the op keeps source order so
+        /// diagnostics and round-trips read naturally.
+        entries: Vec<(String, i64)>,
     },
     /// Push a user-let-binding local. Stack: `[] -> [ty]`.
     ///
@@ -1548,6 +1594,7 @@ impl Op {
             | Op::ConstListFloat { .. }
             | Op::ConstListBool { .. }
             | Op::ConstListString { .. }
+            | Op::ConstDict { .. }
             | Op::LocalGet(_)
             | Op::LetGet { .. }
             | Op::Add(_)

@@ -1106,6 +1106,15 @@ enum AnonDictField {
     /// "host-visible" surface). Stored into the root record at the
     /// matching offset.
     Scalar { name: String, ty: TypeRepr },
+    /// W5-P1: source-level field whose value is a `{str: int}` dict
+    /// literal. Lifted to an internal let-binding (an `IrType::Dict`
+    /// captured local materialised via `Op::ConstDict`); like a
+    /// closure field it contributes no host-visible record slot.
+    /// `entries` are in source declaration order.
+    DictStrInt {
+        name: String,
+        entries: Vec<(String, i64)>,
+    },
 }
 
 /// Try to build an [`AnonDictPlan`] for the entry's body when the
@@ -1188,6 +1197,18 @@ fn anon_dict_return_plan(
                     ret_ty,
                 });
             }
+            Expr::Dict(inner_pairs) => {
+                // W5-P1: a `{str: int}` dict literal becomes a
+                // dict-value internal let-binding. Only the
+                // `{String -> Int}` shape is accepted in P1 — any
+                // other entry shape surfaces UnsupportedExpr so the
+                // edge stays honest (P2/P3 widen value/key types).
+                let entries = classify_anon_dict_str_int_field(inner_pairs, value.range, name)?;
+                fields.push(AnonDictField::DictStrInt {
+                    name: name.clone(),
+                    entries,
+                });
+            }
             _ => {
                 let ty = classify_anon_dict_scalar_field(
                     &value.expr,
@@ -1213,7 +1234,7 @@ fn anon_dict_return_plan(
                 ty: ty.clone(),
                 default: None,
             }),
-            AnonDictField::Closure { .. } => None,
+            AnonDictField::Closure { .. } | AnonDictField::DictStrInt { .. } => None,
         })
         .collect();
     let schema = Schema {
@@ -1269,6 +1290,44 @@ fn classify_anon_dict_scalar_field(
         ),
         range,
     })
+}
+
+/// W5-P1: classify a `{str: int}` dict literal sitting on the RHS of
+/// an anon-Dict-return `#internal` field. Returns the `(key, value)`
+/// entry set in source declaration order when every entry is a
+/// string-key / integer-literal pair; any other entry shape (non-string
+/// key, spread, non-Int value, nested dict) surfaces `UnsupportedExpr`
+/// so the P1 surface stays honest — value/key-type widening is P2/P3.
+fn classify_anon_dict_str_int_field(
+    pairs: &[(TokenKey, Node)],
+    range: TokenRange,
+    field_name: &str,
+) -> Result<Vec<(String, i64)>, LoweringError> {
+    let mut entries: Vec<(String, i64)> = Vec::with_capacity(pairs.len());
+    for (key, value) in pairs {
+        let TokenKey::String(key_name, _, _) = key else {
+            return Err(LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "AnonDictReturn(dict field `{}`: non-string dict key)",
+                    field_name
+                ),
+                range,
+            });
+        };
+        let Expr::Int(v) = &*value.expr else {
+            return Err(LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "AnonDictReturn(dict field `{}`: value for key `{}` is `{}`, only Int literals supported in P1)",
+                    field_name,
+                    key_name,
+                    value.expr.kind()
+                ),
+                range: value.range,
+            });
+        };
+        entries.push((key_name.clone(), *v));
+    }
+    Ok(entries)
 }
 
 fn classify_anon_dict_scalar_field_irt(
@@ -1456,6 +1515,37 @@ fn lower_anon_dict_body(
                         ty: IrType::Closure,
                     },
                     range: value.range,
+                });
+            }
+            AnonDictField::DictStrInt { name, entries } => {
+                // W5-P1: materialise the `{str:int}` dict into the const
+                // pool via `Op::ConstDict` and stash the arena pointer
+                // into a fresh `IrType::Dict` internal let-local. This
+                // is the construction + capture half; the read half
+                // (`DictGetByStringKey`) is a P3 follow-up, so the
+                // let-local is value-only for now.
+                let let_idx = ctx.next_let_idx;
+                ctx.next_let_idx += 1;
+                ctx.lets.push(LetBinding {
+                    name: name.clone(),
+                    idx: let_idx,
+                    ty: IrType::Dict,
+                    schema_brand: None,
+                });
+                let dict_idx = ctx.const_intern.borrow_mut().alloc_dict_idx();
+                ctx.out.push(TaggedOp {
+                    op: Op::ConstDict {
+                        idx: dict_idx,
+                        entries: entries.clone(),
+                    },
+                    range: TokenRange::default(),
+                });
+                ctx.out.push(TaggedOp {
+                    op: Op::LetSet {
+                        idx: let_idx,
+                        ty: IrType::Dict,
+                    },
+                    range: TokenRange::default(),
                 });
             }
             AnonDictField::Scalar { name, ty } => {
@@ -6775,6 +6865,101 @@ mod w7_closure_boundary_tests {
                 "expected LayoutError::UnsupportedTypeInLayoutV1 {{ kind: \"Closure\" }}, got {other:?}"
             ),
         }
+    }
+
+    /// W5-P1 verification: a `{str:int}` dict literal sitting on a
+    /// `#internal` field of an anon-Dict-return body lowers to a
+    /// dict-value capture — `Op::ConstDict` materialising the entry set
+    /// followed by `Op::LetSet { ty: IrType::Dict }` into an internal
+    /// let-local. The dict field contributes no host-visible record
+    /// slot (it is internal, like a lifted closure), so the synthesised
+    /// return schema only carries the `result` scalar.
+    ///
+    /// This is the construction + capture half of the W5 dict-value
+    /// surface. The read half (`DictGetByStringKey`) is a P3 follow-up;
+    /// this `result` field is a plain scalar so the body stays inside
+    /// the P1 envelope (no DictGet).
+    #[test]
+    fn w5p1_dict_value_field_lowers_to_const_dict_let() {
+        let src = "#main(Int n) -> Dict\n\
+                   {\n\
+                     #internal\n\
+                     d: { a: 1, b: 2, c: 3 },\n\
+                     result: n\n\
+                   }";
+        let ast = relon_parser::parse_document(src).expect("parse");
+        let analyzed = relon_analyzer::analyze(&ast);
+        let lowered = lower_workspace_single(&analyzed, &ast)
+            .expect("W5-P1 lowers anon-Dict-return with dict-value field");
+        let module = &lowered.module;
+
+        let entry_idx = module
+            .entry_func_index
+            .expect("W5-P1 builds an entry func");
+        let entry = &module.funcs[entry_idx];
+
+        // Exactly one ConstDict carrying the source-order entries.
+        let const_dicts: Vec<&Vec<(String, i64)>> = entry
+            .body
+            .iter()
+            .filter_map(|t| match &t.op {
+                Op::ConstDict { entries, .. } => Some(entries),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            const_dicts.len(),
+            1,
+            "expected exactly one ConstDict for the `d` dict-value field"
+        );
+        assert_eq!(
+            const_dicts[0],
+            &vec![
+                ("a".to_string(), 1i64),
+                ("b".to_string(), 2i64),
+                ("c".to_string(), 3i64),
+            ],
+            "ConstDict must carry the source-declaration-order entries"
+        );
+
+        // The dict pointer is stashed into a Dict-typed let-local.
+        let dict_let_sets = entry
+            .body
+            .iter()
+            .filter(|t| matches!(t.op, Op::LetSet { ty: IrType::Dict, .. }))
+            .count();
+        assert_eq!(
+            dict_let_sets, 1,
+            "expected one `LetSet {{ ty: Dict }}` capturing the dict value"
+        );
+
+        // `d` is internal — the host-visible return schema carries only
+        // the `result` scalar field.
+        let schema = &lowered.return_schema;
+        assert_eq!(
+            schema.fields.len(),
+            1,
+            "dict-value field must be internal — schema carries only `result`"
+        );
+        assert_eq!(schema.fields[0].name, "result");
+    }
+
+    /// W5-P1 honesty edge: a dict field whose value is not a plain Int
+    /// literal must reject at lowering (value-type widening is P2/P3),
+    /// rather than silently lowering a half-supported shape.
+    #[test]
+    fn w5p1_non_int_dict_value_rejects() {
+        let src = "#main(Int n) -> Dict\n\
+                   {\n\
+                     #internal\n\
+                     d: { a: 1, b: \"two\" },\n\
+                     result: n\n\
+                   }";
+        let err = try_lower(src).expect_err("non-Int dict value must reject in P1");
+        assert!(
+            matches!(err, LoweringError::UnsupportedExpr { .. }),
+            "expected UnsupportedExpr for non-Int dict value, got {err:?}"
+        );
     }
 
     /// AOT-3 verification: a W17-shaped where-bound recursive helper

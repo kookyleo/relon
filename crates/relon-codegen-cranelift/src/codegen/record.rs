@@ -196,7 +196,8 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
             | IrType::ListBool
             | IrType::ListString
             | IrType::ListSchema
-            | IrType::Closure => 4,
+            | IrType::Closure
+            | IrType::Dict => 4,
             IrType::Bool | IrType::Null => 1,
         };
         if self.sandbox.bounds_check {
@@ -236,7 +237,8 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
             | IrType::ListBool
             | IrType::ListString
             | IrType::ListSchema
-            | IrType::Closure => {
+            | IrType::Closure
+            | IrType::Dict => {
                 self.builder
                     .ins()
                     .store(MemFlags::trusted(), value, dest, 0);

@@ -839,7 +839,8 @@ fn ir_ty_to_cl(ty: IrType) -> Result<cranelift_codegen::ir::Type, CraneliftError
         | IrType::ListBool
         | IrType::ListString
         | IrType::ListSchema
-        | IrType::Closure => I32,
+        | IrType::Closure
+        | IrType::Dict => I32,
     })
 }
 
@@ -870,7 +871,8 @@ pub(super) fn field_load_shape(
         | IrType::ListBool
         | IrType::ListString
         | IrType::ListSchema
-        | IrType::Closure => Ok((I32, 4, IrType::I32)),
+        | IrType::Closure
+        | IrType::Dict => Ok((I32, 4, IrType::I32)),
     }
 }
 
