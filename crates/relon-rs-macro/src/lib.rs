@@ -16,6 +16,13 @@
 //! // effective form: pub fn compute(&SandboxState, i64) -> i64 { ... }
 //! ```
 //!
+//! The param / return Rust types follow the source's `#main` signature
+//! — the build.rs generator maps each accepted leaf type (`Int`,
+//! `Float`, `Bool`, `Null`, `String`, `List<Int>`) onto its Rust
+//! surface (`i64`, `f64`, `bool`, `()`, `&str` / `String`, `&[i64]` /
+//! `Vec<i64>`). This macro is signature-agnostic: it only stitches in
+//! the generated bindings file, whatever shape it carries.
+//!
 //! The macro resolves the path to a file stem (or honours the
 //! supplied alias) and emits a single `include!(...)` whose argument
 //! is `concat!(env!("OUT_DIR"), "/relon_rs/<alias>.rs")`. The
