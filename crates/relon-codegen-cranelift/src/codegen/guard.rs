@@ -100,6 +100,22 @@ pub(super) fn make_glob_match_signature(pointer_ty: cranelift_codegen::ir::Type)
     sig
 }
 
+/// Build the cranelift signature for the `RelonCallNative` vtable
+/// slot: `extern "C" fn(state: *const SandboxState, import_idx: i32,
+/// args_ptr: *const i64, arg_count: i32) -> i64`. Dispatches a
+/// source-lowered `Op::CallNative` to the `Arc<dyn RelonFunction>`
+/// registered at `import_idx`; the scalar args are spilled to a stack
+/// slot the codegen passes by address.
+pub(super) fn make_call_native_signature(pointer_ty: cranelift_codegen::ir::Type) -> Signature {
+    let mut sig = Signature::new(CallConv::SystemV);
+    sig.params.push(AbiParam::new(pointer_ty)); // state
+    sig.params.push(AbiParam::new(I32)); // import_idx
+    sig.params.push(AbiParam::new(pointer_ty)); // args_ptr
+    sig.params.push(AbiParam::new(I32)); // arg_count
+    sig.returns.push(AbiParam::new(I64)); // i64-encoded result
+    sig
+}
+
 /// Build the cranelift signature for the libc `fmod` libcall:
 /// `extern "C" fn(a: f64, b: f64) -> f64` (the SysV C ABI). The
 /// cranelift backend has no native float-remainder instruction (x86

@@ -25,7 +25,10 @@ use cranelift_jit::JITModule;
 use relon_eval_api::buffer::{BufferBuilder, BufferError, BufferReader};
 use relon_eval_api::layout::{OffsetTable, SchemaLayout};
 use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
-use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, SmolStr, Thunk, Value};
+use relon_eval_api::{
+    ClosureData, Evaluator, RelonFunction, RuntimeError, Scope, SmolStr, Thunk, Value,
+};
+use relon_ir::ir::NativeImport;
 use relon_parser::{Node, TokenRange};
 
 use crate::cache::CacheEntry;
@@ -237,6 +240,12 @@ pub struct AotEvaluator {
     /// indirect address resolution doesn't dangle.
     #[allow(dead_code)]
     closure_table: Box<[usize]>,
+    /// `#native` imports the lowering pass interned for this module, in
+    /// `import_idx` order. Carried so [`Self::with_host_fns`] can match a
+    /// host-supplied `Arc<dyn RelonFunction>` to the `import_idx` the
+    /// source-lowered `Op::CallNative` references. Empty for legacy
+    /// direct-IR / cache-loaded modules.
+    native_imports: Vec<NativeImport>,
 }
 
 // SAFETY: The JIT-emitted code is reentrant, and `SandboxShared`'s
@@ -636,6 +645,9 @@ impl AotEvaluator {
             buffer_schema,
             const_data: schema_entry.const_data,
             closure_table,
+            // Cache-loaded modules carry no IR import table; host-fn
+            // dispatch from a cached object is out of scope.
+            native_imports: Vec::new(),
         })
     }
 
@@ -929,6 +941,9 @@ impl AotEvaluator {
         param_names: Vec<String>,
         buffer_schema: Option<BufferSchema>,
     ) -> Result<Self, CraneliftError> {
+        // Snapshot the native-import table before the module is consumed
+        // by codegen so `with_host_fns` can map fn names → import_idx.
+        let native_imports = ir.imports.clone();
         // The codegen's tail-cursor protocol needs the return record's
         // fixed-area size up front to seed the cursor past the root.
         // Direct-IR / legacy callers without schema metadata pass 0;
@@ -1049,6 +1064,7 @@ impl AotEvaluator {
             buffer_schema,
             const_data,
             closure_table,
+            native_imports,
         })
     }
 
@@ -1063,6 +1079,51 @@ impl AotEvaluator {
     /// here only affects subsequent dispatches.
     pub fn install_capabilities_mut(&mut self, capabilities: Arc<CapabilityVtable>) {
         self.sandbox_shared.set_capabilities(capabilities);
+    }
+
+    /// The `#native` imports the lowering pass interned for this
+    /// module, in `import_idx` order. Lets a host map fn names to the
+    /// slots [`Self::with_host_fns`] fills.
+    pub fn native_imports(&self) -> &[NativeImport] {
+        &self.native_imports
+    }
+
+    /// Register the host's `Arc<dyn RelonFunction>` callables for
+    /// source-lowered native-fn dispatch. Each entry is keyed by the
+    /// source-level fn name; this matches the name to the `import_idx`
+    /// the lowering pass assigned (via [`Self::native_imports`]) and
+    /// installs the callable in the capability vtable's `import_idx`-
+    /// keyed registry. A source-lowered `Op::CallNative` then dispatches
+    /// to it through the `relon_call_native` helper. Names with no
+    /// matching `#native` import are skipped.
+    ///
+    /// The capability *guard* is enforced independently by the
+    /// `Op::CheckCap` prologue against the grant set via
+    /// [`Self::with_granted_cap`] — registering a callable does not
+    /// grant its capability.
+    pub fn with_host_fns(self, host_fns: &HashMap<String, Arc<dyn RelonFunction>>) -> Self {
+        let mut vt = (*self.sandbox_shared.capabilities_snapshot()).clone();
+        for (idx, imp) in self.native_imports.iter().enumerate() {
+            if let Some(func) = host_fns.get(&imp.name) {
+                vt.register_host_fn(idx as u32, Arc::clone(func));
+            }
+        }
+        self.sandbox_shared.set_capabilities(Arc::new(vt));
+        self
+    }
+
+    /// Grant a capability bit so the source-lowered `Op::CheckCap`
+    /// prologue passes at runtime. Parks a non-null sentinel at the
+    /// bit's vtable slot; the actual dispatch goes through the
+    /// `import_idx`-keyed host-fn registry. Decoupled from the
+    /// analyze-time `caps`: a host can grant statically (build passes
+    /// the reachability check) yet withhold here to exercise a stricter
+    /// runtime posture (the call then traps `CapabilityDenied`).
+    pub fn with_granted_cap(self, bit: u32) -> Self {
+        let mut vt = (*self.sandbox_shared.capabilities_snapshot()).clone();
+        vt.grant(bit);
+        self.sandbox_shared.set_capabilities(Arc::new(vt));
+        self
     }
 
     /// Configure the per-call wall-clock deadline. Pass

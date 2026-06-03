@@ -63,8 +63,9 @@ mod record;
 
 use const_pool::ConstPool;
 use guard::{
-    declare_vtable_data, emit_indirect_host_call, make_cap_lookup_signature, make_fmod_signature,
-    make_glob_match_signature, make_now_signature, make_raise_trap_signature,
+    declare_vtable_data, emit_indirect_host_call, make_call_native_signature,
+    make_cap_lookup_signature, make_fmod_signature, make_glob_match_signature, make_now_signature,
+    make_raise_trap_signature,
 };
 use hot_counter::emit_hot_counter_inject;
 
@@ -475,6 +476,7 @@ fn lower_module_into<M: CrModule>(
     let now_sig = make_now_signature(module.target_config().pointer_type());
     let cap_lookup_sig = make_cap_lookup_signature(module.target_config().pointer_type());
     let glob_match_sig = make_glob_match_signature(module.target_config().pointer_type());
+    let call_native_sig = make_call_native_signature(module.target_config().pointer_type());
 
     // `Op::Mod(IrType::F64)` lowers to a libc `fmod` call — cranelift
     // has no native float-remainder instruction. Declare the external
@@ -609,6 +611,7 @@ fn lower_module_into<M: CrModule>(
         let now_sig_ref = builder.import_signature(now_sig.clone());
         let cap_lookup_sig_ref = builder.import_signature(cap_lookup_sig.clone());
         let glob_match_sig_ref = builder.import_signature(glob_match_sig.clone());
+        let call_native_sig_ref = builder.import_signature(call_native_sig.clone());
         // Import the `fmod` FuncRef into this body so `emit_mod_f64`
         // can emit a direct call. Unreferenced when the body has no
         // `Op::Mod(F64)` — cranelift drops the dead FuncRef and never
@@ -635,6 +638,7 @@ fn lower_module_into<M: CrModule>(
             now_sig_ref,
             cap_lookup_sig_ref,
             glob_match_sig_ref,
+            call_native_sig_ref,
             fmod_func_ref,
             pointer_ty,
             frontend_config: module.target_config(),
@@ -741,6 +745,7 @@ fn lower_module_into<M: CrModule>(
             let now_sig_ref = builder.import_signature(now_sig.clone());
             let cap_lookup_sig_ref = builder.import_signature(cap_lookup_sig.clone());
             let glob_match_sig_ref = builder.import_signature(glob_match_sig.clone());
+            let call_native_sig_ref = builder.import_signature(call_native_sig.clone());
             // Import `fmod` into the lambda body too — a closure
             // predicate (e.g. a `filter` lambda) may contain a Float
             // `%`. Dead-stripped when unreferenced.
@@ -768,6 +773,7 @@ fn lower_module_into<M: CrModule>(
                 now_sig_ref,
                 cap_lookup_sig_ref,
                 glob_match_sig_ref,
+                call_native_sig_ref,
                 fmod_func_ref,
                 pointer_ty,
                 frontend_config: module.target_config(),
@@ -987,6 +993,12 @@ struct Codegen<'a, 'b> {
     /// `glob_match` stdlib slot through the vtable rather than
     /// inlining the trap-sentinel IR body.
     glob_match_sig_ref: SigRef,
+    /// Pre-built cranelift signature for `relon_call_native`
+    /// (`extern "C" fn(state, import_idx: i32, args_ptr, arg_count: i32)
+    /// -> i64`). Used by [`Self::emit_call_native`] to dispatch a
+    /// source-lowered `Op::CallNative { cap_bit: NO_CAPABILITY_BIT }` to
+    /// the `Arc<dyn RelonFunction>` registered at `import_idx`.
+    call_native_sig_ref: SigRef,
     /// `FuncRef` for the libc `fmod` external function, imported into
     /// the current function body. [`Self::emit_mod_f64`] emits a
     /// direct `call(fmod_func_ref, [a, b])` to lower
@@ -1193,6 +1205,7 @@ impl<'a, 'b> Codegen<'a, 'b> {
             VtableSlot::RelonRaiseTrap => self.raise_trap_sig_ref,
             VtableSlot::RelonCapLookup => self.cap_lookup_sig_ref,
             VtableSlot::RelonGlobMatch => self.glob_match_sig_ref,
+            VtableSlot::RelonCallNative => self.call_native_sig_ref,
         };
         emit_indirect_host_call(
             self.builder,
@@ -1234,11 +1247,22 @@ impl<'a, 'b> Codegen<'a, 'b> {
     /// that produced SIGILL on x86 Linux, which `catch_unwind`
     /// cannot intercept on stable Rust.
     fn cond_trap(&mut self, cond: CValue, kind: TrapKind) {
+        let code_val = self.builder.ins().iconst(I64, i64::from(kind as u8));
+        self.cond_trap_with_code(cond, code_val);
+    }
+
+    /// Conditional trap with a **runtime** trap code (rather than a
+    /// compile-time [`TrapKind`]). Used by [`Self::emit_call_native`]'s
+    /// Arc-dispatch path: the `relon_call_native` helper records the
+    /// failing [`TrapKind`] into `state.trap_code` and returns; the call
+    /// site loads that code and branches here so the trap epilogue
+    /// re-publishes the same value. `code_val` must be the i64-loaded
+    /// `trap_code`.
+    fn cond_trap_with_code(&mut self, cond: CValue, code_val: CValue) {
         let trap_block = self
             .trap_block
             .expect("trap_block must be pre-allocated by compile_module");
         let continue_block = self.builder.create_block();
-        let code_val = self.builder.ins().iconst(I64, i64::from(kind as u8));
         self.builder
             .ins()
             .brif(cond, trap_block, &[code_val.into()], continue_block, &[]);

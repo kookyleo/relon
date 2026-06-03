@@ -83,13 +83,21 @@ pub enum VtableSlot {
     /// stdlib body (the body is a trap sentinel — see
     /// `relon_ir::stdlib::defs::glob_match_string`).
     RelonGlobMatch = 3,
+    /// `extern "C" fn(state: *const SandboxState, import_idx: u32,
+    /// args_ptr: *const i64, arg_count: u32) -> i64`.
+    ///
+    /// Dynamic host-fn dispatch for source-lowered `Op::CallNative`
+    /// whose `cap_bit` is `NO_CAPABILITY_BIT`. Resolves the
+    /// `Arc<dyn RelonFunction>` registered at `import_idx`, packs the
+    /// scalar args, and invokes it. See [`SandboxState::call_native`].
+    RelonCallNative = 4,
 }
 
 impl VtableSlot {
     /// Number of slots reserved in the vtable. Bumping this requires
     /// a `GENERATOR_VERSION` bump in `object_cache_integration` so
     /// older cache files self-invalidate.
-    pub const COUNT: u32 = 4;
+    pub const COUNT: u32 = 5;
 
     /// Byte offset of this slot inside the vtable. Each slot is one
     /// host pointer (8 bytes on x86_64-linux, which is v5-γ's only
@@ -139,15 +147,17 @@ pub unsafe fn populate_vtable(vtable_ptr: *mut u8) {
         *slots.add(VtableSlot::RelonCapLookup as usize) = SandboxState::cap_lookup as *const u8;
         *slots.add(VtableSlot::RelonGlobMatch as usize) =
             crate::glob_helper::relon_glob_match_helper as *const u8;
+        *slots.add(VtableSlot::RelonCallNative as usize) = SandboxState::call_native as *const u8;
     }
     tracing::trace!(
         target: "relon::vtable",
-        "populated vtable at {:p}: now={:p} raise_trap={:p} cap_lookup={:p} glob_match={:p}",
+        "populated vtable at {:p}: now={:p} raise_trap={:p} cap_lookup={:p} glob_match={:p} call_native={:p}",
         vtable_ptr,
         SandboxState::now_helper as *const u8,
         SandboxState::raise_trap as *const u8,
         SandboxState::cap_lookup as *const u8,
         crate::glob_helper::relon_glob_match_helper as *const u8,
+        SandboxState::call_native as *const u8,
     );
 }
 
@@ -161,6 +171,7 @@ mod tests {
         assert_eq!(VtableSlot::RelonRaiseTrap.offset_bytes(), 8);
         assert_eq!(VtableSlot::RelonCapLookup.offset_bytes(), 16);
         assert_eq!(VtableSlot::RelonGlobMatch.offset_bytes(), 24);
+        assert_eq!(VtableSlot::RelonCallNative.offset_bytes(), 32);
     }
 
     #[test]
@@ -172,6 +183,7 @@ mod tests {
             VtableSlot::RelonRaiseTrap,
             VtableSlot::RelonCapLookup,
             VtableSlot::RelonGlobMatch,
+            VtableSlot::RelonCallNative,
         ];
         assert_eq!(variants.len() as u32, VtableSlot::COUNT);
     }
@@ -200,6 +212,7 @@ mod tests {
             assert!(!(*slots.add(1)).is_null(), "RelonRaiseTrap slot");
             assert!(!(*slots.add(2)).is_null(), "RelonCapLookup slot");
             assert!(!(*slots.add(3)).is_null(), "RelonGlobMatch slot");
+            assert!(!(*slots.add(4)).is_null(), "RelonCallNative slot");
         }
     }
 }

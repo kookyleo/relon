@@ -51,9 +51,10 @@
 //! capture trap reasons.
 
 use arc_swap::ArcSwap;
-use relon_eval_api::RuntimeError;
+use relon_eval_api::{NativeArgs, NativeFnCaps, RelonFunction, RuntimeError, Value};
 use relon_parser::TokenRange;
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -200,6 +201,45 @@ impl TrapKind {
 /// shape v5-beta-1 supports for `#native` imports).
 pub type HostFnPtr = unsafe extern "C" fn(i64) -> i64;
 
+/// Non-null sentinel parked in a `cap_bit` slot by
+/// [`CapabilityVtable::grant`]. Never actually invoked — the
+/// `Op::CheckCap` codegen only null-checks the slot pointer, and a
+/// granted source-level `Op::CallNative` dispatches through the
+/// `import_idx`-keyed `host_fns` registry rather than this slot. Exists
+/// solely so a granted bit reads back as a non-null pointer.
+unsafe extern "C" fn cap_grant_sentinel(x: i64) -> i64 {
+    x
+}
+
+/// Zero-sized [`NativeFnCaps`] for cranelift-dispatched host fns. Same
+/// shape as the bytecode VM's caps: no closure-callback / iterator
+/// surface yet, so host fns that need those route through the
+/// tree-walker. Cached as a single `Arc` so each dispatch is a refcount
+/// bump rather than an allocation.
+struct CraneliftNativeFnCaps;
+
+impl NativeFnCaps for CraneliftNativeFnCaps {
+    fn call_relon(
+        &self,
+        _func: &Value,
+        _args: Vec<Value>,
+        _range: TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        // Closure callbacks need the JIT frame surface this backend's
+        // host-fn dispatch doesn't expose yet; a host fn that tries to
+        // call back into Relon logic gets this envelope so it can route
+        // through the tree-walker instead.
+        Err(RuntimeError::Unsupported {
+            reason: "cranelift-native host fn: call_relon callback unsupported".to_string(),
+        })
+    }
+}
+
+fn cranelift_native_caps() -> Arc<dyn NativeFnCaps> {
+    static CAPS: std::sync::OnceLock<Arc<dyn NativeFnCaps>> = std::sync::OnceLock::new();
+    Arc::clone(CAPS.get_or_init(|| Arc::new(CraneliftNativeFnCaps) as Arc<dyn NativeFnCaps>))
+}
+
 /// Per-call vtable indexed by cap_bit. Slots holding `None` cause the
 /// generated capability-check sequence to trap with
 /// [`TrapKind::CapabilityDenied`].
@@ -208,9 +248,34 @@ pub type HostFnPtr = unsafe extern "C" fn(i64) -> i64;
 /// address as a constant and re-resolve per call. `Arc` so the
 /// runtime can hand a shared snapshot to long-lived sessions without
 /// cloning every slot.
-#[derive(Debug, Default)]
+///
+/// ## Two dispatch models
+///
+/// * `slots` — raw `extern "C"` host fn pointers indexed by `cap_bit`.
+///   This is the original "host writes a C-ABI fn" model: the codegen
+///   resolves the slot via `cap_lookup` and `call_indirect`s directly.
+///   Also doubles as the capability *grant* surface — a non-null slot
+///   at `cap_bit` is what lets an `Op::CheckCap { cap_bit }` pass.
+/// * `host_fns` — dynamic `Arc<dyn RelonFunction>` callables indexed by
+///   the IR-side `import_idx`. This is the bridge for tree-walker host
+///   fns: a source-lowered `Op::CallNative { cap_bit: NO_CAPABILITY_BIT }`
+///   routes through the `relon_call_native` helper, which packs the
+///   scalar args into `NativeArgs` and invokes the Arc. Keying off
+///   `import_idx` (a private namespace) avoids colliding with the
+///   `cap_bit`-indexed `slots`.
+#[derive(Default, Clone)]
 pub struct CapabilityVtable {
     slots: Vec<Option<HostFnPtr>>,
+    host_fns: HashMap<u32, Arc<dyn RelonFunction>>,
+}
+
+impl std::fmt::Debug for CapabilityVtable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapabilityVtable")
+            .field("slots", &self.slots.len())
+            .field("host_fn_count", &self.host_fns.len())
+            .finish()
+    }
 }
 
 impl CapabilityVtable {
@@ -220,6 +285,7 @@ impl CapabilityVtable {
     pub fn with_capacity(n: usize) -> Self {
         Self {
             slots: vec![None; n],
+            host_fns: HashMap::new(),
         }
     }
 
@@ -260,6 +326,34 @@ impl CapabilityVtable {
             }
             Err(_) => false,
         }
+    }
+
+    /// Register a dynamic `Arc<dyn RelonFunction>` host fn at the given
+    /// `import_idx`. This is the bridge for tree-walker host fns: a
+    /// source-lowered `Op::CallNative { cap_bit: NO_CAPABILITY_BIT }`
+    /// dispatches through `relon_call_native` to the Arc registered
+    /// here. Keyed off `import_idx` so it never collides with the
+    /// `cap_bit`-indexed raw-pointer `slots`.
+    pub fn register_host_fn(&mut self, import_idx: u32, func: Arc<dyn RelonFunction>) {
+        self.host_fns.insert(import_idx, func);
+    }
+
+    /// Resolve the dynamic host fn registered at `import_idx`.
+    pub fn resolve_host_fn(&self, import_idx: u32) -> Option<&Arc<dyn RelonFunction>> {
+        self.host_fns.get(&import_idx)
+    }
+
+    /// Grant a capability bit by parking a non-null sentinel at its
+    /// `slots[cap_bit]`. An `Op::CheckCap { cap_bit }` only null-checks
+    /// the slot, so a sentinel is enough to let the guard pass; the
+    /// actual call dispatches through the `import_idx`-keyed `host_fns`
+    /// registry, not this slot. Mirrors the bytecode VM's grant set.
+    pub fn grant(&mut self, cap_bit: u32) {
+        // SAFETY-of-intent: `cap_grant_sentinel` is never *called* — the
+        // CheckCap path only compares the slot pointer against null, and
+        // the CallNative dispatch for a granted source fn goes through
+        // `host_fns`. The sentinel exists purely to be non-null.
+        self.register(cap_bit, cap_grant_sentinel);
     }
 
     /// Resolve a slot. `None` means the capability is denied.
@@ -830,6 +924,71 @@ impl SandboxState {
         match state.capabilities.lookup(cap_bit) {
             Some(fn_ptr) => fn_ptr as usize,
             None => 0,
+        }
+    }
+
+    /// Dynamic host-fn dispatch helper for source-lowered
+    /// `Op::CallNative { cap_bit: NO_CAPABILITY_BIT }`. Resolves the
+    /// `Arc<dyn RelonFunction>` registered at `import_idx`, packs the
+    /// `arg_count` scalar i64 args (read from `args_ptr`) into
+    /// `NativeArgs`, invokes it, and returns the i64-encoded result.
+    ///
+    /// Errors do not unwind across this `extern "C"` boundary (that
+    /// would be UB on a `panic=unwind` build): instead the helper
+    /// records a [`TrapKind`] in `state.trap_code` and returns `0`. The
+    /// JIT call site loads `trap_code` right after the call and routes a
+    /// non-zero value to the shared trap epilogue, so the host sees a
+    /// typed [`RuntimeError`] (capability denial / host-fn failure /
+    /// unsupported shape) the same way every other cranelift trap
+    /// surfaces.
+    ///
+    /// Scope (phase-4a parity with the bytecode VM): scalar `Int` args
+    /// in, `Int` result out. A non-`Int` arg or result records
+    /// [`TrapKind::Unreachable`] (→ `RuntimeError::Unsupported`).
+    ///
+    /// # Safety
+    ///
+    /// `state` must point at a live, aligned [`SandboxState`]; `args_ptr`
+    /// must point at `arg_count` contiguous `i64`s. The JIT prologue
+    /// passes the same `state` pointer it received and a stack slot it
+    /// just populated, so both invariants hold for every production
+    /// caller.
+    pub(crate) unsafe extern "C" fn call_native(
+        state: *const SandboxState,
+        import_idx: u32,
+        args_ptr: *const i64,
+        arg_count: u32,
+    ) -> i64 {
+        let state = unsafe { &*state };
+        let Some(func) = state.capabilities.resolve_host_fn(import_idx).cloned() else {
+            // No Arc registered for this import. Surface as a generic
+            // unsupported trap — the host wired a gated call but no
+            // callable.
+            state
+                .trap_code
+                .store(TrapKind::Unreachable as u64, Ordering::Relaxed);
+            return 0;
+        };
+        let args_slice = if arg_count == 0 {
+            &[][..]
+        } else {
+            // SAFETY: caller guarantees `arg_count` contiguous i64s.
+            unsafe { std::slice::from_raw_parts(args_ptr, arg_count as usize) }
+        };
+        let packed: Vec<Value> = args_slice.iter().map(|&x| Value::Int(x)).collect();
+        let native_args = NativeArgs::from_positional(packed, cranelift_native_caps());
+        match func.call(native_args, TokenRange::default()) {
+            Ok(Value::Int(v)) => v,
+            Ok(Value::Bool(b)) => i64::from(b),
+            Ok(Value::Null) => 0,
+            Ok(_) | Err(_) => {
+                // Host-fn failure or a return shape outside the phase-4a
+                // scalar envelope. The host sees `RuntimeError::Unsupported`.
+                state
+                    .trap_code
+                    .store(TrapKind::Unreachable as u64, Ordering::Relaxed);
+                0
+            }
         }
     }
 }

@@ -15,14 +15,16 @@
 //! the IR-declared `(param_tys) -> ret_ty` shape.
 
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::types::I32;
-use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value as CValue};
+use cranelift_codegen::ir::types::{I32, I64};
+use cranelift_codegen::ir::{
+    AbiParam, InstBuilder, MemFlags, Signature, StackSlotData, StackSlotKind, Value as CValue,
+};
 use cranelift_codegen::isa::CallConv;
 
-use relon_ir::ir::IrType;
+use relon_ir::ir::{IrType, NO_CAPABILITY_BIT};
 
 use crate::error::CraneliftError;
-use crate::sandbox::TrapKind;
+use crate::sandbox::{TrapKind, STATE_OFFSET_TRAP_CODE};
 use crate::vtable::VtableSlot;
 
 use super::{ir_ty_to_cl, InlineFrame};
@@ -247,6 +249,16 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
             )));
         }
 
+        // Source-lowered native calls carry the `NO_CAPABILITY_BIT`
+        // sentinel (their capability guard rides on the preceding
+        // `Op::CheckCap` ops) and dispatch dynamically through the
+        // `import_idx`-keyed `Arc<dyn RelonFunction>` registry. Hand-
+        // built IR that names a concrete `cap_bit` keeps the legacy
+        // raw-`HostFnPtr` direct path below.
+        if cap_bit == NO_CAPABILITY_BIT {
+            return self.emit_call_native_dynamic(import_idx, param_tys, ret_ty);
+        }
+
         // 1. cap_lookup -> fn_ptr (or null when the slot is empty).
         // Even when capability_check is OFF on the sandbox config, we
         // still need the fn pointer for the indirect call, so the
@@ -304,6 +316,100 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
             self.push(result);
         }
 
+        Ok(())
+    }
+
+    /// Dynamic-dispatch path for a source-lowered `Op::CallNative`
+    /// (`cap_bit == NO_CAPABILITY_BIT`). Spills the scalar args into a
+    /// stack slot and calls the `relon_call_native` host helper, which
+    /// resolves the `Arc<dyn RelonFunction>` registered at `import_idx`
+    /// and invokes it. The helper signals any failure (capability
+    /// denial / host-fn error / unsupported shape) by recording a
+    /// [`TrapKind`] in `state.trap_code`; this site loads that code
+    /// right after the call and routes a non-zero value to the shared
+    /// trap epilogue.
+    ///
+    /// Scope (phase-4a parity with the bytecode VM): scalar args travel
+    /// through the i64 lane and the return is the i64-encoded scalar.
+    /// `ret_ty` outside `{ I64, Null }` is rejected — the richer return
+    /// lanes (Bool / Float / String) ship with the buffer-protocol
+    /// envelope.
+    fn emit_call_native_dynamic(
+        &mut self,
+        import_idx: u32,
+        param_tys: &[IrType],
+        ret_ty: IrType,
+    ) -> Result<(), CraneliftError> {
+        if !matches!(ret_ty, IrType::I64 | IrType::Null) {
+            return Err(CraneliftError::Codegen(format!(
+                "CallNative dynamic dispatch (import #{import_idx}) ret_ty {ret_ty:?} \
+                 outside the phase-4a scalar envelope (I64 / Null only)"
+            )));
+        }
+        let n = param_tys.len();
+
+        // Pop the args (last-pushed = last declaration-order arg).
+        let mut args: Vec<CValue> = Vec::with_capacity(n);
+        for _ in 0..n {
+            args.push(self.pop()?);
+        }
+        args.reverse();
+
+        // Spill the args into an 8-byte-aligned stack slot as i64s, the
+        // same lane convention `relon_call_native` decodes. Narrower
+        // values are widened; an unexpectedly wide lane is rejected
+        // rather than silently truncated.
+        let args_ptr = if n == 0 {
+            self.builder.ins().iconst(self.pointer_ty, 0)
+        } else {
+            let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                (n as u32) * 8,
+                3, // 8-byte align (2^3)
+            ));
+            for (i, v) in args.iter().enumerate() {
+                let ty = self.builder.func.dfg.value_type(*v);
+                let widened = if ty == I64 {
+                    *v
+                } else if ty == I32 {
+                    self.builder.ins().sextend(I64, *v)
+                } else {
+                    return Err(CraneliftError::Codegen(format!(
+                        "CallNative dynamic dispatch (import #{import_idx}) arg {i} has \
+                         cranelift type {ty:?} outside the phase-4a i64 lane"
+                    )));
+                };
+                self.builder
+                    .ins()
+                    .stack_store(widened, slot, (i as i32) * 8);
+            }
+            self.builder.ins().stack_addr(self.pointer_ty, slot, 0)
+        };
+
+        let import_v = self.builder.ins().iconst(I32, i64::from(import_idx));
+        let count_v = self.builder.ins().iconst(I32, n as i64);
+        let inst = self.emit_host_fn_call(
+            VtableSlot::RelonCallNative,
+            &[self.state_ptr, import_v, args_ptr, count_v],
+        );
+        let result = self.builder.inst_results(inst)[0];
+
+        // The helper records a TrapKind in `state.trap_code` on failure
+        // and returns. Load it and route a non-zero code to the trap
+        // epilogue (which re-publishes the same value via raise_trap).
+        let trap_code = self.builder.ins().load(
+            I64,
+            MemFlags::trusted(),
+            self.state_ptr,
+            STATE_OFFSET_TRAP_CODE,
+        );
+        let zero = self.builder.ins().iconst(I64, 0);
+        let trapped = self.builder.ins().icmp(IntCC::NotEqual, trap_code, zero);
+        self.cond_trap_with_code(trapped, trap_code);
+
+        if !matches!(ret_ty, IrType::Null) {
+            self.push(result);
+        }
         Ok(())
     }
 }
