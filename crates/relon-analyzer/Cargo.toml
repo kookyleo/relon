@@ -11,6 +11,7 @@ categories = ["compilers", "development-tools"]
 
 [dependencies]
 relon-parser = { workspace = true }
+relon-cap = { workspace = true }
 miette = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 sha2 = { workspace = true }

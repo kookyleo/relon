@@ -610,9 +610,12 @@ fn gated_fn_rejected_in_sandbox_without_allowlist() {
     let mut ctx = Context::sandboxed();
     ctx.register_fn(
         "fs.read",
-        NativeFnGate {
-            reads_fs: true,
-            ..NativeFnGate::default()
+        {
+            // `NativeFnGate` is `#[non_exhaustive]` (defined in
+            // `relon-cap`); build via default + field set.
+            let mut g = NativeFnGate::default();
+            g.reads_fs = true;
+            g
         },
         Arc::new(ReadFs),
     );
@@ -640,9 +643,12 @@ fn gated_fn_permitted_when_bit_granted() {
     ctx.capabilities.reads_fs = true;
     ctx.register_fn(
         "fs.read",
-        NativeFnGate {
-            reads_fs: true,
-            ..NativeFnGate::default()
+        {
+            // `NativeFnGate` is `#[non_exhaustive]` (defined in
+            // `relon-cap`); build via default + field set.
+            let mut g = NativeFnGate::default();
+            g.reads_fs = true;
+            g
         },
         Arc::new(ReadFs),
     );
@@ -675,9 +681,12 @@ fn fully_granted_caps_let_gated_fns_through() {
     ctx.capabilities = Capabilities::all_granted();
     ctx.register_fn(
         "fs.read",
-        NativeFnGate {
-            reads_fs: true,
-            ..NativeFnGate::default()
+        {
+            // `NativeFnGate` is `#[non_exhaustive]` (defined in
+            // `relon-cap`); build via default + field set.
+            let mut g = NativeFnGate::default();
+            g.reads_fs = true;
+            g
         },
         Arc::new(ReadFs),
     );

@@ -184,9 +184,12 @@ fn host_receives_capability_denied() {
     let mut ctx = Context::sandboxed().with_root(node);
     ctx.register_fn(
         "read_file",
-        NativeFnGate {
-            reads_fs: true,
-            ..NativeFnGate::default()
+        {
+            // `NativeFnGate` is `#[non_exhaustive]` (defined in
+            // `relon-cap`); build via default + field set.
+            let mut g = NativeFnGate::default();
+            g.reads_fs = true;
+            g
         },
         Arc::new(ReadsFs),
     );
@@ -367,42 +370,39 @@ fn host_receives_capability_denied_for_each_new_bit() {
         }
     }
 
+    // `NativeFnGate` is `#[non_exhaustive]` (defined in `relon-cap`), so
+    // each gate is built via default + a single field set.
+    let writes_fs = {
+        let mut g = NativeFnGate::default();
+        g.writes_fs = true;
+        g
+    };
+    let network = {
+        let mut g = NativeFnGate::default();
+        g.network = true;
+        g
+    };
+    let reads_clock = {
+        let mut g = NativeFnGate::default();
+        g.reads_clock = true;
+        g
+    };
+    let reads_env = {
+        let mut g = NativeFnGate::default();
+        g.reads_env = true;
+        g
+    };
+    let uses_rng = {
+        let mut g = NativeFnGate::default();
+        g.uses_rng = true;
+        g
+    };
     let cases: Vec<(&str, NativeFnGate)> = vec![
-        (
-            "writes_fs",
-            NativeFnGate {
-                writes_fs: true,
-                ..NativeFnGate::default()
-            },
-        ),
-        (
-            "network",
-            NativeFnGate {
-                network: true,
-                ..NativeFnGate::default()
-            },
-        ),
-        (
-            "reads_clock",
-            NativeFnGate {
-                reads_clock: true,
-                ..NativeFnGate::default()
-            },
-        ),
-        (
-            "reads_env",
-            NativeFnGate {
-                reads_env: true,
-                ..NativeFnGate::default()
-            },
-        ),
-        (
-            "uses_rng",
-            NativeFnGate {
-                uses_rng: true,
-                ..NativeFnGate::default()
-            },
-        ),
+        ("writes_fs", writes_fs),
+        ("network", network),
+        ("reads_clock", reads_clock),
+        ("reads_env", reads_env),
+        ("uses_rng", uses_rng),
     ];
 
     for (bit, gate) in cases {
@@ -448,10 +448,13 @@ fn capability_denied_reports_first_missing_bit() {
     ctx.capabilities.reads_fs = true; // grant one of the two
     ctx.register_fn(
         "fetch",
-        NativeFnGate {
-            reads_fs: true,
-            network: true,
-            ..NativeFnGate::default()
+        {
+            // `NativeFnGate` is `#[non_exhaustive]` (defined in
+            // `relon-cap`); build via default + field set.
+            let mut g = NativeFnGate::default();
+            g.reads_fs = true;
+            g.network = true;
+            g
         },
         Arc::new(Stub),
     );

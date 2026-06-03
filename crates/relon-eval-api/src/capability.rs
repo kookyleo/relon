@@ -74,34 +74,10 @@ pub trait CapabilityGate: Send + Sync {
     }
 }
 
-impl CapabilityBit {
-    /// Stable, audit-visible string label for this capability.
-    /// Mirrors the `NativeFnGate::missing_bits` field-name strings
-    /// so historical diagnostics keep the same wording.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CapabilityBit::ReadsFs => "reads_fs",
-            CapabilityBit::WritesFs => "writes_fs",
-            CapabilityBit::Network => "network",
-            CapabilityBit::ReadsClock => "reads_clock",
-            CapabilityBit::ReadsEnv => "reads_env",
-            CapabilityBit::UsesRng => "uses_rng",
-        }
-    }
-
-    /// Human-readable denial message for the `reason` field of
-    /// [`RuntimeError::CapabilityDenied`]. The dominant (and only
-    /// `Capabilities`-produced) case: the fn declared this bit but the
-    /// caller never granted it.
-    ///
-    /// [`RuntimeError::CapabilityDenied`]: crate::RuntimeError::CapabilityDenied
-    pub fn deny_message(self) -> String {
-        format!(
-            "function declared `{}` but caller did not grant it",
-            self.as_str()
-        )
-    }
-}
+// `CapabilityBit::as_str` / `deny_message` are inherent methods on the
+// canonical type, which now lives in the `relon-cap` leaf crate (see
+// `relon_cap::CapabilityBit`). They are reachable here through the
+// `crate::context` re-export, so no redefinition is needed.
 
 /// Default gate implementation: consult the per-bit booleans on a
 /// [`Capabilities`] snapshot.
@@ -170,27 +146,23 @@ mod tests {
         // diagnostic: `reads_fs` is declared before `network` in the
         // field order, so it surfaces first.
         let caps = Capabilities::default();
-        let gate = NativeFnGate {
-            reads_fs: true,
-            network: true,
-            ..NativeFnGate::default()
-        };
+        // `NativeFnGate` is `#[non_exhaustive]` (defined in `relon-cap`),
+        // so build via default + field set rather than a struct literal.
+        let mut gate = NativeFnGate::default();
+        gate.reads_fs = true;
+        gate.network = true;
         let denied = caps.check_gate(&gate).expect_err("must deny");
         assert_eq!(denied, CapabilityBit::ReadsFs);
     }
 
     #[test]
     fn check_gate_passes_when_every_required_bit_granted() {
-        let caps = Capabilities {
-            reads_fs: true,
-            network: true,
-            ..Capabilities::default()
-        };
-        let gate = NativeFnGate {
-            reads_fs: true,
-            network: true,
-            ..NativeFnGate::default()
-        };
+        let mut caps = Capabilities::default();
+        caps.reads_fs = true;
+        caps.network = true;
+        let mut gate = NativeFnGate::default();
+        gate.reads_fs = true;
+        gate.network = true;
         caps.check_gate(&gate).expect("must allow");
     }
 
@@ -221,10 +193,8 @@ mod tests {
 
     #[test]
     fn host_supplied_gate_can_override_policy() {
-        let gate = NativeFnGate {
-            reads_fs: true,
-            ..NativeFnGate::default()
-        };
+        let mut gate = NativeFnGate::default();
+        gate.reads_fs = true;
         let denied = DenyAllGate.check_gate(&gate).expect_err("must deny");
         assert_eq!(denied, CapabilityBit::ReadsFs);
     }
