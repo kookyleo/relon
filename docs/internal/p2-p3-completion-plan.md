@@ -111,3 +111,23 @@ src/codegen/
 3. **`CallNative` 是 Phase 1 的核心串行项**:需 ① evaluator 侧 Arc host-fn registry + state 接线 ② MCJIT 注册 `relon_call_native`/`cap_lookup` 符号 ③ `Emit` 接 `imports`/`ir` 句柄。lowering 体本身可移植进 call.rs,但三项共享接线必须先行(详见 call family 报告)。
 
 **留给 Phase 1 的 LLVM 覆盖缺口**:`CallNative`、`ConstList*`、宿主 Schema/List 编组。其余(标量算术、控制流、闭包、字符串、记录构造、能力门 CheckCap/Trap、schema 指针、字段/绝对寻址、全 Unicode 表)已覆盖。
+
+---
+
+## 8. Phase 0b 收口(2026-06-03,已完成、全绿)
+
+§7 三个缺口已收口(Wave 1 并行 + CallNative 串行,均差分锚 cranelift/tree-walk):
+
+| 缺口 | 结果 | 关键 |
+|---|---|---|
+| **宿主 Schema 编组** | ✅ 端到端打通 | `write_value_into_builder` 加 Schema 臂(递归 `sub_record`/`finish_sub_record` 回填 `LoadSchemaPtr` 读的偏移槽)+ `read_value_from_reader` 嵌套 Schema 返回解码。schema-field **真出 42/7**,边界测试升级为真实值断言(tree-walk 金标准)。buffer 协议本就支持子记录,无跨 crate 改动。 |
+| **`ConstListInt/Float/Bool`** | ✅ 降级完成 | ConstPool 加 `list_*_offsets` + 字节布局(int/float align8 `[len][pad][i64/f64…]`、bool align4 `[len][u8…]`),与 cranelift byte-for-byte 一致。ConstListInt 经 from_source codegen parity 验证;Float/Bool 字段被前端拒(不可达),以字节级单测钉死。 |
+| **`CallNative`** | ✅ 开世界动态分发打通 | 镜像 cranelift `emit_call_native_dynamic`/`RelonCallNative`:evaluator 挂 `HostFnRegistry`,`relon_llvm_call_native` helper 经 MCJIT global mapping 接入,Emit 接 `imports`/state,buffer entry 贯穿 caps + `trap_code`。源码降级的 CallNative(`NO_CAPABILITY_BIT`,由前置 CheckCap 把守)**端到端可执行**;grant/deny/dispatch 三态对齐 cranelift。Trap 改写 `trap_code` sentinel(`llvm.trap` 是不可捕获的 SIGILL)。 |
+
+**仍 unsupported(已知边界,非本轮目标)**:
+- `ListGetByIntIdx` / `DictGetByStringKey` / `ConstListString` —— **cranelift 亦不支持**(无 oracle,属未设计区)。
+- `CallNative` 能力门**直连路径**(`cap_bit != NO_CAPABILITY_BIT` 的 cranelift legacy `cap_lookup` + `call_indirect`)—— 源码降级从不走此路(能力由前置 `Op::CheckCap` 独立把守),诚实留 unsupported。
+- **List 类型的返回值解码**(`read_value_from_reader` 的 List 臂)—— Phase B return 解码器限制,留 Phase 1。
+- schema-method dispatch —— 暂无源级路径触发。
+
+**结论**:LLVM-AOT 后端现已覆盖**源码可达的全部主流 Op 面**(标量/控制流/闭包/字符串/记录/能力门/native 调用/schema 字段/const list/全 Unicode 表),三态能力安全 + native 分发端到端验证。余下 unsupported 均为 cranelift 同样未实现或 Phase-B/Phase-1 封套项,已诚实记录。
