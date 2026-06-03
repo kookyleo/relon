@@ -65,8 +65,8 @@ src/codegen/
 | 阶段 | 内容 | 并行性 |
 |---|---|---|
 | **Spike** ✅ | inkwell→wasm32 object 可行(已验证) | — |
-| **0a 骨架(前置)** | **行为不变的重构**:emitter.rs → per-family 模块 + OpVisitor 分发;native MCJIT 路径照旧;arith/control 作样板;其余 family `unsupported` 占位 | **串行**(必须先于 0b) |
-| **0b family 填充** | 逐 family 把 Op 降到 LLVM-IR(照 cranelift 对应文件移植)+ 对 cranelift 差分对齐:mem · collections · string · closure · call(含 CallNative/CheckCap)· schema · unicode | **并行**(各改各文件) |
+| **0a 骨架(前置)** ✅ | **行为不变的重构**:emitter.rs → per-family 模块 + 瘦分发 seam | **串行**(已完成,见 §7) |
+| **0b family 填充** ✅ | 逐 family 把 Op 降到 LLVM-IR(照 cranelift 移植)+ 差分:control · mem · schema · collections · call · unicode | **并行**(已完成,见 §7) |
 | **1 P2 完整** | co-compile LTO 脊梁(host bitcode + 合一 + CallNative 直调)+ Phase C cap/sandbox(信任前置)+ relon-rs 集成 | 串行为主 |
 | **2 P3 翻 target** | target=wasm32:DataLayout 指针宽度 + effectful-host→WASI + wasmtime 运行 + 接 `Backend` 枚举;**退役手写 relon-codegen-wasm** | 串行 |
 | **3 性能峰** | LTO 跨内联深化(打平/超手写) | — |
@@ -87,3 +87,27 @@ src/codegen/
 
 ## 6. 起点
 **Phase 0a(骨架重构,串行)** 先行 → 落地后 **Phase 0b 按 family 并行 fan-out**。loop 驱动 + 集成 + 排序。
+
+---
+
+## 7. Phase 0 实施结果(2026-06-03,已完成、全绿)
+
+**0a 骨架**:`emitter.rs`(6152 行)行为不变地拆成 `codegen/{mod,arith,control,mem,collections,string,closure,call,schema,unicode}.rs`;另加 **0a.1 seam**:把共享的 fat unsupported 大臂拆成 6 条 per-family 瘦委托(`lower_<family>_rest`),令 0b 各 family agent 只改自己的文件、零 mod.rs 冲突。
+
+**0b 并行填充(6 worktree agent,各照 cranelift 移植 + 差分)**:
+
+| family | 新增覆盖 | 仍 unsupported | 差分对齐 |
+|---|---|---|---|
+| **control** | `Select`(build_select)`BrTable`(build_switch) | — | cranelift-gold + tree-walk(经 min/max),全绿 |
+| **mem** | `LoadFieldAtAbsolute` | — | cranelift **本身不支持**此 op(无 oracle);见下「封套」 |
+| **schema** | `LoadSchemaPtr` | schema-method dispatch(暂无源级路径) | tree-walk 为值 oracle(cranelift 不支持) |
+| **collections** | `AllocSubRecord` `PushRecordBase` `EmitTailRecordFromAbsoluteAddr` | `ConstListInt/Float/Bool`(需共享 ConstPool 加 list_*_offsets)`ConstListString`/`ListGetByIntIdx`/`DictGetByStringKey`(**cranelift 亦不支持**) | IR 形状 + cranelift codegen parity + 手验 IR |
+| **call** | `CheckCap`(i64 caps 位掩码门)`Trap`(llvm.trap) | `CallNative`(需 evaluator 侧 host-fn registry + MCJIT 符号接线 + Emit 接 imports) | CheckCap/Trap 语义锚在 cranelift 运行时;LLVM 侧编译正确性 + 非法入口拒绝 |
+| **unicode** | 全 10 个 `*TableAddr`(私有去重 global + scratch memcpy,字节与 cranelift 编码器一致) | — | 表字节 byte-for-byte == relon_ir 编码器 + 去重/长度 |
+
+**跨切发现(均非 family codegen bug,留待 Phase 1)**:
+1. **宿主 arg/return 编组封套(Phase B 限制,共享 `evaluator.rs`)**:`write_value_into_builder` 仅有 Int/Float/Bool/Null 标量臂,**无 Schema 参/List 参/嵌套返回**支持。故 schema-field 全路径 **codegen 已通(from_source 成功降级 LoadSchemaPtr+LoadFieldAtAbsolute),但 run_main 端到端跑不通**——卡在编组,而非任一 op。已用诚实边界测试钉住(`phase0b_{mem,schema}` 断言:build 成功 + run 止于编组封套 + 无 unsupported-op),Phase 1 接通编组后升级为值断言。
+2. **cranelift 不是部分 op 的 oracle**:`LoadFieldAtAbsolute`/`LoadSchemaPtr`/`ListGetByIntIdx`/`DictGetByStringKey`/`ConstListString` 在 cranelift 也是 unsupported;这些 op 的差分以 tree-walk 为金标准(可达时)或锚在 IR/编码器层。
+3. **`CallNative` 是 Phase 1 的核心串行项**:需 ① evaluator 侧 Arc host-fn registry + state 接线 ② MCJIT 注册 `relon_call_native`/`cap_lookup` 符号 ③ `Emit` 接 `imports`/`ir` 句柄。lowering 体本身可移植进 call.rs,但三项共享接线必须先行(详见 call family 报告)。
+
+**留给 Phase 1 的 LLVM 覆盖缺口**:`CallNative`、`ConstList*`、宿主 Schema/List 编组。其余(标量算术、控制流、闭包、字符串、记录构造、能力门 CheckCap/Trap、schema 指针、字段/绝对寻址、全 Unicode 表)已覆盖。
