@@ -85,6 +85,7 @@ mod sandbox;
 mod state;
 mod str_helpers;
 mod vtable;
+mod wasi_host;
 pub mod wasm_link;
 
 pub use codegen::WorldMode;
