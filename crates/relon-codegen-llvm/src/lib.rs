@@ -80,11 +80,15 @@ mod codegen;
 mod error;
 mod evaluator;
 mod mcjit_mm;
+mod sandbox;
 mod state;
 mod str_helpers;
+mod vtable;
 
 pub use error::LlvmError;
 pub use evaluator::{
     EmitObjectInfo, EmittedEntryShape, EmittedField, EmittedFieldType, LlvmAotEvaluator,
 };
+pub use sandbox::{CapabilityVtable, SandboxConfig, SandboxTrapKind};
 pub use state::HostFnRegistry;
+pub use vtable::{populate_global_mappings, VtableSlot};
