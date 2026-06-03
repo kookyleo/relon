@@ -134,7 +134,7 @@ pub(crate) enum EntryShape {
 /// `emit_object` path), mirroring cranelift's *static* `cap_lookup ->
 /// fn_ptr` arm rather than its `_dynamic` helper arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum WorldMode {
+pub enum WorldMode {
     /// Dynamic dispatch through `relon_llvm_call_native`. Default so
     /// the existing MCJIT / `from_source` path is untouched.
     #[default]
