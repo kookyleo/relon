@@ -1,7 +1,7 @@
 //! Negative-test coverage for the corpus support-claim ratchet.
 //!
-//! The corpus-driving tests (`corpus_differential`, `three_way_corpus`,
-//! `bytecode_diff`) assert that every entry's `supported_by` list is
+//! The corpus-driving tests (`corpus_differential`, `three_way_corpus`)
+//! assert that every entry's `supported_by` list is
 //! honoured by the live harness. This file complements that with the
 //! opposite direction: feed the ratchet a hand-crafted "claimed but
 //! bounced" outcome and assert that it surfaces a violation. Without
@@ -13,7 +13,6 @@
 //! stays in microseconds rather than seconds.
 
 use relon_eval_api::Value;
-use relon_test_harness::four_way::FourWayResult;
 use relon_test_harness::ratchet;
 use relon_test_harness::three_way::ThreeWayResult;
 use relon_test_harness::{BackendKind, DiffOutcome};
@@ -82,109 +81,18 @@ fn ratchet_three_way_trace_jit_no_claim_no_violation() {
     );
 }
 
-/// Four-way: `BytecodeUnsupported` against a claim list that includes
-/// `Bytecode` must surface a violation.
-#[test]
-fn ratchet_four_way_bytecode_claim_violation() {
-    let baseline = ThreeWayResult::AllAgree(Value::Int(5));
-    let outcome = FourWayResult::BytecodeUnsupported {
-        baseline: Box::new(baseline),
-        reason: "synthetic: M2-A scaffold rejected String return".to_string(),
-    };
-    let claim = [
-        BackendKind::TreeWalk,
-        BackendKind::CraneliftAot,
-        BackendKind::TraceJit,
-        BackendKind::Bytecode,
-    ];
-    let violations = ratchet::check_four_way("probe_bc_claim", &outcome, &claim);
-    assert_eq!(
-        violations.len(),
-        1,
-        "expected exactly one violation, got {violations:?}"
-    );
-    assert_eq!(violations[0].backend, BackendKind::Bytecode);
-}
-
-/// Four-way: same outcome but the case does *not* claim Bytecode
-/// support — ratchet stays silent. Mirrors a case like
-/// `stdlib_concat_const` today.
-#[test]
-fn ratchet_four_way_bytecode_no_claim_no_violation() {
-    let baseline = ThreeWayResult::AllAgree(Value::Int(5));
-    let outcome = FourWayResult::BytecodeUnsupported {
-        baseline: Box::new(baseline),
-        reason: "synthetic: String return".to_string(),
-    };
-    let claim = [
-        BackendKind::TreeWalk,
-        BackendKind::CraneliftAot,
-        BackendKind::TraceJit,
-    ];
-    let violations = ratchet::check_four_way("probe_bc_no_claim", &outcome, &claim);
-    assert!(
-        violations.is_empty(),
-        "no claim => no violation, got {violations:?}"
-    );
-}
-
-/// Four-way: `BytecodeMatchesBaseline` means bytecode was right but
-/// the trace-JIT skipped. When the case claims `TraceJit`, the
-/// ratchet fires for the trace-JIT tier.
-#[test]
-fn ratchet_four_way_trace_jit_skipped_under_claim() {
-    let outcome = FourWayResult::BytecodeMatchesBaseline {
-        value: Value::Int(15),
-        trace_skip_reason: "trace_jit_outside_catalogue".to_string(),
-    };
-    let claim = [
-        BackendKind::TreeWalk,
-        BackendKind::CraneliftAot,
-        BackendKind::TraceJit,
-        BackendKind::Bytecode,
-    ];
-    let violations = ratchet::check_four_way("probe_tj_skip", &outcome, &claim);
-    assert_eq!(
-        violations.len(),
-        1,
-        "expected one violation for trace-JIT skip, got {violations:?}"
-    );
-    assert_eq!(violations[0].backend, BackendKind::TraceJit);
-}
-
-/// Four-way `BytecodeMatchesBaseline` with the `cranelift_unsupported`
-/// reason prefix routes the violation to the cranelift tier when the
-/// case claims cranelift.
-#[test]
-fn ratchet_four_way_cranelift_skip_routed_correctly() {
-    let outcome = FourWayResult::BytecodeMatchesBaseline {
-        value: Value::Int(15),
-        trace_skip_reason: "cranelift_unsupported".to_string(),
-    };
-    let claim = [
-        BackendKind::TreeWalk,
-        BackendKind::CraneliftAot,
-        BackendKind::Bytecode,
-    ];
-    let violations = ratchet::check_four_way("probe_cr_skip", &outcome, &claim);
-    assert_eq!(violations.len(), 1);
-    assert_eq!(violations[0].backend, BackendKind::CraneliftAot);
-}
-
-/// Sanity: an `AllAgree` outcome never fires the ratchet, regardless
-/// of which backends are in the claim list.
+/// Sanity: an `AllAgree` three-way outcome never fires the ratchet,
+/// regardless of which backends are in the claim list.
 #[test]
 fn ratchet_all_agree_silent() {
-    let outcome = FourWayResult::AllAgree(Value::Int(123));
+    let outcome = ThreeWayResult::AllAgree(Value::Int(123));
     let claim = [
         BackendKind::TreeWalk,
         BackendKind::CraneliftAot,
         BackendKind::TraceJit,
-        BackendKind::Bytecode,
     ];
-    let violations = ratchet::check_four_way("probe_agree", &outcome, &claim);
     assert!(
-        violations.is_empty(),
-        "AllAgree never produces a violation, got {violations:?}"
+        ratchet::check_three_way("probe_agree", &outcome, &claim).is_none(),
+        "AllAgree never produces a violation"
     );
 }

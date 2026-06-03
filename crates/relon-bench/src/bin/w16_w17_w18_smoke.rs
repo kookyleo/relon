@@ -15,7 +15,7 @@
 //! cargo run -p relon-bench --bin w16_w17_w18_smoke
 //! ```
 
-use relon::JitEvaluator;
+use relon::AutoEvaluator;
 use relon_eval_api::{Evaluator as _, Value};
 use std::collections::HashMap;
 
@@ -61,7 +61,7 @@ fn w18_src() -> &'static str {
 }
 
 fn run(label: &str, src: &str, n: i64) -> i64 {
-    let jit = JitEvaluator::new(src)
+    let jit = AutoEvaluator::new(src)
         .unwrap_or_else(|e| panic!("{label}: setup failed:\n{src}\nerr: {e}"));
     let mut args: HashMap<String, Value> = HashMap::new();
     args.insert("n".to_string(), Value::Int(n));

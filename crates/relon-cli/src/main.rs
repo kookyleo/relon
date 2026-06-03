@@ -51,12 +51,6 @@ enum BackendArg {
     /// is rejected — this backend only ships entries.
     #[value(name = "cranelift-aot")]
     CraneliftAot,
-    /// v6-δ M2-A bytecode VM. Stack-based interpreter with IR-PC
-    /// bookkeeping; covers the scalar `#main` envelope (Int / Bool /
-    /// Float / Null). Library-mode `eval_root` is rejected — this
-    /// backend only ships entries.
-    #[value(name = "bytecode")]
-    Bytecode,
 }
 
 #[derive(Parser)]
@@ -309,13 +303,13 @@ fn main() -> miette::Result<()> {
 /// Warning emitted when `--trust` is passed but the resolved execution
 /// path is the cranelift-AOT backend, which the CLI cannot honour it on
 /// (no host-fn registry to grant capabilities from). Surfacing this
-/// keeps the flag from being a silent no-op: tree-walk and bytecode are
-/// the backends that act on `--trust`.
+/// keeps the flag from being a silent no-op: tree-walk is the backend
+/// that acts on `--trust`.
 const TRUST_UNSUPPORTED_ON_AOT: &str =
     "[relon-cli] warning: --trust has no effect on the cranelift-AOT backend \
      (single file, no host-fn registry): it grants no runtime native-fn \
      capability, and the `#import` paths --trust would open are not stitched \
-     by this backend. Use --backend tree-walk or --backend bytecode if your \
+     by this backend. Use --backend tree-walk if your \
      program relies on --trust.";
 
 fn warn_trust_unsupported_on_aot() {
@@ -354,7 +348,7 @@ fn cmd_run(
     // LuaJIT envelope on the W11 shape. Resolve the effective
     // backend once here so the dispatch site below has a
     // single source of truth:
-    //   * --lite + cranelift-aot / bytecode -> hard reject
+    //   * --lite + cranelift-aot            -> hard reject
     //     (operator should not see a silent swap).
     //   * --lite + auto / tree-walk         -> tree-walk
     //   * no --lite                          -> requested backend
@@ -879,9 +873,7 @@ fn cmd_run(
                 // cross-crate API addition tracked separately); we
                 // deliberately do not fabricate an all-granted but
                 // empty vtable here because installing it would
-                // change no behaviour. The bytecode backend below
-                // does honour `--trust` because its policy boundary
-                // (`with_capability_gate`) accepts a gate directly.
+                // change no behaviour.
                 // Surface the no-op rather than silently dropping the flag.
                 if trust {
                     warn_trust_unsupported_on_aot();
@@ -895,45 +887,6 @@ fn cmd_run(
                         .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
                 })?
             }
-            BackendArg::Bytecode => {
-                // v6-δ M2-A bytecode VM. Stack-based
-                // interpreter — handles the scalar `#main`
-                // envelope (Int / Bool / Float / Null);
-                // anything else surfaces as a setup error.
-                //
-                // `--trust` flips the capability posture from the
-                // zero-trust default to `all_granted`. The
-                // `Capabilities` snapshot implements
-                // [`relon_eval_api::CapabilityGate`], so we install
-                // it through the bytecode VM's unified policy
-                // boundary (`with_capability_gate`). The dispatch
-                // path consults this gate for every declared bit
-                // ahead of any capability-sensitive op
-                // (`CheckCap` / `CallNative`); without the grant a
-                // guarded op trips `CapabilityDenied`, matching
-                // the tree-walker's sandbox shape. The current
-                // scalar `from_source` envelope emits no sensitive
-                // ops, so the gate is inert on those sources — but
-                // wiring it here means the trust flag takes effect
-                // the moment guarded ops land instead of being
-                // silently dropped.
-                let caps: Arc<dyn relon_eval_api::CapabilityGate> = if trust {
-                    Arc::new(relon_eval_api::Capabilities::all_granted())
-                } else {
-                    Arc::new(relon_eval_api::Capabilities::default())
-                };
-                let bc = relon_bytecode::BytecodeEvaluator::from_source(&content)
-                    .map_err(|e| {
-                        miette::miette!("bytecode VM backend setup: {e}").with_source_code(
-                            NamedSource::new(file.to_string_lossy(), content.clone()),
-                        )
-                    })?
-                    .with_capability_gate(caps);
-                EvaluatorTrait::run_main(&bc, args_map).map_err(|e| {
-                    Report::new(e)
-                        .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
-                })?
-            }
         }
     } else {
         if args.is_some() {
@@ -942,14 +895,9 @@ fn cmd_run(
             )
             .with_source_code(NamedSource::new(file.to_string_lossy(), content)));
         }
-        if matches!(backend, BackendArg::CraneliftAot | BackendArg::Bytecode) {
-            let name = if matches!(backend, BackendArg::CraneliftAot) {
-                "cranelift-aot"
-            } else {
-                "bytecode"
-            };
+        if matches!(backend, BackendArg::CraneliftAot) {
             return Err(miette::miette!(
-                "{name} backend only supports `#main(...)` entries; the file declares no signature"
+                "cranelift-aot backend only supports `#main(...)` entries; the file declares no signature"
             )
             .with_source_code(NamedSource::new(file.to_string_lossy(), content)));
         }

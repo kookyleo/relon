@@ -1697,13 +1697,6 @@ fn sandbox_matches(a: &SandboxConfig, b: &SandboxConfig) -> bool {
         && a.deadline_check == b.deadline_check
         && a.capability_check == b.capability_check
         && a.div_check == b.div_check
-        // `trace_jit_fn_id` changes the emitted machine code (it gates
-        // the HotCounter prologue in `codegen`), so a cached artifact
-        // built with one value must not be reused under another. It is
-        // a flag field for drift purposes even though the on-disk cache
-        // never persists it (restore forces `None`, so for the
-        // `from_cache_dir` caller both sides are invariantly `None`).
-        && a.trace_jit_fn_id == b.trace_jit_fn_id
 }
 
 impl Evaluator for AotEvaluator {
@@ -1947,39 +1940,21 @@ mod tests {
 
     /// `sandbox_matches` is the cache-drift invalidation guard: its
     /// doc contract says it compares by *every* flag field. Pin that
-    /// two configs differing only in `trace_jit_fn_id` do NOT match —
-    /// the field gates the HotCounter prologue and thus changes the
-    /// emitted machine code, so a cached artifact built with one value
-    /// must never be reused under another.
+    /// two configs differing only in `div_check` do NOT match.
     #[test]
-    fn sandbox_matches_compares_trace_jit_fn_id() {
+    fn sandbox_matches_compares_every_flag() {
         let base = SandboxConfig::default();
-        assert_eq!(base.trace_jit_fn_id, None);
 
         // Identical configs match.
         assert!(sandbox_matches(&base, &base.clone()));
 
-        // Differing only in `trace_jit_fn_id` must NOT match.
-        let with_trace = SandboxConfig {
-            trace_jit_fn_id: Some(7),
+        // Differing only in `div_check` must NOT match.
+        let no_div = SandboxConfig {
+            div_check: false,
             ..base.clone()
         };
-        assert!(!sandbox_matches(&base, &with_trace));
-        assert!(!sandbox_matches(&with_trace, &base));
-
-        // Different non-None ids also fail to match.
-        let other_trace = SandboxConfig {
-            trace_jit_fn_id: Some(9),
-            ..base.clone()
-        };
-        assert!(!sandbox_matches(&with_trace, &other_trace));
-
-        // Same non-None id matches (every other flag equal).
-        let same_trace = SandboxConfig {
-            trace_jit_fn_id: Some(7),
-            ..base
-        };
-        assert!(sandbox_matches(&with_trace, &same_trace));
+        assert!(!sandbox_matches(&base, &no_div));
+        assert!(!sandbox_matches(&no_div, &base));
     }
 
     /// 2026-05-21 dispatch-boundary lever (a) smoke: the SmallMap entry

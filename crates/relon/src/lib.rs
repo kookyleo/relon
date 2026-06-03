@@ -26,7 +26,6 @@
 
 pub mod auto_evaluator;
 pub mod builder;
-pub mod jit;
 pub mod projector;
 
 use relon_analyzer::{
@@ -46,15 +45,9 @@ use std::sync::Arc;
 
 pub use auto_evaluator::{is_trivial_scalar_main, is_trivial_scalar_main_node, AutoEvaluator};
 pub use builder::{EvaluatorBuilder, TrustLevel};
-pub use jit::{JitEvaluator, JitTier};
-#[cfg(feature = "cranelift-aot")]
-pub use jit::{TraceFixture, TraceFixtureDecodeFn, TraceFixtureFallbackFn, TraceFixturePackFn};
 pub use projector::{JsonProjector, Projector};
 // Dart-style canonical AOT entry, re-exported through the facade so
-// hosts can spell `relon::AotEvaluator` alongside `relon::JitEvaluator`
-// without a second crate dep. Mirrors the `JitEvaluator` re-export
-// above — the two together are the v1 of the naming-alignment split
-// (see `crates/relon/src/jit.rs` top-comment and the design note).
+// hosts can spell `relon::AotEvaluator` without a second crate dep.
 pub use relon_analyzer;
 #[cfg(feature = "cranelift-aot")]
 pub use relon_codegen_cranelift::AotEvaluator;
@@ -627,15 +620,6 @@ pub enum Backend {
     /// up-front (e.g. before a latency-sensitive serving loop)
     /// rather than on first `run_main`.
     CraneliftAot,
-    /// v6-δ M2-A bytecode VM backend. Stack-based interpreter that
-    /// consumes the same IR `lower_workspace_single` produces, with
-    /// a per-function `ir_pc_map` enabling future partial-resume
-    /// (M2-B). M2-A only accepts scalar `#main` shapes (Int / Bool /
-    /// Float / Null arg + return fields); list / dict / closure /
-    /// stdlib sources surface as `BackendError::Bytecode`. Pick this
-    /// to exercise the resume-from-deopt path without paying the
-    /// cranelift cold-start cost.
-    Bytecode,
     /// Phase B LLVM-AOT backend. Lowers `.relon` source through the
     /// inkwell-backed emitter into native machine code via LLVM 18's
     /// MCJIT engine. Accepts both the legacy-i64 hand-built IR
@@ -667,12 +651,6 @@ pub enum BackendError {
     /// crate stays decoupled from the cranelift crate's surface.
     #[error("cranelift-aot backend setup failed: {0}")]
     CraneliftAot(String),
-    /// v6-δ M2-A bytecode VM compile / setup failed. Typically the
-    /// source uses constructs outside the M2-A scalar envelope (list
-    /// / dict / closure / stdlib). Wrapper string so this crate stays
-    /// decoupled from the bytecode crate's enum.
-    #[error("bytecode VM backend setup failed: {0}")]
-    Bytecode(String),
     /// Phase A LLVM-AOT pipeline failed. Either the build dropped the
     /// `llvm-aot` cargo feature (so the LLVM crate is not linked) or
     /// the IR shape is outside the Phase A envelope. Wraps the
@@ -682,8 +660,8 @@ pub enum BackendError {
     LlvmAot(String),
     /// Builder requested a feature the selected backend cannot
     /// honour. Today the canonical cause is host-native-fn
-    /// registration under [`Backend::CraneliftAot`] /
-    /// [`Backend::Bytecode`]: neither backend dispatches into the
+    /// registration under [`Backend::CraneliftAot`]: the backend
+    /// does not dispatch into the
     /// tree-walker's host-fn table. Surfacing this loud instead of
     /// silently dropping the registration prevents a class of
     /// "the script can't see my fn" bug reports.
@@ -722,11 +700,6 @@ pub fn new_evaluator(
             "this build was compiled without the `cranelift-aot` feature; rebuild with `--features cranelift-aot` to enable the backend"
                 .to_string(),
         )),
-        Backend::Bytecode => {
-            let ev = relon_bytecode::BytecodeEvaluator::from_source(source)
-                .map_err(|e| BackendError::Bytecode(e.to_string()))?;
-            Ok(Box::new(ev))
-        }
         // Phase B LLVM-AOT: `from_source` wired up through the
         // buffer-protocol emitter. Sources outside the W1 / W2
         // production envelope (closures past peephole, schema-

@@ -20,7 +20,7 @@
 //! (`#main -> Int`). Both checked exact-equal against analytic
 //! constants computed on the fly from the bench scales.
 
-use relon::JitEvaluator;
+use relon::AutoEvaluator;
 use relon_eval_api::{Evaluator as _, Value};
 use std::collections::HashMap;
 
@@ -42,7 +42,7 @@ fn w27_src() -> &'static str {
 }
 
 fn run_int(label: &str, src: &str, n: i64) -> i64 {
-    let jit = JitEvaluator::new(src)
+    let jit = AutoEvaluator::new(src)
         .unwrap_or_else(|e| panic!("{label}: setup failed:\n{src}\nerr: {e}"));
     let mut args: HashMap<String, Value> = HashMap::new();
     args.insert("n".to_string(), Value::Int(n));

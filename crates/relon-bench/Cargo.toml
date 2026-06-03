@@ -23,28 +23,9 @@ llvm-aot = ["relon/llvm-aot", "dep:relon-codegen-llvm"]
 [dependencies]
 relon-parser = { workspace = true }
 relon-evaluator = { workspace = true }
-# M2-C lever 1 (2026-05-21): the W12 bytecode row drives the concrete
-# `BytecodeEvaluator::run_main_i64` typed fast-path to bypass the
-# host-arg `HashMap<String, Value>` round-trip the trait-level
-# `run_main` carries. Direct crate dep so the bench can name the
-# concrete type rather than the `Box<dyn Evaluator>` trait object.
-relon-bytecode = { workspace = true }
-# M2-B phase 4d (2026-05-21): the bytecode VM is driven via the
-# `relon::new_evaluator(src, Backend::Bytecode)` facade so the cmp_lua
-# bench's bytecode row picks up whatever from-source envelope the
-# `BytecodeEvaluator::from_source` pipeline currently honours. Sources
-# outside the scalar envelope surface as `BackendError::Bytecode` and
-# the bench row prints `n/a (UnsupportedOp)` rather than the row's
-# numbers — matches the corpus four-way harness's soft-pass policy.
-#
-# JitEvaluator tier escalation (open follow-up #1, 2026-05-26): the
-# wrapper's trace-recorder hookup + dispatcher-switch wiring lives
-# behind the `cranelift-aot` feature (the feature already gates the
-# AOT row in `try_build_aot` below). Enabling it here lets the
-# bench's `relon_jit` row exercise the auto-promoting Trace tier on
-# hot loops; without the feature `JitEvaluator` stays at the v1
-# tree-walk + bytecode dispatch shape and the row reports
-# bytecode-equivalent numbers.
+# The cmp_lua bench drives the AOT backend via the
+# `relon::new_evaluator(src, Backend::CraneliftAot)` facade
+# (`try_build_aot`); the `cranelift-aot` feature gates that row.
 relon = { workspace = true, features = ["cranelift-aot"] }
 # v5-β-2 stage 4: cranelift-AOT comparison bench. The wasm-AOT
 # backend retired here; the bench crate now only depends on the
@@ -70,35 +51,6 @@ relon-codegen-llvm = { workspace = true, optional = true }
 relon-wasm-evaluator = { workspace = true }
 relon-ir = { workspace = true }
 relon-eval-api = { workspace = true }
-# v6-γ M5 trace-JIT hot-loop bench: depends on the trace-abi
-# `TraceContext` / `TraceEntryStatus` and the trace-jit `TraceBuffer`
-# types so the bench can drive an installed trace directly through
-# `JITedTraceFn::invoke` without going through `run_main`.
-relon-trace-abi = { workspace = true }
-relon-trace-jit = { workspace = true }
-# F-D7-D: cmp_lua W3 / W4 recorder-driven row references
-# `STDLIB_IDX_CONTAINS` to assemble the matching `Op::Call` IR fixture.
-relon-trace-recorder = { workspace = true }
-# v6-ε-0-C: the `trace_jit_warm_tail` bench row installs a
-# `CallConv::Tail` trace explicitly (vs the default-conv install path
-# the `trace_jit_warm` / `trace_jit_warm_ic` rows go through) so the
-# comparison is direct. Pulling cranelift-codegen here only exposes
-# the `CallConv` enum to the bench surface.
-cranelift-codegen = "0.132"
-# v6-ε bench-rewrite (2026-05-19): the new `trace_jit_loop` row
-# hand-builds a cranelift JIT module whose body runs the full N-iter
-# loop internally (bypassing the recorder gap). Frontend + module +
-# jit + native are needed for that build path; they pull in the same
-# 0.131 line the workspace already pins for `relon-codegen-cranelift`.
-cranelift-frontend = "0.132"
-cranelift-module = "0.132"
-cranelift-jit = "0.132"
-cranelift-native = "0.132"
-# `result_slot_offset()` / `host_hooks_offset()` are exposed by the
-# trace-emitter crate; we link them in for the bench's
-# `trace_jit_loop` row so the JIT fn writes through the canonical
-# TraceContext field rather than hard-coding the byte offset.
-relon-trace-emitter = { workspace = true }
 dhat = { version = "0.3", optional = true }
 # v6-λ-0 (bench methodology hardening): `bench_stats` post-processes
 # criterion's `sample.json` per-row to extract p50/p90/p99/p99.9/max.
@@ -155,20 +107,6 @@ name = "cranelift_aot_vs_tree_walk"
 harness = false
 path = "benches/cranelift_aot_vs_tree_walk.rs"
 
-# v6-γ M5 → v6-ε bench-rewrite (2026-05-19): trace-JIT hot-loop
-# micro-bench. The historical "Rust drives N invokes" rows are kept
-# under the `dispatch_*` prefix as the M2-C → ε-0-A falsification
-# chain reference, but the headline rows are now the loop-INSIDE
-# variants (`tree_walk_loop`, `cranelift_aot_loop`, `trace_jit_loop`,
-# `rust_native_loop`) which invoke the callee **once** and measure
-# total / `HOT_LOOP_N`. See the bench module doc + the v6-ε
-# bench-rewrite report for the methodology rationale.
-# Run via `cargo bench -p relon-bench --bench trace_jit_hot_loop`.
-[[bench]]
-name = "trace_jit_hot_loop"
-harness = false
-path = "benches/trace_jit_hot_loop.rs"
-
 # v6-lambda-2/3 (2026-05-19): Relon vs LuaJIT 12-workload paired bench.
 # Implements the 12 adversarial workloads from
 # `docs/internal/relon-vs-luajit-rigorous-plan.md` §3, with a Relon source
@@ -179,32 +117,6 @@ path = "benches/trace_jit_hot_loop.rs"
 name = "cmp_lua"
 harness = false
 path = "benches/cmp_lua.rs"
-
-# F-D8 (2026-05-19): trace-JIT companion to W5 + W6 in `cmp_lua`. Runs
-# the dict-string-key and list-numeric-key hot loops through hand-built
-# cranelift JIT traces that exercise the new TraceOp::DictLookup +
-# TraceOp::ListGet lowerings, plus a tree-walker baseline row for in-
-# bench ratio context. Recorder integration is deferred — the IR walker
-# does not yet recognise the source-side `d[keys[i]]` / `arr[i]`
-# patterns; this bench's row demonstrates the emitter + runtime path
-# is wired end-to-end so the recorder extension lands against a
-# pre-validated lower-half.
-# Run via `cargo bench -p relon-bench --bench cmp_lua_dict_list_trace`.
-[[bench]]
-name = "cmp_lua_dict_list_trace"
-harness = false
-path = "benches/cmp_lua_dict_list_trace.rs"
-
-# 2026-05-21: trace-JIT failure-mode fixtures (abort / high-deopt /
-# cold workload). Three workloads × three rows (tree_walk / cranelift_aot
-# / trace_jit) covering paths the existing W1..W10 hot-loop suite does
-# not touch — see the bench file header for the per-fixture hypothesis
-# table. Same 6-trap hardening as `trace_jit_hot_loop` /  `cmp_lua`.
-# Run via `cargo bench -p relon-bench --bench jit_failure_modes`.
-[[bench]]
-name = "jit_failure_modes"
-harness = false
-path = "benches/jit_failure_modes.rs"
 
 # v3++ item 4 (2026-05-20): SIMD ASCII fast-path throughput. Compares
 # the new `relon_ir::ascii_fold_simd` helper against a scalar
@@ -245,13 +157,3 @@ path = "benches/string_stdlib.rs"
 [[bin]]
 name = "bench_stats"
 path = "src/bin/bench_stats.rs"
-
-# 2026-05-26 W5 layout RCA probe: drives the W5 recorder body through
-# the trace-install pipeline once, then runs the installed entry in
-# tight 10_000-iter batches. Prints per-batch wall-time + trace-fn /
-# tctx / IC / dict addresses so we can correlate the W5 fast-/slow-
-# cluster timings with low-bit alignment patterns. Run via
-# `cargo run -p relon-bench --bin w5_variance_probe --release`.
-[[bin]]
-name = "w5_variance_probe"
-path = "src/bin/w5_variance_probe.rs"

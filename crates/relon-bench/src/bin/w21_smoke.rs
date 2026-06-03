@@ -19,7 +19,7 @@
 //! same shape as W13 / W14 / W15 / W16 / W17 / W18 / W19); exact-equal
 //! check against the analytic constant `W21_N * 3 / 2`.
 
-use relon::JitEvaluator;
+use relon::AutoEvaluator;
 use relon_eval_api::{Evaluator as _, Value};
 use std::collections::HashMap;
 
@@ -45,7 +45,7 @@ fn w21_src() -> &'static str {
 }
 
 fn run_dict_result_int(label: &str, src: &str, n: i64) -> i64 {
-    let jit = JitEvaluator::new(src)
+    let jit = AutoEvaluator::new(src)
         .unwrap_or_else(|e| panic!("{label}: setup failed:\n{src}\nerr: {e}"));
     let mut args: HashMap<String, Value> = HashMap::new();
     args.insert("n".to_string(), Value::Int(n));

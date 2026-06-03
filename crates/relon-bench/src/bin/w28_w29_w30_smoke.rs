@@ -28,7 +28,7 @@
 //! `rustc`'s by ~1 ULP per iter). W30 returns Int (closed-form
 //! `n*(n+1)/2`, exact-equal check).
 
-use relon::JitEvaluator;
+use relon::AutoEvaluator;
 use relon_eval_api::{Evaluator as _, Value};
 use std::collections::HashMap;
 
@@ -50,7 +50,7 @@ fn w30_src() -> &'static str {
 }
 
 fn run_int(label: &str, src: &str, n: i64) -> i64 {
-    let jit = JitEvaluator::new(src)
+    let jit = AutoEvaluator::new(src)
         .unwrap_or_else(|e| panic!("{label}: setup failed:\n{src}\nerr: {e}"));
     let mut args: HashMap<String, Value> = HashMap::new();
     args.insert("n".to_string(), Value::Int(n));
@@ -64,7 +64,7 @@ fn run_int(label: &str, src: &str, n: i64) -> i64 {
 }
 
 fn run_float(label: &str, src: &str, n: i64) -> f64 {
-    let jit = JitEvaluator::new(src)
+    let jit = AutoEvaluator::new(src)
         .unwrap_or_else(|e| panic!("{label}: setup failed:\n{src}\nerr: {e}"));
     let mut args: HashMap<String, Value> = HashMap::new();
     args.insert("n".to_string(), Value::Int(n));

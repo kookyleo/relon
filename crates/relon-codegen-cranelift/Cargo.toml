@@ -25,27 +25,6 @@ relon-parser = { workspace = true }
 # used to wire the analyzer the same way; this is the only AOT path
 # left.
 relon-analyzer = { workspace = true }
-# Shared trace JIT ABI types. v6-γ M2/M3: codegen-cranelift now injects
-# HotCounter prologues at every cranelift entry function and the
-# `trace_install` module drives the
-# `recorder → optimizer → emitter → JIT install` pipeline. See
-# `docs/internal/v6-gamma-integration-plan-2026-05-18.md` §3 + §4.
-relon-trace-abi = { workspace = true }
-# v6-γ M2/M3: recorder + optimizer + emitter pulled in so the trace
-# install pipeline can be driven entirely from the codegen-cranelift
-# layer. Each crate keeps its own test surface; the integration tests
-# live under `tests/trace_jit_smoke.rs`.
-relon-trace-jit = { workspace = true }
-relon-trace-recorder = { workspace = true }
-relon-trace-emitter = { workspace = true }
-# v6-δ M2-B phase 4c: the cranelift backend hosts the
-# `BytecodeHotTrigger` adapter that wires the bytecode VM's
-# hot-counter prologue into the same `__relon_jump_to_recorder`
-# helper the cranelift entry-fn prologue uses. The dep is one-way
-# (codegen-cranelift → bytecode); the bytecode crate itself stays
-# cranelift-free so the wasm32 build still compiles.
-relon-bytecode = { workspace = true }
-
 thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

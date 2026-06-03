@@ -12,8 +12,8 @@
 //!
 //! Each [`CorpusCase`] carries an explicit `supported_by` list — the
 //! backends that **claim** to handle the source today. The drivers
-//! ([`crate::diff_test`] / [`crate::three_way::diff_test_3way`] /
-//! [`crate::four_way::diff_test_4way`]) treat a backend's
+//! ([`crate::diff_test`] / [`crate::three_way::diff_test_3way`])
+//! treat a backend's
 //! `Unsupported` / `NotApplicable` surface as a soft pass **only**
 //! when the backend is not in `supported_by`. If a backend in the
 //! claim list bounces, the corpus harness tests fail loud — that's

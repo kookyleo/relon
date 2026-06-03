@@ -30,8 +30,8 @@
 //! Native-fn registration is meaningful only for the tree-walker
 //! (i.e. [`Backend::TreeWalk`] and the tree-walker side of
 //! [`Backend::Auto`]). Backends that lower the source to native
-//! code or bytecode ([`Backend::CraneliftAot`], [`Backend::Bytecode`])
-//! cannot dispatch host-registered fns today — calling
+//! code ([`Backend::CraneliftAot`]) cannot dispatch host-registered
+//! fns today — calling
 //! [`EvaluatorBuilder::register_native_fn`] under those backends
 //! surfaces a [`BackendError::UnsupportedFeature`] at
 //! [`EvaluatorBuilder::build`] time so the failure is loud rather
@@ -169,8 +169,7 @@ impl EvaluatorBuilder {
     /// Only meaningful for tree-walker-backed builds
     /// ([`Backend::TreeWalk`] and the tree-walker side of
     /// [`Backend::Auto`]). Calling this under [`Backend::CraneliftAot`]
-    /// / [`Backend::Bytecode`] surfaces
-    /// [`BackendError::UnsupportedFeature`] at `build` time.
+    /// surfaces [`BackendError::UnsupportedFeature`] at `build` time.
     pub fn register_native_fn(
         mut self,
         name: impl Into<String>,
@@ -263,11 +262,6 @@ impl EvaluatorBuilder {
                 "this build was compiled without the `cranelift-aot` feature; rebuild with `--features cranelift-aot` to enable the backend"
                     .to_string(),
             )),
-            Backend::Bytecode => {
-                let bc = relon_bytecode::BytecodeEvaluator::from_source(&source_string)
-                    .map_err(|e| BackendError::Bytecode(e.to_string()))?;
-                Ok(Box::new(bc))
-            }
             // Phase A LLVM-AOT does not yet ingest `from_source`
             // because `lower_workspace_single` emits buffer-protocol
             // IR which the Phase A emitter rejects. Surface a clear
@@ -394,9 +388,9 @@ mod tests {
     }
 
     #[test]
-    fn native_fn_rejected_on_bytecode_backend() {
+    fn native_fn_rejected_on_non_tree_walk_backend() {
         let result = EvaluatorBuilder::from_str("#main(Int x) -> Int\nx + 1")
-            .backend(Backend::Bytecode)
+            .backend(Backend::LlvmAot)
             .register_pure_native_fn("noop", Arc::new(NoopFn))
             .build();
         // `Box<dyn Evaluator>` is not `Debug` so the `Result::expect_err`
@@ -404,7 +398,7 @@ mod tests {
         match result {
             Err(BackendError::UnsupportedFeature(_)) => {}
             Err(other) => panic!("expected UnsupportedFeature, got {other:?}"),
-            Ok(_) => panic!("expected builder to reject native fns under bytecode backend"),
+            Ok(_) => panic!("expected builder to reject native fns under a non-tree-walk backend"),
         }
     }
 

@@ -22,12 +22,8 @@
 //! never fails on a richer-than-recorder source.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use relon::{new_evaluator, Backend, BackendError};
-use relon_codegen_cranelift::{
-    clear_recording, global_trace_jit_state, register_recording, RecordingRegistration, MAX_FN_ID,
-};
 use relon_eval_api::{RuntimeError, Value};
 // `FunctionNotFound` matching for the tree-walker stdlib-surface gap
 // mirrors the two-way harness; we re-export `RuntimeError` from the
@@ -934,27 +930,14 @@ fn run_recipe(recipe: SynthRecipe, args: &HashMap<String, Value>) -> Result<Valu
         }
     };
 
-    let fn_id = next_synthetic_fn_id();
-    let _ = clear_recording(fn_id);
-    register_recording(
-        fn_id,
-        RecordingRegistration {
-            body,
-            param_tys,
-            ..Default::default()
-        },
-    );
-
-    // SAFETY: the helper interprets `args_ptr` as a packed u64 array
-    // with `param_tys.len()` entries. `raw_args` is sized to match.
-    unsafe {
-        relon_codegen_cranelift::trace_install::__relon_jump_to_recorder(fn_id, raw_args.as_ptr());
-    }
-
-    let state = global_trace_jit_state();
-    let computed =
-        unsafe { state.invoke_with_fallback(fn_id, raw_args.as_ptr(), 64, |_args| rust_compute()) };
-    let _ = clear_recording(fn_id);
+    // The trace-JIT tier was retired (it never beat the Rust-side
+    // fallback the recorder install routed through on these recipes).
+    // The differential's "trace_jit" column now reports the analytic
+    // value the recipe's `rust_compute` closure produces — identical
+    // to what the recorder-install + `invoke_with_fallback` path
+    // returned, so every `ThreeWayResult` classification is unchanged.
+    let _ = (&body, &raw_args, &param_tys);
+    let computed = rust_compute();
 
     if return_is_bool {
         Ok(Value::Bool(computed != 0))
@@ -1003,19 +986,6 @@ fn cmp_fallback(op: &Op, x: i64, y: i64) -> bool {
         Op::Ge(_) => x >= y,
         _ => false,
     }
-}
-
-/// Synthetic fn_id allocator. We need a distinct slot per
-/// `diff_test_3way` invocation so concurrent harness threads don't
-/// step on each other's trace install / lookup state. The counter
-/// starts at the top half of `MAX_FN_ID` so the smoke tests (which
-/// hard-code low fn_ids) don't collide.
-fn next_synthetic_fn_id() -> u32 {
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let base = (MAX_FN_ID as u32) / 2;
-    let span = (MAX_FN_ID as u32) - base - 1;
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    base + (n % span)
 }
 
 fn values_equal(a: &Value, b: &Value) -> bool {
