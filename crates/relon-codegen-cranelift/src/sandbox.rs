@@ -496,10 +496,11 @@ pub struct SandboxState {
 /// this offset; mirrored here as a const so both the codegen and the
 /// runtime stay in sync.
 pub const STATE_OFFSET_DEADLINE_NS: i32 = 0;
-/// Byte offset of `SandboxState::trap_code`. Not currently read
-/// from cranelift IR (the trap path uses the `raise_trap` host helper
-/// indirectly) but documented for completeness.
-#[allow(dead_code)]
+/// Byte offset of `SandboxState::trap_code`. Read from cranelift IR by
+/// [`crate::codegen`]'s `emit_call_native_dynamic`: after the
+/// `relon_call_native` helper records a failure code here and returns,
+/// the call site `load`s this offset and routes a non-zero value to the
+/// trap epilogue. Other trap paths set it indirectly via `raise_trap`.
 pub const STATE_OFFSET_TRAP_CODE: i32 = 8;
 /// Byte offset of `SandboxState::arena_base`. Cranelift code emits
 /// `load.<pointer_ty>` at this offset to materialise the arena base
