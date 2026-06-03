@@ -85,11 +85,13 @@ mod sandbox;
 mod state;
 mod str_helpers;
 mod vtable;
+pub mod wasm_link;
 
 pub use codegen::WorldMode;
 pub use error::LlvmError;
 pub use evaluator::{
-    EmitObjectInfo, EmittedEntryShape, EmittedField, EmittedFieldType, LlvmAotEvaluator,
+    CodegenTarget, EmitObjectInfo, EmittedEntryShape, EmittedField, EmittedFieldType,
+    LlvmAotEvaluator,
 };
 pub use sandbox::{CapabilityVtable, SandboxConfig, SandboxTrapKind};
 pub use state::HostFnRegistry;

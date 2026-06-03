@@ -62,6 +62,39 @@ use std::path::Path;
 /// than positional slots.
 pub const MAX_LEGACY_ARITY: usize = 4;
 
+/// Codegen target for the object-emit path (S3.X).
+///
+/// The SAME relon-IR → LLVM-IR emitter feeds both variants — only the
+/// `TargetMachine` construction (triple + DataLayout + CPU/features +
+/// reloc/code model) differs. `mem.rs` already lays out the arena via
+/// i32-offset GEPs (zext-i64 + `i8*` base), so the lowered body is
+/// pointer-width agnostic and needs no per-target change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodegenTarget {
+    /// Host x86-64 ELF object (the historical default). Triple +
+    /// CPU/features come from `TargetMachine::get_default_triple` /
+    /// `get_host_cpu_*`, reloc = PIC.
+    Native,
+    /// `wasm32-wasi` object (`\0asm` magic). Uses the WebAssembly LLVM
+    /// backend with the canonical wasm32 DataLayout. Emitted object is
+    /// consumed by `wasmtime` (see `crate::wasm_run`).
+    Wasm32,
+}
+
+/// Reference: the wasm32 DataLayout string LLVM emits for
+/// `wasm32-wasi` (little-endian, 32-bit pointers, i64 8-byte aligned).
+/// The module DataLayout is set authoritatively from the
+/// `TargetMachine`'s target data at emit time; this const documents the
+/// expected shape — note the `p:32:32` that lowers the i32-offset arena
+/// GEPs to 32-bit linear-memory pointers.
+#[allow(dead_code)]
+const WASM32_DATA_LAYOUT: &str = "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-n32:64-S128-ni:1:10:20";
+/// The wasm32 triple. `wasm32-wasi` so the module can later route
+/// effectful host fns through WASI imports (P3 §2.2). For pure-compute
+/// workloads `wasm32-unknown-unknown` would also work; wasi is the
+/// superset.
+const WASM32_TRIPLE: &str = "wasm32-wasi";
+
 // `extern "C"` function pointer aliases for the legacy-i64 entry.
 // Five i64 slots accept the v5-β-1 envelope's max arity; shorter
 // signatures pass zero in the trailing slots — the emitter only
@@ -2079,6 +2112,50 @@ impl LlvmAotEvaluator {
         world_mode: WorldMode,
         host_shim_src: Option<&str>,
     ) -> Result<EmitObjectInfo, LlvmError> {
+        // Default target is the host (native x86-64 ELF). S3.X adds the
+        // wasm32 retarget via `emit_object_for_target`.
+        Self::emit_object_for_target(
+            src,
+            entry_symbol,
+            out_path,
+            options,
+            world_mode,
+            host_shim_src,
+            CodegenTarget::Native,
+        )
+    }
+
+    /// S3.X object-emit seam parameterised by [`CodegenTarget`].
+    ///
+    /// `CodegenTarget::Native` is byte-identical to the historical
+    /// [`Self::emit_object_with_options`] path. `CodegenTarget::Wasm32`
+    /// runs the SAME relon-IR → LLVM-IR emitter but constructs a
+    /// `wasm32-wasi` `TargetMachine` (+ stamps the module's wasm32
+    /// triple / DataLayout) so `write_to_file` emits a `\0asm` object
+    /// instead of an ELF `.o`. The lowered body is unchanged — `mem.rs`
+    /// already lays the arena out via pointer-width-agnostic i32-offset
+    /// GEPs.
+    ///
+    /// Wasm32 today supports the open-world path (no host-bitcode link;
+    /// effectful host fns route through WASI imports, P3 §2.2 — not yet
+    /// wired). Closed-world (host-bitcode co-compile) is native-only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_object_for_target(
+        src: &str,
+        entry_symbol: &str,
+        out_path: &Path,
+        options: &relon_analyzer::AnalyzeOptions,
+        world_mode: WorldMode,
+        host_shim_src: Option<&str>,
+        target: CodegenTarget,
+    ) -> Result<EmitObjectInfo, LlvmError> {
+        if matches!(target, CodegenTarget::Wasm32) && matches!(world_mode, WorldMode::ClosedWorld) {
+            return Err(LlvmError::Codegen(
+                "wasm32 target does not support closed-world host-bitcode co-compile yet \
+                 (effectful host fns route through WASI imports — P3 §2.2)"
+                    .into(),
+            ));
+        }
         let (ir, main_schema, return_schema) =
             Self::lower_source_with_options(src, Some(options))?;
         let main_layout = relon_eval_api::layout::SchemaLayout::offsets_for(&main_schema)
@@ -2254,45 +2331,41 @@ impl LlvmAotEvaluator {
             LlvmError::Codegen(format!("LLVM verifier rejected object module: {e}"))
         })?;
 
-        // Stamp the host CPU onto every function so the per-function
-        // subtarget matches the host `TargetMachine` used for object
-        // codegen below. The object-emit `create_target_machine` already
-        // carries the host CPU/features, but stamping keeps the AOT and
-        // MCJIT paths consistent (same attributes, same lowering).
-        stamp_host_target_attributes(&module);
+        // Construct the object-emit `TargetMachine` for the requested
+        // target up front so the same machine drives both the O3
+        // pipeline and the backend codegen below.
+        let (machine, target_triple) = create_object_target_machine(target)?;
 
-        // Lay down O3 IR-level passes before backend codegen. Same
-        // pipeline the JIT path uses, so the AOT and JIT performance
-        // profiles stay comparable.
-        run_default_o3_pipeline(&module)?;
+        // Stamp the module's triple + DataLayout so the lowered pointer
+        // width / endianness match the machine. Native inherits the
+        // host triple LLVM already uses; wasm32 needs the explicit
+        // `wasm32-wasi` triple + 32-bit DataLayout or the
+        // verifier/codegen would default to the host's 64-bit layout.
+        // Pulling the DataLayout straight from the machine's target data
+        // keeps it authoritative for whichever target we built.
+        module.set_triple(&TargetTriple::create(&target_triple));
+        module.set_data_layout(&machine.get_target_data().get_data_layout());
 
-        // Write a relocatable ELF object. The target machine's
-        // `RelocMode::PIC` produces position-independent code so the
-        // linker can fold this into either a `staticlib` or a final
-        // executable without relocation drama.
-        Target::initialize_native(&InitializationConfig::default())
-            .map_err(|e| LlvmError::Codegen(format!("initialize_native: {e}")))?;
-        let triple_str = TargetMachine::get_default_triple();
-        let target = Target::from_triple(&triple_str)
-            .map_err(|e| LlvmError::Codegen(format!("target from_triple: {e}")))?;
-        let cpu = TargetMachine::get_host_cpu_name();
-        let features = TargetMachine::get_host_cpu_features();
-        let triple = TargetTriple::create(
-            triple_str
-                .as_str()
-                .to_str()
-                .map_err(|e| LlvmError::Codegen(format!("triple utf8: {e}")))?,
-        );
-        let machine = target
-            .create_target_machine(
-                &triple,
-                cpu.to_str().unwrap_or(""),
-                features.to_str().unwrap_or(""),
-                OptimizationLevel::Aggressive,
-                RelocMode::PIC,
-                CodeModel::Default,
-            )
-            .ok_or_else(|| LlvmError::Codegen("create_target_machine returned null".into()))?;
+        match target {
+            CodegenTarget::Native => {
+                // Stamp the host CPU onto every function so the
+                // per-function subtarget matches the host `TargetMachine`.
+                // Keeps the AOT and MCJIT paths consistent.
+                stamp_host_target_attributes(&module);
+                // Host-targeted O3 (same pipeline the JIT path uses).
+                run_default_o3_pipeline(&module)?;
+            }
+            CodegenTarget::Wasm32 => {
+                // No host-CPU stamping (x86 features are meaningless for
+                // wasm and would mis-narrow lowering). Run O3 against the
+                // wasm32 machine so the middle-end optimises for the wasm
+                // target's DataLayout.
+                let opts = PassBuilderOptions::create();
+                module
+                    .run_passes("default<O3>", &machine, opts)
+                    .map_err(|e| LlvmError::Codegen(format!("wasm32 run_passes O3: {e}")))?;
+            }
+        }
 
         if let Some(parent) = out_path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -2509,4 +2582,77 @@ fn run_default_o3_pipeline(module: &inkwell::module::Module<'_>) -> Result<(), L
         .run_passes("default<O3>", &machine, opts)
         .map_err(|e| LlvmError::Codegen(format!("run_passes O3: {e}")))?;
     Ok(())
+}
+
+/// Build the object-emit `TargetMachine` for the requested
+/// [`CodegenTarget`]. Native bakes the host CPU/features + PIC reloc;
+/// Wasm32 initialises the WebAssembly backend and pins the
+/// `wasm32-wasi` triple. The triple String returned alongside lets the
+/// caller stamp the module's target-triple (the DataLayout is pulled
+/// from the machine's target data) so the wasm object's pointer width /
+/// endianness match the machine.
+fn create_object_target_machine(
+    target: CodegenTarget,
+) -> Result<(TargetMachine, String), LlvmError> {
+    match target {
+        CodegenTarget::Native => {
+            Target::initialize_native(&InitializationConfig::default())
+                .map_err(|e| LlvmError::Codegen(format!("initialize_native: {e}")))?;
+            let triple_str = TargetMachine::get_default_triple();
+            let t = Target::from_triple(&triple_str)
+                .map_err(|e| LlvmError::Codegen(format!("target from_triple: {e}")))?;
+            let cpu = TargetMachine::get_host_cpu_name();
+            let features = TargetMachine::get_host_cpu_features();
+            let triple = TargetTriple::create(
+                triple_str
+                    .as_str()
+                    .to_str()
+                    .map_err(|e| LlvmError::Codegen(format!("triple utf8: {e}")))?,
+            );
+            let machine = t
+                .create_target_machine(
+                    &triple,
+                    cpu.to_str().unwrap_or(""),
+                    features.to_str().unwrap_or(""),
+                    OptimizationLevel::Aggressive,
+                    RelocMode::PIC,
+                    CodeModel::Default,
+                )
+                .ok_or_else(|| {
+                    LlvmError::Codegen("create_target_machine returned null".into())
+                })?;
+            let triple_owned = triple_str
+                .as_str()
+                .to_str()
+                .map_err(|e| LlvmError::Codegen(format!("triple utf8: {e}")))?
+                .to_string();
+            Ok((machine, triple_owned))
+        }
+        CodegenTarget::Wasm32 => {
+            // The WebAssembly backend lives behind the `target-webassembly`
+            // inkwell feature; `initialize_webassembly` registers it.
+            Target::initialize_webassembly(&InitializationConfig::default());
+            let triple = TargetTriple::create(WASM32_TRIPLE);
+            let t = Target::from_triple(&triple).map_err(|e| {
+                LlvmError::Codegen(format!("wasm32 target from_triple: {e}"))
+            })?;
+            // No host-CPU narrowing for wasm; the MVP+ feature set is
+            // controlled by the wasm runtime (wasmtime defaults). Reloc
+            // is irrelevant for the wasm object model — `Static`/`Default`
+            // both produce a relocatable `\0asm` object.
+            let machine = t
+                .create_target_machine(
+                    &triple,
+                    /*cpu=*/ "",
+                    /*features=*/ "",
+                    OptimizationLevel::Aggressive,
+                    RelocMode::Static,
+                    CodeModel::Default,
+                )
+                .ok_or_else(|| {
+                    LlvmError::Codegen("wasm32 create_target_machine returned null".into())
+                })?;
+            Ok((machine, WASM32_TRIPLE.to_string()))
+        }
+    }
 }
