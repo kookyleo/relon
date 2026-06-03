@@ -36,18 +36,14 @@
 //!   prerequisite). So the op cannot be exercised in isolation through
 //!   the public surface.
 //!
-//! What this test therefore pins is the **codegen reachability**: with
-//! the `schema` family now also landed (`LoadSchemaPtr`), a schema
-//! program that needs `LoadFieldAtAbsolute` *compiles* — `from_source`
-//! succeeds, proving both ops lower. The end-to-end *run* is still
-//! blocked, but the block is now downstream of codegen, in the shared
-//! Phase-B host arg marshaller (`evaluator.rs::write_value_into_builder`
-//! only has scalar Int/Float/Bool/Null arms — no Schema-typed `#main`
-//! param support yet), NOT in either family's op lowering. The test
-//! asserts exactly that boundary: build OK, run fails at the marshalling
-//! envelope with no unsupported-op error. When Phase 1 wires schema-arg
-//! marshalling, run_main will succeed and this test must be upgraded to
-//! assert the tree-walk value (`Int(42)`).
+//! What this test pins is the **full end-to-end path**: with the
+//! `schema` family (`LoadSchemaPtr`) and the `mem` family
+//! (`LoadFieldAtAbsolute`) both landed, *and* the Phase 0b host-side
+//! Schema-typed `#main` arg marshaller wired into
+//! `evaluator.rs::write_value_into_builder` (recursive `sub_record` /
+//! `finish_sub_record`), the nested-field program both compiles and
+//! runs. `#main(Outer o) -> Int : o.inner.v` with `o.inner.v == 42`
+//! returns `Value::Int(42)`, matching the tree-walk gold standard.
 
 use std::collections::HashMap;
 
@@ -72,37 +68,28 @@ fn nested_field_args(v: i64) -> HashMap<String, Value> {
     args
 }
 
-/// Regression guard for the `mem`-family seam wiring.
+/// End-to-end value assertion for the nested-schema-field path.
 ///
-/// With both `schema` (`LoadSchemaPtr`) and `mem` (`LoadFieldAtAbsolute`)
-/// landed, the nested-field program now *compiles*: `from_source`
-/// succeeds, proving `LoadFieldAtAbsolute` lowers (it is dispatched into
-/// `lower_mem_rest` and emitted, not hitting the unsupported stub). The
-/// end-to-end run is still blocked — but downstream of codegen, in the
-/// shared Phase-B host arg marshaller, which has no Schema-typed `#main`
-/// param arm yet. We assert that exact boundary: build OK; run fails at
-/// the marshalling envelope (`schema expects Schema`), with NO
-/// unsupported-op error for either family's op.
+/// With `schema` (`LoadSchemaPtr`), `mem` (`LoadFieldAtAbsolute`), and
+/// the Phase 0b host-side Schema-typed `#main` arg marshaller all wired,
+/// `#main(Outer o) -> Int : o.inner.v` runs end to end. The host packs
+/// the nested `Outer { inner: Inner { v: 42 } }` into the input buffer
+/// (recursive `sub_record` / `finish_sub_record`), `LoadSchemaPtr` lifts
+/// `o` to its absolute address, and `LoadFieldAtAbsolute` reads through
+/// to `.inner.v`. The result must equal the tree-walk gold standard,
+/// `Value::Int(42)`.
 #[test]
-fn load_field_at_absolute_is_wired_blocked_only_by_arg_marshalling() {
+fn nested_schema_field_runs_end_to_end() {
     let ev = LlvmAotEvaluator::from_source(NESTED_FIELD_SRC).expect(
         "schema (LoadSchemaPtr) + mem (LoadFieldAtAbsolute) both lower: \
          the nested-field program must compile",
     );
-    // The run is blocked solely by the shared Phase-B arg marshaller
-    // (no Schema-typed #main param support). When Phase 1 wires schema-
-    // arg marshalling, this returns Ok and the assertion below must be
-    // upgraded to `assert_eq!(got, Value::Int(42))`.
-    let err = ev
+    let got = ev
         .run_main(nested_field_args(42))
-        .expect_err("schema-typed #main arg is not marshalled in Phase B yet");
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("schema expects Schema"),
-        "block must be the arg-marshalling envelope, not codegen: {msg}"
-    );
-    assert!(
-        !msg.contains("LoadFieldAtAbsolute") && !msg.contains("LoadSchemaPtr"),
-        "neither family op may surface as unsupported anymore: {msg}"
+        .expect("nested-schema #main arg marshals + runs end to end");
+    assert_eq!(
+        got,
+        Value::Int(42),
+        "o.inner.v must read back the gold-standard tree-walk value"
     );
 }
