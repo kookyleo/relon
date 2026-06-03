@@ -87,3 +87,4 @@ pub use error::LlvmError;
 pub use evaluator::{
     EmitObjectInfo, EmittedEntryShape, EmittedField, EmittedFieldType, LlvmAotEvaluator,
 };
+pub use state::HostFnRegistry;

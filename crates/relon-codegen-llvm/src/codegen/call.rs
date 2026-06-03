@@ -16,30 +16,37 @@
 //! - [`Op::Trap`] — an unconditional `llvm.trap` + `unreachable`,
 //!   mirroring cranelift's `emit_trap` (unconditional `cond_trap`).
 //!
-//! `Op::CallNative` stays a `Codegen` stub: the LLVM-side native
-//! dispatch needs MCJIT symbol wiring + a host-fn registry that lives
-//! outside this file (see the module-level note in the Phase 0b report
-//! and the `unsupported_call_native` helper below).
+//! `Op::CallNative` (Phase 0b) lowers to open-world dynamic dispatch:
+//! the source-lowered call (`cap_bit == NO_CAPABILITY_BIT`) spills its
+//! scalar args into an `alloca` and calls the externally-mapped
+//! `relon_llvm_call_native` helper, which resolves the
+//! `import_idx`-keyed `Arc<dyn RelonFunction>` on the per-call
+//! `ArenaState`'s host-fn registry and invokes it. A non-zero
+//! `state.trap_code` after the call routes to `llvm.trap`. This mirrors
+//! cranelift's `emit_call_native_dynamic` / `RelonCallNative` vtable
+//! slot. The capability gate rides on the preceding `Op::CheckCap`. A
+//! hand-built `cap_bit != NO_CAPABILITY_BIT` direct-vtable call stays a
+//! precise `Codegen` error (the legacy raw-`HostFnPtr` path is not
+//! wired on this backend yet).
 
 use inkwell::values::{
     BasicMetadataValueEnum, BasicValueEnum,
 };
-use inkwell::IntPredicate;
+use inkwell::{AddressSpace, IntPredicate};
 
 use relon_ir::ir::{IrType, Op, TrapKind, NO_CAPABILITY_BIT};
 
 use crate::error::LlvmError;
+use crate::state::{NativeTrap, ARENA_STATE_OFFSET_TRAP_CODE};
 
 use super::*;
 
 impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// Phase 0b seam: native dispatch + capability gate + trap
     /// (`CallNative`, `CheckCap`, `Trap`). Dispatched from
-    /// `super::lower_op`.
-    ///
-    /// `CheckCap` + `Trap` are lowered here in full; `CallNative` stays
-    /// a `Codegen` error pending the cross-file MCJIT host-dispatch
-    /// wiring (see [`Self::unsupported_call_native`]).
+    /// `super::lower_op`. All three are lowered here in full —
+    /// `CallNative` via the dynamic-dispatch helper (see
+    /// [`Self::emit_call_native`]).
     pub(crate) fn lower_call_rest(
         &mut self,
         ip: usize,
@@ -51,9 +58,10 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             Op::Trap { kind } => self.emit_trap(*kind),
             Op::CallNative {
                 import_idx,
+                param_tys,
                 ret_ty,
-                ..
-            } => self.unsupported_call_native(*import_idx, *ret_ty),
+                cap_bit,
+            } => self.emit_call_native(*import_idx, param_tys, *ret_ty, *cap_bit),
             other => Err(LlvmError::Codegen(format!(
                 "lower_call_rest reached non-call op {other:?} at ip={ip}"
             ))),
@@ -123,12 +131,15 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .build_conditional_branch(denied, trap_bb, cont_bb)
             .map_err(|e| LlvmError::Codegen(format!("CheckCap branch: {e}")))?;
 
-        // Trap arm: shared `llvm.trap` then `unreachable`.
+        // Trap arm: record `CapabilityDenied` in `state.trap_code` and
+        // return the negative sentinel so the host surfaces a typed
+        // `RuntimeError::CapabilityDenied` after the dispatch returns —
+        // rather than an `llvm.trap` `ud2` (SIGILL) the host cannot
+        // catch on stable Rust. Mirrors cranelift's
+        // `cond_trap(CapabilityDenied)` outcome class. The host reads
+        // `ArenaState::trap_code()` before decoding the buffer.
         self.builder.position_at_end(trap_bb);
-        self.emit_llvm_trap_call("CheckCap")?;
-        self.builder
-            .build_unreachable()
-            .map_err(|e| LlvmError::Codegen(format!("CheckCap unreachable: {e}")))?;
+        self.emit_state_trap(NativeTrap::CapabilityDenied, "CheckCap")?;
 
         // Continue codegen on the granted path.
         self.builder.position_at_end(cont_bb);
@@ -159,22 +170,307 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         Ok(())
     }
 
-    /// `Op::CallNative` LLVM stub. The native dispatch needs the host-fn
-    /// registry + MCJIT symbol resolution wired through the evaluator
-    /// (out of this file); see the Phase 0b report's integration notes.
-    /// Surfacing a precise `Codegen` error lets the host fall back to a
-    /// tree-walk / cranelift tier rather than miscompiling the call.
-    fn unsupported_call_native(
-        &self,
+    /// Lower `Op::CallNative { import_idx, param_tys, ret_ty, cap_bit }`
+    /// via open-world dynamic dispatch — the LLVM mirror of cranelift's
+    /// `emit_call_native_dynamic`.
+    ///
+    /// Sequence (matches cranelift):
+    ///   1. validate `import_idx` / param shape / ret-ty against the
+    ///      module's `#native` import table;
+    ///   2. pop `param_tys.len()` operands, widen each to i64, spill
+    ///      them into an `alloca` block (the i64 lane the helper decodes);
+    ///   3. `call @relon_llvm_call_native(state, import_idx, args_ptr,
+    ///      count)`;
+    ///   4. load `state.trap_code`; a non-zero value branches to an
+    ///      `llvm.trap` (surfaces as a typed host error);
+    ///   5. push the i64 result if `ret_ty != Null`.
+    ///
+    /// Scope (phase-0b parity with the bytecode VM + the cranelift
+    /// dynamic path): scalar args ride the i64 lane; `ret_ty` must be
+    /// `I64` / `Bool` / `Null`. The capability gate is enforced
+    /// independently by the preceding `Op::CheckCap` op (which the
+    /// source lowering always prepends for a gated call); a
+    /// source-lowered `Op::CallNative` carries `cap_bit ==
+    /// NO_CAPABILITY_BIT` and dispatches dynamically. A hand-built
+    /// `cap_bit != NO_CAPABILITY_BIT` (the cranelift legacy raw-`HostFnPtr`
+    /// direct path) is not wired on the LLVM backend yet — it surfaces a
+    /// precise `Codegen` error so the host falls back rather than
+    /// miscompiling.
+    pub(crate) fn emit_call_native(
+        &mut self,
         import_idx: u32,
+        param_tys: &[IrType],
         ret_ty: IrType,
+        cap_bit: u32,
     ) -> Result<(), LlvmError> {
-        Err(LlvmError::Codegen(format!(
-            "Op::CallNative (import_idx={import_idx}, ret_ty={ret_ty:?}) not yet supported on the \
-             LLVM AOT backend: native dispatch needs the host-fn registry + MCJIT symbol wiring \
-             (cranelift's `relon_call_native` helper / `RelonCallNative` vtable slot), which lives \
-             outside the per-family codegen module"
-        )))
+        // Native dispatch only makes sense under the buffer-protocol
+        // entry — that's the only shape carrying the `*state` pointer
+        // the helper needs. The legacy / fast / helper / lambda emits
+        // never carry a `CallNative`, so reject up-front with a precise
+        // diagnostic rather than reading a null state pointer.
+        if !matches!(self.shape, EntryShape::Buffer) {
+            return Err(LlvmError::Codegen(format!(
+                "Op::CallNative (import_idx={import_idx}) requires the buffer-protocol entry \
+                 (only it threads the `*state` pointer the host-dispatch helper needs)"
+            )));
+        }
+
+        // The hand-built direct-`cap_bit` path (cranelift's legacy
+        // raw-`HostFnPtr` `cap_lookup` + `call_indirect`) is not wired
+        // on the LLVM backend. Source-lowered calls always carry
+        // `NO_CAPABILITY_BIT` and ride the dynamic helper below.
+        if cap_bit != NO_CAPABILITY_BIT {
+            return Err(LlvmError::Codegen(format!(
+                "Op::CallNative (import_idx={import_idx}) with cap_bit={cap_bit} (direct \
+                 capability-vtable dispatch) is unsupported on the LLVM AOT backend; only the \
+                 source-lowered NO_CAPABILITY_BIT dynamic-dispatch path is wired"
+            )));
+        }
+
+        // 1. Validate the import index + shapes against the module's
+        //    `#native` table (mirrors cranelift's `self.ir.imports`
+        //    check). Surfaces IR-pass bugs early.
+        let import = self.imports.get(import_idx as usize).ok_or_else(|| {
+            LlvmError::Codegen(format!(
+                "CallNative import_idx {import_idx} out of range (module has {} imports)",
+                self.imports.len()
+            ))
+        })?;
+        if import.param_tys != param_tys {
+            return Err(LlvmError::Codegen(format!(
+                "CallNative import #{import_idx} param shape disagreement: IR call has {:?}, import declares {:?}",
+                param_tys, import.param_tys
+            )));
+        }
+        if import.ret_ty != ret_ty {
+            return Err(LlvmError::Codegen(format!(
+                "CallNative import #{import_idx} ret_ty disagreement: IR call has {:?}, import declares {:?}",
+                ret_ty, import.ret_ty
+            )));
+        }
+        if !matches!(ret_ty, IrType::I64 | IrType::Bool | IrType::Null) {
+            return Err(LlvmError::Codegen(format!(
+                "CallNative dynamic dispatch (import #{import_idx}) ret_ty {ret_ty:?} outside the \
+                 phase-0b scalar envelope (I64 / Bool / Null only)"
+            )));
+        }
+
+        let call_native_fn = self.call_native_fn.ok_or_else(|| {
+            LlvmError::Codegen(
+                "Op::CallNative: relon_llvm_call_native helper not declared (emit_module_funcs \
+                 forgot to wire it for the buffer entry)"
+                    .into(),
+            )
+        })?;
+        let state_ptr = self.state_ptr.ok_or_else(|| {
+            LlvmError::Codegen("Op::CallNative: buffer entry missing state pointer".into())
+        })?;
+
+        let i32_t = self.ctx.i32_type();
+        let i64_t = self.ctx.i64_type();
+        let ptr_t = self.ctx.ptr_type(AddressSpace::default());
+        let i8_t = self.ctx.i8_type();
+        let n = param_tys.len();
+
+        // 2. Pop the args (last-pushed = last declaration-order arg) and
+        //    widen each to i64 (the lane the helper decodes).
+        let mut args: Vec<IntValue<'ctx>> = Vec::with_capacity(n);
+        for _ in 0..n {
+            args.push(self.pop_int("CallNative arg")?);
+        }
+        args.reverse();
+
+        let mut widened: Vec<IntValue<'ctx>> = Vec::with_capacity(n);
+        for (i, v) in args.iter().enumerate() {
+            let w = v.get_type().get_bit_width();
+            let v64 = if w == 64 {
+                *v
+            } else if w < 64 {
+                // Scalar IR args ride as i32 (Bool / I32) — zero-extend
+                // into the i64 lane. The host fn re-wraps as Value::Int.
+                self.builder
+                    .build_int_z_extend(*v, i64_t, &self.next_name("cn_arg_zext"))
+                    .map_err(|e| LlvmError::Codegen(format!("CallNative arg{i} zext: {e}")))?
+            } else {
+                return Err(LlvmError::Codegen(format!(
+                    "CallNative arg{i} has i{w} width outside the phase-0b i64 lane"
+                )));
+            };
+            widened.push(v64);
+        }
+
+        // Spill the widened args into an alloca block (8-byte-aligned
+        // i64 slots) — the contiguous layout `relon_llvm_call_native`
+        // decodes. `args_ptr = null` for the nullary case. The alloca is
+        // placed in the entry block so mem2reg / SROA can promote it.
+        let args_ptr = if n == 0 {
+            ptr_t.const_null()
+        } else {
+            let arr_ty = i64_t.array_type(n as u32);
+            let entry_bb = self.func.get_first_basic_block().ok_or_else(|| {
+                LlvmError::Codegen("CallNative: function has no entry block".into())
+            })?;
+            let cur = self.builder.get_insert_block();
+            if let Some(first) = entry_bb.get_first_instruction() {
+                self.builder.position_before(&first);
+            } else {
+                self.builder.position_at_end(entry_bb);
+            }
+            let slot = self
+                .builder
+                .build_alloca(arr_ty, &self.next_name("cn_args"))
+                .map_err(|e| LlvmError::Codegen(format!("CallNative args alloca: {e}")))?;
+            if let Some(bb) = cur {
+                self.builder.position_at_end(bb);
+            }
+            for (i, v) in widened.iter().enumerate() {
+                let gep = unsafe {
+                    self.builder
+                        .build_in_bounds_gep(
+                            i64_t,
+                            slot,
+                            &[i32_t.const_int(i as u64, false)],
+                            &self.next_name("cn_arg_gep"),
+                        )
+                        .map_err(|e| LlvmError::Codegen(format!("CallNative arg{i} gep: {e}")))?
+                };
+                self.builder
+                    .build_store(gep, *v)
+                    .map_err(|e| LlvmError::Codegen(format!("CallNative arg{i} store: {e}")))?;
+            }
+            slot
+        };
+
+        // 3. call @relon_llvm_call_native(state, import_idx, args_ptr, count)
+        let import_v = i32_t.const_int(u64::from(import_idx), false);
+        let count_v = i32_t.const_int(n as u64, false);
+        let call_args: [BasicMetadataValueEnum<'ctx>; 4] = [
+            state_ptr.into(),
+            import_v.into(),
+            args_ptr.into(),
+            count_v.into(),
+        ];
+        let call_site = self
+            .builder
+            .build_call(call_native_fn, &call_args, &self.next_name("cn_call"))
+            .map_err(|e| LlvmError::Codegen(format!("CallNative build_call: {e}")))?;
+        let result = match call_site.try_as_basic_value() {
+            inkwell::values::ValueKind::Basic(BasicValueEnum::IntValue(v)) => v,
+            other => {
+                return Err(LlvmError::Codegen(format!(
+                    "CallNative: helper returned {other:?}, expected i64"
+                )));
+            }
+        };
+
+        // 4. load `state.trap_code` (the helper records a NativeTrap
+        //    code on failure); a non-zero value means the dispatch
+        //    failed. Return the negative sentinel so the host surfaces a
+        //    typed `RuntimeError` after the dispatch (the helper already
+        //    stored the precise code) — no `llvm.trap` / SIGILL.
+        let trap_gep = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    state_ptr,
+                    &[i32_t.const_int(u64::from(ARENA_STATE_OFFSET_TRAP_CODE), false)],
+                    &self.next_name("cn_trap_gep"),
+                )
+                .map_err(|e| LlvmError::Codegen(format!("CallNative trap_code gep: {e}")))?
+        };
+        let trap_code = self
+            .builder
+            .build_load(i64_t, trap_gep, &self.next_name("cn_trap_code"))
+            .map_err(|e| LlvmError::Codegen(format!("CallNative trap_code load: {e}")))?
+            .into_int_value();
+        let zero = i64_t.const_zero();
+        let trapped = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                trap_code,
+                zero,
+                &self.next_name("cn_trapped"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("CallNative trap cmp: {e}")))?;
+        let trap_bb = self.ctx.append_basic_block(self.func, "cn_trap");
+        let cont_bb = self.ctx.append_basic_block(self.func, "cn_cont");
+        self.builder
+            .build_conditional_branch(trapped, trap_bb, cont_bb)
+            .map_err(|e| LlvmError::Codegen(format!("CallNative trap branch: {e}")))?;
+        self.builder.position_at_end(trap_bb);
+        // The helper already wrote the precise code; just return the
+        // negative sentinel without overwriting it.
+        self.emit_trap_sentinel_return("CallNative")?;
+        self.builder.position_at_end(cont_bb);
+
+        // 5. Push the result. The IR's scalar return types (I64 / Bool)
+        //    all ride the i64 lane; truncate Bool back to i32 to match
+        //    the operand-stack width convention.
+        match ret_ty {
+            IrType::Null => {}
+            IrType::I64 => self.push(result, IrType::I64),
+            IrType::Bool => {
+                let b = self
+                    .builder
+                    .build_int_truncate(result, i32_t, &self.next_name("cn_ret_bool"))
+                    .map_err(|e| LlvmError::Codegen(format!("CallNative ret trunc: {e}")))?;
+                self.push(b, IrType::Bool);
+            }
+            other => {
+                return Err(LlvmError::Codegen(format!(
+                    "CallNative ret_ty {other:?} unreachable after envelope check"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Phase 0b shared trap epilogue: store `code` into
+    /// `state.trap_code`, then `ret i32 -1`. Used by the `Op::CheckCap`
+    /// deny path. The negative bytes-written sentinel signals the host
+    /// to read `ArenaState::trap_code()` and lift it to a typed
+    /// `RuntimeError` instead of decoding the (unwritten) output buffer.
+    /// Requires the buffer-protocol entry (caller asserts `state_ptr`).
+    /// After the terminator the caller positions at a fresh continuation
+    /// block.
+    fn emit_state_trap(&mut self, code: NativeTrap, op_hint: &str) -> Result<(), LlvmError> {
+        let state_ptr = self.state_ptr.ok_or_else(|| {
+            LlvmError::Codegen(format!("{op_hint}: state trap requires the buffer entry"))
+        })?;
+        let i8_t = self.ctx.i8_type();
+        let i32_t = self.ctx.i32_type();
+        let i64_t = self.ctx.i64_type();
+        let gep = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    state_ptr,
+                    &[i32_t.const_int(u64::from(ARENA_STATE_OFFSET_TRAP_CODE), false)],
+                    &self.next_name("trap_store_gep"),
+                )
+                .map_err(|e| LlvmError::Codegen(format!("{op_hint} trap_code gep: {e}")))?
+        };
+        self.builder
+            .build_store(gep, i64_t.const_int(code as u64, false))
+            .map_err(|e| LlvmError::Codegen(format!("{op_hint} trap_code store: {e}")))?;
+        self.emit_trap_sentinel_return(op_hint)
+    }
+
+    /// Emit `ret i32 -1` — the negative bytes-written sentinel the host
+    /// reads as "a trap fired; decode `ArenaState::trap_code()`". Used
+    /// by both [`Self::emit_state_trap`] (which writes the code first)
+    /// and the `Op::CallNative` trap branch (where the dispatch helper
+    /// already wrote the code). Must be called on a fresh block; the
+    /// caller positions at a continuation block afterwards.
+    fn emit_trap_sentinel_return(&mut self, op_hint: &str) -> Result<(), LlvmError> {
+        let i32_t = self.ctx.i32_type();
+        // -1 as i32 — `const_int` takes the two's-complement bit pattern.
+        let neg_one = i32_t.const_int(u64::from(u32::MAX), false);
+        self.builder
+            .build_return(Some(&neg_one))
+            .map_err(|e| LlvmError::Codegen(format!("{op_hint} trap sentinel ret: {e}")))?;
+        Ok(())
     }
 
     /// Phase E.2 multi-function dispatch: lower `Op::Call`.
