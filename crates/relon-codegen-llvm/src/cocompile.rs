@@ -153,33 +153,10 @@ pub fn cocompile_legacy_i64(
 
     let ir_before_link = module.print_to_string().to_string();
 
-    // Compile + link the host bitcode for every imported host fn. One
-    // shim crate carries them all; we link it once.
-    let host_bc = compile_host_shim_to_bitcode(host_shim_src)?;
-    let host_module = LlvmModule::parse_bitcode_from_path(&host_bc, ctx)
-        .map_err(|e| LlvmError::Codegen(format!("cocompile: parse host bitcode: {e}")))?;
-    module
-        .link_in_module(host_module)
-        .map_err(|e| LlvmError::Codegen(format!("cocompile: link_in_module: {e}")))?;
-
-    // Force-inline every host fn the import table named. rustc's
-    // default attribute set makes the O3 inliner decline a trivial
-    // single-use call, so we stamp `alwaysinline` explicitly — this is
-    // the trusted-host-fn inline the LTO co-compile relies on.
-    let always_inline = ctx.create_enum_attribute(
-        inkwell::attributes::Attribute::get_named_enum_kind_id("alwaysinline"),
-        0,
-    );
-    for import in &ir.imports {
-        if let Some(host_fn) = module.get_function(&import.name) {
-            // Only a fn with a body can be inlined; an unresolved decl
-            // would mean the shim didn't define it (surface as an error
-            // later when the JIT can't resolve the symbol).
-            if host_fn.get_first_basic_block().is_some() {
-                host_fn.add_attribute(AttributeLoc::Function, always_inline);
-            }
-        }
-    }
+    // Compile + link the host bitcode for every imported host fn, then
+    // force-inline. Shared with the source-driven `emit_object` buffer
+    // path (`evaluator.rs`).
+    link_and_inline_host_shim(&module, host_shim_src, &ir.imports)?;
 
     run_default_o3_pipeline(&module)?;
 
@@ -196,13 +173,68 @@ pub fn cocompile_legacy_i64(
     })
 }
 
+/// Link a host shim crate's bitcode into `module` and force-inline
+/// every host fn the `imports` table names.
+///
+/// Shared by both closed-world producers:
+/// - [`cocompile_legacy_i64`] (the hand-built JIT spike fixture);
+/// - `LlvmAotEvaluator::emit_object_with_options` (the source-driven
+///   buffer-protocol object path).
+///
+/// 1. compile `host_shim_src` to LLVM-18-compatible bitcode via the
+///    textual-IR / `llvm-as-18` skew bridge (see module docs);
+/// 2. `link_in_module` it into `module`;
+/// 3. stamp `alwaysinline` on every imported host fn that arrived with
+///    a body, so the subsequent O3 pass folds the direct
+///    `call @<host_symbol>` sites into their callers (rustc's default
+///    attribute set otherwise makes the cost-model decline even a
+///    trivial single-use call).
+///
+/// The caller runs the O3 / LTO pipeline afterwards. A host fn the
+/// shim never defined stays an unresolved declaration; that surfaces
+/// downstream (JIT symbol lookup / linker) rather than here.
+pub(crate) fn link_and_inline_host_shim(
+    module: &LlvmModule<'_>,
+    host_shim_src: &str,
+    imports: &[relon_ir::ir::NativeImport],
+) -> Result<(), LlvmError> {
+    let ctx = module.get_context();
+    let host_bc = compile_host_shim_to_bitcode(host_shim_src)?;
+    let host_module = LlvmModule::parse_bitcode_from_path(&host_bc, ctx)
+        .map_err(|e| LlvmError::Codegen(format!("cocompile: parse host bitcode: {e}")))?;
+    module
+        .link_in_module(host_module)
+        .map_err(|e| LlvmError::Codegen(format!("cocompile: link_in_module: {e}")))?;
+
+    let always_inline = ctx.create_enum_attribute(
+        inkwell::attributes::Attribute::get_named_enum_kind_id("alwaysinline"),
+        0,
+    );
+    for import in imports {
+        if let Some(host_fn) = module.get_function(&import.name) {
+            if host_fn.get_first_basic_block().is_some() {
+                host_fn.add_attribute(AttributeLoc::Function, always_inline);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Compile a host shim Rust source to LLVM-18-compatible bitcode.
 ///
 /// The skew bridge (see module docs): emit textual IR with rustc, then
 /// re-assemble it with the system `llvm-as-18`. The returned path is a
 /// `.bc` the inkwell (LLVM-18) module can `parse_bitcode_from_path`.
 fn compile_host_shim_to_bitcode(host_shim_src: &str) -> Result<std::path::PathBuf, LlvmError> {
-    let dir = std::env::temp_dir().join(format!("relon_cocompile_{}", std::process::id()));
+    // Per-invocation unique dir: PID alone collides when two
+    // co-compiles run on the same process (concurrent test threads, or
+    // a JIT + object emit in one build), racing on `host_shim.ll`.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "relon_cocompile_{}_{seq}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir)
         .map_err(|e| LlvmError::Codegen(format!("cocompile: mkdir tmp: {e}")))?;
     let rs_path = dir.join("host_shim.rs");
@@ -218,6 +250,10 @@ fn compile_host_shim_to_bitcode(host_shim_src: &str) -> Result<std::path::PathBu
             "--emit=llvm-ir",
             "--crate-type=cdylib",
             "-O",
+            // Single codegen unit so `--emit=llvm-ir` writes one
+            // `host_shim.ll` rather than per-CGU `*.rcgu.0.ll` shards
+            // it then fails to merge under `-o`.
+            "-Ccodegen-units=1",
             rs_path.to_str().unwrap(),
             "-o",
             ll_path.to_str().unwrap(),

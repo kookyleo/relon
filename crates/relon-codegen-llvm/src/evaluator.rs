@@ -40,8 +40,9 @@ use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
 use relon_parser::Node;
 
 use crate::codegen::{
-    emit_fast_entry, emit_module_funcs, is_buffer_protocol_signature, ConstPool, EntryShape,
-    FastPathProfile, ENTRY_SYMBOL, ENTRY_SYMBOL_FAST,
+    emit_fast_entry, emit_module_funcs, emit_module_funcs_closed_world,
+    is_buffer_protocol_signature, ConstPool, EntryShape, FastPathProfile, WorldMode, ENTRY_SYMBOL,
+    ENTRY_SYMBOL_FAST,
 };
 use crate::error::LlvmError;
 use crate::state::ArenaState;
@@ -333,10 +334,59 @@ impl LlvmAotEvaluator {
         Ok((lowered.module, lowered.main_schema, lowered.return_schema))
     }
 
+    /// Stage 2.⑤ closed-world source constructor. Builds the
+    /// buffer-protocol JIT evaluator with `Op::CallNative` lowered to a
+    /// direct `call @<host_symbol>`, links + inlines the host shim
+    /// bitcode, and reuses the open-world arena-handshake dispatch
+    /// (`run_main`) verbatim — the entry symbol / signature are
+    /// identical, only the native-dispatch lowering differs. No host-fn
+    /// registry / cap mask is needed at runtime: the host body is folded
+    /// into the entry by the LTO inline, so there is no dynamic
+    /// `relon_llvm_call_native` hop to resolve.
+    ///
+    /// The differential oracle for this path is the open-world
+    /// `from_source_with_options` + `run_main` result (anchored, in
+    /// turn, to cranelift's `native_call_from_source`).
+    pub fn from_source_closed_world(
+        src: &str,
+        options: &relon_analyzer::AnalyzeOptions,
+        host_shim_src: &str,
+    ) -> Result<Self, LlvmError> {
+        let (ir, main_schema, return_schema) = Self::lower_source_with_options(src, Some(options))?;
+        let main_layout = relon_eval_api::layout::SchemaLayout::offsets_for(&main_schema)
+            .map_err(|e| LlvmError::Codegen(format!("main schema layout: {e}")))?;
+        let return_layout = relon_eval_api::layout::SchemaLayout::offsets_for(&return_schema)
+            .map_err(|e| LlvmError::Codegen(format!("return schema layout: {e}")))?;
+        let param_names: Vec<String> = main_schema.fields.iter().map(|f| f.name.clone()).collect();
+        let schema = BufferSchema {
+            main_schema,
+            return_schema,
+            main_layout,
+            return_layout,
+        };
+        Self::from_ir_inner_world(
+            ir,
+            param_names,
+            Some(schema),
+            WorldMode::ClosedWorld,
+            Some(host_shim_src),
+        )
+    }
+
     fn from_ir_inner(
         ir: relon_ir::ir::Module,
         param_names: Vec<String>,
         buffer_schema: Option<BufferSchema>,
+    ) -> Result<Self, LlvmError> {
+        Self::from_ir_inner_world(ir, param_names, buffer_schema, WorldMode::OpenWorld, None)
+    }
+
+    fn from_ir_inner_world(
+        ir: relon_ir::ir::Module,
+        param_names: Vec<String>,
+        buffer_schema: Option<BufferSchema>,
+        world_mode: WorldMode,
+        host_shim_src: Option<&str>,
     ) -> Result<Self, LlvmError> {
         let entry_idx = ir
             .entry_func_index
@@ -440,7 +490,11 @@ impl LlvmAotEvaluator {
             .iter()
             .map(|&ir_idx| &ir.funcs[ir_idx as usize])
             .collect();
-        let (_llvm_fn, entry_shape, helper_table, closure_fn_table) = emit_module_funcs(
+        let emit = match world_mode {
+            WorldMode::OpenWorld => emit_module_funcs,
+            WorldMode::ClosedWorld => emit_module_funcs_closed_world,
+        };
+        let (_llvm_fn, entry_shape, helper_table, closure_fn_table) = emit(
             ctx_static,
             &module,
             entry,
@@ -452,6 +506,21 @@ impl LlvmAotEvaluator {
             &ir.closure_table,
             &ir.imports,
         )?;
+
+        // Stage 2.⑤ closed-world: link + inline the host shim bitcode
+        // into the JIT module so the direct `call @<host_symbol>` sites
+        // fold into the host body during the O3 pass below. Done before
+        // the fast-entry emit so a fast entry (Int-only, no native call)
+        // is unaffected; closed-world sources always take the buffer
+        // entry because they carry an `Op::CallNative`.
+        if matches!(world_mode, WorldMode::ClosedWorld) {
+            let shim = host_shim_src.ok_or_else(|| {
+                LlvmError::Codegen(
+                    "from_ir_inner_world: ClosedWorld requires a host_shim_src".into(),
+                )
+            })?;
+            crate::cocompile::link_and_inline_host_shim(&module, shim, &ir.imports)?;
+        }
 
         // Phase D.1 / D.2: attempt to emit the typed fast-path entry
         // alongside the buffer entry whenever the schema qualifies.
@@ -1968,7 +2037,50 @@ impl LlvmAotEvaluator {
         entry_symbol: &str,
         out_path: &Path,
     ) -> Result<EmitObjectInfo, LlvmError> {
-        let (ir, main_schema, return_schema) = Self::lower_source_with_options(src, None)?;
+        // Thin wrapper preserving the historical 3-arg signature the
+        // rs-build `emit_all` calls (Stage 2 keeps this call site
+        // stable). Default options (no host `#native` declarations) +
+        // open-world dispatch — byte-identical to the pre-S2.⑤ path.
+        let options = relon_analyzer::AnalyzeOptions {
+            strict_mode: false,
+            ..Default::default()
+        };
+        Self::emit_object_with_options(
+            src,
+            entry_symbol,
+            out_path,
+            &options,
+            WorldMode::OpenWorld,
+            None,
+        )
+    }
+
+    /// Stage 2.⑤ options-carrying object-emit seam.
+    ///
+    /// Threads a caller-supplied [`relon_analyzer::AnalyzeOptions`] (so
+    /// host `#native` declarations resolve — the W1-C capability-gate
+    /// e2e enabler) and a [`WorldMode`] through the object-emit path.
+    ///
+    /// - [`WorldMode::OpenWorld`] (the [`Self::emit_object`] default):
+    ///   `Op::CallNative` lowers to the dynamic `relon_llvm_call_native`
+    ///   helper. `host_shim_src` is ignored.
+    /// - [`WorldMode::ClosedWorld`]: `Op::CallNative` lowers to a direct
+    ///   `call @<host_symbol>`; `host_shim_src` (the `#[no_mangle]
+    ///   extern "C"` host crate) is compiled to LLVM-18 bitcode, linked
+    ///   into the emitted module, force-inlined, and folded by O3 — so
+    ///   every native call collapses to the host fn body in the `.o`.
+    ///   A `None` shim on the closed-world path is an error when the
+    ///   source actually imports a host fn.
+    pub fn emit_object_with_options(
+        src: &str,
+        entry_symbol: &str,
+        out_path: &Path,
+        options: &relon_analyzer::AnalyzeOptions,
+        world_mode: WorldMode,
+        host_shim_src: Option<&str>,
+    ) -> Result<EmitObjectInfo, LlvmError> {
+        let (ir, main_schema, return_schema) =
+            Self::lower_source_with_options(src, Some(options))?;
         let main_layout = relon_eval_api::layout::SchemaLayout::offsets_for(&main_schema)
             .map_err(|e| LlvmError::Codegen(format!("main schema layout: {e}")))?;
         let return_layout = relon_eval_api::layout::SchemaLayout::offsets_for(&return_schema)
@@ -2008,7 +2120,17 @@ impl LlvmAotEvaluator {
         // Fast-path eligibility — Int-only schema, arity <= 8, no
         // pointer-indirect leaves. Sources that don't qualify drop to
         // the buffer-protocol path below.
-        let fast_profile = build_fast_path_profile(&schema).ok();
+        //
+        // Stage 2.⑤: the closed-world path always takes the buffer
+        // entry — `Op::CallNative` needs the `*state` pointer only the
+        // buffer entry threads (the fast entry has no state slot). An
+        // Int-only `#main` that calls a host fn would otherwise match
+        // the fast profile and emit an entry the native-dispatch
+        // lowering rejects. Force buffer mode for closed-world.
+        let fast_profile = match world_mode {
+            WorldMode::ClosedWorld => None,
+            WorldMode::OpenWorld => build_fast_path_profile(&schema).ok(),
+        };
 
         let ctx = Context::create();
         let module = ctx.create_module("relon_rs_object");
@@ -2072,7 +2194,16 @@ impl LlvmAotEvaluator {
                     .iter()
                     .map(|&ir_idx| &ir.funcs[ir_idx as usize])
                     .collect();
-                let (llvm_fn, _entry_shape, _helper_table, _closure_fn_table) = emit_module_funcs(
+                // Stage 2.⑤: pick the dispatch emitter by world mode.
+                // Open-world (default / rs-build today) keeps the
+                // dynamic `relon_llvm_call_native` hop; closed-world
+                // lowers `Op::CallNative` to a direct `call @<host>`
+                // that the host-bitcode link + inline below folds away.
+                let emit = match world_mode {
+                    WorldMode::OpenWorld => emit_module_funcs,
+                    WorldMode::ClosedWorld => emit_module_funcs_closed_world,
+                };
+                let (llvm_fn, _entry_shape, _helper_table, _closure_fn_table) = emit(
                     &ctx,
                     &module,
                     entry,
@@ -2089,6 +2220,21 @@ impl LlvmAotEvaluator {
                 // consuming binary's linker can resolve it.
                 llvm_fn.as_global_value().set_name(entry_symbol);
                 llvm_fn.set_linkage(Linkage::External);
+
+                // Closed-world: link the host shim bitcode into THIS
+                // module + force-inline every imported host fn so the
+                // direct `call @<host>` sites collapse to the host body.
+                // Reuses the `crate::cocompile` link/inline orchestration.
+                if matches!(world_mode, WorldMode::ClosedWorld) {
+                    let shim = host_shim_src.ok_or_else(|| {
+                        LlvmError::Codegen(
+                            "emit_object_with_options: ClosedWorld requires a host_shim_src \
+                             (the #[no_mangle] extern \"C\" host crate to link + inline)"
+                                .into(),
+                        )
+                    })?;
+                    crate::cocompile::link_and_inline_host_shim(&module, shim, &ir.imports)?;
+                }
 
                 // Detect whether the emitted module references the
                 // `relon_llvm_str_contains_arena` host shim — drives

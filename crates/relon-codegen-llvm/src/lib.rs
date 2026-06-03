@@ -86,6 +86,7 @@ mod state;
 mod str_helpers;
 mod vtable;
 
+pub use codegen::WorldMode;
 pub use error::LlvmError;
 pub use evaluator::{
     EmitObjectInfo, EmittedEntryShape, EmittedField, EmittedFieldType, LlvmAotEvaluator,
