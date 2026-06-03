@@ -203,12 +203,17 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         ret_ty: IrType,
         cap_bit: u32,
     ) -> Result<(), LlvmError> {
-        // Native dispatch only makes sense under the buffer-protocol
-        // entry — that's the only shape carrying the `*state` pointer
-        // the helper needs. The legacy / fast / helper / lambda emits
-        // never carry a `CallNative`, so reject up-front with a precise
-        // diagnostic rather than reading a null state pointer.
-        if !matches!(self.shape, EntryShape::Buffer) {
+        // Open-world dynamic dispatch only makes sense under the
+        // buffer-protocol entry — that's the only shape carrying the
+        // `*state` pointer the `relon_llvm_call_native` helper needs.
+        // The closed-world direct path (Stage 1.B) needs no state
+        // pointer (it emits a plain `call @<host_symbol>`), so it is
+        // accepted on the legacy-i64 entry too — the spike fixture rides
+        // the legacy shape so the linked + inlined module JITs without
+        // the buffer arena handshake.
+        if matches!(self.world_mode, super::WorldMode::OpenWorld)
+            && !matches!(self.shape, EntryShape::Buffer)
+        {
             return Err(LlvmError::Codegen(format!(
                 "Op::CallNative (import_idx={import_idx}) requires the buffer-protocol entry \
                  (only it threads the `*state` pointer the host-dispatch helper needs)"
@@ -253,6 +258,15 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 "CallNative dynamic dispatch (import #{import_idx}) ret_ty {ret_ty:?} outside the \
                  phase-0b scalar envelope (I64 / Bool / Null only)"
             )));
+        }
+
+        // Stage 1.B: closed-world co-compile lowers `Op::CallNative` to
+        // a static `call @<host_symbol>` (cranelift's *static* cap_lookup
+        // -> fn_ptr arm), not the open-world dynamic helper. The host
+        // bitcode is linked in + inlined by `crate::cocompile`. Splits
+        // here so the open-world helper path below is untouched.
+        if matches!(self.world_mode, super::WorldMode::ClosedWorld) {
+            return self.emit_call_native_direct(import_idx, param_tys.len(), ret_ty);
         }
 
         let call_native_fn = self.call_native_fn.ok_or_else(|| {
@@ -420,6 +434,115 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             other => {
                 return Err(LlvmError::Codegen(format!(
                     "CallNative ret_ty {other:?} unreachable after envelope check"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Stage 1.B closed-world direct dispatch for `Op::CallNative`.
+    ///
+    /// Emits a static `call @<host_symbol>` against the `extern`
+    /// declaration `emit_module_funcs_closed_world` pre-declared from
+    /// the `#native` import table (mirrors cranelift's *static*
+    /// `cap_lookup -> fn_ptr -> call_indirect` arm, but resolved fully
+    /// statically since the host-fn set is closed at emit time). The
+    /// host bitcode is linked in + inlined by [`crate::cocompile`], so
+    /// after the O3 / LTO pass this site collapses to the host fn body
+    /// (zero residual `call`).
+    ///
+    /// All scalar args / returns ride the i64 lane (`Bool` / `I32`
+    /// zero-extend in; the i64-bits convention `relon_llvm_call_native`
+    /// also decodes — so the closed-world result is bit-for-bit equal to
+    /// the open-world path). No `state.trap_code` probe: a co-compiled
+    /// host fn is trusted (capability gating, if any, rides on the
+    /// preceding `Op::CheckCap`), so there is no dynamic dispatch failure
+    /// to surface.
+    fn emit_call_native_direct(
+        &mut self,
+        import_idx: u32,
+        n: usize,
+        ret_ty: IrType,
+    ) -> Result<(), LlvmError> {
+        let import = self.imports.get(import_idx as usize).ok_or_else(|| {
+            LlvmError::Codegen(format!(
+                "CallNative (closed-world) import_idx {import_idx} out of range"
+            ))
+        })?;
+        let host_fn = self.module.get_function(&import.name).ok_or_else(|| {
+            LlvmError::Codegen(format!(
+                "Op::CallNative (closed-world): host fn `{}` not declared \
+                 (emit_module_funcs_closed_world forgot to declare it)",
+                import.name
+            ))
+        })?;
+
+        let i32_t = self.ctx.i32_type();
+        let i64_t = self.ctx.i64_type();
+
+        // Pop the args (last-pushed = last declaration-order arg) and
+        // widen each to the i64 lane, matching the host shim ABI.
+        let mut args: Vec<IntValue<'ctx>> = Vec::with_capacity(n);
+        for _ in 0..n {
+            args.push(self.pop_int("CallNative arg")?);
+        }
+        args.reverse();
+
+        let mut call_args: Vec<BasicMetadataValueEnum<'ctx>> = Vec::with_capacity(n);
+        for (i, v) in args.iter().enumerate() {
+            let w = v.get_type().get_bit_width();
+            let v64 = if w == 64 {
+                *v
+            } else if w < 64 {
+                self.builder
+                    .build_int_z_extend(*v, i64_t, &self.next_name("cn_direct_zext"))
+                    .map_err(|e| LlvmError::Codegen(format!("CallNative arg{i} zext: {e}")))?
+            } else {
+                return Err(LlvmError::Codegen(format!(
+                    "CallNative arg{i} has i{w} width outside the i64 lane"
+                )));
+            };
+            call_args.push(v64.into());
+        }
+
+        let call_site = self
+            .builder
+            .build_call(host_fn, &call_args, &self.next_name("cn_direct_call"))
+            .map_err(|e| LlvmError::Codegen(format!("CallNative direct build_call: {e}")))?;
+
+        // Push the result (if any). I64 / Bool both ride the i64 lane;
+        // Bool truncates back to the i32 operand-stack width.
+        match ret_ty {
+            IrType::Null => {}
+            IrType::I64 => {
+                let result = match call_site.try_as_basic_value() {
+                    inkwell::values::ValueKind::Basic(BasicValueEnum::IntValue(v)) => v,
+                    other => {
+                        return Err(LlvmError::Codegen(format!(
+                            "CallNative direct: host fn returned {other:?}, expected i64"
+                        )));
+                    }
+                };
+                self.push(result, IrType::I64);
+            }
+            IrType::Bool => {
+                let result = match call_site.try_as_basic_value() {
+                    inkwell::values::ValueKind::Basic(BasicValueEnum::IntValue(v)) => v,
+                    other => {
+                        return Err(LlvmError::Codegen(format!(
+                            "CallNative direct: host fn returned {other:?}, expected i64"
+                        )));
+                    }
+                };
+                let b = self
+                    .builder
+                    .build_int_truncate(result, i32_t, &self.next_name("cn_direct_bool"))
+                    .map_err(|e| LlvmError::Codegen(format!("CallNative direct ret trunc: {e}")))?;
+                self.push(b, IrType::Bool);
+            }
+            other => {
+                return Err(LlvmError::Codegen(format!(
+                    "CallNative direct ret_ty {other:?} unreachable after envelope check"
                 )));
             }
         }
