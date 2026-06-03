@@ -43,7 +43,12 @@ ordered-float = { workspace = true }
 # - `default-features = false` drops the `target-all` umbrella (all
 #   18 architectures) so cold builds don't link every backend; we
 #   reinstate just the host x86 backend below.
-inkwell = { version = "=0.9.0", default-features = false, features = ["llvm18-1", "target-x86"] }
+#   `target-webassembly` (P3 / S3.X): reinstate the wasm32 backend so
+#   the SAME relon-IR → LLVM-IR emitter can retarget to `wasm32-wasi`
+#   and emit a `\0asm` object. The native x86 path is unaffected; the
+#   wasm backend is only reached when `emit_object*` is called with
+#   `Target::Wasm32`.
+inkwell = { version = "=0.9.0", default-features = false, features = ["llvm18-1", "target-x86", "target-webassembly"] }
 
 # Phase L codegen-quality: MCJIT custom memory manager needs raw mmap
 # control so we can place code with `CodeModel::Small`. The default
@@ -65,3 +70,8 @@ relon-codegen-cranelift = { workspace = true }
 # AOT-1 differential oracle: the f64 arithmetic tests cross-check the
 # LLVM JIT output against the tree-walking interpreter bit-for-bit.
 relon-evaluator = { workspace = true }
+# S3.X wasm32 retarget: `tests/aot_wasm.rs` runs the LLVM→wasm32 object
+# (linked with `wasm-ld`) inside wasmtime and differentials the result
+# against the native `emit_object` / `run_main` oracle. Dev-only so the
+# production codegen crate does not pull in the wasm runtime.
+wasmtime = "45"

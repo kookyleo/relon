@@ -2016,6 +2016,7 @@ dependencies = [
  "relon-parser",
  "relon-util",
  "thiserror 2.0.18",
+ "wasmtime",
 ]
 
 [[package]]
