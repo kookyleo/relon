@@ -16,6 +16,10 @@ categories = ["compilers", "development-tools::build-utils"]
 # callers must have LLVM 18 dev headers on the host (env
 # `LLVM_SYS_181_PREFIX`).
 relon-codegen-llvm = { workspace = true }
+# `AnalyzeOptions` / `FnSignature` / `NativeFnGate` / `Capabilities` —
+# the host-fn declaration surface the closed-world `#native` emit path
+# threads so a gated host call resolves + bakes its `Op::CheckCap` gate.
+relon-analyzer = { workspace = true }
 # Leaf util: shared `is_valid_rust_ident` identifier check.
 relon-util = { workspace = true }
 sha2 = { workspace = true }

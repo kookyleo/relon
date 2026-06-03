@@ -32,6 +32,7 @@ relon_rs_macro::include_relon!("src/bar.relon");
 relon_rs_macro::include_relon!("src/baz.relon");
 relon_rs_macro::include_relon!("src/qux.relon");
 relon_rs_macro::include_relon!("src/quux.relon");
+relon_rs_macro::include_relon!("src/secret.relon");
 
 fn main() {
     let state = relon_rs_shims::SandboxState::default();
@@ -93,5 +94,42 @@ fn main() {
         "buffer-protocol List<Int> return mismatch"
     );
 
-    println!("\nrelon-rs Phase 2 demo: all five call shapes returned the expected value.");
+    // secret — buffer-protocol Int → Int gated on `reads_clock`. The
+    // `.relon` body calls the host `#native` fn `clock_add` (linked +
+    // inlined into the `.o` at build time). The `Op::CheckCap` gate the
+    // emitter baked in is enforced at runtime against the caps mask the
+    // `SandboxState` carries. The binding returns `Result` because the
+    // source is gated.
+    let secret_x: i64 = 42;
+
+    // GRANT: a SandboxState granting `reads_clock` authorises the gated
+    // call; the inlined host body runs and returns the value.
+    let granted = relon_rs_shims::SandboxState::new().grant(relon_rs_shims::CapabilityBit::ReadsClock);
+    let secret_ok = secret::main(&granted, secret_x);
+    println!("secret::main(grant reads_clock, {secret_x}) = {secret_ok:?}");
+    assert_eq!(
+        secret_ok.expect("granted gate must run the body"),
+        secret_x.wrapping_add(1_700_000_000),
+        "granted #native call must return the inlined host fn's value"
+    );
+
+    // DENY: a zero-trust SandboxState withholds `reads_clock`; the gate
+    // traps and the marshaller lifts a typed CapabilityDenied — no
+    // crash, no SIGILL.
+    let denied_state = relon_rs_shims::SandboxState::new();
+    let secret_err = secret::main(&denied_state, secret_x);
+    println!("secret::main(deny, {secret_x}) = {secret_err:?}");
+    assert!(
+        matches!(
+            secret_err,
+            Err(relon_rs_shims::BufferEntryError::CapabilityDenied)
+        ),
+        "ungranted #native call must return a typed CapabilityDenied, got {secret_err:?}"
+    );
+
+    println!(
+        "\nrelon-rs demo: five plain call shapes returned the expected value; \
+         the gated #native call granted -> {} and denied -> CapabilityDenied.",
+        secret_x.wrapping_add(1_700_000_000)
+    );
 }

@@ -61,6 +61,31 @@ pub(crate) const ARENA_STATE_OFFSET_SCRATCH_CURSOR: u32 = ARENA_STATE_OFFSET_TAI
 #[allow(dead_code)]
 pub(crate) const ARENA_STATE_OFFSET_SCRATCH_BASE: u32 = ARENA_STATE_OFFSET_SCRATCH_CURSOR + 4;
 
+/// Byte offset of [`ArenaState::trap_code`]. Mirror of
+/// `relon_codegen_llvm::state::ARENA_STATE_OFFSET_TRAP_CODE`. The four
+/// trailing u32 fields (`arena_len`, `tail_cursor`, `scratch_cursor`,
+/// `scratch_base`) total 16 bytes past `arena_base`; the `u64`
+/// `trap_code` follows on its natural 8-byte boundary at offset 24.
+///
+/// The capability gate the LLVM emitter bakes into a `#native` body
+/// (`Op::CheckCap`) stores [`relon_eval_api::CapabilityBit`]-keyed
+/// `NativeTrap::CapabilityDenied` (= 3) here and returns the negative
+/// `bytes_written` sentinel. The shim **must** own real backing memory
+/// at this offset so the JIT-side `store` lands on a slot
+/// [`call_buffer_entry`] can read back to lift a typed error.
+#[allow(dead_code)]
+pub(crate) const ARENA_STATE_OFFSET_TRAP_CODE: u32 = 24;
+
+/// Byte offset of [`ArenaState::host_fns`]. Mirror of
+/// `relon_codegen_llvm::state::ARENA_STATE_OFFSET_HOST_FNS`. The closed-
+/// world `#native` dispatch the rs-build path emits resolves host fns
+/// at link time (the host bitcode is inlined into the `.o`), so the
+/// JIT body never reads this slot — but the layout must still carry it
+/// so the struct's tail matches the emitter's `#[repr(C)]` view and a
+/// future open-world dynamic dispatch lands on owned memory.
+#[allow(dead_code)]
+pub(crate) const ARENA_STATE_OFFSET_HOST_FNS: u32 = ARENA_STATE_OFFSET_TRAP_CODE + 8;
+
 /// Per-call arena state handed to the JIT entry. The `#[repr(C)]`
 /// layout matches `relon_codegen_llvm::state::ArenaState` exactly so
 /// the emitted body's GEPs land on the right slots.
@@ -91,45 +116,91 @@ pub struct ArenaState {
     pub scratch_cursor: UnsafeCell<u32>,
     /// Arena-relative offset where the scratch region starts.
     pub scratch_base: UnsafeCell<u32>,
+    /// Trap code recorded by the JIT body's `Op::CheckCap` gate (and,
+    /// on a future open-world path, by `relon_llvm_call_native`). `0`
+    /// means "no trap"; `3` (`NativeTrap::CapabilityDenied`) means a
+    /// gated `#native` call was denied because the granted `caps`
+    /// bitmask had the required bit clear. [`call_buffer_entry`] reads
+    /// this slot whenever the entry returns the negative `bytes_written`
+    /// sentinel and lifts the matching typed error.
+    pub trap_code: UnsafeCell<u64>,
+    /// Host-fn registry pointer. The closed-world rs-build path inlines
+    /// host fns into the `.o` at link time, so this stays null — it
+    /// exists only to keep the `#[repr(C)]` tail byte-matched with the
+    /// emitter's `ArenaState`.
+    pub host_fns: UnsafeCell<usize>,
 }
 
-/// Forward-compat sandbox state placeholder.
+/// Host-facing sandbox policy carrier threaded into every AOT call.
 ///
-/// Phase 1 (Int-only fast path) keeps this empty because the typed
-/// `extern "C" fn(i64, ...) -> i64` entry has no arena dependency —
-/// every value lives in a register. Phase 2 buffer-protocol entries
-/// construct an internal [`ArenaState`] inside [`crate::call_buffer_entry`]
-/// per-call; the `SandboxState` the host passes today is unused on
-/// that path, but we keep it in the API surface so the consuming
-/// crate's `foo::main(&state, ...)` call shape stays stable.
+/// The fast path (`extern "C" fn(i64, ...) -> i64`) ignores it — every
+/// value lives in a register and the body has no capability gate. The
+/// buffer-protocol path reads [`Self::caps_mask`] and forwards it as
+/// the entry's trailing `i64 caps` argument so a `#native` body's
+/// `Op::CheckCap` gate consults the host's actual grant: a granted bit
+/// lets the gated call run, a clear bit traps `CapabilityDenied`.
 ///
-/// Phase 3 will grow this struct into the per-call arena container so
-/// hosts can reuse one allocation across many dispatches without
-/// re-paying the `Vec::resize` cost. Until then `Default::default()`
-/// is enough — `call_buffer_entry` owns its own pool.
+/// Construction is grant-explicit: [`SandboxState::default`] /
+/// [`SandboxState::new`] grant **nothing** (zero-trust, same posture as
+/// the evaluator's `Capabilities::default`). Hosts opt into a capability
+/// by building a [`Capabilities`] and passing it to
+/// [`SandboxState::with_capabilities`], or flip a single
+/// [`CapabilityBit`] via [`SandboxState::grant`].
 #[derive(Debug, Default)]
 pub struct SandboxState {
-    // Phase 3 will store:
-    //   arena: Vec<u8>,
-    //   caps: u64,
-    //   trap_code: Cell<i32>,
-    //
-    // Hidden field today: a one-byte tag so Phase 3 additions don't
-    // change `mem::size_of` between releases (helps catch ABI drift
-    // in the consuming crate during the Phase 3 cut-over).
-    _phase: PhantomPhase,
+    /// Granted capability bitmask — bit `b` set means the host granted
+    /// [`CapabilityBit`] index `b`. Forwarded verbatim as the buffer
+    /// entry's `caps` argument. Zero (the default) denies every gated
+    /// `#native` call.
+    caps_mask: i64,
 }
 
-#[derive(Debug, Default)]
-struct PhantomPhase;
-
 impl SandboxState {
-    /// Construct a fresh sandbox state. Phase 2 callers can reuse a
-    /// single instance across many AOT calls because the struct
-    /// holds no per-call data; Phase 3 will require a fresh state per
-    /// call (the arena cursors reset on construction).
+    /// Construct a zero-trust sandbox state — no capability granted.
+    /// Identical to [`Self::default`]; kept for call-site readability.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build a sandbox state granting exactly the capabilities set in
+    /// `caps`. The per-bit booleans map onto the canonical
+    /// [`CapabilityBit`] indices so the resulting mask byte-matches the
+    /// `(caps & (1 << bit))` test the LLVM `Op::CheckCap` gate bakes
+    /// into a gated `#native` body.
+    pub fn with_capabilities(caps: &relon_eval_api::Capabilities) -> Self {
+        let mut s = Self::default();
+        s.set_from_capabilities(caps);
+        s
+    }
+
+    /// Grant a single [`CapabilityBit`], leaving the others untouched.
+    /// Chainable: `SandboxState::new().grant(CapabilityBit::ReadsClock)`.
+    pub fn grant(mut self, bit: relon_eval_api::CapabilityBit) -> Self {
+        self.caps_mask |= 1i64 << bit.bit_index();
+        self
+    }
+
+    /// Mirror every set bit of `caps` onto the internal mask.
+    fn set_from_capabilities(&mut self, caps: &relon_eval_api::Capabilities) {
+        use relon_eval_api::CapabilityBit::*;
+        let set = |mask: &mut i64, on: bool, bit: relon_eval_api::CapabilityBit| {
+            if on {
+                *mask |= 1i64 << bit.bit_index();
+            }
+        };
+        set(&mut self.caps_mask, caps.reads_fs, ReadsFs);
+        set(&mut self.caps_mask, caps.writes_fs, WritesFs);
+        set(&mut self.caps_mask, caps.network, Network);
+        set(&mut self.caps_mask, caps.reads_clock, ReadsClock);
+        set(&mut self.caps_mask, caps.reads_env, ReadsEnv);
+        set(&mut self.caps_mask, caps.uses_rng, UsesRng);
+    }
+
+    /// The granted capability bitmask the buffer entry receives as its
+    /// `caps` argument. Crate-internal — [`crate::call_buffer_entry`]
+    /// forwards it on dispatch.
+    pub(crate) fn caps_mask(&self) -> i64 {
+        self.caps_mask
     }
 }
 
@@ -150,7 +221,18 @@ impl ArenaState {
             tail_cursor: UnsafeCell::new(0),
             scratch_cursor: UnsafeCell::new(0),
             scratch_base: UnsafeCell::new(scratch_base),
+            trap_code: UnsafeCell::new(0),
+            host_fns: UnsafeCell::new(0),
         }
+    }
+
+    /// Read back the trap code the JIT body recorded. `0` means no
+    /// trap. Called by [`crate::call_buffer_entry`] after a negative
+    /// `bytes_written` sentinel to decide which typed error to lift.
+    pub(crate) fn trap_code(&self) -> u64 {
+        // SAFETY: the JIT call has returned, so no concurrent writer to
+        // the cell remains; the read is single-threaded and aliasing-free.
+        unsafe { *self.trap_code.get() }
     }
 }
 
@@ -186,6 +268,14 @@ mod tests {
             offset_of!(ArenaState, scratch_base) as u32,
             ARENA_STATE_OFFSET_SCRATCH_BASE
         );
-        assert!(size_of::<ArenaState>() >= 24);
+        assert_eq!(
+            offset_of!(ArenaState, trap_code) as u32,
+            ARENA_STATE_OFFSET_TRAP_CODE
+        );
+        assert_eq!(
+            offset_of!(ArenaState, host_fns) as u32,
+            ARENA_STATE_OFFSET_HOST_FNS
+        );
+        assert!(size_of::<ArenaState>() >= 32);
     }
 }

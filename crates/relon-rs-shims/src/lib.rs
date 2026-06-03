@@ -45,12 +45,20 @@
 //!   return marshalling (`Int` / `Float` / `Bool` / `Null` / `String` /
 //!   `List<Int>` are wired today)
 //! - Closure-valued returns
-//! - Capability threading on the buffer path — `call_buffer_entry`
-//!   hard-codes `caps = 0`, so `#native` / `Op::CheckCap`-gated bodies
-//!   aren't yet reachable through this crate
-//! - Structured trap propagation (today a Relon-side trap surfaces as
-//!   a Rust panic; Phase 3 will catch + return a typed `Result`)
 //! - Cross-platform host shim coverage (macOS / Windows AOT linking)
+//!
+//! ## Capability threading
+//!
+//! [`SandboxState`] carries the host's granted capability bitmask.
+//! [`call_buffer_entry`] forwards it as the buffer entry's trailing
+//! `i64 caps` argument, so a `#native` body's `Op::CheckCap` gate
+//! consults the host's actual grant: a granted bit lets the gated call
+//! run, a clear bit traps. A denied gate records
+//! `NativeTrap::CapabilityDenied` in `ArenaState::trap_code` + returns
+//! the negative sentinel, which the marshaller lifts to a typed
+//! [`marshal::BufferEntryError::CapabilityDenied`] (no SIGILL / panic).
+//! Hosts grant via [`SandboxState::with_capabilities`] /
+//! [`SandboxState::grant`]; the default state is zero-trust.
 
 #![warn(missing_docs)]
 
@@ -63,6 +71,13 @@ pub use marshal::{
     RetValue,
 };
 pub use sandbox_state::SandboxState;
+
+// Capability surface the consuming crate uses to build a granted
+// `SandboxState`. Re-exported from `relon-eval-api` (which re-exports
+// the canonical `relon-cap` definitions) so a consumer can name
+// `relon_rs_shims::CapabilityBit::ReadsClock` without taking a direct
+// dep on the analyzer / cap crate.
+pub use relon_eval_api::{Capabilities, CapabilityBit};
 
 // `relon_llvm_str_contains_arena` is the only host shim symbol the
 // LLVM AOT pipeline references today (Phase F.1 `str.contains` fast

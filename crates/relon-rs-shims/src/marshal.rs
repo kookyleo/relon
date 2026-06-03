@@ -194,6 +194,16 @@ pub enum BufferEntryError {
     /// host-side trap the JIT raised (today: only `llvm.trap` on
     /// arithmetic UB; Phase 3 adds richer trap codes).
     NegativeBytesWritten(i32),
+    /// A gated `#native` call was denied: the JIT body's `Op::CheckCap`
+    /// gate found the required [`relon_eval_api::CapabilityBit`] clear
+    /// in the granted `caps` mask and trapped. The body recorded
+    /// `NativeTrap::CapabilityDenied` (= 3) in `ArenaState::trap_code`
+    /// and returned the negative `bytes_written` sentinel; the marshaller
+    /// reads the code back and lifts it here instead of letting the
+    /// negative sentinel surface as an opaque `NegativeBytesWritten`.
+    /// The host grants the capability by threading a populated
+    /// [`crate::SandboxState`] (see [`crate::SandboxState::grant`]).
+    CapabilityDenied,
 }
 
 impl core::fmt::Display for BufferEntryError {
@@ -216,9 +226,22 @@ impl core::fmt::Display for BufferEntryError {
                 f,
                 "relon-rs-shims: JIT entry returned trap code {code} (negative bytes_written)"
             ),
+            Self::CapabilityDenied => write!(
+                f,
+                "relon-rs-shims: gated `#native` call denied by the capability gate \
+                 (grant the capability via SandboxState::with_capabilities / ::grant)"
+            ),
         }
     }
 }
+
+/// Trap code the LLVM emitter stores in `ArenaState::trap_code` when a
+/// `#native` body's `Op::CheckCap` gate denies a call. Mirror of
+/// `relon_codegen_llvm::state::NativeTrap::CapabilityDenied as u64`
+/// (and the cranelift `TrapKind::CapabilityDenied`) — the value is
+/// stable across backends (= 3). Duplicated here rather than imported
+/// so the runtime shim doesn't take a dep on the LLVM codegen crate.
+const NATIVE_TRAP_CAPABILITY_DENIED: u64 = 3;
 
 impl std::error::Error for BufferEntryError {}
 
@@ -291,6 +314,13 @@ pub fn call_buffer_entry(
     let scratch_size: u32 = 1_048_576;
     let arena_size = (scratch_base + scratch_size) as usize;
 
+    // The granted capability bitmask the host threaded through
+    // `SandboxState`. Forwarded verbatim as the entry's `caps`
+    // argument so a gated `#native` body's `Op::CheckCap` gate consults
+    // the host's actual grant (was hard-coded `0`, which denied every
+    // gated call regardless of the host's posture).
+    let caps_mask = _state.caps_mask();
+
     // 3. Acquire the per-thread arena pool, dispatch, decode.
     SHIM_ARENA_POOL.with(|cell| match cell.try_borrow_mut() {
         Ok(mut buf) => dispatch_with_arena(
@@ -303,6 +333,7 @@ pub fn call_buffer_entry(
             out_ptr,
             out_cap,
             scratch_base,
+            caps_mask,
             &in_bytes,
             return_fields,
             return_root_size,
@@ -323,6 +354,7 @@ pub fn call_buffer_entry(
                 out_ptr,
                 out_cap,
                 scratch_base,
+                caps_mask,
                 &in_bytes,
                 return_fields,
                 return_root_size,
@@ -342,6 +374,7 @@ fn dispatch_with_arena(
     out_ptr: u32,
     out_cap: u32,
     scratch_base: u32,
+    caps_mask: i64,
     in_bytes: &[u8],
     return_fields: &[EmittedField],
     return_root_size: u32,
@@ -376,13 +409,23 @@ fn dispatch_with_arena(
             in_len as i32,
             out_ptr as i32,
             out_cap as i32,
-            /*caps=*/ 0,
+            caps_mask,
         )
     }))
     .map_err(|_| BufferEntryError::NegativeBytesWritten(-1))?;
 
     if bytes_written < 0 {
-        return Err(BufferEntryError::NegativeBytesWritten(bytes_written));
+        // A negative `bytes_written` is the trap sentinel: the JIT body
+        // recorded a cause in `ArenaState::trap_code` and bailed. Read
+        // it back to lift a typed error. Today the only code the
+        // buffer-protocol body raises through this path is
+        // `CapabilityDenied` (a gated `#native` call the granted `caps`
+        // mask didn't authorise); any other / absent code keeps the
+        // opaque `NegativeBytesWritten` surface.
+        return match state.trap_code() {
+            NATIVE_TRAP_CAPABILITY_DENIED => Err(BufferEntryError::CapabilityDenied),
+            _ => Err(BufferEntryError::NegativeBytesWritten(bytes_written)),
+        };
     }
     let bw = bytes_written as usize;
 
