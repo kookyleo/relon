@@ -1990,9 +1990,58 @@ impl<'a> EmitState<'a> {
                 ));
             }
 
-            // ----- Fallthrough: anything else is a future widening --
-            other => {
-                let name = op_debug_tag(other);
+            // ----- Scope-cut: future widening (explicit, exhaustive) -
+            //
+            // Every remaining `Op` variant the walker does not lower
+            // today is enumerated here so a NEWLY-ADDED `Op` variant
+            // fails to compile against this match instead of being
+            // silently absorbed by a `_` wildcard. The behaviour is
+            // identical to the previous catch-all: each surfaces a
+            // `UnsupportedOp(<op-tag>, Other(<op-tag>))` scope-cut via
+            // `op_debug_tag`.
+            //
+            // The grouped arithmetic / comparison patterns below catch
+            // only the residual `IrType`s — the I64 / F64 / Bool slots
+            // are handled in the dedicated arms above, so reaching here
+            // means an operand type the wasm backend has no lowering
+            // for (e.g. `Add(IrType::String)`).
+            Op::Add(_)
+            | Op::Sub(_)
+            | Op::Mul(_)
+            | Op::Div(_)
+            | Op::Mod(_)
+            | Op::BitAnd(_)
+            | Op::Eq(_)
+            | Op::Ne(_)
+            | Op::Lt(_)
+            | Op::Le(_)
+            | Op::Gt(_)
+            | Op::Ge(_)
+            | Op::LoadStringPtr { .. }
+            | Op::LoadFieldAtAbsolute { .. }
+            | Op::LoadSchemaPtr { .. }
+            | Op::CallNative { .. }
+            | Op::CheckCap { .. }
+            | Op::BrTable { .. }
+            | Op::AllocScratch { .. }
+            | Op::AllocScratchDyn
+            | Op::StoreI32AtAbsolute { .. }
+            | Op::StoreI64AtAbsolute { .. }
+            | Op::MemcpyAtAbsolute
+            | Op::StoreI8AtAbsolute { .. }
+            | Op::StoreF64AtAbsolute { .. }
+            | Op::Trap { .. }
+            | Op::CaseFoldTableAddr { .. }
+            | Op::CombiningMarkRangesAddr
+            | Op::WhitespaceRangesAddr
+            | Op::DecompTableAddr { .. }
+            | Op::CccTableAddr
+            | Op::CompositionTableAddr
+            | Op::FullCaseFoldTableAddr { .. }
+            | Op::CasedRangesAddr
+            | Op::CaseIgnorableRangesAddr
+            | Op::TurkishCaseFoldTableAddr { .. } => {
+                let name = op_debug_tag(op);
                 return Err(LowerError::UnsupportedOp(
                     name,
                     UnsupportedOpReason::Other(name),
