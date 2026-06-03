@@ -86,6 +86,13 @@ fn expected_encoding(ty: EmittedFieldType) -> Encoding {
             ret_rust_ty: "String",
             ret_value_ctor: "RetValue::String",
         },
+        EmittedFieldType::ListInt => Encoding {
+            tag_path: "EmittedFieldType::ListInt",
+            arg_rust_ty: "&[i64]",
+            arg_value_ctor: "ArgValue::ListInt",
+            ret_rust_ty: "Vec<i64>",
+            ret_value_ctor: "RetValue::ListInt",
+        },
         // Adding a variant to `relon_codegen_llvm::EmittedFieldType`
         // without a row here is a compile error — the anti-drift gate.
     }
@@ -100,6 +107,7 @@ const ALL_VARIANTS: &[EmittedFieldType] = &[
     EmittedFieldType::Bool,
     EmittedFieldType::Null,
     EmittedFieldType::String,
+    EmittedFieldType::ListInt,
 ];
 
 /// Strip whitespace so the assertions are robust against rustfmt-style
@@ -147,7 +155,7 @@ fn all_variants_have_encoding() {
     // If a new variant is added without appending it here, the
     // exhaustive `match` in `expected_encoding` is the gate; this count
     // assertion is the reminder to also extend `ALL_VARIANTS`.
-    assert_eq!(ALL_VARIANTS.len(), 5, "update ALL_VARIANTS for new tag");
+    assert_eq!(ALL_VARIANTS.len(), 6, "update ALL_VARIANTS for new tag");
 }
 
 /// `Int` arg + `Int` return: assert the binding carries the
@@ -246,6 +254,51 @@ fn float_roundtrip_triple_consistent() {
     assert!(
         binding.contains(&squeeze(e.ret_value_ctor)),
         "Float return must unpack via `{}`",
+        e.ret_value_ctor
+    );
+}
+
+/// `List<Int>` arg + `List<Int>` return surfaces the full ListInt triple
+/// in one binding: the `&[i64]` param type + `Vec<i64>` return type
+/// (build), the `EmittedFieldType::ListInt` slot tag (codegen), and the
+/// `ArgValue::ListInt` / `RetValue::ListInt` glue (shim). This is the
+/// binding-generation surface; the param→list-return *value* path is a
+/// separate frozen-codegen limitation (see `aot_list.rs`).
+#[test]
+fn list_int_roundtrip_triple_consistent() {
+    let binding = squeeze(&compile_binding(
+        "list_int_rt",
+        "#main(List<Int> xs) -> List<Int>\nxs\n",
+    ));
+    let e = expected_encoding(EmittedFieldType::ListInt);
+
+    // Build-side Rust surface type for the `&[i64]` param + `Vec<i64>`
+    // return.
+    assert!(
+        binding.contains(&squeeze(&format!("xs: {}", e.arg_rust_ty))),
+        "ListInt arg must surface as `{}`; binding=\n{binding}",
+        e.arg_rust_ty
+    );
+    assert!(
+        binding.contains(&squeeze(&format!("-> {}", e.ret_rust_ty))),
+        "ListInt return must surface as `{}`",
+        e.ret_rust_ty
+    );
+    // Codegen-side const tag for the ListInt slot.
+    assert!(
+        binding.contains(&squeeze(e.tag_path)),
+        "ListInt slot must stamp `{}` into the field table",
+        e.tag_path
+    );
+    // Shim-side ArgValue / RetValue glue.
+    assert!(
+        binding.contains(&squeeze(e.arg_value_ctor)),
+        "ListInt arg must pack via `{}`",
+        e.arg_value_ctor
+    );
+    assert!(
+        binding.contains(&squeeze(e.ret_value_ctor)),
+        "ListInt return must unpack via `{}`",
         e.ret_value_ctor
     );
 }

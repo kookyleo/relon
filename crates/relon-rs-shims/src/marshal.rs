@@ -41,7 +41,7 @@
 use core::cell::RefCell;
 
 use relon_eval_api::buffer::{BufferBuilder, BufferReader};
-use relon_eval_api::layout::{FieldKind, FieldOffset, OffsetTable};
+use relon_eval_api::layout::{FieldKind, FieldOffset, ListElementKind, OffsetTable};
 use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
 
 use crate::sandbox_state::{ArenaState, SandboxState};
@@ -97,6 +97,10 @@ pub enum EmittedFieldType {
     /// buffer-relative offset to a `[len: u32 LE][utf8 bytes]` tail
     /// record.
     String,
+    /// `&[i64]` / `Vec<i64>` — pointer-indirect like `String`; fixed slot
+    /// is a 4-byte buffer-relative offset to a `[len: u32 LE][pad to 8]
+    /// [i64 LE …]` tail record (8/8-inline elements).
+    ListInt,
 }
 
 /// Argument value the binding hands to [`call_buffer_entry`]. The
@@ -121,6 +125,10 @@ pub enum ArgValue<'a> {
     /// region — no caller-side aliasing constraint beyond `'a >`
     /// the call duration.
     String(&'a str),
+    /// `&[i64]` argument bound to an `EmittedFieldType::ListInt` slot.
+    /// The buffer writer copies the elements into the arena's tail
+    /// region as a `[len][i64…]` record.
+    ListInt(&'a [i64]),
 }
 
 /// Return value decoded from the JIT entry's output buffer. The
@@ -147,6 +155,10 @@ pub enum RetValue {
     /// call buffer is recycled, so the caller can keep the value
     /// after the dispatch returns.
     String(String),
+    /// `Vec<i64>` return decoded from an `EmittedFieldType::ListInt`
+    /// slot. The elements are copied out of the arena's tail record
+    /// before the per-call buffer is recycled.
+    ListInt(Vec<i64>),
 }
 
 /// Errors surfaced by [`call_buffer_entry`]. Phase 2 keeps the surface
@@ -416,6 +428,7 @@ fn pack_arg(
         (EmittedFieldType::Bool, ArgValue::Bool(v)) => pack_bool(builder, field.name, *v),
         (EmittedFieldType::Null, ArgValue::Null) => pack_null(builder, field.name),
         (EmittedFieldType::String, ArgValue::String(s)) => pack_string(builder, field.name, s),
+        (EmittedFieldType::ListInt, ArgValue::ListInt(v)) => pack_list_int(builder, field.name, v),
         // ----- add new leaf pack arm above this line -----
         (expected, actual) => Err(BufferEntryError::TypeMismatch {
             index,
@@ -455,6 +468,16 @@ fn pack_string(builder: &mut BufferBuilder<'_>, name: &str, v: &str) -> Result<(
         .map_err(|e| BufferEntryError::Buffer(format!("{e}")))
 }
 
+fn pack_list_int(
+    builder: &mut BufferBuilder<'_>,
+    name: &str,
+    v: &[i64],
+) -> Result<(), BufferEntryError> {
+    builder
+        .write_list_int(name, v)
+        .map_err(|e| BufferEntryError::Buffer(format!("{e}")))
+}
+
 /// Decode one `field` slot out of `reader` into the matching
 /// [`RetValue`] variant.
 fn unpack_ret(
@@ -467,6 +490,7 @@ fn unpack_ret(
         EmittedFieldType::Bool => unpack_bool(reader, field.name),
         EmittedFieldType::Null => unpack_null(reader, field.name),
         EmittedFieldType::String => unpack_string(reader, field.name),
+        EmittedFieldType::ListInt => unpack_list_int(reader, field.name),
         // ----- add new leaf unpack arm above this line -----
     }
 }
@@ -506,6 +530,13 @@ fn unpack_string(reader: &BufferReader<'_>, name: &str) -> Result<RetValue, Buff
         .map_err(|e| BufferEntryError::Buffer(format!("{e}")))
 }
 
+fn unpack_list_int(reader: &BufferReader<'_>, name: &str) -> Result<RetValue, BufferEntryError> {
+    reader
+        .read_list_int(name)
+        .map(RetValue::ListInt)
+        .map_err(|e| BufferEntryError::Buffer(format!("{e}")))
+}
+
 fn arg_variant_name(arg: &ArgValue<'_>) -> &'static str {
     match arg {
         ArgValue::Int(_) => "Int",
@@ -513,6 +544,7 @@ fn arg_variant_name(arg: &ArgValue<'_>) -> &'static str {
         ArgValue::Bool(_) => "Bool",
         ArgValue::Null => "Null",
         ArgValue::String(_) => "String",
+        ArgValue::ListInt(_) => "ListInt",
     }
 }
 
@@ -523,6 +555,9 @@ fn ty_to_repr(ty: EmittedFieldType) -> TypeRepr {
         EmittedFieldType::Bool => TypeRepr::Bool,
         EmittedFieldType::Null => TypeRepr::Null,
         EmittedFieldType::String => TypeRepr::String,
+        EmittedFieldType::ListInt => TypeRepr::List {
+            element: Box::new(TypeRepr::Int),
+        },
     }
 }
 
@@ -555,12 +590,27 @@ fn synthesise_layout(fields: &[EmittedField], root_size: u32) -> OffsetTable {
         root_align: 8,
     };
     for f in fields {
-        let (size, align, kind) = match f.ty {
-            EmittedFieldType::Int => (8, 8, FieldKind::Inline { size: 8, align: 8 }),
-            EmittedFieldType::Float => (8, 8, FieldKind::Inline { size: 8, align: 8 }),
-            EmittedFieldType::Bool => (1, 1, FieldKind::Inline { size: 1, align: 1 }),
-            EmittedFieldType::Null => (1, 1, FieldKind::Inline { size: 1, align: 1 }),
-            EmittedFieldType::String => (4, 4, FieldKind::PointerIndirect { tail_alignment: 1 }),
+        let (size, align, kind, list_element) = match f.ty {
+            EmittedFieldType::Int => (8, 8, FieldKind::Inline { size: 8, align: 8 }, None),
+            EmittedFieldType::Float => (8, 8, FieldKind::Inline { size: 8, align: 8 }, None),
+            EmittedFieldType::Bool => (1, 1, FieldKind::Inline { size: 1, align: 1 }, None),
+            EmittedFieldType::Null => (1, 1, FieldKind::Inline { size: 1, align: 1 }, None),
+            EmittedFieldType::String => {
+                (4, 4, FieldKind::PointerIndirect { tail_alignment: 1 }, None)
+            }
+            // `List<Int>` mirrors `relon-eval-api::layout`'s
+            // `list_layout_decision` Int arm byte-for-byte: a 4/4
+            // pointer slot, an 8-aligned tail record, and 8/8-inline
+            // i64 elements.
+            EmittedFieldType::ListInt => (
+                4,
+                4,
+                FieldKind::PointerIndirect { tail_alignment: 8 },
+                Some(ListElementKind::InlineFixed {
+                    elem_size: 8,
+                    elem_align: 8,
+                }),
+            ),
         };
         out.fields.push(FieldOffset {
             name: f.name.to_string(),
@@ -568,7 +618,7 @@ fn synthesise_layout(fields: &[EmittedField], root_size: u32) -> OffsetTable {
             size,
             align,
             kind,
-            list_element: None,
+            list_element,
         });
     }
     out

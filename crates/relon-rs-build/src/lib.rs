@@ -665,6 +665,13 @@ fn rust_type_for(ty: EmittedFieldType) -> RustTypeMap {
             ret_rust_ty: "String",
             ret_match_arm: "RetValue::String(v) => v",
         },
+        EmittedFieldType::ListInt => RustTypeMap {
+            tag_path: "EmittedFieldType::ListInt",
+            arg_rust_ty: "&[i64]",
+            arg_value_expr: |p| format!("ArgValue::ListInt({p})"),
+            ret_rust_ty: "Vec<i64>",
+            ret_match_arm: "RetValue::ListInt(v) => v",
+        },
         // ----- add new leaf type row above this line -----
     }
 }
