@@ -17,17 +17,137 @@ use super::*;
 
 impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// Phase 0b seam: multi-way / select control flow (`Select`,
-    /// `BrTable`). Dispatched from `super::lower_op`. Port from
-    /// `relon-codegen-cranelift`'s `control_flow.rs` and align three-way.
+    /// `BrTable`). Dispatched from `super::lower_op`. Ported from
+    /// `relon-codegen-cranelift`'s `op_visitor::visit_select` and
+    /// `control_flow::emit_br_table`; three-way aligned in
+    /// `tests/phase0b_control.rs`.
     pub(crate) fn lower_control_rest(
         &mut self,
         ip: usize,
-        _ip_hint: &str,
+        ip_hint: &str,
         op: &Op,
     ) -> Result<(), LlvmError> {
-        Err(LlvmError::Codegen(format!(
-            "unsupported op (Phase 0b control seam): {op:?} at ip={ip}"
-        )))
+        match op {
+            Op::Select { ty } => self.emit_select(ip_hint, *ty),
+            Op::BrTable { default, targets } => self.emit_br_table(ip_hint, *default, targets),
+            other => Err(LlvmError::Codegen(format!(
+                "unsupported op (Phase 0b control seam): {other:?} at ip={ip}"
+            ))),
+        }
+    }
+
+    /// Lower `Op::Select { ty }`. Wasm `select` semantics: pop
+    /// `[val_true, val_false, cond]`, push `val_true` when `cond`
+    /// is non-zero, else `val_false`.
+    ///
+    /// Mirrors the cranelift backend's `visit_select`: cranelift's
+    /// `ins().select(cond, val_true, val_false)` maps onto LLVM's
+    /// `build_select`, which takes `(cond_i1, then, else)`. The IR
+    /// pass guarantees both arms share the same wasm slot, so the
+    /// two popped values carry the same LLVM int type; `ty` is the
+    /// IR tag re-stamped onto the pushed result.
+    fn emit_select(&mut self, ip_hint: &str, ty: IrType) -> Result<(), LlvmError> {
+        let cond = self.pop_int(ip_hint)?;
+        let val_false = self.pop_int(ip_hint)?;
+        let val_true = self.pop_int(ip_hint)?;
+        // Narrow the i32 / i64 condition to i1 (non-zero test),
+        // matching `emit_br_if` / `emit_if`.
+        let name = self.next_name("select_cond");
+        let cond_i1 = self
+            .builder
+            .build_int_compare(IntPredicate::NE, cond, cond.get_type().const_zero(), &name)
+            .map_err(|e| LlvmError::Codegen(format!("Select cmp: {e}")))?;
+        let sel_name = self.next_name("select");
+        let selected = self
+            .builder
+            .build_select(cond_i1, val_true, val_false, &sel_name)
+            .map_err(|e| LlvmError::Codegen(format!("Select: {e}")))?
+            .into_int_value();
+        self.push(selected, ty);
+        Ok(())
+    }
+
+    /// Lower `Op::BrTable { default, targets }`. Pops one `i32`
+    /// discriminant; when `index < targets.len()` jumps to
+    /// `targets[index]`, otherwise jumps to `default`. Label depths
+    /// resolve against the same `label_stack` as `Br` / `BrIf`.
+    ///
+    /// Ported from the cranelift backend's `emit_br_table`: cranelift's
+    /// `br_table` + `JumpTable` maps onto LLVM's `build_switch`, with
+    /// one `(i32 case_value, target_bb)` entry per `targets[i]` and the
+    /// default arm pointing at `default`'s resolved block. The Phase B
+    /// envelope's `Block`/`Loop` carry no result phi (`result_ty:
+    /// None`), so — like `emit_br` — `BrTable` is value-less: the
+    /// stack effect is `[i32] -> []` and no yield value rides the edges.
+    /// After the switch the rest of the current block is unreachable,
+    /// so we seal a dead block and open a fresh continuation, exactly
+    /// as `emit_br` does.
+    fn emit_br_table(
+        &mut self,
+        ip_hint: &str,
+        default: u32,
+        targets: &[u32],
+    ) -> Result<(), LlvmError> {
+        let idx = self.pop_int(ip_hint)?;
+        // The discriminant must be i32-wide for the switch case
+        // constants. The IR contract feeds an i32; if a wider value
+        // arrived, truncate to keep the switch operand / case widths
+        // in lockstep.
+        let i32_t = self.ctx.i32_type();
+        let idx_i32 = if idx.get_type().get_bit_width() == 32 {
+            idx
+        } else {
+            self.builder
+                .build_int_truncate(idx, i32_t, &self.next_name("brtable_idx"))
+                .map_err(|e| LlvmError::Codegen(format!("BrTable idx trunc: {e}")))?
+        };
+
+        // Resolve the default target block by label depth.
+        let default_bb = self.br_table_target_bb(default)?;
+
+        // Resolve each per-index target and build the switch cases.
+        let mut cases: Vec<(IntValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> =
+            Vec::with_capacity(targets.len());
+        for (i, depth) in targets.iter().enumerate() {
+            let tgt_bb = self.br_table_target_bb(*depth)?;
+            cases.push((i32_t.const_int(i as u64, false), tgt_bb));
+        }
+
+        self.builder
+            .build_switch(idx_i32, default_bb, &cases)
+            .map_err(|e| LlvmError::Codegen(format!("BrTable switch: {e}")))?;
+
+        // After the switch the surrounding body is unreachable. Open a
+        // fresh dead block sealed with `unreachable`, then a cont block
+        // so subsequent ops have somewhere to land — mirrors `emit_br`.
+        let dead_bb = self
+            .ctx
+            .append_basic_block(self.func, "unreachable_after_br_table");
+        self.builder.position_at_end(dead_bb);
+        self.builder
+            .build_unreachable()
+            .map_err(|e| LlvmError::Codegen(format!("BrTable dead-block unreachable: {e}")))?;
+        let cont_bb = self
+            .ctx
+            .append_basic_block(self.func, "after_br_table_cont");
+        self.builder.position_at_end(cont_bb);
+        Ok(())
+    }
+
+    /// Resolve a `BrTable` arm's label depth to its branch target
+    /// basic block. A `Block` frame's branch target is its `tail_bb`
+    /// (forward exit); a `Loop` frame's is its `header_bb` (back-edge
+    /// continue). Mirrors the `Br` / `BrIf` resolution in `emit_br` /
+    /// `emit_br_if`.
+    fn br_table_target_bb(
+        &self,
+        depth: u32,
+    ) -> Result<inkwell::basic_block::BasicBlock<'ctx>, LlvmError> {
+        let frame = self.label_target(depth)?;
+        Ok(match frame.kind {
+            LabelKind::Block => frame.tail_bb,
+            LabelKind::Loop => frame.header_bb,
+        })
     }
 
     /// Lower `Op::Return`. The shape decides what flows back:
