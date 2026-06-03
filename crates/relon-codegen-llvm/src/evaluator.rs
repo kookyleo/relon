@@ -39,7 +39,7 @@ use ordered_float::OrderedFloat;
 use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
 use relon_parser::Node;
 
-use crate::emitter::{
+use crate::codegen::{
     emit_fast_entry, emit_module_funcs, is_buffer_protocol_signature, ConstPool, EntryShape,
     FastPathProfile, ENTRY_SYMBOL, ENTRY_SYMBOL_FAST,
 };
@@ -1571,7 +1571,7 @@ impl LlvmAotEvaluator {
         // signature. `lower_workspace_single` always produces this
         // shape today; failing the check means an IR-layer change
         // slipped past the test gates.
-        if !crate::emitter::is_buffer_protocol_signature(&entry.params, entry.ret) {
+        if !crate::codegen::is_buffer_protocol_signature(&entry.params, entry.ret) {
             return Err(LlvmError::UnsupportedSignature(
                 "relon-rs build: lowering produced a non-buffer entry shape".into(),
             ));
