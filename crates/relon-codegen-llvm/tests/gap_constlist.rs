@@ -1,22 +1,19 @@
 //! Phase 0b collections close-out: `Op::ConstListInt` /
 //! `ConstListFloat` / `ConstListBool` lowering for the LLVM-AOT backend.
 //!
-//! ## Why this is validated at codegen + byte-layout, not via `run_main`
+//! ## Validated at codegen + byte-layout *and* (since S2.②) end to end
 //!
 //! A const-list literal only surfaces in a source whose `#main` returns
 //! (or stores) a `List<scalar>` field. The LLVM-AOT host-side return
-//! *decoder* (`read_value_from_reader` in `evaluator.rs`) refuses a
-//! `List<T>` return field today — it raises
-//! `RuntimeError::Unsupported { reason: "llvm-aot: return field `…` type
-//! List { element: … } not supported in Phase B" }`. (Verified live:
-//! the cranelift golden decodes the same source to a
-//! `Dict { xs: List([Int(10), Int(20), Int(30)]) }`, but the LLVM
-//! decoder rejects it.) The blocker lives in shared, non-collections
-//! files outside this task's two-file envelope, so a value-level
-//! `run_main` three-way diff is not reachable for these ops without a
-//! cross-family decoder change.
+//! *decoder* (`read_value_from_reader` in `evaluator.rs`) used to refuse
+//! a `List<T>` return field (Phase B limitation). Phase 1 Stage 2.②
+//! widened it: `read_value_from_reader` now has a `List<Int>` arm
+//! (`marshal_list_int_out`) walking the `[len][i64…]` tail record, so the
+//! value-level three-way `run_main` diff against the cranelift golden +
+//! tree-walk gold standard is now reachable (see
+//! `int_list_run_main_three_way_after_return_decode` below).
 //!
-//! What this file pins instead is observable and faithful:
+//! What this file pins:
 //!
 //! 1. **Op presence** — the const-list source lowers to the target op
 //!    (a future lowering change that stops emitting it trips the
@@ -134,26 +131,64 @@ fn int_list_codegen_parity_and_shape() {
     );
 }
 
-/// Documents the e2e blocker: both backends *compile* the const-list
-/// source, but the LLVM return decoder rejects a `List<T>` return
-/// field (Phase B limitation, shared non-collections file). The
-/// cranelift golden decodes it, proving the value-level oracle exists —
-/// it is the LLVM-side decoder, not the lowering this task wired, that
-/// is the gate. When the decoder widens, this test's `is_err` flips and
-/// a proper three-way `run_main` diff becomes reachable.
+/// S2.② closed the Phase B `List<T>` return-decode gap this test used to
+/// pin as blocked: `read_value_from_reader` now has a `List<Int>` arm
+/// (`marshal_list_int_out`) that walks the `[len][i64…]` tail record. The
+/// old negative assertion (`run_main` is_err) is therefore promoted, per
+/// its own instructions, to a real three-way value diff: the LLVM buffer
+/// body decode must match both the cranelift golden and the tree-walk
+/// gold standard for the schema-wrapped `List<Int>` return.
 #[test]
-fn int_list_run_main_blocked_on_return_decoder_not_lowering() {
+fn int_list_run_main_three_way_after_return_decode() {
     use std::collections::HashMap;
+    use std::sync::Arc;
+
     use relon_eval_api::{Evaluator, Value};
+    use relon_evaluator::{Context, Scope, TreeWalkEvaluator};
+    use relon_parser::parse_document;
+
+    /// Pull the `xs` field's `Vec<i64>` out of the returned schema dict.
+    fn xs_of(v: &Value) -> Vec<i64> {
+        let dict = match v {
+            Value::Dict(d) => d,
+            other => panic!("expected schema Dict return, got {other:?}"),
+        };
+        let list = dict.map.get("xs").expect("return dict has `xs` field");
+        match list {
+            Value::List(items) => items
+                .iter()
+                .map(|e| match e {
+                    Value::Int(n) => *n,
+                    other => panic!("expected Int element, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected List for `xs`, got {other:?}"),
+        }
+    }
+
+    // Tree-walk gold standard.
+    let node = parse_document(INT_LIST_SRC).expect("parse INT_LIST_SRC");
+    let analyzed = Arc::new(relon_analyzer::analyze(&node));
+    let mut ctx = Context::new()
+        .with_root(node)
+        .with_analyzed(Arc::clone(&analyzed));
+    TreeWalkEvaluator::prepare_in_place(&mut ctx);
+    let walker = TreeWalkEvaluator::new(Arc::new(ctx));
+    let scope = Arc::new(Scope::default());
+    let mut tw_args = HashMap::new();
+    tw_args.insert("n".to_string(), Value::Int(0));
+    let want = xs_of(&walker.run_main(&scope, tw_args).expect("tree-walk run_main"));
+    assert_eq!(want, vec![10, 20, 30], "oracle sanity");
 
     let llvm = LlvmAotEvaluator::from_source(INT_LIST_SRC).expect("llvm compiles the lowering");
-    let mut args = HashMap::new();
-    args.insert("n".to_string(), Value::Int(0));
-    let res = llvm.run_main(args);
-    assert!(
-        res.is_err(),
-        "expected the Phase B List-return decoder block; got {res:?}. \
-         If this now succeeds the decoder widened — promote this to a \
-         three-way run_main diff against the cranelift golden."
-    );
+    let cl = AotEvaluator::from_source(INT_LIST_SRC).expect("cranelift golden compiles");
+
+    let mut a = HashMap::new();
+    a.insert("n".to_string(), Value::Int(0));
+
+    let got_llvm = xs_of(&llvm.run_main(a.clone()).expect("llvm run_main decodes List<Int>"));
+    let got_cl = xs_of(&cl.run_main(a).expect("cranelift run_main"));
+
+    assert_eq!(got_llvm, want, "LLVM List<Int> return decode diverged from oracle");
+    assert_eq!(got_cl, want, "cranelift List<Int> return decode diverged from oracle");
 }

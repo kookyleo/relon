@@ -1431,6 +1431,9 @@ fn write_value_into_builder(
         (TypeRepr::Schema { schema }, Value::Dict(dict)) => {
             marshal_schema_in(builder, &field.name, schema, dict)
         }
+        (TypeRepr::List { element }, Value::List(items)) if matches!(element.as_ref(), TypeRepr::Int) => {
+            marshal_list_int_in(builder, &field.name, items)
+        }
         // ----- add new leaf marshalling arm above this line -----
         (ty, v) => Err(RuntimeError::Unsupported {
             reason: format!(
@@ -1476,6 +1479,37 @@ fn marshal_null_in(
     name: &str,
 ) -> Result<(), RuntimeError> {
     builder.write_null(name).map_err(buffer_to_runtime_error)
+}
+
+/// S2.② `List<Int>` `#main` arg marshalling. The pointer-indirect
+/// `BufferBuilder::write_list_int` appends a `[len: u32 LE][pad to 8]
+/// [i64 LE …]` record into the parent buffer's tail area and back-patches
+/// the 4-byte buffer-relative offset slot — the same record shape the
+/// ConstPool `add_list_int` blob bakes, so a list `#main` arg and a const
+/// list return share one tail-record protocol. The element `Value`s must
+/// each be `Value::Int` (the schema arm already gated `element == Int`).
+fn marshal_list_int_in(
+    builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
+    name: &str,
+    items: &[Value],
+) -> Result<(), RuntimeError> {
+    let mut ints = Vec::with_capacity(items.len());
+    for it in items {
+        match it {
+            Value::Int(v) => ints.push(*v),
+            other => {
+                return Err(RuntimeError::Unsupported {
+                    reason: format!(
+                        "llvm-aot: List<Int> arg `{name}` element got {} but expects Int",
+                        other.type_name()
+                    ),
+                });
+            }
+        }
+    }
+    builder
+        .write_list_int(name, &ints)
+        .map_err(buffer_to_runtime_error)
 }
 
 /// Phase 0b: Schema-typed `#main` arg marshalling. A branded
@@ -1556,6 +1590,9 @@ fn read_value_from_reader(
         TypeRepr::Null => marshal_null_out(),
         TypeRepr::String => marshal_string_out(reader, &field.name),
         TypeRepr::Schema { schema } => marshal_schema_out(reader, &field.name, schema),
+        TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::Int) => {
+            marshal_list_int_out(reader, &field.name)
+        }
         // ----- add new leaf marshalling arm above this line -----
         other => Err(RuntimeError::Unsupported {
             reason: format!(
@@ -1618,6 +1655,25 @@ fn marshal_string_out(
     reader
         .read_string(name)
         .map(|s| Value::String(s.into()))
+        .map_err(buffer_to_runtime_error)
+}
+
+/// S2.② `List<Int>` return-value decode — the gap 0b recorded. The
+/// JIT body's `StoreField` for a `List<Int>` return wrote the
+/// `[len: u32 LE][pad to 8][i64 LE …]` record into the output buffer's
+/// tail region (the ConstPool `add_list_int` blob is materialised there
+/// for a const-list return) and stamped its buffer-relative offset into
+/// the fixed-area pointer slot. `BufferReader::read_list_int` walks the
+/// same protocol the String decode uses (`[len][bytes]` → `[len][i64…]`),
+/// returning the owned `Vec<i64>` we wrap into a `Value::List` of
+/// `Value::Int`.
+fn marshal_list_int_out(
+    reader: &relon_eval_api::buffer::BufferReader<'_>,
+    name: &str,
+) -> Result<Value, RuntimeError> {
+    reader
+        .read_list_int(name)
+        .map(|v| Value::list(v.into_iter().map(Value::Int).collect()))
         .map_err(buffer_to_runtime_error)
 }
 
@@ -1812,6 +1868,13 @@ pub enum EmittedFieldType {
     /// record. Build.rs uses `BufferBuilder::write_string` to pack
     /// inputs and `BufferReader::read_string` to decode outputs.
     String,
+    /// `&[i64]` / `Vec<i64>`. Pointer-indirect (like `String`): the
+    /// fixed slot is a 4-byte buffer-relative offset to a
+    /// `[len: u32 LE][pad to 8][i64 LE …]` tail record (8/8-inline
+    /// elements, byte-identical to the ConstPool `add_list_int` blob).
+    /// Build.rs uses `BufferBuilder::write_list_int` to pack inputs and
+    /// `BufferReader::read_list_int` to decode outputs.
+    ListInt,
 }
 
 /// Metadata returned by [`LlvmAotEvaluator::emit_object`] so the
@@ -2191,6 +2254,9 @@ fn emitted_field_type_for(
         TypeRepr::Bool => Some(EmittedFieldType::Bool),
         TypeRepr::Null => Some(EmittedFieldType::Null),
         TypeRepr::String => Some(EmittedFieldType::String),
+        TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::Int) => {
+            Some(EmittedFieldType::ListInt)
+        }
         // ----- add new AOT-marshallable leaf type above this line -----
         _ => None,
     }
