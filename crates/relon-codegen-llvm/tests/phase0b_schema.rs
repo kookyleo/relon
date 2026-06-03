@@ -15,14 +15,13 @@
 //! canonical reference for the end-to-end value is therefore the
 //! tree-walker (`reference_tree_walk_value`).
 //!
-//! With both `LoadSchemaPtr` (this seam) and `LoadFieldAtAbsolute` (the
-//! `mem` family) now lowered, the schema-field workload *compiles*:
-//! `from_source` succeeds. The end-to-end *run* is still blocked, but
-//! downstream of codegen — in the shared Phase-B host arg marshaller
-//! (`evaluator.rs::write_value_into_builder` has only scalar arms, no
-//! Schema-typed `#main` param support). `llvm_schema_field_compiles_blocked_on_arg_marshalling`
-//! pins that boundary: build OK, run fails at the marshalling envelope
-//! with no unsupported-op error.
+//! With `LoadSchemaPtr` (this seam), `LoadFieldAtAbsolute` (the `mem`
+//! family), and the Phase 0b host-side Schema-typed `#main` arg
+//! marshaller (`evaluator.rs::write_value_into_builder`'s Schema arm,
+//! recursive `sub_record` / `finish_sub_record`) all wired, the
+//! schema-field workload runs end to end. `llvm_schema_field_runs_end_to_end`
+//! pins the value: `Point { x: 3, y: 4 }.x + .y == 7`, matching the
+//! tree-walk gold standard.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -94,28 +93,24 @@ fn cranelift_declines_load_schema_ptr() {
     );
 }
 
-/// With `LoadSchemaPtr` (this seam) and `LoadFieldAtAbsolute` (mem
-/// family) both lowered, the schema-field workload compiles —
-/// `from_source` succeeds, proving this seam is wired. The end-to-end
-/// run is blocked solely by the shared Phase-B arg marshaller (no
-/// Schema-typed `#main` param arm). Asserts that boundary: build OK,
-/// run fails at marshalling, no unsupported-op error. When Phase 1
-/// wires schema-arg marshalling this must upgrade to
-/// `assert_eq!(out, Value::Int(7))` (the tree-walk reference above).
+/// End-to-end value assertion for the schema-field path.
+///
+/// With `LoadSchemaPtr` (this seam), `LoadFieldAtAbsolute` (mem family),
+/// and the Phase 0b host-side Schema-typed `#main` arg marshaller all
+/// wired, `#main(Point p) -> Int : p.x + p.y` runs end to end. The host
+/// packs the branded `Point { x: 3, y: 4 }` into the input buffer
+/// (recursive `sub_record` / `finish_sub_record`); the result must equal
+/// the tree-walk gold standard, `Value::Int(7)`.
 #[test]
-fn llvm_schema_field_compiles_blocked_on_arg_marshalling() {
+fn llvm_schema_field_runs_end_to_end() {
     let ev = LlvmAotEvaluator::from_source(SCHEMA_FIELD_SRC)
         .expect("LoadSchemaPtr + LoadFieldAtAbsolute both lower: must compile");
-    let err = ev
+    let out = ev
         .run_main(point_arg(3, 4))
-        .expect_err("schema-typed #main arg is not marshalled in Phase B yet");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("schema expects Schema"),
-        "block must be the arg-marshalling envelope, not codegen: {msg}"
-    );
-    assert!(
-        !msg.contains("LoadSchemaPtr") && !msg.contains("LoadFieldAtAbsolute"),
-        "neither op may surface as unsupported anymore: {msg}"
+        .expect("schema-typed #main arg marshals + runs end to end");
+    assert_eq!(
+        out,
+        Value::Int(7),
+        "p.x + p.y must read back the gold-standard tree-walk value"
     );
 }

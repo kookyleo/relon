@@ -1251,6 +1251,29 @@ fn write_value_into_builder(
         (TypeRepr::Null, Value::Null) => builder
             .write_null(&field.name)
             .map_err(buffer_to_runtime_error),
+        // Phase 0b: Schema-typed `#main` arg marshalling. A branded
+        // `Value::Dict` (e.g. `#main(Outer o)`) lands here.
+        // `BufferBuilder::sub_record` / `finish_sub_record` (eval-api
+        // Phase 9.b-1) write the sub-record into the parent buffer's
+        // tail area and back-patch the 4-byte buffer-relative offset
+        // slot in the fixed area — exactly the slot `LoadSchemaPtr`
+        // reads. We recurse over the sub-fields (including nested
+        // Inner); `finish_sub_record`'s internal `relocate_pointers`
+        // rebases the child's own pointer slots into the parent's
+        // coordinate system.
+        (TypeRepr::Schema { schema }, Value::Dict(dict)) => {
+            let sub_layout = relon_eval_api::layout::SchemaLayout::offsets_for(schema)
+                .map_err(|e| RuntimeError::Unsupported {
+                    reason: format!("llvm-aot: schema arg `{}` layout: {e}", field.name),
+                })?;
+            let mut child = builder
+                .sub_record(&field.name, &sub_layout, &schema.fields)
+                .map_err(buffer_to_runtime_error)?;
+            write_schema_into_builder(&mut child, schema, dict, &field.name)?;
+            builder
+                .finish_sub_record(&field.name, child)
+                .map_err(buffer_to_runtime_error)
+        }
         (ty, v) => Err(RuntimeError::Unsupported {
             reason: format!(
                 "llvm-aot: #main arg `{}` got {} but schema expects {ty:?}",
@@ -1259,6 +1282,35 @@ fn write_value_into_builder(
             ),
         }),
     }
+}
+
+/// Recursively fill `child` (a detached sub-record builder) with the
+/// fields of `schema`, pulling each value out of the branded `dict`.
+/// Nested `Schema`-typed fields recurse through
+/// [`write_value_into_builder`]'s Schema arm, which re-enters this
+/// helper one layer down.
+///
+/// `parent_field` is only used for error messages so a missing nested
+/// field names its enclosing slot.
+fn write_schema_into_builder(
+    child: &mut relon_eval_api::buffer::BufferBuilder<'_>,
+    schema: &relon_eval_api::schema_canonical::Schema,
+    dict: &relon_eval_api::ValueDict,
+    parent_field: &str,
+) -> Result<(), RuntimeError> {
+    for sub_field in &schema.fields {
+        let sub_value =
+            dict.map
+                .get(sub_field.name.as_str())
+                .ok_or_else(|| RuntimeError::Unsupported {
+                    reason: format!(
+                        "llvm-aot: schema arg `{parent_field}` is missing field `{}`",
+                        sub_field.name
+                    ),
+                })?;
+        write_value_into_builder(child, sub_field, sub_value)?;
+    }
+    Ok(())
 }
 
 fn read_value_from_reader(
@@ -1293,6 +1345,22 @@ fn read_value_from_reader(
             .read_string(&field.name)
             .map(|s| Value::String(s.into()))
             .map_err(buffer_to_runtime_error),
+        // Phase 0b: nested-Schema return decode. The return record's
+        // pointer slot for a Schema-typed field holds a buffer-relative
+        // offset to the sub-record's fixed area; `BufferReader::sub_record`
+        // anchors a sub-reader there (sharing the parent's byte slice) so
+        // we recurse into its fields and materialise a branded `Value::Dict`.
+        TypeRepr::Schema { schema } => {
+            let sub_layout = relon_eval_api::layout::SchemaLayout::offsets_for(schema)
+                .map_err(|e| RuntimeError::Unsupported {
+                    reason: format!("llvm-aot: return field `{}` layout: {e}", field.name),
+                })?;
+            let sub_reader = reader
+                .sub_record(&field.name, &sub_layout, &schema.fields)
+                .map_err(buffer_to_runtime_error)?;
+            let map = read_record_into_map(&sub_reader, schema)?;
+            Ok(Value::branded_dict(map, Some(schema.name.clone())))
+        }
         other => Err(RuntimeError::Unsupported {
             reason: format!(
                 "llvm-aot: return field `{}` type {other:?} not supported in Phase B",
