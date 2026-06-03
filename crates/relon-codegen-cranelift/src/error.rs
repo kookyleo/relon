@@ -67,3 +67,16 @@ pub enum CraneliftError {
     #[error("cache load failed: {0}")]
     Cache(String),
 }
+
+impl From<relon_ir::FrontendError> for CraneliftError {
+    /// Map the shared frontend pipeline error onto this backend's
+    /// equivalent variant. Each arm preserves the exact message /
+    /// payload the open-coded parse → analyze → lower path produced.
+    fn from(e: relon_ir::FrontendError) -> Self {
+        match e {
+            relon_ir::FrontendError::Parse(msg) => CraneliftError::Parse(msg),
+            relon_ir::FrontendError::Analyze(n) => CraneliftError::Analyze(n),
+            relon_ir::FrontendError::Lowering(msg) => CraneliftError::Lowering(msg),
+        }
+    }
+}

@@ -234,7 +234,6 @@ impl LlvmAotEvaluator {
         ),
         LlvmError,
     > {
-        let ast = relon_parser::parse_document(src).map_err(|e| LlvmError::Parse(e.to_string()))?;
         // W7 closure-as-value (Phase F.W7): the production source
         // `#main(Int n) -> Dict { #internal fib: (k) => ..., result: fib(n) }`
         // trips the v1.5 / v1.6 strict-mode type-surface diagnostics
@@ -246,24 +245,23 @@ impl LlvmAotEvaluator {
         // codegen. Hard structural errors (`UnknownTypeName`,
         // `MainReturnTypeMismatch`, etc.) still surface as `Error`-
         // severity diagnostics under non-strict mode and still gate the
-        // build below.
-        let analyzed = relon_analyzer::analyze_with_options(
-            &ast,
-            &relon_analyzer::AnalyzeOptions {
-                strict_mode: false,
-                ..Default::default()
-            },
-        );
-        if analyzed.has_errors() {
-            let err_count = analyzed
-                .diagnostics
-                .iter()
-                .filter(|d| d.severity() == relon_analyzer::Severity::Error)
-                .count();
-            return Err(LlvmError::Analyze(err_count));
-        }
-        let lowered = relon_ir::lower_workspace_single(&analyzed, &ast)
-            .map_err(|e| LlvmError::Codegen(format!("lower_workspace_single: {e}")))?;
+        // build below. Unlike the bytecode / cranelift tiers, the LLVM
+        // backend does NOT force `standalone_capability_check`.
+        let options = relon_analyzer::AnalyzeOptions {
+            strict_mode: false,
+            ..Default::default()
+        };
+        // Map the shared frontend pipeline error onto this backend's
+        // surface: Parse → Parse, Analyze(n) → Analyze(n), and Lowering
+        // → Codegen with the historical `lower_workspace_single:` prefix
+        // (the LLVM backend has no dedicated `Lowering` variant).
+        let lowered = relon_ir::frontend::compile(src, &options).map_err(|e| match e {
+            relon_ir::FrontendError::Parse(msg) => LlvmError::Parse(msg),
+            relon_ir::FrontendError::Analyze(n) => LlvmError::Analyze(n),
+            relon_ir::FrontendError::Lowering(msg) => {
+                LlvmError::Codegen(format!("lower_workspace_single: {msg}"))
+            }
+        })?;
         Ok((lowered.module, lowered.main_schema, lowered.return_schema))
     }
 
