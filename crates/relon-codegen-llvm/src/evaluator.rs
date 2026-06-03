@@ -1398,6 +1398,24 @@ fn is_single_int_field_record(schema: &relon_eval_api::schema_canonical::Schema)
     schema.fields.len() == 1 && matches!(schema.fields[0].ty, TypeRepr::Int)
 }
 
+/// Marshal a typed [`Value`] into the buffer slot for `field` on the
+/// way *into* the JIT body (host → arena).
+///
+/// ## marshalling-seam contract (host side)
+///
+/// This dispatcher is one of the per-type marshalling seams S1.A
+/// carved out so each leaf type owns a private `marshal_<type>_in`
+/// helper rather than living inline in a single fat `match`. Adding a
+/// new leaf type means: (1) add an arm here delegating to a new
+/// `marshal_<type>_in`, (2) add the symmetric arm to
+/// [`read_value_from_reader`] / `marshal_<type>_out`, and (3) widen the
+/// build.rs-visible [`EmittedFieldType`] triple (see that enum's docs).
+///
+/// Note: MCJIT already marshals `Float` / `Schema` here; the
+/// build.rs-visible [`EmittedFieldType`] surface is the *narrower* set
+/// (see [`lower_field_descriptors`]). Keep the two in mind separately —
+/// this seam is the runtime marshaller, `EmittedFieldType` is the
+/// AOT-binding signature surface.
 fn write_value_into_builder(
     builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
     field: &relon_eval_api::schema_canonical::Field,
@@ -1405,44 +1423,15 @@ fn write_value_into_builder(
 ) -> Result<(), RuntimeError> {
     use relon_eval_api::schema_canonical::TypeRepr;
     match (&field.ty, value) {
-        (TypeRepr::Int, Value::Int(v)) => builder
-            .write_int(&field.name, *v)
-            .map_err(buffer_to_runtime_error),
-        (TypeRepr::Float, Value::Float(v)) => builder
-            .write_float(&field.name, v.into_inner())
-            .map_err(buffer_to_runtime_error),
-        (TypeRepr::Float, Value::Int(v)) => builder
-            .write_float(&field.name, *v as f64)
-            .map_err(buffer_to_runtime_error),
-        (TypeRepr::Bool, Value::Bool(v)) => builder
-            .write_bool(&field.name, *v)
-            .map_err(buffer_to_runtime_error),
-        (TypeRepr::Null, Value::Null) => builder
-            .write_null(&field.name)
-            .map_err(buffer_to_runtime_error),
-        // Phase 0b: Schema-typed `#main` arg marshalling. A branded
-        // `Value::Dict` (e.g. `#main(Outer o)`) lands here.
-        // `BufferBuilder::sub_record` / `finish_sub_record` (eval-api
-        // Phase 9.b-1) write the sub-record into the parent buffer's
-        // tail area and back-patch the 4-byte buffer-relative offset
-        // slot in the fixed area — exactly the slot `LoadSchemaPtr`
-        // reads. We recurse over the sub-fields (including nested
-        // Inner); `finish_sub_record`'s internal `relocate_pointers`
-        // rebases the child's own pointer slots into the parent's
-        // coordinate system.
+        (TypeRepr::Int, Value::Int(v)) => marshal_int_in(builder, &field.name, *v),
+        (TypeRepr::Float, Value::Float(v)) => marshal_float_in(builder, &field.name, v.into_inner()),
+        (TypeRepr::Float, Value::Int(v)) => marshal_float_in(builder, &field.name, *v as f64),
+        (TypeRepr::Bool, Value::Bool(v)) => marshal_bool_in(builder, &field.name, *v),
+        (TypeRepr::Null, Value::Null) => marshal_null_in(builder, &field.name),
         (TypeRepr::Schema { schema }, Value::Dict(dict)) => {
-            let sub_layout = relon_eval_api::layout::SchemaLayout::offsets_for(schema)
-                .map_err(|e| RuntimeError::Unsupported {
-                    reason: format!("llvm-aot: schema arg `{}` layout: {e}", field.name),
-                })?;
-            let mut child = builder
-                .sub_record(&field.name, &sub_layout, &schema.fields)
-                .map_err(buffer_to_runtime_error)?;
-            write_schema_into_builder(&mut child, schema, dict, &field.name)?;
-            builder
-                .finish_sub_record(&field.name, child)
-                .map_err(buffer_to_runtime_error)
+            marshal_schema_in(builder, &field.name, schema, dict)
         }
+        // ----- add new leaf marshalling arm above this line -----
         (ty, v) => Err(RuntimeError::Unsupported {
             reason: format!(
                 "llvm-aot: #main arg `{}` got {} but schema expects {ty:?}",
@@ -1451,6 +1440,72 @@ fn write_value_into_builder(
             ),
         }),
     }
+}
+
+// --- per-variant host-side input marshalling helpers (S1.A seam) ---
+//
+// One `marshal_<type>_in` per leaf type. Future Float/List lanes fill
+// their own helper here without touching sibling arms.
+
+fn marshal_int_in(
+    builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
+    name: &str,
+    v: i64,
+) -> Result<(), RuntimeError> {
+    builder.write_int(name, v).map_err(buffer_to_runtime_error)
+}
+
+fn marshal_float_in(
+    builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
+    name: &str,
+    v: f64,
+) -> Result<(), RuntimeError> {
+    builder.write_float(name, v).map_err(buffer_to_runtime_error)
+}
+
+fn marshal_bool_in(
+    builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
+    name: &str,
+    v: bool,
+) -> Result<(), RuntimeError> {
+    builder.write_bool(name, v).map_err(buffer_to_runtime_error)
+}
+
+fn marshal_null_in(
+    builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
+    name: &str,
+) -> Result<(), RuntimeError> {
+    builder.write_null(name).map_err(buffer_to_runtime_error)
+}
+
+/// Phase 0b: Schema-typed `#main` arg marshalling. A branded
+/// `Value::Dict` (e.g. `#main(Outer o)`) lands here.
+/// `BufferBuilder::sub_record` / `finish_sub_record` (eval-api
+/// Phase 9.b-1) write the sub-record into the parent buffer's tail area
+/// and back-patch the 4-byte buffer-relative offset slot in the fixed
+/// area — exactly the slot `LoadSchemaPtr` reads. We recurse over the
+/// sub-fields (including nested Inner); `finish_sub_record`'s internal
+/// `relocate_pointers` rebases the child's own pointer slots into the
+/// parent's coordinate system.
+fn marshal_schema_in(
+    builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
+    name: &str,
+    schema: &relon_eval_api::schema_canonical::Schema,
+    dict: &relon_eval_api::ValueDict,
+) -> Result<(), RuntimeError> {
+    let sub_layout =
+        relon_eval_api::layout::SchemaLayout::offsets_for(schema).map_err(|e| {
+            RuntimeError::Unsupported {
+                reason: format!("llvm-aot: schema arg `{name}` layout: {e}"),
+            }
+        })?;
+    let mut child = builder
+        .sub_record(name, &sub_layout, &schema.fields)
+        .map_err(buffer_to_runtime_error)?;
+    write_schema_into_builder(&mut child, schema, dict, name)?;
+    builder
+        .finish_sub_record(name, child)
+        .map_err(buffer_to_runtime_error)
 }
 
 /// Recursively fill `child` (a detached sub-record builder) with the
@@ -1482,54 +1537,26 @@ fn write_schema_into_builder(
     Ok(())
 }
 
+/// Decode a buffer slot back into a typed [`Value`] on the way *out* of
+/// the JIT body (arena → host).
+///
+/// Sibling of [`write_value_into_builder`]; same marshalling-seam
+/// contract — each leaf type owns a private `marshal_<type>_out`
+/// helper. Adding a leaf type adds an arm here delegating to a new
+/// `marshal_<type>_out`.
 fn read_value_from_reader(
     reader: &relon_eval_api::buffer::BufferReader<'_>,
     field: &relon_eval_api::schema_canonical::Field,
 ) -> Result<Value, RuntimeError> {
     use relon_eval_api::schema_canonical::TypeRepr;
     match &field.ty {
-        TypeRepr::Int => reader
-            .read_int(&field.name)
-            .map(Value::Int)
-            .map_err(buffer_to_runtime_error),
-        // AOT-1 scalar Float slice: the buffer stores the f64 as 8 LE
-        // bytes (write side: `write_value_into_builder` Float arm); the
-        // reader decodes them back through `read_float`.
-        TypeRepr::Float => reader
-            .read_float(&field.name)
-            .map(|f| Value::Float(OrderedFloat(f)))
-            .map_err(buffer_to_runtime_error),
-        TypeRepr::Bool => reader
-            .read_bool(&field.name)
-            .map(Value::Bool)
-            .map_err(buffer_to_runtime_error),
-        TypeRepr::Null => Ok(Value::Null),
-        // Phase E.1: String return-value decode. The pointer-indirect
-        // StoreField path wrote the `[len:u32][utf8]` record into the
-        // tail region of the output buffer and stamped its buffer-
-        // relative offset into the fixed-area slot. `BufferReader`
-        // walks the same protocol to materialise the borrowed `&str`,
-        // which we then copy into an owned `Value::String`.
-        TypeRepr::String => reader
-            .read_string(&field.name)
-            .map(|s| Value::String(s.into()))
-            .map_err(buffer_to_runtime_error),
-        // Phase 0b: nested-Schema return decode. The return record's
-        // pointer slot for a Schema-typed field holds a buffer-relative
-        // offset to the sub-record's fixed area; `BufferReader::sub_record`
-        // anchors a sub-reader there (sharing the parent's byte slice) so
-        // we recurse into its fields and materialise a branded `Value::Dict`.
-        TypeRepr::Schema { schema } => {
-            let sub_layout = relon_eval_api::layout::SchemaLayout::offsets_for(schema)
-                .map_err(|e| RuntimeError::Unsupported {
-                    reason: format!("llvm-aot: return field `{}` layout: {e}", field.name),
-                })?;
-            let sub_reader = reader
-                .sub_record(&field.name, &sub_layout, &schema.fields)
-                .map_err(buffer_to_runtime_error)?;
-            let map = read_record_into_map(&sub_reader, schema)?;
-            Ok(Value::branded_dict(map, Some(schema.name.clone())))
-        }
+        TypeRepr::Int => marshal_int_out(reader, &field.name),
+        TypeRepr::Float => marshal_float_out(reader, &field.name),
+        TypeRepr::Bool => marshal_bool_out(reader, &field.name),
+        TypeRepr::Null => marshal_null_out(),
+        TypeRepr::String => marshal_string_out(reader, &field.name),
+        TypeRepr::Schema { schema } => marshal_schema_out(reader, &field.name, schema),
+        // ----- add new leaf marshalling arm above this line -----
         other => Err(RuntimeError::Unsupported {
             reason: format!(
                 "llvm-aot: return field `{}` type {other:?} not supported in Phase B",
@@ -1537,6 +1564,84 @@ fn read_value_from_reader(
             ),
         }),
     }
+}
+
+// --- per-variant host-side output marshalling helpers (S1.A seam) ---
+
+fn marshal_int_out(
+    reader: &relon_eval_api::buffer::BufferReader<'_>,
+    name: &str,
+) -> Result<Value, RuntimeError> {
+    reader
+        .read_int(name)
+        .map(Value::Int)
+        .map_err(buffer_to_runtime_error)
+}
+
+/// AOT-1 scalar Float slice: the buffer stores the f64 as 8 LE bytes
+/// (write side: [`marshal_float_in`]); the reader decodes them back
+/// through `read_float`.
+fn marshal_float_out(
+    reader: &relon_eval_api::buffer::BufferReader<'_>,
+    name: &str,
+) -> Result<Value, RuntimeError> {
+    reader
+        .read_float(name)
+        .map(|f| Value::Float(OrderedFloat(f)))
+        .map_err(buffer_to_runtime_error)
+}
+
+fn marshal_bool_out(
+    reader: &relon_eval_api::buffer::BufferReader<'_>,
+    name: &str,
+) -> Result<Value, RuntimeError> {
+    reader
+        .read_bool(name)
+        .map(Value::Bool)
+        .map_err(buffer_to_runtime_error)
+}
+
+fn marshal_null_out() -> Result<Value, RuntimeError> {
+    Ok(Value::Null)
+}
+
+/// Phase E.1: String return-value decode. The pointer-indirect
+/// StoreField path wrote the `[len:u32][utf8]` record into the tail
+/// region of the output buffer and stamped its buffer-relative offset
+/// into the fixed-area slot. `BufferReader` walks the same protocol to
+/// materialise the borrowed `&str`, which we then copy into an owned
+/// `Value::String`.
+fn marshal_string_out(
+    reader: &relon_eval_api::buffer::BufferReader<'_>,
+    name: &str,
+) -> Result<Value, RuntimeError> {
+    reader
+        .read_string(name)
+        .map(|s| Value::String(s.into()))
+        .map_err(buffer_to_runtime_error)
+}
+
+/// Phase 0b: nested-Schema return decode. The return record's pointer
+/// slot for a Schema-typed field holds a buffer-relative offset to the
+/// sub-record's fixed area; `BufferReader::sub_record` anchors a
+/// sub-reader there (sharing the parent's byte slice) so we recurse into
+/// its fields and materialise a branded `Value::Dict`.
+fn marshal_schema_out(
+    reader: &relon_eval_api::buffer::BufferReader<'_>,
+    name: &str,
+    schema: &relon_eval_api::schema_canonical::Schema,
+) -> Result<Value, RuntimeError> {
+    let sub_layout =
+        relon_eval_api::layout::SchemaLayout::offsets_for(schema).map_err(|e| {
+            RuntimeError::Unsupported {
+                reason: format!("llvm-aot: return field `{name}` layout: {e}"),
+            }
+        })?;
+    let sub_reader = reader
+        .sub_record(name, &sub_layout, &schema.fields)
+        .map_err(buffer_to_runtime_error)?;
+    let map = read_record_into_map(&sub_reader, schema)?;
+    Ok(Value::branded_dict(map, Some(schema.name.clone())))
 }
 
 /// Phase E.1: does the return schema include any pointer-indirect
@@ -1671,6 +1776,27 @@ pub struct EmittedField {
 /// nested schemas, and closure-valued returns surface as
 /// `UnsupportedSignature` at emit-object time so the binding never
 /// sees a type tag it can't handle.
+///
+/// ## Three-crate triple contract
+///
+/// This tag is the byte-for-byte-identical seam shared by three crates;
+/// the enum is mirrored (not shared) so the runtime shim and build
+/// generator don't take a dep on this codegen crate:
+///
+/// 1. `relon_codegen_llvm` (this enum) — produced by
+///    [`lower_field_descriptors`].
+/// 2. `relon_rs_shims::EmittedFieldType` — the runtime mirror;
+///    `call_buffer_entry` packs/unpacks per variant.
+/// 3. `relon_rs_build` — `rust_type_for` maps each variant to the Rust
+///    surface type + `ArgValue` / `RetValue` constructor.
+///
+/// **Adding a variant is a four-touch change**: (1) add the variant
+/// here + its arm in [`lower_field_descriptors`]; (2) add the mirror
+/// variant + the `*_in` / `*_out` sibling helpers in
+/// `relon_rs_shims::marshal`; (3) add the `rust_type_for` table row in
+/// `relon_rs_build`; (4) extend the cross-crate round-trip guard test.
+/// The guard test in `relon-rs-build/tests/marshal_roundtrip.rs` fails
+/// closed if any of the three drift.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmittedFieldType {
     /// `i64`. Inline slot at offset, 8/8.
@@ -2014,7 +2140,6 @@ fn lower_field_descriptors(
     schema: &relon_eval_api::schema_canonical::Schema,
     layout: &relon_eval_api::layout::OffsetTable,
 ) -> Result<Vec<EmittedField>, LlvmError> {
-    use relon_eval_api::schema_canonical::TypeRepr;
     let mut out = Vec::with_capacity(schema.fields.len());
     for (i, f) in schema.fields.iter().enumerate() {
         let lo = layout.fields.get(i).ok_or_else(|| {
@@ -2029,18 +2154,12 @@ fn lower_field_descriptors(
                 f.name, lo.name
             )));
         }
-        let ty = match &f.ty {
-            TypeRepr::Int => EmittedFieldType::Int,
-            TypeRepr::Bool => EmittedFieldType::Bool,
-            TypeRepr::Null => EmittedFieldType::Null,
-            TypeRepr::String => EmittedFieldType::String,
-            other => {
-                return Err(LlvmError::UnsupportedSignature(format!(
-                    "relon-rs build (Phase 2): field `{}` type {other:?} not yet wired for marshalling",
-                    f.name
-                )));
-            }
-        };
+        let ty = emitted_field_type_for(&f.ty).ok_or_else(|| {
+            LlvmError::UnsupportedSignature(format!(
+                "relon-rs build (Phase 2): field `{}` type {:?} not yet wired for marshalling",
+                f.name, f.ty
+            ))
+        })?;
         out.push(EmittedField {
             name: f.name.clone(),
             offset: lo.offset as u32,
@@ -2048,6 +2167,30 @@ fn lower_field_descriptors(
         });
     }
     Ok(out)
+}
+
+/// Project one canonical [`TypeRepr`] onto the build.rs-visible
+/// [`EmittedFieldType`] tag, or `None` when the leaf isn't yet wired for
+/// AOT-binding marshalling.
+///
+/// This is the per-variant accept-set table for the
+/// [`EmittedFieldType`] triple's codegen end. To widen the AOT signature
+/// surface (e.g. Float / List lanes), add the matching arm here — the
+/// `None` fall-through keeps every still-unsupported leaf surfacing as
+/// `UnsupportedSignature` rather than silently emitting a tag the shim
+/// can't decode.
+fn emitted_field_type_for(
+    ty: &relon_eval_api::schema_canonical::TypeRepr,
+) -> Option<EmittedFieldType> {
+    use relon_eval_api::schema_canonical::TypeRepr;
+    match ty {
+        TypeRepr::Int => Some(EmittedFieldType::Int),
+        TypeRepr::Bool => Some(EmittedFieldType::Bool),
+        TypeRepr::Null => Some(EmittedFieldType::Null),
+        TypeRepr::String => Some(EmittedFieldType::String),
+        // ----- add new AOT-marshallable leaf type above this line -----
+        _ => None,
+    }
 }
 
 /// Stamp the runtime host CPU/feature set onto every function in the

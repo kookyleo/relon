@@ -69,6 +69,20 @@ pub struct EmittedField {
 /// `Closure` surface as `UnsupportedSignature` on the build.rs side
 /// before they can reach the binding, so the binding never sees an
 /// unknown tag.
+///
+/// ## Three-crate triple contract
+///
+/// This enum is the runtime mirror of
+/// `relon_codegen_llvm::EmittedFieldType`. The tag must stay
+/// byte-for-byte identical across three crates (codegen-llvm, this
+/// runtime shim, build generator) — see the codegen-llvm enum's docs
+/// for the master contract. **Adding a variant here means**: (1) add
+/// the matching [`ArgValue`] / [`RetValue`] variant; (2) add the
+/// `pack_<type>` / `unpack_<type>` sibling helper used by
+/// [`call_buffer_entry`] + extend [`ty_to_repr`] / [`synthesise_layout`];
+/// (3) widen codegen-llvm's `emitted_field_type_for` + the build
+/// generator's `rust_type_for`; (4) extend the cross-crate round-trip
+/// guard test (`relon-rs-build/tests/marshal_roundtrip.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmittedFieldType {
     /// `i64` (Inline 8/8).
@@ -86,6 +100,10 @@ pub enum EmittedFieldType {
 /// Argument value the binding hands to [`call_buffer_entry`]. The
 /// declaration order must match the `#main(...)` parameter order
 /// recorded in the binding's `MAIN_FIELDS` table.
+///
+/// One variant per [`EmittedFieldType`] tag — adding a leaf type adds a
+/// variant here and a `pack_<type>` helper (see the
+/// [`EmittedFieldType`] triple contract).
 #[derive(Debug)]
 pub enum ArgValue<'a> {
     /// `i64` argument bound to an `EmittedFieldType::Int` slot.
@@ -104,6 +122,10 @@ pub enum ArgValue<'a> {
 /// Return value decoded from the JIT entry's output buffer. The
 /// binding's outer wrapper matches on the variant matching its
 /// declared `#main` return type and unwraps the payload.
+///
+/// One variant per [`EmittedFieldType`] tag — adding a leaf type adds a
+/// variant here and an `unpack_<type>` helper (see the
+/// [`EmittedFieldType`] triple contract).
 #[derive(Debug, Clone, PartialEq)]
 pub enum RetValue {
     /// `i64` return decoded from an `EmittedFieldType::Int` slot.
@@ -231,27 +253,7 @@ pub fn call_buffer_entry(
     let main_layout = synthesise_layout(main_fields, main_root_size);
     let mut builder = BufferBuilder::new(&main_layout, &main_schema.fields);
     for (i, (field, arg)) in main_fields.iter().zip(args.iter()).enumerate() {
-        match (field.ty, arg) {
-            (EmittedFieldType::Int, ArgValue::Int(v)) => builder
-                .write_int(field.name, *v)
-                .map_err(|e| BufferEntryError::Buffer(format!("{e}")))?,
-            (EmittedFieldType::Bool, ArgValue::Bool(v)) => builder
-                .write_bool(field.name, *v)
-                .map_err(|e| BufferEntryError::Buffer(format!("{e}")))?,
-            (EmittedFieldType::Null, ArgValue::Null) => builder
-                .write_null(field.name)
-                .map_err(|e| BufferEntryError::Buffer(format!("{e}")))?,
-            (EmittedFieldType::String, ArgValue::String(s)) => builder
-                .write_string(field.name, s)
-                .map_err(|e| BufferEntryError::Buffer(format!("{e}")))?,
-            (expected, actual) => {
-                return Err(BufferEntryError::TypeMismatch {
-                    index: i,
-                    expected,
-                    actual: arg_variant_name(actual),
-                });
-            }
-        }
+        pack_arg(&mut builder, i, field, arg)?;
     }
     let in_bytes = builder.finish();
 
@@ -380,33 +382,107 @@ fn dispatch_with_arena(
         .map_err(|e| BufferEntryError::Buffer(format!("{e}")))?;
     let mut out = Vec::with_capacity(return_fields.len());
     for field in return_fields.iter() {
-        let v = match field.ty {
-            EmittedFieldType::Int => RetValue::Int(
-                reader
-                    .read_int(field.name)
-                    .map_err(|e| BufferEntryError::Buffer(format!("{e}")))?,
-            ),
-            EmittedFieldType::Bool => RetValue::Bool(
-                reader
-                    .read_bool(field.name)
-                    .map_err(|e| BufferEntryError::Buffer(format!("{e}")))?,
-            ),
-            EmittedFieldType::Null => {
-                reader
-                    .read_null(field.name)
-                    .map_err(|e| BufferEntryError::Buffer(format!("{e}")))?;
-                RetValue::Null
-            }
-            EmittedFieldType::String => RetValue::String(
-                reader
-                    .read_string(field.name)
-                    .map_err(|e| BufferEntryError::Buffer(format!("{e}")))?
-                    .to_owned(),
-            ),
-        };
-        out.push(v);
+        out.push(unpack_ret(&reader, field)?);
     }
     Ok(out)
+}
+
+// --- per-variant marshalling helpers (S1.A seam) ---
+//
+// `call_buffer_entry` delegates per-field pack / unpack to one helper
+// per [`EmittedFieldType`] tag. A future Float / List lane adds its
+// `pack_<type>` / `unpack_<type>` sibling here without disturbing the
+// others — mirroring the codegen-llvm `marshal_<type>_in` / `_out`
+// seam.
+
+/// Pack one typed [`ArgValue`] into `builder` for `field`'s slot,
+/// dispatching on the `(field.ty, arg)` pairing. A tag/value mismatch
+/// surfaces as [`BufferEntryError::TypeMismatch`] (a binding bug).
+fn pack_arg(
+    builder: &mut BufferBuilder<'_>,
+    index: usize,
+    field: &EmittedField,
+    arg: &ArgValue<'_>,
+) -> Result<(), BufferEntryError> {
+    match (field.ty, arg) {
+        (EmittedFieldType::Int, ArgValue::Int(v)) => pack_int(builder, field.name, *v),
+        (EmittedFieldType::Bool, ArgValue::Bool(v)) => pack_bool(builder, field.name, *v),
+        (EmittedFieldType::Null, ArgValue::Null) => pack_null(builder, field.name),
+        (EmittedFieldType::String, ArgValue::String(s)) => pack_string(builder, field.name, s),
+        // ----- add new leaf pack arm above this line -----
+        (expected, actual) => Err(BufferEntryError::TypeMismatch {
+            index,
+            expected,
+            actual: arg_variant_name(actual),
+        }),
+    }
+}
+
+fn pack_int(builder: &mut BufferBuilder<'_>, name: &str, v: i64) -> Result<(), BufferEntryError> {
+    builder
+        .write_int(name, v)
+        .map_err(|e| BufferEntryError::Buffer(format!("{e}")))
+}
+
+fn pack_bool(builder: &mut BufferBuilder<'_>, name: &str, v: bool) -> Result<(), BufferEntryError> {
+    builder
+        .write_bool(name, v)
+        .map_err(|e| BufferEntryError::Buffer(format!("{e}")))
+}
+
+fn pack_null(builder: &mut BufferBuilder<'_>, name: &str) -> Result<(), BufferEntryError> {
+    builder
+        .write_null(name)
+        .map_err(|e| BufferEntryError::Buffer(format!("{e}")))
+}
+
+fn pack_string(builder: &mut BufferBuilder<'_>, name: &str, v: &str) -> Result<(), BufferEntryError> {
+    builder
+        .write_string(name, v)
+        .map_err(|e| BufferEntryError::Buffer(format!("{e}")))
+}
+
+/// Decode one `field` slot out of `reader` into the matching
+/// [`RetValue`] variant.
+fn unpack_ret(
+    reader: &BufferReader<'_>,
+    field: &EmittedField,
+) -> Result<RetValue, BufferEntryError> {
+    match field.ty {
+        EmittedFieldType::Int => unpack_int(reader, field.name),
+        EmittedFieldType::Bool => unpack_bool(reader, field.name),
+        EmittedFieldType::Null => unpack_null(reader, field.name),
+        EmittedFieldType::String => unpack_string(reader, field.name),
+        // ----- add new leaf unpack arm above this line -----
+    }
+}
+
+fn unpack_int(reader: &BufferReader<'_>, name: &str) -> Result<RetValue, BufferEntryError> {
+    reader
+        .read_int(name)
+        .map(RetValue::Int)
+        .map_err(|e| BufferEntryError::Buffer(format!("{e}")))
+}
+
+fn unpack_bool(reader: &BufferReader<'_>, name: &str) -> Result<RetValue, BufferEntryError> {
+    reader
+        .read_bool(name)
+        .map(RetValue::Bool)
+        .map_err(|e| BufferEntryError::Buffer(format!("{e}")))
+}
+
+fn unpack_null(reader: &BufferReader<'_>, name: &str) -> Result<RetValue, BufferEntryError> {
+    reader
+        .read_null(name)
+        .map(|_| RetValue::Null)
+        .map_err(|e| BufferEntryError::Buffer(format!("{e}")))
+}
+
+fn unpack_string(reader: &BufferReader<'_>, name: &str) -> Result<RetValue, BufferEntryError> {
+    reader
+        .read_string(name)
+        .map(|s| RetValue::String(s.to_owned()))
+        .map_err(|e| BufferEntryError::Buffer(format!("{e}")))
 }
 
 fn arg_variant_name(arg: &ArgValue<'_>) -> &'static str {
