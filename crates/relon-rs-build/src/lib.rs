@@ -62,6 +62,13 @@ use std::path::{Path, PathBuf};
 
 use relon_codegen_llvm::{EmittedEntryShape, EmittedField, EmittedFieldType, LlvmAotEvaluator};
 
+/// Per-native-fn capability requirement, re-exported from
+/// `relon-analyzer` so a `build.rs` consumer can construct a
+/// [`NativeHostFn`] gate without taking a direct dep on the analyzer
+/// crate. Build a default and flip the bits the host fn needs:
+/// `let mut g = NativeFnGate::default(); g.reads_clock = true;`.
+pub use relon_analyzer::NativeFnGate;
+
 /// Optimisation level requested from the LLVM backend. Phase 1 always
 /// runs the same `-O3` middle-end pipeline regardless of this value;
 /// the type exists so the [`Compiler::opt_level`] setter can express
@@ -83,6 +90,44 @@ struct SourceEntry {
     /// Rust-side identifier the binding generator uses. When `None`
     /// the file basename (e.g. `foo` for `src/foo.relon`) is used.
     alias: Option<String>,
+    /// Host `#native` functions this source calls by name. When
+    /// non-empty, [`Compiler::emit_all`] lowers the source closed-world
+    /// (`Op::CallNative` → `call @<host_symbol>`), threading the
+    /// matching [`relon_analyzer::AnalyzeOptions`] so the host
+    /// declarations resolve and the host shim Rust source links + inlines
+    /// into the `.o`. Empty for a pure source (open-world, the historical
+    /// path).
+    host_fns: Vec<NativeHostFn>,
+}
+
+/// Declaration of one host-provided `#native` function a `.relon`
+/// source calls by name. The consuming crate's `build.rs` registers
+/// it via [`Compiler::native_fn`] / [`Compiler::source_with_native_fns`].
+///
+/// The closed-world emit path uses this to (1) resolve the call name in
+/// the analyzer (`host_fn_names` / `host_fn_signatures`), (2) bake the
+/// `Op::CheckCap` capability gate from `gate`, and (3) compile +
+/// inline `rust_impl` (a `#[no_mangle] extern "C"` Rust body) into the
+/// emitted object so the linked binary is self-contained.
+#[derive(Debug, Clone)]
+pub struct NativeHostFn {
+    /// Function name as called from the `.relon` source. Must match the
+    /// `#[no_mangle]` symbol exported by [`Self::rust_impl`].
+    pub name: String,
+    /// Scalar parameter leaf types, in declaration order. Phase G1
+    /// wires the scalar lane the closed-world dynamic envelope accepts:
+    /// `"Int"`, `"Bool"`. Each maps onto an `i64` C ABI slot.
+    pub param_types: Vec<String>,
+    /// Return leaf type — `"Int"`, `"Bool"`, or `"Null"`.
+    pub return_type: String,
+    /// Capability bits this function requires. A non-empty gate makes
+    /// the source gated: the binding surfaces `Result<T,
+    /// BufferEntryError>` so a runtime denial returns a typed
+    /// `CapabilityDenied` rather than panicking.
+    pub gate: relon_analyzer::NativeFnGate,
+    /// `#[no_mangle] pub extern "C" fn <name>(...) -> ...` Rust source
+    /// the closed-world co-compile links + inlines into the `.o`.
+    pub rust_impl: String,
 }
 
 /// Fluent compile-orchestrator the build.rs caller drives.
@@ -159,6 +204,33 @@ impl Compiler {
         self.sources.push(SourceEntry {
             path: path.as_ref().to_path_buf(),
             alias: None,
+            host_fns: Vec::new(),
+        });
+        self
+    }
+
+    /// Register a `.relon` source that calls one or more host `#native`
+    /// functions. The source lowers closed-world: each call resolves
+    /// against the supplied [`NativeHostFn`] declarations, its
+    /// capability gate is baked in, and the host Rust bodies link +
+    /// inline into the emitted `.o` (the linked binary is
+    /// self-contained — no separate host symbol to resolve at the
+    /// consumer link step).
+    ///
+    /// A source with a gated host fn surfaces its binding as
+    /// `Result<T, ::relon_rs_shims::BufferEntryError>`: an authorised
+    /// call returns `Ok(value)`, an unauthorised one (the
+    /// `SandboxState` didn't grant the required capability) returns
+    /// `Err(BufferEntryError::CapabilityDenied)` rather than trapping.
+    pub fn source_with_native_fns<P: AsRef<Path>>(
+        &mut self,
+        path: P,
+        host_fns: Vec<NativeHostFn>,
+    ) -> &mut Self {
+        self.sources.push(SourceEntry {
+            path: path.as_ref().to_path_buf(),
+            alias: None,
+            host_fns,
         });
         self
     }
@@ -172,6 +244,7 @@ impl Compiler {
         self.sources.push(SourceEntry {
             path: path.as_ref().to_path_buf(),
             alias: Some(alias.into()),
+            host_fns: Vec::new(),
         });
         self
     }
@@ -227,8 +300,28 @@ impl Compiler {
             let object_name = format!("{alias}.o");
             let object_path = out_dir.join(&object_name);
 
-            let info = LlvmAotEvaluator::emit_object(&src, &symbol, &object_path)
-                .map_err(|e| BuildError::Llvm(e, canonical_path.clone()))?;
+            // Pure sources keep the historical open-world `emit_object`
+            // path (byte-identical). Sources that call host `#native`
+            // fns lower closed-world: the host declarations resolve via
+            // `AnalyzeOptions`, the gate bakes in, and the host Rust
+            // bodies link + inline into the `.o`.
+            let required_caps_mask = required_caps_mask(&entry.host_fns);
+            let info = if entry.host_fns.is_empty() {
+                LlvmAotEvaluator::emit_object(&src, &symbol, &object_path)
+                    .map_err(|e| BuildError::Llvm(e, canonical_path.clone()))?
+            } else {
+                let options = build_native_options(&entry.host_fns);
+                let shim = render_host_shim(&entry.host_fns);
+                LlvmAotEvaluator::emit_object_with_options(
+                    &src,
+                    &symbol,
+                    &object_path,
+                    &options,
+                    relon_codegen_llvm::WorldMode::ClosedWorld,
+                    Some(&shim),
+                )
+                .map_err(|e| BuildError::Llvm(e, canonical_path.clone()))?
+            };
 
             // Rebuild only when the source itself changed; the build
             // crate's own changes are tracked by cargo at the dep
@@ -278,6 +371,7 @@ impl Compiler {
                 const_data: info.const_data,
                 source_path: canonical_path,
                 aliased: entry.alias.is_some(),
+                required_caps_mask,
             });
         }
 
@@ -348,6 +442,13 @@ struct BindingModule {
     /// `include_relon!("foo.relon" as bar)`); the binding generator
     /// emits a flat `pub fn <alias>(...)` rather than a `mod`.
     aliased: bool,
+    /// OR of `(1 << bit)` over every capability bit the source's host
+    /// `#native` fns require. Non-zero means the source is gated: the
+    /// buffer binding returns `Result<T, BufferEntryError>` so a runtime
+    /// denial surfaces as a typed `CapabilityDenied`. Zero for a pure
+    /// (open-world) or ungated source — the binding returns `T` directly
+    /// (the historical shape, `.expect(...)` on the marshaller).
+    required_caps_mask: i64,
 }
 
 fn file_stem_or_err(path: &Path) -> Result<String, BuildError> {
@@ -371,6 +472,98 @@ fn mangled_symbol(alias: &str, src: &str) -> String {
     let digest = hasher.finalize();
     let prefix = hex::encode(&digest[..4]);
     format!("__relon_{prefix}_main")
+}
+
+/// OR of `(1 << bit)` over every capability bit required by any of
+/// `host_fns`' gates. Drives the binding's `Result` vs plain-`T`
+/// return shape and is the bitmask the runtime gate tests against the
+/// host's granted `SandboxState` mask.
+fn required_caps_mask(host_fns: &[NativeHostFn]) -> i64 {
+    let mut mask = 0i64;
+    for f in host_fns {
+        for bit in f.gate.required_bit_indices() {
+            mask |= 1i64 << bit;
+        }
+    }
+    mask
+}
+
+/// Build the [`relon_analyzer::AnalyzeOptions`] the closed-world emit
+/// path threads so each host `#native` call resolves (name + signature),
+/// its capability gate bakes into the IR, and the static
+/// reachability check passes.
+///
+/// The granted `caps` here flips **every** required bit on: the static
+/// check must not reject the source at build time, because the runtime
+/// grant/deny decision rides the `caps` argument the host threads per
+/// call. (The same `.o` serves both the authorised and unauthorised
+/// runtime paths.)
+fn build_native_options(host_fns: &[NativeHostFn]) -> relon_analyzer::AnalyzeOptions {
+    use std::collections::{HashMap, HashSet};
+
+    let mut names: HashSet<String> = HashSet::new();
+    let mut signatures: HashMap<String, relon_analyzer::FnSignature> = HashMap::new();
+    let mut gates: HashMap<String, relon_analyzer::NativeFnGate> = HashMap::new();
+
+    for f in host_fns {
+        names.insert(f.name.clone());
+        let params = f
+            .param_types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| relon_analyzer::FnParam {
+                name: format!("_{i}"),
+                ty: relon_analyzer::type_node_simple(ty),
+                optional: false,
+            })
+            .collect();
+        signatures.insert(
+            f.name.clone(),
+            relon_analyzer::FnSignature {
+                name: f.name.clone(),
+                generics: Vec::new(),
+                params,
+                return_type: relon_analyzer::type_node_simple(&f.return_type),
+                variadic_tail: None,
+            },
+        );
+        gates.insert(f.name.clone(), f.gate.clone());
+    }
+
+    // Grant every required bit so the static check passes; runtime
+    // grant/deny is the host's `caps` mask, not this build-time grant.
+    let mut caps = relon_analyzer::Capabilities::default();
+    for f in host_fns {
+        caps.reads_fs |= f.gate.reads_fs;
+        caps.writes_fs |= f.gate.writes_fs;
+        caps.network |= f.gate.network;
+        caps.reads_clock |= f.gate.reads_clock;
+        caps.reads_env |= f.gate.reads_env;
+        caps.uses_rng |= f.gate.uses_rng;
+    }
+
+    relon_analyzer::AnalyzeOptions {
+        host_fn_names: names,
+        host_fn_signatures: signatures,
+        host_fn_gates: gates,
+        caps,
+        strict_mode: false,
+        ..Default::default()
+    }
+}
+
+/// Concatenate every host fn's `#[no_mangle] extern "C"` Rust body into
+/// the single shim source the closed-world co-compile links + inlines.
+fn render_host_shim(host_fns: &[NativeHostFn]) -> String {
+    let mut out = String::new();
+    out.push_str("// Auto-generated host shim for relon-rs closed-world `#native` link.\n");
+    for f in host_fns {
+        out.push_str(&f.rust_impl);
+        if !f.rust_impl.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
 }
 
 fn render_bindings(modules: &[BindingModule]) -> String {
@@ -499,8 +692,49 @@ fn render_one_buffer(out: &mut String, m: &BindingModule) {
         .first()
         .map(|f| rust_type_for(f.ty))
         .unwrap_or_else(|| rust_type_for(EmittedFieldType::Null));
-    let rust_ret_ty = return_map.ret_rust_ty;
+    let inner_ret_ty = return_map.ret_rust_ty;
     let ret_match_arm = return_map.ret_match_arm;
+
+    // Gated sources (a host `#native` fn requires a capability) surface
+    // their binding as `Result<T, BufferEntryError>` so a runtime
+    // denial returns a typed `CapabilityDenied` instead of panicking.
+    // Ungated / pure sources keep the historical plain-`T` shape
+    // (the marshaller never errors on those, so `.expect(...)` is
+    // unreachable in practice and keeps the call site ergonomic).
+    let gated = m.required_caps_mask != 0;
+    let rust_ret_ty = if gated {
+        format!("::std::result::Result<{inner_ret_ty}, ::relon_rs_shims::BufferEntryError>")
+    } else {
+        inner_ret_ty.to_string()
+    };
+
+    // The marshaller-result handling differs by gate: gated bindings
+    // `?`-propagate the error and wrap the decoded value in `Ok`;
+    // ungated bindings `.expect(...)` (preserving the historical
+    // never-errors contract).
+    let (call_tail, decode) = if gated {
+        (
+            "?;".to_string(),
+            format!(
+                "match ret.pop().expect(\"return record empty\") {{\n\
+                 {ret_arm},\n\
+                 other => panic!(\"binding type mismatch on return: {{other:?}}\"),\n\
+             }}\n",
+                ret_arm = ok_wrap_match_arm(ret_match_arm),
+            ),
+        )
+    } else {
+        (
+            ".expect(\"relon AOT body trapped\");".to_string(),
+            format!(
+                "match ret.pop().expect(\"return record empty\") {{\n\
+                 {ret_arm},\n\
+                 other => panic!(\"binding type mismatch on return: {{other:?}}\"),\n\
+             }}\n",
+                ret_arm = ret_match_arm,
+            ),
+        )
+    };
 
     let main_fields_lit = render_field_slice(&m.main_fields);
     let return_fields_lit = render_field_slice(&m.return_fields);
@@ -548,11 +782,8 @@ fn render_one_buffer(out: &mut String, m: &BindingModule) {
              RETURN_HAS_TAIL,\n\
              _state,\n\
              &args,\n\
-         ).expect(\"relon AOT body trapped\");\n\
-         match ret.pop().expect(\"return record empty\") {{\n\
-             {ret_arm},\n\
-             other => panic!(\"binding type mismatch on return: {{other:?}}\"),\n\
-         }}\n",
+         ){call_tail}\n\
+         {decode}",
         sym = sym,
         main_fields = main_fields_lit,
         return_fields = return_fields_lit,
@@ -561,7 +792,8 @@ fn render_one_buffer(out: &mut String, m: &BindingModule) {
         return_root_size = m.return_root_size,
         return_has_tail = m.return_has_tail,
         arg_values = arg_value_exprs.join(", "),
-        ret_arm = ret_match_arm,
+        call_tail = call_tail,
+        decode = decode,
     );
 
     if m.aliased {
@@ -699,6 +931,27 @@ fn render_byte_slice(bytes: &[u8]) -> String {
     }
     out.push(']');
     out
+}
+
+/// Wrap a `RetValue` match arm's value expression in `Ok(...)` for the
+/// gated (`Result`-returning) binding. Splits the arm on the first
+/// `=>`: the left half is the pattern, the right half the decoded
+/// value, and the result is `<pattern> => ::std::result::Result::Ok(<value>)`.
+/// The arms come from [`rust_type_for`]'s `ret_match_arm` table — each
+/// is a single `Pattern => value` clause with no nested `=>`.
+fn ok_wrap_match_arm(arm: &str) -> String {
+    match arm.split_once("=>") {
+        Some((pat, val)) => format!(
+            "{} => ::std::result::Result::Ok({})",
+            pat.trim(),
+            val.trim()
+        ),
+        // Defensive: the table always contains `=>`, but if it ever
+        // doesn't, fall back to wrapping the whole arm so the generated
+        // source still compiles into a visible error rather than silently
+        // mis-decoding.
+        None => format!("{} => ::std::result::Result::Ok(())", arm.trim()),
+    }
 }
 
 /// Sanitise a `#main` parameter name into a safe Rust identifier.

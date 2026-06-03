@@ -2157,6 +2157,7 @@ name = "relon-rs-build"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "relon-analyzer",
  "relon-codegen-llvm",
  "relon-util",
  "sha2",
