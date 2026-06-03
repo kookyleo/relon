@@ -121,6 +121,29 @@ pub(crate) enum EntryShape {
     Buffer,
 }
 
+/// Stage 1.B: whether `Op::CallNative` lowers to **open-world**
+/// dynamic dispatch (the `relon_llvm_call_native` helper resolved at
+/// runtime via `add_global_mapping`) or **closed-world** static
+/// dispatch (a direct `call @<host_symbol>` to an `extern` declaration
+/// the LTO co-compile step later links + inlines).
+///
+/// `OpenWorld` is the default and the only path MCJIT / `from_source`
+/// ever uses — it must stay reachable verbatim. `ClosedWorld` is only
+/// selected by the co-compile orchestration (`crate::cocompile`) when
+/// the full host-fn set is known at emit time (the build.rs /
+/// `emit_object` path), mirroring cranelift's *static* `cap_lookup ->
+/// fn_ptr` arm rather than its `_dynamic` helper arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum WorldMode {
+    /// Dynamic dispatch through `relon_llvm_call_native`. Default so
+    /// the existing MCJIT / `from_source` path is untouched.
+    #[default]
+    OpenWorld,
+    /// Static `call @<host_symbol>` to an external declaration. The
+    /// host bitcode is linked in + inlined by the LTO co-compile pass.
+    ClosedWorld,
+}
+
 /// Phase D.1 fast-path profile: describes a `#main(Int...) -> Int`
 /// source shape eligible for the typed legacy-i64 dispatch fast path.
 ///
@@ -368,6 +391,10 @@ pub(crate) fn is_buffer_protocol_signature(params: &[IrType], ret: IrType) -> bo
 /// helper lookup table the `Emit` driver hands off to the per-function
 /// lowering so sibling calls can find their callee, and the closure
 /// table (one entry per `fn_table_idx`, in source order).
+/// Open-world entry point (the only one MCJIT / `from_source` use).
+/// `Op::CallNative` lowers to the dynamic `relon_llvm_call_native`
+/// helper. Signature kept stable so the `evaluator.rs` call sites are
+/// untouched.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) fn emit_module_funcs<'ctx>(
     ctx: &'ctx Context,
@@ -380,6 +407,83 @@ pub(crate) fn emit_module_funcs<'ctx>(
     lambdas: &[&Func],
     closure_table: &[u32],
     imports: &[relon_ir::ir::NativeImport],
+) -> Result<
+    (
+        FunctionValue<'ctx>,
+        EntryShape,
+        HashMap<u32, FunctionValue<'ctx>>,
+        Vec<FunctionValue<'ctx>>,
+    ),
+    LlvmError,
+> {
+    emit_module_funcs_impl(
+        ctx,
+        module,
+        entry,
+        buffer_return_size,
+        const_pool,
+        helpers,
+        helper_ir_indices,
+        lambdas,
+        closure_table,
+        imports,
+        WorldMode::OpenWorld,
+    )
+}
+
+/// Stage 1.B closed-world entry point. `Op::CallNative` lowers to a
+/// static `call @<host_symbol>` against an `extern` declaration; the
+/// host bitcode is linked in + inlined by [`crate::cocompile`]. Used
+/// only by the co-compile orchestration — never by MCJIT / `from_source`.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn emit_module_funcs_closed_world<'ctx>(
+    ctx: &'ctx Context,
+    module: &LlvmModule<'ctx>,
+    entry: &Func,
+    buffer_return_size: u32,
+    const_pool: &ConstPool,
+    helpers: &[&Func],
+    helper_ir_indices: Option<&[u32]>,
+    lambdas: &[&Func],
+    closure_table: &[u32],
+    imports: &[relon_ir::ir::NativeImport],
+) -> Result<
+    (
+        FunctionValue<'ctx>,
+        EntryShape,
+        HashMap<u32, FunctionValue<'ctx>>,
+        Vec<FunctionValue<'ctx>>,
+    ),
+    LlvmError,
+> {
+    emit_module_funcs_impl(
+        ctx,
+        module,
+        entry,
+        buffer_return_size,
+        const_pool,
+        helpers,
+        helper_ir_indices,
+        lambdas,
+        closure_table,
+        imports,
+        WorldMode::ClosedWorld,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn emit_module_funcs_impl<'ctx>(
+    ctx: &'ctx Context,
+    module: &LlvmModule<'ctx>,
+    entry: &Func,
+    buffer_return_size: u32,
+    const_pool: &ConstPool,
+    helpers: &[&Func],
+    helper_ir_indices: Option<&[u32]>,
+    lambdas: &[&Func],
+    closure_table: &[u32],
+    imports: &[relon_ir::ir::NativeImport],
+    world_mode: WorldMode,
 ) -> Result<
     (
         FunctionValue<'ctx>,
@@ -447,13 +551,15 @@ pub(crate) fn emit_module_funcs<'ctx>(
             &helper_table,
             &closure_fn_table,
             imports,
+            world_mode,
         )?;
         (fv, EntryShape::Buffer)
     } else {
         // The legacy-i64 entry shape covers hand-built fixtures only; it
         // never references ConstString and supplies its own empty pool
         // inside `emit_legacy_entry_impl`.
-        let fv = emit_legacy_entry_with_helpers(ctx, module, entry, &helper_table)?;
+        let fv =
+            emit_legacy_entry_with_helpers(ctx, module, entry, &helper_table, imports, world_mode)?;
         (fv, EntryShape::LegacyI64)
     };
 
@@ -881,6 +987,34 @@ fn declare_call_native<'ctx>(
     )
 }
 
+/// Stage 1.B closed-world: declare a host `#native` fn as an external
+/// `(i64...) -> i64` so `Op::CallNative` can emit a direct
+/// `call @<host_symbol>`. Every scalar arg / return rides the i64 lane
+/// (Bool / I32 zero-extend in; Null returns `void`), matching the host
+/// shim's `#[no_mangle] extern "C" fn(i64...) -> i64` ABI the
+/// co-compile step links in. Idempotent: a repeated import name reuses
+/// the existing declaration.
+///
+/// The lane is deliberately the same i64 width the open-world helper
+/// decodes, so the two paths are bit-for-bit differential-comparable.
+fn declare_host_fn_direct<'ctx>(
+    ctx: &'ctx Context,
+    module: &LlvmModule<'ctx>,
+    import: &relon_ir::ir::NativeImport,
+) -> FunctionValue<'ctx> {
+    if let Some(f) = module.get_function(&import.name) {
+        return f;
+    }
+    let i64_t = ctx.i64_type();
+    let params: Vec<BasicMetadataTypeEnum<'ctx>> =
+        import.param_tys.iter().map(|_| i64_t.into()).collect();
+    let fn_ty = match import.ret_ty {
+        IrType::Null => ctx.void_type().fn_type(&params, false),
+        _ => i64_t.fn_type(&params, false),
+    };
+    module.add_function(&import.name, fn_ty, Some(Linkage::External))
+}
+
 /// #359 (W20): map an [`IrType`] to the LLVM type used in a helper /
 /// lambda **call ABI** slot. This mirrors the operand-stack
 /// convention where `F64` rides as its 64-bit *bit pattern* in an i64
@@ -1190,8 +1324,10 @@ fn emit_legacy_entry_with_helpers<'ctx>(
     module: &LlvmModule<'ctx>,
     func: &Func,
     helper_table: &HashMap<u32, FunctionValue<'ctx>>,
+    imports: &[relon_ir::ir::NativeImport],
+    world_mode: WorldMode,
 ) -> Result<FunctionValue<'ctx>, LlvmError> {
-    emit_legacy_entry_impl(ctx, module, func, Some(helper_table))
+    emit_legacy_entry_impl(ctx, module, func, Some(helper_table), imports, world_mode)
 }
 
 /// Emit a Phase-A `(I64...) -> I64` function. Used by tests + the
@@ -1202,6 +1338,8 @@ fn emit_legacy_entry_impl<'ctx>(
     module: &LlvmModule<'ctx>,
     func: &Func,
     helper_table: Option<&HashMap<u32, FunctionValue<'ctx>>>,
+    imports: &[relon_ir::ir::NativeImport],
+    world_mode: WorldMode,
 ) -> Result<FunctionValue<'ctx>, LlvmError> {
     for (i, p) in func.params.iter().enumerate() {
         if *p != IrType::I64 {
@@ -1249,6 +1387,18 @@ fn emit_legacy_entry_impl<'ctx>(
         emit.helper_table = Some(table.clone());
     }
     emit.llvm_trap_fn = Some(declare_llvm_trap(ctx, module));
+    // Stage 1.B: closed-world legacy entry threads the `#native` import
+    // table + pre-declares each host fn as an `extern` so `CallNative`
+    // emits a direct `call @<host_symbol>` (no state pointer needed).
+    // The open-world legacy path keeps `imports` empty (the legacy
+    // fixtures never carry a `CallNative`).
+    emit.imports = imports;
+    emit.world_mode = world_mode;
+    if matches!(world_mode, WorldMode::ClosedWorld) {
+        for import in imports {
+            declare_host_fn_direct(ctx, module, import);
+        }
+    }
     emit.lower_body(&func.body)?;
 
     Ok(llvm_fn)
@@ -1282,6 +1432,7 @@ fn emit_buffer_entry_with_helpers<'ctx>(
         Some(helper_table),
         &[],
         &[],
+        WorldMode::OpenWorld,
     )
 }
 
@@ -1299,6 +1450,7 @@ fn emit_buffer_entry_with_helpers_and_closures<'ctx, 'cp>(
     helper_table: &HashMap<u32, FunctionValue<'ctx>>,
     closure_fn_table: &[FunctionValue<'ctx>],
     imports: &'cp [relon_ir::ir::NativeImport],
+    world_mode: WorldMode,
 ) -> Result<FunctionValue<'ctx>, LlvmError> {
     emit_buffer_entry_impl(
         ctx,
@@ -1309,6 +1461,7 @@ fn emit_buffer_entry_with_helpers_and_closures<'ctx, 'cp>(
         Some(helper_table),
         closure_fn_table,
         imports,
+        world_mode,
     )
 }
 
@@ -1326,6 +1479,7 @@ fn emit_buffer_entry_impl<'ctx, 'cp>(
     helper_table: Option<&HashMap<u32, FunctionValue<'ctx>>>,
     closure_fn_table: &[FunctionValue<'ctx>],
     imports: &'cp [relon_ir::ir::NativeImport],
+    world_mode: WorldMode,
 ) -> Result<FunctionValue<'ctx>, LlvmError> {
     let i32_t = ctx.i32_type();
     let i64_t = ctx.i64_type();
@@ -1426,10 +1580,29 @@ fn emit_buffer_entry_impl<'ctx, 'cp>(
     }
     emit.closure_fn_table = closure_fn_table.to_vec();
     emit.llvm_trap_fn = Some(declare_llvm_trap(ctx, module));
-    // Phase 0b: thread the `#native` import table + the dynamic-dispatch
-    // helper through so `Op::CallNative` can validate + emit the call.
+    // Phase 0b: thread the `#native` import table through so
+    // `Op::CallNative` can validate the call shape.
     emit.imports = imports;
-    emit.call_native_fn = Some(declare_call_native(ctx, module));
+    emit.world_mode = world_mode;
+    match world_mode {
+        // Open-world (MCJIT / from_source): declare the dynamic-dispatch
+        // helper so `Op::CallNative` emits a `call @relon_llvm_call_native`
+        // that `add_global_mapping` later resolves to the host address.
+        WorldMode::OpenWorld => {
+            emit.call_native_fn = Some(declare_call_native(ctx, module));
+        }
+        // Closed-world (Stage 1.B LTO co-compile): pre-declare every
+        // host fn as an `extern` so `Op::CallNative` can emit a direct
+        // `call @<host_symbol>`. The host bitcode is linked + inlined by
+        // `crate::cocompile`. No `relon_llvm_call_native` helper exists
+        // on this path.
+        WorldMode::ClosedWorld => {
+            emit.call_native_fn = None;
+            for import in imports {
+                declare_host_fn_direct(ctx, module, import);
+            }
+        }
+    }
     emit.lower_body(&func.body)?;
 
     Ok(llvm_fn)
@@ -1655,6 +1828,11 @@ pub(crate) struct Emit<'ctx, 'b, 'cp> {
     /// it. `None` outside the buffer-protocol entry (the only shape
     /// that carries a `*state` pointer to thread through).
     pub(crate) call_native_fn: Option<FunctionValue<'ctx>>,
+    /// Stage 1.B: open-world (dynamic helper) vs closed-world (static
+    /// direct `call @<host_symbol>`) native dispatch. Defaults to
+    /// [`WorldMode::OpenWorld`] so MCJIT / `from_source` are untouched;
+    /// only `crate::cocompile` flips it to `ClosedWorld`.
+    pub(crate) world_mode: WorldMode,
 }
 
 /// Phase E.1: per-call inline-frame state. One entry per active
@@ -1880,6 +2058,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             known_capture_offsets: Vec::new(),
             imports: &[],
             call_native_fn: None,
+            world_mode: WorldMode::OpenWorld,
         }
     }
 

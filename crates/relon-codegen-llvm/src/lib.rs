@@ -77,6 +77,7 @@
 //!   to debug.
 
 mod codegen;
+pub mod cocompile;
 mod error;
 mod evaluator;
 mod mcjit_mm;
