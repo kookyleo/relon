@@ -390,6 +390,22 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// indirect slot lives at that address plus `offset`. The
     /// resulting load is a plain i32, so we don't go through
     /// `field_load_kind`'s zext / type-tagging logic.
+    ///
+    /// The slot value the host marshalled into the input buffer is
+    /// **input-buffer-relative** (relative to `in_ptr`, the start of the
+    /// input record — `BufferBuilder` lays the tail record into the input
+    /// buffer and back-patches a buffer-relative offset). Every operand-
+    /// stack pointer consumer downstream (`ReadStringLen` via
+    /// `arena_addr_i32`, the pointer-indirect `StoreField` /
+    /// `EmitTailRecordFromAbsoluteAddr` tail-record copy, `Op::Call`
+    /// stdlib helpers) treats the pointer as **arena-relative** — the
+    /// same coordinate the const-pool / scratch producers push. So we
+    /// rebase the loaded offset by `in_ptr` here, once at the source,
+    /// instead of teaching every consumer about the param-vs-const
+    /// distinction. Without this rebase, returning a list / string
+    /// parameter by identity (`#main(List<Int> xs) -> List<Int> = xs`)
+    /// copies the record from `arena_base + offset` (wrong region) and
+    /// emits garbage; see `tests/aot_list_param_return.rs`.
     pub(crate) fn emit_load_pointer_indirect_param(
         &mut self,
         offset: u32,
@@ -408,8 +424,51 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .build_load(self.ctx.i32_type(), addr, &name)
             .map_err(|e| LlvmError::Codegen(format!("Load*Ptr load: {e}")))?
             .into_int_value();
-        self.push(raw, ty);
+        // Rebase the input-buffer-relative slot value to an arena-relative
+        // offset so the uniform `arena_base + ptr` resolution every
+        // downstream consumer uses lands inside the input record.
+        let name = self.next_name("loadptr_arena_rel");
+        let arena_rel = self
+            .builder
+            .build_int_add(raw, in_ptr_i32, &name)
+            .map_err(|e| LlvmError::Codegen(format!("Load*Ptr rebase: {e}")))?;
+        self.push(arena_rel, ty);
         Ok(())
+    }
+
+    /// Compute `align_up(value + add, align)` as an i32 value. `align`
+    /// must be a power of two (the record alignments are 4 / 8); for
+    /// `align <= 1` the rounding is a no-op and the result is `value +
+    /// add`. Used by the pointer-indirect record copy to resolve a
+    /// record's inner payload position (`align_up(record_start + 4,
+    /// align)`) from either the source or destination record start.
+    pub(crate) fn align_up_const(
+        &mut self,
+        value: IntValue<'ctx>,
+        add: u32,
+        align: u32,
+        label: &str,
+    ) -> Result<IntValue<'ctx>, LlvmError> {
+        let i32_t = self.ctx.i32_type();
+        let summed = self
+            .builder
+            .build_int_add(value, i32_t.const_int(u64::from(add), false), &format!("{label}_sum"))
+            .map_err(|e| LlvmError::Codegen(format!("{label} add: {e}")))?;
+        if align <= 1 {
+            return Ok(summed);
+        }
+        let bumped = self
+            .builder
+            .build_int_add(
+                summed,
+                i32_t.const_int(u64::from(align - 1), false),
+                &format!("{label}_bump"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("{label} align bump: {e}")))?;
+        let mask = i32_t.const_int(u64::from(!(align - 1)), false);
+        self.builder
+            .build_and(bumped, mask, &format!("{label}_align"))
+            .map_err(|e| LlvmError::Codegen(format!("{label} align and: {e}")))
     }
 
     /// Compute `arena_base + off_i32` as an LLVM pointer. Mirrors
@@ -770,7 +829,24 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         self.builder
             .build_store(tail_gep, new_cur)
             .map_err(|e| LlvmError::Codegen(format!("tail cursor store: {e}")))?;
-        // memcpy(arena_base + out_ptr + aligned, src_abs, record_size).
+        // Write the destination record at `out_ptr + aligned`.
+        //
+        // The record's *inner* padding is position-dependent: the host
+        // protocol lays the payload at `align_up(record_start + 4,
+        // align)`, so the gap between the 4-byte `[len]` header and the
+        // payload is `align_up(record_start + 4, align) - record_start -
+        // 4` — which differs between the source record (whatever offset
+        // the input marshaller / const-pool put it at) and the freshly-
+        // aligned destination slot. A verbatim `memcpy(record_size)` from
+        // the source therefore drags the *source's* pad geometry into the
+        // destination and misaligns the payload whenever the two record
+        // starts have different `% align` residues (e.g. a `List<Int>`
+        // input arg lands its record 4-aligned-but-not-8, payload at
+        // header+4; the 8-aligned output slot expects payload at
+        // header+8). So copy the `[len]` header and the payload
+        // *separately*, reading the payload from the source's actual
+        // payload position and writing it to the destination's — the pad
+        // is recomputed on each side rather than copied.
         let out_ptr_i32 = self.lookup_param(2)?; // IR LocalGet(2) == out_ptr
         let dst_off = self
             .builder
@@ -778,14 +854,37 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .map_err(|e| LlvmError::Codegen(format!("ptr-indirect dst off: {e}")))?;
         let dst_ptr = self.arena_addr_i32(dst_off)?;
         let i64_t = self.ctx.i64_type();
-        let rec64 = self
-            .builder
-            .build_int_z_extend(record_size, i64_t, "ptr_indirect_rec64")
-            .map_err(|e| LlvmError::Codegen(format!("rec64 zext: {e}")))?;
         let _ = arena_base_ptr;
+        // Header: store the `[len: u32]` prefix at the destination record
+        // start (`dst_off + 0`).
         self.builder
-            .build_memcpy(dst_ptr, align, src_abs, 1, rec64)
-            .map_err(|e| LlvmError::Codegen(format!("ptr-indirect memcpy: {e}")))?;
+            .build_store(dst_ptr, len_i32)
+            .map_err(|e| LlvmError::Codegen(format!("ptr-indirect len store: {e}")))?;
+        // Payload byte count: String / ListBool are 1 byte/element,
+        // ListInt / ListFloat are 8.
+        let payload_bytes = match ty {
+            IrType::String | IrType::ListBool => len_i32,
+            IrType::ListInt | IrType::ListFloat => self
+                .builder
+                .build_left_shift(len_i32, i32_t.const_int(3, false), "payload_shl")
+                .map_err(|e| LlvmError::Codegen(format!("payload shl: {e}")))?,
+            _ => unreachable!("record_size match already rejected other types"),
+        };
+        // Source payload offset = align_up(src_off + 4, align). Recompute
+        // it from the (arena-relative) source record start rather than
+        // assuming a fixed header+pad — see the comment above.
+        let src_payload_off = self.align_up_const(src_off_i32, 4, align, "src_payload")?;
+        let src_payload_ptr = self.arena_addr_i32(src_payload_off)?;
+        // Destination payload offset = align_up(dst_off + 4, align).
+        let dst_payload_off = self.align_up_const(dst_off, 4, align, "dst_payload")?;
+        let dst_payload_ptr = self.arena_addr_i32(dst_payload_off)?;
+        let payload64 = self
+            .builder
+            .build_int_z_extend(payload_bytes, i64_t, "ptr_indirect_payload64")
+            .map_err(|e| LlvmError::Codegen(format!("payload64 zext: {e}")))?;
+        self.builder
+            .build_memcpy(dst_payload_ptr, align, src_payload_ptr, 1, payload64)
+            .map_err(|e| LlvmError::Codegen(format!("ptr-indirect payload memcpy: {e}")))?;
         // Store `aligned` (buffer-relative offset of the new record)
         // into the fixed-area slot at `out_ptr + offset`.
         let slot_off = self

@@ -32,15 +32,15 @@
 //!   accepts `#main(List<Int> xs) -> List<Int>`) and the host packs a
 //!   correct `[len][i64…]` tail record (`marshal_list_int_in` delegates
 //!   to the same `BufferBuilder::write_list_int` the eval-api buffer
-//!   tests round-trip). But returning a *param* list by identity
-//!   (`xs`) yields garbage out of the JIT body — the frozen codegen
-//!   writes the input-buffer-relative pointer into the *output*
-//!   buffer's slot without copying the record across the two arenas.
-//!   That is a body/codegen limitation (codegen is frozen for this
-//!   lane), not a marshalling-seam gap, so this test asserts the
-//!   descriptor surface for the param but does **not** claim a working
-//!   param→list-return value path. See the module note rather than a
-//!   silently-passing assertion.
+//!   tests round-trip). Returning a *param* list by identity (`xs`) is
+//!   now a working value path too — see `aot_list_param_return.rs` for
+//!   the three-way value diff. (The earlier garbage came from the
+//!   pointer-indirect `StoreField` copying the input record's
+//!   position-dependent inner padding verbatim into a differently-
+//!   aligned output slot; the copy now writes the `[len]` header and
+//!   payload separately, recomputing the pad on each side, and rebases
+//!   the input-buffer-relative param pointer by `in_ptr`.) This file
+//!   keeps asserting only the descriptor surface for the param.
 //! * `List<Int>` parameters consumed *into a scalar* (`xs[0] + xs[1]`)
 //!   are rejected by the analyzer (`Analyze(1)`) — a front-end gap noted
 //!   in 0b, unreachable here.
@@ -140,9 +140,10 @@ fn param_list_emit_object_native_descriptors() {
 
 /// A `List<Int>` *parameter* lowers its descriptor surface — the slot
 /// the binding generator emits as `EmittedFieldType::ListInt`. (The
-/// param→list-return *value* path is a frozen-codegen limitation; see
-/// the module note. This only pins that `emit_object` accepts the
-/// signature so the binding generator can stamp the ListInt arg row.)
+/// param→list-return *value* path now works; its three-way value diff
+/// lives in `aot_list_param_return.rs`. This test only pins that
+/// `emit_object` accepts the signature so the binding generator can
+/// stamp the ListInt arg row.)
 #[test]
 fn list_param_emit_object_descriptor_only() {
     let info = emit_to_tmp("list_param", LIST_PARAM_SRC)
