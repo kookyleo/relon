@@ -923,7 +923,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
  "foldhash 0.1.5",
- "serde",
 ]
 
 [[package]]
@@ -1942,7 +1941,6 @@ dependencies = [
  "relon-evaluator",
  "relon-ir",
  "relon-parser",
- "relon-wasm-evaluator",
  "serde",
  "serde_json",
  "tempfile",
@@ -2017,20 +2015,6 @@ dependencies = [
  "relon-util",
  "thiserror 2.0.18",
  "wasmtime",
-]
-
-[[package]]
-name = "relon-codegen-wasm"
-version = "0.1.0"
-dependencies = [
- "relon-analyzer",
- "relon-eval-api",
- "relon-evaluator",
- "relon-ir",
- "relon-parser",
- "thiserror 2.0.18",
- "wasm-encoder 0.244.0",
- "wasmparser 0.244.0",
 ]
 
 [[package]]
@@ -2224,22 +2208,6 @@ dependencies = [
  "serde-wasm-bindgen",
  "serde_json",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "relon-wasm-evaluator"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "relon-analyzer",
- "relon-codegen-wasm",
- "relon-eval-api",
- "relon-evaluator",
- "relon-ir",
- "relon-parser",
- "thiserror 2.0.18",
- "tracing",
- "wasmtime",
 ]
 
 [[package]]
@@ -3003,7 +2971,6 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
  "semver",
- "serde",
 ]
 
 [[package]]
