@@ -688,6 +688,53 @@ fn multi_field_dict_return_aligns_native_via_wasmtime() {
     assert_eq!(out.get("y"), Some(&Decoded::Int(want_y)), "dict field y");
 }
 
+/// W5-P3 — `d[k]` dict-get probe runs on wasm32. A `#main` dict body
+/// binds `#internal d` (an `Op::ConstDict` arena record) and the
+/// `result` Int field probes it with a `ConstString` key. This proves
+/// the IR-lowered linear-scan + byte-compare probe lowers to wasm32
+/// with NO unsatisfiable import (only the standard libc symbols the
+/// `linker_with_multi3` harness already provides) and matches the
+/// native LLVM oracle byte-for-byte. The full w5 (map-loop capture +
+/// `#internal keys` list) stays scope-cut until P4 — see
+/// `w5_nested_dict_field_is_unsupported_on_wasm32_emit`.
+#[test]
+fn w5_p3_dict_get_aligns_native_via_wasmtime() {
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping w5-p3 dict-get");
+        return;
+    }
+    // "c" is the middle of the sorted 5-entry table → value 3; the
+    // probe must scan past "a"/"b" before matching.
+    let src = "#main(Int i) -> Dict\n\
+               {\n\
+                 #internal\n\
+                 d: { a: 1, b: 2, c: 3, d: 4, e: 5 },\n\
+                 result: d[\"c\"]\n\
+               }";
+    let want = match native_run(src, HashMap::from([("i".to_string(), Value::Int(0))])) {
+        Value::Dict(d) => match d.map.get("result") {
+            Some(Value::Int(v)) => *v,
+            other => panic!("native result not Int: {other:?}"),
+        },
+        other => panic!("native expected Dict, got {other:?}"),
+    };
+    assert_eq!(want, 3, "native oracle: d[\"c\"] == 3");
+
+    let (bytes, info) = build("w5_p3_dict_get", src);
+    assert!(
+        matches!(info.shape, relon_codegen_llvm::EmittedEntryShape::Buffer),
+        "w5-p3 expected Buffer shape, got {:?}",
+        info.shape
+    );
+    let in_record = pack_single_int(&info, 0);
+    let out = run_buffer(&bytes, "relon_parity_w5_p3_dict_get", &info, &in_record);
+    assert_eq!(
+        out.get("result"),
+        Some(&Decoded::Int(want)),
+        "w5-p3 wasm dict-get != native oracle"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Honest ❌ gaps — assert the new wasm32 object-emit path *rejects* these
 // old corpus shapes (so a future widening of the emitter that silently

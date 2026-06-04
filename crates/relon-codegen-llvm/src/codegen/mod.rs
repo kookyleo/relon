@@ -202,6 +202,14 @@ pub struct ConstPool {
     /// `[len: u32 LE][off_0: u32 LE]...[off_{N-1}: u32 LE]` whose
     /// `off_i` is the arena-relative offset of String record `i`.
     pub list_string_offsets: std::collections::HashMap<u32, u32>,
+    /// W5-P1/P3: `{String -> Int}` dict pool: `idx -> record byte
+    /// offset`. Record layout (byte-identical to cranelift's
+    /// `visit_const_dict`): `[entry_count: u32 LE][pad: u32][shape_hash:
+    /// u64 LE]` header, a `[key_off: u32][key_len: u32][value: i64]`
+    /// entry table sorted by key bytes, then the concatenated UTF-8 key
+    /// payload (`key_off` record-relative). The W5-P3 dict-get probe
+    /// binary-/linear-searches this table at runtime.
+    pub dict_offsets: std::collections::HashMap<u32, u32>,
     /// Materialised bytes in record order. The host trampoline copies
     /// these verbatim to `arena[..bytes.len()]` before every dispatch.
     pub bytes: Vec<u8>,
@@ -233,6 +241,7 @@ impl ConstPool {
             Op::ConstListFloat { idx, elements } => self.add_list_float(*idx, elements),
             Op::ConstListBool { idx, elements } => self.add_list_bool(*idx, elements),
             Op::ConstListString { idx, elements } => self.add_list_string(*idx, elements),
+            Op::ConstDict { idx, entries } => self.add_dict(*idx, entries),
             Op::Block { body, .. } | Op::Loop { body, .. } => self.collect_body(body),
             Op::If {
                 then_body,
@@ -382,6 +391,72 @@ impl ConstPool {
             self.bytes.extend_from_slice(&off.to_le_bytes());
         }
         self.list_string_offsets.insert(idx, header_off);
+        Ok(())
+    }
+
+    /// W5-P1/P3: lay out a `{String -> Int}` dict record. Byte-identical
+    /// to cranelift's `const_pool::visit_const_dict` (cross-backend
+    /// arena data contract) so the W5-P3 dict-get probe reads the same
+    /// bytes on either backend:
+    ///
+    /// ```text
+    /// [entry_count: u32 LE][pad: u32][shape_hash: u64 LE]   ; 16-byte header
+    /// entry_count × [key_off: u32 LE][key_len: u32 LE][value: i64 LE]
+    /// concatenated UTF-8 key bytes                          ; key_off record-rel
+    /// ```
+    ///
+    /// The entry table is sorted by key bytes (deterministic + probe-
+    /// friendly); the record start is 8-aligned so the i64 values + the
+    /// u64 shape_hash land on natural boundaries.
+    fn add_dict(&mut self, idx: u32, entries: &[(String, i64)]) -> Result<(), LlvmError> {
+        if self.dict_offsets.contains_key(&idx) {
+            return Ok(());
+        }
+        self.align_to(8);
+        let off = u32::try_from(self.bytes.len())
+            .map_err(|_| LlvmError::Codegen("llvm const pool exceeds u32 range".into()))?;
+
+        let mut sorted: Vec<&(String, i64)> = entries.iter().collect();
+        sorted.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+
+        let entry_count = u32::try_from(sorted.len())
+            .map_err(|_| LlvmError::Codegen("ConstDict entry count exceeds u32".into()))?;
+        let shape_hash =
+            relon_ir::shape_hash::shape_hash_for_keys(sorted.iter().map(|(k, _)| k.as_str()));
+
+        // Header.
+        self.bytes.extend_from_slice(&entry_count.to_le_bytes());
+        self.bytes.extend_from_slice(&[0u8; 4]); // pad: keep shape_hash 8-aligned
+        self.bytes.extend_from_slice(&shape_hash.to_le_bytes());
+
+        const HEADER_BYTES: u32 = 16;
+        const ENTRY_BYTES: u32 = 16;
+        let table_bytes = entry_count
+            .checked_mul(ENTRY_BYTES)
+            .ok_or_else(|| LlvmError::Codegen("ConstDict table size overflow".into()))?;
+        let key_payload_base = HEADER_BYTES
+            .checked_add(table_bytes)
+            .ok_or_else(|| LlvmError::Codegen("ConstDict key base overflow".into()))?;
+
+        // Entry table. key_off is record-relative; accumulate as we go.
+        let mut running_key_off = key_payload_base;
+        for (key, value) in &sorted {
+            let key_len = u32::try_from(key.len())
+                .map_err(|_| LlvmError::Codegen("ConstDict key length exceeds u32".into()))?;
+            self.bytes.extend_from_slice(&running_key_off.to_le_bytes());
+            self.bytes.extend_from_slice(&key_len.to_le_bytes());
+            self.bytes.extend_from_slice(&value.to_le_bytes());
+            running_key_off = running_key_off
+                .checked_add(key_len)
+                .ok_or_else(|| LlvmError::Codegen("ConstDict key offset overflow".into()))?;
+        }
+
+        // Key payload.
+        for (key, _) in &sorted {
+            self.bytes.extend_from_slice(key.as_bytes());
+        }
+
+        self.dict_offsets.insert(idx, off);
         Ok(())
     }
 }
