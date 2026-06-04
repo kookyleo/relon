@@ -75,3 +75,10 @@ relon-evaluator = { workspace = true }
 # against the native `emit_object` / `run_main` oracle. Dev-only so the
 # production codegen crate does not pull in the wasm runtime.
 wasmtime = "45"
+# §8 follow-up (standard-WASI spike): `tests/aot_wasm_std_wasi.rs` proves a
+# relon-emitted wasm module can import the STANDARD
+# `wasi_snapshot_preview1::clock_time_get` symbol and be satisfied by the
+# off-the-shelf `wasmtime-wasi` preview1 host (`p1::add_to_linker_sync` +
+# `WasiP1Ctx`) — NOT a relon-custom `Linker::func_wrap` env import. Dev-only,
+# pinned to the same major as `wasmtime` so the two share a runtime.
+wasmtime-wasi = "45"
