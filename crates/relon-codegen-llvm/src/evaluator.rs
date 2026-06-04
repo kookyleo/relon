@@ -834,6 +834,9 @@ impl LlvmAotEvaluator {
         if let Some(f) = module.get_function(crate::state::RELON_LLVM_READ_DIR_SYMBOL) {
             engine.add_global_mapping(&f, crate::state::relon_llvm_read_dir_addr());
         }
+        if let Some(f) = module.get_function(crate::state::RELON_LLVM_STAT_SYMBOL) {
+            engine.add_global_mapping(&f, crate::state::relon_llvm_stat_addr());
+        }
 
         let entry_ptr = engine.get_function_address(ENTRY_SYMBOL).map_err(|e| {
             LlvmError::Codegen(format!(

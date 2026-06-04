@@ -475,4 +475,34 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         self.push(result_off);
         Ok(())
     }
+
+    /// Lower the built-in `stat(path)` primitive (`Op::Stat`): pop the
+    /// path String operand (an arena-relative i32 offset), call the
+    /// `RelonStat` host helper through the capability vtable, and push the
+    /// `Dict` of file metadata (also an arena-relative i32 offset, pointing
+    /// at the dict record). The `reads_fs` gate fired in the preceding
+    /// `Op::CheckCap`.
+    ///
+    /// The helper bump-allocates the dict record at `tail_cursor` and
+    /// returns its offset (or a negative sentinel on failure, having
+    /// recorded a `TrapKind` in `state.trap_code`). Identical trap-on-
+    /// trap_code shape to `emit_read_file` / `emit_read_dir`.
+    pub(super) fn emit_stat(&mut self) -> Result<(), CraneliftError> {
+        let path_off = self.pop()?;
+        let inst = self.emit_host_fn_call(VtableSlot::RelonStat, &[self.state_ptr, path_off]);
+        let result_off = self.builder.inst_results(inst)[0];
+
+        let trap_code = self.builder.ins().load(
+            I64,
+            MemFlags::trusted(),
+            self.state_ptr,
+            STATE_OFFSET_TRAP_CODE,
+        );
+        let zero = self.builder.ins().iconst(I64, 0);
+        let trapped = self.builder.ins().icmp(IntCC::NotEqual, trap_code, zero);
+        self.cond_trap_with_code(trapped, trap_code);
+
+        self.push(result_off);
+        Ok(())
+    }
 }

@@ -212,6 +212,15 @@ fn build() -> HashMap<String, FnSignature> {
     );
     m.insert(k, v);
 
+    // P-fs Stage 3: `stat(path: String) -> Dict` — read a path's file
+    // metadata (`{is_dir: Bool, size: Int}`). Always in scope, no
+    // `#import` required. Gated by `reads_fs` (implicit gate injected in
+    // `capability_check`). The lowering recognises it as `Op::Stat`;
+    // native lowers to a host runtime helper (sandboxed to the configured
+    // root), wasm to the standard preview1 `path_filestat_get` import.
+    let (k, v) = sig("stat", vec![param("path", tn!(String))], tn!(Dict), None);
+    m.insert(k, v);
+
     // -- list intrinsics (polymorphic; v1.1 generics) -----------------
     // `_list_map<T, U>(List<T>, Closure<(T) -> U>) -> List<U>`.
     //

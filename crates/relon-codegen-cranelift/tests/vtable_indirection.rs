@@ -18,12 +18,13 @@ use tempfile::tempdir;
 
 #[test]
 fn vtable_layout_matches_slot_count() {
-    // 9 active slots × 8-byte pointer = 72 bytes used; the reserved
+    // 10 active slots × 8-byte pointer = 80 bytes used; the reserved
     // section is 32 slots so we have headroom for new helpers. Slots 5/6
     // are the built-in clock()/random() capability-primitive helpers;
     // slot 7 is the built-in read_file() helper (P-fs Stage 1); slot 8 is
-    // the built-in read_dir() helper (P-fs Stage 2).
-    assert_eq!(VtableSlot::COUNT, 9);
+    // the built-in read_dir() helper (P-fs Stage 2); slot 9 is the
+    // built-in stat() helper (P-fs Stage 3).
+    assert_eq!(VtableSlot::COUNT, 10);
     let active_bytes: usize = VtableSlot::COUNT as usize * 8;
     assert!(VTABLE_BYTES >= active_bytes);
     assert_eq!(VtableSlot::RelonNow.offset_bytes(), 0);
@@ -35,6 +36,7 @@ fn vtable_layout_matches_slot_count() {
     assert_eq!(VtableSlot::RelonRandom.offset_bytes(), 48);
     assert_eq!(VtableSlot::RelonReadFile.offset_bytes(), 56);
     assert_eq!(VtableSlot::RelonReadDir.offset_bytes(), 64);
+    assert_eq!(VtableSlot::RelonStat.offset_bytes(), 72);
     assert_eq!(VTABLE_SYMBOL, "__relon_capability_vtable");
 }
 

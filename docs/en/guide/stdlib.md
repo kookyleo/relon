@@ -48,6 +48,7 @@ the [capability model](./sandbox):
 | `random()` | `Int` — a non-deterministic 64-bit value | `uses_rng` | standard WASI `random_get` |
 | `read_file(path)` | `String` — the file's UTF-8 contents | `reads_fs` | standard WASI preview1 `path_open` / `fd_read` / `fd_close` |
 | `read_dir(path)` | `List<String>` — the directory's entry names, **sorted** | `reads_fs` | not yet implemented (native-only) |
+| `stat(path)` | `Dict{size: Int, is_dir: Bool}` — file metadata | `reads_fs` | standard WASI preview1 `path_filestat_get` |
 
 ```relon
 {
@@ -76,6 +77,14 @@ UTF-8 only). `read_dir` is **native-only** for now — byte-equal across the
 three native backends (tree-walk, cranelift-native, llvm-native); the wasm32
 arm (the standard preview1 `fd_readdir` dirent-stream protocol) is deferred and
 raises a loud codegen error rather than emit an incorrect listing.
+
+`stat(path)` reads a path's file metadata into a `{size: Int, is_dir: Bool}`
+dict against the same sandbox root (same escape refusal). `size` is the file's
+byte length and `is_dir` is whether the path is a directory. `stat` is byte-equal
+across all four backends — tree-walk, cranelift-native, llvm-native, and wasm32:
+the wasm arm lowers to the standard preview1 `path_filestat_get` import (a fixed
+64-byte `filestat` struct — no dirent stream), reading `filetype` and `size` out
+of it, so any off-the-shelf WASI host runs it.
 
 They are built into the language (no `#import`), but the host must grant the
 matching capability bit — the **same gate** as host-registered native fns,

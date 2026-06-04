@@ -3122,14 +3122,15 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
 
             // call.rs — native dispatch + capability gate + trap +
             // built-in WASI-backed capability primitives
-            // (clock/random/read_file/read_dir)
+            // (clock/random/read_file/read_dir/stat)
             Op::CallNative { .. }
             | Op::CheckCap { .. }
             | Op::Trap { .. }
             | Op::ReadClock
             | Op::ReadRandom
             | Op::ReadFile
-            | Op::ReadDir => self.lower_call_rest(ip, &ip_hint, &tagged.op)?,
+            | Op::ReadDir
+            | Op::Stat => self.lower_call_rest(ip, &ip_hint, &tagged.op)?,
 
             // schema.rs — schema pointer / method dispatch
             Op::LoadSchemaPtr { .. } => self.lower_schema_rest(ip, &ip_hint, &tagged.op)?,

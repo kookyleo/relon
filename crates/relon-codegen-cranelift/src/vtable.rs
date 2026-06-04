@@ -130,13 +130,26 @@ pub enum VtableSlot {
     /// negative sentinel on a sandbox-escape / I/O failure, which the
     /// codegen turns into a trap).
     RelonReadDir = 8,
+    /// `extern "C" fn(state: *const SandboxState, path_off: i32) -> i32`.
+    ///
+    /// Built-in `stat(path)` primitive (`Op::Stat`), P-fs Stage 3.
+    /// `path_off` is the arena-relative offset of the path's wasm-style
+    /// String record (`[len: u32 LE][utf8 bytes]`). The helper reads the
+    /// path out of the arena, resolves it against the shared filesystem
+    /// sandbox root (`relon_util`), reads the metadata
+    /// (`std::fs::metadata`), bump-allocates a `{is_dir: Bool, size: Int}`
+    /// dict record at `tail_cursor` (the `Op::ConstDict` layout), and
+    /// returns the record's arena-relative offset (or a negative sentinel
+    /// on a sandbox-escape / I/O failure, which the codegen turns into a
+    /// trap).
+    RelonStat = 9,
 }
 
 impl VtableSlot {
     /// Number of slots reserved in the vtable. Bumping this requires
     /// a `GENERATOR_VERSION` bump in `object_cache_integration` so
     /// older cache files self-invalidate.
-    pub const COUNT: u32 = 9;
+    pub const COUNT: u32 = 10;
 
     /// Byte offset of this slot inside the vtable. Each slot is one
     /// host pointer (8 bytes on x86_64-linux, which is v5-γ's only
@@ -194,10 +207,12 @@ pub unsafe fn populate_vtable(vtable_ptr: *mut u8) {
             crate::read_file_helper::relon_read_file_helper as *const u8;
         *slots.add(VtableSlot::RelonReadDir as usize) =
             crate::read_dir_helper::relon_read_dir_helper as *const u8;
+        *slots.add(VtableSlot::RelonStat as usize) =
+            crate::stat_helper::relon_stat_helper as *const u8;
     }
     tracing::trace!(
         target: "relon::vtable",
-        "populated vtable at {:p}: now={:p} raise_trap={:p} cap_lookup={:p} glob_match={:p} call_native={:p} clock_wall={:p} random={:p} read_file={:p} read_dir={:p}",
+        "populated vtable at {:p}: now={:p} raise_trap={:p} cap_lookup={:p} glob_match={:p} call_native={:p} clock_wall={:p} random={:p} read_file={:p} read_dir={:p} stat={:p}",
         vtable_ptr,
         SandboxState::now_helper as *const u8,
         SandboxState::raise_trap as *const u8,
@@ -208,6 +223,7 @@ pub unsafe fn populate_vtable(vtable_ptr: *mut u8) {
         SandboxState::random_helper as *const u8,
         crate::read_file_helper::relon_read_file_helper as *const u8,
         crate::read_dir_helper::relon_read_dir_helper as *const u8,
+        crate::stat_helper::relon_stat_helper as *const u8,
     );
 }
 
@@ -226,6 +242,7 @@ mod tests {
         assert_eq!(VtableSlot::RelonRandom.offset_bytes(), 48);
         assert_eq!(VtableSlot::RelonReadFile.offset_bytes(), 56);
         assert_eq!(VtableSlot::RelonReadDir.offset_bytes(), 64);
+        assert_eq!(VtableSlot::RelonStat.offset_bytes(), 72);
     }
 
     #[test]
@@ -242,6 +259,7 @@ mod tests {
             VtableSlot::RelonRandom,
             VtableSlot::RelonReadFile,
             VtableSlot::RelonReadDir,
+            VtableSlot::RelonStat,
         ];
         assert_eq!(variants.len() as u32, VtableSlot::COUNT);
     }
@@ -275,6 +293,7 @@ mod tests {
             assert!(!(*slots.add(6)).is_null(), "RelonRandom slot");
             assert!(!(*slots.add(7)).is_null(), "RelonReadFile slot");
             assert!(!(*slots.add(8)).is_null(), "RelonReadDir slot");
+            assert!(!(*slots.add(9)).is_null(), "RelonStat slot");
         }
     }
 }

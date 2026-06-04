@@ -43,7 +43,7 @@
 //! well-defined) — a standard WASI host returns `0` for the supported
 //! clocks, so this path is not exercised in practice.
 
-use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, PointerValue};
+use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, IntValue, PointerValue};
 use inkwell::AddressSpace;
 use inkwell::IntPredicate;
 
@@ -112,6 +112,469 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             )),
             crate::CodegenTarget::Native => self.emit_read_dir_native(),
         }
+    }
+
+    /// Lower `Op::Stat`: built-in `stat(path) -> Dict` primitive (P-fs
+    /// Stage 3). Pops the path String (an arena-relative i32 offset) and
+    /// pushes the `{is_dir: Bool, size: Int}` Dict (also an arena-relative
+    /// i32 offset, pointing at the dict record).
+    pub(crate) fn emit_stat(&mut self) -> Result<(), LlvmError> {
+        match self.target {
+            crate::CodegenTarget::Wasm32 => self.emit_stat_wasi(),
+            crate::CodegenTarget::Native => self.emit_stat_native(),
+        }
+    }
+
+    /// Native: `call @relon_llvm_stat(state, path_off) -> i32`. The helper
+    /// reads the path, reads the metadata, materializes the
+    /// `{is_dir, size}` dict record at the scratch cursor, and returns its
+    /// offset (or a negative sentinel + `state.trap_code` on failure).
+    /// Identical trap-on-trap_code shape to `emit_read_dir_native`, only
+    /// the pushed value type differs (`Dict`).
+    fn emit_stat_native(&mut self) -> Result<(), LlvmError> {
+        let i8_t = self.ctx.i8_type();
+        let i32_t = self.ctx.i32_type();
+        let i64_t = self.ctx.i64_type();
+        let ptr_t = self.ctx.ptr_type(AddressSpace::default());
+
+        let state_ptr = self.state_ptr.ok_or_else(|| {
+            LlvmError::Codegen(
+                "Op::Stat requires the buffer-protocol entry (no state_ptr available)".into(),
+            )
+        })?;
+
+        let path_off = self.pop("Stat")?.val;
+
+        let symbol = crate::state::RELON_LLVM_STAT_SYMBOL;
+        let helper = match self.module.get_function(symbol) {
+            Some(f) => f,
+            None => {
+                let fn_ty = i32_t.fn_type(&[ptr_t.into(), i32_t.into()], false);
+                self.module
+                    .add_function(symbol, fn_ty, Some(inkwell::module::Linkage::External))
+            }
+        };
+        let call_site = self
+            .builder
+            .build_call(
+                helper,
+                &[state_ptr.into(), path_off.into()],
+                &self.next_name("stat"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("stat build_call: {e}")))?;
+        let result_off = match call_site.try_as_basic_value() {
+            inkwell::values::ValueKind::Basic(BasicValueEnum::IntValue(v)) => v,
+            other => {
+                return Err(LlvmError::Codegen(format!(
+                    "stat helper returned {other:?}, expected i32"
+                )));
+            }
+        };
+
+        // Load `state.trap_code`; non-zero means the stat failed.
+        let trap_gep = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    state_ptr,
+                    &[i32_t
+                        .const_int(u64::from(crate::state::ARENA_STATE_OFFSET_TRAP_CODE), false)],
+                    &self.next_name("st_trap_gep"),
+                )
+                .map_err(|e| LlvmError::Codegen(format!("stat trap_code gep: {e}")))?
+        };
+        let trap_code = self
+            .builder
+            .build_load(i64_t, trap_gep, &self.next_name("st_trap_code"))
+            .map_err(|e| LlvmError::Codegen(format!("stat trap_code load: {e}")))?
+            .into_int_value();
+        let zero = i64_t.const_zero();
+        let trapped = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                trap_code,
+                zero,
+                &self.next_name("st_trapped"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("stat trap cmp: {e}")))?;
+        let trap_bb = self.ctx.append_basic_block(self.func, "st_trap");
+        let cont_bb = self.ctx.append_basic_block(self.func, "st_cont");
+        self.builder
+            .build_conditional_branch(trapped, trap_bb, cont_bb)
+            .map_err(|e| LlvmError::Codegen(format!("stat trap branch: {e}")))?;
+        self.builder.position_at_end(trap_bb);
+        self.emit_trap_sentinel_return("Stat")?;
+        self.builder.position_at_end(cont_bb);
+
+        // The result is the arena-relative offset of the dict record.
+        self.push(result_off, IrType::Dict);
+        Ok(())
+    }
+
+    /// wasm32 `stat(path)` → standard preview1 `path_filestat_get`.
+    ///
+    /// ## ABI (`path_filestat_get`)
+    ///
+    /// ```text
+    /// path_filestat_get(fd: i32, flags: i32, path_ptr: i32, path_len: i32,
+    ///                   filestat_out: i32) -> errno: i32
+    /// ```
+    ///
+    /// `fd` is the conventional first preopened dir (fd 3); `flags=1`
+    /// (`symlink_follow`); `filestat_out` points at a 64-byte linear-memory
+    /// scratch slot the host fills with the `filestat` struct. We read two
+    /// of its fields:
+    ///   * `filetype` — `u8` at struct offset 16 (`3` == directory);
+    ///   * `size` — `u64` at struct offset 32.
+    ///
+    /// ## arena Dict-out reconciliation
+    ///
+    /// To stay bit-equal with the native arm's scratch-Dict-out
+    /// convention, the result lands in a fresh `{is_dir: Bool, size: Int}`
+    /// dict record bump-allocated in the scratch region (`scratch_base +
+    /// align_up(scratch_cursor, 8)`), shaped exactly like the
+    /// `Op::ConstDict` layout (`[entry_count][pad][shape_hash]` header,
+    /// sorted `[key_off][key_len][value]` entries, then the key payload).
+    /// The keys (`is_dir` < `size`) and `shape_hash` are compile-time
+    /// constants; only the two entry values come from the host filestat.
+    /// Pushing the record's arena-relative offset as a `Dict` operand
+    /// makes the existing return-store path copy it out verbatim — exactly
+    /// like the native helper's return value.
+    ///
+    /// On a non-zero errno (open / stat failure, e.g. a sandbox-denied
+    /// path) the lowering records `NativeTrap::CapabilityDenied` in
+    /// `state.trap_code` and routes to the trap epilogue.
+    fn emit_stat_wasi(&mut self) -> Result<(), LlvmError> {
+        use crate::state::{
+            ARENA_STATE_OFFSET_SCRATCH_BASE, ARENA_STATE_OFFSET_SCRATCH_CURSOR,
+            ARENA_STATE_OFFSET_TRAP_CODE,
+        };
+
+        // Dict record layout constants (mirror const_pool::visit_const_dict
+        // and the native helper). filestat field offsets per WASI preview1.
+        const HEADER_BYTES: u32 = 16;
+        const ENTRY_BYTES: u32 = 16;
+        const FILESTAT_FILETYPE_OFF: u64 = 16; // u8
+        const FILESTAT_SIZE_OFF: u64 = 32; // u64
+        const WASI_FILETYPE_DIRECTORY: u64 = 3;
+        // Sorted-by-key entries: ("is_dir", <bool>), ("size", <u64>).
+        const KEYS: [&str; 2] = ["is_dir", "size"];
+
+        let i8_t = self.ctx.i8_type();
+        let i32_t = self.ctx.i32_type();
+        let i64_t = self.ctx.i64_type();
+        let ptr_t = self.ctx.ptr_type(AddressSpace::default());
+
+        let state_ptr = self.state_ptr.ok_or_else(|| {
+            LlvmError::Codegen(
+                "Op::Stat wasm32 requires the buffer-protocol entry (no state_ptr available)"
+                    .into(),
+            )
+        })?;
+        self.arena_base_ptr.ok_or_else(|| {
+            LlvmError::Codegen("Op::Stat wasm32 outside buffer-protocol entry shape".into())
+        })?;
+
+        // Pop the path String operand (arena-relative i32 offset to a
+        // `[len:u32][utf8]` record). Path payload at +4.
+        let path_off = self.pop_int("Stat")?;
+        let path_len_ptr = self.arena_addr_i32(path_off)?;
+        let path_len = self
+            .builder
+            .build_load(i32_t, path_len_ptr, &self.next_name("st_path_len"))
+            .map_err(|e| LlvmError::Codegen(format!("stat path_len load: {e}")))?
+            .into_int_value();
+        let path_payload_off = self
+            .builder
+            .build_int_add(
+                path_off,
+                i32_t.const_int(4, false),
+                &self.next_name("st_pp_off"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("stat path payload off: {e}")))?;
+        let path_payload_ptr = self.arena_addr_i32(path_payload_off)?;
+
+        // Load scratch_base / scratch_cursor and compute the 8-aligned
+        // record offset.
+        let load_state_u32 = |this: &mut Self, off: u32, hint: &str| -> Result<_, LlvmError> {
+            let gep = unsafe {
+                this.builder
+                    .build_in_bounds_gep(
+                        i8_t,
+                        state_ptr,
+                        &[i32_t.const_int(u64::from(off), false)],
+                        &this.next_name(&format!("{hint}_gep")),
+                    )
+                    .map_err(|e| LlvmError::Codegen(format!("stat {hint} gep: {e}")))?
+            };
+            let v = this
+                .builder
+                .build_load(i32_t, gep, &this.next_name(hint))
+                .map_err(|e| LlvmError::Codegen(format!("stat {hint} load: {e}")))?
+                .into_int_value();
+            Ok((gep, v))
+        };
+        let (cursor_gep, scratch_cursor) =
+            load_state_u32(self, ARENA_STATE_OFFSET_SCRATCH_CURSOR, "st_scratch_cursor")?;
+        let (_, scratch_base) =
+            load_state_u32(self, ARENA_STATE_OFFSET_SCRATCH_BASE, "st_scratch_base")?;
+        // record_off = scratch_base + align_up(scratch_cursor, 8).
+        let aligned_cursor = self.align_up_const(scratch_cursor, 0, 8, "st_cursor")?;
+        let record_off = self
+            .builder
+            .build_int_add(
+                scratch_base,
+                aligned_cursor,
+                &self.next_name("st_record_off"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("stat record off: {e}")))?;
+
+        // 64-byte filestat scratch slot (linear-memory stack slot).
+        let filestat_ty = i8_t.array_type(64);
+        let filestat_slot = self.alloc_entry(filestat_ty.into(), "st_filestat")?;
+        let filestat_addr = self
+            .builder
+            .build_ptr_to_int(filestat_slot, i32_t, &self.next_name("st_filestat_addr"))
+            .map_err(|e| LlvmError::Codegen(format!("stat filestat ptrtoint: {e}")))?;
+
+        // path_filestat_get(fd=3, flags=1, path_ptr, path_len, *filestat).
+        let pfg_ty = i32_t.fn_type(
+            &[
+                i32_t.into(), // fd
+                i32_t.into(), // flags
+                ptr_t.into(), // path_ptr
+                i32_t.into(), // path_len
+                ptr_t.into(), // filestat_out
+            ],
+            false,
+        );
+        let pfg = self.declare_wasi_import("path_filestat_get", pfg_ty);
+        let errno = self
+            .builder
+            .build_call(
+                pfg,
+                &[
+                    i32_t.const_int(WASI_PREOPEN_DIRFD, false).into(),
+                    i32_t.const_int(1, false).into(), // symlink_follow
+                    path_payload_ptr.into(),
+                    path_len.into(),
+                    filestat_slot.into(),
+                ],
+                &self.next_name("st_errno"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("stat path_filestat_get call: {e}")))?;
+        let errno = match errno.try_as_basic_value() {
+            inkwell::values::ValueKind::Basic(BasicValueEnum::IntValue(v)) => v,
+            other => {
+                return Err(LlvmError::Codegen(format!(
+                    "stat path_filestat_get returned {other:?}, expected i32 errno"
+                )));
+            }
+        };
+        let failed = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                errno,
+                i32_t.const_zero(),
+                &self.next_name("st_failed"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("stat errno cmp: {e}")))?;
+        let ok_bb = self.ctx.append_basic_block(self.func, "st_ok");
+        let trap_bb = self.ctx.append_basic_block(self.func, "st_wasm_trap");
+        let cont_bb = self.ctx.append_basic_block(self.func, "st_wasm_cont");
+        self.builder
+            .build_conditional_branch(failed, trap_bb, ok_bb)
+            .map_err(|e| LlvmError::Codegen(format!("stat errno branch: {e}")))?;
+
+        // --- ok: read filetype + size, materialize the dict record ---
+        self.builder.position_at_end(ok_bb);
+        // filetype (u8 @16) -> is_dir = (filetype == 3) as i64.
+        let ft_off = self
+            .builder
+            .build_int_add(
+                filestat_addr,
+                i32_t.const_int(FILESTAT_FILETYPE_OFF, false),
+                &self.next_name("st_ft_off"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("stat filetype off: {e}")))?;
+        let ft_ptr = self
+            .builder
+            .build_int_to_ptr(ft_off, ptr_t, &self.next_name("st_ft_ptr"))
+            .map_err(|e| LlvmError::Codegen(format!("stat filetype inttoptr: {e}")))?;
+        let filetype = self
+            .builder
+            .build_load(i8_t, ft_ptr, &self.next_name("st_filetype"))
+            .map_err(|e| LlvmError::Codegen(format!("stat filetype load: {e}")))?
+            .into_int_value();
+        let is_dir_bool = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                filetype,
+                i8_t.const_int(WASI_FILETYPE_DIRECTORY, false),
+                &self.next_name("st_is_dir_bool"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("stat is_dir cmp: {e}")))?;
+        let is_dir_i64 = self
+            .builder
+            .build_int_z_extend(is_dir_bool, i64_t, &self.next_name("st_is_dir_i64"))
+            .map_err(|e| LlvmError::Codegen(format!("stat is_dir zext: {e}")))?;
+        // size (u64 @32).
+        let sz_off = self
+            .builder
+            .build_int_add(
+                filestat_addr,
+                i32_t.const_int(FILESTAT_SIZE_OFF, false),
+                &self.next_name("st_sz_off"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("stat size off: {e}")))?;
+        let sz_ptr = self
+            .builder
+            .build_int_to_ptr(sz_off, ptr_t, &self.next_name("st_sz_ptr"))
+            .map_err(|e| LlvmError::Codegen(format!("stat size inttoptr: {e}")))?;
+        let size_i64 = self
+            .builder
+            .build_load(i64_t, sz_ptr, &self.next_name("st_size"))
+            .map_err(|e| LlvmError::Codegen(format!("stat size load: {e}")))?
+            .into_int_value();
+
+        // Materialize the dict record. All offsets are record-relative
+        // compile-time constants; only the two entry values are dynamic.
+        // store_u32 / store_u64 write at `record_off + rel`.
+        let entry_values = [is_dir_i64, size_i64];
+        let key_payload_base = HEADER_BYTES + KEYS.len() as u32 * ENTRY_BYTES;
+        let shape_hash = relon_ir::shape_hash::shape_hash_for_keys(KEYS.iter().copied());
+
+        let store_const_u32 = |this: &mut Self, rel: u32, val: u32| -> Result<(), LlvmError> {
+            let off = this
+                .builder
+                .build_int_add(
+                    record_off,
+                    i32_t.const_int(u64::from(rel), false),
+                    &this.next_name("st_w32_off"),
+                )
+                .map_err(|e| LlvmError::Codegen(format!("stat w32 off: {e}")))?;
+            let p = this.arena_addr_i32(off)?;
+            this.builder
+                .build_store(p, i32_t.const_int(u64::from(val), false))
+                .map_err(|e| LlvmError::Codegen(format!("stat w32 store: {e}")))?;
+            Ok(())
+        };
+        let store_dyn_u64 =
+            |this: &mut Self, rel: u32, val: IntValue<'ctx>| -> Result<(), LlvmError> {
+                let off = this
+                    .builder
+                    .build_int_add(
+                        record_off,
+                        i32_t.const_int(u64::from(rel), false),
+                        &this.next_name("st_w64_off"),
+                    )
+                    .map_err(|e| LlvmError::Codegen(format!("stat w64 off: {e}")))?;
+                let p = this.arena_addr_i32(off)?;
+                this.builder
+                    .build_store(p, val)
+                    .map_err(|e| LlvmError::Codegen(format!("stat w64 store: {e}")))?;
+                Ok(())
+            };
+        let store_const_u64 = |this: &mut Self, rel: u32, val: u64| -> Result<(), LlvmError> {
+            let off = this
+                .builder
+                .build_int_add(
+                    record_off,
+                    i32_t.const_int(u64::from(rel), false),
+                    &this.next_name("st_cw64_off"),
+                )
+                .map_err(|e| LlvmError::Codegen(format!("stat const w64 off: {e}")))?;
+            let p = this.arena_addr_i32(off)?;
+            this.builder
+                .build_store(p, i64_t.const_int(val, false))
+                .map_err(|e| LlvmError::Codegen(format!("stat const w64 store: {e}")))?;
+            Ok(())
+        };
+        let store_const_u8 = |this: &mut Self, rel: u32, byte: u8| -> Result<(), LlvmError> {
+            let off = this
+                .builder
+                .build_int_add(
+                    record_off,
+                    i32_t.const_int(u64::from(rel), false),
+                    &this.next_name("st_w8_off"),
+                )
+                .map_err(|e| LlvmError::Codegen(format!("stat w8 off: {e}")))?;
+            let p = this.arena_addr_i32(off)?;
+            this.builder
+                .build_store(p, i8_t.const_int(u64::from(byte), false))
+                .map_err(|e| LlvmError::Codegen(format!("stat w8 store: {e}")))?;
+            Ok(())
+        };
+
+        // Header: [entry_count][pad][shape_hash].
+        store_const_u32(self, 0, KEYS.len() as u32)?;
+        store_const_u32(self, 4, 0)?;
+        store_const_u64(self, 8, shape_hash)?;
+        // Entry table + key payload.
+        let mut running_key_off = key_payload_base;
+        let mut entry_rel = HEADER_BYTES;
+        let mut key_rel = key_payload_base;
+        for (k, v) in KEYS.iter().zip(entry_values.iter()) {
+            let klen = k.len() as u32;
+            store_const_u32(self, entry_rel, running_key_off)?;
+            store_const_u32(self, entry_rel + 4, klen)?;
+            store_dyn_u64(self, entry_rel + 8, *v)?;
+            for (i, b) in k.bytes().enumerate() {
+                store_const_u8(self, key_rel + i as u32, b)?;
+            }
+            running_key_off += klen;
+            entry_rel += ENTRY_BYTES;
+            key_rel += klen;
+        }
+
+        // scratch_cursor = (record_off - scratch_base) + total record size.
+        let total_record = key_rel; // == key_payload_base + sum(key lens)
+        let rec_rel = self
+            .builder
+            .build_int_sub(record_off, scratch_base, &self.next_name("st_rec_rel"))
+            .map_err(|e| LlvmError::Codegen(format!("stat rec rel: {e}")))?;
+        let new_cursor = self
+            .builder
+            .build_int_add(
+                rec_rel,
+                i32_t.const_int(u64::from(total_record), false),
+                &self.next_name("st_new_cursor"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("stat new cursor: {e}")))?;
+        self.builder
+            .build_store(cursor_gep, new_cursor)
+            .map_err(|e| LlvmError::Codegen(format!("stat cursor store: {e}")))?;
+        self.builder
+            .build_unconditional_branch(cont_bb)
+            .map_err(|e| LlvmError::Codegen(format!("stat ok branch: {e}")))?;
+
+        // --- trap: record CapabilityDenied + route to trap epilogue ---
+        self.builder.position_at_end(trap_bb);
+        let trap_gep = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    state_ptr,
+                    &[i32_t.const_int(u64::from(ARENA_STATE_OFFSET_TRAP_CODE), false)],
+                    &self.next_name("st_wasm_trap_gep"),
+                )
+                .map_err(|e| LlvmError::Codegen(format!("stat wasm trap gep: {e}")))?
+        };
+        self.builder
+            .build_store(
+                trap_gep,
+                i64_t.const_int(crate::state::NativeTrap::CapabilityDenied as u64, false),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("stat wasm trap store: {e}")))?;
+        self.emit_trap_sentinel_return("Stat")?;
+
+        // --- cont: push the record offset as a Dict operand ---
+        self.builder.position_at_end(cont_bb);
+        self.push(record_off, IrType::Dict);
+        Ok(())
     }
 
     /// Native: `call @relon_llvm_read_dir(state, path_off) -> i32`. The
