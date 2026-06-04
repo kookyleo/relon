@@ -804,37 +804,57 @@ fn w7_recursive_closure_dict_is_unsupported_on_wasm32_emit() {
     );
 }
 
-/// W5 production Dict — nested-Dict `#internal` field (`d: { a: 1, ... }`)
-/// in an `AnonDictReturn`. Rejected **before any backend codegen** by the
-/// shared `relon-ir` lowering layer
-/// (`lowering::classify_anon_dict_scalar_field` →
-/// `AnonDictReturn(field 'd': unsupported value shape 'Dict')`), which
-/// only classifies scalar / String / arith / `#main`-param / closure-call
-/// field shapes — a nested `Dict` value has no scalar `TypeRepr`. The
-/// rejection is identical for native object-emit, wasm32, AND cranelift
-/// (same `lower_workspace_single` entry point), so widening it is an IR-
-/// layer change shared with the cranelift backend, out of scope for this
-/// task's `relon-codegen-llvm`-only remit. Guard retained: a future IR
-/// widening that flips this verdict should re-run the parity decision.
+/// W5-P4 — the full production w5 Dict now compiles end-to-end to wasm32
+/// and matches the native LLVM oracle. The body binds `#internal d` (an
+/// `Op::ConstDict` arena record), `#internal keys` (an
+/// `Op::ConstListString` arena record), and a host-visible
+/// `result: list.sum(range(n).map((i) => d[keys[i % 10]]))`. The map loop
+/// is inlined (`emit_range_pipeline_loop`); its body resolves `keys[i%10]`
+/// (a `ListString` int-index → String handle) then `d[<String>]` (the
+/// IR-lowered dict-probe linear scan + byte compare) entirely through the
+/// captured `d` / `keys` let-bindings — no new wasm import beyond the
+/// standard libc symbols the harness already provides. n=10 sums
+/// `d["a"]..d["j"]` = 1+2+…+10 = 55. This was the P1-P3 scope-cut guard
+/// (`w5_nested_dict_field_is_unsupported_on_wasm32_emit`); P4 flips it to
+/// a real value assertion against the native oracle.
 #[test]
-fn w5_nested_dict_field_is_unsupported_on_wasm32_emit() {
+fn w5_full_dict_probe_aligns_native_via_wasmtime() {
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping w5-full dict-probe");
+        return;
+    }
     let src = "#import list from \"std/list\"\n#main(Int n) -> Dict\n{\n#internal\n\
                d: { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10 },\n#internal\n\
                keys: [\"a\", \"b\", \"c\", \"d\", \"e\", \"f\", \"g\", \"h\", \"i\", \"j\"],\n\
                result: list.sum(range(n).map((i) => d[keys[i % 10]]))\n}";
-    let obj = std::env::temp_dir().join(format!("relon_parity_w5_{}.o", std::process::id()));
-    let r = LlvmAotEvaluator::emit_object_for_target(
-        src,
-        "relon_parity_w5",
-        &obj,
-        &opts(),
-        WorldMode::OpenWorld,
-        None,
-        CodegenTarget::Wasm32,
-    );
-    let _ = std::fs::remove_file(&obj);
+    let n = 10i64;
+    // Native LLVM oracle (non-strict opts — the inline map body's
+    // `d[keys[i%10]]` is not statically derivable by the strict analyzer,
+    // matching how w2 / w5_inline run through `opts()`).
+    let want = match LlvmAotEvaluator::from_source_with_options(src, &opts())
+        .expect("native w5 from_source")
+        .run_main(HashMap::from([("n".to_string(), Value::Int(n))]))
+        .expect("native w5 run_main")
+    {
+        Value::Dict(d) => match d.map.get("result") {
+            Some(Value::Int(v)) => *v,
+            other => panic!("native result not Int: {other:?}"),
+        },
+        other => panic!("native expected Dict, got {other:?}"),
+    };
+    assert_eq!(want, 55, "native oracle: full w5 sum == 55");
+
+    let (bytes, info) = build("w5_full", src);
     assert!(
-        r.is_err(),
-        "W5 nested-dict field unexpectedly emitted on wasm32 — re-evaluate parity decision"
+        matches!(info.shape, relon_codegen_llvm::EmittedEntryShape::Buffer),
+        "w5-full expected Buffer shape, got {:?}",
+        info.shape
+    );
+    let in_record = pack_single_int(&info, n);
+    let out = run_buffer(&bytes, "relon_parity_w5_full", &info, &in_record);
+    assert_eq!(
+        out.get("result"),
+        Some(&Decoded::Int(want)),
+        "w5-full wasm dict-probe != native oracle"
     );
 }

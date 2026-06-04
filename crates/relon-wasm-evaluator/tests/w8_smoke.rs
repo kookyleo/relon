@@ -20,9 +20,11 @@
 //!
 //! Note: the **production** W8 source (`#main(Int n) -> Dict` with an
 //! `#internal dispatch: (tag) => ...` first-class closure called via
-//! `dispatch(i % 4)`) still scope-cuts at the classifier and routes
-//! through the tree-walker fallback — that path is Z.4 follow-up. See
-//! `scope_cut_smoke.rs` for the scope-cut tier check pattern.
+//! `dispatch(i % 4)`) now COMPILES too — W5-P4 widened the IR
+//! `anon_dict_return_plan` to accept a `result: list.sum(range.map(...))`
+//! host field, and the captured closure resolves through the Z.4.3
+//! closure-as-value path. See `w8_production_dict_source_compiles_and_matches_oracle`
+//! for the value-pinned honesty check.
 
 use std::collections::HashMap;
 
@@ -133,22 +135,26 @@ fn w8_fast_path_round_trips() {
 }
 
 #[test]
-fn w8_production_dict_source_still_scope_cuts() {
+fn w8_production_dict_source_compiles_and_matches_oracle() {
     // The production source binds `dispatch: (tag) => ...` as a
     // `#internal` closure called via `dispatch(i % 4)` and returns
     // `Dict { dispatch, result }`. Phase Z.4.1 unlocked the bare-
     // `Dict` mini-ABI on the walker; Phase Z.4.3 unlocked the
     // closure-as-value path (`MakeClosure` / `CallClosure` +
-    // funcref-table dispatch). W8 production still stays scope-cut
-    // **upstream** of the walker — the IR-pipeline's
-    // `anon_dict_return_plan` rejects `list.sum(range(n).map(...))`
-    // as the value for `result:` (the classifier only accepts
-    // calls into previously-classified closure fields), so the
-    // source never reaches the walker even after Z.4.3. Resolving
-    // this needs an IR-pipeline widening that recognises the
-    // `list.sum(... map(closure))` shape; until then the tree-walker
-    // fallback is the honest path — a silent fast-path pass would be
-    // the paper-win anti-pattern from design §7.
+    // funcref-table dispatch).
+    //
+    // W5-P4 widened the IR `anon_dict_return_plan` to classify a
+    // `result: list.sum(range(n).map(...))` host-visible field as
+    // `Int` (the dict-probe workload's host field). That widening
+    // also lets W8 production through the classifier: its `result`
+    // field has the same `list.sum(range.map(...))` shape, and the
+    // captured `dispatch` closure is resolved by the existing Z.4.3
+    // closure-as-value lowering. So W8 production now COMPILES to
+    // wasm (tier promotes `Cold` → `Compiled` on first call) and
+    // returns the correct value — an honest promotion, not a paper
+    // win. This test pins the **value** against an independent
+    // tree-walk oracle so a real mis-compile (wrong arm mapping /
+    // capture) trips here rather than passing silently.
     let prod_src = "#import list from \"std/list\"\n\
                     #main(Int n) -> Dict\n\
                     {\n\
@@ -157,10 +163,33 @@ fn w8_production_dict_source_still_scope_cuts() {
                       result: list.sum(range(n).map((i) => dispatch(i % 4)))\n\
                     }";
     let ev = WasmEvaluator::new(prod_src).expect("WasmEvaluator::new(W8 production)");
+    // Construction compiles to wasm — no tree-walker fallback.
     assert_eq!(
         ev.active_tier(),
-        Tier::TreeWalker,
-        "W8 production Dict source must surface tree-walker fallback \
-         (IR anon-Dict-plan rejects stdlib calls — separate follow-up)"
+        Tier::Cold,
+        "W8 production now compiles to wasm (Cold before first call), \
+         not a tree-walker fallback"
+    );
+    let n = 8i64;
+    let out = ev
+        .run_main(HashMap::from([("n".to_string(), Value::Int(n))]))
+        .expect("run_main(W8 production)");
+    // n=8 visits i%4 twice over {0,1,2,3} → 2*(1+2+3+4) = 20.
+    let want = expected_w8(n);
+    match out {
+        Value::Dict(d) => {
+            let result = d.map.get("result").expect("W8 dict missing `result`");
+            assert_eq!(
+                result,
+                &Value::Int(want),
+                "W8 production compiled result must match tree-walk oracle"
+            );
+        }
+        other => panic!("W8 production expected Dict, got {other:?}"),
+    }
+    assert_eq!(
+        ev.active_tier(),
+        Tier::Compiled,
+        "W8 production must run on the compiled tier after invoke"
     );
 }
