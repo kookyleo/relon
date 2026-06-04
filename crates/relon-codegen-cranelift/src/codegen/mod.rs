@@ -910,10 +910,12 @@ fn body_needs_tail_cursor(body: &[TaggedOp]) -> bool {
             | Op::EmitTailRecordFromAbsoluteAddr { .. }
             // `read_file` bump-allocates its contents String record at
             // `tail_cursor`, so the prologue must initialise the cursor
-            // past the fixed return-root area. `read_dir` likewise
-            // bump-allocates its List<String> record there.
+            // past the fixed return-root area. `read_dir` / `stat`
+            // likewise bump-allocate their List<String> / Dict record
+            // there.
             | Op::ReadFile
-            | Op::ReadDir => return true,
+            | Op::ReadDir
+            | Op::Stat => return true,
             Op::If {
                 then_body,
                 else_body,
@@ -1208,9 +1210,12 @@ impl<'a, 'b> Codegen<'a, 'b> {
             // `fn(*state) -> i64` shape as `RelonNow`, so they reuse
             // its prebuilt signature reference.
             VtableSlot::RelonClockWall | VtableSlot::RelonRandom => self.now_sig_ref,
-            // `read_dir` shares the same `fn(*state, path_off: i32) ->
-            // i32` shape as `read_file`, so it reuses the prebuilt sig.
-            VtableSlot::RelonReadFile | VtableSlot::RelonReadDir => self.read_file_sig_ref,
+            // `read_dir` / `stat` share the same `fn(*state, path_off:
+            // i32) -> i32` shape as `read_file`, so they reuse the
+            // prebuilt sig.
+            VtableSlot::RelonReadFile | VtableSlot::RelonReadDir | VtableSlot::RelonStat => {
+                self.read_file_sig_ref
+            }
         };
         emit_indirect_host_call(
             self.builder,

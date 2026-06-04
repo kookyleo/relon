@@ -64,6 +64,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             Op::ReadRandom => self.emit_read_random(),
             Op::ReadFile => self.emit_read_file(),
             Op::ReadDir => self.emit_read_dir(),
+            Op::Stat => self.emit_stat(),
             other => Err(LlvmError::Codegen(format!(
                 "lower_call_rest reached non-call op {other:?} at ip={ip}"
             ))),

@@ -1043,6 +1043,41 @@ pub enum Op {
     ///   error rather than emit a silent / incorrect listing.
     ReadDir,
 
+    /// Built-in WASI-backed file metadata primitive (`stat(path)` in
+    /// source). P-fs Stage 3.
+    ///
+    /// Pops one `String` operand (the path) and pushes one `Dict`
+    /// (`{is_dir: Bool, size: Int}`). Stack effect: `[String] -> [Dict]`.
+    /// The path is an arena-relative `[len: u32 LE][utf8 bytes]` record;
+    /// the result is an arena-relative dict record (the same layout
+    /// `Op::ConstDict` produces: a `[entry_count: u32 LE][pad: u32]
+    /// [shape_hash: u64 LE]` header, then `entry_count` sorted-by-key
+    /// `[key_off: u32 LE][key_len: u32 LE][value: i64 LE]` entries, then
+    /// the concatenated key payload). The two keys are `is_dir` and
+    /// `size` (sorted byte-lexicographic: `is_dir` < `size`); `is_dir`'s
+    /// `Bool` is stored as an `i64` 0/1 in the entry value slot.
+    ///
+    /// Lowering always emits a preceding `Op::CheckCap { ReadsFs }`, so
+    /// the capability gate fires before the metadata read. The path is
+    /// resolved relative to the host-configured sandbox root (native
+    /// `std::fs`) or the wasm preopened directory (preview1) — never an
+    /// absolute / escaping path. Backend lowering:
+    /// - **tree-walk** (gold standard): `std::fs::metadata`, sandboxed to
+    ///   the configured root, mapped to a `Value::Dict`.
+    /// - **cranelift native**: indirect call through the capability
+    ///   vtable's `RelonStat` slot — the helper reads the path, calls
+    ///   `std::fs::metadata`, and bump-allocates the dict record, returning
+    ///   its arena-relative offset.
+    /// - **llvm native**: a host `extern "C"` helper with the same
+    ///   arena-offset-in / arena-offset-out contract.
+    /// - **wasm32**: the standard preview1 `path_filestat_get` import
+    ///   writes a 64-byte `filestat` struct into linear memory; the
+    ///   lowering reads `filetype` (offset 16; `3` == directory) and
+    ///   `size` (offset 32) and materializes the dict record. Satisfied by
+    ///   any standard WASI host (`wasmtime-wasi`) with a preopened
+    ///   directory.
+    Stat,
+
     /// Phase 4.c-1 control flow primitive.
     ///
     /// Emit a wasm `block <blocktype>` containing `body`, followed by
@@ -1820,6 +1855,12 @@ impl Op {
             // (non-deterministic), so it's opaque to the trace recorder
             // like `Op::CallNative`.
             Op::ReadDir => Unrecoverable,
+
+            // Built-in WASI-backed file metadata read. Crosses a
+            // capability boundary + touches the host filesystem
+            // (non-deterministic), so it's opaque to the trace recorder
+            // like `Op::CallNative`.
+            Op::Stat => Unrecoverable,
         }
     }
 }

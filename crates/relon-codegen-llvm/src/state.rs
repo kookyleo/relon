@@ -856,6 +856,212 @@ pub fn relon_llvm_read_dir_addr() -> usize {
     relon_llvm_read_dir as *const () as usize
 }
 
+/// Symbol the LLVM module declares the native `stat()` helper under
+/// (P-fs Stage 3).
+pub const RELON_LLVM_STAT_SYMBOL: &str = "relon_llvm_stat";
+
+/// Host helper backing the built-in `stat(path)` primitive on the native
+/// target (`Op::Stat`). Mirrors the cranelift `relon_stat_helper`: reads
+/// the path's wasm-style String record out of the arena, resolves it
+/// against the shared filesystem sandbox root (`relon_util`), reads the
+/// metadata (`std::fs::metadata`), bump-allocates a `{is_dir: Bool, size:
+/// Int}` dict record (the `Op::ConstDict` layout) in the scratch region,
+/// advances the cursor, and returns the record's arena-relative offset.
+/// On failure it records a [`NativeTrap`] in `state.trap_code` and
+/// returns `-1`.
+///
+/// ABI: `extern "C" fn(state: *const ArenaState, path_off: i32) -> i32`.
+///
+/// # Safety
+///
+/// `state` must point at a live, properly aligned [`ArenaState`] for the
+/// duration of the call.
+pub unsafe extern "C" fn relon_llvm_stat(state: *const ArenaState, path_off: i32) -> i32 {
+    if state.is_null() {
+        return -1;
+    }
+    // SAFETY: caller upholds the ArenaState invariants.
+    let state = unsafe { &*state };
+    let arena_base = unsafe { *state.arena_base.get() };
+    let arena_len = unsafe { *state.arena_len.get() };
+    if arena_base == 0 {
+        unsafe { *state.trap_code.get() = NativeTrap::HostFnMissing as u64 };
+        return -1;
+    }
+
+    // 1. Read the path bytes out of the arena (`[len: u32 LE][bytes]`).
+    let read_record = |off: i32| -> Option<(u32, *const u8)> {
+        if off < 0 {
+            return None;
+        }
+        let off_u = off as u32;
+        let header_end = off_u.checked_add(4)?;
+        if header_end > arena_len {
+            return None;
+        }
+        // SAFETY: bounds checked against arena_len.
+        let len = unsafe { std::ptr::read_unaligned((arena_base + off_u as usize) as *const u32) };
+        let payload_end = header_end.checked_add(len)?;
+        if payload_end > arena_len {
+            return None;
+        }
+        Some((len, (arena_base + header_end as usize) as *const u8))
+    };
+    let (path_len, path_ptr) = match read_record(path_off) {
+        Some(v) => v,
+        None => {
+            unsafe { *state.trap_code.get() = NativeTrap::HostFnMissing as u64 };
+            return -1;
+        }
+    };
+    // SAFETY: read_record validated the payload range.
+    let path_bytes = unsafe { std::slice::from_raw_parts(path_ptr, path_len as usize) };
+    let path = match std::str::from_utf8(path_bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            unsafe { *state.trap_code.get() = NativeTrap::HostFnMissing as u64 };
+            return -1;
+        }
+    };
+
+    // 2. Resolve against the sandbox root (refuses escapes), 3. read.
+    let resolved = match relon_util::resolve_fs_sandbox_path(path) {
+        Ok(p) => p,
+        Err(_) => {
+            unsafe { *state.trap_code.get() = NativeTrap::CapabilityDenied as u64 };
+            return -1;
+        }
+    };
+    let meta = match std::fs::metadata(&resolved) {
+        Ok(m) => m,
+        Err(_) => {
+            unsafe { *state.trap_code.get() = NativeTrap::CapabilityDenied as u64 };
+            return -1;
+        }
+    };
+    let is_dir = meta.is_dir();
+    let size = meta.len() as i64;
+
+    // 4. Bump-allocate the dict record in the scratch region, 8-aligned
+    //    (so the i64 values + u64 shape_hash land naturally). Layout
+    //    mirrors `Op::ConstDict` / `const_pool::visit_const_dict`:
+    //    `[entry_count][pad][shape_hash]` header, sorted
+    //    `[key_off][key_len][value]` entries, then the key payload.
+    //    Keys (sorted byte-lexicographic): "is_dir" < "size".
+    let entries: [(&str, i64); 2] = [("is_dir", i64::from(is_dir)), ("size", size)];
+    const HEADER_BYTES: u32 = 16;
+    const ENTRY_BYTES: u32 = 16;
+    let entry_count = entries.len() as u32;
+
+    let scratch_base = unsafe { *state.scratch_base.get() };
+    let pre = unsafe { *state.scratch_cursor.get() };
+    let record_off = match scratch_base
+        .checked_add(pre)
+        .map(|c| relon_util::align_up(c, 8))
+    {
+        Some(v) => v,
+        None => {
+            unsafe { *state.trap_code.get() = NativeTrap::HostFnError as u64 };
+            return -1;
+        }
+    };
+
+    let key_payload_base = match entry_count
+        .checked_mul(ENTRY_BYTES)
+        .and_then(|t| HEADER_BYTES.checked_add(t))
+    {
+        Some(v) => v,
+        None => {
+            unsafe { *state.trap_code.get() = NativeTrap::HostFnError as u64 };
+            return -1;
+        }
+    };
+    let mut total = key_payload_base;
+    for (k, _) in &entries {
+        total = match u32::try_from(k.len())
+            .ok()
+            .and_then(|kl| total.checked_add(kl))
+        {
+            Some(v) => v,
+            None => {
+                unsafe { *state.trap_code.get() = NativeTrap::HostFnError as u64 };
+                return -1;
+            }
+        };
+    }
+    let record_end = match record_off.checked_add(total) {
+        Some(v) => v,
+        None => {
+            unsafe { *state.trap_code.get() = NativeTrap::HostFnError as u64 };
+            return -1;
+        }
+    };
+    if record_end > arena_len {
+        unsafe { *state.trap_code.get() = NativeTrap::HostFnError as u64 };
+        return -1;
+    }
+
+    let shape_hash = relon_ir::shape_hash::shape_hash_for_keys(entries.iter().map(|(k, _)| *k));
+
+    let write_u32 = |rel: u32, val: u32| {
+        // SAFETY: `[record_off, record_end)` is bounds-checked in-arena.
+        unsafe {
+            std::ptr::write_unaligned((arena_base + (record_off + rel) as usize) as *mut u32, val)
+        };
+    };
+    let write_u64 = |rel: u32, val: u64| {
+        // SAFETY: as above; record is 8-aligned.
+        unsafe {
+            std::ptr::write_unaligned((arena_base + (record_off + rel) as usize) as *mut u64, val)
+        };
+    };
+
+    // Header.
+    write_u32(0, entry_count);
+    write_u32(4, 0); // pad
+    write_u64(8, shape_hash);
+
+    // Entry table + key payload (key_off is record-relative).
+    let mut running_key_off = key_payload_base;
+    let mut entry_rel = HEADER_BYTES;
+    let mut key_rel = key_payload_base;
+    for (k, v) in &entries {
+        let klen = k.len() as u32;
+        write_u32(entry_rel, running_key_off);
+        write_u32(entry_rel + 4, klen);
+        write_u64(entry_rel + 8, *v as u64);
+        // SAFETY: key payload `[key_rel, key_rel + klen)` is in-record.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                k.as_ptr(),
+                (arena_base + (record_off + key_rel) as usize) as *mut u8,
+                k.len(),
+            );
+        }
+        running_key_off += klen;
+        entry_rel += ENTRY_BYTES;
+        key_rel += klen;
+    }
+
+    // SAFETY: publish the post-bump scratch cursor (scratch-relative).
+    unsafe {
+        *state.scratch_cursor.get() = match record_end.checked_sub(scratch_base) {
+            Some(v) => v,
+            None => {
+                *state.trap_code.get() = NativeTrap::HostFnError as u64;
+                return -1;
+            }
+        };
+    }
+    i32::try_from(record_off).unwrap_or(-1)
+}
+
+/// Address of [`relon_llvm_stat`] for `add_global_mapping`.
+#[inline]
+pub fn relon_llvm_stat_addr() -> usize {
+    relon_llvm_stat as *const () as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
