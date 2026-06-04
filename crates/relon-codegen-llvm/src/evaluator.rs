@@ -2412,7 +2412,26 @@ impl LlvmAotEvaluator {
         // first, and on emit failure fall through to the buffer entry
         // (which lowers `Op::ConstString` against the real const-pool).
         let fast_profile = match fast_profile {
-            Some(profile) if fast_entry_emittable(entry) => Some(profile),
+            // W7 recursive-closure Dict: a module that declares lambdas
+            // (`#internal fib: (k) => ... fib(...)`) can match the fast
+            // `(i64..) -> i64` envelope (Int `#main`, single-Int `result`
+            // field) yet its body emits `Op::MakeClosure` /
+            // `Op::CallClosure`, which resolve a lambda FunctionValue from
+            // the module-wide `closure_fn_table`. The fast-only object-emit
+            // branch emits *only* the fast entry with empty helper / closure
+            // tables (it never declares + emits the lambda bodies), so
+            // `MakeClosure fn_table_idx=N` hits an empty table. The buffer
+            // path routes through `emit_module_funcs`, which declares every
+            // lambda up-front (forward reference for `fib`'s self-call) and
+            // emits each lambda body — the only place closures lower
+            // correctly for static object emit. Force the buffer entry
+            // whenever the module declares any lambda. The in-process MCJIT
+            // path (`from_ir_inner_world`) already gets this for free: it
+            // emits the buffer module first (lambdas declared + emitted) and
+            // only *adds* a fast entry on top, reusing the populated table.
+            Some(profile) if fast_entry_emittable(entry) && ir.closure_table.is_empty() => {
+                Some(profile)
+            }
             _ => None,
         };
 
