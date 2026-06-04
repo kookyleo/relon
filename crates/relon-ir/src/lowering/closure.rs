@@ -263,9 +263,22 @@ pub(super) fn lower_closure_as_value(
     // -----------------------------------------------------------------
     let free_vars = collect_free_vars(&lambda_body.expr, lambda_params);
     let mut resolved: Vec<(String, IrType, u32)> = Vec::new();
+    // #359 (W20 container perf): free vars that resolve to a where-bound
+    // scalar literal (`soft` / `dt` / masses) are INLINED into the lambda
+    // body as `Op::Const*` rather than captured through the arena captures
+    // struct (an opaque load LLVM's `-O3` cannot fold). This keeps
+    // `dx*dx + soft` a compile-time-constant expression inside
+    // `pair_force` so the optimizer folds the inner-loop arithmetic. The
+    // constant is the exact source literal, so the body computes a
+    // bit-identical value.
+    let mut inlined_consts: Vec<(String, IrType, ScalarConst)> = Vec::new();
     for name in free_vars {
         if let Some((ty, outer_idx)) = resolve_capture(&name, lambda_body.range, ctx)? {
-            resolved.push((name, ty, outer_idx));
+            if let Some(sc) = ctx.const_let_values.get(&outer_idx).copied() {
+                inlined_consts.push((name, ty, sc));
+            } else {
+                resolved.push((name, ty, outer_idx));
+            }
         }
     }
     let (offsets, captures_size) = layout_captures(&resolved);
@@ -378,6 +391,25 @@ pub(super) fn lower_closure_as_value(
                 inner.closure_let_signatures.insert(inner_let_idx, sig);
             }
         }
+        inner_let_idx += 1;
+    }
+    // #359 (W20 container perf): inlined scalar constants. Rather than
+    // capturing the value through the arena captures struct (an opaque
+    // load LLVM can't fold), register a fresh inner let-local that maps
+    // to the compile-time constant in `inner.const_let_values`. The body
+    // never emits a `LetGet` for it — `lower_variable`'s bare-const path
+    // resolves each reference straight to an `Op::Const*`, keeping the
+    // value a compile-time constant the optimizer can fold into the
+    // inner-loop arithmetic. The let-binding exists only so the name
+    // resolves to this idx; no `LetSet` / load is emitted.
+    for (name, ty, sc) in inlined_consts.iter() {
+        inner.lets.push(LetBinding {
+            name: name.clone(),
+            idx: inner_let_idx,
+            ty: *ty,
+            schema_brand: None,
+        });
+        inner.const_let_values.insert(inner_let_idx, *sc);
         inner_let_idx += 1;
     }
     // Lambda's own params: stash each wasm local into a let-local
