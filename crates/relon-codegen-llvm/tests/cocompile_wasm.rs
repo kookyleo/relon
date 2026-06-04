@@ -250,7 +250,10 @@ fn run_in_wasmtime(
         Val::I32(v) => v,
         other => panic!("expected i32 bytes-written, got {other:?}"),
     };
-    assert!(written >= 0, "buffer entry returned trap sentinel {written}");
+    assert!(
+        written >= 0,
+        "buffer entry returned trap sentinel {written}"
+    );
 
     let ret_off = info.return_fields[0].offset as usize;
     let mut out = vec![0u8; info.return_root_size as usize];

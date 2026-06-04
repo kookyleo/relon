@@ -2504,7 +2504,11 @@ impl LlvmAotEvaluator {
                             )?;
                         }
                         CodegenTarget::Native => {
-                            crate::cocompile::link_and_inline_host_shim(&module, shim, &ir.imports)?;
+                            crate::cocompile::link_and_inline_host_shim(
+                                &module,
+                                shim,
+                                &ir.imports,
+                            )?;
                         }
                     }
                 }
