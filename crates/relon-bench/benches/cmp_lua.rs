@@ -4121,7 +4121,6 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // ("unresolved variable `list`"); the row records n/a and
         // skips the timed loop. Coverage widens once phase 4c lifts
         // stdlib + list-ctor surface into bytecode.
-
     }
 
     // ----- W2 -----
@@ -4164,7 +4163,6 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // M2-B phase 4d bytecode row — W2 uses `list.sum(...map(...))`,
         // closure + stdlib; bounces with `analyzer rejected source`
         // until phase 4c-cont lifts the closure surface.
-
     }
 
     // ----- W3 -----
@@ -4233,7 +4231,6 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // pure string-accumulator loop the bytecode VM accepts. The
         // row matches what the W2 ladder above does — assert
         // correctness, then time the closed-form runtime.
-
     }
 
     // ----- W4 -----
@@ -4276,7 +4273,6 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // `range(n).map(...).filter(...).len()` into a pure i64
         // count accumulator the bytecode VM accepts. Bench row
         // follows the W2 ladder.
-
     }
 
     // ----- W4_long_haystack -----
@@ -4352,7 +4348,6 @@ fn bench_cmp_lua(c: &mut Criterion) {
                 })
             });
         });
-
     }
 
     // ----- W5 -----
@@ -4536,7 +4531,6 @@ fn bench_cmp_lua(c: &mut Criterion) {
         // `StoreFieldAtRecord`). The row is keyed `W7_fib` /
         // `relon_llvm_aot`; the bespoke section above stops at the
         // tree-walker / LuaJIT / bytecode breakdown rows.
-
     }
 
     // ----- W8 polymorphic -----
