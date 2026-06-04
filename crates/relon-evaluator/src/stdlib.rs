@@ -119,6 +119,14 @@ pub fn register_to(ctx: &mut Context) {
     rng_gate.uses_rng = true;
     ctx.register_fn("clock", clock_gate, Arc::new(Clock));
     ctx.register_fn("random", rng_gate, Arc::new(RandomFn));
+    // P-fs Stage 1: `read_file(path) -> String`, gated by `reads_fs`.
+    // Tree-walk gold-standard oracle: reads the file's UTF-8 contents,
+    // sandboxed to the shared filesystem root (`relon_util`). The
+    // compiled backends resolve the same root (native helper / wasm
+    // preopen), so all four executors return byte-identical content.
+    let mut read_file_gate = NativeFnGate::default();
+    read_file_gate.reads_fs = true;
+    ctx.register_fn("read_file", read_file_gate, Arc::new(ReadFileFn));
 
     // Schema-machinery validators. Spec §6.3 mandates these exist with
     // the documented semantics; they're consumed by the `#schema`
@@ -417,12 +425,12 @@ impl RelonFunction for MathAbs {
 
 // GATED-CAPABILITY-PRIMITIVES-BEGIN
 //
-// The two impls below are the ONLY ambient-API users in this file, and
+// The impls below are the ONLY ambient-API users in this file, and
 // they are exactly what the `purity_guard` test endorses: gated host
 // fns registered via `register_fn(name, gate, fn)` with a non-empty
-// `NativeFnGate` (`reads_clock` / `uses_rng`). The purity scan excludes
-// this delimited region — the ban targets *ungated* ambient APIs, not
-// these capability-gated built-in primitives.
+// `NativeFnGate` (`reads_clock` / `uses_rng` / `reads_fs`). The purity
+// scan excludes this delimited region — the ban targets *ungated*
+// ambient APIs, not these capability-gated built-in primitives.
 
 /// Built-in `clock()` primitive. Returns the wall-clock reading as an
 /// `Int` count of nanoseconds since the Unix epoch — the same physical
@@ -467,6 +475,45 @@ impl RelonFunction for RandomFn {
                 Err(_) => 0,
             };
         Ok(Value::Int(bits))
+    }
+}
+
+/// Built-in `read_file(path: String) -> String` primitive (P-fs
+/// Stage 1). Reads the file's UTF-8 contents, sandboxed to the shared
+/// filesystem root (`relon_util::resolve_fs_sandbox_path`) — the same
+/// root the wasm backend preopens and the native codegen helpers read.
+/// The capability gate (`reads_fs`) is enforced by the evaluator before
+/// dispatch. Path escapes (`../`, absolute paths, symlinks out of root)
+/// are refused with `CapabilityDenied`.
+struct ReadFileFn;
+impl RelonFunction for ReadFileFn {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let path = match &args[0] {
+            Value::String(s) => s.to_string(),
+            other => {
+                return Err(RuntimeError::TypeMismatch {
+                    expected: "String".to_string(),
+                    found: other.type_name().to_string(),
+                    range,
+                })
+            }
+        };
+        let resolved = relon_util::resolve_fs_sandbox_path(&path).map_err(|reason| {
+            RuntimeError::CapabilityDenied {
+                cap_bit: None,
+                reason,
+                range,
+            }
+        })?;
+        let contents =
+            std::fs::read_to_string(&resolved).map_err(|e| RuntimeError::IoError(e.to_string()))?;
+        Ok(Value::String(contents.into()))
     }
 }
 // GATED-CAPABILITY-PRIMITIVES-END

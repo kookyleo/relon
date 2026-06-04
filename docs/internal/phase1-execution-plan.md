@@ -225,5 +225,7 @@ Stage 1 + Stage 2 全部 lane 已并入 main、`cargo build/test/clippy --worksp
   - **Stage 4 写(`write_file`/`create_dir`/`remove`)**:门控 `WritesFs=1`(已存在);wasm `path_open` create/write oflags + `RIGHTS_FD_WRITE` + `fd_write`,preopen 须授 `DirPerms::MUTATE`。
 - **共性**:read_file 攻克的「非 nullary + 缓冲区编组 + arena String/struct-out」正是 **P-net 也要的地基**(见 P-net 结论)。
 
-**待建**:P-fs Stage 1 `read_file`(spike 已证,production 多面工程)· P-net(defer 至 preview2)。
+**进度(2026-06-04)**:P-fs Stage 1 `read_file(path) -> String` 已落 **三后端**(tree-walk 金标准 + cranelift-native + llvm-native),**three-way bit-equal** 实测通过(`crates/relon-codegen-llvm/tests/read_file_four_way.rs`);新 `Op::ReadFile`(String 进/出)+ `CheckCap{ReadsFs}` 前导;path 沙箱到共享 root(`relon_util::resolve_fs_sandbox_path`,native 等价于 wasm preopen),逃逸/绝对路径/越界符号链接拒;cranelift 新 `VtableSlot::RelonReadFile`(COUNT 7→8 + GENERATOR_VERSION v5-gamma 5)+ `read_file_helper`(写 scratch String 记录);llvm-native host extern `relon_llvm_read_file`(同 arena scratch 约定)。
+- **wasm32 lowering 诚实缓做**:WASI fd 协议 marshalling 与 llvm buffer 的 `out_ptr`-相对 tail-record 约定(`emit_store_field_pointer_indirect`)+ harness 回读对齐是比 native 大的单块,Stage 1 暂缓——`emit_read_file_wasi` 显式报 codegen 错(拒编译,非假绿),四方测试断言「wasm 拒编译」;标准 preview1 fd 协议 + preopened-dir host 仍由 spike `tests/aot_wasm_wasi_fs_spike.rs` 证。
+- 待建:P-fs Stage 1 wasm32 lowering · Stage 2-4 · P-net(defer 至 preview2)。
 - 工程注:wasm 对象用 `write_to_file`(非 `write_to_memory_buffer`,后者产 malformed uleb128,wasm-ld-17 拒)。

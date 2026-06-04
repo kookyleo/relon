@@ -978,6 +978,36 @@ pub enum Op {
     ///   WASI host (`wasmtime-wasi`).
     ReadRandom,
 
+    /// Built-in WASI-backed filesystem read primitive (`read_file(path)`
+    /// in source). P-fs Stage 1.
+    ///
+    /// Pops one `String` operand (the path) and pushes one `String`
+    /// (the file contents). Stack effect: `[String] -> [String]`. Both
+    /// values are arena-relative `[len: u32 LE][utf8 bytes]` records on
+    /// the supported codegen surface (cranelift / llvm); the tree-walker
+    /// uses native `Value::String`.
+    ///
+    /// Lowering always emits a preceding `Op::CheckCap { ReadsFs }`, so
+    /// the capability gate fires before the read. The path is resolved
+    /// relative to a host-configured sandbox root (native `std::fs`) or
+    /// the wasm preopened directory (preview1) — never an absolute /
+    /// escaping path. Backend lowering:
+    /// - **tree-walk** (gold standard): `std::fs::read_to_string`,
+    ///   sandboxed to the configured root.
+    /// - **cranelift native**: indirect call through the capability
+    ///   vtable's `RelonReadFile` slot — the helper reads the path
+    ///   record out of the arena, reads the file (root-sandboxed),
+    ///   bump-allocates a new String record at `tail_cursor`, and
+    ///   returns its arena-relative offset.
+    /// - **llvm native**: a host `extern "C"` helper with the same
+    ///   arena-offset-in / arena-offset-out contract.
+    /// - **wasm32**: the standard preview1 fd protocol
+    ///   (`path_open` -> `fd_read` -> `fd_close`), reading the path out
+    ///   of the arena and writing the contents into a fresh arena String
+    ///   record. Satisfied by any standard WASI host (`wasmtime-wasi`)
+    ///   with a preopened directory.
+    ReadFile,
+
     /// Phase 4.c-1 control flow primitive.
     ///
     /// Emit a wasm `block <blocktype>` containing `body`, followed by
@@ -1744,6 +1774,11 @@ impl Op {
             // (they cross a capability boundary), so they're opaque to
             // the trace recorder exactly like `Op::CallNative`.
             Op::ReadClock | Op::ReadRandom => Unrecoverable,
+
+            // Built-in WASI-backed filesystem read. Crosses a capability
+            // boundary + touches the host filesystem (non-deterministic),
+            // so it's opaque to the trace recorder like `Op::CallNative`.
+            Op::ReadFile => Unrecoverable,
         }
     }
 }

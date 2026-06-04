@@ -6211,4 +6211,73 @@ fn builtin_clock_cap_bit_index_matches_ir_constant() {
     use relon_eval_api::CapabilityBit;
     assert_eq!(CapabilityBit::ReadsClock.bit_index(), 3);
     assert_eq!(CapabilityBit::UsesRng.bit_index(), 5);
+    // P-fs Stage 1: read_file gates on `reads_fs` (bit 0).
+    assert_eq!(CapabilityBit::ReadsFs.bit_index(), 0);
+}
+
+fn caps_reads_fs() -> Capabilities {
+    let mut c = Capabilities::default();
+    c.reads_fs = true;
+    c
+}
+
+/// Lay down a fixed fixture file inside a fresh temp dir, point the
+/// shared FS sandbox root at it, and return `(dir, filename, content)`.
+fn fs_fixture(tag: &str) -> (std::path::PathBuf, &'static str, &'static str) {
+    const CONTENT: &str = "relon read_file gold standard\nline two\n";
+    const FILENAME: &str = "fixture.txt";
+    let dir = std::env::temp_dir().join(format!(
+        "relon_rf_tw_{tag}_{}_{:p}",
+        std::process::id(),
+        &CONTENT
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(FILENAME), CONTENT).unwrap();
+    relon_util::set_fs_sandbox_root(&dir);
+    (dir, FILENAME, CONTENT)
+}
+
+#[test]
+fn builtin_read_file_granted_returns_contents() {
+    let (dir, name, content) = fs_fixture("granted");
+    let src = format!("{{ data: read_file(\"{name}\") }}");
+    let v = eval_doc_with_caps(&src, caps_reads_fs()).expect("read_file granted");
+    let Value::Dict(d) = v else {
+        panic!("expected dict, got {v:?}");
+    };
+    let Some(Value::String(s)) = d.map.get("data") else {
+        panic!(
+            "read_file() should yield a String, got {:?}",
+            d.map.get("data")
+        );
+    };
+    assert_eq!(s.as_str(), content);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn builtin_read_file_ungranted_denied() {
+    let (dir, name, _) = fs_fixture("ungranted");
+    let src = format!("{{ data: read_file(\"{name}\") }}");
+    let err = eval_doc_with_caps(&src, Capabilities::default())
+        .expect_err("ungranted read_file() must be denied");
+    assert!(
+        matches!(err, RuntimeError::CapabilityDenied { .. }),
+        "expected CapabilityDenied, got {err:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn builtin_read_file_path_escape_refused() {
+    let (dir, _, _) = fs_fixture("escape");
+    // `../` climbs above the sandbox root — must be refused even with
+    // the capability granted.
+    let err = eval_doc_with_caps(r#"{ data: read_file("../escape.txt") }"#, caps_reads_fs())
+        .expect_err("path escape must be refused");
+    assert!(
+        matches!(err, RuntimeError::CapabilityDenied { .. }),
+        "expected CapabilityDenied for escape, got {err:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

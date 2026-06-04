@@ -2372,6 +2372,9 @@ const CAP_BIT_READS_CLOCK: u32 = 3;
 /// Capability bit index for `uses_rng`. Mirrors
 /// `relon_cap::CapabilityBit::UsesRng.bit_index()` (== 5).
 const CAP_BIT_USES_RNG: u32 = 5;
+/// Capability bit index for `reads_fs`. Mirrors
+/// `relon_cap::CapabilityBit::ReadsFs.bit_index()` (== 0).
+const CAP_BIT_READS_FS: u32 = 0;
 
 /// Lower a built-in WASI-backed capability primitive — `clock()` or
 /// `random()` — into a `CheckCap`-guarded `ReadClock` / `ReadRandom`.
@@ -2390,6 +2393,53 @@ fn try_lower_builtin_capability(
     range: TokenRange,
     ctx: &mut LowerCtx<'_>,
 ) -> Result<Option<()>, LoweringError> {
+    // `read_file(path: String) -> String` (P-fs Stage 1) is the only
+    // non-nullary built-in capability primitive: it takes one `String`
+    // path operand and pushes one `String` of file contents, gated by
+    // `reads_fs`. Handled here ahead of the nullary `clock` / `random`
+    // shape because its arg-marshalling differs.
+    if name == "read_file" {
+        if arity != 1 || args.len() != 1 || args[0].name.is_some() {
+            // Wrong arity / keyword arg — fall through so the usual
+            // unknown-method / arg-mismatch diagnostic surfaces.
+            return Ok(None);
+        }
+        // 1. Capability prologue, before any argument side effect.
+        ctx.out.push(TaggedOp {
+            op: Op::CheckCap {
+                cap_bit: CAP_BIT_READS_FS,
+            },
+            range,
+        });
+        // 2. The path argument must land on the operand stack as a
+        //    `String`.
+        let arg = &args[0];
+        lower_expr(&arg.value.expr, arg.value.range, ctx)?;
+        let pushed = ctx
+            .tstack
+            .pop()
+            .ok_or_else(|| LoweringError::UnsupportedExpr {
+                kind: "FnCall(read_file path-stack-empty)".to_string(),
+                range,
+            })?;
+        if pushed != IrType::String {
+            return Err(LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "FnCall(read_file) path arg type mismatch: expected String, got {pushed:?}"
+                ),
+                range,
+            });
+        }
+        // 3. The effectful read pops the `String` path and pushes the
+        //    `String` contents.
+        ctx.out.push(TaggedOp {
+            op: Op::ReadFile,
+            range,
+        });
+        ctx.tstack.push(IrType::String);
+        return Ok(Some(()));
+    }
+
     let (cap_bit, op) = match name {
         "clock" => (CAP_BIT_READS_CLOCK, Op::ReadClock),
         "random" => (CAP_BIT_USES_RNG, Op::ReadRandom),

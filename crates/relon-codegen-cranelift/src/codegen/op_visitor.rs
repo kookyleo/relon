@@ -493,6 +493,10 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         Ok(())
     }
 
+    fn visit_read_file(&mut self) -> Result<(), CraneliftError> {
+        self.emit_read_file()
+    }
+
     fn visit_make_closure(
         &mut self,
         fn_table_idx: u32,

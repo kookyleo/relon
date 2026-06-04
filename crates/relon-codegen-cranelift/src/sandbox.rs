@@ -773,6 +773,43 @@ impl SandboxState {
         unsafe { *self.tail_cursor.get() }
     }
 
+    /// Read the arena-relative scratch-region base. The `read_file`
+    /// host helper bump-allocates its contents String record inside the
+    /// scratch region (`scratch_base + scratch_cursor`), the same place
+    /// the codegen's `Op::AllocScratch` path produces String operands,
+    /// so the record resolves through the normal arena-relative String
+    /// offset convention.
+    ///
+    /// # Safety
+    ///
+    /// Must only be called while the JIT thread is executing host code
+    /// on behalf of a still-live JIT entry, so the cell is unaliased.
+    pub(crate) unsafe fn scratch_base(&self) -> u32 {
+        unsafe { *self.scratch_base.get() }
+    }
+
+    /// Read the current scratch-region bump cursor. Companion to
+    /// [`Self::scratch_base`] / [`Self::set_scratch_cursor`].
+    ///
+    /// # Safety
+    ///
+    /// See [`Self::scratch_base`].
+    pub(crate) unsafe fn scratch_cursor(&self) -> u32 {
+        unsafe { *self.scratch_cursor.get() }
+    }
+
+    /// Advance the scratch-region bump cursor to `new_cursor` after the
+    /// `read_file` helper has written its contents record.
+    ///
+    /// # Safety
+    ///
+    /// See [`Self::scratch_base`].
+    pub(crate) unsafe fn set_scratch_cursor(&self, new_cursor: u32) {
+        unsafe {
+            *self.scratch_cursor.get() = new_cursor;
+        }
+    }
+
     /// Read the current arena base pointer as a raw `usize`.
     ///
     /// Used by host helpers that need to resolve an arena-relative

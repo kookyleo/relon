@@ -129,12 +129,12 @@ pub(crate) fn run_single(tree: &mut AnalyzedTree) {
 /// [`run_single`].
 /// Inject the implicit gates for the built-in WASI-backed capability
 /// primitives. `clock()` requires `reads_clock`; `random()` requires
-/// `uses_rng`. These are language-level intrinsics (no host
-/// registration), so the gate is synthesized here rather than read from
-/// `host_fn_gates`. A host that also registers a `clock` / `random`
-/// fn keeps its own gate (we only insert when absent), but the built-in
-/// names are reserved by the lowering, so that shadowing does not occur
-/// in practice.
+/// `uses_rng`; `read_file(path)` requires `reads_fs`. These are
+/// language-level intrinsics (no host registration), so the gate is
+/// synthesized here rather than read from `host_fn_gates`. A host that
+/// also registers a fn of the same name keeps its own gate (we only
+/// insert when absent), but the built-in names are reserved by the
+/// lowering, so that shadowing does not occur in practice.
 fn insert_builtin_capability_gates(gates: &mut HashMap<String, NativeFnGate>) {
     gates.entry("clock".to_string()).or_insert_with(|| {
         let mut g = NativeFnGate::default();
@@ -144,6 +144,12 @@ fn insert_builtin_capability_gates(gates: &mut HashMap<String, NativeFnGate>) {
     gates.entry("random".to_string()).or_insert_with(|| {
         let mut g = NativeFnGate::default();
         g.uses_rng = true;
+        g
+    });
+    // P-fs Stage 1: `read_file(path)` requires `reads_fs`.
+    gates.entry("read_file".to_string()).or_insert_with(|| {
+        let mut g = NativeFnGate::default();
+        g.reads_fs = true;
         g
     });
 }
@@ -537,8 +543,11 @@ mod tests {
     //    fn). Guards the early-return shortcut.
     #[test]
     fn empty_gates_skip_check() {
+        // Use a neutral host-fn name (NOT the reserved `read_file`
+        // builtin, which now always carries an implicit `reads_fs`
+        // gate): an ungated host fn must stay silent.
         let mut names = HashSet::new();
-        names.insert("read_file".to_string());
+        names.insert("host_thing".to_string());
         let opts = AnalyzeOptions {
             host_fn_names: names,
             host_fn_signatures: HashMap::new(),
@@ -550,7 +559,7 @@ mod tests {
         let mut loader = MapLoader::new();
         let ws = build_with_options(
             "/abs/entry",
-            r#"{ x: read_file("a.txt") }"#,
+            r#"{ x: host_thing("a.txt") }"#,
             &mut loader,
             &opts,
         );

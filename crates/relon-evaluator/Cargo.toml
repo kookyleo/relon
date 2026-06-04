@@ -33,6 +33,7 @@ relon-eval-api = { workspace = true }
 # Keeping the table in one place avoids the two backends drifting
 # apart on grapheme-cluster semantics.
 relon-ir = { workspace = true }
+relon-util = { workspace = true }
 ordered-float.workspace = true
 # `rc` enables `serde::Serialize`/`Deserialize` for `Arc<T>` so that
 # `Value::List(Arc<Vec<Value>>)` and `Value::Dict(Arc<ValueDict>)` can
