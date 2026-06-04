@@ -35,65 +35,20 @@ available:
 }
 ```
 
-## Capability-gated builtins
+## No effectful language builtins
 
-Unlike the pure builtins above (and every std module), these language-level
-builtins are **effectful** — they read ambient, non-deterministic sources,
-so they are **not** covered by the determinism guarantee and are gated by
-the [capability model](./sandbox):
+Relon the language has **no** effectful builtins — there is no `clock()`,
+`random()`, `read_file()`, `read_dir()`, or `stat()`. Relon is a pure
+function `f(inputs) -> output`: it never reaches out to the world during
+evaluation. Any effectful value (the current time, a random nonce, a file's
+contents, a directory listing, file metadata, an environment variable) is
+**taken by the host** and fed in as an **input** to the evaluation.
 
-| Function | Returns | Capability | wasm backend lowering |
-|---|---|---|---|
-| `clock()` | `Int` — wall-clock time in nanoseconds | `reads_clock` | standard WASI `clock_time_get` |
-| `random()` | `Int` — a non-deterministic 64-bit value | `uses_rng` | standard WASI `random_get` |
-| `read_file(path)` | `String` — the file's UTF-8 contents | `reads_fs` | standard WASI preview1 `path_open` / `fd_read` / `fd_close` |
-| `read_dir(path)` | `List<String>` — the directory's entry names, **sorted** | `reads_fs` | not yet implemented (native-only) |
-| `stat(path)` | `Dict{size: Int, is_dir: Bool}` — file metadata | `reads_fs` | standard WASI preview1 `path_filestat_get` |
-
-```relon
-{
-    now: clock(),                 // needs reads_clock, else CapabilityDenied
-    nonce: random(),              // needs uses_rng
-    config: read_file("app.toml") // needs reads_fs
-}
-```
-
-`read_file(path)` resolves `path` against a single host-configured **filesystem
-sandbox root** and refuses any path that escapes it (`../`, absolute paths,
-symlinks out of root → `CapabilityDenied`). The root is the native analogue of
-the directory a WASI host **preopens** for the wasm backend — relative paths
-resolve against the same root across every executor, so the result is
-byte-identical. (`read_file` is byte-equal across all four backends — tree-walk,
-cranelift-native, llvm-native, and wasm32: the wasm arm lowers to the standard
-preview1 fd protocol — `path_open` / `fd_read` / `fd_close` against the
-preopened dir — so any off-the-shelf WASI host runs it.)
-
-`read_dir(path)` lists a directory's bare entry file names against the same
-sandbox root (same escape refusal). The entry names are **sorted**
-byte-lexicographically — `read_dir` / `fd_readdir` iteration order is
-OS-unspecified, and the sort is what makes every backend return a
-byte-identical list. Non-UTF-8 names are skipped (the wire String layout is
-UTF-8 only). `read_dir` is **native-only** for now — byte-equal across the
-three native backends (tree-walk, cranelift-native, llvm-native); the wasm32
-arm (the standard preview1 `fd_readdir` dirent-stream protocol) is deferred and
-raises a loud codegen error rather than emit an incorrect listing.
-
-`stat(path)` reads a path's file metadata into a `{size: Int, is_dir: Bool}`
-dict against the same sandbox root (same escape refusal). `size` is the file's
-byte length and `is_dir` is whether the path is a directory. `stat` is byte-equal
-across all four backends — tree-walk, cranelift-native, llvm-native, and wasm32:
-the wasm arm lowers to the standard preview1 `path_filestat_get` import (a fixed
-64-byte `filestat` struct — no dirent stream), reading `filetype` and `size` out
-of it, so any off-the-shelf WASI host runs it.
-
-They are built into the language (no `#import`), but the host must grant the
-matching capability bit — the **same gate** as host-registered native fns,
-so an ungranted call raises `CapabilityDenied`. On the native backends they
-call the host runtime (`SystemTime` / OS RNG); on the **wasm backend** they
-lower to **standard WASI imports**, so the emitted module runs on any
-standard WASI host (wasmtime / browser / …) and that host grants the clock /
-randomness — relon's `requires <cap>` lines up with the WASI capability
-grant. See [Sandbox & capabilities](./sandbox).
+A host that needs to expose an effectful operation does so explicitly via a
+`#native` function it registers (and gates with a capability bit) — that is
+the host's own, audited escape hatch, not a language builtin. See
+[the ADR](../../internal/adr-effectful-io-builtins-2026-06-04) for the
+rationale and [Sandbox & capabilities](./sandbox) for the capability model.
 
 ## std/list
 

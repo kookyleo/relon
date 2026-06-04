@@ -144,22 +144,15 @@ capability layer just gates declared bits against grants.
 through `StdModuleResolver` rather than the filesystem, and are part
 of the spec.
 
-### Built-in capability primitives: `clock()` / `random()`
+### No effectful language builtins
 
-`reads_clock` and `uses_rng` also gate two **language-level built-in
-primitives**, not just host-registered native fns:
-
-- `clock() -> Int` (wall-clock nanoseconds) needs `reads_clock`.
-- `random() -> Int` (non-deterministic 64-bit) needs `uses_rng`.
-
-These are the only **effectful** built-ins — everything else in the
-language and stdlib is pure. The gate is identical to native fns:
-ungranted → `CapabilityDenied`. On the **wasm backend** they lower to
-**standard WASI imports** (`clock_time_get` / `random_get`), so the
-emitted module is satisfied by any standard WASI host and relon's
-`requires <cap>` aligns 1:1 with the WASI capability grant (relon's
-capability bits and WASI's capability categories are isomorphic by
-design). See [Standard library → Capability-gated builtins](./stdlib).
+The capability bits gate only **host-registered `#native` fns**, never
+language builtins: Relon has **no** effectful builtins (`clock()`,
+`random()`, `read_file()`, `read_dir()`, `stat()` do not exist). The
+language is a pure function — effectful values are taken by the host and
+fed in as inputs. See
+[the ADR](../../internal/adr-effectful-io-builtins-2026-06-04) and
+[Standard library → No effectful language builtins](./stdlib).
 
 ### `max_steps: Option<u64>`
 

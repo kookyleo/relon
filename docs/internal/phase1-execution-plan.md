@@ -174,6 +174,10 @@ Stage 1 + Stage 2 全部 lane 已并入 main、`cargo build/test/clippy --worksp
 
 ## 8. Follow-up:wasm 线副作用对齐「标准 wasm / 标准 WASI」(待 co-compile lane 完成后做)
 
+> **⚠️ 已撤销(2026-06-04)**:下文的 **P-clock / P-random / P-fs**(内建语言级 effectful 能力原语 `clock()` / `random()` / `read_file()` / `read_dir()` / `stat()`)已**整体撤销并前向删除**。定论:**Relon 语言是纯函数,不暴露任何 effectful 语言级 builtin** —— 文件/时钟/随机数等都应由 host 作为 input 喂进来,而非语言向外伸手的能力。理由与边界见 [`adr-effectful-io-builtins-2026-06-04.md`](./adr-effectful-io-builtins-2026-06-04.md)。`#native`(host 注册的 effectful fn)+ 6 个 `CapabilityBit` + `CheckCap`/`CallNative` 基建保留;`List<String>` 顶层返回的 codegen 重定位(与 read_dir 解耦的纯返回机制)保留。下文 P-clock/P-random/P-fs 的「✅ / 进度」记录仅作历史留存,**不再代表当前代码状态**。
+>
+> P-net(defer 至 preview2)的调研结论不受影响,仍只关乎 host 注册的 effectful fn(若将来重开)。
+
 **北极星**:relon 的 wasm 产物就是一个**标准、可移植、生态原生的 wasm 模块**;处理副作用/外部依赖**照常规 wasm 程序那套走**(effectful → import,宿主提供),不自造 relon 专属隔离。
 
 **现状**:`wasi_host.rs` 把 effectful `#native` 降成 **`(import "env" "<name>")`** 自定义 host import —— 由 relon 自己的 wasmtime runner 经 `Linker::func_wrap` 提供。**精神对(effectful→import)但绑死 relon runner**:这个模块只能在 relon 的 runner 里跑。

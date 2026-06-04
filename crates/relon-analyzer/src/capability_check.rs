@@ -14,7 +14,7 @@
 //!
 //! v1 uses *textual reachability*: every `Expr::FnCall` in any module's
 //! `node_index` is treated as reachable. We don't prune dead branches
-//! (`if false { read_file() }` still flags) and we don't resolve
+//! (`if false { host_read() }` still flags) and we don't resolve
 //! `obj.method` virtual dispatch (a multi-segment path with non-string
 //! / spread / index segments is silently skipped). The walker is a
 //! single linear pass over `node_index`; closure bodies and match arms
@@ -56,12 +56,7 @@ pub(crate) fn run(workspace: &mut WorkspaceTree) {
         return;
     };
     let caps = entry_tree.caps.clone();
-    let mut gates = entry_tree.host_fn_gates.clone();
-    // The built-in WASI-backed capability primitives (`clock` /
-    // `random`) always carry an implicit gate, even with no host-
-    // registered gates. Inject them so an ungranted `clock()` /
-    // `random()` is flagged the same way a gated `#native` call is.
-    insert_builtin_capability_gates(&mut gates);
+    let gates = entry_tree.host_fn_gates.clone();
 
     // v1.1 control-flow pruning + single-pass walk: collect every node
     // id that lives under a statically-dead branch (`false ? ... : 0`
@@ -113,10 +108,7 @@ pub(crate) fn run(workspace: &mut WorkspaceTree) {
 /// tree's own diagnostics so the build fails before lowering.
 pub(crate) fn run_single(tree: &mut AnalyzedTree) {
     let caps = tree.caps.clone();
-    let mut gates = tree.host_fn_gates.clone();
-    // Built-in `clock` / `random` always carry an implicit gate (see
-    // `run`), so the walk runs even when the host registered no gates.
-    insert_builtin_capability_gates(&mut gates);
+    let gates = tree.host_fn_gates.clone();
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
     walk_tree_for_gated_calls(tree, &caps, &gates, &mut diagnostics);
     tree.diagnostics.extend(diagnostics);
@@ -127,45 +119,6 @@ pub(crate) fn run_single(tree: &mut AnalyzedTree) {
 /// a diagnostic for each reachable gated call whose cap isn't granted.
 /// Used by both the workspace [`run`] and the single-tree
 /// [`run_single`].
-/// Inject the implicit gates for the built-in WASI-backed capability
-/// primitives. `clock()` requires `reads_clock`; `random()` requires
-/// `uses_rng`; `read_file(path)` requires `reads_fs`. These are
-/// language-level intrinsics (no host registration), so the gate is
-/// synthesized here rather than read from `host_fn_gates`. A host that
-/// also registers a fn of the same name keeps its own gate (we only
-/// insert when absent), but the built-in names are reserved by the
-/// lowering, so that shadowing does not occur in practice.
-fn insert_builtin_capability_gates(gates: &mut HashMap<String, NativeFnGate>) {
-    gates.entry("clock".to_string()).or_insert_with(|| {
-        let mut g = NativeFnGate::default();
-        g.reads_clock = true;
-        g
-    });
-    gates.entry("random".to_string()).or_insert_with(|| {
-        let mut g = NativeFnGate::default();
-        g.uses_rng = true;
-        g
-    });
-    // P-fs Stage 1: `read_file(path)` requires `reads_fs`.
-    gates.entry("read_file".to_string()).or_insert_with(|| {
-        let mut g = NativeFnGate::default();
-        g.reads_fs = true;
-        g
-    });
-    // P-fs Stage 2: `read_dir(path)` requires `reads_fs`.
-    gates.entry("read_dir".to_string()).or_insert_with(|| {
-        let mut g = NativeFnGate::default();
-        g.reads_fs = true;
-        g
-    });
-    // P-fs Stage 3: `stat(path)` requires `reads_fs`.
-    gates.entry("stat".to_string()).or_insert_with(|| {
-        let mut g = NativeFnGate::default();
-        g.reads_fs = true;
-        g
-    });
-}
-
 fn walk_tree_for_gated_calls(
     tree: &AnalyzedTree,
     caps: &Capabilities,
@@ -415,9 +368,9 @@ mod tests {
         }
     }
 
-    fn options_with_read_file_gate(caps: Capabilities) -> AnalyzeOptions {
+    fn options_with_host_read_gate(caps: Capabilities) -> AnalyzeOptions {
         options_with_gate(
-            "read_file",
+            "host_read",
             gate_bits(true, false, false, false, false, false),
             caps,
         )
@@ -465,11 +418,11 @@ mod tests {
     // 1. Direct call from entry, caps deny → flagged.
     #[test]
     fn direct_call_without_grant_is_flagged() {
-        let opts = options_with_read_file_gate(Capabilities::default());
+        let opts = options_with_host_read_gate(Capabilities::default());
         let mut loader = MapLoader::new();
         let ws = build_with_options(
             "/abs/entry",
-            r#"{ x: read_file("a.txt") }"#,
+            r#"{ x: host_read("a.txt") }"#,
             &mut loader,
             &opts,
         );
@@ -478,7 +431,7 @@ mod tests {
         assert!(matches!(
             diags[0],
             Diagnostic::CapabilityRequired { fn_name, capability, .. }
-                if fn_name == "read_file" && capability == "reads_fs"
+                if fn_name == "host_read" && capability == "reads_fs"
         ));
     }
 
@@ -487,9 +440,9 @@ mod tests {
     //    reachability).
     #[test]
     fn cross_module_call_is_flagged() {
-        let opts = options_with_read_file_gate(Capabilities::default());
+        let opts = options_with_host_read_gate(Capabilities::default());
         let mut loader = MapLoader::new();
-        loader.add("./lib", "/abs/lib", r#"{ data: read_file("a.txt") }"#);
+        loader.add("./lib", "/abs/lib", r#"{ data: host_read("a.txt") }"#);
         let ws = build_with_options(
             "/abs/entry",
             r#"#import lib from "./lib"
@@ -512,11 +465,11 @@ mod tests {
     // 3. Closure body call → flagged.
     #[test]
     fn closure_body_call_is_flagged() {
-        let opts = options_with_read_file_gate(Capabilities::default());
+        let opts = options_with_host_read_gate(Capabilities::default());
         let mut loader = MapLoader::new();
         let ws = build_with_options(
             "/abs/entry",
-            r#"{ load: (name) => read_file(name) }"#,
+            r#"{ load: (name) => host_read(name) }"#,
             &mut loader,
             &opts,
         );
@@ -528,7 +481,7 @@ mod tests {
     // 4. Stdlib call (`len`) is not in `host_fn_gates` → silent.
     #[test]
     fn stdlib_call_is_silent() {
-        let opts = options_with_read_file_gate(Capabilities::default());
+        let opts = options_with_host_read_gate(Capabilities::default());
         let mut loader = MapLoader::new();
         let ws = build_with_options("/abs/entry", r#"{ n: len([1, 2, 3]) }"#, &mut loader, &opts);
         assert!(cap_diags(&ws).is_empty());
@@ -539,11 +492,11 @@ mod tests {
     #[test]
     fn reads_fs_grant_silences_diagnostic() {
         let caps = caps_bits(true, false, false, false, false, false);
-        let opts = options_with_read_file_gate(caps);
+        let opts = options_with_host_read_gate(caps);
         let mut loader = MapLoader::new();
         let ws = build_with_options(
             "/abs/entry",
-            r#"{ x: read_file("a.txt") }"#,
+            r#"{ x: host_read("a.txt") }"#,
             &mut loader,
             &opts,
         );
@@ -555,9 +508,7 @@ mod tests {
     //    fn). Guards the early-return shortcut.
     #[test]
     fn empty_gates_skip_check() {
-        // Use a neutral host-fn name (NOT the reserved `read_file`
-        // builtin, which now always carries an implicit `reads_fs`
-        // gate): an ungated host fn must stay silent.
+        // An ungated host fn must stay silent.
         let mut names = HashSet::new();
         names.insert("host_thing".to_string());
         let opts = AnalyzeOptions {
@@ -595,7 +546,7 @@ mod tests {
         // path with a non-string segment must yield None (silent).
         let path = vec![
             TokenKey::String(
-                "read_file".to_string(),
+                "host_read".to_string(),
                 relon_parser::TokenRange::default(),
                 false,
             ),
@@ -609,11 +560,11 @@ mod tests {
     //    becomes redundant.
     #[test]
     fn capability_required_blocks_evaluation() {
-        let opts = options_with_read_file_gate(Capabilities::default());
+        let opts = options_with_host_read_gate(Capabilities::default());
         let mut loader = MapLoader::new();
         let ws = build_with_options(
             "/abs/entry",
-            r#"{ x: read_file("a.txt") }"#,
+            r#"{ x: host_read("a.txt") }"#,
             &mut loader,
             &opts,
         );
@@ -624,10 +575,10 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // 9. A → B → read_file across two import hops is still flagged.
+    // 9. A → B → host_read across two import hops is still flagged.
     #[test]
     fn transitive_chain_is_flagged() {
-        let opts = options_with_read_file_gate(Capabilities::default());
+        let opts = options_with_host_read_gate(Capabilities::default());
         let mut loader = MapLoader::new();
         loader
             .add(
@@ -636,7 +587,7 @@ mod tests {
                 r#"#import c from "./c"
                 { mid: c.leaf }"#,
             )
-            .add("./c", "/abs/c", r#"{ leaf: read_file("a.txt") }"#);
+            .add("./c", "/abs/c", r#"{ leaf: host_read("a.txt") }"#);
         let ws = build_with_options(
             "/abs/entry",
             r#"#import b from "./b"
@@ -650,16 +601,16 @@ mod tests {
 
     // -------------------------------------------------------------------
     // v1.1 — control-flow pruning: dead branches under a statically-known
-    // ternary cond no longer flag. `false ? read_file() : 0` keeps the
+    // ternary cond no longer flag. `false ? host_read() : 0` keeps the
     // FnCall in the AST (and in `node_index`), but `dead_branch_of`
     // hides it from the capability walk.
     #[test]
     fn dead_ternary_branch_is_not_flagged() {
-        let opts = options_with_read_file_gate(Capabilities::default());
+        let opts = options_with_host_read_gate(Capabilities::default());
         let mut loader = MapLoader::new();
         let ws = build_with_options(
             "/abs/entry",
-            r#"{ f(): false ? read_file("a.txt") : 0 }"#,
+            r#"{ f(): false ? host_read("a.txt") : 0 }"#,
             &mut loader,
             &opts,
         );
@@ -674,11 +625,11 @@ mod tests {
     // and the gated call inside it is silenced.
     #[test]
     fn dead_and_rhs_is_not_flagged() {
-        let opts = options_with_read_file_gate(Capabilities::default());
+        let opts = options_with_host_read_gate(Capabilities::default());
         let mut loader = MapLoader::new();
         let ws = build_with_options(
             "/abs/entry",
-            r#"{ x: false && (read_file("a.txt") == "") }"#,
+            r#"{ x: false && (host_read("a.txt") == "") }"#,
             &mut loader,
             &opts,
         );
@@ -688,11 +639,11 @@ mod tests {
     // v1.1 — `true || gated()` short-circuits at fold time → rhs dead.
     #[test]
     fn dead_or_rhs_is_not_flagged() {
-        let opts = options_with_read_file_gate(Capabilities::default());
+        let opts = options_with_host_read_gate(Capabilities::default());
         let mut loader = MapLoader::new();
         let ws = build_with_options(
             "/abs/entry",
-            r#"{ x: true || (read_file("a.txt") == "") }"#,
+            r#"{ x: true || (host_read("a.txt") == "") }"#,
             &mut loader,
             &opts,
         );
@@ -700,14 +651,14 @@ mod tests {
     }
 
     // v1.1 negative — the live branch of a constant-cond ternary is still
-    // walked. `true ? read_file() : 0` keeps `read_file()` reachable.
+    // walked. `true ? host_read() : 0` keeps `host_read()` reachable.
     #[test]
     fn live_ternary_branch_is_still_flagged() {
-        let opts = options_with_read_file_gate(Capabilities::default());
+        let opts = options_with_host_read_gate(Capabilities::default());
         let mut loader = MapLoader::new();
         let ws = build_with_options(
             "/abs/entry",
-            r#"{ f(): true ? read_file("a.txt") : 0 }"#,
+            r#"{ f(): true ? host_read("a.txt") : 0 }"#,
             &mut loader,
             &opts,
         );
@@ -719,11 +670,11 @@ mod tests {
     // gated call inside either branch still flags.
     #[test]
     fn variable_cond_keeps_both_branches_live() {
-        let opts = options_with_read_file_gate(Capabilities::default());
+        let opts = options_with_host_read_gate(Capabilities::default());
         let mut loader = MapLoader::new();
         let ws = build_with_options(
             "/abs/entry",
-            r#"{ flag: true, f(): flag ? read_file("a.txt") : 0 }"#,
+            r#"{ flag: true, f(): flag ? host_read("a.txt") : 0 }"#,
             &mut loader,
             &opts,
         );
@@ -736,11 +687,11 @@ mod tests {
     // silenced.
     #[test]
     fn nested_call_in_dead_branch_is_silenced() {
-        let opts = options_with_read_file_gate(Capabilities::default());
+        let opts = options_with_host_read_gate(Capabilities::default());
         let mut loader = MapLoader::new();
         let ws = build_with_options(
             "/abs/entry",
-            r#"{ f(): false ? [read_file("a.txt"), read_file("b.txt")] : [] }"#,
+            r#"{ f(): false ? [host_read("a.txt"), host_read("b.txt")] : [] }"#,
             &mut loader,
             &opts,
         );

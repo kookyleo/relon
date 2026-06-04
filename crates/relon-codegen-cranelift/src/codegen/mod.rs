@@ -64,7 +64,7 @@ use const_pool::ConstPool;
 use guard::{
     declare_vtable_data, emit_indirect_host_call, make_call_native_signature,
     make_cap_lookup_signature, make_fmod_signature, make_glob_match_signature, make_now_signature,
-    make_raise_trap_signature, make_read_file_signature,
+    make_raise_trap_signature,
 };
 
 /// Output of a successful compile: a JIT module plus the entry's
@@ -466,7 +466,6 @@ fn lower_module_into<M: CrModule>(
     let cap_lookup_sig = make_cap_lookup_signature(module.target_config().pointer_type());
     let glob_match_sig = make_glob_match_signature(module.target_config().pointer_type());
     let call_native_sig = make_call_native_signature(module.target_config().pointer_type());
-    let read_file_sig = make_read_file_signature(module.target_config().pointer_type());
 
     // `Op::Mod(IrType::F64)` lowers to a libc `fmod` call — cranelift
     // has no native float-remainder instruction. Declare the external
@@ -592,7 +591,6 @@ fn lower_module_into<M: CrModule>(
         let cap_lookup_sig_ref = builder.import_signature(cap_lookup_sig.clone());
         let glob_match_sig_ref = builder.import_signature(glob_match_sig.clone());
         let call_native_sig_ref = builder.import_signature(call_native_sig.clone());
-        let read_file_sig_ref = builder.import_signature(read_file_sig.clone());
         // Import the `fmod` FuncRef into this body so `emit_mod_f64`
         // can emit a direct call. Unreferenced when the body has no
         // `Op::Mod(F64)` — cranelift drops the dead FuncRef and never
@@ -620,7 +618,6 @@ fn lower_module_into<M: CrModule>(
             cap_lookup_sig_ref,
             glob_match_sig_ref,
             call_native_sig_ref,
-            read_file_sig_ref,
             fmod_func_ref,
             pointer_ty,
             frontend_config: module.target_config(),
@@ -728,7 +725,6 @@ fn lower_module_into<M: CrModule>(
             let cap_lookup_sig_ref = builder.import_signature(cap_lookup_sig.clone());
             let glob_match_sig_ref = builder.import_signature(glob_match_sig.clone());
             let call_native_sig_ref = builder.import_signature(call_native_sig.clone());
-            let read_file_sig_ref = builder.import_signature(read_file_sig.clone());
             // Import `fmod` into the lambda body too — a closure
             // predicate (e.g. a `filter` lambda) may contain a Float
             // `%`. Dead-stripped when unreferenced.
@@ -757,7 +753,6 @@ fn lower_module_into<M: CrModule>(
                 cap_lookup_sig_ref,
                 glob_match_sig_ref,
                 call_native_sig_ref,
-                read_file_sig_ref,
                 fmod_func_ref,
                 pointer_ty,
                 frontend_config: module.target_config(),
@@ -907,15 +902,7 @@ fn body_needs_tail_cursor(body: &[TaggedOp]) -> bool {
             } => return true,
             Op::AllocRootRecord { .. }
             | Op::AllocSubRecord { .. }
-            | Op::EmitTailRecordFromAbsoluteAddr { .. }
-            // `read_file` bump-allocates its contents String record at
-            // `tail_cursor`, so the prologue must initialise the cursor
-            // past the fixed return-root area. `read_dir` / `stat`
-            // likewise bump-allocate their List<String> / Dict record
-            // there.
-            | Op::ReadFile
-            | Op::ReadDir
-            | Op::Stat => return true,
+            | Op::EmitTailRecordFromAbsoluteAddr { .. } => return true,
             Op::If {
                 then_body,
                 else_body,
@@ -993,12 +980,6 @@ struct Codegen<'a, 'b> {
     /// source-lowered `Op::CallNative { cap_bit: NO_CAPABILITY_BIT }` to
     /// the `Arc<dyn RelonFunction>` registered at `import_idx`.
     call_native_sig_ref: SigRef,
-    /// Pre-built cranelift signature for `relon_read_file_helper`
-    /// (`extern "C" fn(state, path_off: i32) -> i32`). Used by
-    /// [`Self::emit_read_file`] to lower the built-in `read_file(path)`
-    /// primitive (`Op::ReadFile`) through the `RelonReadFile` vtable
-    /// slot.
-    read_file_sig_ref: SigRef,
     /// `FuncRef` for the libc `fmod` external function, imported into
     /// the current function body. [`Self::emit_mod_f64`] emits a
     /// direct `call(fmod_func_ref, [a, b])` to lower
@@ -1206,16 +1187,6 @@ impl<'a, 'b> Codegen<'a, 'b> {
             VtableSlot::RelonCapLookup => self.cap_lookup_sig_ref,
             VtableSlot::RelonGlobMatch => self.glob_match_sig_ref,
             VtableSlot::RelonCallNative => self.call_native_sig_ref,
-            // The built-in clock / random helpers share the same
-            // `fn(*state) -> i64` shape as `RelonNow`, so they reuse
-            // its prebuilt signature reference.
-            VtableSlot::RelonClockWall | VtableSlot::RelonRandom => self.now_sig_ref,
-            // `read_dir` / `stat` share the same `fn(*state, path_off:
-            // i32) -> i32` shape as `read_file`, so they reuse the
-            // prebuilt sig.
-            VtableSlot::RelonReadFile | VtableSlot::RelonReadDir | VtableSlot::RelonStat => {
-                self.read_file_sig_ref
-            }
         };
         emit_indirect_host_call(
             self.builder,
@@ -1314,26 +1285,6 @@ impl<'a, 'b> Codegen<'a, 'b> {
             .ins()
             .icmp(IntCC::SignedGreaterThanOrEqual, elapsed, deadline);
         self.cond_trap(cmp, TrapKind::ResourceExhausted);
-    }
-
-    /// Lower the built-in `clock()` primitive (`Op::ReadClock`): call
-    /// the host wall-clock helper through the capability vtable and
-    /// push the i64 nanosecond reading. The `reads_clock` gate fired in
-    /// the preceding `Op::CheckCap`.
-    fn emit_read_clock(&mut self) {
-        let inst = self.emit_host_fn_call(VtableSlot::RelonClockWall, &[self.state_ptr]);
-        let ns = self.builder.inst_results(inst)[0];
-        self.push(ns);
-    }
-
-    /// Lower the built-in `random()` primitive (`Op::ReadRandom`): call
-    /// the host entropy helper through the capability vtable and push
-    /// the i64 of random bytes. The `uses_rng` gate fired in the
-    /// preceding `Op::CheckCap`.
-    fn emit_read_random(&mut self) {
-        let inst = self.emit_host_fn_call(VtableSlot::RelonRandom, &[self.state_ptr]);
-        let bits = self.builder.inst_results(inst)[0];
-        self.push(bits);
     }
 
     /// Materialise a cranelift `Variable` for a `LocalGet` slot the
