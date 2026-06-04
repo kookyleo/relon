@@ -24,3 +24,23 @@ w5 单 `result` 字段牵出:① dict-literal 作可捕获值(无 `DictNew`/aren
 
 ## 起点
 **P1(dict-value 地基,串行)** 先行 → P2 双后端并行 → P3 → P4 收口翻守卫。loop 驱动 + 集成。落地后 → 退役 codegen-wasm + wasm-evaluator(留 bindings)→ 终版汇报。
+
+---
+
+## 实施结果(2026-06-04,P1-P4 全部完成、全绿、四方对齐)
+
+| 阶段 | 结果 | 关键 |
+|---|---|---|
+| **P1 dict-value 地基** | ✅ | `IrType::Dict`(i32 arena 指针)+ `Op::ConstDict` + probe-friendly 布局(`[count][shape_hash]` + 排序 `[key_off][key_len][value]` 表 + UTF-8 key 池,可二分);两后端 const-pool byte-identical |
+| **P2 string-list 物化** | ✅ | `ConstListString`(指针数组)+ ListString 按 int 索引(`keys[i]`→String handle,复用 `EmitTailRecordFromAbsoluteAddr{String}`,不发 trace-only 的 ListGetByIntIdx);cranelift+llvm byte-identical,three-way 对齐 |
+| **P3 DictGetByStringKey 静态探针** | ✅ | `d[k]` 降成 **IR-lowered 线性扫描 + 逐字节比较**(纯既有原语,零新运行时符号/零 wasm import → wasm-portable);挂在 `lower_variable` 动态索引分发;not-found→`Trap{IndexOutOfBounds}`(诚实);cranelift 无需改动(原语已支持) |
+| **P4 收口** | ✅ | classifier 接受 `#internal` ListString 字段 + `list.sum` 标量分类;map peephole 内联体经 `lower_expr` 在外层 ctx **天然捕获** d/keys 句柄(无需改 peephole),`d[keys[i%10]]` 自动接 P2 索引 + P3 探针;翻 parity 守卫为真值断言 |
+
+**最终达成**:完整 w5 `#main(Int n) -> Dict { #internal d:{a:1..j:10}, #internal keys:["a".."j"], result: list.sum(range(n).map(i => d[keys[i%10]])) }` **真编译到 native + wasm32**,n=10 跑出 `result=55`,**四方对齐**:tree-walk(金标准)/ cranelift / llvm native / **wasm32→wasm-ld→wasmtime**。IR-shape 钉死降出 `ConstDict`+`ConstListString`+探针 op、**不含** `Op::DictGetByStringKey`(静态 codegen 红线)。
+
+**诚实记录**:
+- `scope_cut_smoke::w5` 不变 —— 旧 `WasmEvaluator` scope-cut 由其自带文本 classifier 驱动(不查 relon-ir),仍 tree-walk 返回 55,**无误编**。
+- P4 的 `list.sum` 分类拓宽**副作用**让 W8 production Dict 也能经旧 `relon-codegen-wasm` 编译;核实其编出**正确值**(n=8→`result=20`,对齐 tree-walk oracle,非静默误编)后,把 `w8_production_dict_source_still_scope_cuts` 从 scope-cut 断言**诚实改为 value-pinned**(仅测试,未动生产代码)。
+- 全程 cranelift 零回归;W7 递归闭包守卫仍正确 reject(那是另一独立 epic)。
+
+**新增可编译 op 面**:`ConstDict` / `IrType::Dict` / `ConstListString` / ListString-index / `d[k]` 静态 dict 探针 —— 跨 native + wasm32,three-way oracle 完整。**w5 不再是 wasm 退役阻塞** —— 现在退役 codegen-wasm + wasm-evaluator 零覆盖损失(w4 已补、w5 已 wasm-编译;w7 是独立 epic)。
