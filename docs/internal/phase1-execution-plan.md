@@ -202,7 +202,7 @@ Stage 1 + Stage 2 全部 lane 已并入 main、`cargo build/test/clippy --worksp
 - **分期(每个 = 1 IR op + native/wasm 双臂 codegen lowering + 复用现有 cap;native 降成 runtime 调 std,wasm 降成标准 WASI import)**:
   1. **P-clock** ✅(c5ad3c07):内建 `clock()` 原语,复用 `CapabilityBit::ReadsClock`;wasm→标准 `clock_time_get`、native→cranelift `RelonClockWall`/`SystemTime` + llvm host extern。
   2. **P-random** ✅(c5ad3c07):内建 `random()`,复用 `UsesRng`;wasm→标准 `random_get`、native→`/dev/urandom`(std-only 无新 dep)。
-  3. **P-fs**(大,待开):`fd_*` + preopened dir,需 fd table / path-open。
+  3. **P-fs**(**spike 已证 / production read_file 设计待建**):见下。
   4. **P-net**(**defer,待 preview2**):见下调研结论。
 
 **P-clock/P-random 落地实证**:内建 `clock()`/`random()`(`()->Int`)CheckCap 门控;wasm import section 验证是 `wasi_snapshot_preview1`(非自定义 env)、现成 `wasmtime-wasi` p1 host 满足、跑出可信值;非确定性按可信性断言(clock ±5s 窗 / random 非常量),能力门未授权三档(tree-walk/cranelift/wasm)全拒;cranelift `GENERATOR_VERSION` 3→4 / `VtableSlot::COUNT` 5→7 无回归。**两个小原语已对位 WASI 标准落地**。
@@ -215,5 +215,15 @@ Stage 1 + Stage 2 全部 lane 已并入 main、`cargo build/test/clippy --worksp
 - **无值得做的 preview1 net 子集**:主动 connect 规范无;被动 fd host 未实现 + 形状畸形(不能选连谁)+ 投入≈P-fs 产出≈零。
 - **路线**:① **先 P-fs**(preview1 `path_open`/`fd_*` 标准齐全 + p1 host 真实现)—— 它同样需「非 nullary + iovec 缓冲区编组 + fd 句柄在 relon 值层表示」,在**低风险 preview1 地基**上把这套机制验清,P-net 直接复用;② P-fs + preview2 componentization 就绪后再开 P-net。
 
-**待开**:P-fs(进行中)· P-net(defer 至 preview2,前置见上)。
+### P-fs 调研结论(2026-06-04):spike 已证,production read_file 是多面工程(设计待建)
+- **Spike 已绿**(commit 624a2278,`tests/aot_wasm_wasi_fs_spike.rs`):标准 preview1 fd 协议(`path_open`/`fd_read`/`fd_close`)经 **preopened dir + 现成 `wasmtime-wasi` host**(`WasiCtxBuilder::preopened_dir` + `p1::add_to_linker_sync`,无 relon func_wrap)端到端 byte-exact 读出文件。`ReadsFs=0` 已存在、复用。**坑**:dirfd=3(stdio 占 0/1/2);`fs_rights_base` 必须是合法位(`RIGHTS_FD_READ|FD_SEEK=6`,传 `!0` 会 host abort)。
+- **production `read_file(String)->String` 未建,诚实缓做**:它**不像 clock/random**(nullary Int-out)—— 是 **String-in / String-out + 多调用 + arena String-out**。关键卡点:现有动态 `Op::CallNative` 的 cranelift 路径(`SandboxState::call_native`)**只支持标量(Int/Bool 进、Int 出)**,扛不了 String 参/返。需要新基建,非套用 clock/random 脚手架。
+- **分期设计**:
+  - **Stage 1 `read_file`**:新 `Op::ReadFile`(String 进/出)+ `CheckCap{ReadsFs}` 前导;tree-walk 金标准(`std::fs::read_to_string`,trivial);cranelift 新 `VtableSlot::ReadFile`(bump COUNT 7→8 + GENERATOR_VERSION + layout 测试)+ helper 从 arena 读 path 记录、`std::fs` 读、**bump tail_cursor 写新 String 记录**(新活,glob_helper 只读不写回);**LLVM wasm** 降成 spike 的 3-call fd 协议 + 把内容写进 arena String 记录(`emit_tail_alloc` 目前只在 cranelift 有,LLVM 要补——**最大单块**)。**path 解析策略**:native `std::fs` 须 sandbox 到与 wasm preopen 同一 dir(host 配 root 在 SandboxState/Context),四后端语义对齐。内容确定 → **four-way bit-equal** 可做。
+  - **Stage 2 `read_dir->List<String>`**:wasm `fd_readdir`(dirent 流解析)+ native `std::fs::read_dir`;需 `List<String>` arena 输出。
+  - **Stage 3 `stat->{size,is_dir}`**:wasm `path_filestat_get`(filestat 结构进内存)+ native metadata;需结构返回。
+  - **Stage 4 写(`write_file`/`create_dir`/`remove`)**:门控 `WritesFs=1`(已存在);wasm `path_open` create/write oflags + `RIGHTS_FD_WRITE` + `fd_write`,preopen 须授 `DirPerms::MUTATE`。
+- **共性**:read_file 攻克的「非 nullary + 缓冲区编组 + arena String/struct-out」正是 **P-net 也要的地基**(见 P-net 结论)。
+
+**待建**:P-fs Stage 1 `read_file`(spike 已证,production 多面工程)· P-net(defer 至 preview2)。
 - 工程注:wasm 对象用 `write_to_file`(非 `write_to_memory_buffer`,后者产 malformed uleb128,wasm-ld-17 拒)。
