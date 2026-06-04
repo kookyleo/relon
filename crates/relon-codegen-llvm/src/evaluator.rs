@@ -40,9 +40,9 @@ use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
 use relon_parser::Node;
 
 use crate::codegen::{
-    emit_fast_entry, emit_module_funcs, emit_module_funcs_closed_world, emit_module_funcs_wasm,
-    is_buffer_protocol_signature, ConstPool, EntryShape, FastPathProfile, WorldMode, ENTRY_SYMBOL,
-    ENTRY_SYMBOL_FAST,
+    emit_fast_entry, emit_module_funcs, emit_module_funcs_closed_world,
+    emit_module_funcs_closed_world_wasm, emit_module_funcs_wasm, is_buffer_protocol_signature,
+    ConstPool, EntryShape, FastPathProfile, WorldMode, ENTRY_SYMBOL, ENTRY_SYMBOL_FAST,
 };
 use crate::error::LlvmError;
 use crate::state::ArenaState;
@@ -1893,6 +1893,70 @@ fn body_references_const_pool(body: &[relon_ir::ir::TaggedOp]) -> bool {
     false
 }
 
+/// P3 §2.2 wasm closed-world routing: derive a per-`import_idx`
+/// effectful flag from the IR's `Op::CheckCap` → `Op::CallNative` shape.
+///
+/// The IR lowering (`try_lower_native_call`) emits one `Op::CheckCap`
+/// per capability bit a host fn's gate requires *immediately before* the
+/// call's argument evaluation, then the `Op::CallNative`. A **pure**
+/// host fn (empty gate) emits zero preceding CheckCaps; an **effectful**
+/// one (reads clock / IO / side effect — gated by a capability) emits at
+/// least one. The `NativeImport.cap_bit` carried into codegen is always
+/// `NO_CAPABILITY_BIT` (the guard rides the CheckCap ops, not the call),
+/// so this CheckCap-presence scan is the in-codegen signal that survives
+/// IR lowering — no analyzer/IR change required.
+///
+/// Returns `effectful[i] == true` iff import index `i`'s call site is
+/// guarded by a preceding CheckCap. Walks every function body
+/// (entry + helpers + lambdas), maintaining a per-body count of pending
+/// CheckCaps consumed by the next CallNative. A pure call nested inside
+/// an effectful call's arguments carries no CheckCap of its own, so it
+/// won't be mis-flagged.
+fn compute_effectful_imports(ir: &relon_ir::ir::Module) -> Vec<bool> {
+    let mut effectful = vec![false; ir.imports.len()];
+    for func in &ir.funcs {
+        scan_body_effectful(&func.body, &mut effectful);
+    }
+    effectful
+}
+
+fn scan_body_effectful(body: &[relon_ir::ir::TaggedOp], effectful: &mut [bool]) {
+    use relon_ir::ir::Op;
+    // Pending CheckCaps in declaration order ahead of the next CallNative
+    // in this op sequence. The lowering pins them right before the call's
+    // args, so a non-zero count when a CallNative is reached marks that
+    // import effectful.
+    let mut pending_check_caps: u32 = 0;
+    for tagged in body {
+        match &tagged.op {
+            Op::CheckCap { .. } => pending_check_caps += 1,
+            Op::CallNative { import_idx, .. } => {
+                if pending_check_caps > 0 {
+                    if let Some(slot) = effectful.get_mut(*import_idx as usize) {
+                        *slot = true;
+                    }
+                }
+                pending_check_caps = 0;
+            }
+            // Nested control flow: recurse so a CheckCap-guarded call
+            // inside a branch / loop is still flagged. A nested block
+            // starts its own pending count.
+            Op::Block { body, .. } | Op::Loop { body, .. } => {
+                scan_body_effectful(body, effectful);
+            }
+            Op::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                scan_body_effectful(then_body, effectful);
+                scan_body_effectful(else_body, effectful);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// order to buffer offsets when eligible.
 fn build_fast_path_profile(schema: &BufferSchema) -> Result<FastPathProfile, ()> {
     use relon_eval_api::schema_canonical::TypeRepr;
@@ -2194,9 +2258,12 @@ impl LlvmAotEvaluator {
     /// already lays the arena out via pointer-width-agnostic i32-offset
     /// GEPs.
     ///
-    /// Wasm32 today supports the open-world path (no host-bitcode link;
-    /// effectful host fns route through WASI imports, P3 §2.2 — not yet
-    /// wired). Closed-world (host-bitcode co-compile) is native-only.
+    /// Wasm32 supports both worlds (P3 §2.2). Open-world routes every
+    /// `#native` host fn through a WASI import. Closed-world co-compiles
+    /// the **pure-compute** host fns into the wasm unit and inlines them
+    /// (via `link_and_inline_host_shim_wasm_pure_only`), while still
+    /// routing **effectful** (capability-gated) host fns through WASI
+    /// imports — symmetric with the native closed-world inline.
     #[allow(clippy::too_many_arguments)]
     pub fn emit_object_for_target(
         src: &str,
@@ -2207,13 +2274,6 @@ impl LlvmAotEvaluator {
         host_shim_src: Option<&str>,
         target: CodegenTarget,
     ) -> Result<EmitObjectInfo, LlvmError> {
-        if matches!(target, CodegenTarget::Wasm32) && matches!(world_mode, WorldMode::ClosedWorld) {
-            return Err(LlvmError::Codegen(
-                "wasm32 target does not support closed-world host-bitcode co-compile yet \
-                 (effectful host fns route through WASI imports — P3 §2.2)"
-                    .into(),
-            ));
-        }
         let (ir, main_schema, return_schema) = Self::lower_source_with_options(src, Some(options))?;
         let main_layout = relon_eval_api::layout::SchemaLayout::offsets_for(&main_schema)
             .map_err(|e| LlvmError::Codegen(format!("main schema layout: {e}")))?;
@@ -2362,29 +2422,54 @@ impl LlvmAotEvaluator {
                 // Stage 2.⑤ / P3 §2.2: pick the dispatch emitter by world
                 // mode + target. Native open-world (default / rs-build
                 // today) keeps the dynamic `relon_llvm_call_native` hop;
-                // closed-world lowers `Op::CallNative` to a direct
+                // native closed-world lowers `Op::CallNative` to a direct
                 // `call @<host>` that the host-bitcode link + inline below
-                // folds away. wasm32 (always open-world — closed-world is
-                // rejected up top) lowers `Op::CallNative` to a **wasm
-                // import** call (`crate::wasi_host`), since the native
-                // MCJIT helper is unreachable inside the sandbox.
-                let emit = match (world_mode, target) {
-                    (WorldMode::OpenWorld, CodegenTarget::Wasm32) => emit_module_funcs_wasm,
-                    (WorldMode::OpenWorld, CodegenTarget::Native) => emit_module_funcs,
-                    (WorldMode::ClosedWorld, _) => emit_module_funcs_closed_world,
+                // folds away. wasm32 open-world lowers `Op::CallNative` to a
+                // **wasm import** call (`crate::wasi_host`). wasm32
+                // closed-world (P3 §2.2 co-compile) inlines the
+                // **pure-compute** host fns into the wasm unit while routing
+                // **effectful** ones (capability-gated) through wasm imports
+                // — `effectful_imports` carries the per-import split derived
+                // from the IR's CheckCap shape.
+                let effectful_imports = compute_effectful_imports(&ir);
+                let llvm_fn = match (world_mode, target) {
+                    (WorldMode::ClosedWorld, CodegenTarget::Wasm32) => {
+                        emit_module_funcs_closed_world_wasm(
+                            &ctx,
+                            &module,
+                            entry,
+                            buffer_return_size,
+                            &const_pool,
+                            &helpers,
+                            Some(&helper_ir_indices),
+                            &lambdas,
+                            &ir.closure_table,
+                            &ir.imports,
+                            &effectful_imports,
+                        )?
+                        .0
+                    }
+                    (world_mode, target) => {
+                        let emit = match (world_mode, target) {
+                            (WorldMode::OpenWorld, CodegenTarget::Wasm32) => emit_module_funcs_wasm,
+                            (WorldMode::OpenWorld, CodegenTarget::Native) => emit_module_funcs,
+                            (WorldMode::ClosedWorld, _) => emit_module_funcs_closed_world,
+                        };
+                        emit(
+                            &ctx,
+                            &module,
+                            entry,
+                            buffer_return_size,
+                            &const_pool,
+                            &helpers,
+                            Some(&helper_ir_indices),
+                            &lambdas,
+                            &ir.closure_table,
+                            &ir.imports,
+                        )?
+                        .0
+                    }
                 };
-                let (llvm_fn, _entry_shape, _helper_table, _closure_fn_table) = emit(
-                    &ctx,
-                    &module,
-                    entry,
-                    buffer_return_size,
-                    &const_pool,
-                    &helpers,
-                    Some(&helper_ir_indices),
-                    &lambdas,
-                    &ir.closure_table,
-                    &ir.imports,
-                )?;
                 // Rename the canonical buffer entry to the build.rs-
                 // supplied symbol and force external linkage so the
                 // consuming binary's linker can resolve it.
@@ -2395,6 +2480,12 @@ impl LlvmAotEvaluator {
                 // module + force-inline every imported host fn so the
                 // direct `call @<host>` sites collapse to the host body.
                 // Reuses the `crate::cocompile` link/inline orchestration.
+                // Native links the host shim built for the host triple;
+                // wasm32 links the host shim built for
+                // `wasm32-unknown-unknown` so the inlined body matches the
+                // wasm unit's pointer width. Either way only the
+                // pre-declared (pure) host fns carry a direct `call @<host>`
+                // to fold — effectful imports stay as wasm imports.
                 if matches!(world_mode, WorldMode::ClosedWorld) {
                     let shim = host_shim_src.ok_or_else(|| {
                         LlvmError::Codegen(
@@ -2403,7 +2494,19 @@ impl LlvmAotEvaluator {
                                 .into(),
                         )
                     })?;
-                    crate::cocompile::link_and_inline_host_shim(&module, shim, &ir.imports)?;
+                    match target {
+                        CodegenTarget::Wasm32 => {
+                            crate::cocompile::link_and_inline_host_shim_wasm_pure_only(
+                                &module,
+                                shim,
+                                &ir.imports,
+                                &effectful_imports,
+                            )?;
+                        }
+                        CodegenTarget::Native => {
+                            crate::cocompile::link_and_inline_host_shim(&module, shim, &ir.imports)?;
+                        }
+                    }
                 }
 
                 // Detect whether the emitted module references the
