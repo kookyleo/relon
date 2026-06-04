@@ -269,6 +269,22 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         // bitcode is linked in + inlined by `crate::cocompile`. Splits
         // here so the open-world helper path below is untouched.
         if matches!(self.world_mode, super::WorldMode::ClosedWorld) {
+            // P3 §2.2 wasm closed-world: route per-import. An **effectful**
+            // host fn (capability-gated — `effectful_imports[idx] == true`)
+            // must NOT be inlined into the sandbox; it crosses the boundary
+            // as a **wasm import** (`emit_call_native_wasi`). A pure-compute
+            // host fn co-compiles + inlines via the direct path, mirroring
+            // the native closed-world inline. On the native closed-world
+            // path `effectful_imports` is empty, so every call takes the
+            // direct path exactly as before.
+            let effectful = self
+                .effectful_imports
+                .get(import_idx as usize)
+                .copied()
+                .unwrap_or(false);
+            if matches!(self.target, crate::CodegenTarget::Wasm32) && effectful {
+                return self.emit_call_native_wasi(import_idx, param_tys.len(), ret_ty);
+            }
             return self.emit_call_native_direct(import_idx, param_tys.len(), ret_ty);
         }
 

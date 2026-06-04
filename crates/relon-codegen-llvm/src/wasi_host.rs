@@ -10,12 +10,15 @@
 //!   engine patches in — there is no MCJIT engine behind a `wasm-ld`
 //!   linked module, so the symbol would be an unresolved native import
 //!   wasmtime cannot satisfy with the right `(state, idx, args, n)` ABI.
-//! - host-bitcode co-compile (closed-world) is *native-only* — the
-//!   wasm32 object-emit path rejects `WorldMode::ClosedWorld` outright
-//!   (see `emit_object_for_target`). A *pure-compute* host fn would want
-//!   inlining, but an **effectful** one (IO / clock / side effect) must
-//!   not be inlined into the sandbox at all — it has to cross the
-//!   sandbox boundary back out to the trusted host.
+//! - host-bitcode co-compile (closed-world) now spans both targets
+//!   (P3 §2.2): the wasm32 object-emit path co-compiles + inlines a
+//!   *pure-compute* host fn into the unit (see
+//!   `cocompile::link_and_inline_host_shim_wasm_pure_only`). But an
+//!   **effectful** host fn (IO / clock / side effect) must *not* be
+//!   inlined into the sandbox — it has to cross the sandbox boundary back
+//!   out to the trusted host, so it keeps this WASI-import lowering even
+//!   under closed-world. The pure/effectful split is keyed off the IR's
+//!   capability-gate (`Op::CheckCap`) shape (`compute_effectful_imports`).
 //!
 //! The sandbox-correct lowering for an effectful host fn on wasm32 is a
 //! **wasm import**: the module declares the host fn as an `extern`

@@ -200,8 +200,94 @@ pub(crate) fn link_and_inline_host_shim(
     host_shim_src: &str,
     imports: &[relon_ir::ir::NativeImport],
 ) -> Result<(), LlvmError> {
+    link_and_inline_host_shim_for_target(module, host_shim_src, imports, HostShimTarget::Native)
+}
+
+/// Which target the host shim is compiled for. The native path emits an
+/// x86-64 textual IR (host triple); the wasm path emits a
+/// `wasm32-unknown-unknown` textual IR with the `p:32:32` DataLayout so
+/// the linked-in host body matches the relon wasm32 module's pointer
+/// width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostShimTarget {
+    Native,
+    Wasm32,
+}
+
+/// Wasm32 sibling of [`link_and_inline_host_shim`]: compile the host
+/// shim with `rustc --target wasm32-unknown-unknown --emit=llvm-ir`, parse
+/// the textual IR in-process (LLVM-18), and `link_in_module` it into a
+/// relon **wasm32** module so a pure-compute host fn the `imports` table
+/// names gets force-inlined into the wasm unit instead of routed across a
+/// WASI import boundary.
+///
+/// ## wasm32 spike result (validated)
+///
+/// rustc-wasm32 textual IR carries `target triple = "wasm32-unknown-unknown"`
+/// and `target datalayout = "e-m:e-p:32:32-…-ni:1:10:20"`. The relon wasm
+/// module pins `wasm32-wasi`. `link_in_module` tolerates the triple
+/// mismatch (LLVM treats a triple disagreement as a warning, not an
+/// error) and the DataLayouts are compatible (both little-endian,
+/// `p:32:32`), so the inkwell LLVM-18 parser accepts the rustc-22 `.ll`
+/// and the post-O3 wasm32 pipeline inlines the host body — exactly the
+/// native bridge, retargeted. The one residual skew (shared with native):
+/// a host fn whose return value LLVM can range-narrow emits a
+/// `range(iN …)` return attribute the LLVM-18 parser rejects; that
+/// surfaces as a `parse host textual IR` error rather than a silent
+/// miscompile.
+/// wasm closed-world host-shim co-compile that only inlines the
+/// **pure-compute** host fns. `effectful[i] == true` marks import index
+/// `i` as effectful (capability-gated) — it stays a `wasm import` and is
+/// *not* force-inlined even if the shim happens to carry a body for it.
+///
+/// The contract for the caller (`emit_object_for_target`): the wasm
+/// closed-world `host_shim_src` should define **only** the pure host fns;
+/// an effectful fn's implementation lives in the trusted host outside the
+/// sandbox (supplied by wasmtime's `Linker` at instantiation). This entry
+/// just makes the inline set explicit so a pure-only shim is the norm.
+pub(crate) fn link_and_inline_host_shim_wasm_pure_only(
+    module: &LlvmModule<'_>,
+    host_shim_src: &str,
+    imports: &[relon_ir::ir::NativeImport],
+    effectful: &[bool],
+) -> Result<(), LlvmError> {
     let ctx = module.get_context();
-    let host_ll = compile_host_shim_to_textual_ir(host_shim_src)?;
+    let host_ll = compile_host_shim_to_textual_ir(host_shim_src, HostShimTarget::Wasm32)?;
+    let buffer = MemoryBuffer::create_from_file(&host_ll)
+        .map_err(|e| LlvmError::Codegen(format!("cocompile: read host wasm .ll: {e}")))?;
+    let host_module = ctx
+        .create_module_from_ir(buffer)
+        .map_err(|e| LlvmError::Codegen(format!("cocompile: parse host wasm textual IR: {e}")))?;
+    module
+        .link_in_module(host_module)
+        .map_err(|e| LlvmError::Codegen(format!("cocompile: wasm link_in_module: {e}")))?;
+
+    let always_inline = ctx.create_enum_attribute(
+        inkwell::attributes::Attribute::get_named_enum_kind_id("alwaysinline"),
+        0,
+    );
+    for (idx, import) in imports.iter().enumerate() {
+        if effectful.get(idx).copied().unwrap_or(false) {
+            // Effectful: keep the wasm import boundary; never inline.
+            continue;
+        }
+        if let Some(host_fn) = module.get_function(&import.name) {
+            if host_fn.get_first_basic_block().is_some() {
+                host_fn.add_attribute(AttributeLoc::Function, always_inline);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn link_and_inline_host_shim_for_target(
+    module: &LlvmModule<'_>,
+    host_shim_src: &str,
+    imports: &[relon_ir::ir::NativeImport],
+    target: HostShimTarget,
+) -> Result<(), LlvmError> {
+    let ctx = module.get_context();
+    let host_ll = compile_host_shim_to_textual_ir(host_shim_src, target)?;
     // In-process LLVM-18 parse of rustc's textual IR: no external
     // `llvm-as-18` binary, no rustc-bitcode summary-version skew. LLVM's
     // textual IR is forward-compatible enough across the rustc/system
@@ -237,7 +323,10 @@ pub(crate) fn link_and_inline_host_shim(
 /// enough across the rustc/system-LLVM major gap that the 18.1.3 parser
 /// accepts it — no external assembler, no bitcode summary-version skew.
 /// The returned path is a `.ll` the caller reads via `MemoryBuffer`.
-fn compile_host_shim_to_textual_ir(host_shim_src: &str) -> Result<std::path::PathBuf, LlvmError> {
+fn compile_host_shim_to_textual_ir(
+    host_shim_src: &str,
+    target: HostShimTarget,
+) -> Result<std::path::PathBuf, LlvmError> {
     // Per-invocation unique dir: PID alone collides when two
     // co-compiles run on the same process (concurrent test threads, or
     // a JIT + object emit in one build), racing on `host_shim.ll`.
@@ -253,19 +342,27 @@ fn compile_host_shim_to_textual_ir(host_shim_src: &str) -> Result<std::path::Pat
 
     // 1. rustc --emit=llvm-ir (textual): decouples from rustc's bitcode
     //    binary format / ThinLTO summary version.
+    let mut args: Vec<&str> = vec![
+        "--emit=llvm-ir",
+        "--crate-type=cdylib",
+        "-O",
+        // Single codegen unit so `--emit=llvm-ir` writes one
+        // `host_shim.ll` rather than per-CGU `*.rcgu.0.ll` shards
+        // it then fails to merge under `-o`.
+        "-Ccodegen-units=1",
+    ];
+    // wasm32 retarget: the host body must come out with the wasm32
+    // `p:32:32` DataLayout / triple so it links into the relon wasm32
+    // module (see `link_and_inline_host_shim_wasm` docs).
+    if matches!(target, HostShimTarget::Wasm32) {
+        args.push("--target");
+        args.push("wasm32-unknown-unknown");
+    }
+    args.push(rs_path.to_str().unwrap());
+    args.push("-o");
+    args.push(ll_path.to_str().unwrap());
     let rustc = Command::new("rustc")
-        .args([
-            "--emit=llvm-ir",
-            "--crate-type=cdylib",
-            "-O",
-            // Single codegen unit so `--emit=llvm-ir` writes one
-            // `host_shim.ll` rather than per-CGU `*.rcgu.0.ll` shards
-            // it then fails to merge under `-o`.
-            "-Ccodegen-units=1",
-            rs_path.to_str().unwrap(),
-            "-o",
-            ll_path.to_str().unwrap(),
-        ])
+        .args(&args)
         .output()
         .map_err(|e| LlvmError::Codegen(format!("cocompile: spawn rustc: {e}")))?;
     if !rustc.status.success() {

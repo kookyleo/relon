@@ -545,6 +545,7 @@ pub(crate) fn emit_module_funcs<'ctx>(
         imports,
         WorldMode::OpenWorld,
         crate::CodegenTarget::Native,
+        &[],
     )
 }
 
@@ -587,6 +588,7 @@ pub(crate) fn emit_module_funcs_wasm<'ctx>(
         imports,
         WorldMode::OpenWorld,
         crate::CodegenTarget::Wasm32,
+        &[],
     )
 }
 
@@ -628,6 +630,60 @@ pub(crate) fn emit_module_funcs_closed_world<'ctx>(
         imports,
         WorldMode::ClosedWorld,
         crate::CodegenTarget::Native,
+        &[],
+    )
+}
+
+/// P3 §2.2 wasm closed-world co-compile entry point. Like
+/// [`emit_module_funcs_closed_world`] but targets **wasm32**: a
+/// pure-compute `Op::CallNative` (an import whose `effectful_imports`
+/// flag is `false`) lowers to a direct `call @<host_symbol>` that the
+/// wasm host-shim co-compile ([`crate::cocompile::link_and_inline_host_shim_wasm`])
+/// links + inlines into the wasm unit, mirroring the native closed-world
+/// inline. An **effectful** import (flag `true` — capability-gated by a
+/// preceding `Op::CheckCap`) instead routes to a **wasm import** call
+/// ([`crate::wasi_host`]) so the side effect crosses the sandbox boundary
+/// back out to the trusted host (ADR §2.2: pure inline, effectful → WASI).
+///
+/// `effectful_imports[i]` is the per-`import_idx` effectful flag; the
+/// caller (`emit_object_for_target`) derives it from the IR's
+/// CheckCap → CallNative shape.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn emit_module_funcs_closed_world_wasm<'ctx>(
+    ctx: &'ctx Context,
+    module: &LlvmModule<'ctx>,
+    entry: &Func,
+    buffer_return_size: u32,
+    const_pool: &ConstPool,
+    helpers: &[&Func],
+    helper_ir_indices: Option<&[u32]>,
+    lambdas: &[&Func],
+    closure_table: &[u32],
+    imports: &[relon_ir::ir::NativeImport],
+    effectful_imports: &[bool],
+) -> Result<
+    (
+        FunctionValue<'ctx>,
+        EntryShape,
+        HashMap<u32, FunctionValue<'ctx>>,
+        Vec<FunctionValue<'ctx>>,
+    ),
+    LlvmError,
+> {
+    emit_module_funcs_impl(
+        ctx,
+        module,
+        entry,
+        buffer_return_size,
+        const_pool,
+        helpers,
+        helper_ir_indices,
+        lambdas,
+        closure_table,
+        imports,
+        WorldMode::ClosedWorld,
+        crate::CodegenTarget::Wasm32,
+        effectful_imports,
     )
 }
 
@@ -645,6 +701,7 @@ fn emit_module_funcs_impl<'ctx>(
     imports: &[relon_ir::ir::NativeImport],
     world_mode: WorldMode,
     target: crate::CodegenTarget,
+    effectful_imports: &[bool],
 ) -> Result<
     (
         FunctionValue<'ctx>,
@@ -714,6 +771,7 @@ fn emit_module_funcs_impl<'ctx>(
             imports,
             world_mode,
             target,
+            effectful_imports,
         )?;
         (fv, EntryShape::Buffer)
     } else {
@@ -1594,6 +1652,7 @@ fn emit_buffer_entry_with_helpers<'ctx>(
         &[],
         WorldMode::OpenWorld,
         crate::CodegenTarget::Native,
+        &[],
     )
 }
 
@@ -1613,6 +1672,7 @@ fn emit_buffer_entry_with_helpers_and_closures<'ctx, 'cp>(
     imports: &'cp [relon_ir::ir::NativeImport],
     world_mode: WorldMode,
     target: crate::CodegenTarget,
+    effectful_imports: &'cp [bool],
 ) -> Result<FunctionValue<'ctx>, LlvmError> {
     emit_buffer_entry_impl(
         ctx,
@@ -1625,6 +1685,7 @@ fn emit_buffer_entry_with_helpers_and_closures<'ctx, 'cp>(
         imports,
         world_mode,
         target,
+        effectful_imports,
     )
 }
 
@@ -1644,6 +1705,7 @@ fn emit_buffer_entry_impl<'ctx, 'cp>(
     imports: &'cp [relon_ir::ir::NativeImport],
     world_mode: WorldMode,
     target: crate::CodegenTarget,
+    effectful_imports: &'cp [bool],
 ) -> Result<FunctionValue<'ctx>, LlvmError> {
     let i32_t = ctx.i32_type();
     let i64_t = ctx.i64_type();
@@ -1749,6 +1811,7 @@ fn emit_buffer_entry_impl<'ctx, 'cp>(
     emit.imports = imports;
     emit.world_mode = world_mode;
     emit.target = target;
+    emit.effectful_imports = effectful_imports;
     match world_mode {
         // Open-world (MCJIT / from_source): declare the dynamic-dispatch
         // helper so `Op::CallNative` emits a `call @relon_llvm_call_native`
@@ -1771,10 +1834,21 @@ fn emit_buffer_entry_impl<'ctx, 'cp>(
         // `call @<host_symbol>`. The host bitcode is linked + inlined by
         // `crate::cocompile`. No `relon_llvm_call_native` helper exists
         // on this path.
+        //
+        // P3 §2.2 wasm closed-world: only pre-declare the **pure-compute**
+        // host fns as direct externs (those get co-compiled + inlined).
+        // An **effectful** host fn must NOT be inlined into the sandbox —
+        // its `Op::CallNative` routes to `emit_call_native_wasi`, which
+        // declares the `(import "env" …)` lazily. Pre-declaring it here as
+        // a plain extern would still be link-resolved by the inlined-shim,
+        // defeating the boundary, so we skip effectful imports.
         WorldMode::ClosedWorld => {
             emit.call_native_fn = None;
-            for import in imports {
-                declare_host_fn_direct(ctx, module, import);
+            for (idx, import) in imports.iter().enumerate() {
+                let effectful = effectful_imports.get(idx).copied().unwrap_or(false);
+                if !effectful {
+                    declare_host_fn_direct(ctx, module, import);
+                }
             }
         }
     }
@@ -2015,6 +2089,17 @@ pub(crate) struct Emit<'ctx, 'b, 'cp> {
     /// [`crate::wasi_host`]) instead of the native MCJIT
     /// `relon_llvm_call_native` helper, which the sandbox cannot reach.
     pub(crate) target: crate::CodegenTarget,
+    /// P3 §2.2 wasm closed-world routing: per-`import_idx` effectful flag.
+    /// `effectful_imports[i] == true` means the host fn at import index
+    /// `i` is capability-gated (a preceding `Op::CheckCap` guards its
+    /// call) — an *effectful* fn that must cross the sandbox boundary as a
+    /// **WASI import**, not be inlined into the wasm unit. `false` (or an
+    /// out-of-range index on the legacy / native paths) means pure-compute:
+    /// co-compile + inline. Empty slice on every path except wasm32
+    /// closed-world; the wasm closed-world emit
+    /// (`emit_module_funcs_closed_world_wasm`) populates it from the IR's
+    /// CheckCap → CallNative shape.
+    pub(crate) effectful_imports: &'cp [bool],
 }
 
 /// Phase E.1: per-call inline-frame state. One entry per active
@@ -2242,6 +2327,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             call_native_fn: None,
             world_mode: WorldMode::OpenWorld,
             target: crate::CodegenTarget::Native,
+            effectful_imports: &[],
         }
     }
 
