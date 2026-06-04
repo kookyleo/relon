@@ -188,3 +188,10 @@ Stage 1 + Stage 2 全部 lane 已并入 main、`cargo build/test/clippy --worksp
 **正交说明**:本 follow-up 只关 effectful import 的**形状**(自定义 `env::*` → 标准 WASI);与正在做的**纯计算宿主 co-compile inline**(把 pure `#native` inline 进 wasm 单元、无 import)互不影响 —— effectful 不论怎样都走 import,只是 import 改成标准 WASI 形态。
 
 **待办时机**:co-compile lane(纯计算宿主一体编译进 wasm)落地后再开本 follow-up lane。
+
+### 设计决策(2026-06-04,用户定):直接向 WASI 标准靠拢,不自造平行标准
+- **「relon 尚无自己的标准,向既有生态靠拢」** —— wasm 线的 effectful 能力**直接采纳 WASI 标准接口**,不另立一套 relon 专属能力原语词汇与之并行。
+- 即:relon 的内建 effectful 能力(clock / fs / random / net / env)**就是** WASI 接口本身 —— `reads_clock` ↔ `wasi:clocks`/`clock_time_get`、`reads_fs` ↔ WASI preopen/`fd_*`、`random` ↔ `wasi:random`/`random_get` …;codegen 发**标准 WASI import**,由任何标准 WASI host(`wasmtime-wasi`/jco/wasmer)满足,**不绑 relon runner**。
+- 起步选 **preview1**(`wasi_snapshot_preview1`,稳定 + module-based + 广支持);preview2/component-model 作后续。
+- 用户自定义任意 `#native`(非标准能力)仍可走宿主 import,但**标准能力一律走 WASI**,不重造。
+- 这条决策覆盖前文「核心难点」的设计摇摆:**不引入 relon 平行能力原语体系,直接映 WASI**。
