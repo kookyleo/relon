@@ -56,6 +56,9 @@ use crate::error::LlvmError;
 const WASI_CLOCK_REALTIME: u64 = 0;
 /// WASI preview1 import module name (standard, ecosystem-native).
 const WASI_MODULE: &str = "wasi_snapshot_preview1";
+/// The conventional first preopened directory fd for `path_open`: stdio
+/// occupies 0/1/2, the first `preopened_dir` lands at 3.
+const WASI_PREOPEN_DIRFD: u64 = 3;
 
 impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// Lower `Op::ReadClock`: built-in `clock()` primitive.
@@ -184,23 +187,375 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// (`path_open` -> `fd_read` -> `fd_close`) against a preopened dir,
     /// writing the contents into a fresh arena String record.
     ///
-    /// P-fs Stage 1 honest scope: NOT YET IMPLEMENTED on wasm32. The
-    /// spike (`tests/aot_wasm_wasi_fs_spike.rs`) proved the fd protocol +
-    /// preopened-dir host in isolation, but productionizing it here means
-    /// reconciling the WASI linear-memory iovec marshalling with the
-    /// LLVM buffer-protocol's `out_ptr`-relative tail-record convention
-    /// (`emit_store_field_pointer_indirect`) and the harness readback —
-    /// a larger block than the native arms. Surfacing a loud codegen
-    /// error keeps the wasm path from emitting a silently-wrong module
-    /// (no fake green): a `read_file` program simply refuses to compile
-    /// for wasm32 until the marshalling is wired.
+    /// ## fd protocol (mirrors `tests/aot_wasm_wasi_fs_spike.rs`)
+    ///
+    /// The path operand is a String handle: an arena-relative i32 offset
+    /// to a `[len:u32 LE][utf8]` record. We read its `len` and point
+    /// `path_open` at the payload (`arena_base + path_off + 4`) — the
+    /// path bytes already live in linear memory.
+    ///
+    ///   * `path_open(dirfd=3, dirflags=0, path_ptr, path_len, oflags=0,
+    ///                fs_rights_base=RIGHTS_FD_READ|FD_SEEK,
+    ///                fs_rights_inheriting=same, fdflags=0, *fd_out)` —
+    ///     the conventional first preopened dir is fd 3 (stdio 0/1/2).
+    ///   * a single iovec `{buf: i32, len: i32}` whose `buf` is the
+    ///     content record's **payload** (`record+4`) and `len` is the
+    ///     remaining scratch budget;
+    ///   * `fd_read(fd, *iovec, 1, *nread)`;
+    ///   * `fd_close(fd)`.
+    ///
+    /// ## iovec ↔ arena String-out reconciliation
+    ///
+    /// To stay bit-equal with the native arm's scratch-String-out
+    /// convention, the contents land in a fresh String record bump-
+    /// allocated in the **scratch region** (`scratch_base +
+    /// scratch_cursor`, 4-aligned) shaped `[len:u32][utf8]`. The iovec's
+    /// `buf` points at `record+4`, so `fd_read` writes the file bytes
+    /// straight into the record payload. Afterwards we store the host-
+    /// written `nread` into the record's `[len]` header and bump
+    /// `scratch_cursor` past `4 + nread`. Pushing the record's arena-
+    /// relative offset as a `String` operand makes the existing return-
+    /// store path (`emit_store_field_pointer_indirect`) copy it out
+    /// verbatim — exactly like the native helper's return value.
+    ///
+    /// The fd_out / iovec / nread WASI marshalling slots are entry-block
+    /// `alloca`s (linear-memory stack slots on wasm32); `ptrtoint` gives
+    /// the i32 linear-memory addresses the WASI ABI expects.
+    ///
+    /// On any non-zero errno (open / read failure, e.g. a sandbox-denied
+    /// path the preopened host refuses) the lowering records
+    /// `NativeTrap::CapabilityDenied` in `state.trap_code` and routes to
+    /// the trap epilogue — the same host-observable outcome the native
+    /// arms raise for an unreadable / escaping path.
     fn emit_read_file_wasi(&mut self) -> Result<(), LlvmError> {
-        Err(LlvmError::Codegen(
-            "Op::ReadFile (read_file) wasm32 lowering not yet implemented (P-fs Stage 1 ships \
-             tree-walk + cranelift + llvm-native; wasm fd-protocol marshalling is deferred — \
-             see crates/relon-codegen-llvm/src/codegen/wasi_cap.rs)"
-                .into(),
-        ))
+        use crate::state::{
+            ARENA_STATE_OFFSET_LEN, ARENA_STATE_OFFSET_SCRATCH_BASE,
+            ARENA_STATE_OFFSET_SCRATCH_CURSOR, ARENA_STATE_OFFSET_TRAP_CODE,
+        };
+
+        let i8_t = self.ctx.i8_type();
+        let i32_t = self.ctx.i32_type();
+        let i64_t = self.ctx.i64_type();
+        let ptr_t = self.ctx.ptr_type(AddressSpace::default());
+
+        let state_ptr = self.state_ptr.ok_or_else(|| {
+            LlvmError::Codegen(
+                "Op::ReadFile wasm32 requires the buffer-protocol entry (no state_ptr available)"
+                    .into(),
+            )
+        })?;
+        // arena_base_ptr is consumed indirectly through arena_addr_i32.
+        self.arena_base_ptr.ok_or_else(|| {
+            LlvmError::Codegen("Op::ReadFile wasm32 outside buffer-protocol entry shape".into())
+        })?;
+
+        // Pop the path String operand (an arena-relative i32 offset to a
+        // `[len:u32][utf8]` record).
+        let path_off = self.pop_int("ReadFile")?;
+
+        // path_len = *(arena_base + path_off); path payload at +4.
+        let path_len_ptr = self.arena_addr_i32(path_off)?;
+        let path_len = self
+            .builder
+            .build_load(i32_t, path_len_ptr, &self.next_name("rf_path_len"))
+            .map_err(|e| LlvmError::Codegen(format!("read_file path_len load: {e}")))?
+            .into_int_value();
+        let path_payload_off = self
+            .builder
+            .build_int_add(
+                path_off,
+                i32_t.const_int(4, false),
+                &self.next_name("rf_path_payload_off"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("read_file path payload off: {e}")))?;
+        let path_payload_ptr = self.arena_addr_i32(path_payload_off)?;
+
+        // Reserve the content String record at `scratch_base +
+        // scratch_cursor`, 4-aligned. The record header occupies 4 bytes;
+        // `fd_read` writes the file bytes into the payload at `record+4`.
+        let load_state_u32 = |this: &mut Self, off: u32, hint: &str| -> Result<_, LlvmError> {
+            let gep = unsafe {
+                this.builder
+                    .build_in_bounds_gep(
+                        i8_t,
+                        state_ptr,
+                        &[i32_t.const_int(u64::from(off), false)],
+                        &this.next_name(&format!("{hint}_gep")),
+                    )
+                    .map_err(|e| LlvmError::Codegen(format!("read_file {hint} gep: {e}")))?
+            };
+            let v = this
+                .builder
+                .build_load(i32_t, gep, &this.next_name(hint))
+                .map_err(|e| LlvmError::Codegen(format!("read_file {hint} load: {e}")))?
+                .into_int_value();
+            Ok((gep, v))
+        };
+        let (cursor_gep, scratch_cursor) =
+            load_state_u32(self, ARENA_STATE_OFFSET_SCRATCH_CURSOR, "rf_scratch_cursor")?;
+        let (_, scratch_base) =
+            load_state_u32(self, ARENA_STATE_OFFSET_SCRATCH_BASE, "rf_scratch_base")?;
+        let (_, arena_len) = load_state_u32(self, ARENA_STATE_OFFSET_LEN, "rf_arena_len")?;
+
+        // record_off = scratch_base + align_up(scratch_cursor, 4).
+        let aligned_cursor = self.align_up_const(scratch_cursor, 0, 4, "rf_cursor")?;
+        let record_off = self
+            .builder
+            .build_int_add(
+                scratch_base,
+                aligned_cursor,
+                &self.next_name("rf_record_off"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("read_file record off: {e}")))?;
+        let payload_off = self
+            .builder
+            .build_int_add(
+                record_off,
+                i32_t.const_int(4, false),
+                &self.next_name("rf_payload_off"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("read_file payload off: {e}")))?;
+        let payload_ptr = self.arena_addr_i32(payload_off)?;
+        // Absolute (linear-memory) i32 address of the payload for the
+        // iovec `buf` field.
+        let payload_addr_i32 = self
+            .builder
+            .build_ptr_to_int(payload_ptr, i32_t, &self.next_name("rf_payload_addr"))
+            .map_err(|e| LlvmError::Codegen(format!("read_file payload ptrtoint: {e}")))?;
+        // Read capacity = arena_len - payload_off (room left in the arena
+        // for the file bytes). `fd_read` will read at most this many.
+        let capacity = self
+            .builder
+            .build_int_sub(arena_len, payload_off, &self.next_name("rf_capacity"))
+            .map_err(|e| LlvmError::Codegen(format!("read_file capacity sub: {e}")))?;
+
+        // WASI marshalling scratch: fd_out (i32), iovec {buf,len} (8B),
+        // nread (i32). Entry-block allocas → linear-memory stack slots.
+        let fd_out_slot = self.alloc_entry(i32_t.into(), "rf_fd_out")?;
+        let iovec_slot = self.alloc_entry(i64_t.into(), "rf_iovec")?; // {i32 buf, i32 len}
+        let nread_slot = self.alloc_entry(i32_t.into(), "rf_nread")?;
+
+        // --- path_open(dirfd=3, 0, path_ptr, path_len, 0, rights,
+        //               rights, 0, *fd_out) -> errno ---
+        let path_open_ty = i32_t.fn_type(
+            &[
+                i32_t.into(), // dirfd
+                i32_t.into(), // dirflags
+                ptr_t.into(), // path_ptr
+                i32_t.into(), // path_len
+                i32_t.into(), // oflags
+                i64_t.into(), // fs_rights_base
+                i64_t.into(), // fs_rights_inheriting
+                i32_t.into(), // fdflags
+                ptr_t.into(), // fd_out
+            ],
+            false,
+        );
+        let path_open = self.declare_wasi_import("path_open", path_open_ty);
+        // RIGHTS_FD_READ (bit 1) | RIGHTS_FD_SEEK (bit 2): the strict host
+        // rejects unknown rights bits, so pass exactly what a read needs.
+        let rights = i64_t.const_int((1 << 1) | (1 << 2), false);
+        let open_errno = self
+            .builder
+            .build_call(
+                path_open,
+                &[
+                    i32_t.const_int(WASI_PREOPEN_DIRFD, false).into(),
+                    i32_t.const_zero().into(),
+                    path_payload_ptr.into(),
+                    path_len.into(),
+                    i32_t.const_zero().into(),
+                    rights.into(),
+                    rights.into(),
+                    i32_t.const_zero().into(),
+                    fd_out_slot.into(),
+                ],
+                &self.next_name("rf_open_errno"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("read_file path_open call: {e}")))?;
+        let open_errno = match open_errno.try_as_basic_value() {
+            inkwell::values::ValueKind::Basic(BasicValueEnum::IntValue(v)) => v,
+            other => {
+                return Err(LlvmError::Codegen(format!(
+                    "read_file path_open returned {other:?}, expected i32 errno"
+                )));
+            }
+        };
+        let open_failed = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                open_errno,
+                i32_t.const_zero(),
+                &self.next_name("rf_open_failed"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("read_file open cmp: {e}")))?;
+        let open_ok_bb = self.ctx.append_basic_block(self.func, "rf_open_ok");
+        let trap_bb = self.ctx.append_basic_block(self.func, "rf_wasm_trap");
+        let cont_bb = self.ctx.append_basic_block(self.func, "rf_wasm_cont");
+        self.builder
+            .build_conditional_branch(open_failed, trap_bb, open_ok_bb)
+            .map_err(|e| LlvmError::Codegen(format!("read_file open branch: {e}")))?;
+
+        // --- open_ok: build iovec, fd_read, fd_close ---
+        self.builder.position_at_end(open_ok_bb);
+        let fd = self
+            .builder
+            .build_load(i32_t, fd_out_slot, &self.next_name("rf_fd"))
+            .map_err(|e| LlvmError::Codegen(format!("read_file fd load: {e}")))?
+            .into_int_value();
+        // iovec.buf = payload_addr; iovec.len = capacity.
+        self.builder
+            .build_store(iovec_slot, payload_addr_i32)
+            .map_err(|e| LlvmError::Codegen(format!("read_file iovec buf store: {e}")))?;
+        let iovec_len_ptr = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    iovec_slot,
+                    &[i32_t.const_int(4, false)],
+                    &self.next_name("rf_iovec_len_gep"),
+                )
+                .map_err(|e| LlvmError::Codegen(format!("read_file iovec len gep: {e}")))?
+        };
+        self.builder
+            .build_store(iovec_len_ptr, capacity)
+            .map_err(|e| LlvmError::Codegen(format!("read_file iovec len store: {e}")))?;
+
+        let fd_read_ty = i32_t.fn_type(
+            &[i32_t.into(), ptr_t.into(), i32_t.into(), ptr_t.into()],
+            false,
+        );
+        let fd_read = self.declare_wasi_import("fd_read", fd_read_ty);
+        let read_errno = self
+            .builder
+            .build_call(
+                fd_read,
+                &[
+                    fd.into(),
+                    iovec_slot.into(),
+                    i32_t.const_int(1, false).into(),
+                    nread_slot.into(),
+                ],
+                &self.next_name("rf_read_errno"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("read_file fd_read call: {e}")))?;
+        let read_errno = match read_errno.try_as_basic_value() {
+            inkwell::values::ValueKind::Basic(BasicValueEnum::IntValue(v)) => v,
+            other => {
+                return Err(LlvmError::Codegen(format!(
+                    "read_file fd_read returned {other:?}, expected i32 errno"
+                )));
+            }
+        };
+        // Close regardless of read errno (best-effort).
+        let fd_close_ty = i32_t.fn_type(&[i32_t.into()], false);
+        let fd_close = self.declare_wasi_import("fd_close", fd_close_ty);
+        self.builder
+            .build_call(fd_close, &[fd.into()], &self.next_name("rf_close"))
+            .map_err(|e| LlvmError::Codegen(format!("read_file fd_close call: {e}")))?;
+        let read_failed = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                read_errno,
+                i32_t.const_zero(),
+                &self.next_name("rf_read_failed"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("read_file read cmp: {e}")))?;
+        let read_ok_bb = self.ctx.append_basic_block(self.func, "rf_read_ok");
+        self.builder
+            .build_conditional_branch(read_failed, trap_bb, read_ok_bb)
+            .map_err(|e| LlvmError::Codegen(format!("read_file read branch: {e}")))?;
+
+        // --- read_ok: stamp the record header + bump scratch_cursor ---
+        self.builder.position_at_end(read_ok_bb);
+        let nread = self
+            .builder
+            .build_load(i32_t, nread_slot, &self.next_name("rf_nread_val"))
+            .map_err(|e| LlvmError::Codegen(format!("read_file nread load: {e}")))?
+            .into_int_value();
+        // Write `nread` into the record's `[len]` header.
+        let record_hdr_ptr = self.arena_addr_i32(record_off)?;
+        self.builder
+            .build_store(record_hdr_ptr, nread)
+            .map_err(|e| LlvmError::Codegen(format!("read_file record len store: {e}")))?;
+        // scratch_cursor = (record_off - scratch_base) + 4 + nread.
+        let rec_rel = self
+            .builder
+            .build_int_sub(record_off, scratch_base, &self.next_name("rf_rec_rel"))
+            .map_err(|e| LlvmError::Codegen(format!("read_file rec rel: {e}")))?;
+        let four_plus = self
+            .builder
+            .build_int_add(
+                nread,
+                i32_t.const_int(4, false),
+                &self.next_name("rf_four_plus"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("read_file 4+nread: {e}")))?;
+        let new_cursor = self
+            .builder
+            .build_int_add(rec_rel, four_plus, &self.next_name("rf_new_cursor"))
+            .map_err(|e| LlvmError::Codegen(format!("read_file new cursor: {e}")))?;
+        self.builder
+            .build_store(cursor_gep, new_cursor)
+            .map_err(|e| LlvmError::Codegen(format!("read_file cursor store: {e}")))?;
+        self.builder
+            .build_unconditional_branch(cont_bb)
+            .map_err(|e| LlvmError::Codegen(format!("read_file ok branch: {e}")))?;
+
+        // --- trap: record CapabilityDenied + route to trap epilogue ---
+        self.builder.position_at_end(trap_bb);
+        let trap_gep = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    state_ptr,
+                    &[i32_t.const_int(u64::from(ARENA_STATE_OFFSET_TRAP_CODE), false)],
+                    &self.next_name("rf_wasm_trap_gep"),
+                )
+                .map_err(|e| LlvmError::Codegen(format!("read_file wasm trap gep: {e}")))?
+        };
+        self.builder
+            .build_store(
+                trap_gep,
+                i64_t.const_int(crate::state::NativeTrap::CapabilityDenied as u64, false),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("read_file wasm trap store: {e}")))?;
+        self.emit_trap_sentinel_return("ReadFile")?;
+
+        // --- cont: push the record offset as a String operand ---
+        self.builder.position_at_end(cont_bb);
+        self.push(record_off, IrType::String);
+        Ok(())
+    }
+
+    /// Allocate an entry-block slot of `ty` (a linear-memory stack slot
+    /// on wasm32) and return its pointer. Used for the WASI marshalling
+    /// scratch (fd_out / iovec / nread) the fd protocol writes through.
+    fn alloc_entry(
+        &mut self,
+        ty: inkwell::types::BasicTypeEnum<'ctx>,
+        hint: &str,
+    ) -> Result<PointerValue<'ctx>, LlvmError> {
+        let entry_bb = self
+            .func
+            .get_first_basic_block()
+            .ok_or_else(|| LlvmError::Codegen("wasi cap: function has no entry block".into()))?;
+        let cur = self.builder.get_insert_block();
+        if let Some(first) = entry_bb.get_first_instruction() {
+            self.builder.position_before(&first);
+        } else {
+            self.builder.position_at_end(entry_bb);
+        }
+        let slot = self
+            .builder
+            .build_alloca(ty, &self.next_name(hint))
+            .map_err(|e| LlvmError::Codegen(format!("wasi cap {hint} alloca: {e}")))?;
+        if let Some(bb) = cur {
+            self.builder.position_at_end(bb);
+        }
+        Ok(slot)
     }
 
     /// Native: declare the host `extern "C" fn() -> i64` helper symbol

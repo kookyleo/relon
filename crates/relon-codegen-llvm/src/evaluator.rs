@@ -2910,11 +2910,20 @@ fn create_object_target_machine(
             // controlled by the wasm runtime (wasmtime defaults). Reloc
             // is irrelevant for the wasm object model — `Static`/`Default`
             // both produce a relocatable `\0asm` object.
+            //
+            // `+bulk-memory`: lower `llvm.memcpy` / `llvm.memset` to the
+            // native `memory.copy` / `memory.fill` ops instead of a libc
+            // `env::memcpy` import. The pointer-indirect String / List
+            // return-store path (`emit_store_field_pointer_indirect`)
+            // emits a `memcpy`; without bulk-memory wasm-ld leaves an
+            // unresolved `env::memcpy` import that no standard WASI host
+            // satisfies. wasmtime enables bulk-memory by default, so the
+            // emitted module stays ecosystem-portable.
             let machine = t
                 .create_target_machine(
                     &triple,
                     /*cpu=*/ "",
-                    /*features=*/ "",
+                    /*features=*/ "+bulk-memory",
                     OptimizationLevel::Aggressive,
                     RelocMode::Static,
                     CodeModel::Default,

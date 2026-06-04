@@ -61,9 +61,10 @@ sandbox root** and refuses any path that escapes it (`../`, absolute paths,
 symlinks out of root → `CapabilityDenied`). The root is the native analogue of
 the directory a WASI host **preopens** for the wasm backend — relative paths
 resolve against the same root across every executor, so the result is
-byte-identical. (Stage 1 ships `read_file` on the tree-walk, cranelift-native
-and llvm-native backends; the wasm32 lowering to the preview1 fd protocol is
-staged behind it.)
+byte-identical. (`read_file` is byte-equal across all four backends — tree-walk,
+cranelift-native, llvm-native, and wasm32: the wasm arm lowers to the standard
+preview1 fd protocol — `path_open` / `fd_read` / `fd_close` against the
+preopened dir — so any off-the-shelf WASI host runs it.)
 
 They are built into the language (no `#import`), but the host must grant the
 matching capability bit — the **same gate** as host-registered native fns,
