@@ -24,16 +24,19 @@
 //!     buffer entry so the const-pool resolves)
 //!
 //! **Honest gaps not asserted as green** (recorded in the agent report,
-//! not faked): the W5/W7 production Dict sources with nested-Dict /
-//! `#internal`-recursive-closure fields. Both are rejected **before any
-//! backend codegen** by the shared `relon-ir` lowering layer
-//! (`AnonDictReturn(... unsupported value shape 'Dict')` for W5;
-//! `MakeClosure` with an empty closure_fn_table for W7) — the same
-//! verdict for native object-emit, wasm32, AND cranelift, so widening
-//! them is an IR-layer change shared with the cranelift backend, out of
-//! scope here. Also the `relon-wasm-bindings` browser/LSP surface (a
-//! wasm-bindgen tree-walk interpreter, an orthogonal mechanism the AOT
-//! object path does not and is not meant to replace).
+//! not faked): the W5 production Dict source with nested-Dict fields is
+//! rejected **before any backend codegen** by the shared `relon-ir`
+//! lowering layer (`AnonDictReturn(... unsupported value shape 'Dict')`)
+//! — the same verdict for native object-emit, wasm32, AND cranelift, so
+//! widening it is an IR-layer change shared with the cranelift backend,
+//! out of scope here. (The sibling W7 `#internal`-recursive-closure Dict
+//! now lowers four ways — see
+//! `w7_recursive_closure_dict_aligns_four_ways_via_wasmtime`; its old
+//! "rejected" verdict was a fast-path mis-route in
+//! `emit_object_for_target`, not an IR / cranelift gap.) Also the
+//! `relon-wasm-bindings` browser/LSP surface (a wasm-bindgen tree-walk
+//! interpreter, an orthogonal mechanism the AOT object path does not and
+//! is not meant to replace).
 //!
 //! **No fake green**: every assertion runs the value out of wasmtime and
 //! compares to the native oracle.
@@ -786,27 +789,96 @@ fn w4_filter_contains_aligns_native_via_wasmtime() {
 }
 
 /// W7 production Dict — `#internal fib: (k) => ... fib(...)` first-class
-/// recursive closure. Rejected by the emitter (`MakeClosure` with an
-/// empty closure_fn_table) for BOTH native object-emit and wasm32.
+/// **recursive** closure. The body lifts `fib` to an internal let-bound
+/// closure handle that captures itself (`fib(k-1) + fib(k-2)`) and the
+/// host-visible `result` field calls it. The IR lowering populates the
+/// module's `closure_table` with the single `fib` lambda; the object-emit
+/// path routes through `emit_module_funcs`, which declares every lambda
+/// up-front (forward reference for the self-call) and emits each lambda
+/// body — so the recursive closure lowers correctly for static wasm32
+/// emit and runs in wasmtime to the same value as the native LLVM, the
+/// cranelift JIT, and the tree-walk oracle (four-way bit-equal).
+///
+/// This was the P1-P3 honest-gap guard
+/// (`w7_recursive_closure_dict_is_unsupported_on_wasm32_emit`): the
+/// failure was a fast-path mis-route in `emit_object_for_target` — a
+/// closure module whose `#main(Int n) -> { result: Int }` schema matched
+/// the fast `(i64..) -> i64` envelope was emitted as a fast-only entry
+/// with an empty `closure_fn_table` (the fast-only branch never declares
+/// nor emits the lambda bodies). The fix forces the buffer entry whenever
+/// the module declares any lambda, mirroring how the in-process MCJIT
+/// path already emits the buffer module first. fib(13) = 233.
 #[test]
-fn w7_recursive_closure_dict_is_unsupported_on_wasm32_emit() {
+fn w7_recursive_closure_dict_aligns_four_ways_via_wasmtime() {
     let src = "#main(Int n) -> Dict\n{\n#internal\n\
                fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\nresult: fib(n)\n}";
-    let obj = std::env::temp_dir().join(format!("relon_parity_w7_{}.o", std::process::id()));
-    let r = LlvmAotEvaluator::emit_object_for_target(
+    let n = 13i64;
+    let want = 233i64; // fib(13)
+
+    // Tree-walk gold standard.
+    {
+        use relon_evaluator::{Context, Scope, TreeWalkEvaluator};
+        use std::sync::Arc;
+        let node = relon_parser::parse_document(src).expect("parse w7");
+        let analyzed = Arc::new(relon_analyzer::analyze(&node));
+        let mut ctx = Context::new()
+            .with_root(node)
+            .with_analyzed(Arc::clone(&analyzed));
+        TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        let walker = TreeWalkEvaluator::new(Arc::new(ctx));
+        let scope = Arc::new(Scope::default());
+        let out = walker
+            .run_main(&scope, HashMap::from([("n".to_string(), Value::Int(n))]))
+            .expect("tree-walk run_main");
+        assert_eq!(w7_result(&out), want, "tree-walk fib(13) != 233");
+    }
+
+    // Native LLVM oracle (in-process MCJIT).
+    let native = w7_result(&native_run(
         src,
-        "relon_parity_w7",
-        &obj,
-        &opts(),
-        WorldMode::OpenWorld,
-        None,
-        CodegenTarget::Wasm32,
-    );
-    let _ = std::fs::remove_file(&obj);
+        HashMap::from([("n".to_string(), Value::Int(n))]),
+    ));
+    assert_eq!(native, want, "native LLVM fib(13) != 233");
+
+    // Cranelift JIT.
+    {
+        use relon_codegen_cranelift::AotEvaluator;
+        let cl = AotEvaluator::from_source_with_options(src, &opts()).expect("cranelift compiles");
+        let out = cl
+            .run_main(HashMap::from([("n".to_string(), Value::Int(n))]))
+            .expect("cranelift run_main");
+        assert_eq!(w7_result(&out), want, "cranelift fib(13) != 233");
+    }
+
+    // wasm32 object-emit → wasm-ld → wasmtime.
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping w7 wasm leg");
+        return;
+    }
+    let (bytes, info) = build("w7", src);
     assert!(
-        r.is_err(),
-        "W7 recursive-closure Dict unexpectedly emitted on wasm32 — re-evaluate parity decision"
+        matches!(info.shape, relon_codegen_llvm::EmittedEntryShape::Buffer),
+        "w7 expected Buffer shape (closure module forced off the fast path), got {:?}",
+        info.shape
     );
+    let in_record = pack_single_int(&info, n);
+    let out = run_buffer(&bytes, "relon_parity_w7", &info, &in_record);
+    assert_eq!(
+        out.get("result"),
+        Some(&Decoded::Int(want)),
+        "w7 wasm recursive-closure fib(13) != native oracle"
+    );
+}
+
+/// Pull the `result` Int out of a tree-walk / cranelift / native Dict.
+fn w7_result(v: &Value) -> i64 {
+    match v {
+        Value::Dict(d) => match d.map.get("result") {
+            Some(Value::Int(n)) => *n,
+            other => panic!("w7 result not Int: {other:?}"),
+        },
+        other => panic!("w7 expected Dict, got {other:?}"),
+    }
 }
 
 /// W5-P4 — the full production w5 Dict now compiles end-to-end to wasm32

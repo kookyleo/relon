@@ -34,12 +34,14 @@
 //!   pointer harmlessly), pack the input record, call the entry, and
 //!   decode the output record. See `run_buffer_in_wasmtime`.
 //!
-//! Not reached (honest gaps): self-capturing recursive closures (cmp_lua
-//! W7) are rejected by the **native** `emit_object` fast-entry path
-//! itself (empty `closure_fn_table`), so they are out of scope for both
-//! native and wasm object-emit. Pointer-indirect **return** payloads
-//! (String / List return → tail-region records) and effectful host fns
-//! (→ WASI imports, P3 §2.2) are not exercised here.
+//! Self-capturing recursive closures (cmp_lua W7) now lower for both
+//! native and wasm object-emit: a closure module is forced onto the
+//! buffer entry (`emit_module_funcs` declares + emits every lambda body),
+//! and `aot_wasm_parity::w7_recursive_closure_dict_aligns_four_ways_via_wasmtime`
+//! runs it four ways (tree-walk / native LLVM / cranelift / wasm) to the
+//! same fib value. Pointer-indirect **return** payloads (String / List
+//! return → tail-region records) and effectful host fns (→ WASI imports,
+//! P3 §2.2) are not exercised here.
 
 use std::path::PathBuf;
 
@@ -103,14 +105,14 @@ const WORKLOADS: &[Workload] = &[
 ];
 
 // NOTE on recursion: the self-capturing closure / recursive `fib`
-// (cmp_lua W7) is NOT in the corpus because the **native**
-// `emit_object` fast-entry path itself rejects it — the fast emitter
-// passes an empty `closure_fn_table`, so `Op::MakeClosure` errors with
-// "fn_table_idx out of range" on BOTH native and wasm32. This is a
-// pre-existing native object-emit limitation (the closure tables are
-// only populated on the MCJIT `run_main` path), not a wasm-side gap.
-// Closures themselves are covered by `closure_w2_dot` / `closure_squares`
-// (anonymous `.map(...)` lambdas, which lower through the fast entry).
+// (cmp_lua W7) is exercised by its own four-way differential
+// (`aot_wasm_parity::w7_recursive_closure_dict_aligns_four_ways_via_wasmtime`)
+// rather than this fast-path corpus, because a closure module is forced
+// onto the **buffer** entry (the only static-emit path that declares +
+// emits the lambda bodies and the forward reference for the self-call).
+// Closures over the fast entry are covered by `closure_w2_dot` /
+// `closure_squares` (anonymous `.map(...)` lambdas, no module-level
+// closure_table).
 
 /// Native oracle: the scalar i64 the fast-path entry must produce.
 /// For the Dict-return W7 shape `run_main` yields a `Value::Dict`; we
