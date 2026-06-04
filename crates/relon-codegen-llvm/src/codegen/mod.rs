@@ -91,6 +91,31 @@ use mem::{AbsLoad, AbsStore};
 /// crates simultaneously.
 pub(crate) const ENTRY_SYMBOL: &str = "relon_llvm_entry";
 
+/// Tag a `load` instruction with `!invariant.load !{}` so LLVM treats
+/// every load from the address as returning the same value for the
+/// instruction's lifetime — letting GVN/LICM hoist it out of loops and
+/// collapse redundant reloads.
+///
+/// SOUND ONLY for genuinely call-invariant memory. The single caller is
+/// the per-entry / per-lambda `state.arena_base` word load
+/// (`ARENA_STATE_OFFSET_BASE`): the host fills the base pointer into the
+/// `ArenaState` struct *before* the entry runs and never mutates it for
+/// the call's duration (only the scratch / tail cursors at later offsets
+/// are written — see `state.rs`; no `build_store` ever targets offset 0).
+/// Without this tag LLVM reloads the base from the opaque state pointer on
+/// every arena access inside a loop (the W20 n-body inner loop showed a
+/// `mov (%state), %base` reload per pair access), because it cannot prove
+/// the intervening arena stores don't alias the state struct. The tag is
+/// metadata only — it changes no value, so every backend stays
+/// bit-identical.
+fn mark_invariant_load(ctx: &Context, loaded: BasicValueEnum<'_>) {
+    if let Some(inst) = loaded.as_instruction_value() {
+        let kind_id = ctx.get_kind_id("invariant.load");
+        let empty = ctx.metadata_node(&[]);
+        let _ = inst.set_metadata(empty, kind_id);
+    }
+}
+
 /// Phase D.1 dispatch-boundary fast path: a second exported entry
 /// emitted alongside the buffer-protocol entry whenever the source's
 /// `#main(Int...) -> Int` shape qualifies. Skips the HashMap pack +
@@ -1369,10 +1394,11 @@ fn emit_lambda_body<'ctx>(
     };
     // TODO(P3-wasm32): use DataLayout pointer width instead of i64
     // for the arena-base word load + inttoptr below.
-    let arena_base_int = builder
+    let arena_base_load = builder
         .build_load(i64_t, arena_base_gep, "lambda_arena_base")
-        .map_err(|e| LlvmError::Codegen(format!("lambda arena_base load: {e}")))?
-        .into_int_value();
+        .map_err(|e| LlvmError::Codegen(format!("lambda arena_base load: {e}")))?;
+    mark_invariant_load(ctx, arena_base_load);
+    let arena_base_int = arena_base_load.into_int_value();
     let arena_base_ptr = builder
         .build_int_to_ptr(arena_base_int, ptr_t, "lambda_arena_base_ptr")
         .map_err(|e| LlvmError::Codegen(format!("lambda arena_base inttoptr: {e}")))?;
@@ -1758,10 +1784,11 @@ fn emit_buffer_entry_impl<'ctx, 'cp>(
     // assumes the workspace's only target is 64-bit.
     // TODO(P3-wasm32): use DataLayout pointer width instead of i64
     // for the arena-base word load + inttoptr below.
-    let arena_base_int = builder
+    let arena_base_load = builder
         .build_load(i64_t, arena_base_gep, "arena_base")
-        .map_err(|e| LlvmError::Codegen(format!("arena_base load: {e}")))?
-        .into_int_value();
+        .map_err(|e| LlvmError::Codegen(format!("arena_base load: {e}")))?;
+    mark_invariant_load(ctx, arena_base_load);
+    let arena_base_int = arena_base_load.into_int_value();
     let arena_base_ptr = builder
         .build_int_to_ptr(arena_base_int, ptr_t, "arena_base_ptr")
         .map_err(|e| LlvmError::Codegen(format!("arena_base inttoptr: {e}")))?;
