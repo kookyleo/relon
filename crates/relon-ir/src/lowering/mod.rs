@@ -147,6 +147,21 @@ struct LowerCtx<'a> {
     /// The signature is the **user-visible** surface (no implicit
     /// captures_ptr) — same convention as `Op::CallClosure`.
     closure_let_signatures: HashMap<u32, (Vec<IrType>, IrType)>,
+    /// #359 (W20 container perf): per-let-idx compile-time scalar
+    /// constant value for where-bound scalar literals (`soft: 0.1`,
+    /// `dt: 0.01`, `m0: 1.0`, ...). Recorded by [`lower_where`] when a
+    /// binding's value is a bare `Expr::Int` / `Expr::Float` /
+    /// `Expr::Bool` literal. [`lower_variable`] folds a bare reference to
+    /// such a binding into the literal `Op::Const*`, and the
+    /// capture-resolution path ([`closure::lower_closure_as_value`])
+    /// inlines it into a closure body (e.g. `pair_force`) rather than
+    /// capturing it through the arena captures struct. Folding `soft` /
+    /// `dt` / the masses to compile-time constants lets LLVM `-O3` see
+    /// the real inner-loop arithmetic (`dx*dx + 0.1`) instead of an
+    /// opaque load, recovering the scalar half of the W20 gap
+    /// (2.14x -> ~1.69x on s90). The inlined constant is the exact source
+    /// literal, so every backend computes a bit-identical value.
+    const_let_values: HashMap<u32, ScalarConst>,
     /// Module-wide `#native` import accumulator. Shared across the
     /// entry body, schema-method bodies, and lambda bodies so a native
     /// call from any of them interns into one [`Module::imports`]
@@ -154,6 +169,20 @@ struct LowerCtx<'a> {
     /// host-fn-free source) means [`lower_fn_call`] never resolves a
     /// native call and the free-call path keeps its prior behaviour.
     native_imports: Rc<RefCell<NativeImportBuilder>>,
+}
+
+/// A where-bound scalar literal recorded for closure-capture inlining.
+/// See [`LowerCtx::const_let_values`]. The variants mirror the bare
+/// literal `Op::Const*` shapes; lowering re-emits the matching const op
+/// inside a closure body that references the binding.
+#[derive(Debug, Clone, Copy)]
+enum ScalarConst {
+    I64(i64),
+    /// Stored as the `f64` value; re-emitted via `OrderedFloat` exactly
+    /// as the original `Expr::Float` literal lowers, so the inlined
+    /// `Op::ConstF64` is bit-identical to the captured load.
+    F64(f64),
+    Bool(bool),
 }
 
 /// Information the lowering walker needs when handling `self`-prefixed
@@ -306,6 +335,7 @@ impl<'a> LowerCtx<'a> {
             method_params: Vec::new(),
             lambda_table: Rc::new(RefCell::new(Vec::new())),
             closure_let_signatures: HashMap::new(),
+            const_let_values: HashMap::new(),
             native_imports,
         }
     }
@@ -337,6 +367,7 @@ impl<'a> LowerCtx<'a> {
             method_params,
             lambda_table: Rc::new(RefCell::new(Vec::new())),
             closure_let_signatures: HashMap::new(),
+            const_let_values: HashMap::new(),
             native_imports,
         }
     }
@@ -4499,6 +4530,19 @@ fn lower_where(
                 continue;
             }
         }
+        // #359 (W20 div-trap unlock): record a where-bound *scalar
+        // literal* (`soft: 0.1`, `dt: 0.01`, `m0: 1.0`, ...) as a
+        // compile-time constant keyed by its let-idx, so a closure that
+        // captures it can inline the constant instead of loading it from
+        // the captures struct (see `LowerCtx::const_let_values`). Only
+        // bare `Int` / `Float` / `Bool` literals qualify — anything
+        // computed still flows through the normal capture path.
+        let scalar_const = match &*value.expr {
+            Expr::Int(i) => Some(ScalarConst::I64(*i)),
+            Expr::Float(f) => Some(ScalarConst::F64(f.into_inner())),
+            Expr::Bool(b) => Some(ScalarConst::Bool(*b)),
+            _ => None,
+        };
         lower_expr(&value.expr, value.range, ctx)?;
         let value_ty = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
             kind: "Where(binding-empty-stack)".to_string(),
@@ -4510,6 +4554,9 @@ fn lower_where(
             op: Op::LetSet { idx, ty: value_ty },
             range: value.range,
         });
+        if let Some(sc) = scalar_const {
+            ctx.const_let_values.insert(idx, sc);
+        }
         ctx.lets.push(LetBinding {
             name,
             idx,
@@ -5743,6 +5790,34 @@ fn lower_variable(
             });
         }
     };
+    // #359 (W20 container perf): a bare reference to a where-bound
+    // SCALAR CONSTANT let (`soft` / `dt` / a mass) lowers to the literal
+    // `Op::Const*` directly instead of a `LetGet` (an alloca load
+    // pre-mem2reg, or — when captured by a closure — an opaque load from
+    // the arena captures struct). Folding it to a compile-time constant
+    // lets LLVM's `-O3` value-range / arithmetic simplification see the
+    // real value (`dx*dx + 0.1`) instead of an opaque load, recovering
+    // the scalar half of the W20 inner-loop overhead (2.14x -> ~1.69x on
+    // s90). Restricted to single-segment paths (`path.len() == 1` — no
+    // field/index chaining) and to lets recorded in `const_let_values`;
+    // the inlined literal is the exact source value, so all backends
+    // compute a bit-identical result. Scalar-let shadowing is respected
+    // because `const_let_values` is keyed by the same let-idx the
+    // innermost binding resolves to.
+    if path.len() == 1 {
+        if let Some(b) = ctx.lets.iter().rev().find(|b| b.name == head) {
+            if let Some(sc) = ctx.const_let_values.get(&b.idx).copied() {
+                let (op, ty) = match sc {
+                    ScalarConst::I64(i) => (Op::ConstI64(i), IrType::I64),
+                    ScalarConst::F64(f) => (Op::ConstF64(OrderedFloat::from(f)), IrType::F64),
+                    ScalarConst::Bool(b) => (Op::ConstBool(b), IrType::Bool),
+                };
+                ctx.out.push(TaggedOp { op, range });
+                ctx.tstack.push(ty);
+                return Ok(());
+            }
+        }
+    }
     // The walker pushes a value onto the vstack representing the
     // root binding's IR type plus, for schema-typed roots, the
     // canonical schema shape and brand so chained field offsets can
