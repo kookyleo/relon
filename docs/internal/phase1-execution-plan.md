@@ -200,8 +200,10 @@ Stage 1 + Stage 2 全部 lane 已并入 main、`cargo build/test/clippy --worksp
 - **机制已证**:`tests/aot_wasm_std_wasi.rs` —— wasm 模块 import **标准 `(import "wasi_snapshot_preview1" "clock_time_get")`**(经 LLVM `wasm-import-module`/`wasm-import-name` 属性从默认 `env` 改到标准 WASI module),由**现成 `wasmtime-wasi` preview1 host**(`p1::add_to_linker_sync`,无 relon 自定义 func_wrap)满足,u64 时间戳经 linear memory 编组、值对齐 `SystemTime`。证了「codegen 能发标准 WASI import + 编组 + 标准 host 满足」。
 - **关键澄清(落法)**:relon effectful 现状 100% 用户 `#native`、无内建能力原语;**直接映 WASI ⇒ 必须引入「内建 WASI-backed 能力原语」**(compiler 把 clock/fs/random 降成固定 WASI ABI + 编组),用户任意 `#native` 仍走宿主 import。**不走「用户 fn 自动映 WASI」(设计不成立)。**
 - **分期(每个 = 1 IR op + native/wasm 双臂 codegen lowering + 复用现有 cap;native 降成 runtime 调 std,wasm 降成标准 WASI import)**:
-  1. **P-clock**(下一步,中等):源级/IR 内建 `clock` 原语,复用 `CapabilityBit::ReadsClock`;wasm→`clock_time_get`(spike 机制产品化),native→`SystemTime`。
-  2. **P-random**(小):`random_get(*buf,len)`,buffer-out 编组,`UsesRng`。
-  3. **P-fs**(大):`fd_*` + preopened dir,需 fd table / path-open。
-  4. **P-net**(大):`wasi:sockets`,preview1 支持弱,建议等 preview2。
+  1. **P-clock** ✅(c5ad3c07):内建 `clock()` 原语,复用 `CapabilityBit::ReadsClock`;wasm→标准 `clock_time_get`、native→cranelift `RelonClockWall`/`SystemTime` + llvm host extern。
+  2. **P-random** ✅(c5ad3c07):内建 `random()`,复用 `UsesRng`;wasm→标准 `random_get`、native→`/dev/urandom`(std-only 无新 dep)。
+  3. **P-fs**(大,待开):`fd_*` + preopened dir,需 fd table / path-open。
+  4. **P-net**(大,待开):`wasi:sockets`,preview1 支持弱,建议等 preview2。
+
+**P-clock/P-random 落地实证**:内建 `clock()`/`random()`(`()->Int`)CheckCap 门控;wasm import section 验证是 `wasi_snapshot_preview1`(非自定义 env)、现成 `wasmtime-wasi` p1 host 满足、跑出可信值;非确定性按可信性断言(clock ±5s 窗 / random 非常量),能力门未授权三档(tree-walk/cranelift/wasm)全拒;cranelift `GENERATOR_VERSION` 3→4 / `VtableSlot::COUNT` 5→7 无回归。**两个小原语已对位 WASI 标准落地**;P-fs/P-net 大设计待用户再开。
 - 工程注:wasm 对象用 `write_to_file`(非 `write_to_memory_buffer`,后者产 malformed uleb128,wasm-ld-17 拒)。
