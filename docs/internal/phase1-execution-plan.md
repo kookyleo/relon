@@ -203,7 +203,17 @@ Stage 1 + Stage 2 全部 lane 已并入 main、`cargo build/test/clippy --worksp
   1. **P-clock** ✅(c5ad3c07):内建 `clock()` 原语,复用 `CapabilityBit::ReadsClock`;wasm→标准 `clock_time_get`、native→cranelift `RelonClockWall`/`SystemTime` + llvm host extern。
   2. **P-random** ✅(c5ad3c07):内建 `random()`,复用 `UsesRng`;wasm→标准 `random_get`、native→`/dev/urandom`(std-only 无新 dep)。
   3. **P-fs**(大,待开):`fd_*` + preopened dir,需 fd table / path-open。
-  4. **P-net**(大,待开):`wasi:sockets`,preview1 支持弱,建议等 preview2。
+  4. **P-net**(**defer,待 preview2**):见下调研结论。
 
-**P-clock/P-random 落地实证**:内建 `clock()`/`random()`(`()->Int`)CheckCap 门控;wasm import section 验证是 `wasi_snapshot_preview1`(非自定义 env)、现成 `wasmtime-wasi` p1 host 满足、跑出可信值;非确定性按可信性断言(clock ±5s 窗 / random 非常量),能力门未授权三档(tree-walk/cranelift/wasm)全拒;cranelift `GENERATOR_VERSION` 3→4 / `VtableSlot::COUNT` 5→7 无回归。**两个小原语已对位 WASI 标准落地**;P-fs/P-net 大设计待用户再开。
+**P-clock/P-random 落地实证**:内建 `clock()`/`random()`(`()->Int`)CheckCap 门控;wasm import section 验证是 `wasi_snapshot_preview1`(非自定义 env)、现成 `wasmtime-wasi` p1 host 满足、跑出可信值;非确定性按可信性断言(clock ±5s 窗 / random 非常量),能力门未授权三档(tree-walk/cranelift/wasm)全拒;cranelift `GENERATOR_VERSION` 3→4 / `VtableSlot::COUNT` 5→7 无回归。**两个小原语已对位 WASI 标准落地**。
+
+### P-net 调研结论(2026-06-04):defer,必须等 preview2
+- **preview1 主动建连规范级不存在**:`wasi_snapshot_preview1.witx` 仅 4 个被动 `sock_{accept,recv,send,shutdown}`,**无 `sock_connect/open/bind/listen`、无 DNS**——socket fd 只能宿主预注入,guest 不能主动建连/监听。
+- **致命**:这 4 个被动 `sock_*` 在 relon 实际用的 **`wasmtime-wasi 45` p1 host 里全是未实现桩**(`p1.rs` 返回 `Errno::Notsock`)→ 连被动 fd 都跑不通,除非 fork host(违背「现成 WASI host」北极星)。
+- **net 必须 preview2 / component-model**:`wasi:sockets`(tcp/udp/ip-name-lookup)全是 component-model(WIT)接口,**无 module-based preview1 等价**。relon 当前是 module-based preview1 路径,上 preview2 = 三件大事:① **componentization emit 段**(`wasm_link.rs` 在 `wasm-ld` 后接 `wasm-tools component new` + preview1→p2 adapter)② **component runtime**(`wasmtime::component::{Component,Linker}` + `p2::add_to_linker` + `WasiCtx` 的 `socket_addr_check`/`inherit_network`,把 `requires network` 映到 p2 网络授权)③ **canonical-ABI glue**(socket `resource` own/drop、`result<_,error-code>`、`list<u8>` 编组,LLVM 不生成 → 手写或 wit-bindgen)。`wasmtime-wasi 45` host 侧已含完整 p2 sockets,缺口纯在 relon 的 emit pipeline + guest glue。
+- **native std::net 无碍**:`CapabilityBit::Network=2` **已预留**(无需新 cap);cranelift vtable slot / llvm host extern 助手模式现成,换成 `std::net` 即可。瓶颈 100% 在 wasm 侧 + net 的**非 nullary 形状**(带参 + 缓冲区编组,clock/random 的「零参单返」模板覆盖不到)。
+- **无值得做的 preview1 net 子集**:主动 connect 规范无;被动 fd host 未实现 + 形状畸形(不能选连谁)+ 投入≈P-fs 产出≈零。
+- **路线**:① **先 P-fs**(preview1 `path_open`/`fd_*` 标准齐全 + p1 host 真实现)—— 它同样需「非 nullary + iovec 缓冲区编组 + fd 句柄在 relon 值层表示」,在**低风险 preview1 地基**上把这套机制验清,P-net 直接复用;② P-fs + preview2 componentization 就绪后再开 P-net。
+
+**待开**:P-fs(进行中)· P-net(defer 至 preview2,前置见上)。
 - 工程注:wasm 对象用 `write_to_file`(非 `write_to_memory_buffer`,后者产 malformed uleb128,wasm-ld-17 拒)。
