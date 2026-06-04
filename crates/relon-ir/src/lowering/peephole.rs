@@ -8,7 +8,6 @@
 
 use super::*;
 
-
 /// review-improvement-160 bytecode M3 phase 2: recognise the
 /// `list.sum(range(...))` peephole at the receiver/method/inner-call
 /// level and emit an explicit `Op::Loop` accumulator.  Returns
@@ -1667,7 +1666,6 @@ pub(super) fn try_lower_list_sum_value(
     Ok(Some(()))
 }
 
-
 /// Match a bare `range(a, b)` / `range(b)` call, returning its arg
 /// slice. Unlike [`match_range_chain`] this rejects any trailing
 /// `.map(...)` / `.filter(...)` stages — the W18 slice materialises the
@@ -2119,7 +2117,10 @@ pub(super) fn list_has_computed_element(items: &[Node]) -> bool {
 /// counter) so the caller can re-lower from a clean state. Used to
 /// classify a computed list literal's element shape before committing
 /// to the matching materialiser.
-pub(super) fn probe_expr_ir_ty(node: &Node, ctx: &mut LowerCtx<'_>) -> Result<IrType, LoweringError> {
+pub(super) fn probe_expr_ir_ty(
+    node: &Node,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<IrType, LoweringError> {
     let out_len = ctx.out.len();
     let tstack_len = ctx.tstack.len();
     let lets_len = ctx.lets.len();

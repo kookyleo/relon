@@ -120,11 +120,11 @@ fn select_i32_discriminant_picks_arm() {
     // in the LLVM emitter against cranelift's `select`.
     //   cond = (x as-i32-const 1) == 1  -> always true here; pick a.
     let body = vec![
-        t(Op::LocalGet(0)),       // a
-        t(Op::LocalGet(1)),       // b
-        t(Op::ConstI32(1)),       // cond lhs
-        t(Op::ConstI32(1)),       // cond rhs
-        t(Op::Eq(IrType::I32)),   // cond: 1 == 1 -> true (i32 1)
+        t(Op::LocalGet(0)),     // a
+        t(Op::LocalGet(1)),     // b
+        t(Op::ConstI32(1)),     // cond lhs
+        t(Op::ConstI32(1)),     // cond rhs
+        t(Op::Eq(IrType::I32)), // cond: 1 == 1 -> true (i32 1)
         t(Op::Select { ty: IrType::I64 }),
         t(Op::Return),
     ];

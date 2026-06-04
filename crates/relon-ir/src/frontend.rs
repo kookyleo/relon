@@ -59,8 +59,7 @@ pub enum FrontendError {
 /// `standalone_capability_check`, no `strict_mode` relaxation); the
 /// caller owns that.
 pub fn compile(src: &str, options: &AnalyzeOptions) -> Result<LoweredEntry, FrontendError> {
-    let ast =
-        relon_parser::parse_document(src).map_err(|e| FrontendError::Parse(e.to_string()))?;
+    let ast = relon_parser::parse_document(src).map_err(|e| FrontendError::Parse(e.to_string()))?;
     let analyzed = relon_analyzer::analyze_with_options(&ast, options);
     if analyzed.has_errors() {
         let err_count = analyzed

@@ -495,9 +495,8 @@ impl OpVisitor for ConstPool {
         let header_off = u32::try_from(self.bytes.len()).map_err(|_| {
             CraneliftError::Codegen("ConstListString header offset exceeds u32".into())
         })?;
-        let len = u32::try_from(elements.len()).map_err(|_| {
-            CraneliftError::Codegen("ConstListString length exceeds u32".into())
-        })?;
+        let len = u32::try_from(elements.len())
+            .map_err(|_| CraneliftError::Codegen("ConstListString length exceeds u32".into()))?;
         self.bytes.extend_from_slice(&len.to_le_bytes());
         for off in &str_offsets {
             self.bytes.extend_from_slice(&off.to_le_bytes());
@@ -935,7 +934,8 @@ mod tests {
         // Each entry's key_off/key_len slices the right key bytes.
         for (i, (k, _)) in [("a", 10i64), ("b", 20), ("c", 30)].iter().enumerate() {
             let entry_base = 16 + i * 16;
-            let off = u32::from_le_bytes(b[entry_base..entry_base + 4].try_into().unwrap()) as usize;
+            let off =
+                u32::from_le_bytes(b[entry_base..entry_base + 4].try_into().unwrap()) as usize;
             let len =
                 u32::from_le_bytes(b[entry_base + 4..entry_base + 8].try_into().unwrap()) as usize;
             assert_eq!(&b[off..off + len], k.as_bytes(), "key {i} payload slice");

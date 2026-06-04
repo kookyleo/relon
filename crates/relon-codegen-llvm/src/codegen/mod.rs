@@ -56,18 +56,13 @@ use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::{Linkage, Module as LlvmModule};
 use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum};
-use inkwell::values::{
-    BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue,
-};
+use inkwell::values::{BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue};
 use inkwell::{AddressSpace, IntPredicate};
 
 use relon_ir::ir::{Func, IrType, Module as IrModule, Op, TaggedOp};
 
 use crate::error::LlvmError;
-use crate::state::{
-    ARENA_STATE_OFFSET_BASE,
-    ARENA_STATE_OFFSET_TAIL_CURSOR,
-};
+use crate::state::{ARENA_STATE_OFFSET_BASE, ARENA_STATE_OFFSET_TAIL_CURSOR};
 
 // Per-`Op`-family lowering modules. Each holds an
 // `impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp>` block with the `emit_*`
@@ -1133,10 +1128,7 @@ fn declare_llvm_trap<'ctx>(ctx: &'ctx Context, module: &LlvmModule<'ctx>) -> Fun
 /// can't see the static from inside the host dylib's section layout —
 /// same constraint as the `str.contains` shim). Idempotent so repeated
 /// emit passes don't duplicate the declaration.
-fn declare_call_native<'ctx>(
-    ctx: &'ctx Context,
-    module: &LlvmModule<'ctx>,
-) -> FunctionValue<'ctx> {
+fn declare_call_native<'ctx>(ctx: &'ctx Context, module: &LlvmModule<'ctx>) -> FunctionValue<'ctx> {
     if let Some(f) = module.get_function(crate::state::RELON_LLVM_CALL_NATIVE_SYMBOL) {
         return f;
     }
@@ -2352,7 +2344,11 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         }
     }
 
-    pub(crate) fn ensure_let_slot(&mut self, idx: u32, ty: IrType) -> Result<PointerValue<'ctx>, LlvmError> {
+    pub(crate) fn ensure_let_slot(
+        &mut self,
+        idx: u32,
+        ty: IrType,
+    ) -> Result<PointerValue<'ctx>, LlvmError> {
         if let Some((ptr, existing_ty)) = self.let_slots.get(&idx) {
             if *existing_ty != ty {
                 return Err(LlvmError::Codegen(format!(
@@ -3008,9 +3004,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             }
 
             // mem.rs — absolute-addressed field load
-            Op::LoadFieldAtAbsolute { .. } => {
-                self.lower_mem_rest(ip, &ip_hint, &tagged.op)?
-            }
+            Op::LoadFieldAtAbsolute { .. } => self.lower_mem_rest(ip, &ip_hint, &tagged.op)?,
 
             // call.rs — native dispatch + capability gate + trap
             Op::CallNative { .. } | Op::CheckCap { .. } | Op::Trap { .. } => {
@@ -3047,8 +3041,6 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             None => idx,
         }
     }
-
-
 
     // -- helpers --------------------------------------------------------
 
@@ -3097,58 +3089,26 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         }
     }
 
-
-
-
-
-
-
-
-
     // -- control flow ---------------------------------------------------
-
-
-
-
-
-
 }
-
-
 
 /// Inline lookup table used by `emit_load_field`. Picks the LLVM
 /// integer type + the IR tag we push back onto the operand stack
 /// for a Phase-B-supported scalar field type.
-impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
-
-
-}
+impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {}
 
 // ---------------------------------------------------------------------------
 // Phase E.1: raw-memory primitives, scratch allocator, StrConcatN.
 // ---------------------------------------------------------------------------
 
-
-
 impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     /// Map an `IrType` to the LLVM int type used for the operand stack
     /// representation. Used by `Op::MakeClosure` capture reads and
     /// `Op::CallClosure` return loads.
-    pub(crate) fn ir_ty_to_llvm_int(&self, ty: IrType) -> Result<inkwell::types::IntType<'ctx>, LlvmError> {
+    pub(crate) fn ir_ty_to_llvm_int(
+        &self,
+        ty: IrType,
+    ) -> Result<inkwell::types::IntType<'ctx>, LlvmError> {
         match ty {
             IrType::I64 | IrType::F64 => Ok(self.ctx.i64_type()),
             IrType::I32
@@ -3164,16 +3124,6 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             | IrType::Dict => Ok(self.ctx.i32_type()),
         }
     }
-
-
-
-
-
-
-
-
-
-
 }
 
 #[cfg(test)]

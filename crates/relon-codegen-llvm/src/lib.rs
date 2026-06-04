@@ -76,8 +76,8 @@
 //!   piping also forces stringly-typed IR generation that's awkward
 //!   to debug.
 
-mod codegen;
 pub mod cocompile;
+mod codegen;
 mod error;
 mod evaluator;
 mod mcjit_mm;

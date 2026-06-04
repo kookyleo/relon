@@ -29,9 +29,7 @@
 //! precise `Codegen` error (the legacy raw-`HostFnPtr` path is not
 //! wired on this backend yet).
 
-use inkwell::values::{
-    BasicMetadataValueEnum, BasicValueEnum,
-};
+use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum};
 use inkwell::{AddressSpace, IntPredicate};
 
 use relon_ir::ir::{IrType, Op, TrapKind, NO_CAPABILITY_BIT};
@@ -122,7 +120,12 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         let zero = i64_t.const_zero();
         let denied = self
             .builder
-            .build_int_compare(IntPredicate::EQ, masked, zero, &self.next_name("cap_denied"))
+            .build_int_compare(
+                IntPredicate::EQ,
+                masked,
+                zero,
+                &self.next_name("cap_denied"),
+            )
             .map_err(|e| LlvmError::Codegen(format!("CheckCap cmp: {e}")))?;
 
         let trap_bb = self.ctx.append_basic_block(self.func, "cap_denied_trap");

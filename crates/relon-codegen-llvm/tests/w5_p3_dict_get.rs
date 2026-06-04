@@ -147,7 +147,8 @@ fn dict_get_lowers_to_probe_not_dict_get_op() {
     // Static codegen must NOT emit Op::DictGetByStringKey (it stays
     // trace-recorder-only; the cranelift / llvm catch-alls reject it).
     assert!(
-        !ops.iter().any(|o| matches!(o, Op::DictGetByStringKey { .. })),
+        !ops.iter()
+            .any(|o| matches!(o, Op::DictGetByStringKey { .. })),
         "static codegen must NOT emit Op::DictGetByStringKey; ops:\n{ops:#?}"
     );
 }

@@ -243,10 +243,7 @@ fn compile_host_shim_to_textual_ir(host_shim_src: &str) -> Result<std::path::Pat
     // a JIT + object emit in one build), racing on `host_shim.ll`.
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "relon_cocompile_{}_{seq}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("relon_cocompile_{}_{seq}", std::process::id()));
     std::fs::create_dir_all(&dir)
         .map_err(|e| LlvmError::Codegen(format!("cocompile: mkdir tmp: {e}")))?;
     let rs_path = dir.join("host_shim.rs");

@@ -22,8 +22,8 @@
 use std::collections::BTreeMap;
 
 use relon_test_harness::corpus::{all_cases, CorpusCase, Tier};
-use relon_test_harness::three_way::{diff_test_3way, ThreeWayResult};
 use relon_test_harness::ratchet;
+use relon_test_harness::three_way::{diff_test_3way, ThreeWayResult};
 
 #[derive(Debug, Default)]
 struct TierCounts {

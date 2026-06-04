@@ -505,7 +505,11 @@ fn pack_null(builder: &mut BufferBuilder<'_>, name: &str) -> Result<(), BufferEn
         .map_err(|e| BufferEntryError::Buffer(format!("{e}")))
 }
 
-fn pack_string(builder: &mut BufferBuilder<'_>, name: &str, v: &str) -> Result<(), BufferEntryError> {
+fn pack_string(
+    builder: &mut BufferBuilder<'_>,
+    name: &str,
+    v: &str,
+) -> Result<(), BufferEntryError> {
     builder
         .write_string(name, v)
         .map_err(|e| BufferEntryError::Buffer(format!("{e}")))

@@ -3,9 +3,7 @@
 //! Block/Loop/Br/BrIf/If and Return. `Select` / `BrTable` are still in
 //! the `unsupported` set in `super::lower_op` (Phase 0b fills them here).
 
-use inkwell::values::{
-    BasicValueEnum, IntValue,
-};
+use inkwell::values::{BasicValueEnum, IntValue};
 use inkwell::IntPredicate;
 
 use relon_ir::ir::{IrType, Op, TaggedOp};
@@ -396,7 +394,11 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         Ok(())
     }
 
-    pub(crate) fn emit_loop(&mut self, result_ty: Option<IrType>, body: &[TaggedOp]) -> Result<(), LlvmError> {
+    pub(crate) fn emit_loop(
+        &mut self,
+        result_ty: Option<IrType>,
+        body: &[TaggedOp],
+    ) -> Result<(), LlvmError> {
         if result_ty.is_some() {
             return Err(LlvmError::Codegen(
                 "Loop with result_ty: Phase B envelope does not carry loop-result phis".into(),

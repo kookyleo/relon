@@ -33,7 +33,9 @@
 //! the carrier differs (symbol name vs data-section offset).
 
 use crate::state::{relon_llvm_call_native_addr, RELON_LLVM_CALL_NATIVE_SYMBOL};
-use crate::str_helpers::{relon_llvm_str_contains_arena_addr, RELON_LLVM_STR_CONTAINS_ARENA_SYMBOL};
+use crate::str_helpers::{
+    relon_llvm_str_contains_arena_addr, RELON_LLVM_STR_CONTAINS_ARENA_SYMBOL,
+};
 
 /// One slot per host helper the LLVM codegen indirects through, in the
 /// same order cranelift pins them in its data-vtable. Adding a new

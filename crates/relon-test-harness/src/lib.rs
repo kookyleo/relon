@@ -226,7 +226,6 @@ pub mod ratchet {
             }
         }
     }
-
 }
 
 /// Outcome of one differential test run.

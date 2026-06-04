@@ -420,7 +420,10 @@ fn float_buffer_path_aligns_native_via_wasmtime() {
     use relon_eval_api::{Evaluator, Value};
     let ev = LlvmAotEvaluator::from_source(src).expect("native from_source");
     let mut args = std::collections::HashMap::new();
-    args.insert("x".to_string(), Value::Float(ordered_float::OrderedFloat(x)));
+    args.insert(
+        "x".to_string(),
+        Value::Float(ordered_float::OrderedFloat(x)),
+    );
     let want = match ev.run_main(args).expect("native run_main") {
         Value::Float(f) => f.into_inner(),
         other => panic!("expected Float, got {other:?}"),
@@ -463,7 +466,10 @@ fn float_buffer_path_aligns_native_via_wasmtime() {
     let ret_off = info.return_fields[0].offset as usize;
     let got = f64::from_le_bytes(out[ret_off..ret_off + 8].try_into().unwrap());
 
-    assert_eq!(got, want, "wasm32 Float buffer result {got} != native {want}");
+    assert_eq!(
+        got, want,
+        "wasm32 Float buffer result {got} != native {want}"
+    );
     let _ = std::fs::remove_file(&obj);
     let _ = std::fs::remove_file(&wasm);
 }
