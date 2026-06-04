@@ -640,6 +640,222 @@ pub fn relon_llvm_read_file_addr() -> usize {
     relon_llvm_read_file as *const () as usize
 }
 
+/// Symbol the LLVM module declares the native `read_dir()` helper under
+/// (P-fs Stage 2).
+pub const RELON_LLVM_READ_DIR_SYMBOL: &str = "relon_llvm_read_dir";
+
+/// Host helper backing the built-in `read_dir(path)` primitive on the
+/// native target (`Op::ReadDir`). Mirrors the cranelift
+/// `relon_read_dir_helper`: reads the path's wasm-style String record
+/// out of the arena, resolves it against the shared filesystem sandbox
+/// root (`relon_util`), lists the directory's entry names, SORTS them
+/// (byte-lexicographic, for cross-backend determinism), bump-allocates a
+/// `List<String>` pointer-array record (the `Op::ConstListString`
+/// layout) in the scratch region, advances the cursor, and returns the
+/// header record's arena-relative offset. On failure it records a
+/// [`NativeTrap`] in `state.trap_code` and returns `-1`.
+///
+/// ABI: `extern "C" fn(state: *const ArenaState, path_off: i32) -> i32`.
+///
+/// # Safety
+///
+/// `state` must point at a live, properly aligned [`ArenaState`] for the
+/// duration of the call.
+pub unsafe extern "C" fn relon_llvm_read_dir(state: *const ArenaState, path_off: i32) -> i32 {
+    if state.is_null() {
+        return -1;
+    }
+    // SAFETY: caller upholds the ArenaState invariants.
+    let state = unsafe { &*state };
+    let arena_base = unsafe { *state.arena_base.get() };
+    let arena_len = unsafe { *state.arena_len.get() };
+    if arena_base == 0 {
+        unsafe { *state.trap_code.get() = NativeTrap::HostFnMissing as u64 };
+        return -1;
+    }
+
+    // 1. Read the path bytes out of the arena (`[len: u32 LE][bytes]`).
+    let read_record = |off: i32| -> Option<(u32, *const u8)> {
+        if off < 0 {
+            return None;
+        }
+        let off_u = off as u32;
+        let header_end = off_u.checked_add(4)?;
+        if header_end > arena_len {
+            return None;
+        }
+        // SAFETY: bounds checked against arena_len.
+        let len = unsafe { std::ptr::read_unaligned((arena_base + off_u as usize) as *const u32) };
+        let payload_end = header_end.checked_add(len)?;
+        if payload_end > arena_len {
+            return None;
+        }
+        Some((len, (arena_base + header_end as usize) as *const u8))
+    };
+    let (path_len, path_ptr) = match read_record(path_off) {
+        Some(v) => v,
+        None => {
+            unsafe { *state.trap_code.get() = NativeTrap::HostFnMissing as u64 };
+            return -1;
+        }
+    };
+    // SAFETY: read_record validated the payload range.
+    let path_bytes = unsafe { std::slice::from_raw_parts(path_ptr, path_len as usize) };
+    let path = match std::str::from_utf8(path_bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            unsafe { *state.trap_code.get() = NativeTrap::HostFnMissing as u64 };
+            return -1;
+        }
+    };
+
+    // 2. Resolve against the sandbox root (refuses escapes), 3. list.
+    let resolved = match relon_util::resolve_fs_sandbox_path(path) {
+        Ok(p) => p,
+        Err(_) => {
+            unsafe { *state.trap_code.get() = NativeTrap::CapabilityDenied as u64 };
+            return -1;
+        }
+    };
+    let mut names: Vec<String> = Vec::new();
+    let dir_iter = match std::fs::read_dir(&resolved) {
+        Ok(it) => it,
+        Err(_) => {
+            unsafe { *state.trap_code.get() = NativeTrap::CapabilityDenied as u64 };
+            return -1;
+        }
+    };
+    for entry in dir_iter {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => {
+                unsafe { *state.trap_code.get() = NativeTrap::CapabilityDenied as u64 };
+                return -1;
+            }
+        };
+        // Bare file name; skip non-UTF-8 (arena String layout is UTF-8).
+        if let Some(name) = entry.file_name().to_str() {
+            names.push(name.to_string());
+        }
+    }
+    // 4. Sort for cross-backend determinism.
+    names.sort_unstable();
+
+    // 5. Bump-allocate the List<String> record into the scratch region.
+    let scratch_base = unsafe { *state.scratch_base.get() };
+    let pre = unsafe { *state.scratch_cursor.get() };
+
+    let write_u32 = |off: u32, val: u32| {
+        // SAFETY: callers bounds-check `off` against arena_len first.
+        unsafe { std::ptr::write_unaligned((arena_base + off as usize) as *mut u32, val) };
+    };
+
+    // Element String records first, each 4-aligned, capturing offsets.
+    let mut cursor = relon_util::align_up(
+        match scratch_base.checked_add(pre) {
+            Some(v) => v,
+            None => {
+                unsafe { *state.trap_code.get() = NativeTrap::HostFnError as u64 };
+                return -1;
+            }
+        },
+        4,
+    );
+    let mut str_offsets: Vec<u32> = Vec::with_capacity(names.len());
+    for name in &names {
+        cursor = relon_util::align_up(cursor, 4);
+        let slen = match u32::try_from(name.len()) {
+            Ok(n) => n,
+            Err(_) => {
+                unsafe { *state.trap_code.get() = NativeTrap::HostFnError as u64 };
+                return -1;
+            }
+        };
+        let header_end = match cursor.checked_add(4) {
+            Some(v) => v,
+            None => {
+                unsafe { *state.trap_code.get() = NativeTrap::HostFnError as u64 };
+                return -1;
+            }
+        };
+        let record_end = match header_end.checked_add(slen) {
+            Some(v) => v,
+            None => {
+                unsafe { *state.trap_code.get() = NativeTrap::HostFnError as u64 };
+                return -1;
+            }
+        };
+        if record_end > arena_len {
+            unsafe { *state.trap_code.get() = NativeTrap::HostFnError as u64 };
+            return -1;
+        }
+        write_u32(cursor, slen);
+        // SAFETY: payload range `[header_end, record_end)` is in-arena.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                (arena_base + header_end as usize) as *mut u8,
+                name.len(),
+            );
+        }
+        str_offsets.push(cursor);
+        cursor = record_end;
+    }
+
+    // Header `[len][off_0]...[off_{N-1}]`, 4-aligned.
+    cursor = relon_util::align_up(cursor, 4);
+    let header_off = cursor;
+    let len = match u32::try_from(names.len()) {
+        Ok(n) => n,
+        Err(_) => {
+            unsafe { *state.trap_code.get() = NativeTrap::HostFnError as u64 };
+            return -1;
+        }
+    };
+    let header_end = match cursor.checked_add(4) {
+        Some(v) => v,
+        None => {
+            unsafe { *state.trap_code.get() = NativeTrap::HostFnError as u64 };
+            return -1;
+        }
+    };
+    let offsets_end = match len.checked_mul(4).and_then(|n| header_end.checked_add(n)) {
+        Some(v) => v,
+        None => {
+            unsafe { *state.trap_code.get() = NativeTrap::HostFnError as u64 };
+            return -1;
+        }
+    };
+    if offsets_end > arena_len {
+        unsafe { *state.trap_code.get() = NativeTrap::HostFnError as u64 };
+        return -1;
+    }
+    write_u32(header_off, len);
+    let mut w = header_end;
+    for off in &str_offsets {
+        write_u32(w, *off);
+        w += 4;
+    }
+
+    // SAFETY: publish the post-bump scratch cursor (scratch-relative).
+    unsafe {
+        *state.scratch_cursor.get() = match offsets_end.checked_sub(scratch_base) {
+            Some(v) => v,
+            None => {
+                *state.trap_code.get() = NativeTrap::HostFnError as u64;
+                return -1;
+            }
+        };
+    }
+    i32::try_from(header_off).unwrap_or(-1)
+}
+
+/// Address of [`relon_llvm_read_dir`] for `add_global_mapping`.
+#[inline]
+pub fn relon_llvm_read_dir_addr() -> usize {
+    relon_llvm_read_dir as *const () as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

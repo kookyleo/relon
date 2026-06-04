@@ -127,6 +127,14 @@ pub fn register_to(ctx: &mut Context) {
     let mut read_file_gate = NativeFnGate::default();
     read_file_gate.reads_fs = true;
     ctx.register_fn("read_file", read_file_gate, Arc::new(ReadFileFn));
+    // P-fs Stage 2: `read_dir(path) -> List<String>`, gated by
+    // `reads_fs`. Gold-standard oracle: lists the directory's entry
+    // names, sandboxed to the shared root, then SORTS them — OS
+    // directory order is unspecified, so the sort is what makes all
+    // backends return a byte-identical list.
+    let mut read_dir_gate = NativeFnGate::default();
+    read_dir_gate.reads_fs = true;
+    ctx.register_fn("read_dir", read_dir_gate, Arc::new(ReadDirFn));
 
     // Schema-machinery validators. Spec §6.3 mandates these exist with
     // the documented semantics; they're consumed by the `#schema`
@@ -514,6 +522,59 @@ impl RelonFunction for ReadFileFn {
         let contents =
             std::fs::read_to_string(&resolved).map_err(|e| RuntimeError::IoError(e.to_string()))?;
         Ok(Value::String(contents.into()))
+    }
+}
+
+/// Built-in `read_dir(path: String) -> List<String>` primitive (P-fs
+/// Stage 2). Lists the directory's entry file names (bare names, no
+/// path prefix), sandboxed to the shared filesystem root
+/// (`relon_util::resolve_fs_sandbox_path`) — the same root the native
+/// codegen helpers resolve. The capability gate (`reads_fs`) is
+/// enforced by the evaluator before dispatch. Path escapes are refused
+/// with `CapabilityDenied`. The names are SORTED (byte-lexicographic)
+/// so all four executors return a byte-identical list despite the
+/// OS-unspecified directory iteration order.
+struct ReadDirFn;
+impl RelonFunction for ReadDirFn {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let path = match &args[0] {
+            Value::String(s) => s.to_string(),
+            other => {
+                return Err(RuntimeError::TypeMismatch {
+                    expected: "String".to_string(),
+                    found: other.type_name().to_string(),
+                    range,
+                })
+            }
+        };
+        let resolved = relon_util::resolve_fs_sandbox_path(&path).map_err(|reason| {
+            RuntimeError::CapabilityDenied {
+                cap_bit: None,
+                reason,
+                range,
+            }
+        })?;
+        let mut names: Vec<String> = Vec::new();
+        for entry in
+            std::fs::read_dir(&resolved).map_err(|e| RuntimeError::IoError(e.to_string()))?
+        {
+            let entry = entry.map_err(|e| RuntimeError::IoError(e.to_string()))?;
+            // Bare file name; non-UTF-8 names are skipped (the arena
+            // String layout is UTF-8 only, mirroring `read_file`).
+            if let Some(name) = entry.file_name().to_str() {
+                names.push(name.to_string());
+            }
+        }
+        names.sort_unstable();
+        Ok(Value::list(
+            names.into_iter().map(|s| Value::String(s.into())).collect(),
+        ))
     }
 }
 // GATED-CAPABILITY-PRIMITIVES-END

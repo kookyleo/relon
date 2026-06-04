@@ -197,6 +197,21 @@ fn build() -> HashMap<String, FnSignature> {
     );
     m.insert(k, v);
 
+    // P-fs Stage 2: `read_dir(path: String) -> List<String>` — list a
+    // directory's entry file names. Always in scope, no `#import`
+    // required. Gated by `reads_fs` (implicit gate injected in
+    // `capability_check`). The lowering recognises it as `Op::ReadDir`;
+    // native lowers to a host runtime helper (sandboxed to the
+    // configured root) that sorts the names for cross-backend
+    // determinism. Wasm32 is not yet implemented (native-only stage).
+    let (k, v) = sig(
+        "read_dir",
+        vec![param("path", tn!(String))],
+        type_node_generic("List", vec![tn!(String)]),
+        None,
+    );
+    m.insert(k, v);
+
     // -- list intrinsics (polymorphic; v1.1 generics) -----------------
     // `_list_map<T, U>(List<T>, Closure<(T) -> U>) -> List<U>`.
     //

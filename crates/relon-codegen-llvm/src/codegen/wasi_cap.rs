@@ -92,6 +92,115 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         }
     }
 
+    /// Lower `Op::ReadDir`: built-in `read_dir(path) -> List<String>`
+    /// primitive (P-fs Stage 2). Pops the path String (an arena-relative
+    /// i32 offset) and pushes the List<String> of sorted entry names
+    /// (also an arena-relative i32 offset, pointing at the header record).
+    ///
+    /// Native-only: wasm32 (`fd_readdir` dirent-stream protocol) is NOT
+    /// yet implemented and raises a loud codegen error rather than emit a
+    /// silent / incorrect listing.
+    pub(crate) fn emit_read_dir(&mut self) -> Result<(), LlvmError> {
+        match self.target {
+            crate::CodegenTarget::Wasm32 => Err(LlvmError::Codegen(
+                "Op::ReadDir (read_dir) is not yet implemented on wasm32: the WASI preview1 \
+                 `fd_readdir` dirent-stream protocol (paged cookie loop + in-linear-memory \
+                 sort of variable-length names) is deferred to a later P-fs stage. \
+                 read_dir is supported on the native backends (tree-walk / cranelift / \
+                 llvm-native) only."
+                    .into(),
+            )),
+            crate::CodegenTarget::Native => self.emit_read_dir_native(),
+        }
+    }
+
+    /// Native: `call @relon_llvm_read_dir(state, path_off) -> i32`. The
+    /// helper reads the path, lists + sorts the entries, materializes a
+    /// List<String> record at the scratch cursor, and returns its offset
+    /// (or a negative sentinel + `state.trap_code` on failure). Identical
+    /// trap-on-trap_code shape to `emit_read_file_native`, only the
+    /// pushed value type differs (`ListString`).
+    fn emit_read_dir_native(&mut self) -> Result<(), LlvmError> {
+        let i8_t = self.ctx.i8_type();
+        let i32_t = self.ctx.i32_type();
+        let i64_t = self.ctx.i64_type();
+        let ptr_t = self.ctx.ptr_type(AddressSpace::default());
+
+        let state_ptr = self.state_ptr.ok_or_else(|| {
+            LlvmError::Codegen(
+                "Op::ReadDir requires the buffer-protocol entry (no state_ptr available)".into(),
+            )
+        })?;
+
+        let path_off = self.pop("ReadDir")?.val;
+
+        let symbol = crate::state::RELON_LLVM_READ_DIR_SYMBOL;
+        let helper = match self.module.get_function(symbol) {
+            Some(f) => f,
+            None => {
+                let fn_ty = i32_t.fn_type(&[ptr_t.into(), i32_t.into()], false);
+                self.module
+                    .add_function(symbol, fn_ty, Some(inkwell::module::Linkage::External))
+            }
+        };
+        let call_site = self
+            .builder
+            .build_call(
+                helper,
+                &[state_ptr.into(), path_off.into()],
+                &self.next_name("read_dir"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("read_dir build_call: {e}")))?;
+        let result_off = match call_site.try_as_basic_value() {
+            inkwell::values::ValueKind::Basic(BasicValueEnum::IntValue(v)) => v,
+            other => {
+                return Err(LlvmError::Codegen(format!(
+                    "read_dir helper returned {other:?}, expected i32"
+                )));
+            }
+        };
+
+        // Load `state.trap_code`; non-zero means the listing failed.
+        let trap_gep = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    state_ptr,
+                    &[i32_t
+                        .const_int(u64::from(crate::state::ARENA_STATE_OFFSET_TRAP_CODE), false)],
+                    &self.next_name("rd_trap_gep"),
+                )
+                .map_err(|e| LlvmError::Codegen(format!("read_dir trap_code gep: {e}")))?
+        };
+        let trap_code = self
+            .builder
+            .build_load(i64_t, trap_gep, &self.next_name("rd_trap_code"))
+            .map_err(|e| LlvmError::Codegen(format!("read_dir trap_code load: {e}")))?
+            .into_int_value();
+        let zero = i64_t.const_zero();
+        let trapped = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                trap_code,
+                zero,
+                &self.next_name("rd_trapped"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("read_dir trap cmp: {e}")))?;
+        let trap_bb = self.ctx.append_basic_block(self.func, "rd_trap");
+        let cont_bb = self.ctx.append_basic_block(self.func, "rd_cont");
+        self.builder
+            .build_conditional_branch(trapped, trap_bb, cont_bb)
+            .map_err(|e| LlvmError::Codegen(format!("read_dir trap branch: {e}")))?;
+        self.builder.position_at_end(trap_bb);
+        self.emit_trap_sentinel_return("ReadDir")?;
+        self.builder.position_at_end(cont_bb);
+
+        // The result is the arena-relative offset of the List<String>.
+        self.push(result_off, IrType::ListString);
+        Ok(())
+    }
+
     /// Native: `call @relon_llvm_read_file(state, path_off) -> i32`. The
     /// helper reads the path out of the arena, resolves it against the
     /// shared sandbox root, reads the file, bump-allocates a String

@@ -240,6 +240,11 @@ pub trait OpVisitor {
     /// See the op doc for the per-target lowering (native host helper
     /// vs standard WASI `path_open`/`fd_read`/`fd_close`).
     fn visit_read_file(&mut self) -> Result<Self::Output, Self::Error>;
+    /// Built-in directory listing primitive (`Op::ReadDir`). Pops one
+    /// `String` (the path) and pushes one `List<String>` (the sorted
+    /// entry file names). See the op doc for the per-target lowering
+    /// (native host helper; wasm32 not yet implemented).
+    fn visit_read_dir(&mut self) -> Result<Self::Output, Self::Error>;
     fn visit_make_closure(
         &mut self,
         fn_table_idx: u32,
@@ -385,6 +390,7 @@ pub fn walk_op<V: OpVisitor>(op: &Op, visitor: &mut V) -> Result<V::Output, V::E
         Op::ReadClock => visitor.visit_read_clock(),
         Op::ReadRandom => visitor.visit_read_random(),
         Op::ReadFile => visitor.visit_read_file(),
+        Op::ReadDir => visitor.visit_read_dir(),
         Op::Block { result_ty, body } => visitor.visit_block(*result_ty, body),
         Op::Loop { result_ty, body } => visitor.visit_loop_(*result_ty, body),
         Op::Br { label_depth } => visitor.visit_br(*label_depth),
@@ -759,6 +765,11 @@ mod tests {
         fn visit_read_file(&mut self) -> Result<(), ()> {
             self.calls += 1;
             self.last = "ReadFile";
+            Ok(())
+        }
+        fn visit_read_dir(&mut self) -> Result<(), ()> {
+            self.calls += 1;
+            self.last = "ReadDir";
             Ok(())
         }
         fn visit_make_closure(&mut self, _: u32, _: &[ClosureCapture], _: u32) -> Result<(), ()> {
