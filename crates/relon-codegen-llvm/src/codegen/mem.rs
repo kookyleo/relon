@@ -6,9 +6,7 @@
 //! (the dynamic-base schema-field load) is lowered here too via
 //! `lower_mem_rest` (Phase 0b).
 
-use inkwell::values::{
-    BasicValueEnum, IntValue, PointerValue,
-};
+use inkwell::values::{BasicValueEnum, IntValue, PointerValue};
 
 use relon_ir::ir::{IrType, Op};
 
@@ -98,9 +96,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             let bits = self
                 .builder
                 .build_bit_cast(f, self.ctx.i64_type(), &self.next_name("loadfa_f64_bits"))
-                .map_err(|e| {
-                    LlvmError::Codegen(format!("LoadFieldAtAbsolute f64 bitcast: {e}"))
-                })?
+                .map_err(|e| LlvmError::Codegen(format!("LoadFieldAtAbsolute f64 bitcast: {e}")))?
                 .into_int_value();
             self.push(bits, IrType::F64);
             return Ok(());
@@ -452,7 +448,11 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         let i32_t = self.ctx.i32_type();
         let summed = self
             .builder
-            .build_int_add(value, i32_t.const_int(u64::from(add), false), &format!("{label}_sum"))
+            .build_int_add(
+                value,
+                i32_t.const_int(u64::from(add), false),
+                &format!("{label}_sum"),
+            )
             .map_err(|e| LlvmError::Codegen(format!("{label} add: {e}")))?;
         if align <= 1 {
             return Ok(summed);
@@ -475,7 +475,10 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// `Codegen::arena_addr` on the cranelift side — used by every
     /// `*AtAbsolute` lowering path. No bounds check (Phase E.1 retains
     /// the same "trust the IR + LLVM trap on UB" stance as Phase B).
-    pub(crate) fn arena_addr_i32(&mut self, off_i32: IntValue<'ctx>) -> Result<PointerValue<'ctx>, LlvmError> {
+    pub(crate) fn arena_addr_i32(
+        &mut self,
+        off_i32: IntValue<'ctx>,
+    ) -> Result<PointerValue<'ctx>, LlvmError> {
         let arena_base_ptr = self.arena_base_ptr.ok_or_else(|| {
             LlvmError::Codegen("absolute load/store outside buffer-protocol entry shape".into())
         })?;
@@ -655,7 +658,10 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// region. Pushes the pre-bump cursor as an arena-relative i32
     /// offset onto the virtual stack — same shape as cranelift's
     /// `emit_alloc_scratch`.
-    pub(crate) fn emit_alloc_scratch_common(&mut self, size_v: IntValue<'ctx>) -> Result<(), LlvmError> {
+    pub(crate) fn emit_alloc_scratch_common(
+        &mut self,
+        size_v: IntValue<'ctx>,
+    ) -> Result<(), LlvmError> {
         let state_ptr = self.state_ptr.ok_or_else(|| {
             LlvmError::Codegen(
                 "AllocScratch outside buffer-protocol entry shape (no state ptr)".into(),

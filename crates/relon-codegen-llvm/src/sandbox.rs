@@ -300,7 +300,11 @@ impl CapabilityVtable {
     ///
     /// Returns `true` if the bit was granted; `false` if the gate denied
     /// it (mask bit left clear).
-    pub fn register_via_gate<G: CapabilityGate>(&mut self, gate: &G, cap_bit: CapabilityBit) -> bool {
+    pub fn register_via_gate<G: CapabilityGate>(
+        &mut self,
+        gate: &G,
+        cap_bit: CapabilityBit,
+    ) -> bool {
         match gate.check(cap_bit) {
             Ok(()) => {
                 self.grant(cap_bit.bit_index());

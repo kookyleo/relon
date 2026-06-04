@@ -156,7 +156,13 @@ fn const_list_string_index_three_way() {
         let got_llvm = result_of(&llvm.run_main(a.clone()).expect("llvm run_main"));
         let got_cl = result_of(&cl.run_main(a).expect("cranelift run_main"));
 
-        assert_eq!(got_cl, oracle, "cranelift List<String> index diverged at i={i}");
-        assert_eq!(got_llvm, oracle, "llvm List<String> index diverged at i={i}");
+        assert_eq!(
+            got_cl, oracle,
+            "cranelift List<String> index diverged at i={i}"
+        );
+        assert_eq!(
+            got_llvm, oracle,
+            "llvm List<String> index diverged at i={i}"
+        );
     }
 }

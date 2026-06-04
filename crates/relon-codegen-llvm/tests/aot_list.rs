@@ -103,9 +103,10 @@ fn emit_to_tmp(name: &str, src: &str) -> Result<relon_codegen_llvm::EmitObjectIn
     std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("create tmp dir: {e}"))?;
     let out = tmp_dir.join(format!("{name}.o"));
     let symbol = format!("__test_aot_list_{name}");
-    let info =
-        LlvmAotEvaluator::emit_object(src, &symbol, &out).map_err(|e| format!("{e:?}"))?;
-    let bytes = std::fs::metadata(&out).map_err(|e| format!("stat .o: {e}"))?.len();
+    let info = LlvmAotEvaluator::emit_object(src, &symbol, &out).map_err(|e| format!("{e:?}"))?;
+    let bytes = std::fs::metadata(&out)
+        .map_err(|e| format!("stat .o: {e}"))?
+        .len();
     if bytes == 0 {
         return Err("emit_object produced an empty .o".to_string());
     }

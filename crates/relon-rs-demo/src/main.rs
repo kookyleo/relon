@@ -104,7 +104,8 @@ fn main() {
 
     // GRANT: a SandboxState granting `reads_clock` authorises the gated
     // call; the inlined host body runs and returns the value.
-    let granted = relon_rs_shims::SandboxState::new().grant(relon_rs_shims::CapabilityBit::ReadsClock);
+    let granted =
+        relon_rs_shims::SandboxState::new().grant(relon_rs_shims::CapabilityBit::ReadsClock);
     let secret_ok = secret::main(&granted, secret_x);
     println!("secret::main(grant reads_clock, {secret_x}) = {secret_ok:?}");
     assert_eq!(

@@ -84,8 +84,12 @@ impl UnicodeTable {
             UnicodeTable::Whitespace => "relon_uni_whitespace",
             UnicodeTable::Cased => "relon_uni_cased_ranges",
             UnicodeTable::CaseIgnorable => "relon_uni_case_ignorable_ranges",
-            UnicodeTable::Decomp { compatibility: true } => "relon_uni_decomp_nfkd",
-            UnicodeTable::Decomp { compatibility: false } => "relon_uni_decomp_nfd",
+            UnicodeTable::Decomp {
+                compatibility: true,
+            } => "relon_uni_decomp_nfkd",
+            UnicodeTable::Decomp {
+                compatibility: false,
+            } => "relon_uni_decomp_nfd",
             UnicodeTable::Ccc => "relon_uni_ccc",
             UnicodeTable::Composition => "relon_uni_composition",
         }
@@ -339,10 +343,7 @@ mod tests {
                 .build_in_bounds_gep(
                     i8_t,
                     state_ptr,
-                    &[i32_t.const_int(
-                        crate::state::ARENA_STATE_OFFSET_BASE as u64,
-                        false,
-                    )],
+                    &[i32_t.const_int(crate::state::ARENA_STATE_OFFSET_BASE as u64, false)],
                     "base_gep",
                 )
                 .unwrap()
@@ -458,7 +459,9 @@ mod tests {
                 ),
             ),
             (
-                Op::DecompTableAddr { compatibility: false },
+                Op::DecompTableAddr {
+                    compatibility: false,
+                },
                 "relon_uni_decomp_nfd",
                 relon_ir::normalization::encode_decomp_table_bytes(
                     relon_ir::normalization_data::NFD_INDEX,
@@ -466,7 +469,9 @@ mod tests {
                 ),
             ),
             (
-                Op::DecompTableAddr { compatibility: true },
+                Op::DecompTableAddr {
+                    compatibility: true,
+                },
                 "relon_uni_decomp_nfkd",
                 relon_ir::normalization::encode_decomp_table_bytes(
                     relon_ir::normalization_data::NFKD_INDEX,

@@ -38,7 +38,12 @@ impl BinOp {
 }
 
 impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
-    pub(crate) fn emit_binop(&mut self, ip_hint: &str, ty: IrType, op: BinOp) -> Result<(), LlvmError> {
+    pub(crate) fn emit_binop(
+        &mut self,
+        ip_hint: &str,
+        ty: IrType,
+        op: BinOp,
+    ) -> Result<(), LlvmError> {
         let b = self.pop_int(ip_hint)?;
         let a = self.pop_int(ip_hint)?;
 

@@ -108,7 +108,8 @@ fn w5_full_lowers_to_const_records_and_probe() {
         "dict probe must byte-compare via LoadI8UAtAbsolute"
     );
     assert!(
-        !ops.iter().any(|o| matches!(o, Op::DictGetByStringKey { .. })),
+        !ops.iter()
+            .any(|o| matches!(o, Op::DictGetByStringKey { .. })),
         "static codegen must NOT emit Op::DictGetByStringKey"
     );
 }

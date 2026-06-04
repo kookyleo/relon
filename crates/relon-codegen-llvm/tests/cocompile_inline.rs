@@ -29,10 +29,10 @@ use std::sync::Arc;
 
 use relon_codegen_llvm::cocompile::cocompile_legacy_i64;
 use relon_codegen_llvm::LlvmAotEvaluator;
-use relon_eval_api::{
-    CapabilityBit, Evaluator, NativeArgs, RelonFunction, RuntimeError, Value,
+use relon_eval_api::{CapabilityBit, Evaluator, NativeArgs, RelonFunction, RuntimeError, Value};
+use relon_ir::ir::{
+    Func, IrType, Module as IrModule, NativeImport, Op, TaggedOp, NO_CAPABILITY_BIT,
 };
-use relon_ir::ir::{Func, IrType, Module as IrModule, NativeImport, Op, TaggedOp, NO_CAPABILITY_BIT};
 use relon_parser::TokenRange;
 
 const HOST_FN: &str = "host_add7";

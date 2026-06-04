@@ -136,7 +136,8 @@ fn linker_with_multi3(engine: &wasmtime::Engine) -> wasmtime::Linker<()> {
                 };
                 let n = n as usize;
                 let mut tmp = vec![0u8; n];
-                mem.read(&caller, src as usize, &mut tmp).expect("memcpy read");
+                mem.read(&caller, src as usize, &mut tmp)
+                    .expect("memcpy read");
                 mem.write(&mut caller, dest as usize, &tmp)
                     .expect("memcpy write");
                 dest
@@ -195,7 +196,8 @@ fn linker_with_multi3(engine: &wasmtime::Engine) -> wasmtime::Linker<()> {
                 };
                 let n = n as usize;
                 let mut buf = vec![0u8; n];
-                mem.read(&caller, s as usize, &mut buf).expect("memchr read");
+                mem.read(&caller, s as usize, &mut buf)
+                    .expect("memchr read");
                 let needle = c as u8;
                 match buf.iter().position(|&b| b == needle) {
                     Some(off) => s + off as i32,
@@ -214,7 +216,9 @@ fn run_fast(bytes: &[u8], entry: &str, args: &[i64]) -> i64 {
     let module = Module::new(&engine, bytes).expect("Module::new");
     let mut store = Store::new(&engine, ());
     let linker = linker_with_multi3(&engine);
-    let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .expect("instantiate");
     let func = instance
         .get_func(&mut store, entry)
         .unwrap_or_else(|| panic!("export `{entry}` missing"));
@@ -269,7 +273,9 @@ fn run_buffer(
     let module = Module::new(&engine, bytes).expect("Module::new");
     let mut store = Store::new(&engine, ());
     let linker = linker_with_multi3(&engine);
-    let instance = linker.instantiate(&mut store, &module).expect("instantiate");
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .expect("instantiate");
 
     let memory = match instance.get_export(&mut store, "memory") {
         Some(Extern::Memory(m)) => m,
@@ -315,7 +321,8 @@ fn run_buffer(
     let mut state = [0u8; STATE_SIZE];
     state[STATE_OFF_ARENA_BASE..STATE_OFF_ARENA_BASE + 8]
         .copy_from_slice(&(arena_abs as u64).to_le_bytes());
-    state[STATE_OFF_TAIL_CURSOR..STATE_OFF_TAIL_CURSOR + 4].copy_from_slice(&out_root.to_le_bytes());
+    state[STATE_OFF_TAIL_CURSOR..STATE_OFF_TAIL_CURSOR + 4]
+        .copy_from_slice(&out_root.to_le_bytes());
     state[STATE_OFF_SCRATCH_BASE..STATE_OFF_SCRATCH_BASE + 4]
         .copy_from_slice(&scratch_base.to_le_bytes());
     memory
@@ -370,15 +377,13 @@ fn run_buffer(
     for f in &info.return_fields {
         let off = f.offset as usize;
         let val = match f.ty {
-            EmittedFieldType::Int => Decoded::Int(i64::from_le_bytes(
-                out[off..off + 8].try_into().unwrap(),
-            )),
-            EmittedFieldType::Float => Decoded::Float(f64::from_le_bytes(
-                out[off..off + 8].try_into().unwrap(),
-            )),
-            EmittedFieldType::Bool => {
-                Decoded::Int(if out[off] != 0 { 1 } else { 0 })
+            EmittedFieldType::Int => {
+                Decoded::Int(i64::from_le_bytes(out[off..off + 8].try_into().unwrap()))
             }
+            EmittedFieldType::Float => {
+                Decoded::Float(f64::from_le_bytes(out[off..off + 8].try_into().unwrap()))
+            }
+            EmittedFieldType::Bool => Decoded::Int(if out[off] != 0 { 1 } else { 0 }),
             EmittedFieldType::Null => Decoded::Int(0),
             EmittedFieldType::String => {
                 let record_start = read_u32(&out, off);

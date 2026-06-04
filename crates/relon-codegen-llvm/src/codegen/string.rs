@@ -4,18 +4,14 @@
 //! the `contains` const-needle / extern-shim lowerings (plus their
 //! libc/host-shim declarations).
 
-use inkwell::values::{
-    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue,
-};
 use inkwell::module::Linkage;
+use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue};
 use inkwell::{AddressSpace, IntPredicate};
 
 use relon_ir::ir::IrType;
 
 use crate::error::LlvmError;
-use crate::state::{
-    ARENA_STATE_OFFSET_SCRATCH_BASE, ARENA_STATE_OFFSET_SCRATCH_CURSOR,
-};
+use crate::state::{ARENA_STATE_OFFSET_SCRATCH_BASE, ARENA_STATE_OFFSET_SCRATCH_CURSOR};
 
 use super::*;
 
@@ -25,7 +21,11 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// record sized `total + 4`, stamps the header, then memcpys each
     /// operand's payload at the running cursor. Pushes the resulting
     /// i32 offset. Mirrors cranelift's `emit_str_concat_n`.
-    pub(crate) fn emit_str_concat_n(&mut self, ip_hint: &str, operand_count: u32) -> Result<(), LlvmError> {
+    pub(crate) fn emit_str_concat_n(
+        &mut self,
+        ip_hint: &str,
+        operand_count: u32,
+    ) -> Result<(), LlvmError> {
         if operand_count < 2 {
             return Err(LlvmError::Codegen(format!(
                 "Op::StrConcatN with operand_count={operand_count} (expected >= 2)"
@@ -159,7 +159,10 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// out-of-bounds budget is *strictly tighter* than the historical
     /// path — there is no new failure mode where the fast path
     /// exceeds the arena while the slow path would have fit.
-    pub(crate) fn emit_str_add_inplace_or_concat(&mut self, ip_hint: &str) -> Result<(), LlvmError> {
+    pub(crate) fn emit_str_add_inplace_or_concat(
+        &mut self,
+        ip_hint: &str,
+    ) -> Result<(), LlvmError> {
         let arena_base_ptr = self.arena_base_ptr.ok_or_else(|| {
             LlvmError::Codegen(
                 "Op::Add(String) outside buffer-protocol entry shape (no arena_base)".into(),

@@ -59,7 +59,7 @@ use relon_codegen_llvm::{
     VtableSlot,
 };
 use relon_eval_api::{
-    CapabilityBit, Capabilities, Evaluator, NativeArgs, NativeFnCaps, RelonFunction, RuntimeError,
+    Capabilities, CapabilityBit, Evaluator, NativeArgs, NativeFnCaps, RelonFunction, RuntimeError,
     Value,
 };
 use relon_parser::TokenRange;
@@ -71,7 +71,12 @@ use relon_parser::TokenRange;
 /// No-callback `NativeFnCaps` for direct host-fn dispatch in unit tests.
 struct NoCb;
 impl NativeFnCaps for NoCb {
-    fn call_relon(&self, _f: &Value, _a: Vec<Value>, _r: TokenRange) -> Result<Value, RuntimeError> {
+    fn call_relon(
+        &self,
+        _f: &Value,
+        _a: Vec<Value>,
+        _r: TokenRange,
+    ) -> Result<Value, RuntimeError> {
         Err(RuntimeError::Unsupported {
             reason: "no cb".into(),
         })
@@ -146,7 +151,11 @@ fn emit_object_produces_a_linkable_native_artefact() {
     assert!(meta.len() > 0, "emitted object must be non-empty");
     // ELF magic — confirm it is a real relocatable object, not a stub.
     let bytes = std::fs::read(&out).expect("read object");
-    assert_eq!(&bytes[..4], b"\x7fELF", "emitted file must be an ELF object");
+    assert_eq!(
+        &bytes[..4],
+        b"\x7fELF",
+        "emitted file must be an ELF object"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

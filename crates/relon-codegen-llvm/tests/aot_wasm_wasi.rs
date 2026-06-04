@@ -32,9 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use relon_codegen_llvm::{CodegenTarget, LlvmAotEvaluator, WorldMode};
-use relon_eval_api::{
-    CapabilityBit, Evaluator, NativeArgs, RelonFunction, RuntimeError, Value,
-};
+use relon_eval_api::{CapabilityBit, Evaluator, NativeArgs, RelonFunction, RuntimeError, Value};
 
 const SRC: &str = "#main(Int x) -> Int\nclock_add(x)";
 const HOST_FN: &str = "clock_add";
@@ -129,9 +127,7 @@ fn native_oracle(x: i64) -> i64 {
 /// Returns `(wasm_bytes, EmitObjectInfo)` or an `Err` carrying the
 /// reason when `wasm-ld` is unavailable (so the caller skips rather than
 /// fails the suite on a host without `lld`).
-fn build_wasm(
-    entry: &str,
-) -> Result<(Vec<u8>, relon_codegen_llvm::EmitObjectInfo), String> {
+fn build_wasm(entry: &str) -> Result<(Vec<u8>, relon_codegen_llvm::EmitObjectInfo), String> {
     if relon_codegen_llvm::wasm_link::find_wasm_ld().is_none() {
         return Err("wasm-ld not found on PATH (install lld)".into());
     }

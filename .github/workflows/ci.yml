@@ -63,14 +63,20 @@ jobs:
   miri:
     # F-1 per docs/internal/formalization-targets-2026-05-23.md:
     # run cargo miri on every crate whose unsafe surface lives in
-    # pure Rust (no cranelift / FFI / mmap). Catches UB regressions
-    # in the trace-jit runtime helpers, bytecode arena, SmolStr SSO,
-    # and recorder bookkeeping.
+    # pure Rust (no cranelift / FFI / mmap / target intrinsics).
+    # Catches UB regressions in the SmolStr SSO layout exercised by
+    # relon-eval-api.
     #
     # NOT covered: relon-codegen-cranelift (pulls cranelift / wasmtime
     # whose generated nightly code currently uses unstable features
-    # the pinned miri rustc rejects) and relon-wasm-bindings (browser target).
-    # Those keep their stable-job coverage.
+    # the pinned miri rustc rejects), relon-wasm-bindings (browser
+    # target), relon-object-cache (dlopen / memfd FFI), and relon-ir's
+    # ascii_fold_simd (wasm32 +simd128 intrinsics). Those keep their
+    # stable-job coverage.
+    #
+    # The retired trace-JIT / bytecode crates (relon-trace-abi,
+    # relon-trace-jit, relon-trace-recorder, relon-bytecode) were
+    # deleted in 62bf6805; their miri steps were dropped with them.
     name: miri (unsafe modules)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -89,60 +95,8 @@ jobs:
         run: cargo +nightly miri test -p relon-eval-api
         env:
           MIRIFLAGS: -Zmiri-disable-isolation
-      - name: miri test (relon-trace-abi)
-        run: cargo +nightly miri test -p relon-trace-abi
-        env:
-          MIRIFLAGS: -Zmiri-disable-isolation
-      - name: miri test (relon-trace-jit lib)
-        run: cargo +nightly miri test -p relon-trace-jit --lib
-        env:
-          # `-Zmiri-ignore-leaks` is required for this crate: the
-          # `__relon_str_*` / `StringRef::from_owned|from_static` /
-          # `__relon_str_concat_n_alloc` / `__relon_str_substring`
-          # runtime helpers are caller-managed — production code drains
-          # them via `reclaim_trace_strings()` at trace exit. The unit
-          # tests intentionally exercise the alloc shape without the
-          # reclaim call, so miri's default "leak == error" flags every
-          # such test. The flag suppresses *leak* reporting only;
-          # use-after-free / double-free / OOB checks still fire, which
-          # is what the F-1 sweep actually buys.
-          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-ignore-leaks
-      - name: miri test (relon-trace-recorder)
-        run: cargo +nightly miri test -p relon-trace-recorder
-        env:
-          MIRIFLAGS: -Zmiri-disable-isolation
-      - name: miri test (relon-bytecode lib)
-        run: cargo +nightly miri test -p relon-bytecode --lib
-        env:
-          MIRIFLAGS: -Zmiri-disable-isolation
 
-  kani:
-    # F-2 per docs/internal/formalization-targets-2026-05-23.md:
-    # bounded model-check the layout arithmetic in the trace-JIT
-    # runtime helpers (dict_v2 entry table bounds, stored payload
-    # bounds, str_concat_n_alloc cursor bounds, str_substring
-    # clamping). Proofs live in
-    # crates/relon-trace-jit/src/runtime/proofs.rs behind #[cfg(kani)].
-    #
-    # Local: cargo kani -p relon-trace-jit.
-    name: kani (JIT helper bounds proofs)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      # kani-github-action seeds the build cache with the full
-      # workspace, which transitively builds `relon-codegen-llvm` →
-      # `llvm-sys`. The cache priming fails without the LLVM 18 dev
-      # libs even though the `relon-trace-jit` proof target itself
-      # has no LLVM dep.
-      LLVM_SYS_181_PREFIX: /usr/lib/llvm-18
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Install LLVM 18 dev libs (with Polly)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends llvm-18-dev libpolly-18-dev
-      - name: Install Kani
-        uses: model-checking/kani-github-action@v1
-      - name: kani -p relon-trace-jit
-        run: cargo kani -p relon-trace-jit
+  # The kani job (F-2 bounds proofs) was removed: its only proof target
+  # was relon-trace-jit/src/runtime/proofs.rs, deleted with the retired
+  # trace-JIT crate in 62bf6805. No #[cfg(kani)] proofs remain in the
+  # workspace, so there is nothing to model-check.

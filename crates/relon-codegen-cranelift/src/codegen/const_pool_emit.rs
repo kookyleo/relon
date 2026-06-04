@@ -86,9 +86,7 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
                 self.const_pool.list_string_offsets.get(&idx).copied(),
                 "ConstListString",
             ),
-            ConstValueKind::Dict => {
-                (self.const_pool.dict_offsets.get(&idx).copied(), "ConstDict")
-            }
+            ConstValueKind::Dict => (self.const_pool.dict_offsets.get(&idx).copied(), "ConstDict"),
         };
         let off = offset.ok_or_else(|| {
             CraneliftError::Codegen(format!("{label} idx {idx} not in pre-computed pool"))

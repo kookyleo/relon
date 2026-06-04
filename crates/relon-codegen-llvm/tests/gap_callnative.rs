@@ -119,7 +119,11 @@ fn callnative_dispatch_matches_cranelift_golden() {
         .with_granted_cap(CapabilityBit::ReadsClock.bit_index());
     let cl_val = cl.run_main(args(35)).expect("cranelift dispatch");
     assert_eq!(cl_val, Value::Int(42), "cranelift golden value");
-    assert_eq!(cl_native.hits.load(Ordering::SeqCst), 1, "cranelift host hit");
+    assert_eq!(
+        cl_native.hits.load(Ordering::SeqCst),
+        1,
+        "cranelift host hit"
+    );
 
     // LLVM under test.
     let llvm_native = Arc::new(AddSeven {
@@ -131,7 +135,10 @@ fn callnative_dispatch_matches_cranelift_golden() {
         .with_granted_cap(CapabilityBit::ReadsClock.bit_index());
     let llvm_val = llvm.run_main(args(35)).expect("llvm dispatch");
 
-    assert_eq!(llvm_val, cl_val, "LLVM dispatch must match cranelift golden");
+    assert_eq!(
+        llvm_val, cl_val,
+        "LLVM dispatch must match cranelift golden"
+    );
     assert_eq!(llvm_val, Value::Int(42), "LLVM dispatch oracle");
     assert_eq!(
         llvm_native.hits.load(Ordering::SeqCst),
@@ -219,7 +226,8 @@ fn callnative_missing_callable_traps_typed() {
 
 #[test]
 fn callnative_uses_buffer_entry_with_dispatch_helper() {
-    let llvm = LlvmAotEvaluator::from_source_with_options(SRC, &host_options()).expect("llvm build");
+    let llvm =
+        LlvmAotEvaluator::from_source_with_options(SRC, &host_options()).expect("llvm build");
     let dump = llvm.emit_ir_dump();
     assert!(
         dump.contains("relon_llvm_call_native"),

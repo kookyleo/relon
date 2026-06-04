@@ -183,7 +183,8 @@ fn emit_object_with_options_closed_world_produces_object() {
     // seam resolves the `#native` declaration AND the closed-world
     // buffer emit + host link/inline run to completion under the
     // object-codegen pipeline (not just JIT).
-    let dir = std::env::temp_dir().join(format!("relon_cocompile_buffer_obj_{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("relon_cocompile_buffer_obj_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("mkdir tmp");
     let out = dir.join("closed_world_main.o");
 
@@ -210,11 +211,13 @@ fn emit_object_default_open_world_still_works() {
     // the pre-S2.⑤ open-world path (thin wrapper around
     // `emit_object_with_options`). A non-native Int source proves the
     // wrapper didn't regress the default seam.
-    let dir = std::env::temp_dir().join(format!("relon_cocompile_buffer_ow_{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("relon_cocompile_buffer_ow_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("mkdir tmp");
     let out = dir.join("plain_main.o");
-    let info = LlvmAotEvaluator::emit_object("#main(Int x) -> Int\nx + 1", "relon_plain_main", &out)
-        .expect("open-world emit_object");
+    let info =
+        LlvmAotEvaluator::emit_object("#main(Int x) -> Int\nx + 1", "relon_plain_main", &out)
+            .expect("open-world emit_object");
     assert_eq!(info.entry_symbol, "relon_plain_main");
     assert!(std::fs::metadata(&out).expect("object written").len() > 0);
     let _ = std::fs::remove_dir_all(&dir);

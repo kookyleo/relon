@@ -27,12 +27,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use ordered_float::OrderedFloat;
 use relon_codegen_cranelift::AotEvaluator;
 use relon_codegen_llvm::{EmittedEntryShape, EmittedFieldType, LlvmAotEvaluator};
 use relon_eval_api::{Evaluator, Value};
 use relon_evaluator::{Context, Scope, TreeWalkEvaluator};
 use relon_parser::parse_document;
-use ordered_float::OrderedFloat;
 
 /// `#main(Float) -> Float`: pure-Float scalar arithmetic.
 const FLOAT_SRC: &str = "#main(Float x) -> Float\nx * 2.5 + 1.0\n";
@@ -75,10 +75,11 @@ fn emit_to_tmp(name: &str, src: &str) -> Result<relon_codegen_llvm::EmitObjectIn
     std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("create tmp dir: {e}"))?;
     let out = tmp_dir.join(format!("{name}.o"));
     let symbol = format!("__test_aot_float_{name}");
-    let info =
-        LlvmAotEvaluator::emit_object(src, &symbol, &out).map_err(|e| format!("{e:?}"))?;
+    let info = LlvmAotEvaluator::emit_object(src, &symbol, &out).map_err(|e| format!("{e:?}"))?;
     // The emitter must have written a real ELF object — not just metadata.
-    let bytes = std::fs::metadata(&out).map_err(|e| format!("stat .o: {e}"))?.len();
+    let bytes = std::fs::metadata(&out)
+        .map_err(|e| format!("stat .o: {e}"))?
+        .len();
     if bytes == 0 {
         return Err("emit_object produced an empty .o".to_string());
     }
@@ -171,13 +172,7 @@ fn mixed_float_int_value_e2e_three_way_bit_identical() {
     let cl = AotEvaluator::from_source(MIXED_SRC)
         .unwrap_or_else(|e| panic!("cranelift from_source: {e:?}"));
 
-    for &(x, n) in &[
-        (0.0f64, 0i64),
-        (1.5, 4),
-        (-2.25, 7),
-        (100.0, -3),
-        (0.1, 1),
-    ] {
+    for &(x, n) in &[(0.0f64, 0i64), (1.5, 4), (-2.25, 7), (100.0, -3), (0.1, 1)] {
         let mut a = HashMap::new();
         a.insert("x".to_string(), f(x));
         a.insert("n".to_string(), Value::Int(n));

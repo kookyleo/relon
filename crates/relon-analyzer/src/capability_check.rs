@@ -716,11 +716,26 @@ mod tests {
     #[test]
     fn each_new_capability_bit_flagged_independently() {
         let cases: Vec<(&str, NativeFnGate)> = vec![
-            ("writes_fs", gate_bits(false, true, false, false, false, false)),
-            ("network", gate_bits(false, false, true, false, false, false)),
-            ("reads_clock", gate_bits(false, false, false, true, false, false)),
-            ("reads_env", gate_bits(false, false, false, false, true, false)),
-            ("uses_rng", gate_bits(false, false, false, false, false, true)),
+            (
+                "writes_fs",
+                gate_bits(false, true, false, false, false, false),
+            ),
+            (
+                "network",
+                gate_bits(false, false, true, false, false, false),
+            ),
+            (
+                "reads_clock",
+                gate_bits(false, false, false, true, false, false),
+            ),
+            (
+                "reads_env",
+                gate_bits(false, false, false, false, true, false),
+            ),
+            (
+                "uses_rng",
+                gate_bits(false, false, false, false, false, true),
+            ),
         ];
         for (bit, gate) in cases {
             let opts = options_with_gate("f", gate, Capabilities::default());

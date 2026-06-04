@@ -53,8 +53,8 @@ use peephole::{
     emit_list_value_materialize, list_has_computed_element, list_is_float_shaped, match_bare_range,
     match_materializable_outer_map, probe_expr_ir_ty, try_lower_len_filter_range,
     try_lower_list_filter, try_lower_list_len, try_lower_list_sum_range, try_lower_list_sum_value,
-    try_lower_materialized_list_reduce, try_lower_nested_range_map_reduce, try_lower_range_chain_len,
-    try_lower_range_chain_reduce,
+    try_lower_materialized_list_reduce, try_lower_nested_range_map_reduce,
+    try_lower_range_chain_len, try_lower_range_chain_reduce,
 };
 
 /// Per-function lowering state shared across the recursive walk.
@@ -1120,10 +1120,7 @@ enum AnonDictField {
     /// `IrType::ListString` captured local materialised via
     /// `Op::ConstListString`); like a Dict field it contributes no
     /// host-visible record slot. `elements` are in source order.
-    ListString {
-        name: String,
-        elements: Vec<String>,
-    },
+    ListString { name: String, elements: Vec<String> },
 }
 
 /// Try to build an [`AnonDictPlan`] for the entry's body when the
@@ -1231,8 +1228,7 @@ fn anon_dict_return_plan(
                 // other element surfaces UnsupportedExpr so the edge
                 // stays honest (non-String list fields are out of
                 // scope for this surface).
-                let elements =
-                    classify_anon_dict_list_string_field(items, value.range, name)?;
+                let elements = classify_anon_dict_list_string_field(items, value.range, name)?;
                 fields.push(AnonDictField::ListString {
                     name: name.clone(),
                     elements,
@@ -1416,7 +1412,8 @@ fn classify_anon_dict_scalar_field_irt(
             // value type. The head must name a known dict field and the
             // single trailing segment must be a `Dynamic` (bracket)
             // index; `lower_dict_string_index` emits the actual probe.
-            if let [TokenKey::String(name, _, _), TokenKey::Dynamic(_, optional)] = path.as_slice() {
+            if let [TokenKey::String(name, _, _), TokenKey::Dynamic(_, optional)] = path.as_slice()
+            {
                 if !optional && dict_field_names.contains(name.as_str()) {
                     return Ok(IrType::I64);
                 }
@@ -2227,7 +2224,6 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
         }),
     }
 }
-
 
 /// Phase F.2 (W7 anon-Dict-return): when a free-call's head names a
 /// closure-typed let-binding (a `(name) => ...` value lifted into an
@@ -7589,9 +7585,7 @@ mod w7_closure_boundary_tests {
             .expect("W5-P1 lowers anon-Dict-return with dict-value field");
         let module = &lowered.module;
 
-        let entry_idx = module
-            .entry_func_index
-            .expect("W5-P1 builds an entry func");
+        let entry_idx = module.entry_func_index.expect("W5-P1 builds an entry func");
         let entry = &module.funcs[entry_idx];
 
         // Exactly one ConstDict carrying the source-order entries.
@@ -7622,7 +7616,15 @@ mod w7_closure_boundary_tests {
         let dict_let_sets = entry
             .body
             .iter()
-            .filter(|t| matches!(t.op, Op::LetSet { ty: IrType::Dict, .. }))
+            .filter(|t| {
+                matches!(
+                    t.op,
+                    Op::LetSet {
+                        ty: IrType::Dict,
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(
             dict_let_sets, 1,

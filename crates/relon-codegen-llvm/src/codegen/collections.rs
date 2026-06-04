@@ -102,7 +102,10 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// `Op::AllocRootRecord` / `Op::AllocSubRecord` record-local
     /// index. Each variable holds an out_ptr-relative i32 offset.
     /// Mirrors cranelift's `get_or_create_record_local`.
-    pub(crate) fn get_or_create_record_local(&mut self, idx: u32) -> Result<PointerValue<'ctx>, LlvmError> {
+    pub(crate) fn get_or_create_record_local(
+        &mut self,
+        idx: u32,
+    ) -> Result<PointerValue<'ctx>, LlvmError> {
         if let Some(p) = self.record_locals.get(&idx).copied() {
             return Ok(p);
         }
@@ -156,7 +159,9 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         align: u32,
     ) -> Result<IntValue<'ctx>, LlvmError> {
         let state_ptr = self.state_ptr.ok_or_else(|| {
-            LlvmError::Codegen("tail alloc outside buffer-protocol entry shape (no state ptr)".into())
+            LlvmError::Codegen(
+                "tail alloc outside buffer-protocol entry shape (no state ptr)".into(),
+            )
         })?;
         let i32_t = self.ctx.i32_type();
         let i8_t = self.ctx.i8_type();

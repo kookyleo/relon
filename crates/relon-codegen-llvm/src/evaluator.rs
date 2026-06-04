@@ -1526,14 +1526,18 @@ fn write_value_into_builder(
     use relon_eval_api::schema_canonical::TypeRepr;
     match (&field.ty, value) {
         (TypeRepr::Int, Value::Int(v)) => marshal_int_in(builder, &field.name, *v),
-        (TypeRepr::Float, Value::Float(v)) => marshal_float_in(builder, &field.name, v.into_inner()),
+        (TypeRepr::Float, Value::Float(v)) => {
+            marshal_float_in(builder, &field.name, v.into_inner())
+        }
         (TypeRepr::Float, Value::Int(v)) => marshal_float_in(builder, &field.name, *v as f64),
         (TypeRepr::Bool, Value::Bool(v)) => marshal_bool_in(builder, &field.name, *v),
         (TypeRepr::Null, Value::Null) => marshal_null_in(builder, &field.name),
         (TypeRepr::Schema { schema }, Value::Dict(dict)) => {
             marshal_schema_in(builder, &field.name, schema, dict)
         }
-        (TypeRepr::List { element }, Value::List(items)) if matches!(element.as_ref(), TypeRepr::Int) => {
+        (TypeRepr::List { element }, Value::List(items))
+            if matches!(element.as_ref(), TypeRepr::Int) =>
+        {
             marshal_list_int_in(builder, &field.name, items)
         }
         // ----- add new leaf marshalling arm above this line -----
@@ -1565,7 +1569,9 @@ fn marshal_float_in(
     name: &str,
     v: f64,
 ) -> Result<(), RuntimeError> {
-    builder.write_float(name, v).map_err(buffer_to_runtime_error)
+    builder
+        .write_float(name, v)
+        .map_err(buffer_to_runtime_error)
 }
 
 fn marshal_bool_in(
@@ -1629,12 +1635,11 @@ fn marshal_schema_in(
     schema: &relon_eval_api::schema_canonical::Schema,
     dict: &relon_eval_api::ValueDict,
 ) -> Result<(), RuntimeError> {
-    let sub_layout =
-        relon_eval_api::layout::SchemaLayout::offsets_for(schema).map_err(|e| {
-            RuntimeError::Unsupported {
-                reason: format!("llvm-aot: schema arg `{name}` layout: {e}"),
-            }
-        })?;
+    let sub_layout = relon_eval_api::layout::SchemaLayout::offsets_for(schema).map_err(|e| {
+        RuntimeError::Unsupported {
+            reason: format!("llvm-aot: schema arg `{name}` layout: {e}"),
+        }
+    })?;
     let mut child = builder
         .sub_record(name, &sub_layout, &schema.fields)
         .map_err(buffer_to_runtime_error)?;
@@ -1789,12 +1794,11 @@ fn marshal_schema_out(
     name: &str,
     schema: &relon_eval_api::schema_canonical::Schema,
 ) -> Result<Value, RuntimeError> {
-    let sub_layout =
-        relon_eval_api::layout::SchemaLayout::offsets_for(schema).map_err(|e| {
-            RuntimeError::Unsupported {
-                reason: format!("llvm-aot: return field `{name}` layout: {e}"),
-            }
-        })?;
+    let sub_layout = relon_eval_api::layout::SchemaLayout::offsets_for(schema).map_err(|e| {
+        RuntimeError::Unsupported {
+            reason: format!("llvm-aot: return field `{name}` layout: {e}"),
+        }
+    })?;
     let sub_reader = reader
         .sub_record(name, &sub_layout, &schema.fields)
         .map_err(buffer_to_runtime_error)?;
@@ -1867,10 +1871,7 @@ fn body_references_const_pool(body: &[relon_ir::ir::TaggedOp]) -> bool {
                 then_body,
                 else_body,
                 ..
-            } => {
-                body_references_const_pool(then_body)
-                    || body_references_const_pool(else_body)
-            }
+            } => body_references_const_pool(then_body) || body_references_const_pool(else_body),
             // `Op::Call` inlines a bundled-stdlib body whose own const-
             // pool ops would resolve against the same (empty, on the fast
             // entry) pool. Mirror `ConstPool::collect_op`'s stdlib
@@ -2213,8 +2214,7 @@ impl LlvmAotEvaluator {
                     .into(),
             ));
         }
-        let (ir, main_schema, return_schema) =
-            Self::lower_source_with_options(src, Some(options))?;
+        let (ir, main_schema, return_schema) = Self::lower_source_with_options(src, Some(options))?;
         let main_layout = relon_eval_api::layout::SchemaLayout::offsets_for(&main_schema)
             .map_err(|e| LlvmError::Codegen(format!("main schema layout: {e}")))?;
         let return_layout = relon_eval_api::layout::SchemaLayout::offsets_for(&return_schema)
@@ -2711,9 +2711,7 @@ fn create_object_target_machine(
                     RelocMode::PIC,
                     CodeModel::Default,
                 )
-                .ok_or_else(|| {
-                    LlvmError::Codegen("create_target_machine returned null".into())
-                })?;
+                .ok_or_else(|| LlvmError::Codegen("create_target_machine returned null".into()))?;
             let triple_owned = triple_str
                 .as_str()
                 .to_str()
@@ -2726,9 +2724,8 @@ fn create_object_target_machine(
             // inkwell feature; `initialize_webassembly` registers it.
             Target::initialize_webassembly(&InitializationConfig::default());
             let triple = TargetTriple::create(WASM32_TRIPLE);
-            let t = Target::from_triple(&triple).map_err(|e| {
-                LlvmError::Codegen(format!("wasm32 target from_triple: {e}"))
-            })?;
+            let t = Target::from_triple(&triple)
+                .map_err(|e| LlvmError::Codegen(format!("wasm32 target from_triple: {e}")))?;
             // No host-CPU narrowing for wasm; the MVP+ feature set is
             // controlled by the wasm runtime (wasmtime defaults). Reloc
             // is irrelevant for the wasm object model — `Static`/`Default`

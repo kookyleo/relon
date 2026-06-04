@@ -495,9 +495,7 @@ mod tests {
         // SAFETY: `reg` outlives the call below.
         unsafe { state.install_host_fns(&reg as *const _) };
         let args = [41i64];
-        let r = unsafe {
-            relon_llvm_call_native(&state as *const _, 0, args.as_ptr(), 1)
-        };
+        let r = unsafe { relon_llvm_call_native(&state as *const _, 0, args.as_ptr(), 1) };
         assert_eq!(r, 42);
         assert_eq!(state.trap_code(), 0);
     }

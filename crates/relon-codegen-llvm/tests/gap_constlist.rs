@@ -177,7 +177,11 @@ fn int_list_run_main_three_way_after_return_decode() {
     let scope = Arc::new(Scope::default());
     let mut tw_args = HashMap::new();
     tw_args.insert("n".to_string(), Value::Int(0));
-    let want = xs_of(&walker.run_main(&scope, tw_args).expect("tree-walk run_main"));
+    let want = xs_of(
+        &walker
+            .run_main(&scope, tw_args)
+            .expect("tree-walk run_main"),
+    );
     assert_eq!(want, vec![10, 20, 30], "oracle sanity");
 
     let llvm = LlvmAotEvaluator::from_source(INT_LIST_SRC).expect("llvm compiles the lowering");
@@ -186,9 +190,19 @@ fn int_list_run_main_three_way_after_return_decode() {
     let mut a = HashMap::new();
     a.insert("n".to_string(), Value::Int(0));
 
-    let got_llvm = xs_of(&llvm.run_main(a.clone()).expect("llvm run_main decodes List<Int>"));
+    let got_llvm = xs_of(
+        &llvm
+            .run_main(a.clone())
+            .expect("llvm run_main decodes List<Int>"),
+    );
     let got_cl = xs_of(&cl.run_main(a).expect("cranelift run_main"));
 
-    assert_eq!(got_llvm, want, "LLVM List<Int> return decode diverged from oracle");
-    assert_eq!(got_cl, want, "cranelift List<Int> return decode diverged from oracle");
+    assert_eq!(
+        got_llvm, want,
+        "LLVM List<Int> return decode diverged from oracle"
+    );
+    assert_eq!(
+        got_cl, want,
+        "cranelift List<Int> return decode diverged from oracle"
+    );
 }
