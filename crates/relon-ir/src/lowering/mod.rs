@@ -1115,6 +1115,15 @@ enum AnonDictField {
         name: String,
         entries: Vec<(String, i64)>,
     },
+    /// W5-P4: source-level field whose value is a `["a", "b", ...]`
+    /// list-of-string literal. Lifted to an internal let-binding (an
+    /// `IrType::ListString` captured local materialised via
+    /// `Op::ConstListString`); like a Dict field it contributes no
+    /// host-visible record slot. `elements` are in source order.
+    ListString {
+        name: String,
+        elements: Vec<String>,
+    },
 }
 
 /// Try to build an [`AnonDictPlan`] for the entry's body when the
@@ -1214,6 +1223,21 @@ fn anon_dict_return_plan(
                     entries,
                 });
             }
+            Expr::List(items) => {
+                // W5-P4: a `["a", "b", ...]` list-of-string literal
+                // becomes a `ListString` internal let-binding (the
+                // `#internal keys` field of the dict-probe workload).
+                // Only the all-String-literal shape is accepted; any
+                // other element surfaces UnsupportedExpr so the edge
+                // stays honest (non-String list fields are out of
+                // scope for this surface).
+                let elements =
+                    classify_anon_dict_list_string_field(items, value.range, name)?;
+                fields.push(AnonDictField::ListString {
+                    name: name.clone(),
+                    elements,
+                });
+            }
             _ => {
                 let ty = classify_anon_dict_scalar_field(
                     &value.expr,
@@ -1240,7 +1264,9 @@ fn anon_dict_return_plan(
                 ty: ty.clone(),
                 default: None,
             }),
-            AnonDictField::Closure { .. } | AnonDictField::DictStrInt { .. } => None,
+            AnonDictField::Closure { .. }
+            | AnonDictField::DictStrInt { .. }
+            | AnonDictField::ListString { .. } => None,
         })
         .collect();
     let schema = Schema {
@@ -1338,6 +1364,34 @@ fn classify_anon_dict_str_int_field(
     Ok(entries)
 }
 
+/// W5-P4: classify a `["a", "b", ...]` list-of-string literal sitting on
+/// the RHS of an anon-Dict-return `#internal` field (the `keys` field of
+/// the dict-probe workload). Returns the element set in source order when
+/// every element is a String literal; any other element shape (non-String
+/// literal, nested list, spread) surfaces `UnsupportedExpr` so the
+/// surface stays honest — non-String list fields are out of scope here.
+fn classify_anon_dict_list_string_field(
+    items: &[Node],
+    range: TokenRange,
+    field_name: &str,
+) -> Result<Vec<String>, LoweringError> {
+    let mut elements: Vec<String> = Vec::with_capacity(items.len());
+    for node in items {
+        let Expr::String(s) = &*node.expr else {
+            return Err(LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "AnonDictReturn(list field `{}`: element `{}`, only String literals supported)",
+                    field_name,
+                    node.expr.kind()
+                ),
+                range,
+            });
+        };
+        elements.push(s.clone());
+    }
+    Ok(elements)
+}
+
 fn classify_anon_dict_scalar_field_irt(
     expr: &Expr,
     range: TokenRange,
@@ -1379,6 +1433,18 @@ fn classify_anon_dict_scalar_field_irt(
             if let [TokenKey::String(name, _, _)] = path.as_slice() {
                 if let Some((_, ret_ty)) = closure_field_sigs.get(name.as_str()) {
                     return Ok(*ret_ty);
+                }
+            }
+            // W5-P4: `result: list.sum(range(...)[.map|.filter]*)` — the
+            // dict-probe workload's host-visible field. `list.sum` over a
+            // range pipeline always yields an `Int` accumulator (the
+            // peephole `emit_range_pipeline_loop` enforces an Int-valued
+            // element and rejects otherwise), so classify the field as
+            // I64; the actual loop + capture is lowered in `lower_expr`.
+            if let [TokenKey::String(head, _, _), TokenKey::String(method, _, _)] = path.as_slice()
+            {
+                if head == "list" && method == "sum" {
+                    return Ok(IrType::I64);
                 }
             }
             Err(LoweringError::UnsupportedExpr {
@@ -1565,6 +1631,38 @@ fn lower_anon_dict_body(
                     op: Op::LetSet {
                         idx: let_idx,
                         ty: IrType::Dict,
+                    },
+                    range: TokenRange::default(),
+                });
+            }
+            AnonDictField::ListString { name, elements } => {
+                // W5-P4: materialise the `["a", ...]` list into the const
+                // pool via `Op::ConstListString` and stash the arena
+                // pointer into a fresh `IrType::ListString` internal
+                // let-local. Captured by a later sibling `result` field
+                // (the map-loop body `keys[i % 10]`); the let-binding is
+                // registered before `result` lowers so `Variable(keys)`
+                // resolves to `LetGet { idx, ListString }`.
+                let let_idx = ctx.next_let_idx;
+                ctx.next_let_idx += 1;
+                ctx.lets.push(LetBinding {
+                    name: name.clone(),
+                    idx: let_idx,
+                    ty: IrType::ListString,
+                    schema_brand: None,
+                });
+                let list_idx = ctx.const_intern.borrow_mut().alloc_list_string_idx();
+                ctx.out.push(TaggedOp {
+                    op: Op::ConstListString {
+                        idx: list_idx,
+                        elements: elements.clone(),
+                    },
+                    range: TokenRange::default(),
+                });
+                ctx.out.push(TaggedOp {
+                    op: Op::LetSet {
+                        idx: let_idx,
+                        ty: IrType::ListString,
                     },
                     range: TokenRange::default(),
                 });
