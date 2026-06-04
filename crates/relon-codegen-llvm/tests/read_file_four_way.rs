@@ -38,9 +38,18 @@ use relon_eval_api::{CapabilityBit, Evaluator, RuntimeError, Value};
 const CONTENT: &str = "relon read_file four-way parity\nsecond line\n";
 const FILENAME: &str = "fixture.txt";
 
-/// Create a fresh temp dir holding the fixture file, point the shared
-/// FS sandbox root at it, and return the dir (caller cleans up).
-fn fixture(tag: &str) -> PathBuf {
+/// Serializes the fs-reading tests in this binary. The thread-local
+/// sandbox root isolates each test's root, but these tests also drive
+/// concurrent JIT / MCJIT / wasm-ld / wasmtime through process-global
+/// toolchain state; holding this lock for the test body keeps them from
+/// interleaving (the test passes deterministically in isolation).
+static FS_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Create a fresh temp dir holding the fixture file, point the FS sandbox
+/// root at it, and return the dir plus a serialization guard the caller
+/// holds for the whole test (caller cleans up the dir).
+fn fixture(tag: &str) -> (PathBuf, std::sync::MutexGuard<'static, ()>) {
+    let guard = FS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!(
         "relon_rf_4way_{tag}_{}_{:p}",
         std::process::id(),
@@ -49,7 +58,7 @@ fn fixture(tag: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).expect("create fixture dir");
     std::fs::write(dir.join(FILENAME), CONTENT).expect("write fixture");
     relon_util::set_fs_sandbox_root(&dir);
-    dir
+    (dir, guard)
 }
 
 fn caps_reads_fs() -> Capabilities {
@@ -119,7 +128,7 @@ fn run_llvm_native() -> String {
 
 #[test]
 fn read_file_three_native_executors_are_byte_equal() {
-    let dir = fixture("equal");
+    let (dir, _serial) = fixture("equal");
 
     let tw = run_tree_walk();
     let cl = run_cranelift();
@@ -140,7 +149,7 @@ fn read_file_three_native_executors_are_byte_equal() {
 
 #[test]
 fn read_file_ungranted_traps_on_native_backends() {
-    let dir = fixture("ungranted");
+    let (dir, _serial) = fixture("ungranted");
 
     // Build with the cap granted (analyze passes) but withhold the
     // runtime grant — the `Op::CheckCap` prologue must trap.
@@ -169,7 +178,7 @@ fn read_file_ungranted_traps_on_native_backends() {
 
 #[test]
 fn read_file_path_escape_traps_on_native_backends() {
-    let dir = fixture("escape");
+    let (dir, _serial) = fixture("escape");
     const ESCAPE_SRC: &str = "#main() -> String\nread_file(\"../escape.txt\")";
 
     let cl = AotEvaluator::from_source_with_options(ESCAPE_SRC, &opts_reads_fs())
@@ -426,7 +435,7 @@ fn read_file_wasm_imports_standard_wasi_fd_protocol() {
 /// (standard WASI + preopened host) all produce the same file content.
 #[test]
 fn read_file_four_way_byte_equal() {
-    let dir = fixture("4way");
+    let (dir, _serial) = fixture("4way");
 
     let tw = run_tree_walk();
     let cl = run_cranelift();
@@ -466,7 +475,7 @@ fn read_file_four_way_byte_equal() {
 /// non-zero `trap_code` (CapabilityDenied) rather than reading the file.
 #[test]
 fn read_file_ungranted_traps_on_wasm() {
-    let dir = fixture("wasm_ungranted");
+    let (dir, _serial) = fixture("wasm_ungranted");
 
     let (bytes, info) = match build_wasm_read_file(SRC, "relon_main_read_file") {
         Ok(v) => v,

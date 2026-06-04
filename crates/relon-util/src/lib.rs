@@ -47,31 +47,35 @@ pub fn is_valid_rust_ident(s: &str) -> bool {
 /// path against the same root. Keeping the root in one leaf crate gives
 /// every backend a single source of truth without a dependency cycle.
 mod fs_sandbox {
+    use std::cell::RefCell;
     use std::path::{Path, PathBuf};
-    use std::sync::RwLock;
 
-    static FS_SANDBOX_ROOT: RwLock<Option<PathBuf>> = RwLock::new(None);
-
-    /// Set the filesystem sandbox root used by `read_file`. All relative
-    /// paths resolve against this directory and any path escaping it is
-    /// refused. Pass the same directory the wasm host preopens so the
-    /// four executors agree.
-    pub fn set_fs_sandbox_root(root: impl Into<PathBuf>) {
-        let mut guard = FS_SANDBOX_ROOT
-            .write()
-            .expect("fs sandbox root lock poisoned");
-        *guard = Some(root.into());
+    // Thread-scoped, not process-global: `read_file`'s native helper runs
+    // synchronously on the evaluation thread (the same thread that called
+    // `set_fs_sandbox_root`), so a thread-local root gives each concurrent
+    // evaluation an independent sandbox root instead of one process-wide
+    // root that concurrent evaluations would clobber. (The wasm backend
+    // does not consult this — it resolves against the WASI host's preopened
+    // dir.) Caveat: set the root on the same thread that evaluates; setting
+    // it on one thread and evaluating on another sees the default root.
+    thread_local! {
+        static FS_SANDBOX_ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
     }
 
-    /// Current sandbox root: the host-configured root, or the process
+    /// Set the filesystem sandbox root used by `read_file` **on the current
+    /// thread**. All relative paths resolve against this directory and any
+    /// path escaping it is refused. Pass the same directory the wasm host
+    /// preopens so the four executors agree. Thread-scoped: set it on the
+    /// thread that runs the evaluation.
+    pub fn set_fs_sandbox_root(root: impl Into<PathBuf>) {
+        FS_SANDBOX_ROOT.with(|r| *r.borrow_mut() = Some(root.into()));
+    }
+
+    /// Current sandbox root: the thread's configured root, or the process
     /// current working directory when unset.
     fn current_root() -> PathBuf {
-        if let Some(root) = FS_SANDBOX_ROOT
-            .read()
-            .expect("fs sandbox root lock poisoned")
-            .as_ref()
-        {
-            return root.clone();
+        if let Some(root) = FS_SANDBOX_ROOT.with(|r| r.borrow().clone()) {
+            return root;
         }
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     }
