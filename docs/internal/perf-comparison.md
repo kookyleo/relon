@@ -87,7 +87,10 @@ native AOT(≈Rust)  >  wasm / wasmtime  >  LuaJIT trace JIT  ≫  tree-walk 解
 - **#3 where-bound 标量常量当 SSA 已 LANDED**(承重项):`soft/dt/m*` 折成 `Op::Const*`(含 lambda 体内,非 arena captures-struct load)。**s90 实测:W20 2.14× → 1.69×**(53.9µs→42.4µs,回收 ~11.4µs/~21%),值 bit-identical(`llvm_w20_n_body` oracle + cmp_lua 三方)。
 - **#1 div-trap 消除 已建但 revert**:完整 sound 的 `FloatRange` lattice 实现,但对 W20 死代码——源里 `(s[j]-s[i])*(s[j]-s[i])` 是两个独立 SSA load,emit 时证不了相等(LLVM 仅 post-O3 CSE,trap fcmp 已发),需 **load-CSE / Dup 能力**才能让 #1 生效。按"不 ship 死码"revert,div÷0 语义保持 HEAD 行为。
 - **#2 fixed-arity reduce 寄存器化 未做**(最结构性,bit-identical 风险高)。
-- **剩余到 ≤1.2× 的路**:#1(需先上 load-CSE/Dup)+ #2(reduce 累加器 → scalar φ,解锁 SROA/向量化)。当前 **1.69×**,距 Rust 已收窄,但未贴可信门。
+- **#4 invariant.load 已 LANDED**(commit 6cd07990):`state.arena_base`(offset 0,host 写一次、call 期不写)标 `!invariant.load` → LLVM 把 inttoptr 提出循环,W20 内循环 arena-base reload 6→1。**s90 实测 1.69× → 1.57×**(纯 metadata,bit-identical)。
+- **#1 重 profile 后判定不做**:LLVM post-O3 **已自动 CSE** 重复 `s[j]-s[i]` load + 部分向量化,只剩 1 ud2、per-fdiv 零检查廉价可预测;删 trap 要 fast-math(改 bit,红线)或重建 lattice(大/险),延迟检查语义错(`1e308/1e-308`→inf,tree-walk 不 trap)。**收益已被 LLVM 自动吃掉。**
+- **#2 reduce 寄存器化 deferred(高风险)**:8 元素 state 经 where-bound 闭包链(step→accel→pair_force)以 arena handle 传,寄存器化需重写三闭包 ABI / 内联整链,bit-identical 风险极高、可能误伤 W16/W19。
+- **现状 W20 = 1.57×**(2.14×→1.69×→1.57×,两个零风险 bit-identical 赢)。**剩余 ~1.57× 全是 8 元素 state 的 arena round-trip(#2)**,需高风险结构改造才能贴 ≤1.2×——对单个 n-body workload,边际/风险偏高,**安全赢已捕获**。
 
 ---
 
