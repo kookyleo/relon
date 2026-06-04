@@ -180,10 +180,10 @@ fn host_receives_capability_denied() {
         }
     }
 
-    let node = parse_document(r#"{ x: read_file() }"#).expect("parse");
+    let node = parse_document(r#"{ x: host_read() }"#).expect("parse");
     let mut ctx = Context::sandboxed().with_root(node);
     ctx.register_fn(
-        "read_file",
+        "host_read",
         {
             // `NativeFnGate` is `#[non_exhaustive]` (defined in
             // `relon-cap`); build via default + field set.
@@ -204,7 +204,7 @@ fn host_receives_capability_denied() {
     let RuntimeError::CapabilityDenied { reason, range, .. } = &err else {
         panic!("expected CapabilityDenied, got {err:?}");
     };
-    assert!(reason.contains("read_file"), "reason: {reason}");
+    assert!(reason.contains("host_read"), "reason: {reason}");
     assert_range_pinned(*range, "CapabilityDenied");
     render_does_not_panic(&err);
 }

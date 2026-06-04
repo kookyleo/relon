@@ -60,11 +60,6 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 ret_ty,
                 cap_bit,
             } => self.emit_call_native(*import_idx, param_tys, *ret_ty, *cap_bit),
-            Op::ReadClock => self.emit_read_clock(),
-            Op::ReadRandom => self.emit_read_random(),
-            Op::ReadFile => self.emit_read_file(),
-            Op::ReadDir => self.emit_read_dir(),
-            Op::Stat => self.emit_stat(),
             other => Err(LlvmError::Codegen(format!(
                 "lower_call_rest reached non-call op {other:?} at ip={ip}"
             ))),

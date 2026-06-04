@@ -130,20 +130,14 @@ change——宿主侧别用穷举式 struct literal 构造，统一通过
 `std/...` 虚拟模块**不**消耗 `reads_fs`——它们走 `StdModuleResolver`
 而非文件系统，是规范的一部分。
 
-### 内建能力原语：`clock()` / `random()`
+### 语言没有 effectful builtin
 
-`reads_clock` 与 `uses_rng` 现在也门控两个**语言级内建原语**，而不只是
-宿主注册的原生函数：
-
-- `clock() -> Int`（wall-clock 纳秒）需 `reads_clock`。
-- `random() -> Int`（非确定 64 位）需 `uses_rng`。
-
-它们是仅有的 **effectful（有副作用）** 内建——语言与 stdlib 的其余一切
-都是纯函数。门控与原生函数完全一致：未授权即 `CapabilityDenied`。在
-**wasm 后端**它们降成**标准 WASI import**（`clock_time_get` /
-`random_get`），故产出的模块可由任何标准 WASI host 满足，relon 的
-`requires <cap>` 与 WASI 能力授予 1:1 对齐（relon 的能力位与 WASI 的能力
-分类天生同构）。详见 [标准库 → 能力门控 builtin](./stdlib.md)。
+能力位只门控**宿主注册的 `#native` fn**，绝不门控语言 builtin：Relon
+**没有**任何 effectful builtin（`clock()`、`random()`、`read_file()`、
+`read_dir()`、`stat()` 都不存在）。语言是一个纯函数 —— effectful 的值
+由宿主取好、作为 input 喂进来。详见
+[ADR](../../internal/adr-effectful-io-builtins-2026-06-04) 与
+[标准库 → 语言没有 effectful builtin](./stdlib.md)。
 
 ### `max_steps: Option<u64>`
 

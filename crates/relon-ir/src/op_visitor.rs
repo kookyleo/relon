@@ -227,29 +227,6 @@ pub trait OpVisitor {
         cap_bit: u32,
     ) -> Result<Self::Output, Self::Error>;
     fn visit_check_cap(&mut self, cap_bit: u32) -> Result<Self::Output, Self::Error>;
-    /// Built-in clock primitive (`Op::ReadClock`). Pushes one `I64`
-    /// nanosecond wall-clock reading. See the op doc for the per-target
-    /// lowering (native host helper vs standard WASI `clock_time_get`).
-    fn visit_read_clock(&mut self) -> Result<Self::Output, Self::Error>;
-    /// Built-in random primitive (`Op::ReadRandom`). Pushes one `I64`
-    /// of fresh random bytes. See the op doc for the per-target
-    /// lowering (native host helper vs standard WASI `random_get`).
-    fn visit_read_random(&mut self) -> Result<Self::Output, Self::Error>;
-    /// Built-in filesystem read primitive (`Op::ReadFile`). Pops one
-    /// `String` (the path) and pushes one `String` (the file contents).
-    /// See the op doc for the per-target lowering (native host helper
-    /// vs standard WASI `path_open`/`fd_read`/`fd_close`).
-    fn visit_read_file(&mut self) -> Result<Self::Output, Self::Error>;
-    /// Built-in directory listing primitive (`Op::ReadDir`). Pops one
-    /// `String` (the path) and pushes one `List<String>` (the sorted
-    /// entry file names). See the op doc for the per-target lowering
-    /// (native host helper; wasm32 not yet implemented).
-    fn visit_read_dir(&mut self) -> Result<Self::Output, Self::Error>;
-    /// Built-in file metadata primitive (`Op::Stat`). Pops one `String`
-    /// (the path) and pushes one `Dict` (`{is_dir: Bool, size: Int}`).
-    /// See the op doc for the per-target lowering (native host helper;
-    /// wasm32 `path_filestat_get`).
-    fn visit_stat(&mut self) -> Result<Self::Output, Self::Error>;
     fn visit_make_closure(
         &mut self,
         fn_table_idx: u32,
@@ -392,11 +369,6 @@ pub fn walk_op<V: OpVisitor>(op: &Op, visitor: &mut V) -> Result<V::Output, V::E
             cap_bit,
         } => visitor.visit_call_native(*import_idx, param_tys, *ret_ty, *cap_bit),
         Op::CheckCap { cap_bit } => visitor.visit_check_cap(*cap_bit),
-        Op::ReadClock => visitor.visit_read_clock(),
-        Op::ReadRandom => visitor.visit_read_random(),
-        Op::ReadFile => visitor.visit_read_file(),
-        Op::ReadDir => visitor.visit_read_dir(),
-        Op::Stat => visitor.visit_stat(),
         Op::Block { result_ty, body } => visitor.visit_block(*result_ty, body),
         Op::Loop { result_ty, body } => visitor.visit_loop_(*result_ty, body),
         Op::Br { label_depth } => visitor.visit_br(*label_depth),
@@ -756,31 +728,6 @@ mod tests {
         fn visit_check_cap(&mut self, _: u32) -> Result<(), ()> {
             self.calls += 1;
             self.last = "CheckCap";
-            Ok(())
-        }
-        fn visit_read_clock(&mut self) -> Result<(), ()> {
-            self.calls += 1;
-            self.last = "ReadClock";
-            Ok(())
-        }
-        fn visit_read_random(&mut self) -> Result<(), ()> {
-            self.calls += 1;
-            self.last = "ReadRandom";
-            Ok(())
-        }
-        fn visit_read_file(&mut self) -> Result<(), ()> {
-            self.calls += 1;
-            self.last = "ReadFile";
-            Ok(())
-        }
-        fn visit_read_dir(&mut self) -> Result<(), ()> {
-            self.calls += 1;
-            self.last = "ReadDir";
-            Ok(())
-        }
-        fn visit_stat(&mut self) -> Result<(), ()> {
-            self.calls += 1;
-            self.last = "Stat";
             Ok(())
         }
         fn visit_make_closure(&mut self, _: u32, _: &[ClosureCapture], _: u32) -> Result<(), ()> {

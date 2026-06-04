@@ -921,7 +921,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
 
     /// Lower `Op::StoreField { ty: ListString }` — the pointer-*array*
     /// marshalling. The source record (materialised by
-    /// `Op::ConstListString` / the `read_dir` helper) is one contiguous
+    /// `Op::ConstListString`) is one contiguous
     /// arena block laid out as
     ///
     /// ```text

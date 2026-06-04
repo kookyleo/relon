@@ -100,20 +100,6 @@ pub(super) fn make_glob_match_signature(pointer_ty: cranelift_codegen::ir::Type)
     sig
 }
 
-/// Build the cranelift signature for the `RelonReadFile` vtable slot:
-/// `extern "C" fn(state: *const SandboxState, path_off: i32) -> i32`.
-/// `path_off` is the arena-relative offset of the path's wasm-style
-/// String record; the i32 return is the arena-relative offset of the
-/// freshly tail-allocated contents String record, or a negative
-/// sentinel on failure.
-pub(super) fn make_read_file_signature(pointer_ty: cranelift_codegen::ir::Type) -> Signature {
-    let mut sig = Signature::new(CallConv::SystemV);
-    sig.params.push(AbiParam::new(pointer_ty));
-    sig.params.push(AbiParam::new(I32));
-    sig.returns.push(AbiParam::new(I32));
-    sig
-}
-
 /// Build the cranelift signature for the `RelonCallNative` vtable
 /// slot: `extern "C" fn(state: *const SandboxState, import_idx: i32,
 /// args_ptr: *const i64, arg_count: i32) -> i64`. Dispatches a

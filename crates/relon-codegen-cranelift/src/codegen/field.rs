@@ -344,8 +344,8 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
     /// marshalling. Mirrors the LLVM backend's
     /// `emit_store_field_list_string`.
     ///
-    /// The source record (materialised by `Op::ConstListString` / the
-    /// `read_dir` helper) is one contiguous arena block:
+    /// The source record (materialised by `Op::ConstListString`) is one
+    /// contiguous arena block:
     ///
     /// ```text
     ///   [str_0 record][str_1]...[str_{N-1}][header]
