@@ -171,6 +171,18 @@ fn build() -> HashMap<String, FnSignature> {
     );
     m.insert(k, v);
 
+    // Built-in WASI-backed capability primitives — always in scope, no
+    // `#import` required. `clock()` reads the wall clock (ns since the
+    // Unix epoch); `random()` reads 8 random bytes. Both are nullary,
+    // return `Int`, and are capability-gated (`reads_clock` / `uses_rng`)
+    // by the implicit gates injected in `capability_check`. The lowering
+    // recognises them as `Op::ReadClock` / `Op::ReadRandom`; native
+    // lowers to a host runtime helper, wasm to a standard WASI import.
+    let (k, v) = sig("clock", vec![], tn!(Int), None);
+    m.insert(k, v);
+    let (k, v) = sig("random", vec![], tn!(Int), None);
+    m.insert(k, v);
+
     // -- list intrinsics (polymorphic; v1.1 generics) -----------------
     // `_list_map<T, U>(List<T>, Closure<(T) -> U>) -> List<U>`.
     //

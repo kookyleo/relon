@@ -483,6 +483,16 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         self.emit_check_cap(cap_bit)
     }
 
+    fn visit_read_clock(&mut self) -> Result<(), CraneliftError> {
+        self.emit_read_clock();
+        Ok(())
+    }
+
+    fn visit_read_random(&mut self) -> Result<(), CraneliftError> {
+        self.emit_read_random();
+        Ok(())
+    }
+
     fn visit_make_closure(
         &mut self,
         fn_table_idx: u32,

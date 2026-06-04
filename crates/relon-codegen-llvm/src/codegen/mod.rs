@@ -79,6 +79,7 @@ mod mem;
 mod schema;
 mod string;
 mod unicode;
+mod wasi_cap;
 
 // Family-local enums consumed by the central `lower_op` dispatch.
 use arith::BinOp;
@@ -3092,10 +3093,13 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             // mem.rs — absolute-addressed field load
             Op::LoadFieldAtAbsolute { .. } => self.lower_mem_rest(ip, &ip_hint, &tagged.op)?,
 
-            // call.rs — native dispatch + capability gate + trap
-            Op::CallNative { .. } | Op::CheckCap { .. } | Op::Trap { .. } => {
-                self.lower_call_rest(ip, &ip_hint, &tagged.op)?
-            }
+            // call.rs — native dispatch + capability gate + trap +
+            // built-in WASI-backed capability primitives (clock/random)
+            Op::CallNative { .. }
+            | Op::CheckCap { .. }
+            | Op::Trap { .. }
+            | Op::ReadClock
+            | Op::ReadRandom => self.lower_call_rest(ip, &ip_hint, &tagged.op)?,
 
             // schema.rs — schema pointer / method dispatch
             Op::LoadSchemaPtr { .. } => self.lower_schema_rest(ip, &ip_hint, &tagged.op)?,

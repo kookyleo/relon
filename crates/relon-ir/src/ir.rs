@@ -944,6 +944,40 @@ pub enum Op {
         cap_bit: u32,
     },
 
+    /// Built-in WASI-backed clock primitive (`clock()` in source).
+    ///
+    /// Reads the current wall-clock time as a `u64` count of
+    /// nanoseconds since the Unix epoch and pushes it onto the operand
+    /// stack as an `I64`. Stack effect: `[] -> [I64]`.
+    ///
+    /// Lowering always emits a preceding `Op::CheckCap { ReadsClock }`
+    /// so the capability gate fires before the read. Backend lowering:
+    /// - **native** (cranelift + llvm): calls a trusted host runtime
+    ///   helper that reads `SystemTime::now()`.
+    /// - **wasm32**: emits the standard WASI preview1 import
+    ///   `(import "wasi_snapshot_preview1" "clock_time_get")` with the
+    ///   fixed `(i32 clock_id, i64 precision, i32 *time) -> i32 errno`
+    ///   signature, marshalling the `u64` timestamp back out of linear
+    ///   memory. Satisfied by any standard WASI host (`wasmtime-wasi`).
+    ReadClock,
+
+    /// Built-in WASI-backed random primitive (`random()` in source).
+    ///
+    /// Reads 8 fresh random bytes and pushes them onto the operand
+    /// stack as an `I64` (little-endian bit pattern). Stack effect:
+    /// `[] -> [I64]`.
+    ///
+    /// Lowering always emits a preceding `Op::CheckCap { UsesRng }`.
+    /// Backend lowering:
+    /// - **native** (cranelift + llvm): calls a trusted host runtime
+    ///   helper backed by `getrandom`-class OS entropy.
+    /// - **wasm32**: emits the standard WASI preview1 import
+    ///   `(import "wasi_snapshot_preview1" "random_get")` with the
+    ///   `(i32 *buf, i32 len) -> i32 errno` signature, marshalling the
+    ///   8 bytes back out of linear memory. Satisfied by any standard
+    ///   WASI host (`wasmtime-wasi`).
+    ReadRandom,
+
     /// Phase 4.c-1 control flow primitive.
     ///
     /// Emit a wasm `block <blocktype>` containing `body`, followed by
@@ -1704,6 +1738,12 @@ impl Op {
             // Native imports — opaque to the trace recorder by
             // construction. Always ABORTs the trace.
             Op::CallNative { .. } => Unrecoverable,
+
+            // Built-in WASI-backed capability primitives read from the
+            // host clock / OS entropy. Non-deterministic + side-effecting
+            // (they cross a capability boundary), so they're opaque to
+            // the trace recorder exactly like `Op::CallNative`.
+            Op::ReadClock | Op::ReadRandom => Unrecoverable,
         }
     }
 }

@@ -2363,6 +2363,55 @@ fn try_lower_local_closure_call(
 /// an arity mismatch here means the host registered a signature the
 /// analyzer never saw — bail to `Ok(false)` and let the unknown-method
 /// error surface rather than emit a malformed call.
+/// Capability bit index for `reads_clock`. Mirrors
+/// `relon_cap::CapabilityBit::ReadsClock.bit_index()` (== 3). relon-ir
+/// deliberately doesn't depend on relon-cap, so the index is duplicated
+/// here as a named constant; the cross-crate value is asserted by the
+/// capability-gate tests in relon-analyzer / relon-evaluator.
+const CAP_BIT_READS_CLOCK: u32 = 3;
+/// Capability bit index for `uses_rng`. Mirrors
+/// `relon_cap::CapabilityBit::UsesRng.bit_index()` (== 5).
+const CAP_BIT_USES_RNG: u32 = 5;
+
+/// Lower a built-in WASI-backed capability primitive — `clock()` or
+/// `random()` — into a `CheckCap`-guarded `ReadClock` / `ReadRandom`.
+///
+/// Both primitives are nullary, return `Int`, and are language-level
+/// intrinsics (no stdlib body, no host `#native` registration). The
+/// capability gate is emitted as an `Op::CheckCap { cap_bit }` prologue
+/// exactly like `try_lower_native_call`, so the trap fires before the
+/// effectful read. Returns `Ok(Some(()))` when the name matched (and
+/// the call was lowered), `Ok(None)` to fall through to stdlib / native
+/// dispatch.
+fn try_lower_builtin_capability(
+    name: &str,
+    args: &[relon_parser::CallArg],
+    arity: u32,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    let (cap_bit, op) = match name {
+        "clock" => (CAP_BIT_READS_CLOCK, Op::ReadClock),
+        "random" => (CAP_BIT_USES_RNG, Op::ReadRandom),
+        _ => return Ok(None),
+    };
+    // Both primitives are nullary. A wrong arity / keyword arg means the
+    // call doesn't match the built-in shape — fall through so the usual
+    // unknown-method / arg-mismatch diagnostic surfaces.
+    if arity != 0 || !args.is_empty() {
+        return Ok(None);
+    }
+    // 1. Capability prologue, before the effectful read.
+    ctx.out.push(TaggedOp {
+        op: Op::CheckCap { cap_bit },
+        range,
+    });
+    // 2. The effectful read pushes one `Int`.
+    ctx.out.push(TaggedOp { op, range });
+    ctx.tstack.push(IrType::I64);
+    Ok(Some(()))
+}
+
 fn try_lower_native_call(
     name: &str,
     args: &[relon_parser::CallArg],
@@ -2612,6 +2661,14 @@ fn lower_fn_call(
     //     `list_int_length(xs)` explicitly.
     if receiver_segments.is_empty() {
         // Free-call form.
+        // Built-in WASI-backed capability primitives (`clock()` /
+        // `random()`) resolve before stdlib dispatch: they are
+        // language-level intrinsics with no stdlib body and no host
+        // registration, lowered to a `CheckCap`-guarded `ReadClock` /
+        // `ReadRandom` op (native → host runtime, wasm → standard WASI).
+        if let Some(()) = try_lower_builtin_capability(method_name, args, arity, range, ctx)? {
+            return Ok(());
+        }
         let Some(fn_index) = stdlib_function_index(method_name) else {
             // Not a stdlib builtin — try a host-registered native fn.
             // Stdlib wins on a name clash (builtins stay first-class);

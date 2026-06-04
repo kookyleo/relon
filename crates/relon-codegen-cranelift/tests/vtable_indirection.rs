@@ -18,9 +18,10 @@ use tempfile::tempdir;
 
 #[test]
 fn vtable_layout_matches_slot_count() {
-    // 5 active slots × 8-byte pointer = 40 bytes used; the reserved
-    // section is 32 slots so we have headroom for new helpers.
-    assert_eq!(VtableSlot::COUNT, 5);
+    // 7 active slots × 8-byte pointer = 56 bytes used; the reserved
+    // section is 32 slots so we have headroom for new helpers. Slots 5/6
+    // are the built-in clock()/random() capability-primitive helpers.
+    assert_eq!(VtableSlot::COUNT, 7);
     let active_bytes: usize = VtableSlot::COUNT as usize * 8;
     assert!(VTABLE_BYTES >= active_bytes);
     assert_eq!(VtableSlot::RelonNow.offset_bytes(), 0);
@@ -28,6 +29,8 @@ fn vtable_layout_matches_slot_count() {
     assert_eq!(VtableSlot::RelonCapLookup.offset_bytes(), 16);
     assert_eq!(VtableSlot::RelonGlobMatch.offset_bytes(), 24);
     assert_eq!(VtableSlot::RelonCallNative.offset_bytes(), 32);
+    assert_eq!(VtableSlot::RelonClockWall.offset_bytes(), 40);
+    assert_eq!(VtableSlot::RelonRandom.offset_bytes(), 48);
     assert_eq!(VTABLE_SYMBOL, "__relon_capability_vtable");
 }
 

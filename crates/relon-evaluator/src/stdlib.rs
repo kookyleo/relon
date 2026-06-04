@@ -103,6 +103,23 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_fn("min", Arc::clone(&math_min));
     ctx.register_pure_fn("clamp", math_clamp);
 
+    // Built-in WASI-backed capability primitives (P-clock / P-random).
+    // These are the tree-walk gold-standard oracle for the compiled
+    // backends: `clock()` reads the wall clock (ns since the Unix
+    // epoch), `random()` reads 8 OS-entropy bytes. The ambient reads
+    // live in the delimited gated region below. Registered with a
+    // non-empty `NativeFnGate` so the evaluator enforces the capability
+    // gate (`reads_clock` / `uses_rng`) via `check_native_fn_capability`
+    // — an ungranted call raises `RuntimeError::CapabilityDenied`,
+    // matching the compiled backends' `Op::CheckCap` trap.
+    use relon_eval_api::context::NativeFnGate;
+    let mut clock_gate = NativeFnGate::default();
+    clock_gate.reads_clock = true;
+    let mut rng_gate = NativeFnGate::default();
+    rng_gate.uses_rng = true;
+    ctx.register_fn("clock", clock_gate, Arc::new(Clock));
+    ctx.register_fn("random", rng_gate, Arc::new(RandomFn));
+
     // Schema-machinery validators. Spec §6.3 mandates these exist with
     // the documented semantics; they're consumed by the `#schema`
     // decorator, not by user-facing scripts directly.
@@ -397,6 +414,62 @@ impl RelonFunction for MathAbs {
         }
     }
 }
+
+// GATED-CAPABILITY-PRIMITIVES-BEGIN
+//
+// The two impls below are the ONLY ambient-API users in this file, and
+// they are exactly what the `purity_guard` test endorses: gated host
+// fns registered via `register_fn(name, gate, fn)` with a non-empty
+// `NativeFnGate` (`reads_clock` / `uses_rng`). The purity scan excludes
+// this delimited region — the ban targets *ungated* ambient APIs, not
+// these capability-gated built-in primitives.
+
+/// Built-in `clock()` primitive. Returns the wall-clock reading as an
+/// `Int` count of nanoseconds since the Unix epoch — the same physical
+/// clock the compiled backends read (native `SystemTime`, wasm WASI
+/// `clock_time_get(CLOCK_REALTIME)`), so all three executors are
+/// value-comparable within a time window. The capability gate
+/// (`reads_clock`) is enforced by the evaluator before dispatch.
+struct Clock;
+impl RelonFunction for Clock {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        expect_arg_count(&args.into_positional(), 0, range)?;
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        Ok(Value::Int(ns))
+    }
+}
+
+/// Built-in `random()` primitive. Returns 8 fresh random bytes packed
+/// into an `Int` (little-endian), backed by OS entropy via
+/// `/dev/urandom` — the same source shape the compiled backends use
+/// (native `/dev/urandom`, wasm WASI `random_get`). The capability gate
+/// (`uses_rng`) is enforced by the evaluator before dispatch.
+struct RandomFn;
+impl RelonFunction for RandomFn {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        use std::io::Read;
+        expect_arg_count(&args.into_positional(), 0, range)?;
+        let mut buf = [0u8; 8];
+        let bits =
+            match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)) {
+                Ok(()) => i64::from_le_bytes(buf),
+                Err(_) => 0,
+            };
+        Ok(Value::Int(bits))
+    }
+}
+// GATED-CAPABILITY-PRIMITIVES-END
 
 fn to_f64_val(v: &Value) -> f64 {
     match v {
@@ -3195,6 +3268,23 @@ mod purity_guard {
             Some(idx) => &source[..idx],
             None => source,
         };
+        // Exclude the delimited gated-capability-primitive region. Those
+        // two impls (`clock` / `random`) are the endorsed exception: they
+        // ARE gated host fns (`register_fn` + non-empty `NativeFnGate`),
+        // which is exactly what this guard's error message directs ambient
+        // capabilities toward. The ban applies to *ungated* ambient APIs.
+        let source: String = match (
+            source.find("// GATED-CAPABILITY-PRIMITIVES-BEGIN"),
+            source.find("// GATED-CAPABILITY-PRIMITIVES-END"),
+        ) {
+            (Some(b), Some(e)) if e > b => {
+                let mut s = source[..b].to_string();
+                s.push_str(&source[e..]);
+                s
+            }
+            _ => source.to_string(),
+        };
+        let source = source.as_str();
         let banned = [
             "std::fs",
             "std::env",
