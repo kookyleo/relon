@@ -32,6 +32,119 @@ pub fn is_valid_rust_ident(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Filesystem sandbox root shared by every executor (tree-walk,
+/// cranelift native, llvm native).
+///
+/// P-fs Stage 1's `read_file(path)` primitive resolves its `path`
+/// argument relative to a single process-global root and refuses any
+/// path that escapes it. The default root is the process current
+/// working directory; hosts override it with [`set_fs_sandbox_root`].
+///
+/// This is the native-side analogue of the wasm preopened directory:
+/// the wasm backend lowers `read_file` to the standard preview1 fd
+/// protocol against a preopened dir, and the host preopens the same
+/// directory it installs here, so all four executors resolve a relative
+/// path against the same root. Keeping the root in one leaf crate gives
+/// every backend a single source of truth without a dependency cycle.
+mod fs_sandbox {
+    use std::path::{Path, PathBuf};
+    use std::sync::RwLock;
+
+    static FS_SANDBOX_ROOT: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+    /// Set the filesystem sandbox root used by `read_file`. All relative
+    /// paths resolve against this directory and any path escaping it is
+    /// refused. Pass the same directory the wasm host preopens so the
+    /// four executors agree.
+    pub fn set_fs_sandbox_root(root: impl Into<PathBuf>) {
+        let mut guard = FS_SANDBOX_ROOT
+            .write()
+            .expect("fs sandbox root lock poisoned");
+        *guard = Some(root.into());
+    }
+
+    /// Current sandbox root: the host-configured root, or the process
+    /// current working directory when unset.
+    fn current_root() -> PathBuf {
+        if let Some(root) = FS_SANDBOX_ROOT
+            .read()
+            .expect("fs sandbox root lock poisoned")
+            .as_ref()
+        {
+            return root.clone();
+        }
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
+
+    /// Resolve `path` against the sandbox root, refusing absolute paths
+    /// and any path that escapes the root (`../`, symlinks). Returns the
+    /// absolute, root-contained path to read.
+    ///
+    /// The escape check canonicalizes the root and the joined target so
+    /// symlink + `..` escapes are caught the same way (mirrors
+    /// `FilesystemModuleResolver`). When the file does not exist yet the
+    /// lexical-only containment check still applies, so a non-existent
+    /// `../escape.txt` is refused before the read is attempted.
+    pub fn resolve_fs_sandbox_path(path: &str) -> Result<PathBuf, String> {
+        let root = current_root();
+        let candidate = Path::new(path);
+        if candidate.is_absolute() {
+            return Err(format!(
+                "read_file: absolute path {path:?} is outside the filesystem sandbox root"
+            ));
+        }
+        let joined = root.join(candidate);
+
+        // Prefer canonicalization (catches symlink + `..` escapes). When
+        // the target does not exist, fall back to a lexical check that
+        // still rejects any component that climbs above the root.
+        let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        match std::fs::canonicalize(&joined) {
+            Ok(canon) => {
+                if !canon.starts_with(&canonical_root) {
+                    return Err(format!(
+                        "read_file: path {path:?} escapes the filesystem sandbox root"
+                    ));
+                }
+                Ok(canon)
+            }
+            Err(_) => {
+                if lexically_escapes(candidate) {
+                    return Err(format!(
+                        "read_file: path {path:?} escapes the filesystem sandbox root"
+                    ));
+                }
+                Ok(joined)
+            }
+        }
+    }
+
+    /// Lexical `..`-escape check: returns true when walking the path's
+    /// normal/parent components ever drops below the root.
+    fn lexically_escapes(path: &Path) -> bool {
+        use std::path::Component;
+        let mut depth: i32 = 0;
+        for comp in path.components() {
+            match comp {
+                Component::ParentDir => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return true;
+                    }
+                }
+                Component::Normal(_) => depth += 1,
+                Component::CurDir => {}
+                // RootDir / Prefix can't appear in a relative path we
+                // already rejected as absolute; treat as escape.
+                _ => return true,
+            }
+        }
+        false
+    }
+}
+
+pub use fs_sandbox::{resolve_fs_sandbox_path, set_fs_sandbox_root};
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -46,13 +46,24 @@ the [capability model](./sandbox):
 |---|---|---|---|
 | `clock()` | `Int` — wall-clock time in nanoseconds | `reads_clock` | standard WASI `clock_time_get` |
 | `random()` | `Int` — a non-deterministic 64-bit value | `uses_rng` | standard WASI `random_get` |
+| `read_file(path)` | `String` — the file's UTF-8 contents | `reads_fs` | standard WASI preview1 `path_open` / `fd_read` / `fd_close` |
 
 ```relon
 {
-    now: clock(),        // needs reads_clock, else CapabilityDenied
-    nonce: random()      // needs uses_rng
+    now: clock(),                 // needs reads_clock, else CapabilityDenied
+    nonce: random(),              // needs uses_rng
+    config: read_file("app.toml") // needs reads_fs
 }
 ```
+
+`read_file(path)` resolves `path` against a single host-configured **filesystem
+sandbox root** and refuses any path that escapes it (`../`, absolute paths,
+symlinks out of root → `CapabilityDenied`). The root is the native analogue of
+the directory a WASI host **preopens** for the wasm backend — relative paths
+resolve against the same root across every executor, so the result is
+byte-identical. (Stage 1 ships `read_file` on the tree-walk, cranelift-native
+and llvm-native backends; the wasm32 lowering to the preview1 fd protocol is
+staged behind it.)
 
 They are built into the language (no `#import`), but the host must grant the
 matching capability bit — the **same gate** as host-registered native fns,

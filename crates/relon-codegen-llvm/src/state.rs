@@ -483,6 +483,145 @@ pub extern "C" fn relon_llvm_read_random_i64() -> i64 {
     }
 }
 
+/// Symbol the LLVM module declares the native `read_file()` helper
+/// under (P-fs Stage 1).
+pub const RELON_LLVM_READ_FILE_SYMBOL: &str = "relon_llvm_read_file";
+
+/// Host helper backing the built-in `read_file(path)` primitive on the
+/// native target (`Op::ReadFile`). Mirrors the cranelift
+/// `relon_read_file_helper`: reads the path's wasm-style String record
+/// out of the arena, resolves it against the shared filesystem sandbox
+/// root (`relon_util`), reads the file, bump-allocates a fresh String
+/// record at `tail_cursor`, advances the cursor, and returns the new
+/// record's arena-relative offset. On failure it records a [`NativeTrap`]
+/// in `state.trap_code` and returns `-1` — the codegen turns the
+/// negative result into the standard trap epilogue.
+///
+/// ABI: `extern "C" fn(state: *const ArenaState, path_off: i32) -> i32`.
+///
+/// # Safety
+///
+/// `state` must point at a live, properly aligned [`ArenaState`] for the
+/// duration of the call (the codegen passes the same per-dispatch state
+/// pointer it threads through `relon_llvm_call_native`).
+pub unsafe extern "C" fn relon_llvm_read_file(state: *const ArenaState, path_off: i32) -> i32 {
+    if state.is_null() {
+        return -1;
+    }
+    // SAFETY: caller upholds the ArenaState invariants.
+    let state = unsafe { &*state };
+    let arena_base = unsafe { *state.arena_base.get() };
+    let arena_len = unsafe { *state.arena_len.get() };
+    if arena_base == 0 {
+        unsafe { *state.trap_code.get() = NativeTrap::HostFnMissing as u64 };
+        return -1;
+    }
+
+    // 1. Read the path bytes out of the arena (`[len: u32 LE][bytes]`).
+    let read_record = |off: i32| -> Option<(u32, *const u8)> {
+        if off < 0 {
+            return None;
+        }
+        let off_u = off as u32;
+        let header_end = off_u.checked_add(4)?;
+        if header_end > arena_len {
+            return None;
+        }
+        // SAFETY: bounds checked against arena_len.
+        let len = unsafe { std::ptr::read_unaligned((arena_base + off_u as usize) as *const u32) };
+        let payload_end = header_end.checked_add(len)?;
+        if payload_end > arena_len {
+            return None;
+        }
+        Some((len, (arena_base + header_end as usize) as *const u8))
+    };
+    let (path_len, path_ptr) = match read_record(path_off) {
+        Some(v) => v,
+        None => {
+            unsafe { *state.trap_code.get() = NativeTrap::HostFnMissing as u64 };
+            return -1;
+        }
+    };
+    // SAFETY: read_record validated the payload range.
+    let path_bytes = unsafe { std::slice::from_raw_parts(path_ptr, path_len as usize) };
+    let path = match std::str::from_utf8(path_bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            unsafe { *state.trap_code.get() = NativeTrap::HostFnMissing as u64 };
+            return -1;
+        }
+    };
+
+    // 2. Resolve against the sandbox root (refuses escapes), 3. read.
+    let resolved = match relon_util::resolve_fs_sandbox_path(path) {
+        Ok(p) => p,
+        Err(_) => {
+            unsafe { *state.trap_code.get() = NativeTrap::CapabilityDenied as u64 };
+            return -1;
+        }
+    };
+    let contents = match std::fs::read(&resolved) {
+        Ok(b) => b,
+        Err(_) => {
+            unsafe { *state.trap_code.get() = NativeTrap::CapabilityDenied as u64 };
+            return -1;
+        }
+    };
+    let content_len = match u32::try_from(contents.len()) {
+        Ok(n) => n,
+        Err(_) => {
+            unsafe { *state.trap_code.get() = NativeTrap::HostFnError as u64 };
+            return -1;
+        }
+    };
+
+    // 4. Bump-allocate a String record inside the scratch region
+    //    (`scratch_base + scratch_cursor`), 4-aligned — the same
+    //    arena-relative offset convention `Op::AllocScratch` produces
+    //    for String operands, so the record resolves verbatim as a
+    //    `String` value on the operand stack and the return-store path
+    //    copies it out normally.
+    let scratch_base = unsafe { *state.scratch_base.get() };
+    let pre = unsafe { *state.scratch_cursor.get() };
+    let aligned_cursor = relon_util::align_up(pre, 4);
+    let record_off = match scratch_base.checked_add(aligned_cursor) {
+        Some(v) => v,
+        None => {
+            unsafe { *state.trap_code.get() = NativeTrap::HostFnError as u64 };
+            return -1;
+        }
+    };
+    let header_end = match record_off.checked_add(4) {
+        Some(v) => v,
+        None => {
+            unsafe { *state.trap_code.get() = NativeTrap::HostFnError as u64 };
+            return -1;
+        }
+    };
+    let record_end = match header_end.checked_add(content_len) {
+        Some(v) => v,
+        None => {
+            unsafe { *state.trap_code.get() = NativeTrap::HostFnError as u64 };
+            return -1;
+        }
+    };
+    if record_end > arena_len {
+        unsafe { *state.trap_code.get() = NativeTrap::HostFnError as u64 };
+        return -1;
+    }
+    // SAFETY: the record `[record_off, record_end)` is inside the arena.
+    unsafe {
+        std::ptr::write_unaligned((arena_base + record_off as usize) as *mut u32, content_len);
+        std::ptr::copy_nonoverlapping(
+            contents.as_ptr(),
+            (arena_base + header_end as usize) as *mut u8,
+            contents.len(),
+        );
+        *state.scratch_cursor.get() = record_end - scratch_base;
+    }
+    i32::try_from(record_off).unwrap_or(-1)
+}
+
 /// Address of [`relon_llvm_read_clock_ns`] for `add_global_mapping`.
 #[inline]
 pub fn relon_llvm_read_clock_addr() -> usize {
@@ -493,6 +632,12 @@ pub fn relon_llvm_read_clock_addr() -> usize {
 #[inline]
 pub fn relon_llvm_read_random_addr() -> usize {
     relon_llvm_read_random_i64 as *const () as usize
+}
+
+/// Address of [`relon_llvm_read_file`] for `add_global_mapping`.
+#[inline]
+pub fn relon_llvm_read_file_addr() -> usize {
+    relon_llvm_read_file as *const () as usize
 }
 
 #[cfg(test)]

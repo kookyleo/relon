@@ -412,4 +412,37 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         }
         Ok(())
     }
+
+    /// Lower the built-in `read_file(path)` primitive (`Op::ReadFile`):
+    /// pop the path String operand (an arena-relative i32 offset), call
+    /// the `RelonReadFile` host helper through the capability vtable,
+    /// and push the contents String (also an arena-relative i32 offset).
+    /// The `reads_fs` gate fired in the preceding `Op::CheckCap`.
+    ///
+    /// The helper bump-allocates a fresh String record at `tail_cursor`
+    /// and returns its offset (or a negative sentinel on failure, having
+    /// recorded a `TrapKind` in `state.trap_code`). We load that code
+    /// and route a non-zero value to the trap epilogue, exactly like the
+    /// dynamic `Op::CallNative` path.
+    pub(super) fn emit_read_file(&mut self) -> Result<(), CraneliftError> {
+        let path_off = self.pop()?;
+        let inst = self.emit_host_fn_call(VtableSlot::RelonReadFile, &[self.state_ptr, path_off]);
+        let result_off = self.builder.inst_results(inst)[0];
+
+        // The helper records a TrapKind in `state.trap_code` on failure
+        // and returns a negative sentinel. Load the code and trap on a
+        // non-zero value (sandbox escape / I/O error / arena overflow).
+        let trap_code = self.builder.ins().load(
+            I64,
+            MemFlags::trusted(),
+            self.state_ptr,
+            STATE_OFFSET_TRAP_CODE,
+        );
+        let zero = self.builder.ins().iconst(I64, 0);
+        let trapped = self.builder.ins().icmp(IntCC::NotEqual, trap_code, zero);
+        self.cond_trap_with_code(trapped, trap_code);
+
+        self.push(result_off);
+        Ok(())
+    }
 }

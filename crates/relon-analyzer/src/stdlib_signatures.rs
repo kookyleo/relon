@@ -183,6 +183,20 @@ fn build() -> HashMap<String, FnSignature> {
     let (k, v) = sig("random", vec![], tn!(Int), None);
     m.insert(k, v);
 
+    // P-fs Stage 1: `read_file(path: String) -> String` — read a file's
+    // UTF-8 contents. Always in scope, no `#import` required. Gated by
+    // `reads_fs` (implicit gate injected in `capability_check`). The
+    // lowering recognises it as `Op::ReadFile`; native lowers to a host
+    // runtime helper (sandboxed to the configured root), wasm to the
+    // standard preview1 `path_open`/`fd_read`/`fd_close` fd protocol.
+    let (k, v) = sig(
+        "read_file",
+        vec![param("path", tn!(String))],
+        tn!(String),
+        None,
+    );
+    m.insert(k, v);
+
     // -- list intrinsics (polymorphic; v1.1 generics) -----------------
     // `_list_map<T, U>(List<T>, Closure<(T) -> U>) -> List<U>`.
     //

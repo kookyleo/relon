@@ -3094,12 +3094,14 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             Op::LoadFieldAtAbsolute { .. } => self.lower_mem_rest(ip, &ip_hint, &tagged.op)?,
 
             // call.rs — native dispatch + capability gate + trap +
-            // built-in WASI-backed capability primitives (clock/random)
+            // built-in WASI-backed capability primitives
+            // (clock/random/read_file)
             Op::CallNative { .. }
             | Op::CheckCap { .. }
             | Op::Trap { .. }
             | Op::ReadClock
-            | Op::ReadRandom => self.lower_call_rest(ip, &ip_hint, &tagged.op)?,
+            | Op::ReadRandom
+            | Op::ReadFile => self.lower_call_rest(ip, &ip_hint, &tagged.op)?,
 
             // schema.rs — schema pointer / method dispatch
             Op::LoadSchemaPtr { .. } => self.lower_schema_rest(ip, &ip_hint, &tagged.op)?,

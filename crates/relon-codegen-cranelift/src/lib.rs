@@ -76,6 +76,7 @@ pub mod error;
 pub mod evaluator;
 pub mod glob_helper;
 pub mod object_cache_integration;
+pub mod read_file_helper;
 pub mod sandbox;
 pub mod schema_cache;
 pub mod trap_handler;

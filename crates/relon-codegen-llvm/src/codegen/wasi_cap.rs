@@ -45,6 +45,7 @@
 
 use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, PointerValue};
 use inkwell::AddressSpace;
+use inkwell::IntPredicate;
 
 use relon_ir::ir::IrType;
 
@@ -75,6 +76,131 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 "read_random",
             ),
         }
+    }
+
+    /// Lower `Op::ReadFile`: built-in `read_file(path) -> String`
+    /// primitive (P-fs Stage 1). Pops the path String (an arena-relative
+    /// i32 offset) and pushes the contents String (also an arena-relative
+    /// i32 offset).
+    pub(crate) fn emit_read_file(&mut self) -> Result<(), LlvmError> {
+        match self.target {
+            crate::CodegenTarget::Wasm32 => self.emit_read_file_wasi(),
+            crate::CodegenTarget::Native => self.emit_read_file_native(),
+        }
+    }
+
+    /// Native: `call @relon_llvm_read_file(state, path_off) -> i32`. The
+    /// helper reads the path out of the arena, resolves it against the
+    /// shared sandbox root, reads the file, bump-allocates a String
+    /// record at `tail_cursor`, and returns its offset (or a negative
+    /// sentinel + `state.trap_code` on failure). Mirrors the dynamic
+    /// `Op::CallNative` trap-on-trap_code shape.
+    fn emit_read_file_native(&mut self) -> Result<(), LlvmError> {
+        let i8_t = self.ctx.i8_type();
+        let i32_t = self.ctx.i32_type();
+        let i64_t = self.ctx.i64_type();
+        let ptr_t = self.ctx.ptr_type(AddressSpace::default());
+
+        let state_ptr = self.state_ptr.ok_or_else(|| {
+            LlvmError::Codegen(
+                "Op::ReadFile requires the buffer-protocol entry (no state_ptr available)".into(),
+            )
+        })?;
+
+        // Pop the path String operand (an i32 arena offset).
+        let path_off = self.pop("ReadFile")?.val;
+
+        let symbol = crate::state::RELON_LLVM_READ_FILE_SYMBOL;
+        let helper = match self.module.get_function(symbol) {
+            Some(f) => f,
+            None => {
+                // (state: ptr, path_off: i32) -> i32
+                let fn_ty = i32_t.fn_type(&[ptr_t.into(), i32_t.into()], false);
+                self.module
+                    .add_function(symbol, fn_ty, Some(inkwell::module::Linkage::External))
+            }
+        };
+        let call_site = self
+            .builder
+            .build_call(
+                helper,
+                &[state_ptr.into(), path_off.into()],
+                &self.next_name("read_file"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("read_file build_call: {e}")))?;
+        let result_off = match call_site.try_as_basic_value() {
+            inkwell::values::ValueKind::Basic(BasicValueEnum::IntValue(v)) => v,
+            other => {
+                return Err(LlvmError::Codegen(format!(
+                    "read_file helper returned {other:?}, expected i32"
+                )));
+            }
+        };
+
+        // Load `state.trap_code`; a non-zero value means the read failed
+        // (sandbox escape / I/O error / arena overflow). Route to the
+        // trap epilogue (helper already stored the precise code).
+        let trap_gep = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    state_ptr,
+                    &[i32_t
+                        .const_int(u64::from(crate::state::ARENA_STATE_OFFSET_TRAP_CODE), false)],
+                    &self.next_name("rf_trap_gep"),
+                )
+                .map_err(|e| LlvmError::Codegen(format!("read_file trap_code gep: {e}")))?
+        };
+        let trap_code = self
+            .builder
+            .build_load(i64_t, trap_gep, &self.next_name("rf_trap_code"))
+            .map_err(|e| LlvmError::Codegen(format!("read_file trap_code load: {e}")))?
+            .into_int_value();
+        let zero = i64_t.const_zero();
+        let trapped = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                trap_code,
+                zero,
+                &self.next_name("rf_trapped"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("read_file trap cmp: {e}")))?;
+        let trap_bb = self.ctx.append_basic_block(self.func, "rf_trap");
+        let cont_bb = self.ctx.append_basic_block(self.func, "rf_cont");
+        self.builder
+            .build_conditional_branch(trapped, trap_bb, cont_bb)
+            .map_err(|e| LlvmError::Codegen(format!("read_file trap branch: {e}")))?;
+        self.builder.position_at_end(trap_bb);
+        self.emit_trap_sentinel_return("ReadFile")?;
+        self.builder.position_at_end(cont_bb);
+
+        // The result is the arena-relative offset of the contents String.
+        self.push(result_off, IrType::String);
+        Ok(())
+    }
+
+    /// wasm32 `read_file(path)` → standard preview1 fd protocol
+    /// (`path_open` -> `fd_read` -> `fd_close`) against a preopened dir,
+    /// writing the contents into a fresh arena String record.
+    ///
+    /// P-fs Stage 1 honest scope: NOT YET IMPLEMENTED on wasm32. The
+    /// spike (`tests/aot_wasm_wasi_fs_spike.rs`) proved the fd protocol +
+    /// preopened-dir host in isolation, but productionizing it here means
+    /// reconciling the WASI linear-memory iovec marshalling with the
+    /// LLVM buffer-protocol's `out_ptr`-relative tail-record convention
+    /// (`emit_store_field_pointer_indirect`) and the harness readback —
+    /// a larger block than the native arms. Surfacing a loud codegen
+    /// error keeps the wasm path from emitting a silently-wrong module
+    /// (no fake green): a `read_file` program simply refuses to compile
+    /// for wasm32 until the marshalling is wired.
+    fn emit_read_file_wasi(&mut self) -> Result<(), LlvmError> {
+        Err(LlvmError::Codegen(
+            "Op::ReadFile (read_file) wasm32 lowering not yet implemented (P-fs Stage 1 ships \
+             tree-walk + cranelift + llvm-native; wasm fd-protocol marshalling is deferred — \
+             see crates/relon-codegen-llvm/src/codegen/wasi_cap.rs)"
+                .into(),
+        ))
     }
 
     /// Native: declare the host `extern "C" fn() -> i64` helper symbol

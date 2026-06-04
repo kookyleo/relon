@@ -828,6 +828,9 @@ impl LlvmAotEvaluator {
         if let Some(f) = module.get_function(crate::state::RELON_LLVM_READ_RANDOM_SYMBOL) {
             engine.add_global_mapping(&f, crate::state::relon_llvm_read_random_addr());
         }
+        if let Some(f) = module.get_function(crate::state::RELON_LLVM_READ_FILE_SYMBOL) {
+            engine.add_global_mapping(&f, crate::state::relon_llvm_read_file_addr());
+        }
 
         let entry_ptr = engine.get_function_address(ENTRY_SYMBOL).map_err(|e| {
             LlvmError::Codegen(format!(
@@ -1978,15 +1981,16 @@ fn scan_body_effectful(body: &[relon_ir::ir::TaggedOp], effectful: &mut [bool]) 
 }
 
 /// True when any IR function body contains a built-in capability
-/// primitive (`Op::ReadClock` / `Op::ReadRandom`). These are guarded by
-/// an `Op::CheckCap` reading the buffer entry's trailing `caps` slot, so
-/// a module that uses them must take the buffer-protocol entry even when
-/// its `#main` schema is otherwise fast-path eligible.
+/// primitive (`Op::ReadClock` / `Op::ReadRandom` / `Op::ReadFile`).
+/// These are guarded by an `Op::CheckCap` reading the buffer entry's
+/// trailing `caps` slot, so a module that uses them must take the
+/// buffer-protocol entry even when its `#main` schema is otherwise
+/// fast-path eligible.
 fn ir_uses_capability_primitive(ir: &relon_ir::ir::Module) -> bool {
     use relon_ir::ir::{Op, TaggedOp};
     fn body_uses(body: &[TaggedOp]) -> bool {
         body.iter().any(|t| match &t.op {
-            Op::ReadClock | Op::ReadRandom => true,
+            Op::ReadClock | Op::ReadRandom | Op::ReadFile => true,
             Op::If {
                 then_body,
                 else_body,

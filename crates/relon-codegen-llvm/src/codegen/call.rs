@@ -62,6 +62,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             } => self.emit_call_native(*import_idx, param_tys, *ret_ty, *cap_bit),
             Op::ReadClock => self.emit_read_clock(),
             Op::ReadRandom => self.emit_read_random(),
+            Op::ReadFile => self.emit_read_file(),
             other => Err(LlvmError::Codegen(format!(
                 "lower_call_rest reached non-call op {other:?} at ip={ip}"
             ))),
@@ -619,7 +620,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// and the `Op::CallNative` trap branch (where the dispatch helper
     /// already wrote the code). Must be called on a fresh block; the
     /// caller positions at a continuation block afterwards.
-    fn emit_trap_sentinel_return(&mut self, op_hint: &str) -> Result<(), LlvmError> {
+    pub(crate) fn emit_trap_sentinel_return(&mut self, op_hint: &str) -> Result<(), LlvmError> {
         let i32_t = self.ctx.i32_type();
         // -1 as i32 — `const_int` takes the two's-complement bit pattern.
         let neg_one = i32_t.const_int(u64::from(u32::MAX), false);
