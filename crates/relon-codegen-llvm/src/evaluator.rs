@@ -1726,6 +1726,9 @@ fn read_value_from_reader(
         TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::Int) => {
             marshal_list_int_out(reader, &field.name)
         }
+        TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::String) => {
+            marshal_list_string_out(reader, &field.name)
+        }
         // ----- add new leaf marshalling arm above this line -----
         other => Err(RuntimeError::Unsupported {
             reason: format!(
@@ -1807,6 +1810,24 @@ fn marshal_list_int_out(
     reader
         .read_list_int(name)
         .map(|v| Value::list(v.into_iter().map(Value::Int).collect()))
+        .map_err(buffer_to_runtime_error)
+}
+
+/// `List<String>` return-value decode. The `StoreField { ty: ListString }`
+/// path copied the whole pointer-array block — header
+/// `[len][off_0..off_{N-1}]` plus the per-entry `[slen][utf8]` String
+/// records — into the output buffer's tail and relocated every `off_i`
+/// into the buffer's coordinate system. `BufferReader::read_list_string`
+/// walks that protocol: it follows each buffer-relative entry offset to
+/// its String record and borrows the UTF-8 payload, which we copy into
+/// owned `Value::String`s.
+fn marshal_list_string_out(
+    reader: &relon_eval_api::buffer::BufferReader<'_>,
+    name: &str,
+) -> Result<Value, RuntimeError> {
+    reader
+        .read_list_string(name)
+        .map(|v| Value::list(v.into_iter().map(|s| Value::String(s.into())).collect()))
         .map_err(buffer_to_runtime_error)
 }
 

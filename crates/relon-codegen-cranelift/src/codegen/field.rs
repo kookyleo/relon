@@ -141,9 +141,9 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
     /// wasm-side tail-cursor protocol: pop the source pointer, memcpy
     /// the `[len:4][payload]` record into `out_ptr + tail_cursor`,
     /// store `tail_cursor` (the new buffer-relative offset) into the
-    /// fixed-area slot, and bump `tail_cursor`. ListString /
-    /// ListSchema stay unsupported because they need per-entry
-    /// relocation.
+    /// fixed-area slot, and bump `tail_cursor`. ListString routes to
+    /// [`Codegen::emit_store_list_string`] (the pointer-array variant
+    /// with per-entry offset relocation); ListSchema stays unsupported.
     pub(super) fn emit_store_field(
         &mut self,
         offset: u32,
@@ -160,7 +160,10 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         ) {
             return self.emit_store_pointer_indirect(offset, ty);
         }
-        if matches!(ty, IrType::ListString | IrType::ListSchema) {
+        if matches!(ty, IrType::ListString) {
+            return self.emit_store_list_string(offset);
+        }
+        if matches!(ty, IrType::ListSchema) {
             return Err(CraneliftError::Codegen(format!(
                 "StoreField pointer-indirect type {ty:?} (pointer-array) not yet supported",
             )));
@@ -334,6 +337,131 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         self.builder
             .ins()
             .store(MemFlags::trusted(), pre_cursor, slot_addr, 0);
+        Ok(())
+    }
+
+    /// Lower `Op::StoreField { ty: ListString }` — the pointer-*array*
+    /// marshalling. Mirrors the LLVM backend's
+    /// `emit_store_field_list_string`.
+    ///
+    /// The source record (materialised by `Op::ConstListString` / the
+    /// `read_dir` helper) is one contiguous arena block:
+    ///
+    /// ```text
+    ///   [str_0 record][str_1]...[str_{N-1}][header]
+    /// ```
+    ///
+    /// with each `str_i` a 4-aligned `[slen: u32][utf8]` record and the
+    /// header a 4-aligned `[len: u32][off_0: u32]...[off_{N-1}: u32]`
+    /// whose `off_i` are *arena-relative* offsets to `str_i`. The String
+    /// records sit before the header, so `off_0` is the block's lowest
+    /// offset and the block spans `[off_0, header_end)`.
+    ///
+    /// The whole block moves rigidly into the output buffer's tail, so a
+    /// single `delta = dst_block_bufrel - src_block_start_arena` (a
+    /// multiple of 4, preserving inner alignment) relocates every inner
+    /// pointer: `new_off_i = off_i + delta`, `new_header = header_off +
+    /// delta`. We memcpy the block, stamp `new_header` into the fixed
+    /// slot, then walk the copied header's offset array adding `delta` to
+    /// each entry — rewriting arena coordinates into the out-buffer ones
+    /// `BufferReader::read_list_string` walks.
+    pub(super) fn emit_store_list_string(&mut self, offset: u32) -> Result<(), CraneliftError> {
+        let header_off = self.pop()?;
+        let arena_base = self.builder.ins().load(
+            self.pointer_ty,
+            MemFlags::trusted(),
+            self.state_ptr,
+            STATE_OFFSET_ARENA_BASE,
+        );
+
+        // len = [header_off].
+        let header_off_p = self.builder.ins().uextend(self.pointer_ty, header_off);
+        let header_abs = self.builder.ins().iadd(arena_base, header_off_p);
+        let len = self
+            .builder
+            .ins()
+            .load(I32, MemFlags::trusted(), header_abs, 0);
+
+        // offsets_end = header_off + 4 + len*4.
+        let four = self.builder.ins().iconst(I32, 4);
+        let two = self.builder.ins().iconst(I32, 2);
+        let offs_bytes = self.builder.ins().ishl(len, two);
+        let header_payload = self.builder.ins().iadd(header_off, four);
+        let offsets_end = self.builder.ins().iadd(header_payload, offs_bytes);
+
+        // src_block_start = (len != 0) ? off_0 : header_off, where
+        // off_0 = [header_off + 4]. Empty list → block is just the header.
+        let off0 = self
+            .builder
+            .ins()
+            .load(I32, MemFlags::trusted(), header_abs, 4);
+        let zero = self.builder.ins().iconst(I32, 0);
+        let len_nz = self.builder.ins().icmp(IntCC::NotEqual, len, zero);
+        let src_block_start = self.builder.ins().select(len_nz, off0, header_off);
+        let block_size = self.builder.ins().isub(offsets_end, src_block_start);
+
+        // Reserve the tail slot (4-aligned) and compute dst.
+        let dst_block = self.emit_tail_alloc(block_size, 4)?;
+        let out_ptr_i32 = self.get_local(2)?;
+        let out_ptr = self.builder.ins().uextend(self.pointer_ty, out_ptr_i32);
+        let dst_block_p = self.builder.ins().uextend(self.pointer_ty, dst_block);
+        let src_block_p = self.builder.ins().uextend(self.pointer_ty, src_block_start);
+        let dest0 = self.builder.ins().iadd(arena_base, out_ptr);
+        let dest = self.builder.ins().iadd(dest0, dst_block_p);
+        let src_abs = self.builder.ins().iadd(arena_base, src_block_p);
+        let size_p = self.builder.ins().uextend(self.pointer_ty, block_size);
+        self.builder
+            .call_memcpy(self.frontend_config, dest, src_abs, size_p);
+
+        // delta = dst_block - src_block_start (multiple of 4).
+        let delta = self.builder.ins().isub(dst_block, src_block_start);
+
+        // new_header_bufrel = header_off + delta -> fixed-area slot.
+        let new_header = self.builder.ins().iadd(header_off, delta);
+        let slot_addr = self.buffer_field_addr(2 /* out_ptr */, offset, 4)?;
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), new_header, slot_addr, 0);
+
+        // entries_base (buffer-relative) = new_header + 4; absolute base
+        // = arena_base + out_ptr + entries_base.
+        let entries_base = self.builder.ins().iadd(new_header, four);
+        let entries_base_p = self.builder.ins().uextend(self.pointer_ty, entries_base);
+        let entries_abs = self.builder.ins().iadd(dest0, entries_base_p);
+
+        // Relocation loop: for i in 0..len, *(entries_abs + i*4) += delta.
+        let header_blk = self.builder.create_block();
+        let body_blk = self.builder.create_block();
+        let done_blk = self.builder.create_block();
+        self.builder.append_block_param(header_blk, I32);
+        let i0 = self.builder.ins().iconst(I32, 0);
+        self.builder.ins().jump(header_blk, &[i0.into()]);
+
+        self.builder.switch_to_block(header_blk);
+        let i_val = self.builder.block_params(header_blk)[0];
+        let cond = self.builder.ins().icmp(IntCC::UnsignedLessThan, i_val, len);
+        self.builder.ins().brif(cond, body_blk, &[], done_blk, &[]);
+
+        self.builder.switch_to_block(body_blk);
+        let i_bytes = self.builder.ins().ishl(i_val, two);
+        let i_bytes_p = self.builder.ins().uextend(self.pointer_ty, i_bytes);
+        let entry_addr = self.builder.ins().iadd(entries_abs, i_bytes_p);
+        let old = self
+            .builder
+            .ins()
+            .load(I32, MemFlags::trusted(), entry_addr, 0);
+        let new = self.builder.ins().iadd(old, delta);
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), new, entry_addr, 0);
+        let one = self.builder.ins().iconst(I32, 1);
+        let i_next = self.builder.ins().iadd(i_val, one);
+        self.builder.ins().jump(header_blk, &[i_next.into()]);
+
+        self.builder.switch_to_block(done_blk);
+        self.builder.seal_block(header_blk);
+        self.builder.seal_block(body_blk);
+        self.builder.seal_block(done_blk);
         Ok(())
     }
 
