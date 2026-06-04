@@ -880,6 +880,54 @@ impl SandboxState {
         state.epoch.elapsed().as_nanos() as i64
     }
 
+    /// Host helper for the built-in `clock()` primitive (`Op::ReadClock`).
+    /// Reads the wall clock (`SystemTime::now()`) and returns the count
+    /// of nanoseconds since the Unix epoch — the native-target analogue
+    /// of the wasm `clock_time_get(CLOCK_REALTIME, ...)` import, so the
+    /// two backends produce values off the same physical clock.
+    ///
+    /// Distinct from [`Self::now_helper`], which probes the *monotonic*
+    /// deadline clock and may fast-return 0. The capability gate
+    /// (`reads_clock`) is enforced by the preceding `Op::CheckCap`.
+    ///
+    /// # Safety
+    ///
+    /// `state` must point at a live, properly aligned [`SandboxState`]
+    /// for the duration of the call. Unused here, but the call shape
+    /// matches the other vtable helpers (`fn(*state) -> i64`).
+    pub(crate) unsafe extern "C" fn clock_wall_helper(_state: *const SandboxState) -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0)
+    }
+
+    /// Host helper for the built-in `random()` primitive
+    /// (`Op::ReadRandom`). Returns 8 fresh random bytes packed into an
+    /// `i64` (little-endian), the native-target analogue of the wasm
+    /// `random_get` WASI import.
+    ///
+    /// Backed by OS entropy via `/dev/urandom` (std-only, no extra
+    /// crate dependency; the supported target is Linux-x86_64). The
+    /// capability gate (`uses_rng`) is enforced by the preceding
+    /// `Op::CheckCap`. On a read failure the helper returns 0 rather
+    /// than trapping — a degraded but well-defined value; production
+    /// hosts on this target always have `/dev/urandom`.
+    ///
+    /// # Safety
+    ///
+    /// `state` must point at a live, properly aligned [`SandboxState`]
+    /// for the duration of the call (unused here; call shape mirrors
+    /// the other vtable helpers).
+    pub(crate) unsafe extern "C" fn random_helper(_state: *const SandboxState) -> i64 {
+        use std::io::Read;
+        let mut buf = [0u8; 8];
+        match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)) {
+            Ok(()) => i64::from_le_bytes(buf),
+            Err(_) => 0,
+        }
+    }
+
     /// Helper invoked from cranelift to record a trap code. The JIT
     /// epilogue calls this then returns a sentinel value the
     /// trampoline interprets as "trap fired".

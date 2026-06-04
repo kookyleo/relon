@@ -91,13 +91,25 @@ pub enum VtableSlot {
     /// `Arc<dyn RelonFunction>` registered at `import_idx`, packs the
     /// scalar args, and invokes it. See [`SandboxState::call_native`].
     RelonCallNative = 4,
+    /// `extern "C" fn(state: *const SandboxState) -> i64`.
+    ///
+    /// Built-in `clock()` primitive (`Op::ReadClock`). Reads the host
+    /// wall clock (`SystemTime::now()`) and returns the count of
+    /// nanoseconds since the Unix epoch. Distinct from
+    /// [`Self::RelonNow`], which is the monotonic deadline probe.
+    RelonClockWall = 5,
+    /// `extern "C" fn(state: *const SandboxState) -> i64`.
+    ///
+    /// Built-in `random()` primitive (`Op::ReadRandom`). Returns 8
+    /// fresh random bytes packed into an `i64` (host OS entropy).
+    RelonRandom = 6,
 }
 
 impl VtableSlot {
     /// Number of slots reserved in the vtable. Bumping this requires
     /// a `GENERATOR_VERSION` bump in `object_cache_integration` so
     /// older cache files self-invalidate.
-    pub const COUNT: u32 = 5;
+    pub const COUNT: u32 = 7;
 
     /// Byte offset of this slot inside the vtable. Each slot is one
     /// host pointer (8 bytes on x86_64-linux, which is v5-γ's only
@@ -148,16 +160,21 @@ pub unsafe fn populate_vtable(vtable_ptr: *mut u8) {
         *slots.add(VtableSlot::RelonGlobMatch as usize) =
             crate::glob_helper::relon_glob_match_helper as *const u8;
         *slots.add(VtableSlot::RelonCallNative as usize) = SandboxState::call_native as *const u8;
+        *slots.add(VtableSlot::RelonClockWall as usize) =
+            SandboxState::clock_wall_helper as *const u8;
+        *slots.add(VtableSlot::RelonRandom as usize) = SandboxState::random_helper as *const u8;
     }
     tracing::trace!(
         target: "relon::vtable",
-        "populated vtable at {:p}: now={:p} raise_trap={:p} cap_lookup={:p} glob_match={:p} call_native={:p}",
+        "populated vtable at {:p}: now={:p} raise_trap={:p} cap_lookup={:p} glob_match={:p} call_native={:p} clock_wall={:p} random={:p}",
         vtable_ptr,
         SandboxState::now_helper as *const u8,
         SandboxState::raise_trap as *const u8,
         SandboxState::cap_lookup as *const u8,
         crate::glob_helper::relon_glob_match_helper as *const u8,
         SandboxState::call_native as *const u8,
+        SandboxState::clock_wall_helper as *const u8,
+        SandboxState::random_helper as *const u8,
     );
 }
 
@@ -172,6 +189,8 @@ mod tests {
         assert_eq!(VtableSlot::RelonCapLookup.offset_bytes(), 16);
         assert_eq!(VtableSlot::RelonGlobMatch.offset_bytes(), 24);
         assert_eq!(VtableSlot::RelonCallNative.offset_bytes(), 32);
+        assert_eq!(VtableSlot::RelonClockWall.offset_bytes(), 40);
+        assert_eq!(VtableSlot::RelonRandom.offset_bytes(), 48);
     }
 
     #[test]
@@ -184,6 +203,8 @@ mod tests {
             VtableSlot::RelonCapLookup,
             VtableSlot::RelonGlobMatch,
             VtableSlot::RelonCallNative,
+            VtableSlot::RelonClockWall,
+            VtableSlot::RelonRandom,
         ];
         assert_eq!(variants.len() as u32, VtableSlot::COUNT);
     }
@@ -213,6 +234,8 @@ mod tests {
             assert!(!(*slots.add(2)).is_null(), "RelonCapLookup slot");
             assert!(!(*slots.add(3)).is_null(), "RelonGlobMatch slot");
             assert!(!(*slots.add(4)).is_null(), "RelonCallNative slot");
+            assert!(!(*slots.add(5)).is_null(), "RelonClockWall slot");
+            assert!(!(*slots.add(6)).is_null(), "RelonRandom slot");
         }
     }
 }

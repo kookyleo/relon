@@ -759,6 +759,14 @@ impl LlvmAotEvaluator {
             .is_some()
             || module
                 .get_function(crate::state::RELON_LLVM_CALL_NATIVE_SYMBOL)
+                .is_some()
+            // Built-in clock()/random() host helpers are host-resident
+            // externs too — same ±2 GB-relocation constraint.
+            || module
+                .get_function(crate::state::RELON_LLVM_READ_CLOCK_SYMBOL)
+                .is_some()
+            || module
+                .get_function(crate::state::RELON_LLVM_READ_RANDOM_SYMBOL)
                 .is_some();
         let force_default_mcjit = std::env::var_os("RELON_LLVM_FORCE_DEFAULT_MCJIT").is_some();
         let engine = if uses_extern_shim || force_default_mcjit {
@@ -807,6 +815,18 @@ impl LlvmAotEvaluator {
         // a `CallNative` (the symbol is absent).
         if let Some(cn_fn) = module.get_function(crate::state::RELON_LLVM_CALL_NATIVE_SYMBOL) {
             engine.add_global_mapping(&cn_fn, crate::state::relon_llvm_call_native_addr());
+        }
+
+        // Built-in WASI-backed capability primitives on the native
+        // target: map the `clock()` / `random()` host helpers so an
+        // emitted `call @relon_llvm_read_clock_ns` / `..._read_random_i64`
+        // resolves (same MCJIT-mapping constraint as the helpers above).
+        // No-op when the module never emitted the matching primitive.
+        if let Some(f) = module.get_function(crate::state::RELON_LLVM_READ_CLOCK_SYMBOL) {
+            engine.add_global_mapping(&f, crate::state::relon_llvm_read_clock_addr());
+        }
+        if let Some(f) = module.get_function(crate::state::RELON_LLVM_READ_RANDOM_SYMBOL) {
+            engine.add_global_mapping(&f, crate::state::relon_llvm_read_random_addr());
         }
 
         let entry_ptr = engine.get_function_address(ENTRY_SYMBOL).map_err(|e| {
@@ -1957,6 +1977,28 @@ fn scan_body_effectful(body: &[relon_ir::ir::TaggedOp], effectful: &mut [bool]) 
     }
 }
 
+/// True when any IR function body contains a built-in capability
+/// primitive (`Op::ReadClock` / `Op::ReadRandom`). These are guarded by
+/// an `Op::CheckCap` reading the buffer entry's trailing `caps` slot, so
+/// a module that uses them must take the buffer-protocol entry even when
+/// its `#main` schema is otherwise fast-path eligible.
+fn ir_uses_capability_primitive(ir: &relon_ir::ir::Module) -> bool {
+    use relon_ir::ir::{Op, TaggedOp};
+    fn body_uses(body: &[TaggedOp]) -> bool {
+        body.iter().any(|t| match &t.op {
+            Op::ReadClock | Op::ReadRandom => true,
+            Op::If {
+                then_body,
+                else_body,
+                ..
+            } => body_uses(then_body) || body_uses(else_body),
+            Op::Block { body, .. } | Op::Loop { body, .. } => body_uses(body),
+            _ => false,
+        })
+    }
+    ir.funcs.iter().any(|f| body_uses(&f.body))
+}
+
 /// order to buffer offsets when eligible.
 fn build_fast_path_profile(schema: &BufferSchema) -> Result<FastPathProfile, ()> {
     use relon_eval_api::schema_canonical::TypeRepr;
@@ -2331,6 +2373,14 @@ impl LlvmAotEvaluator {
             // fast `(i64..)->i64` entry has neither). Same reasoning the
             // closed-world arm uses to force buffer mode.
             WorldMode::OpenWorld if !ir.imports.is_empty() => None,
+            // P-clock / P-random: a built-in capability primitive
+            // (`Op::ReadClock` / `Op::ReadRandom`) is guarded by an
+            // `Op::CheckCap` that reads the trailing `caps` slot — only
+            // the buffer entry threads it. Force buffer mode even for an
+            // Int-only `#main` whose body reads the clock / RNG (no
+            // `#native` import, so the `imports.is_empty()` arm above
+            // doesn't fire). Same reasoning as the host-fn arm.
+            WorldMode::OpenWorld if ir_uses_capability_primitive(&ir) => None,
             WorldMode::OpenWorld => build_fast_path_profile(&schema).ok(),
         };
 

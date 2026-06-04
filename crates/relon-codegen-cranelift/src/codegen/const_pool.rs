@@ -722,6 +722,12 @@ impl OpVisitor for ConstPool {
     fn visit_check_cap(&mut self, _: u32) -> Result<(), CraneliftError> {
         Ok(())
     }
+    fn visit_read_clock(&mut self) -> Result<(), CraneliftError> {
+        Ok(())
+    }
+    fn visit_read_random(&mut self) -> Result<(), CraneliftError> {
+        Ok(())
+    }
     fn visit_make_closure(
         &mut self,
         _: u32,

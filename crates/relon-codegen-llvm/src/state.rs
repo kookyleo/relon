@@ -435,6 +435,66 @@ pub fn relon_llvm_call_native_addr() -> usize {
     relon_llvm_call_native as *const () as usize
 }
 
+// ---------------------------------------------------------------------
+// Built-in WASI-backed capability primitives — NATIVE target helpers.
+//
+// On the native (non-wasm) target the built-in `clock()` / `random()`
+// primitives (`Op::ReadClock` / `Op::ReadRandom`) lower to a `call` of
+// these host-resident `extern "C"` symbols, resolved at MCJIT link time
+// via `engine.add_global_mapping` (same mechanism as
+// `relon_llvm_call_native`). On wasm32 the same ops instead emit a
+// standard WASI import (`clock_time_get` / `random_get`) — see
+// `crate::wasi_cap`. The capability gate (`reads_clock` / `uses_rng`)
+// rides the preceding `Op::CheckCap`.
+// ---------------------------------------------------------------------
+
+/// Symbol the LLVM module declares the native `clock()` helper under.
+pub const RELON_LLVM_READ_CLOCK_SYMBOL: &str = "relon_llvm_read_clock_ns";
+
+/// Symbol the LLVM module declares the native `random()` helper under.
+pub const RELON_LLVM_READ_RANDOM_SYMBOL: &str = "relon_llvm_read_random_i64";
+
+/// Host helper backing the built-in `clock()` primitive on the native
+/// target. Returns the wall-clock reading as nanoseconds since the Unix
+/// epoch — the native analogue of the wasm `clock_time_get(REALTIME)`
+/// import, so both backends read off the same physical clock.
+///
+/// `extern "C"` + no unwind: a clock read cannot fail in a way that
+/// needs to cross the boundary (the `unwrap_or(0)` keeps it total).
+pub extern "C" fn relon_llvm_read_clock_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+/// Host helper backing the built-in `random()` primitive on the native
+/// target. Returns 8 fresh random bytes packed into an i64 (LE) — the
+/// native analogue of the wasm `random_get` import. Backed by OS
+/// entropy via `/dev/urandom` (std-only; the supported target is
+/// Linux-x86_64). Returns 0 on read failure (degraded but well-defined;
+/// production hosts on this target always have `/dev/urandom`).
+pub extern "C" fn relon_llvm_read_random_i64() -> i64 {
+    use std::io::Read;
+    let mut buf = [0u8; 8];
+    match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut buf)) {
+        Ok(()) => i64::from_le_bytes(buf),
+        Err(_) => 0,
+    }
+}
+
+/// Address of [`relon_llvm_read_clock_ns`] for `add_global_mapping`.
+#[inline]
+pub fn relon_llvm_read_clock_addr() -> usize {
+    relon_llvm_read_clock_ns as *const () as usize
+}
+
+/// Address of [`relon_llvm_read_random_i64`] for `add_global_mapping`.
+#[inline]
+pub fn relon_llvm_read_random_addr() -> usize {
+    relon_llvm_read_random_i64 as *const () as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

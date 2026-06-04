@@ -56,13 +56,12 @@ pub(crate) fn run(workspace: &mut WorkspaceTree) {
         return;
     };
     let caps = entry_tree.caps.clone();
-    let gates = entry_tree.host_fn_gates.clone();
-
-    // No gates → nothing to enforce. Skip the walk entirely so hosts
-    // that only register pure fns (empty gate map) pay zero overhead.
-    if gates.is_empty() {
-        return;
-    }
+    let mut gates = entry_tree.host_fn_gates.clone();
+    // The built-in WASI-backed capability primitives (`clock` /
+    // `random`) always carry an implicit gate, even with no host-
+    // registered gates. Inject them so an ungranted `clock()` /
+    // `random()` is flagged the same way a gated `#native` call is.
+    insert_builtin_capability_gates(&mut gates);
 
     // v1.1 control-flow pruning + single-pass walk: collect every node
     // id that lives under a statically-dead branch (`false ? ... : 0`
@@ -113,13 +112,11 @@ pub(crate) fn run(workspace: &mut WorkspaceTree) {
 /// any [`Diagnostic::CapabilityRequired`] (Error severity) to the
 /// tree's own diagnostics so the build fails before lowering.
 pub(crate) fn run_single(tree: &mut AnalyzedTree) {
-    // No gates → nothing to enforce; zero overhead for pure-fn hosts
-    // and every host-fn-free source.
-    if tree.host_fn_gates.is_empty() {
-        return;
-    }
     let caps = tree.caps.clone();
-    let gates = tree.host_fn_gates.clone();
+    let mut gates = tree.host_fn_gates.clone();
+    // Built-in `clock` / `random` always carry an implicit gate (see
+    // `run`), so the walk runs even when the host registered no gates.
+    insert_builtin_capability_gates(&mut gates);
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
     walk_tree_for_gated_calls(tree, &caps, &gates, &mut diagnostics);
     tree.diagnostics.extend(diagnostics);
@@ -130,6 +127,27 @@ pub(crate) fn run_single(tree: &mut AnalyzedTree) {
 /// a diagnostic for each reachable gated call whose cap isn't granted.
 /// Used by both the workspace [`run`] and the single-tree
 /// [`run_single`].
+/// Inject the implicit gates for the built-in WASI-backed capability
+/// primitives. `clock()` requires `reads_clock`; `random()` requires
+/// `uses_rng`. These are language-level intrinsics (no host
+/// registration), so the gate is synthesized here rather than read from
+/// `host_fn_gates`. A host that also registers a `clock` / `random`
+/// fn keeps its own gate (we only insert when absent), but the built-in
+/// names are reserved by the lowering, so that shadowing does not occur
+/// in practice.
+fn insert_builtin_capability_gates(gates: &mut HashMap<String, NativeFnGate>) {
+    gates.entry("clock".to_string()).or_insert_with(|| {
+        let mut g = NativeFnGate::default();
+        g.reads_clock = true;
+        g
+    });
+    gates.entry("random".to_string()).or_insert_with(|| {
+        let mut g = NativeFnGate::default();
+        g.uses_rng = true;
+        g
+    });
+}
+
 fn walk_tree_for_gated_calls(
     tree: &AnalyzedTree,
     caps: &Capabilities,

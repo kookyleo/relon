@@ -6101,3 +6101,114 @@ fn run_main_w7_recursive_closure_dict_field() {
         d.map
     );
 }
+
+// ---------------------------------------------------------------------
+// P-clock / P-random — built-in WASI-backed capability primitives.
+//
+// Tree-walk gold-standard oracle assertions. clock()/random() values are
+// non-deterministic, so these assert per-tier credibility (plausible
+// range / non-constant) rather than bit-equality, plus the capability
+// gate (granted -> value, ungranted -> CapabilityDenied).
+// ---------------------------------------------------------------------
+
+/// Evaluate `source` under an explicit capability grant.
+fn eval_doc_with_caps(source: &str, caps: Capabilities) -> Result<Value, RuntimeError> {
+    let node = parse_doc(source);
+    let mut ctx = Context::new().with_root(node);
+    ctx.capabilities = caps;
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx))
+        .eval_root(&std::sync::Arc::new(Scope::default()))
+}
+
+fn caps_reads_clock() -> Capabilities {
+    let mut c = Capabilities::default();
+    c.reads_clock = true;
+    c
+}
+
+fn caps_uses_rng() -> Capabilities {
+    let mut c = Capabilities::default();
+    c.uses_rng = true;
+    c
+}
+
+#[test]
+fn builtin_clock_granted_returns_plausible_wall_clock() {
+    // Wall-clock reading must land within a sane window of the test
+    // process's own SystemTime read (credibility, not bit-equality).
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    let v = eval_doc_with_caps("{ t: clock() }", caps_reads_clock()).expect("clock granted");
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    let Value::Dict(d) = v else {
+        panic!("expected dict, got {v:?}");
+    };
+    let Some(Value::Int(ns)) = d.map.get("t") else {
+        panic!("clock() should yield an Int, got {:?}", d.map.get("t"));
+    };
+    let slack = 5_000_000_000i64; // 5s scheduling slack
+    assert!(
+        *ns >= before - slack && *ns <= after + slack,
+        "clock() reading {ns} ns outside window [{before}, {after}] (+/-5s)"
+    );
+}
+
+#[test]
+fn builtin_clock_ungranted_denied() {
+    let err = eval_doc_with_caps("{ t: clock() }", Capabilities::default())
+        .expect_err("ungranted clock() must be denied");
+    assert!(
+        matches!(err, RuntimeError::CapabilityDenied { .. }),
+        "expected CapabilityDenied, got {err:?}"
+    );
+}
+
+#[test]
+fn builtin_random_granted_is_non_constant() {
+    // Random values are non-deterministic: assert the distribution is
+    // not a frozen constant (two reads differ) rather than any value.
+    let v = eval_doc_with_caps("{ a: random(), b: random(), c: random() }", caps_uses_rng())
+        .expect("random granted");
+    let Value::Dict(d) = v else {
+        panic!("expected dict, got {v:?}");
+    };
+    let pick = |k: &str| match d.map.get(k) {
+        Some(Value::Int(n)) => *n,
+        other => panic!("random() should yield an Int, got {other:?}"),
+    };
+    let (a, b, c) = (pick("a"), pick("b"), pick("c"));
+    assert!(
+        !(a == b && b == c),
+        "three random() reads were all identical ({a}); RNG looks frozen"
+    );
+}
+
+#[test]
+fn builtin_random_ungranted_denied() {
+    let err = eval_doc_with_caps("{ r: random() }", Capabilities::default())
+        .expect_err("ungranted random() must be denied");
+    assert!(
+        matches!(err, RuntimeError::CapabilityDenied { .. }),
+        "expected CapabilityDenied, got {err:?}"
+    );
+}
+
+#[test]
+fn builtin_clock_cap_bit_index_matches_ir_constant() {
+    // Cross-crate guard: the IR lowering hard-codes the cap bit indices
+    // (relon-ir has no relon-cap dep). Pin them against the canonical
+    // CapabilityBit values so the duplication can't silently drift.
+    use relon_eval_api::CapabilityBit;
+    assert_eq!(CapabilityBit::ReadsClock.bit_index(), 3);
+    assert_eq!(CapabilityBit::UsesRng.bit_index(), 5);
+}
