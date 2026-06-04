@@ -23,16 +23,20 @@
 //! listing, the wasm lowering raises a loud codegen error — asserted by
 //! [`read_dir_wasm_is_a_loud_codegen_error`].
 //!
-//! ## why the listing is observed via where-bound indexing
+//! ## the listing is observed as a direct `List<String>` return
 //!
-//! A top-level `#main() -> List<String>` return is refused by the
-//! cranelift / llvm-native return-root copy path (pointer-array
-//! relocation is `not yet supported` — a pre-existing limitation
-//! independent of read_dir). The W5-P2 `List<String>` shape that IS
-//! `from_source`-reachable binds the list in a `where` and indexes it
-//! by the `#main` Int param, returning a schema-wrapped `String`. We
-//! reuse that exact shape to observe each sorted entry name on all
-//! three backends.
+//! A top-level `#main() -> List<String>` return is now marshalled by
+//! the cranelift / llvm-native `StoreField { ty: ListString }` path:
+//! the whole pointer-array record (header `[len][off_0..]` plus the
+//! per-entry `[slen][utf8]` String records) is copied into the output
+//! buffer's tail and every inner offset relocated into the buffer's
+//! coordinate system (`emit_store_field_list_string` /
+//! `emit_store_list_string`). `read_dir(".")` is therefore returned
+//! straight out of `#main` and the three native executors compared
+//! whole-list (sorted, so byte-deterministic). The wasm32 arm stays
+//! deferred for two independent reasons: `fd_readdir` enumeration is
+//! unimplemented AND the relon-rs `EmittedFieldType` triple has no
+//! `ListString` tag yet (the AOT-binding / wasm-object emit path).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -87,22 +91,25 @@ fn opts_reads_fs() -> AnalyzeOptions {
     }
 }
 
-/// `read_dir(".")` bound in a `where`, indexed by the `#main` Int param,
-/// returned through a schema-wrapped `String` field. The
-/// `from_source`-reachable shape for observing a `List<String>` element
-/// on the compiled backends (same shape as `w5_p2_list_string`).
-const SRC: &str = "#schema R { String result: * }\n\
-                   #main(Int i) -> R\n\
-                   { result: (entries[i] where { entries: read_dir(\".\") }) }";
+/// `read_dir(".")` returned directly as the `#main` result. The
+/// `StoreField { ty: ListString }` marshalling copies the whole
+/// pointer-array record into the output buffer's tail with each inner
+/// offset relocated, so the sorted listing is observed as a direct
+/// `List<String>` return on all three native backends.
+const SRC: &str = "#main(Int i) -> List<String>\n\
+                   read_dir(\".\")";
 
-/// Pull the `result` String field out of the returned schema dict.
-fn result_of(v: &Value) -> String {
+/// Pull the sorted entry names out of the returned `List<String>`.
+fn result_of(v: &Value) -> Vec<String> {
     match v {
-        Value::Dict(d) => match d.map.get("result").expect("return dict has `result`") {
-            Value::String(s) => s.to_string(),
-            other => panic!("expected String `result`, got {other:?}"),
-        },
-        other => panic!("expected schema Dict return, got {other:?}"),
+        Value::List(items) => items
+            .iter()
+            .map(|e| match e {
+                Value::String(s) => s.to_string(),
+                other => panic!("expected String element, got {other:?}"),
+            })
+            .collect(),
+        other => panic!("expected List<String> return, got {other:?}"),
     }
 }
 
@@ -110,8 +117,8 @@ fn arg_i(i: i64) -> HashMap<String, Value> {
     HashMap::from([("i".to_string(), Value::Int(i))])
 }
 
-/// Tree-walk gold standard at index `i`.
-fn run_tree_walk(i: i64) -> String {
+/// Tree-walk gold standard listing.
+fn run_tree_walk(i: i64) -> Vec<String> {
     use relon_evaluator::{Context, TreeWalkEvaluator};
     use relon_parser::parse_document;
     let node = parse_document(SRC).expect("parse");
@@ -145,25 +152,42 @@ fn read_dir_three_native_executors_are_byte_equal() {
         .expect("llvm from_source")
         .with_granted_cap(CapabilityBit::ReadsFs.bit_index());
 
-    for (i, want) in SORTED.iter().enumerate() {
-        let idx = i as i64;
-        let tw = run_tree_walk(idx);
-        assert_eq!(tw, *want, "tree-walk sorted entry {i} mismatch");
+    let want: Vec<String> = SORTED.iter().map(|s| s.to_string()).collect();
+    let tw = run_tree_walk(0);
+    assert_eq!(tw, want, "tree-walk sorted listing mismatch");
 
-        let cl_v = result_of(&cl.run_main(arg_i(idx)).expect("cranelift run_main"));
-        assert_eq!(
-            cl_v, tw,
-            "cranelift read_dir[{i}] not byte-equal to tree-walk gold standard"
-        );
+    let cl_v = result_of(&cl.run_main(arg_i(0)).expect("cranelift run_main"));
+    assert_eq!(
+        cl_v, tw,
+        "cranelift read_dir() List<String> return not byte-equal to tree-walk gold standard"
+    );
 
-        let llvm_v = result_of(&llvm.run_main(arg_i(idx)).expect("llvm run_main"));
-        assert_eq!(
-            llvm_v, tw,
-            "llvm-native read_dir[{i}] not byte-equal to tree-walk gold standard"
-        );
-    }
+    let llvm_v = result_of(&llvm.run_main(arg_i(0)).expect("llvm run_main"));
+    assert_eq!(
+        llvm_v, tw,
+        "llvm-native read_dir() List<String> return not byte-equal to tree-walk gold standard"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A const `#main() -> List<String>` literal returns the same bytes on
+/// all three native backends — the `StoreField { ty: ListString }`
+/// pointer-array marshalling exercised without the `read_dir` helper
+/// (the const-pool `ConstListString` blob is the source record).
+#[test]
+fn const_list_string_return_three_way() {
+    const CONST_SRC: &str = "#main(Int i) -> List<String>\n[\"b\", \"a\", \"c\"]";
+    let want = vec!["b".to_string(), "a".to_string(), "c".to_string()];
+
+    let cl = AotEvaluator::from_source(CONST_SRC).expect("cranelift from_source");
+    let llvm = LlvmAotEvaluator::from_source(CONST_SRC).expect("llvm from_source");
+
+    let cl_v = result_of(&cl.run_main(arg_i(0)).expect("cranelift run_main"));
+    assert_eq!(cl_v, want, "cranelift const List<String> return mismatch");
+    let llvm_v = result_of(&llvm.run_main(arg_i(0)).expect("llvm run_main"));
+    assert_eq!(llvm_v, want, "llvm const List<String> return mismatch");
+    assert_eq!(cl_v, llvm_v, "cranelift vs llvm const return divergence");
 }
 
 #[test]
@@ -234,9 +258,17 @@ fn read_dir_path_escape_traps_on_native_backends() {
 fn read_dir_wasm_is_a_loud_codegen_error() {
     let (dir, _serial) = fixture("wasm_reject");
 
+    // Use the schema-wrapped String-return shape (read_dir bound in a
+    // `where`, indexed) so the wasm emit reaches the `read_dir` /
+    // `fd_readdir` body codegen error rather than tripping on the
+    // separate `List<String>` return-marshalling triple gap first — this
+    // test pins the fd_readdir enumeration deferral specifically.
+    const WASM_REJECT_SRC: &str = "#schema R { String result: * }\n\
+                                   #main(Int i) -> R\n\
+                                   { result: (entries[i] where { entries: read_dir(\".\") }) }";
     let obj = std::env::temp_dir().join(format!("relon_rd_wasm_{}.o", std::process::id()));
     let err = LlvmAotEvaluator::emit_object_for_target(
-        SRC,
+        WASM_REJECT_SRC,
         "relon_main_read_dir",
         &obj,
         &opts_reads_fs(),

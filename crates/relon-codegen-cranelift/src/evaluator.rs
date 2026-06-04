@@ -1885,6 +1885,14 @@ fn read_value_from_reader(
                 .read_list_bool(&field.name)
                 .map(|v| Value::List(Arc::new(v.into_iter().map(Value::Bool).collect())))
                 .map_err(buffer_to_runtime_error),
+            TypeRepr::String => reader
+                .read_list_string(&field.name)
+                .map(|v| {
+                    Value::List(Arc::new(
+                        v.into_iter().map(|s| Value::String(s.into())).collect(),
+                    ))
+                })
+                .map_err(buffer_to_runtime_error),
             other => Err(RuntimeError::Unsupported {
                 reason: format!(
                     "cranelift-native: cannot decode list field `{field}` of element type `{ty:?}` in schema `{schema}`",

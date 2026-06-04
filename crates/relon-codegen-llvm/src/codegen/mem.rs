@@ -222,6 +222,14 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         ) {
             return self.emit_store_field_pointer_indirect(ip_hint, offset, ty);
         }
+        // `List<String>` is pointer-indirect *and* pointer-array: the
+        // record header `[len][off_0..off_{N-1}]` carries arena-relative
+        // offsets to per-entry String sub-records, so it needs the whole
+        // contiguous block copied into the tail plus a relocation of each
+        // inner offset into the output buffer's coordinate system.
+        if matches!(ty, IrType::ListString) {
+            return self.emit_store_field_list_string(ip_hint, offset);
+        }
         // Phase D.1 fast path: rewrite trailing StoreField into a
         // store against the i64 ret_slot. Only the single Int return
         // slot is supported — any other offset means the IR is past
@@ -907,6 +915,263 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .map_err(|e| LlvmError::Codegen(format!("ptr-indirect slot store: {e}")))?;
         // Flag the body so the buffer-protocol epilogue returns the
         // post-bump tail cursor.
+        self.needs_tail_cursor = true;
+        Ok(())
+    }
+
+    /// Lower `Op::StoreField { ty: ListString }` — the pointer-*array*
+    /// marshalling. The source record (materialised by
+    /// `Op::ConstListString` / the `read_dir` helper) is one contiguous
+    /// arena block laid out as
+    ///
+    /// ```text
+    ///   [str_0 record][str_1 record]...[str_{N-1} record][header]
+    /// ```
+    ///
+    /// where each `str_i` record is `[slen: u32][utf8]` (4-aligned) and
+    /// the header is `[len: u32][off_0: u32]...[off_{N-1}: u32]`
+    /// (4-aligned). Every `off_i` is an *arena-relative* byte offset to
+    /// `str_i`. The String records sit *before* the header, so the block
+    /// spans `[off_0, header_end)` — `off_0` is the lowest offset.
+    ///
+    /// Because the entire block moves rigidly into the output buffer's
+    /// tail, a single delta relocates every inner pointer:
+    ///
+    /// ```text
+    ///   delta      = dst_block_bufrel - src_block_start_arena
+    ///   new_off_i  = off_i + delta            (buffer-relative)
+    ///   new_header = header_off + delta       (buffer-relative)
+    /// ```
+    ///
+    /// `delta` is a multiple of 4 (both endpoints are 4-aligned), so the
+    /// rigid copy preserves every inner `[slen][utf8]` record's 4-byte
+    /// alignment. We therefore (1) memcpy the whole block into the tail,
+    /// (2) stamp `new_header` into the fixed-area slot, and (3) walk the
+    /// copied header's offset array adding `delta` to each entry —
+    /// rewriting the arena coordinates into out-buffer coordinates the
+    /// host `BufferReader::read_list_string` walks.
+    pub(crate) fn emit_store_field_list_string(
+        &mut self,
+        ip_hint: &str,
+        offset: u32,
+    ) -> Result<(), LlvmError> {
+        let _arena_base_ptr = self.arena_base_ptr.ok_or_else(|| {
+            LlvmError::Codegen("StoreField (ListString) outside buffer entry".into())
+        })?;
+        let state_ptr = self.state_ptr.ok_or_else(|| {
+            LlvmError::Codegen("StoreField (ListString): missing state ptr".into())
+        })?;
+        let header_off = self.pop_int(ip_hint)?;
+        let i32_t = self.ctx.i32_type();
+        let i8_t = self.ctx.i8_type();
+        let i64_t = self.ctx.i64_type();
+
+        // len = [header_off].
+        let header_abs = self.arena_addr_i32(header_off)?;
+        let len = self
+            .builder
+            .build_load(i32_t, header_abs, "ls_len")
+            .map_err(|e| LlvmError::Codegen(format!("ListString len load: {e}")))?
+            .into_int_value();
+
+        // offsets_end = header_off + 4 + len*4.
+        let four = i32_t.const_int(4, false);
+        let offs_bytes = self
+            .builder
+            .build_left_shift(len, i32_t.const_int(2, false), "ls_offs_bytes")
+            .map_err(|e| LlvmError::Codegen(format!("ListString offs<<2: {e}")))?;
+        let header_payload = self
+            .builder
+            .build_int_add(header_off, four, "ls_header_payload")
+            .map_err(|e| LlvmError::Codegen(format!("ListString header+4: {e}")))?;
+        let offsets_end = self
+            .builder
+            .build_int_add(header_payload, offs_bytes, "ls_offsets_end")
+            .map_err(|e| LlvmError::Codegen(format!("ListString offsets_end: {e}")))?;
+
+        // src_block_start = (len != 0) ? off_0 : header_off, where
+        // off_0 = [header_off + 4] (the first / lowest String record
+        // offset). For an empty list the block is just the 4-byte header.
+        let off0_abs = self.arena_addr_i32(header_payload)?;
+        let off0 = self
+            .builder
+            .build_load(i32_t, off0_abs, "ls_off0")
+            .map_err(|e| LlvmError::Codegen(format!("ListString off0 load: {e}")))?
+            .into_int_value();
+        let len_nz = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::NE,
+                len,
+                i32_t.const_zero(),
+                "ls_len_nz",
+            )
+            .map_err(|e| LlvmError::Codegen(format!("ListString len!=0: {e}")))?;
+        let src_block_start = self
+            .builder
+            .build_select(len_nz, off0, header_off, "ls_block_start")
+            .map_err(|e| LlvmError::Codegen(format!("ListString block_start select: {e}")))?
+            .into_int_value();
+        let block_size = self
+            .builder
+            .build_int_sub(offsets_end, src_block_start, "ls_block_size")
+            .map_err(|e| LlvmError::Codegen(format!("ListString block_size: {e}")))?;
+
+        // Tail-bump: align cur up to 4, reserve block_size.
+        let tail_gep = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    state_ptr,
+                    &[i32_t.const_int(u64::from(ARENA_STATE_OFFSET_TAIL_CURSOR), false)],
+                    "ls_tail_gep",
+                )
+                .map_err(|e| LlvmError::Codegen(format!("ListString tail GEP: {e}")))?
+        };
+        let cur = self
+            .builder
+            .build_load(i32_t, tail_gep, "ls_tail_pre")
+            .map_err(|e| LlvmError::Codegen(format!("ListString tail load: {e}")))?
+            .into_int_value();
+        let sum = self
+            .builder
+            .build_int_add(cur, i32_t.const_int(3, false), "ls_tail_align_sum")
+            .map_err(|e| LlvmError::Codegen(format!("ListString tail align add: {e}")))?;
+        let dst_block = self
+            .builder
+            .build_and(
+                sum,
+                i32_t.const_int(u64::from(!3u32), false),
+                "ls_dst_block",
+            )
+            .map_err(|e| LlvmError::Codegen(format!("ListString tail align and: {e}")))?;
+        let new_cur = self
+            .builder
+            .build_int_add(dst_block, block_size, "ls_tail_post")
+            .map_err(|e| LlvmError::Codegen(format!("ListString tail bump: {e}")))?;
+        self.builder
+            .build_store(tail_gep, new_cur)
+            .map_err(|e| LlvmError::Codegen(format!("ListString tail store: {e}")))?;
+
+        // memcpy(out_ptr + dst_block, arena + src_block_start, block_size).
+        let out_ptr = self.lookup_param(2)?;
+        let dst_off = self
+            .builder
+            .build_int_add(out_ptr, dst_block, "ls_dst_off")
+            .map_err(|e| LlvmError::Codegen(format!("ListString dst off: {e}")))?;
+        let dst_ptr = self.arena_addr_i32(dst_off)?;
+        let src_ptr = self.arena_addr_i32(src_block_start)?;
+        let block64 = self
+            .builder
+            .build_int_z_extend(block_size, i64_t, "ls_block64")
+            .map_err(|e| LlvmError::Codegen(format!("ListString block64 zext: {e}")))?;
+        self.builder
+            .build_memcpy(dst_ptr, 4, src_ptr, 1, block64)
+            .map_err(|e| LlvmError::Codegen(format!("ListString block memcpy: {e}")))?;
+
+        // delta = dst_block - src_block_start (i32, multiple of 4).
+        let delta = self
+            .builder
+            .build_int_sub(dst_block, src_block_start, "ls_delta")
+            .map_err(|e| LlvmError::Codegen(format!("ListString delta: {e}")))?;
+
+        // new_header_bufrel = header_off + delta -> fixed-area slot.
+        let new_header = self
+            .builder
+            .build_int_add(header_off, delta, "ls_new_header")
+            .map_err(|e| LlvmError::Codegen(format!("ListString new_header: {e}")))?;
+        let slot_off = self
+            .builder
+            .build_int_add(
+                out_ptr,
+                i32_t.const_int(u64::from(offset), false),
+                "ls_slot_off",
+            )
+            .map_err(|e| LlvmError::Codegen(format!("ListString slot off: {e}")))?;
+        let slot_addr = self.arena_addr_i32(slot_off)?;
+        self.builder
+            .build_store(slot_addr, new_header)
+            .map_err(|e| LlvmError::Codegen(format!("ListString slot store: {e}")))?;
+
+        // Relocation loop: for i in 0..len, the copied header's offset
+        // entry at (out_ptr + new_header + 4 + i*4) is rewritten to
+        // (off_i + delta). `new_header + 4` is the copied offset array's
+        // buffer-relative start.
+        let entries_base = self
+            .builder
+            .build_int_add(
+                self.builder
+                    .build_int_add(out_ptr, new_header, "ls_entries_hdr")
+                    .map_err(|e| LlvmError::Codegen(format!("ListString entries hdr: {e}")))?,
+                four,
+                "ls_entries_base",
+            )
+            .map_err(|e| LlvmError::Codegen(format!("ListString entries base: {e}")))?;
+
+        let loop_hdr = self.ctx.append_basic_block(self.func, "ls_reloc_hdr");
+        let loop_body = self.ctx.append_basic_block(self.func, "ls_reloc_body");
+        let loop_done = self.ctx.append_basic_block(self.func, "ls_reloc_done");
+        let pre_bb = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| LlvmError::Codegen("ListString reloc: no insert block".into()))?;
+        self.builder
+            .build_unconditional_branch(loop_hdr)
+            .map_err(|e| LlvmError::Codegen(format!("ListString reloc entry br: {e}")))?;
+
+        // Header: i = phi [0, pre], [i_next, body].
+        self.builder.position_at_end(loop_hdr);
+        let i_phi = self
+            .builder
+            .build_phi(i32_t, "ls_i")
+            .map_err(|e| LlvmError::Codegen(format!("ListString i phi: {e}")))?;
+        i_phi.add_incoming(&[(&i32_t.const_zero(), pre_bb)]);
+        let i_val = i_phi.as_basic_value().into_int_value();
+        let cond = self
+            .builder
+            .build_int_compare(inkwell::IntPredicate::ULT, i_val, len, "ls_i_lt")
+            .map_err(|e| LlvmError::Codegen(format!("ListString i<len: {e}")))?;
+        self.builder
+            .build_conditional_branch(cond, loop_body, loop_done)
+            .map_err(|e| LlvmError::Codegen(format!("ListString reloc cond br: {e}")))?;
+
+        // Body: entry_off = entries_base + i*4; *(entry) += delta.
+        self.builder.position_at_end(loop_body);
+        let i_bytes = self
+            .builder
+            .build_left_shift(i_val, i32_t.const_int(2, false), "ls_i_bytes")
+            .map_err(|e| LlvmError::Codegen(format!("ListString i<<2: {e}")))?;
+        let entry_off = self
+            .builder
+            .build_int_add(entries_base, i_bytes, "ls_entry_off")
+            .map_err(|e| LlvmError::Codegen(format!("ListString entry off: {e}")))?;
+        let entry_addr = self.arena_addr_i32(entry_off)?;
+        let old = self
+            .builder
+            .build_load(i32_t, entry_addr, "ls_entry_old")
+            .map_err(|e| LlvmError::Codegen(format!("ListString entry load: {e}")))?
+            .into_int_value();
+        let new = self
+            .builder
+            .build_int_add(old, delta, "ls_entry_new")
+            .map_err(|e| LlvmError::Codegen(format!("ListString entry reloc: {e}")))?;
+        self.builder
+            .build_store(entry_addr, new)
+            .map_err(|e| LlvmError::Codegen(format!("ListString entry store: {e}")))?;
+        let i_next = self
+            .builder
+            .build_int_add(i_val, i32_t.const_int(1, false), "ls_i_next")
+            .map_err(|e| LlvmError::Codegen(format!("ListString i++: {e}")))?;
+        let body_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| LlvmError::Codegen("ListString reloc: no body block".into()))?;
+        i_phi.add_incoming(&[(&i_next, body_end)]);
+        self.builder
+            .build_unconditional_branch(loop_hdr)
+            .map_err(|e| LlvmError::Codegen(format!("ListString reloc back-edge: {e}")))?;
+
+        self.builder.position_at_end(loop_done);
         self.needs_tail_cursor = true;
         Ok(())
     }
