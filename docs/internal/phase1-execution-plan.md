@@ -169,3 +169,22 @@ Stage 1 + Stage 2 全部 lane 已并入 main、`cargo build/test/clippy --worksp
 - `relon-wasm-bindings`:**不可退役** —— 浏览器解释器(tree-walk via wasm-bindgen)+ LSP(format/hover/goto/complete/rename/inlay),与 AOT codegen **正交**,新路径无替代、也不打算替代。
 
 **Backend::WasmAot**:不加回(`relon/src/lib.rs` 已主动退役该变体)。wasm 是**构建期 emit 产物**(像 native .o),非进程内运行时 backend —— 与架构一致。
+
+---
+
+## 8. Follow-up:wasm 线副作用对齐「标准 wasm / 标准 WASI」(待 co-compile lane 完成后做)
+
+**北极星**:relon 的 wasm 产物就是一个**标准、可移植、生态原生的 wasm 模块**;处理副作用/外部依赖**照常规 wasm 程序那套走**(effectful → import,宿主提供),不自造 relon 专属隔离。
+
+**现状**:`wasi_host.rs` 把 effectful `#native` 降成 **`(import "env" "<name>")`** 自定义 host import —— 由 relon 自己的 wasmtime runner 经 `Linker::func_wrap` 提供。**精神对(effectful→import)但绑死 relon runner**:这个模块只能在 relon 的 runner 里跑。
+
+**目标(follow-up)**:把 effectful 能力映到**标准 WASI 接口**而非 `env::*` 自定义 import:
+- `reads_clock` → `wasi:clocks/wall-clock`(preview2)/ `clock_time_get`(preview1)
+- 文件 → preopened dir / `fd_*`;网络 → `wasi:sockets`;随机 → `wasi:random`;env/args → `environ_get`/`args_get`
+- → relon 编出的 wasm 跑在**任何 WASI host**(wasmtime / wasmer / 浏览器 jco / 云 wasm 平台),不绑 relon runner。
+
+**契合点**:WASI(尤其 preview2 / component model)**本身 capability-secure**(无 ambient 权限,时钟/目录/socket 显式授予),与 relon 的 `CheckCap` / `CapabilityBit` / `NativeFnGate`(`requires <cap>`)**天生同构**。`requires reads_clock` ↔ 宿主授予 `wasi:clocks`,两层能力检查叠在同一条 import 边界上。
+
+**正交说明**:本 follow-up 只关 effectful import 的**形状**(自定义 `env::*` → 标准 WASI);与正在做的**纯计算宿主 co-compile inline**(把 pure `#native` inline 进 wasm 单元、无 import)互不影响 —— effectful 不论怎样都走 import,只是 import 改成标准 WASI 形态。
+
+**待办时机**:co-compile lane(纯计算宿主一体编译进 wasm)落地后再开本 follow-up lane。
