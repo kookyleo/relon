@@ -1008,6 +1008,41 @@ pub enum Op {
     ///   with a preopened directory.
     ReadFile,
 
+    /// Built-in WASI-backed directory listing primitive
+    /// (`read_dir(path)` in source). P-fs Stage 2.
+    ///
+    /// Pops one `String` operand (the directory path) and pushes one
+    /// `List<String>` (the entry file names). Stack effect:
+    /// `[String] -> [ListString]`. The path is an arena-relative
+    /// `[len: u32 LE][utf8 bytes]` record; the result is an
+    /// arena-relative `List<String>` pointer-array record (the same
+    /// layout `Op::ConstListString` produces: element String records
+    /// first, then a `[len][off_0]...[off_{N-1}]` header whose offset is
+    /// the pushed handle).
+    ///
+    /// Lowering always emits a preceding `Op::CheckCap { ReadsFs }`, so
+    /// the capability gate fires before the listing. Entries are the
+    /// bare file names within the directory (no path prefix), and — to
+    /// keep all backends bit-identical despite OS-nondeterministic
+    /// directory order — the names are **sorted (byte-lexicographic)**
+    /// before materialization. The path is resolved relative to the
+    /// host-configured sandbox root (native `std::fs`) — never an
+    /// absolute / escaping path. Backend lowering:
+    /// - **tree-walk** (gold standard): `std::fs::read_dir`, sandboxed
+    ///   to the configured root, names sorted into a `Value::List`.
+    /// - **cranelift native**: indirect call through the capability
+    ///   vtable's `RelonReadDir` slot — the helper reads the path,
+    ///   lists + sorts the entries, and bump-allocates the
+    ///   `List<String>` record, returning its arena-relative offset.
+    /// - **llvm native**: a host `extern "C"` helper with the same
+    ///   arena-offset-in / arena-offset-out contract.
+    /// - **wasm32**: NOT YET IMPLEMENTED (P-fs Stage 2 is native-only).
+    ///   The standard preview1 `fd_readdir` dirent-stream protocol
+    ///   (paged cookie loop + in-linear-memory sort of variable-length
+    ///   names) is deferred; the wasm lowering raises a loud codegen
+    ///   error rather than emit a silent / incorrect listing.
+    ReadDir,
+
     /// Phase 4.c-1 control flow primitive.
     ///
     /// Emit a wasm `block <blocktype>` containing `body`, followed by
@@ -1779,6 +1814,12 @@ impl Op {
             // boundary + touches the host filesystem (non-deterministic),
             // so it's opaque to the trace recorder like `Op::CallNative`.
             Op::ReadFile => Unrecoverable,
+
+            // Built-in WASI-backed directory listing. Crosses a
+            // capability boundary + touches the host filesystem
+            // (non-deterministic), so it's opaque to the trace recorder
+            // like `Op::CallNative`.
+            Op::ReadDir => Unrecoverable,
         }
     }
 }

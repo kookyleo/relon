@@ -152,6 +152,12 @@ fn insert_builtin_capability_gates(gates: &mut HashMap<String, NativeFnGate>) {
         g.reads_fs = true;
         g
     });
+    // P-fs Stage 2: `read_dir(path)` requires `reads_fs`.
+    gates.entry("read_dir".to_string()).or_insert_with(|| {
+        let mut g = NativeFnGate::default();
+        g.reads_fs = true;
+        g
+    });
 }
 
 fn walk_tree_for_gated_calls(

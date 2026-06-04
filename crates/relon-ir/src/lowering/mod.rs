@@ -2471,6 +2471,50 @@ fn try_lower_builtin_capability(
         return Ok(Some(()));
     }
 
+    // `read_dir(path: String) -> List<String>` (P-fs Stage 2): one
+    // `String` path operand, pushes a `List<String>` of the directory's
+    // sorted entry names, gated by `reads_fs`. Same single-arg
+    // marshalling as `read_file`, only the result type differs.
+    if name == "read_dir" {
+        if arity != 1 || args.len() != 1 || args[0].name.is_some() {
+            return Ok(None);
+        }
+        // 1. Capability prologue, before any argument side effect.
+        ctx.out.push(TaggedOp {
+            op: Op::CheckCap {
+                cap_bit: CAP_BIT_READS_FS,
+            },
+            range,
+        });
+        // 2. The path argument must land on the operand stack as a
+        //    `String`.
+        let arg = &args[0];
+        lower_expr(&arg.value.expr, arg.value.range, ctx)?;
+        let pushed = ctx
+            .tstack
+            .pop()
+            .ok_or_else(|| LoweringError::UnsupportedExpr {
+                kind: "FnCall(read_dir path-stack-empty)".to_string(),
+                range,
+            })?;
+        if pushed != IrType::String {
+            return Err(LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "FnCall(read_dir) path arg type mismatch: expected String, got {pushed:?}"
+                ),
+                range,
+            });
+        }
+        // 3. The effectful listing pops the `String` path and pushes the
+        //    `List<String>` of entry names.
+        ctx.out.push(TaggedOp {
+            op: Op::ReadDir,
+            range,
+        });
+        ctx.tstack.push(IrType::ListString);
+        return Ok(Some(()));
+    }
+
     let (cap_bit, op) = match name {
         "clock" => (CAP_BIT_READS_CLOCK, Op::ReadClock),
         "random" => (CAP_BIT_USES_RNG, Op::ReadRandom),
