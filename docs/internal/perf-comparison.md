@@ -83,6 +83,12 @@ native AOT(≈Rust)  >  wasm / wasmtime  >  LuaJIT trace JIT  ≫  tree-walk 解
 
 **预期**:#1+#2 把 W20 从 2.14× 收到 ~1.2–1.3×(贴 ≤1.2× 可信门)。**诚实**:~53% 是可工程化掉的实现税(arena 表示选择,非 Value 语义要求);div-trap 47% 半固有但热路径大部可恢复;**真 Value 语义固有税 ≈ 0**(无 boxing/动态 tag/重复 marshal,入口编组 1.1%)。
 
+### 落地实测(2026-06-04,commit f9b6fa19)
+- **#3 where-bound 标量常量当 SSA 已 LANDED**(承重项):`soft/dt/m*` 折成 `Op::Const*`(含 lambda 体内,非 arena captures-struct load)。**s90 实测:W20 2.14× → 1.69×**(53.9µs→42.4µs,回收 ~11.4µs/~21%),值 bit-identical(`llvm_w20_n_body` oracle + cmp_lua 三方)。
+- **#1 div-trap 消除 已建但 revert**:完整 sound 的 `FloatRange` lattice 实现,但对 W20 死代码——源里 `(s[j]-s[i])*(s[j]-s[i])` 是两个独立 SSA load,emit 时证不了相等(LLVM 仅 post-O3 CSE,trap fcmp 已发),需 **load-CSE / Dup 能力**才能让 #1 生效。按"不 ship 死码"revert,div÷0 语义保持 HEAD 行为。
+- **#2 fixed-arity reduce 寄存器化 未做**(最结构性,bit-identical 风险高)。
+- **剩余到 ≤1.2× 的路**:#1(需先上 load-CSE/Dup)+ #2(reduce 累加器 → scalar φ,解锁 SROA/向量化)。当前 **1.69×**,距 Rust 已收窄,但未贴可信门。
+
 ---
 
 ## 4. 关联
