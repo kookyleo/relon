@@ -144,6 +144,23 @@ capability layer just gates declared bits against grants.
 through `StdModuleResolver` rather than the filesystem, and are part
 of the spec.
 
+### Built-in capability primitives: `clock()` / `random()`
+
+`reads_clock` and `uses_rng` also gate two **language-level built-in
+primitives**, not just host-registered native fns:
+
+- `clock() -> Int` (wall-clock nanoseconds) needs `reads_clock`.
+- `random() -> Int` (non-deterministic 64-bit) needs `uses_rng`.
+
+These are the only **effectful** built-ins — everything else in the
+language and stdlib is pure. The gate is identical to native fns:
+ungranted → `CapabilityDenied`. On the **wasm backend** they lower to
+**standard WASI imports** (`clock_time_get` / `random_get`), so the
+emitted module is satisfied by any standard WASI host and relon's
+`requires <cap>` aligns 1:1 with the WASI capability grant (relon's
+capability bits and WASI's capability categories are isomorphic by
+design). See [Standard library → Capability-gated builtins](./stdlib).
+
 ### `max_steps: Option<u64>`
 
 The evaluator carries an internal step counter — each `eval_internal`

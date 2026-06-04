@@ -35,6 +35,34 @@ available:
 }
 ```
 
+## Capability-gated builtins
+
+Unlike the pure builtins above (and every std module), these language-level
+builtins are **effectful** — they read ambient, non-deterministic sources,
+so they are **not** covered by the determinism guarantee and are gated by
+the [capability model](./sandbox):
+
+| Function | Returns | Capability | wasm backend lowering |
+|---|---|---|---|
+| `clock()` | `Int` — wall-clock time in nanoseconds | `reads_clock` | standard WASI `clock_time_get` |
+| `random()` | `Int` — a non-deterministic 64-bit value | `uses_rng` | standard WASI `random_get` |
+
+```relon
+{
+    now: clock(),        // needs reads_clock, else CapabilityDenied
+    nonce: random()      // needs uses_rng
+}
+```
+
+They are built into the language (no `#import`), but the host must grant the
+matching capability bit — the **same gate** as host-registered native fns,
+so an ungranted call raises `CapabilityDenied`. On the native backends they
+call the host runtime (`SystemTime` / OS RNG); on the **wasm backend** they
+lower to **standard WASI imports**, so the emitted module runs on any
+standard WASI host (wasmtime / browser / …) and that host grants the clock /
+randomness — relon's `requires <cap>` lines up with the WASI capability
+grant. See [Sandbox & capabilities](./sandbox).
+
 ## std/list
 
 ```relon
