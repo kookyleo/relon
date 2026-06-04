@@ -31,13 +31,13 @@ use relon_eval_api::layout::{FieldKind, OffsetTable, SchemaLayout};
 use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
 use relon_parser::{ClosureParam, Expr, Node, Operator, TokenKey, TokenRange, TypeNode};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::error::LoweringError;
 use crate::intern::ConstInternTables;
 use crate::ir::{
-    ClosureCapture, Func, IrType, Module, NativeImport, Op, TaggedOp, NO_CAPABILITY_BIT,
+    ClosureCapture, Func, IrType, Module, NativeImport, Op, TaggedOp, TrapKind, NO_CAPABILITY_BIT,
 };
 use crate::stdlib::{
     builtin_stdlib, stdlib_closure_arg_signature, stdlib_function_count, stdlib_function_index,
@@ -568,7 +568,7 @@ fn lower_workspace_single_with_module(
 /// (failed-to-load slots) are skipped; the workspace pass already
 /// surfaced their `ModuleNotFound` diagnostic.
 fn reachable_modules(ws: &WorkspaceTree, entry_module: &str) -> Vec<String> {
-    use std::collections::{HashSet, VecDeque};
+    use std::collections::VecDeque;
     let mut seen: HashSet<String> = HashSet::new();
     let mut queue: VecDeque<String> = VecDeque::new();
     let mut out: Vec<String> = Vec::new();
@@ -1162,6 +1162,10 @@ fn anon_dict_return_plan(
 
     let mut fields: Vec<AnonDictField> = Vec::with_capacity(pairs.len());
     let mut closure_field_sigs: HashMap<&str, (Vec<IrType>, IrType)> = HashMap::new();
+    // W5-P3: `{String -> Int}` dict fields seen so far, so a later
+    // sibling field's `d[k]` index classifies to the dict's `Int`
+    // value type. Source order makes `d` visible before `result`.
+    let mut dict_field_names: HashSet<&str> = HashSet::new();
 
     for (key, value) in pairs {
         let TokenKey::String(name, _, _) = key else {
@@ -1204,6 +1208,7 @@ fn anon_dict_return_plan(
                 // other entry shape surfaces UnsupportedExpr so the
                 // edge stays honest (P2/P3 widen value/key types).
                 let entries = classify_anon_dict_str_int_field(inner_pairs, value.range, name)?;
+                dict_field_names.insert(name.as_str());
                 fields.push(AnonDictField::DictStrInt {
                     name: name.clone(),
                     entries,
@@ -1215,6 +1220,7 @@ fn anon_dict_return_plan(
                     value.range,
                     &param_tys,
                     &closure_field_sigs,
+                    &dict_field_names,
                     name,
                 )?;
                 fields.push(AnonDictField::Scalar {
@@ -1274,6 +1280,7 @@ fn classify_anon_dict_scalar_field(
     range: TokenRange,
     main_param_tys: &HashMap<&str, IrType>,
     closure_field_sigs: &HashMap<&str, (Vec<IrType>, IrType)>,
+    dict_field_names: &HashSet<&str>,
     field_name: &str,
 ) -> Result<TypeRepr, LoweringError> {
     let irt = classify_anon_dict_scalar_field_irt(
@@ -1281,6 +1288,7 @@ fn classify_anon_dict_scalar_field(
         range,
         main_param_tys,
         closure_field_sigs,
+        dict_field_names,
         field_name,
     )?;
     ir_type_to_type_repr(irt).ok_or_else(|| LoweringError::UnsupportedExpr {
@@ -1335,6 +1343,7 @@ fn classify_anon_dict_scalar_field_irt(
     range: TokenRange,
     main_param_tys: &HashMap<&str, IrType>,
     closure_field_sigs: &HashMap<&str, (Vec<IrType>, IrType)>,
+    dict_field_names: &HashSet<&str>,
     field_name: &str,
 ) -> Result<IrType, LoweringError> {
     match expr {
@@ -1346,6 +1355,16 @@ fn classify_anon_dict_scalar_field_irt(
             if let [TokenKey::String(name, _, _)] = path.as_slice() {
                 if let Some(t) = main_param_tys.get(name.as_str()) {
                     return Ok(*t);
+                }
+            }
+            // W5-P3: `d[k]` — a sibling `{String -> Int}` dict field
+            // indexed by a String key — classifies to the dict's `Int`
+            // value type. The head must name a known dict field and the
+            // single trailing segment must be a `Dynamic` (bracket)
+            // index; `lower_dict_string_index` emits the actual probe.
+            if let [TokenKey::String(name, _, _), TokenKey::Dynamic(_, optional)] = path.as_slice() {
+                if !optional && dict_field_names.contains(name.as_str()) {
+                    return Ok(IrType::I64);
                 }
             }
             Err(LoweringError::UnsupportedExpr {
@@ -1382,6 +1401,7 @@ fn classify_anon_dict_scalar_field_irt(
                 lhs.range,
                 main_param_tys,
                 closure_field_sigs,
+                dict_field_names,
                 field_name,
             )?;
             let rt = classify_anon_dict_scalar_field_irt(
@@ -1389,6 +1409,7 @@ fn classify_anon_dict_scalar_field_irt(
                 rhs.range,
                 main_param_tys,
                 closure_field_sigs,
+                dict_field_names,
                 field_name,
             )?;
             match (lt, rt) {
@@ -2930,6 +2951,407 @@ fn lower_list_string_index(
     });
     ctx.tstack.pop(); // i32 addr
     ctx.tstack.push(IrType::String);
+    Ok(())
+}
+
+/// W5-P3: lower `d[k]` where `d` is a materialised `{String -> Int}`
+/// dict (an `IrType::Dict` arena handle pushed by [`lower_variable`]'s
+/// head load via `Op::ConstDict`) and `k` is a runtime `String` handle
+/// (e.g. `keys[i]`, the same `[slen: u32][utf8]` record `ConstString`
+/// pushes). The lookup runs entirely as IR-lowered primitive ops
+/// (`Block`/`Loop`/`BrIf`/`LoadI32AtAbsolute`/`LoadI8UAtAbsolute`/…),
+/// so it needs **no new runtime helper / wasm import**: every backend
+/// (cranelift AOT, LLVM AOT, wasm32) already lowers these ops, exactly
+/// as the bundled `starts_with` stdlib body does its byte compare.
+///
+/// ## Arena dict record (record-relative offsets — see
+/// `relon-codegen-*::const_pool::visit_const_dict`)
+///
+/// ```text
+/// [entry_count: u32 @0][pad: u32 @4][shape_hash: u64 @8]      ; 16-byte header
+/// entry_count × [key_off: u32][key_len: u32][value: i64]      ; 16 bytes each,
+///                                                             ;   sorted by key
+/// concatenated UTF-8 key bytes                                ; key_off is
+///                                                             ;   record-relative
+/// ```
+///
+/// ## Probe (linear scan + byte compare)
+///
+/// ```text
+/// dict_base = <Dict handle>          ; i32 arena-relative
+/// kh        = <String handle from k> ; i32 arena-relative
+/// klen      = load_u32(kh + 0)       ; key byte length
+/// n         = load_u32(dict_base+0)  ; entry_count
+/// i = 0; found = 0; result = 0
+/// loop over entries:
+///   if found != 0 || i >= n: break
+///   eoff      = dict_base + 16 + i*16
+///   ekey_len  = load_u32(eoff + 4)
+///   if ekey_len == klen:
+///     ekey_addr = dict_base + load_u32(eoff + 0)   ; record-relative key_off
+///     j = 0; mismatch = 0
+///     inner byte loop until j == klen or a byte differs
+///     if mismatch == 0:               ; full match
+///       result = load_i64(eoff + 8); found = 1
+///   i += 1
+/// if found == 0: trap(IndexOutOfBounds)   ; honest miss — no silent wrong value
+/// push result (Int)
+/// ```
+///
+/// The scan is linear (the entry table being key-sorted is not
+/// required for correctness; a binary search is a future optimisation).
+/// No bounds branch is needed beyond `i < n` — the probe stays within
+/// the record by construction. The not-found path traps rather than
+/// returning a sentinel so a miss is never silently mis-read.
+fn lower_dict_string_index(
+    index_node: &Node,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    // Pop the `Dict` receiver handle into an i32 let-local.
+    let top = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
+        kind: "Variable(dict-index-empty-stack)".to_string(),
+        range,
+    })?;
+    debug_assert_eq!(top, IrType::Dict);
+    let dict_base = ctx.next_let_idx;
+    ctx.next_let_idx += 1;
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: dict_base,
+            ty: IrType::I32,
+        },
+        range,
+    });
+
+    // Lower the key expression; it must produce a `String` handle.
+    lower_expr(&index_node.expr, index_node.range, ctx)?;
+    let key_ty = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
+        kind: "Variable(dict-index-key-empty-stack)".to_string(),
+        range,
+    })?;
+    if key_ty != IrType::String {
+        return Err(LoweringError::UnsupportedExpr {
+            kind: format!("Variable(dict-index key must be String, got {key_ty:?})"),
+            range,
+        });
+    }
+    let kh = ctx.next_let_idx;
+    ctx.next_let_idx += 1;
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: kh,
+            ty: IrType::I32,
+        },
+        range,
+    });
+
+    // Fresh scratch let-locals for the probe state. All i32 except the
+    // i64 `result` accumulator.
+    let klen = ctx.next_let_idx;
+    let n = ctx.next_let_idx + 1;
+    let i = ctx.next_let_idx + 2;
+    let found = ctx.next_let_idx + 3;
+    let ekey_len = ctx.next_let_idx + 4;
+    let ekey_addr = ctx.next_let_idx + 5;
+    let eoff = ctx.next_let_idx + 6;
+    let j = ctx.next_let_idx + 7;
+    let mismatch = ctx.next_let_idx + 8;
+    let result = ctx.next_let_idx + 9;
+    ctx.next_let_idx += 10;
+
+    let i32_get = |idx: u32| TaggedOp {
+        op: Op::LetGet {
+            idx,
+            ty: IrType::I32,
+        },
+        range,
+    };
+    let i32_set = |idx: u32| TaggedOp {
+        op: Op::LetSet {
+            idx,
+            ty: IrType::I32,
+        },
+        range,
+    };
+    let ci32 = |v: i32| TaggedOp {
+        op: Op::ConstI32(v),
+        range,
+    };
+    let add = || TaggedOp {
+        op: Op::Add(IrType::I32),
+        range,
+    };
+    let load_u32 = |off: u32| TaggedOp {
+        op: Op::LoadI32AtAbsolute { offset: off },
+        range,
+    };
+
+    // klen = load_u32(kh + 0)
+    ctx.out.push(i32_get(kh));
+    ctx.out.push(load_u32(0));
+    ctx.out.push(i32_set(klen));
+
+    // n = load_u32(dict_base + 0)
+    ctx.out.push(i32_get(dict_base));
+    ctx.out.push(load_u32(0));
+    ctx.out.push(i32_set(n));
+
+    // i = 0; found = 0; result = 0
+    ctx.out.push(ci32(0));
+    ctx.out.push(i32_set(i));
+    ctx.out.push(ci32(0));
+    ctx.out.push(i32_set(found));
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI64(0),
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: result,
+            ty: IrType::I64,
+        },
+        range,
+    });
+
+    // Inner byte-compare loop (mismatch := first differing byte / 0 on
+    // full window match). Built once and embedded into the entry body.
+    let inner_compare = TaggedOp {
+        op: Op::Block {
+            result_ty: None,
+            body: vec![TaggedOp {
+                op: Op::Loop {
+                    result_ty: None,
+                    body: vec![
+                        // j >= klen ? br 1 (fully matched; mismatch stays 0)
+                        i32_get(j),
+                        i32_get(klen),
+                        TaggedOp {
+                            op: Op::Ge(IrType::I32),
+                            range,
+                        },
+                        TaggedOp {
+                            op: Op::BrIf { label_depth: 1 },
+                            range,
+                        },
+                        // kb = load_i8(kh + 4 + j)
+                        i32_get(kh),
+                        ci32(4),
+                        add(),
+                        i32_get(j),
+                        add(),
+                        TaggedOp {
+                            op: Op::LoadI8UAtAbsolute { offset: 0 },
+                            range,
+                        },
+                        // eb = load_i8(ekey_addr + j)
+                        i32_get(ekey_addr),
+                        i32_get(j),
+                        add(),
+                        TaggedOp {
+                            op: Op::LoadI8UAtAbsolute { offset: 0 },
+                            range,
+                        },
+                        // mismatch = (kb != eb)
+                        TaggedOp {
+                            op: Op::Ne(IrType::I32),
+                            range,
+                        },
+                        i32_set(mismatch),
+                        // mismatch != 0 ? br 1
+                        i32_get(mismatch),
+                        ci32(0),
+                        TaggedOp {
+                            op: Op::Ne(IrType::I32),
+                            range,
+                        },
+                        TaggedOp {
+                            op: Op::BrIf { label_depth: 1 },
+                            range,
+                        },
+                        // j = j + 1
+                        i32_get(j),
+                        ci32(1),
+                        add(),
+                        i32_set(j),
+                        TaggedOp {
+                            op: Op::Br { label_depth: 0 },
+                            range,
+                        },
+                    ],
+                },
+                range,
+            }],
+        },
+        range,
+    };
+
+    // Per-entry body: compute eoff, compare key length, then bytes.
+    let entry_body = vec![
+        // found != 0 ? br 1
+        i32_get(found),
+        ci32(0),
+        TaggedOp {
+            op: Op::Ne(IrType::I32),
+            range,
+        },
+        TaggedOp {
+            op: Op::BrIf { label_depth: 1 },
+            range,
+        },
+        // i >= n ? br 1
+        i32_get(i),
+        i32_get(n),
+        TaggedOp {
+            op: Op::Ge(IrType::I32),
+            range,
+        },
+        TaggedOp {
+            op: Op::BrIf { label_depth: 1 },
+            range,
+        },
+        // eoff = dict_base + 16 + i*16
+        i32_get(dict_base),
+        ci32(16),
+        add(),
+        i32_get(i),
+        ci32(16),
+        TaggedOp {
+            op: Op::Mul(IrType::I32),
+            range,
+        },
+        add(),
+        i32_set(eoff),
+        // ekey_len = load_u32(eoff + 4)
+        i32_get(eoff),
+        load_u32(4),
+        i32_set(ekey_len),
+        // `if ekey_len == klen { compare bytes }`, expressed as a
+        // stack-neutral skip-block: branch past the body when the key
+        // lengths differ (`Op::If` requires both branches to push a
+        // value, so a structured `Block { BrIf 0; body }` is the clean
+        // void-conditional form here).
+        TaggedOp {
+            op: Op::Block {
+                result_ty: None,
+                body: vec![
+                    // ekey_len != klen ? br 0 (skip — length mismatch)
+                    i32_get(ekey_len),
+                    i32_get(klen),
+                    TaggedOp {
+                        op: Op::Ne(IrType::I32),
+                        range,
+                    },
+                    TaggedOp {
+                        op: Op::BrIf { label_depth: 0 },
+                        range,
+                    },
+                    // ekey_addr = dict_base + load_u32(eoff + 0)
+                    i32_get(dict_base),
+                    i32_get(eoff),
+                    load_u32(0),
+                    add(),
+                    i32_set(ekey_addr),
+                    // j = 0; mismatch = 0
+                    ci32(0),
+                    i32_set(j),
+                    ci32(0),
+                    i32_set(mismatch),
+                    inner_compare,
+                    // mismatch != 0 ? br 0 (skip — bytes differ)
+                    i32_get(mismatch),
+                    ci32(0),
+                    TaggedOp {
+                        op: Op::Ne(IrType::I32),
+                        range,
+                    },
+                    TaggedOp {
+                        op: Op::BrIf { label_depth: 0 },
+                        range,
+                    },
+                    // full match: result = load_i64(eoff+8); found = 1
+                    i32_get(eoff),
+                    TaggedOp {
+                        op: Op::LoadI64AtAbsolute { offset: 8 },
+                        range,
+                    },
+                    TaggedOp {
+                        op: Op::LetSet {
+                            idx: result,
+                            ty: IrType::I64,
+                        },
+                        range,
+                    },
+                    ci32(1),
+                    i32_set(found),
+                ],
+            },
+            range,
+        },
+        // i = i + 1
+        i32_get(i),
+        ci32(1),
+        add(),
+        i32_set(i),
+        TaggedOp {
+            op: Op::Br { label_depth: 0 },
+            range,
+        },
+    ];
+
+    // Outer scan: Block { Loop { entry_body } }. Stack-neutral.
+    ctx.out.push(TaggedOp {
+        op: Op::Block {
+            result_ty: None,
+            body: vec![TaggedOp {
+                op: Op::Loop {
+                    result_ty: None,
+                    body: entry_body,
+                },
+                range,
+            }],
+        },
+        range,
+    });
+
+    // Honest miss: trap if no entry matched. w5 always hits, but a
+    // missing key must never surface a silent wrong value. Expressed
+    // as a skip-block: branch past the trap when `found != 0`.
+    ctx.out.push(TaggedOp {
+        op: Op::Block {
+            result_ty: None,
+            body: vec![
+                // found != 0 ? br 0 (hit — skip the trap)
+                i32_get(found),
+                ci32(0),
+                TaggedOp {
+                    op: Op::Ne(IrType::I32),
+                    range,
+                },
+                TaggedOp {
+                    op: Op::BrIf { label_depth: 0 },
+                    range,
+                },
+                TaggedOp {
+                    op: Op::Trap {
+                        kind: TrapKind::IndexOutOfBounds,
+                    },
+                    range,
+                },
+            ],
+        },
+        range,
+    });
+
+    // Push the i64 value result as an Int.
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet {
+            idx: result,
+            ty: IrType::I64,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I64);
     Ok(())
 }
 
@@ -5359,6 +5781,29 @@ fn lower_variable(
             }
             // Pops the `ListString` receiver, pushes the String handle.
             lower_list_string_index(index_node, range, ctx)?;
+            return Ok(());
+        }
+        // W5-P3: 1D `d[k]` index on a materialised `{String -> Int}`
+        // dict receiver — the dict-probe workload. `d` is an
+        // `IrType::Dict` arena handle (pushed by `Op::ConstDict` /
+        // `LetGet{Dict}`); the bracket index `k` lowers to a runtime
+        // `String` handle (a `keys[i]` element or a `ConstString`). The
+        // probe is a fully IR-lowered linear scan + byte compare over
+        // the arena entry table, so native + wasm32 need no new runtime
+        // import. Only the single trailing-index form is accepted (no
+        // nested dict-of-dict in scope).
+        if receiver_ty == Some(IrType::Dict) && path.len() == 2 {
+            let TokenKey::Dynamic(index_node, optional) = &path[1] else {
+                unreachable!("guarded by the all-Dynamic check above");
+            };
+            if *optional {
+                return Err(LoweringError::UnsupportedExpr {
+                    kind: "Variable(optional-dict-index unsupported)".to_string(),
+                    range,
+                });
+            }
+            // Pops the `Dict` receiver, pushes the i64 value (Int).
+            lower_dict_string_index(index_node, range, ctx)?;
             return Ok(());
         }
         // A `Dynamic` segment on a non-list receiver is not a

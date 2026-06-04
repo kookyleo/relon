@@ -42,6 +42,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             Op::ConstListFloat { idx, .. } => self.emit_const_list(*idx, IrType::ListFloat),
             Op::ConstListBool { idx, .. } => self.emit_const_list(*idx, IrType::ListBool),
             Op::ConstListString { idx, .. } => self.emit_const_list(*idx, IrType::ListString),
+            Op::ConstDict { idx, .. } => self.emit_const_list(*idx, IrType::Dict),
             Op::AllocSubRecord {
                 record_local_idx,
                 root_size,
@@ -82,6 +83,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 self.const_pool.list_string_offsets.get(&idx),
                 "ConstListString",
             ),
+            IrType::Dict => (self.const_pool.dict_offsets.get(&idx), "ConstDict"),
             other => {
                 return Err(LlvmError::Codegen(format!(
                     "emit_const_list: unexpected list type {other:?}"
