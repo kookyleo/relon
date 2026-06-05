@@ -322,6 +322,23 @@ fn args1(name: &str, v: Value) -> HashMap<String, Value> {
     HashMap::from([(name.to_string(), v)])
 }
 
+fn iflts(items: &[f64]) -> Value {
+    Value::List(Arc::new(
+        items
+            .iter()
+            .map(|x| Value::Float(ordered_float::OrderedFloat(*x)))
+            .collect(),
+    ))
+}
+
+fn ibools(items: &[bool]) -> Value {
+    Value::List(Arc::new(items.iter().map(|b| Value::Bool(*b)).collect()))
+}
+
+fn strings(items: &[&str]) -> Value {
+    Value::List(Arc::new(items.iter().map(|x| s(x)).collect()))
+}
+
 fn from_cps(cps: &[u32]) -> String {
     cps.iter().map(|c| char::from_u32(*c).unwrap()).collect()
 }
@@ -444,6 +461,164 @@ fn mixed_scalar_and_cross_region() {
     );
 }
 
+// ---- F3: cross-region scalar / String list object fields -------------
+//
+// `-> Dict { tags: someStringListParam, xs: someIntListParam, n: Int }`. The
+// list parameters live in the input region; the object head is in the output
+// region. F3 stores each parameter list root's arena-absolute offset into the
+// object slot (no tail copy — the param-identity path is cross-region, not the
+// const-pool literal copy path the host-visible scalar classifier uses for an
+// in-source `["a", "b"]` literal). The `BufferReader` field readers
+// (`read_list_string` / `read_list_int` / `read_list_float` / `read_list_bool`)
+// follow the arena-absolute slot cross-region, gated by
+// `verify_object_return_multi`.
+
+const SRC_TAGS: &str = "#main(List<String> tags) -> Dict\n{ tags: tags, n: 1 }";
+
+#[test]
+fn anon_dict_list_string_field() {
+    assert_four_way(
+        SRC_TAGS,
+        args1(
+            "tags",
+            strings(&["a", "", &from_cps(&[0x4E2D, 0x6587]), &"x".repeat(3000)]),
+        ),
+    );
+}
+
+#[test]
+fn anon_dict_list_string_field_empty() {
+    assert_four_way(SRC_TAGS, args1("tags", list(vec![])));
+}
+
+const SRC_XS_INT: &str = "#main(List<Int> xs) -> Dict\n{ xs: xs, n: 1 }";
+
+#[test]
+fn anon_dict_list_int_field() {
+    assert_four_way(
+        SRC_XS_INT,
+        args1("xs", iints(&[0, -1, i64::MIN, i64::MAX, 42])),
+    );
+}
+
+const SRC_XS_FLOAT: &str = "#main(List<Float> xs) -> Dict\n{ xs: xs, n: 1 }";
+
+#[test]
+fn anon_dict_list_float_field() {
+    assert_four_way(
+        SRC_XS_FLOAT,
+        args1("xs", iflts(&[0.0, -1.5, f64::MIN, f64::MAX, 2.5])),
+    );
+}
+
+const SRC_XS_BOOL: &str = "#main(List<Bool> xs) -> Dict\n{ xs: xs, n: 1 }";
+
+#[test]
+fn anon_dict_list_bool_field() {
+    assert_four_way(SRC_XS_BOOL, args1("xs", ibools(&[true, false, true])));
+}
+
+/// Mixed: a scalar field plus a String-list and an Int-list cross-region
+/// field in one object.
+const SRC_MULTI_LIST: &str = "#main(List<String> tags, List<Int> xs) -> Dict\n\
+     { tags: tags, xs: xs, n: 7 }";
+
+#[test]
+fn anon_dict_multi_cross_region_lists() {
+    let mut m = HashMap::new();
+    m.insert(
+        "tags".to_string(),
+        strings(&[&from_cps(&[0x1F980]), "bb", ""]),
+    );
+    m.insert("xs".to_string(), iints(&[10, -20, 30]));
+    assert_four_way(SRC_MULTI_LIST, m);
+}
+
+// ---- F3: cross-region branded-struct fields --------------------------
+//
+// `#schema Wrapper { servers: List<Server>, n: Int }` returned via
+// `#main(List<Server> servers) -> Wrapper { servers: servers, n: 7 }`. This
+// rides the branded dict-into-record lowering path (distinct from the
+// anon-Dict path), which F3 teaches the same cross-region arena-absolute slot
+// store. The host object positive-path is identical (a branded `Value::Dict`).
+
+const SRC_WRAP_SERVERS: &str = "#schema Server { name: String, port: Int }\n\
+     #schema Wrapper { servers: List<Server>, n: Int }\n\
+     #main(List<Server> servers) -> Wrapper { servers: servers, n: 7 }";
+
+#[test]
+fn branded_struct_list_schema_field() {
+    let long = "y".repeat(4096);
+    assert_four_way(
+        SRC_WRAP_SERVERS,
+        args1(
+            "servers",
+            list(vec![
+                cfg("Server", vec![("name", s("")), ("port", Value::Int(0))]),
+                cfg(
+                    "Server",
+                    vec![
+                        ("name", s(&from_cps(&[0x4E2D, 0x6587]))),
+                        ("port", Value::Int(-1)),
+                    ],
+                ),
+                cfg(
+                    "Server",
+                    vec![("name", s(&long)), ("port", Value::Int(i64::MAX))],
+                ),
+            ]),
+        ),
+    );
+}
+
+#[test]
+fn branded_struct_list_schema_field_empty() {
+    assert_four_way(SRC_WRAP_SERVERS, args1("servers", list(vec![])));
+}
+
+const SRC_WRAP_GRID: &str = "#schema Wrapper { g: List<List<Int>>, n: Int }\n\
+     #main(List<List<Int>> grid) -> Wrapper { g: grid, n: 1 }";
+
+#[test]
+fn branded_struct_list_list_field() {
+    assert_four_way(
+        SRC_WRAP_GRID,
+        args1(
+            "grid",
+            list(vec![
+                iints(&[1, 2, 3]),
+                iints(&[]),
+                iints(&[i64::MIN, i64::MAX]),
+            ]),
+        ),
+    );
+}
+
+const SRC_WRAP_TAGS: &str = "#schema Wrapper { tags: List<String>, n: Int }\n\
+     #main(List<String> tags) -> Wrapper { tags: tags, n: 1 }";
+
+#[test]
+fn branded_struct_list_string_field() {
+    assert_four_way(
+        SRC_WRAP_TAGS,
+        args1(
+            "tags",
+            strings(&["", "a", &from_cps(&[0x6587]), &"z".repeat(2000)]),
+        ),
+    );
+}
+
+const SRC_WRAP_XS: &str = "#schema Wrapper { xs: List<Int>, n: Int }\n\
+     #main(List<Int> xs) -> Wrapper { xs: xs, n: 1 }";
+
+#[test]
+fn branded_struct_list_int_field() {
+    assert_four_way(
+        SRC_WRAP_XS,
+        args1("xs", iints(&[0, -7, i64::MIN, i64::MAX])),
+    );
+}
+
 // ---- proptest --------------------------------------------------------
 
 fn string_strat() -> impl Strategy<Value = String> {
@@ -502,6 +677,45 @@ proptest! {
     fn diff_grid_object(grid in grid_strat()) {
         let oracle = run_tree_walk(SRC_GRID, args1("grid", grid.clone()));
         if let Some(res) = run_wasm(SRC_GRID, &args1("grid", grid)) {
+            let wasm = res.map_err(TestCaseError::fail)?;
+            prop_assert_eq!(fields_of(&wasm), fields_of(&oracle));
+        }
+    }
+
+    // F3: cross-region String-list object field (anon-Dict path).
+    #[test]
+    fn diff_tags_object(
+        tags in prop::collection::vec(string_strat(), 0..8)
+            .prop_map(|v| list(v.into_iter().map(|x| s(&x)).collect()))
+    ) {
+        let oracle = run_tree_walk(SRC_TAGS, args1("tags", tags.clone()));
+        if let Some(res) = run_wasm(SRC_TAGS, &args1("tags", tags)) {
+            let wasm = res.map_err(TestCaseError::fail)?;
+            prop_assert_eq!(fields_of(&wasm), fields_of(&oracle));
+        }
+    }
+
+    // F3: cross-region Int-list object field (anon-Dict path).
+    #[test]
+    fn diff_xs_int_object(
+        xs in prop::collection::vec(
+            prop_oneof![Just(i64::MIN), Just(i64::MAX), Just(0i64), any::<i64>()],
+            0..10,
+        )
+        .prop_map(|r| Value::List(Arc::new(r.into_iter().map(Value::Int).collect())))
+    ) {
+        let oracle = run_tree_walk(SRC_XS_INT, args1("xs", xs.clone()));
+        if let Some(res) = run_wasm(SRC_XS_INT, &args1("xs", xs)) {
+            let wasm = res.map_err(TestCaseError::fail)?;
+            prop_assert_eq!(fields_of(&wasm), fields_of(&oracle));
+        }
+    }
+
+    // F3: cross-region branded-struct List<Schema> field (branded path).
+    #[test]
+    fn diff_branded_servers_object(servers in servers_strat()) {
+        let oracle = run_tree_walk(SRC_WRAP_SERVERS, args1("servers", servers.clone()));
+        if let Some(res) = run_wasm(SRC_WRAP_SERVERS, &args1("servers", servers)) {
             let wasm = res.map_err(TestCaseError::fail)?;
             prop_assert_eq!(fields_of(&wasm), fields_of(&oracle));
         }

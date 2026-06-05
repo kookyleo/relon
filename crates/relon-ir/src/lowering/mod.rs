@@ -2103,7 +2103,21 @@ fn lower_anon_dict_body(
                     }
                 })?;
                 let expected_ir = type_repr_to_ir_type(ty)?;
-                debug_assert!(matches!(expected_ir, IrType::ListSchema | IrType::ListList));
+                // F1b admitted `ListSchema` / `ListList`; F3 widens to the
+                // pointer-array `ListString` and the inline-fixed scalar
+                // lists (`ListInt` / `ListFloat` / `ListBool`). Every one is
+                // a cross-region list whose param root slot stores an
+                // arena-absolute offset (the value `lower_expr` pushes via
+                // the matching `LoadList*Ptr`).
+                debug_assert!(matches!(
+                    expected_ir,
+                    IrType::ListSchema
+                        | IrType::ListList
+                        | IrType::ListString
+                        | IrType::ListInt
+                        | IrType::ListFloat
+                        | IrType::ListBool
+                ));
                 lower_expr(&value.expr, value.range, ctx)?;
                 let top = ctx
                     .tstack
@@ -2357,17 +2371,29 @@ fn pointer_array_param_identity_walk(expr: &Expr) -> bool {
     matches!(expr, Expr::Variable(path) if path.len() == 1)
 }
 
-/// F1b: classify a host-visible anon-Dict-return field whose value is a
-/// bare `#main` parameter identity (`servers`) of pointer-array list type
-/// that the cross-region object path can marshal. Returns the parameter's
-/// canonical type when it is:
+/// F1b / F3: classify a host-visible anon-Dict-return field whose value is
+/// a bare `#main` parameter identity (`servers` / `tags` / `xs`) of a list
+/// type that the cross-region object path can marshal. Returns the
+/// parameter's canonical type when it is:
 ///   * `List<Schema{…}>` whose element sub-record stays inside the
 ///     in-place reader's decode envelope (`list_schema_subrecord_in_s4_scope`),
-///     or
-///   * `List<List<scalar>>` (the nested-scalar pointer array).
+///   * `List<List<scalar>>` (the nested-scalar pointer array),
+///   * `List<String>` (the pointer-array-of-string), or
+///   * `List<Int>` / `List<Float>` / `List<Bool>` (the inline-fixed scalar
+///     list — F3).
 ///
-/// Anything else — a scalar / `List<scalar>` / `List<String>` param (these
-/// already have their own field paths), a deeper nested element list, a
+/// All of these live in the *input* region when sourced from a parameter
+/// identity while the object head sits in the *output* region, so the field
+/// slot must store the parameter list root's **arena-absolute** offset (no
+/// tail copy) and the host's multi-region verifier + reader follow it
+/// cross-region. The host decode side already handles every one of these
+/// element types: the object positive-`bytes_written` path runs
+/// `verify_object_return_multi` over the whole arena, and the `BufferReader`
+/// field readers (`read_list_string` / `read_list_int` / `read_list_record`
+/// / `read_list_list`) follow arena-absolute slot pointers cross-region, so
+/// widening the lowering classifier is all that is needed.
+///
+/// Anything else — a scalar param, a deeper nested element list, a
 /// `List<List<String|Schema>>`, or a non-parameter expression — returns
 /// `None`, so the field falls through to the existing scalar classifier and
 /// stays a loud cap. Mirrors the single-value return gate
@@ -2401,8 +2427,74 @@ fn anon_dict_cross_region_param_list<'p>(
         {
             Some(ty)
         }
+        // F3: `List<String>` (pointer-array-of-string) and `List<scalar>`
+        // (inline-fixed Int / Float / Bool). The parameter data lives in
+        // the input region; the cross-region slot stores its arena-absolute
+        // offset, which the verifier + `read_list_string` / `read_list_*`
+        // readers follow cross-region.
+        TypeRepr::String | TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool => Some(ty),
         _ => None,
     }
+}
+
+/// F3: classify a **branded-struct** return field (`#schema Wrapper {
+/// servers: List<Server>, … }` returned via `#main(…) -> Wrapper { servers:
+/// servers, … }`) as a cross-region parameter-list field. Returns `true`
+/// when the field's declared `List<…>` type is one the cross-region object
+/// path can marshal AND the value is a bare `#main` parameter identity of a
+/// list type whose IR shape matches the field.
+///
+/// This is the branded-struct sibling of [`anon_dict_cross_region_param_list`]
+/// (which works the anon-Dict lowering path); the difference is only how the
+/// two paths reach the field — the field type / value-shape admission rules
+/// and the resulting arena-absolute slot store are identical. The element
+/// type envelope matches: `List<Schema>` confined to S4 sub-record scope,
+/// `List<List<scalar>>`, `List<String>`, and `List<Int|Float|Bool>`. The
+/// value must be a single-segment `Variable` resolving to a `#main` param
+/// whose `IrType` is the matching pointer-array / list type — a literal /
+/// load / call is **not** a cross-region identity walk and keeps the
+/// existing const-pool / loud-cap paths.
+fn branded_field_cross_region_param_list(
+    field_ty: &TypeRepr,
+    value: &Node,
+    ctx: &LowerCtx<'_>,
+) -> bool {
+    let TypeRepr::List { element } = field_ty else {
+        return false;
+    };
+    // Field element-type envelope (mirrors `anon_dict_cross_region_param_list`).
+    let field_ir = match element.as_ref() {
+        TypeRepr::Schema { .. } if list_schema_subrecord_in_s4_scope(field_ty) => {
+            IrType::ListSchema
+        }
+        TypeRepr::List { element: inner }
+            if matches!(
+                inner.as_ref(),
+                TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool
+            ) =>
+        {
+            IrType::ListList
+        }
+        TypeRepr::String => IrType::ListString,
+        TypeRepr::Int => IrType::ListInt,
+        TypeRepr::Float => IrType::ListFloat,
+        TypeRepr::Bool => IrType::ListBool,
+        // A `List<Schema>` outside S4 scope, a deeper-nested element list, or
+        // a `List<List<String|Schema>>` is out of scope — not cross-region.
+        _ => return false,
+    };
+    // The value must be a bare `#main` parameter identity whose IR list type
+    // matches the field. A param-field walk (`w.items`) or any other source
+    // is not an identity walk and stays on the existing paths.
+    let Expr::Variable(path) = &*value.expr else {
+        return false;
+    };
+    let [TokenKey::String(name, _, _)] = path.as_slice() else {
+        return false;
+    };
+    ctx.params
+        .iter()
+        .any(|b| b.name == *name && b.ty == field_ir)
 }
 
 /// True when a `List<Schema>` return type's per-element sub-record carries
@@ -6242,6 +6334,46 @@ fn lower_dict_field_value(
             Ok(())
         }
         (TypeRepr::String, _) | (TypeRepr::List { .. }, _) => {
+            // F3: cross-region branded-struct field. When the field is a
+            // `List<…>` and its value is a bare `#main` parameter identity
+            // whose data lives in the input region (the object head sits in
+            // the output region), store the parameter list root's
+            // arena-absolute offset directly into the field slot — exactly
+            // like the anon-Dict `CrossRegionParamList` path (F1b/F2). The
+            // value `lower_expr` pushes over a `Variable(param)` is the
+            // `LoadList*Ptr` arena-absolute offset (F1 slot convention); we
+            // store it verbatim with NO tail copy (the copy would lose the
+            // cross-region link and, for pointer-array lists, mis-relocate
+            // the in-buffer offsets). The host's object positive-path
+            // verifier (`verify_object_return_multi`) classifies the offset
+            // into the input region, bounds-checks the whole reachable
+            // graph, and only then does the `BufferReader` field reader
+            // follow it cross-region — bit-equal to the tree-walk oracle.
+            if let TypeRepr::List { .. } = &canonical.ty {
+                if branded_field_cross_region_param_list(&canonical.ty, value, ctx) {
+                    lower_expr(&value.expr, range, ctx)?;
+                    let popped = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
+                        kind: "Dict(cross-region-field-value-stack-empty)".to_string(),
+                        range,
+                    })?;
+                    let expected_ir = type_repr_to_ir_type_dict(&canonical.ty);
+                    if popped != expected_ir {
+                        return Err(LoweringError::UnsupportedFieldType {
+                            schema: schema.name.clone(),
+                            field: canonical.name.clone(),
+                            ty: format!(
+                                "cross-region field expected {expected_ir:?}, got {popped:?}"
+                            ),
+                            range,
+                        });
+                    }
+                    // The slot stores the arena-absolute offset directly.
+                    // The caller's `StoreFieldAtRecord` writes an i32
+                    // pointer-indirect slot; push the i32 offset for it.
+                    ctx.tstack.push(IrType::I32);
+                    return Ok(());
+                }
+            }
             // Pointer-array list fields (`List<String>` / `List<Schema>`
             // / `List<List<_>>`) inside a branded-struct return are only
             // marshalled correctly from a const-pool `ConstListString`

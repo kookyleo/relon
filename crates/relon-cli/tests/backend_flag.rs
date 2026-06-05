@@ -137,6 +137,66 @@ fn cross_region_object_cjk_byte_equal_across_backends() {
     );
 }
 
+/// F3: a cross-region **branded-struct** return
+/// (`#main(List<Server> servers) -> Wrapper { servers: servers, n: 7 }`)
+/// with a CJK String field must produce byte-identical JSON on tree-walk
+/// and cranelift-AOT. Same cross-region mechanism as the anon-`Dict` case
+/// above, but reached via the branded dict-into-record lowering path.
+#[test]
+fn cross_region_branded_struct_cjk_byte_equal_across_backends() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-crossregion-branded-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(
+        &path,
+        "#schema Server { name: String, port: Int }\n\
+         #schema Wrapper { servers: List<Server>, n: Int }\n\
+         #main(List<Server> servers) -> Wrapper { servers: servers, n: 7 }\n",
+    )
+    .expect("write fixture");
+
+    let cjk: String = [0x4E2Du32, 0x6587u32]
+        .iter()
+        .map(|c| char::from_u32(*c).unwrap())
+        .collect();
+    let args_json = format!(
+        r#"{{"servers":[{{"name":"{cjk}","port":8080}},{{"name":"","port":0}},{{"name":"edge","port":-1}}]}}"#
+    );
+
+    let run = |backend: &str| -> String {
+        let out = Command::new(BINARY)
+            .arg("run")
+            .arg(&path)
+            .arg("--backend")
+            .arg(backend)
+            .arg("--args")
+            .arg(&args_json)
+            .output()
+            .expect("spawn relon CLI");
+        assert!(
+            out.status.success(),
+            "CLI exited non-zero for {backend}: stderr={}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        String::from_utf8(out.stdout).expect("utf-8 stdout")
+    };
+
+    let tw = run("tree-walk");
+    let aot = run("cranelift-aot");
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        tw.contains(&cjk) && tw.contains("8080") && tw.contains('7'),
+        "tree-walk output must carry the CJK field + port + n: {tw:?}"
+    );
+    assert_eq!(
+        tw, aot,
+        "tree-walk vs cranelift-aot cross-region branded-struct JSON differs:\n  tw  = {tw:?}\n  aot = {aot:?}"
+    );
+}
+
 /// `--trust` is honoured by tree-walk + bytecode but is a no-op on the
 /// cranelift-AOT backend (no host-fn registry to grant capabilities
 /// from). It must NOT be silently dropped: the CLI warns on stderr so
