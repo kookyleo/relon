@@ -47,6 +47,7 @@ pub mod schema_lower;
 pub mod scope;
 pub mod smol_str;
 pub mod value;
+pub mod verifier;
 
 pub use capability::CapabilityGate;
 pub use context::{

@@ -378,6 +378,164 @@ fn build_tree_walk(source: &str) -> Result<Box<dyn Evaluator>, String> {
     new_evaluator(source, Backend::TreeWalk).map_err(|e| format!("{e}"))
 }
 
+/// Which backends a [`assert_all_backends_bit_equal`] run actually
+/// compared, and the agreed reference value. Returned (rather than
+/// panicking on success) so a caller can assert the LLVM leg ran when
+/// it expects the `llvm-aot` feature to be on.
+#[derive(Debug, Clone)]
+pub struct AllBackendsReport {
+    /// The value every compared backend agreed on (tree-walk is the
+    /// golden oracle, so this is the tree-walk result).
+    pub value: Value,
+    /// `true` when the LLVM-AOT backend participated (the `llvm-aot`
+    /// feature was enabled and the source compiled). `false` when LLVM
+    /// was skipped — either feature-off or the backend declined the
+    /// `#main` shape (recorded in `llvm_skip_reason`).
+    pub llvm_compared: bool,
+    /// Why LLVM did not participate, when `llvm_compared` is `false`.
+    pub llvm_skip_reason: Option<String>,
+    /// `true` when the cranelift-AOT backend participated. `false` when
+    /// cranelift declined the `#main` shape (it falls back to tree-walk
+    /// in production, so a decline is not a failure here).
+    pub cranelift_compared: bool,
+    /// Why cranelift did not participate, when `cranelift_compared` is
+    /// `false`.
+    pub cranelift_skip_reason: Option<String>,
+}
+
+/// Differential assertion across every available backend: tree-walk
+/// (golden oracle) vs cranelift-AOT vs — when the `llvm-aot` feature is
+/// enabled — LLVM-AOT. Each backend runs the same `(source, args)`; the
+/// results are compared **deep / bit-for-bit** through [`value_bit_eq`]
+/// (every string byte, every list element, every dict field) *and*
+/// cross-checked via a JSON projection so a string-content divergence
+/// the structural compare somehow missed still surfaces.
+///
+/// A compiled backend that declines the `#main` shape (returns a setup
+/// error) is recorded as "skipped" rather than failing — in production
+/// such shapes fall back to the tree-walk oracle, so a decline is the
+/// expected, correct behaviour. A backend that *does* run but produces
+/// a value differing from tree-walk panics with a precise diff.
+///
+/// Panics (via `assert!`) on any value / trap divergence so it reads
+/// naturally as a test assertion. Returns an [`AllBackendsReport`] on
+/// agreement so callers can additionally assert *which* backends ran.
+pub fn assert_all_backends_bit_equal(
+    source: &str,
+    args: HashMap<String, Value>,
+) -> AllBackendsReport {
+    // 1. Tree-walk golden oracle — must succeed.
+    let tw = build_tree_walk(source).unwrap_or_else(|e| panic!("tree-walk setup failed: {e}"));
+    let tw_value = tw
+        .run_main(args.clone())
+        .unwrap_or_else(|e| panic!("tree-walk run_main trapped: {e:?}"));
+
+    // 2. Cranelift-AOT. A setup decline is a recorded skip, not a fail.
+    let (cranelift_compared, cranelift_skip_reason) =
+        match new_evaluator(source, Backend::CraneliftAot) {
+            Ok(ev) => {
+                let cr_value = ev
+                    .run_main(args.clone())
+                    .unwrap_or_else(|e| panic!("cranelift run_main trapped: {e:?}"));
+                assert_values_agree("cranelift-AOT", &tw_value, &cr_value);
+                (true, None)
+            }
+            Err(BackendError::CraneliftAot(reason)) => (false, Some(reason)),
+            Err(other) => panic!("cranelift setup unexpected error: {other}"),
+        };
+
+    // 3. LLVM-AOT — only when the feature is compiled in.
+    let (llvm_compared, llvm_skip_reason) = run_llvm_leg(source, &args, &tw_value);
+
+    AllBackendsReport {
+        value: tw_value,
+        llvm_compared,
+        llvm_skip_reason,
+        cranelift_compared,
+        cranelift_skip_reason,
+    }
+}
+
+/// Run the LLVM-AOT leg of the differential. With the `llvm-aot`
+/// feature compiled in, this drives the LLVM backend and asserts
+/// agreement; without it, the leg is a no-op recorded as skipped so the
+/// default workspace build (no LLVM 18 headers) stays green.
+#[cfg(feature = "llvm-aot")]
+fn run_llvm_leg(
+    source: &str,
+    args: &HashMap<String, Value>,
+    tw_value: &Value,
+) -> (bool, Option<String>) {
+    match new_evaluator(source, Backend::LlvmAot) {
+        Ok(ev) => {
+            let llvm_value = ev
+                .run_main(args.clone())
+                .unwrap_or_else(|e| panic!("LLVM run_main trapped: {e:?}"));
+            assert_values_agree("LLVM-AOT", tw_value, &llvm_value);
+            (true, None)
+        }
+        Err(BackendError::LlvmAot(reason)) => (false, Some(reason)),
+        Err(other) => panic!("LLVM setup unexpected error: {other}"),
+    }
+}
+
+#[cfg(not(feature = "llvm-aot"))]
+fn run_llvm_leg(
+    _source: &str,
+    _args: &HashMap<String, Value>,
+    _tw_value: &Value,
+) -> (bool, Option<String>) {
+    (
+        false,
+        Some("llvm-aot feature not enabled in this build".to_string()),
+    )
+}
+
+/// Assert `candidate` agrees with the tree-walk `reference` both
+/// structurally ([`value_bit_eq`]) and under a JSON projection. The
+/// JSON cross-check catches any string-content / numeric-encoding drift
+/// the structural compare might not (it shouldn't, but a second
+/// independent path keeps the fixture honest).
+fn assert_values_agree(backend: &str, reference: &Value, candidate: &Value) {
+    assert!(
+        value_bit_eq(reference, candidate),
+        "{backend} value diverges from tree-walk oracle:\n  oracle    = {reference:?}\n  {backend} = {candidate:?}"
+    );
+    let ref_json = value_to_json(reference);
+    let cand_json = value_to_json(candidate);
+    assert_eq!(
+        ref_json, cand_json,
+        "{backend} JSON projection diverges from tree-walk oracle"
+    );
+}
+
+/// Project a `Value` into a `serde_json::Value` for the cross-check.
+/// Self-contained (no dependency on the `relon` projector) so the
+/// harness's compare path stays minimal. Floats project via `to_bits`
+/// hex so NaN / signed-zero distinctions survive; strings project
+/// verbatim so every byte participates in the JSON compare.
+fn value_to_json(v: &Value) -> serde_json::Value {
+    use serde_json::Value as J;
+    match v {
+        Value::Null => J::Null,
+        Value::Bool(b) => J::Bool(*b),
+        Value::Int(i) => J::Number((*i).into()),
+        Value::Float(f) => J::String(format!("f64:{:#018x}", f.into_inner().to_bits())),
+        Value::String(s) => J::String(s.to_string()),
+        Value::List(items) => J::Array(items.iter().map(value_to_json).collect()),
+        Value::Dict(d) => {
+            let mut map = serde_json::Map::new();
+            for (k, val) in &d.map {
+                map.insert(k.to_string(), value_to_json(val));
+            }
+            J::Object(map)
+        }
+        // Non-host-visible variants never cross the return boundary; a
+        // projection request for one is a harness bug.
+        other => J::String(format!("<non-projectable:{}>", other.type_name())),
+    }
+}
+
 /// Compare two `Value`s for bit-identical equality. Floats compare
 /// by `to_bits` so NaN patterns stay distinct; dicts compare
 /// field-set + per-field recursive (insertion order is informational
@@ -452,5 +610,62 @@ pub fn trap_equivalent(a: &RuntimeError, b: &RuntimeError) -> bool {
         // equivalent — that surfaces as `TrapMismatch`.
         (Unsupported { .. }, Unsupported { .. }) => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod all_backends_fixture_tests {
+    use super::*;
+
+    /// Const-pool `List<String>` return — the brief's canonical proof
+    /// case. Tree-walk + cranelift must agree bit-for-bit (LLVM too when
+    /// the feature is on); the decoded value is the literal list.
+    #[test]
+    fn const_pool_list_string_agrees() {
+        let src = "#main() -> List<String>\n[\"a\", \"bb\"]";
+        let report = assert_all_backends_bit_equal(src, HashMap::new());
+        let Value::List(items) = &report.value else {
+            panic!("expected a list, got {:?}", report.value);
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], Value::String("a".into()));
+        assert_eq!(items[1], Value::String("bb".into()));
+        // Cranelift must have actually run this const-pool shape.
+        assert!(
+            report.cranelift_compared,
+            "cranelift should compile a const-pool List<String> return; skipped: {:?}",
+            report.cranelift_skip_reason
+        );
+    }
+
+    /// Scalar Int return through an arg — exercises the simplest
+    /// in-buffer-param path.
+    #[test]
+    fn scalar_identity_agrees() {
+        let src = "#main(Int x) -> Int\nx";
+        let mut args = HashMap::new();
+        args.insert("x".to_string(), Value::Int(i64::MIN));
+        let report = assert_all_backends_bit_equal(src, args);
+        assert_eq!(report.value, Value::Int(i64::MIN));
+    }
+
+    /// String-field object return (anon-dict with a String literal
+    /// field) — proves the fixture compares nested string content.
+    #[test]
+    fn string_field_object_agrees() {
+        let src = "#main() -> String\n\"hello world\"";
+        let report = assert_all_backends_bit_equal(src, HashMap::new());
+        assert_eq!(report.value, Value::String("hello world".into()));
+    }
+
+    /// A multi-byte (3-byte UTF-8) string literal, spelled via escapes
+    /// so the source stays ASCII. Confirms the byte-exact compare path
+    /// survives non-ASCII payloads.
+    #[test]
+    fn multibyte_string_agrees() {
+        // U+4E2D U+6587 ("Chinese") — 6 bytes, 2 chars.
+        let src = "#main() -> String\n\"\\u4e2d\\u6587\"";
+        let report = assert_all_backends_bit_equal(src, HashMap::new());
+        assert_eq!(report.value, Value::String("\u{4e2d}\u{6587}".into()));
     }
 }
