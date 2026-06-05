@@ -181,35 +181,38 @@ fn unsupported_return_shapes_fail_loudly_not_silently() {
         // Top-level List<Schema> / List<List> returns.
         "#schema P {\n    Int x: *\n}\n#main() -> List<P>\n[{x:1},{x:2}]",
         "#main() -> List<List<Int>>\n[[1, 2], [3, 4]]",
-        // Pointer-array list returns sourced from a parameter (NOT a
-        // const-pool list literal) inside an OBJECT field. The top-level
-        // `#main(List<String> ss) -> List<String> = ss` identity is now
-        // lifted by the S3 in-place region-walk return (proven bit-equal in
-        // `relon-test-harness/tests/return_inplace_list_string.rs`), so it
-        // is no longer in this cap list. The branded-struct *field* surface
-        // (`-> S { tags: t }`) is object-field marshalling, a later step,
-        // and must still fail loudly at lowering.
-        "#schema S {\n    tags: List<String>\n}\n#main(List<String> t) -> S\n{ tags: t }",
-        // Cross-region hazard through a branded-struct field surface. F1b
-        // lifts the *anon-Dict* cross-region field (see LLVM_ONLY_CAP); the
-        // branded-struct path routes through `lower_dict_into_record` (not
-        // the anon-Dict walker) and has no cross-region field store yet, so
-        // it stays a loud cap on both backends.
-        "#schema Server { name: String }\n#schema Cfg { servers: List<Server> }\n\
-         #main(List<Server> servers) -> Cfg\n{ servers: servers }",
+        // Parameter-*field* List<Schema> sources (`w.items`) inside an
+        // object — the field-load rebase path is not a param identity walk;
+        // stays capped (F4).
+        "#schema Server { name: String }\n#schema W { items: List<Server> }\n\
+         #main(W w) -> Dict\n{ servers: w.items, n: 1 }",
+        // Doubly-nested pointer-array (`List<List<Schema>>`) field — out of
+        // scope (F5).
+        "#schema Server { name: String }\n\
+         #main(List<List<Server>> xs) -> Dict\n{ xs: xs, n: 1 }",
     ];
-    // F2: cross-region *anon-Dict* object fields (param-sourced
-    // `List<Schema>` / `List<List<scalar>>`) now ship on cranelift AND llvm
-    // (wasm shares the IR + the same store path) — the object head sits in
-    // out_buf and the field slot holds the parameter list root's
-    // arena-absolute offset into in_buf; the host's multi-region verifier
-    // classifies + bounds-checks it before the reader follows it
+    // F2/F3: cross-region object fields sourced by parameter identity now
+    // ship on cranelift AND llvm (wasm shares the IR + the same store path).
+    // The object head sits in out_buf and the field slot holds the parameter
+    // list root's arena-absolute offset into in_buf; the host's multi-region
+    // verifier classifies + bounds-checks it before the reader follows it
     // cross-region (bit-equal to tree-walk, proven four-way in
-    // `relon-test-harness/tests/return_cross_region_object.rs`).
+    // `relon-test-harness/tests/return_cross_region_object.rs` and
+    // `relon-codegen-llvm/tests/cross_region_object_four_way.rs`). F2 covers
+    // the anon-Dict `List<Schema>` / `List<List<scalar>>` fields; F3 adds the
+    // branded-struct path and the scalar/String list field types.
     const BOTH_COMPILE: &[&str] = &[
         "#schema Server { name: String, port: Int }\n\
          #main(List<Server> servers) -> Dict\n{ servers: servers, n: 1 }",
         "#main(List<List<Int>> grid) -> Dict\n{ g: grid, n: 1 }",
+        // F3: branded-struct List<String> field.
+        "#schema S {\n    tags: List<String>\n}\n#main(List<String> t) -> S\n{ tags: t }",
+        // F3: branded-struct List<Schema> field.
+        "#schema Server { name: String }\n#schema Cfg { servers: List<Server> }\n\
+         #main(List<Server> servers) -> Cfg\n{ servers: servers }",
+        // F3: anon-Dict scalar/String list fields sourced by param identity.
+        "#main(List<String> tags) -> Dict\n{ tags: tags, n: 1 }",
+        "#main(List<Int> xs) -> Dict\n{ xs: xs, n: 1 }",
     ];
     for src in BOTH_CAP {
         let cl = AotEvaluator::from_source(src);

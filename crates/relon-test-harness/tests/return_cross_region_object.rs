@@ -246,6 +246,143 @@ fn mixed_scalar_and_cross_region() {
     );
 }
 
+// ---- F3: scalar / String list object fields (anon-Dict path) --------
+
+/// `List<String>` parameter-identity object field (cross-region, not the
+/// const-pool literal copy path).
+const SRC_TAGS: &str = "#main(List<String> tags) -> Dict\n{ tags: tags, n: 1 }";
+
+#[test]
+fn anon_dict_list_string_field() {
+    assert_cross_region(
+        SRC_TAGS,
+        args1(
+            "tags",
+            list(vec![
+                s("a"),
+                s(""),
+                s(&from_cps(&[0x4E2D, 0x6587])),
+                s(&"x".repeat(3000)),
+            ]),
+        ),
+    );
+}
+
+#[test]
+fn anon_dict_list_string_field_empty() {
+    assert_cross_region(SRC_TAGS, args1("tags", list(vec![])));
+}
+
+/// `List<Int>` parameter-identity object field (inline-fixed scalar list,
+/// still routed cross-region for a uniform arena-absolute slot).
+const SRC_XS: &str = "#main(List<Int> xs) -> Dict\n{ xs: xs, n: 1 }";
+
+#[test]
+fn anon_dict_list_int_field() {
+    assert_cross_region(SRC_XS, args1("xs", iints(&[0, -1, i64::MIN, i64::MAX, 42])));
+}
+
+/// Two cross-region scalar/String lists + a scalar field in one object.
+const SRC_MULTI_LIST: &str = "#main(List<String> tags, List<Int> xs) -> Dict\n\
+     { tags: tags, xs: xs, n: 7 }";
+
+#[test]
+fn anon_dict_multi_cross_region_lists() {
+    let mut m = HashMap::new();
+    m.insert(
+        "tags".to_string(),
+        list(vec![s(&from_cps(&[0x1F980])), s("bb"), s("")]),
+    );
+    m.insert("xs".to_string(), iints(&[10, -20, 30]));
+    assert_cross_region(SRC_MULTI_LIST, m);
+}
+
+// ---- F3: branded-struct cross-region fields (branded path) ----------
+
+const SRC_WRAP_SERVERS: &str = "#schema Server { name: String, port: Int }\n\
+     #schema Wrapper { servers: List<Server>, n: Int }\n\
+     #main(List<Server> servers) -> Wrapper { servers: servers, n: 7 }";
+
+#[test]
+fn branded_struct_servers_field() {
+    assert_cross_region(
+        SRC_WRAP_SERVERS,
+        args1(
+            "servers",
+            list(vec![
+                cfg("Server", vec![("name", s("")), ("port", Value::Int(0))]),
+                cfg(
+                    "Server",
+                    vec![
+                        ("name", s(&from_cps(&[0x4E2D, 0x6587]))),
+                        ("port", Value::Int(-1)),
+                    ],
+                ),
+                cfg(
+                    "Server",
+                    vec![
+                        ("name", s(&"y".repeat(4096))),
+                        ("port", Value::Int(i64::MAX)),
+                    ],
+                ),
+            ]),
+        ),
+    );
+}
+
+#[test]
+fn branded_struct_servers_field_empty() {
+    assert_cross_region(SRC_WRAP_SERVERS, args1("servers", list(vec![])));
+}
+
+const SRC_WRAP_TAGS: &str = "#schema Wrapper { tags: List<String>, n: Int }\n\
+     #main(List<String> tags) -> Wrapper { tags: tags, n: 1 }";
+
+#[test]
+fn branded_struct_tags_field() {
+    assert_cross_region(
+        SRC_WRAP_TAGS,
+        args1(
+            "tags",
+            list(vec![
+                s(""),
+                s("a"),
+                s(&from_cps(&[0x6587])),
+                s(&"z".repeat(2000)),
+            ]),
+        ),
+    );
+}
+
+const SRC_WRAP_XS: &str = "#schema Wrapper { xs: List<Int>, n: Int }\n\
+     #main(List<Int> xs) -> Wrapper { xs: xs, n: 1 }";
+
+#[test]
+fn branded_struct_xs_field() {
+    assert_cross_region(
+        SRC_WRAP_XS,
+        args1("xs", iints(&[0, -7, i64::MIN, i64::MAX])),
+    );
+}
+
+const SRC_WRAP_GRID: &str = "#schema Wrapper { g: List<List<Int>>, n: Int }\n\
+     #main(List<List<Int>> grid) -> Wrapper { g: grid, n: 1 }";
+
+#[test]
+fn branded_struct_grid_field() {
+    assert_cross_region(
+        SRC_WRAP_GRID,
+        args1(
+            "grid",
+            list(vec![
+                iints(&[1, 2, 3]),
+                iints(&[]),
+                iints(&[i64::MIN, i64::MAX]),
+            ]),
+        ),
+    );
+}
+
 // ---- proptest -------------------------------------------------------
 
 fn string_strat() -> impl Strategy<Value = String> {
@@ -304,6 +441,44 @@ proptest! {
         #[cfg(feature = "llvm-aot")]
         prop_assert!(report.llvm_compared, "F2: llvm must compile the cross-region grid shape");
     }
+
+    // F3: cross-region String-list object field (anon-Dict path).
+    #[test]
+    fn diff_tags_object(
+        tags in prop::collection::vec(string_strat(), 0..8)
+            .prop_map(|v| list(v.into_iter().map(|x| s(&x)).collect()))
+    ) {
+        let src = "#main(List<String> tags) -> Dict\n{ tags: tags, n: 1 }";
+        let report = assert_all_backends_bit_equal(src, args1("tags", tags));
+        prop_assert!(report.cranelift_compared, "cranelift must compile the cross-region tags shape");
+        #[cfg(feature = "llvm-aot")]
+        prop_assert!(report.llvm_compared, "F3: llvm must compile the cross-region tags shape");
+    }
+
+    // F3: cross-region Int-list object field (anon-Dict path).
+    #[test]
+    fn diff_xs_int_object(
+        xs in prop::collection::vec(any::<i64>(), 0..10)
+            .prop_map(|v| list(v.into_iter().map(Value::Int).collect()))
+    ) {
+        let src = "#main(List<Int> xs) -> Dict\n{ xs: xs, n: 1 }";
+        let report = assert_all_backends_bit_equal(src, args1("xs", xs));
+        prop_assert!(report.cranelift_compared, "cranelift must compile the cross-region xs shape");
+        #[cfg(feature = "llvm-aot")]
+        prop_assert!(report.llvm_compared, "F3: llvm must compile the cross-region xs shape");
+    }
+
+    // F3: cross-region branded-struct List<Schema> field (branded path).
+    #[test]
+    fn diff_branded_servers_object(servers in servers_strat()) {
+        let src = "#schema Server { name: String, port: Int }\n\
+                   #schema Wrapper { servers: List<Server>, n: Int }\n\
+                   #main(List<Server> servers) -> Wrapper { servers: servers, n: 7 }";
+        let report = assert_all_backends_bit_equal(src, args1("servers", servers));
+        prop_assert!(report.cranelift_compared, "cranelift must compile the F3 branded-struct shape");
+        #[cfg(feature = "llvm-aot")]
+        prop_assert!(report.llvm_compared, "F3: llvm must compile the branded-struct shape");
+    }
 }
 
 // ---- loud-cap guards ------------------------------------------------
@@ -333,21 +508,24 @@ fn both_backends_compile_cross_region_object() {
     }
 }
 
-/// Shapes still beyond F1b must cap on cranelift too (loud decline).
+/// Shapes still beyond F3 must cap on both native backends (loud decline).
+/// F3 released branded-struct fields + scalar/String list object fields; what
+/// remains capped is the parameter-*field* list source (`w.items` / `o.tags`,
+/// F4) and the doubly-nested pointer-array (`List<List<Schema>>`, F5).
 #[test]
-fn beyond_f1b_still_capped_on_cranelift() {
+fn beyond_f3_still_capped() {
     let cap_cases = [
-        // Branded-struct field surface still routes through the branded
-        // dict-into-record path (not the anon-Dict cross-region path),
-        // which has no cross-region field store yet — stays capped.
-        "#schema Server { name: String }\n#schema Cfg { servers: List<Server> }\n\
-         #main(List<Server> servers) -> Cfg\n{ servers: servers }",
-        // Parameter-*field* List<Schema> inside an object — the field-load
-        // rebase path is not an identity walk; stays capped.
+        // Parameter-*field* List<Schema> inside an anon-Dict — the field-load
+        // rebase path is not an identity walk; stays capped (F4).
         "#schema Server { name: String }\n#schema W { items: List<Server> }\n\
          #main(W w) -> Dict\n{ servers: w.items, n: 1 }",
+        // Parameter-*field* List<Schema> inside a branded struct — same
+        // field-load source, stays capped (F4).
+        "#schema Server { name: String }\n#schema W { items: List<Server> }\n\
+         #schema Cfg { servers: List<Server> }\n\
+         #main(W w) -> Cfg\n{ servers: w.items }",
         // List<List<Schema>> field — inner pointer-array-of-pointer-array,
-        // out of F1b scope.
+        // out of scope (F5).
         "#schema Server { name: String }\n\
          #main(List<List<Server>> xs) -> Dict\n{ xs: xs, n: 1 }",
     ];
@@ -356,9 +534,46 @@ fn beyond_f1b_still_capped_on_cranelift() {
             Err(BackendError::CraneliftAot(_)) => { /* loud decline — correct */ }
             Err(other) => panic!("expected a CraneliftAot decline for `{src}`, got {other}"),
             Ok(_) => panic!(
-                "cranelift unexpectedly accepted a beyond-F1b shape: `{src}` — a silent \
+                "cranelift unexpectedly accepted a beyond-F3 shape: `{src}` — a silent \
                  miscompile path may have opened"
             ),
         }
+        #[cfg(feature = "llvm-aot")]
+        match new_evaluator(src, Backend::LlvmAot) {
+            Err(BackendError::LlvmAot(_)) => { /* loud decline — correct */ }
+            Err(other) => panic!("expected an LlvmAot decline for `{src}`, got {other}"),
+            Ok(_) => panic!("llvm unexpectedly accepted a beyond-F3 shape: `{src}`"),
+        }
+    }
+}
+
+/// F3: the branded-struct cross-region field surface now compiles on both
+/// native backends (was a cap through F2). It rides the branded
+/// dict-into-record lowering path, distinct from the anon-Dict path. The
+/// four-way bit-equal proof lives in
+/// `relon-codegen-llvm/tests/cross_region_object_four_way.rs`.
+#[test]
+fn branded_struct_cross_region_field_compiles() {
+    let shapes = [
+        "#schema Server { name: String, port: Int }\n\
+         #schema Wrapper { servers: List<Server>, n: Int }\n\
+         #main(List<Server> servers) -> Wrapper { servers: servers, n: 7 }",
+        "#schema Wrapper { g: List<List<Int>>, n: Int }\n\
+         #main(List<List<Int>> grid) -> Wrapper { g: grid, n: 1 }",
+        "#schema Wrapper { tags: List<String>, n: Int }\n\
+         #main(List<String> tags) -> Wrapper { tags: tags, n: 1 }",
+        "#schema Wrapper { xs: List<Int>, n: Int }\n\
+         #main(List<Int> xs) -> Wrapper { xs: xs, n: 1 }",
+    ];
+    for src in shapes {
+        assert!(
+            new_evaluator(src, Backend::CraneliftAot).is_ok(),
+            "cranelift must compile the F3 branded-struct cross-region shape: `{src}`"
+        );
+        #[cfg(feature = "llvm-aot")]
+        assert!(
+            new_evaluator(src, Backend::LlvmAot).is_ok(),
+            "llvm must compile the F3 branded-struct cross-region shape: `{src}`"
+        );
     }
 }

@@ -167,26 +167,31 @@ signature**; each parameter declares one host-pushed slot:
 >   is supported on both backends above), or a `List<Schema>` whose
 >   sub-record carries a nested `List<Schema>` / `List<List<…>>` field.
 >
->   An **anon-`Dict` field** of `List<Schema>` / `List<List<scalar>>` type
->   sourced by parameter identity (`-> Dict { servers: servers, n: 1 }`
->   where `servers: List<Server>` is a `#main` param) is now supported
->   **four-way** — tree-walk == cranelift == llvm == compiled wasm (F1b on
->   cranelift, F2 on llvm + wasm). The object header is built in `out_buf`,
->   but the parameter-sourced field's data lives in `in_buf` — a genuine
->   **cross-region** field pointer. Under the arena-absolute slot
->   convention the field slot stores the parameter list root's
->   arena-absolute offset directly (no copy); before any decode the host
->   runs the **multi-region** object verifier over the whole arena anchored
->   at `out_ptr`, which classifies the slot pointer into the input region
->   and bounds-checks the entire reachable graph (down to every sub-record
->   String field), then `BufferReader::new_at_base` follows it cross-region
->   — bit-equal to the tree-walk oracle. On wasm the host reads the same
->   arena out of linear memory and runs the same verifier-gated decode, so
->   there is no wasm-specific path. The **branded-struct** field surface
->   (`-> Cfg { servers: servers }`) still stays a loud cap on every backend
->   — it routes through a different lowering path that has no cross-region
->   field store yet. In every still-capped case the backend refuses rather
->   than store an `in_buf` pointer into an `out_buf` slot. The host-side
+>   An **object field** sourced by parameter identity — whether the object
+>   is an **anon-`Dict`** (`-> Dict { servers: servers, n: 1 }`) or a
+>   **branded `#schema` struct** (`#schema Wrapper { servers: List<Server>,
+>   n: Int }` returned via `-> Wrapper { servers: servers, n: 7 }`) — is
+>   supported **four-way** (tree-walk == cranelift == llvm == compiled wasm).
+>   The field may be `List<Schema>`, `List<List<scalar>>`, `List<String>`,
+>   or `List<Int|Float|Bool>` (F1b/F2 on cranelift/llvm/wasm for
+>   `List<Schema>` / `List<List<scalar>>`; F3 added the branded-struct path
+>   and the scalar/String list field types on all four). The object header
+>   is built in `out_buf`, but the parameter-sourced field's data lives in
+>   `in_buf` — a genuine **cross-region** field pointer. Under the
+>   arena-absolute slot convention the field slot stores the parameter list
+>   root's arena-absolute offset directly (no copy — note this is distinct
+>   from an in-source list **literal** field, e.g. `tags: ["a", "b"]`, which
+>   is copied into the `out_buf` tail and is self-contained there); before
+>   any decode the host runs the **multi-region** object verifier over the
+>   whole arena anchored at `out_ptr`, which classifies the slot pointer into
+>   the input region and bounds-checks the entire reachable graph (down to
+>   every sub-record String field), then `BufferReader::new_at_base` follows
+>   it cross-region — bit-equal to the tree-walk oracle. On wasm the host
+>   reads the same arena out of linear memory and runs the same
+>   verifier-gated decode, so there is no wasm-specific path. In every
+>   still-capped case (a parameter-*field* list source, or a doubly-nested
+>   `List<List<Schema>>`) the backend refuses rather than store an `in_buf`
+>   pointer into an `out_buf` slot. The host-side
 >   *decode* is in
 >   place — `BufferReader` walks the buffer with a single base and
 >   reconstructs the nested `Value` recursively (`read_list_record` /

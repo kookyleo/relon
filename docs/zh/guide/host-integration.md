@@ -137,19 +137,24 @@ host-pushed slot：
 >   `List<List<scalar>>`（入参 **恒等** 形两个后端均已支持，见上）；或返回子
 >   记录自身再含嵌套 `List<Schema>` / `List<List<…>>` 字段的 `List<Schema>`。
 >
->   返回**含该类入参恒等字段的匿名 `Dict`**
->   （`-> Dict { servers: servers, n: 1 }`，其中 `servers: List<Server>`
->   是 `#main` 入参）现已**四方**支持 —— tree-walk == cranelift == llvm ==
->   编译 wasm（cranelift 为 F1b，llvm 与 wasm 为 F2）。对象头建在
->   `out_buf`，但入参来源字段的数据仍在 `in_buf` —— 这是真正的**跨区**字段
->   指针。在 arena-绝对槽约定下，字段槽**直接**存入参 list 根的 arena-绝对
->   偏移（不拷贝）；解码前 host 先以 `out_ptr` 为锚对**整 arena** 跑**多区**
->   对象 verifier，把槽指针判区到 input 区并对整张可达图界检（深至每个子记录
->   的 String 字段），再由 `BufferReader::new_at_base` 跨区走读 —— 逐字节等价
->   于 tree-walk oracle。wasm 上 host 从**线性内存**取同一片 arena 并跑同一份
->   verifier 门控的解码，无 wasm 专属路径。**结构体**字段面
->   （`-> Cfg { servers: servers }`）在所有后端上仍响亮 cap —— 它走另一条
->   lowering 路径，尚无跨区字段存储。所有仍 cap 的情形下后端均拒绝，绝不把
+>   返回**含该类入参恒等字段的对象** —— 无论对象是**匿名 `Dict`**
+>   （`-> Dict { servers: servers, n: 1 }`）还是**结构体 `#schema`**
+>   （`#schema Wrapper { servers: List<Server>, n: Int }`，经
+>   `-> Wrapper { servers: servers, n: 7 }` 返回）—— 均**四方**支持
+>   （tree-walk == cranelift == llvm == 编译 wasm）。字段类型可为
+>   `List<Schema>`、`List<List<scalar>>`、`List<String>` 或
+>   `List<Int|Float|Bool>`（`List<Schema>` / `List<List<scalar>>` 在
+>   cranelift 为 F1b、llvm 与 wasm 为 F2；F3 增加了结构体路径与标量/String
+>   list 字段类型，四方齐通）。对象头建在 `out_buf`，但入参来源字段的数据仍在
+>   `in_buf` —— 这是真正的**跨区**字段指针。在 arena-绝对槽约定下，字段槽
+>   **直接**存入参 list 根的 arena-绝对偏移（不拷贝 —— 注意这与源码内 list
+>   **字面量**字段如 `tags: ["a", "b"]` 不同，后者拷进 `out_buf` 尾区、自洽于
+>   该区）；解码前 host 先以 `out_ptr` 为锚对**整 arena** 跑**多区**对象
+>   verifier，把槽指针判区到 input 区并对整张可达图界检（深至每个子记录的
+>   String 字段），再由 `BufferReader::new_at_base` 跨区走读 —— 逐字节等价于
+>   tree-walk oracle。wasm 上 host 从**线性内存**取同一片 arena 并跑同一份
+>   verifier 门控的解码，无 wasm 专属路径。所有仍 cap 的情形（入参**字段**来源
+>   的 list，或双层嵌套的 `List<List<Schema>>`）下后端均拒绝，绝不把
 >   `in_buf` 指针塞进 `out_buf` 槽。host 侧 **解码已就位**：
 >   `BufferReader` 以单一基址走读 buffer，递归重建嵌套 `Value`
 >   （`List<Schema>` 走 `read_list_record` / `read_list_record_at`，
