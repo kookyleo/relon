@@ -79,7 +79,12 @@ signature**; each parameter declares one host-pushed slot:
 > - **`List<scalar>`** and **`List<String>`** parameters,
 > - **user-`#schema` struct parameters** whose fields are scalars,
 >   `String`, or `List<scalar>` / `List<String>` — the whole structured
->   config record, including string and list fields.
+>   config record, including string and list fields,
+> - **nested-`#schema` struct fields** read through a multi-segment walk
+>   (`o.inner.x`, and deeper such as `c.b.a.v`). Both field-declaration
+>   spellings work — the value-position `inner: Inner` and the prefix
+>   `Inner inner: *` — and each intermediate segment rebases to its
+>   sub-record before the leaf field read.
 >
 > Still **not yet** supported on the compiled backends (rejected up
 > front with a clear `unsupported type in #main` / `LoadListSchemaPtr` /
@@ -89,8 +94,8 @@ signature**; each parameter declares one host-pushed slot:
 > - `Dict<_, _>` parameters (the analyzer cannot type `d["x"]` index
 >   reads; use a `#schema` struct for structured config instead),
 > - nested-list parameters (`List<List<…>>`),
-> - `List<Schema>` parameters and schema fields,
-> - multi-segment nested-schema walks (`o.inner.x`).
+> - `List<Schema>` parameters and schema fields (including a `List<Schema>`
+>   field reached through an otherwise-supported nested-schema walk).
 
 ### Boundary Result vs Relon value-level Result
 
