@@ -24,6 +24,8 @@ The further down, the faster — but the higher the prep cost. Relon **picks a t
 
 You **don't have to choose**: the SDK entry `Backend::Auto` switches dynamically based on IR-op-count thresholds.
 
+`Backend::Auto` is also **adaptive on capability**: if a program uses a `#main` shape the compiled (Cranelift AOT) backend can't express yet (for example a `#main() -> List<P>` return), auto transparently falls back to the tree-walk interpreter and still produces the correct result — it logs the fallback (so you know AOT acceleration was skipped for that run) rather than failing. Genuine source errors and host faults are **not** swallowed: they surface as usual.
+
 ## 3. The trace JIT trick
 
 Trace JIT is the top tier. The principle is like **record + edit**:

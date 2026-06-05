@@ -68,6 +68,39 @@ pub enum CraneliftError {
     Cache(String),
 }
 
+impl CraneliftError {
+    /// `true` when this error means "the compiled backend can't express
+    /// this `#main` shape" rather than "the program / host is wrong".
+    ///
+    /// The auto-tier router uses this to decide whether to fall back to
+    /// the tree-walk interpreter. The judgment is deliberately narrow:
+    /// only the three lowering / codegen *capability-boundary* variants
+    /// qualify.
+    ///
+    /// * [`Self::Lowering`] — the IR lowering pass refused the analyzed
+    ///   tree (e.g. `unsupported type in #main: List<P>`). The tree-walk
+    ///   oracle handles every such shape.
+    /// * [`Self::Codegen`] — IR → cranelift IR tripped on an op the
+    ///   narrow native subset doesn't cover yet.
+    /// * [`Self::UnsupportedSignature`] — the `#main` signature falls
+    ///   outside the compiled envelope.
+    ///
+    /// Everything else stays a hard error so the caller surfaces it:
+    /// [`Self::Parse`] / [`Self::Analyze`] are genuine source errors the
+    /// tree-walk would (and should) report itself; [`Self::HostTarget`]
+    /// / [`Self::JitSetup`] / [`Self::ModuleDefine`] / [`Self::Cache`]
+    /// are host / infrastructure faults that masking behind a silent
+    /// tree-walk fallback would hide.
+    pub fn is_unsupported_shape(&self) -> bool {
+        matches!(
+            self,
+            CraneliftError::Lowering(_)
+                | CraneliftError::Codegen(_)
+                | CraneliftError::UnsupportedSignature(_)
+        )
+    }
+}
+
 impl From<relon_ir::FrontendError> for CraneliftError {
     /// Map the shared frontend pipeline error onto this backend's
     /// equivalent variant. Each arm preserves the exact message /
