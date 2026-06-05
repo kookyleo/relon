@@ -1,5 +1,6 @@
 //! Backend-shared host side of the in-place region-walk return ABI
-//! (S1/S2 `List<List<scalar>>`, S3 `List<String>`). When a compiled
+//! (S1/S2 `List<List<scalar>>`, S3 `List<String>`, S4 `List<Schema>`).
+//! When a compiled
 //! `#main` returns a parameter-sourced pointer-array list, the machine
 //! code does **not** copy the value into `out_buf`. Instead the epilogue
 //! reports the arena-absolute offset of the return root via the negative
@@ -10,7 +11,8 @@
 //! 3. runs the bounds [`verify_value_at`] over the whole reachable graph
 //!    confined to that region — **a verify failure aborts the decode**,
 //! 4. only on a clean verify decodes the value in place via the matching
-//!    positional reader (`read_list_list_at` / `read_list_string_at`).
+//!    positional reader (`read_list_list_at` / `read_list_string_at` /
+//!    `read_list_record_at`).
 //!
 //! Both the cranelift and llvm backends call into this one
 //! implementation, so the sentinel → region-select → verifier → decode
@@ -21,8 +23,9 @@
 use std::sync::Arc;
 
 use crate::buffer::BufferReader;
-use crate::layout::OffsetTable;
-use crate::schema_canonical::{Field, TypeRepr};
+use crate::layout::{OffsetTable, SchemaLayout};
+use crate::schema_canonical::{Field, Schema, TypeRepr};
+use crate::smol_str::SmolStr;
 use crate::value::Value;
 use crate::verifier::{verify_value_at, Region};
 use crate::RuntimeError;
@@ -75,7 +78,8 @@ pub fn decode_inplace_sentinel(ret: i32) -> Result<usize, RuntimeError> {
 
 /// Decode an in-place region-walk return for a single-value return whose
 /// root is a parameter-sourced pointer-array list: `List<List<scalar>>`
-/// (S1/S2) or `List<String>` (S3). The machine code reported `root_abs`
+/// (S1/S2), `List<String>` (S3), or `List<Schema>` (S4). The machine
+/// code reported `root_abs`
 /// (the arena-absolute offset of the return root) via the negative
 /// sentinel; the caller already recovered it with
 /// [`decode_inplace_sentinel`].
@@ -100,14 +104,22 @@ pub fn decode_inplace_return(
     return_fields: &[Field],
 ) -> Result<Value, RuntimeError> {
     // The return must be a pointer-array list the in-place ABI emits:
-    // `List<List<scalar>>` or `List<String>`. Classify it up front so the
-    // region/verify pipeline below is shape-agnostic and only the final
-    // decode branches. Anything else is ABI drift — surface it loudly.
-    enum InplaceShape {
+    // `List<List<scalar>>`, `List<String>`, or `List<Schema>`. Classify it
+    // up front so the region/verify pipeline below is shape-agnostic and
+    // only the final decode branches. Anything else is ABI drift — surface
+    // it loudly.
+    // The `List` prefix on every variant is intentional: each names the
+    // concrete pointer-array return shape (`List<List>` / `List<String>` /
+    // `List<Schema>`) the sentinel can carry, so the shared prefix is the
+    // point rather than noise.
+    #[allow(clippy::enum_variant_names)]
+    enum InplaceShape<'a> {
         /// `List<List<scalar>>`; carries the innermost scalar element type.
         ListListScalar(TypeRepr),
         /// `List<String>`.
         ListString,
+        /// `List<Schema>`; carries the per-element sub-record schema.
+        ListSchema(&'a Schema),
     }
     let shape = match &return_field.ty {
         TypeRepr::List { element } => match element.as_ref() {
@@ -115,10 +127,11 @@ pub fn decode_inplace_return(
                 InplaceShape::ListListScalar(inner.as_ref().clone())
             }
             TypeRepr::String => InplaceShape::ListString,
+            TypeRepr::Schema { schema } => InplaceShape::ListSchema(schema.as_ref()),
             other => {
                 return Err(RuntimeError::IoError(format!(
                     "{backend} in-place return: unsupported list element {other:?} \
-                     (expected List<scalar> or String)"
+                     (expected List<scalar>, String, or Schema)"
                 )));
             }
         },
@@ -208,5 +221,121 @@ pub fn decode_inplace_return(
                 items.into_iter().map(|s| Value::String(s.into())).collect(),
             )))
         }
+        InplaceShape::ListSchema(schema) => {
+            // The verifier already certified the whole graph: outer
+            // entries, each sub-record's fixed area, and every String /
+            // List field pointer the sub-record carries (see
+            // `verify_pointer_target` -> `TypeRepr::Schema`). Decode each
+            // entry's sub-record into a branded dict, positionally, sharing
+            // the same region slice — bit-identical to the field-slot
+            // `read_list_record` path the tree-walk oracle's writer feeds.
+            let elem_layout = SchemaLayout::offsets_for(schema).map_err(|e| {
+                RuntimeError::IoError(format!(
+                    "{backend} in-place List<Schema> element `{}` layout: {e}",
+                    schema.name
+                ))
+            })?;
+            let sub_readers = reader
+                .read_list_record_at(root_rel, &elem_layout, schema)
+                .map_err(|e| RuntimeError::IoError(format!("{backend} buffer: {e}")))?;
+            let mut items = Vec::with_capacity(sub_readers.len());
+            for sub in &sub_readers {
+                let map = read_record_into_branded_map(backend, sub, schema)?;
+                items.push(Value::branded_dict(map, Some(schema.name.clone())));
+            }
+            Ok(Value::List(Arc::new(items)))
+        }
+    }
+}
+
+/// Drain every field of `schema` from the sub-record `reader` into a
+/// sorted `BTreeMap<SmolStr, Value>` — the branded-dict body for one
+/// `List<Schema>` element. Mirrors the codegen evaluators'
+/// `read_record_into_map`, but lives here so both AOT backends share the
+/// one in-place sub-record decode. The field decode reuses the existing
+/// [`BufferReader`] field-slot readers, which the verifier has already
+/// proven stay in-region for every pointer they follow.
+fn read_record_into_branded_map(
+    backend: &str,
+    reader: &BufferReader<'_>,
+    schema: &Schema,
+) -> Result<std::collections::BTreeMap<SmolStr, Value>, RuntimeError> {
+    let mut map = std::collections::BTreeMap::new();
+    for field in &schema.fields {
+        let value = read_record_field(backend, reader, field)?;
+        map.insert(SmolStr::from(field.name.as_str()), value);
+    }
+    Ok(map)
+}
+
+/// Decode one sub-record field (`reader` is the per-element sub-record
+/// reader) into a [`Value`]. Covers the scalar leaves plus the
+/// pointer-indirect field shapes a `List<Schema>` element carries within
+/// S4 scope: `String`, `List<scalar>`, and `List<String>`. Deeper nested
+/// pointer-array element fields (`List<Schema>` / `List<List<…>>` *inside*
+/// a sub-record) are out of S4 scope and capped loudly at lowering, so a
+/// reach here is ABI drift surfaced rather than silently mis-decoded.
+fn read_record_field(
+    backend: &str,
+    reader: &BufferReader<'_>,
+    field: &Field,
+) -> Result<Value, RuntimeError> {
+    let name = field.name.as_str();
+    let map_err = |e: crate::buffer::BufferError| {
+        RuntimeError::IoError(format!(
+            "{backend} in-place List<Schema> field `{name}`: {e}"
+        ))
+    };
+    match &field.ty {
+        TypeRepr::Int => reader.read_int(name).map(Value::Int).map_err(map_err),
+        TypeRepr::Float => reader
+            .read_float(name)
+            .map(|f| Value::Float(ordered_float::OrderedFloat(f)))
+            .map_err(map_err),
+        TypeRepr::Bool => reader.read_bool(name).map(Value::Bool).map_err(map_err),
+        TypeRepr::Null => reader
+            .read_null(name)
+            .map(|()| Value::Null)
+            .map_err(map_err),
+        TypeRepr::String => reader
+            .read_string(name)
+            .map(|s| Value::String(s.into()))
+            .map_err(map_err),
+        TypeRepr::List { element } => match element.as_ref() {
+            TypeRepr::Int => reader
+                .read_list_int(name)
+                .map(|v| Value::List(Arc::new(v.into_iter().map(Value::Int).collect())))
+                .map_err(map_err),
+            TypeRepr::Float => reader
+                .read_list_float(name)
+                .map(|v| {
+                    Value::List(Arc::new(
+                        v.into_iter()
+                            .map(|f| Value::Float(ordered_float::OrderedFloat(f)))
+                            .collect(),
+                    ))
+                })
+                .map_err(map_err),
+            TypeRepr::Bool => reader
+                .read_list_bool(name)
+                .map(|v| Value::List(Arc::new(v.into_iter().map(Value::Bool).collect())))
+                .map_err(map_err),
+            TypeRepr::String => reader
+                .read_list_string(name)
+                .map(|v| {
+                    Value::List(Arc::new(
+                        v.into_iter().map(|s| Value::String(s.into())).collect(),
+                    ))
+                })
+                .map_err(map_err),
+            other => Err(RuntimeError::IoError(format!(
+                "{backend} in-place List<Schema> sub-record field `{name}` has unsupported \
+                 list element {other:?} (S4 covers List<scalar> / List<String>)"
+            ))),
+        },
+        other => Err(RuntimeError::IoError(format!(
+            "{backend} in-place List<Schema> sub-record field `{name}` has unsupported type \
+             {other:?}"
+        ))),
     }
 }

@@ -449,22 +449,25 @@ fn nested_schema_with_list_schema_field_three_way() {
 ///
 /// Materialised this round: `List<Schema>` / `List<List<scalar>>`
 /// params + schema fields consumed through `.length()` / a sibling
-/// scalar read. Still capped: the *return* side of `List<Schema>`
-/// (`StoreField(ListSchema)` is unsupported), inner pointer-array
-/// element lists (`List<List<String>>`), and `Dict` params (analyzer
-/// dead-end).
+/// scalar read. Still capped: inner pointer-array element lists
+/// (`List<List<String>>`), and `Dict` params (analyzer dead-end).
 ///
 /// NOTE: the nested-list **identity return**
-/// `#main(List<List<Int>> xss) -> List<List<Int>> = xss` is now
-/// supported on **both** AOT backends via the in-place region-walk
-/// return ABI (S1 cranelift, S2 llvm — each reports the input-region
-/// root to the host instead of copying). That case moved to
-/// [`nested_list_identity_return_both_backends`] below.
+/// `#main(List<List<Int>> xss) -> List<List<Int>> = xss` and the
+/// `List<Schema>` **identity return**
+/// `#main(List<P> ps) -> List<P> = ps` are now supported on **both** AOT
+/// backends via the in-place region-walk return ABI (S1/S2 nested list,
+/// S4 List<Schema> — each reports the input-region root to the host
+/// instead of copying). Those moved to
+/// [`nested_list_identity_return_both_backends`] /
+/// [`list_schema_identity_return_both_backends`] below.
 #[test]
 fn unsupported_pointer_indirect_shapes_loudly_capped() {
     for src in [
-        // List<Schema> *return* (StoreField pointer-array not lowered).
-        "#schema P { x: Int }\n#main(List<P> ps) -> List<P>\nps",
+        // List<Schema> *return* reached through a parameter **field** —
+        // the field-load rebase is not proven bit-equal for an in-place
+        // return; stays a loud cap (the param-*identity* case is lifted).
+        "#schema P { x: Int }\n#schema W { ps: List<P> }\n#main(W w) -> List<P>\nw.ps",
         // Dict param.
         "#main(Dict<String, Int> d) -> Dict<String, Int>\nd",
         // inner pointer-array element list: List<List<String>> stays a
@@ -495,5 +498,26 @@ fn nested_list_identity_return_both_backends() {
     assert!(
         LlvmAotEvaluator::from_source(src).is_ok(),
         "llvm must compile the S2 nested-list identity return (in-place region-walk ABI)"
+    );
+}
+
+/// The `List<Schema>` identity return is lifted on **both** AOT backends
+/// (S4) via the in-place region-walk return ABI — the machine code reports
+/// the input-region root and the host verifier recurses to every
+/// sub-record field pointer before decoding each element into a branded
+/// dict. Pins that both compile the shape so neither regresses to a loud
+/// cap. Three-way bit-equality (including every sub-object field's bytes)
+/// is proven by `relon-test-harness/tests/return_inplace_list_schema.rs`;
+/// here we only assert the backends accept the `#main` shape.
+#[test]
+fn list_schema_identity_return_both_backends() {
+    let src = "#schema P { name: String, x: Int }\n#main(List<P> ps) -> List<P>\nps";
+    assert!(
+        AotEvaluator::from_source(src).is_ok(),
+        "cranelift must compile the S4 List<Schema> identity return"
+    );
+    assert!(
+        LlvmAotEvaluator::from_source(src).is_ok(),
+        "llvm must compile the S4 List<Schema> identity return (in-place region-walk ABI)"
     );
 }

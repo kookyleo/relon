@@ -1758,6 +1758,105 @@ impl<'a> BufferReader<'a> {
         Ok(out)
     }
 
+    /// Read a `List<Schema>` whose **outer pointer-array header** sits
+    /// directly at `header_off` (a region-relative offset into
+    /// `self.bytes`), rather than being reached through a record's
+    /// fixed-area slot.
+    ///
+    /// This is the reader half of the in-place region-walk return ABI
+    /// (S4). The machine code returns the arena-absolute offset of the
+    /// root list header `[len][off_0]…[off_{N-1}]`; the host rebases it to
+    /// a region-relative offset, runs [`crate::verifier::verify_value_at`]
+    /// over the whole reachable graph (outer entries → each sub-record's
+    /// fixed area → every String / List field pointer the sub-record
+    /// carries), and only then calls this to decode in place. Each entry
+    /// pointer names a sub-record anchored at `elem_layout`; a
+    /// [`BufferReader`] is produced per entry sharing the same buffer
+    /// slice, so subsequent field reads (`read_string`, `read_list_int`,
+    /// …) resolve back into the same tail area — bit-identical to the
+    /// field-slot [`Self::read_list_record`] path the tree-walk oracle's
+    /// writer feeds.
+    pub fn read_list_record_at<'b>(
+        &self,
+        header_off: usize,
+        elem_layout: &'b OffsetTable,
+        elem_schema: &'b Schema,
+    ) -> Result<Vec<BufferReader<'a>>, BufferError>
+    where
+        'b: 'a,
+    {
+        // Header sits directly at `header_off`: `[len][off_0]…`.
+        if header_off
+            .checked_add(4)
+            .map(|end| end > self.bytes.len())
+            .unwrap_or(true)
+        {
+            return Err(BufferError::MalformedPayload {
+                name: "<in-place root>".to_string(),
+                reason: "in-place list-record header length prefix exceeds buffer end",
+            });
+        }
+        let mut len_buf = [0u8; 4];
+        len_buf.copy_from_slice(&self.bytes[header_off..header_off + 4]);
+        let count = u32::from_le_bytes(len_buf) as usize;
+        let entries_start = header_off + 4;
+        let mut out: Vec<BufferReader<'a>> = Vec::with_capacity(count);
+        for i in 0..count {
+            let cursor =
+                entries_start
+                    .checked_add(i * 4)
+                    .ok_or_else(|| BufferError::MalformedPayload {
+                        name: "<in-place root>".to_string(),
+                        reason: "in-place list-record entry cursor overflows usize",
+                    })?;
+            if cursor + 4 > self.bytes.len() {
+                return Err(BufferError::MalformedPayload {
+                    name: "<in-place root>".to_string(),
+                    reason: "in-place list-record entry pointer exceeds buffer end",
+                });
+            }
+            let mut entry_buf = [0u8; 4];
+            entry_buf.copy_from_slice(&self.bytes[cursor..cursor + 4]);
+            let sub_base = u32::from_le_bytes(entry_buf) as usize;
+            let sub_end = sub_base.checked_add(elem_layout.root_size).ok_or_else(|| {
+                BufferError::MalformedPayload {
+                    name: "<in-place root>".to_string(),
+                    reason: "in-place list-record sub-record end overflows usize",
+                }
+            })?;
+            if sub_end > self.bytes.len() {
+                return Err(BufferError::MalformedPayload {
+                    name: "<in-place root>".to_string(),
+                    reason: "in-place list-record sub-record exceeds buffer end",
+                });
+            }
+            let field_index = elem_layout
+                .fields
+                .iter()
+                .filter_map(|fo| {
+                    elem_schema
+                        .fields
+                        .iter()
+                        .find(|f| f.name == fo.name)
+                        .map(|f| FieldEntry {
+                            name: fo.name.clone(),
+                            ty: f.ty.clone(),
+                            offset: sub_base + fo.offset,
+                            size: fo.size,
+                            kind: fo.kind,
+                            list_element: fo.list_element,
+                        })
+                })
+                .collect();
+            out.push(BufferReader {
+                layout: elem_layout,
+                field_index,
+                bytes: self.bytes,
+            });
+        }
+        Ok(out)
+    }
+
     /// Read a `List<List<scalar>>` from `field_name` as a vector of
     /// inner `Vec<Value>`s. The outer slot points at a pointer-array
     /// header `[len][off_0]…[off_{N-1}]` whose entries name per-element

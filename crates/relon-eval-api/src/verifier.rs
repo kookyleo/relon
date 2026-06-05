@@ -1004,4 +1004,199 @@ mod tests {
             "got {err:?}"
         );
     }
+
+    // ---- in-place `List<Schema>` root (S4 field-pointer layer) ----------
+
+    /// A `Cfg` schema whose fields interleave inline scalars with String
+    /// and List<scalar>/List<String> tails at varied offsets — the exact
+    /// historically-tricky mixed-offset layout (a String hiding after a
+    /// Bool, a List between two scalars).
+    fn cfg_schema() -> Schema {
+        Schema {
+            name: "Cfg".into(),
+            generics: vec![],
+            fields: vec![
+                field("flag", TypeRepr::Bool),
+                field("name", TypeRepr::String),
+                field("port", TypeRepr::Int),
+                field("tags", list(TypeRepr::String)),
+                field("nums", list(TypeRepr::Int)),
+            ],
+        }
+    }
+
+    /// Build a `Ret { value: List<Cfg> }` buffer with `n` sub-records, the
+    /// shape the S4 in-place return decodes. Returns the bytes plus the
+    /// `value` slot's `(list_element, root header offset)` so a test can
+    /// drive `verify_value_at` the way the host does — the root header is
+    /// `[len][off_i]` and each `off_i` points at a `Cfg` sub-record whose
+    /// String / List fields point at their own tail records.
+    fn list_cfg_buffer(n: usize) -> (Vec<u8>, Option<ListElementKind>, usize) {
+        let cfg = cfg_schema();
+        let cfg_layout = SchemaLayout::offsets_for(&cfg).expect("cfg layout");
+        let ret = Schema {
+            name: "Ret".into(),
+            generics: vec![],
+            fields: vec![field(
+                "value",
+                list(TypeRepr::Schema {
+                    schema: Box::new(cfg.clone()),
+                }),
+            )],
+        };
+        let ret_layout = SchemaLayout::offsets_for(&ret).expect("ret layout");
+        let mut b = BufferBuilder::new(&ret_layout, &ret.fields);
+        let mut writer = b
+            .list_record_writer("value", &cfg_layout, &cfg)
+            .expect("list_record_writer");
+        for i in 0..n {
+            let mut child = writer.start_entry();
+            child.write_bool("flag", i % 2 == 0).unwrap();
+            child.write_string("name", &format!("cfg-{i}")).unwrap();
+            child.write_int("port", (1000 + i) as i64).unwrap();
+            child.write_list_string("tags", &["a", "", "bb"]).unwrap();
+            child.write_list_int("nums", &[i as i64, -1, 7]).unwrap();
+            writer.finish_entry(&mut b, child).expect("finish entry");
+        }
+        b.finish_list_record(writer).expect("finish list");
+        let bytes = b.finish();
+        let fo = &ret_layout.fields[0];
+        let mut slot = [0u8; 4];
+        slot.copy_from_slice(&bytes[fo.offset..fo.offset + 4]);
+        let header_off = u32::from_le_bytes(slot) as usize;
+        (bytes, fo.list_element, header_off)
+    }
+
+    fn list_cfg_ty() -> TypeRepr {
+        list(TypeRepr::Schema {
+            schema: Box::new(cfg_schema()),
+        })
+    }
+
+    #[test]
+    fn inplace_list_schema_verifies_clean() {
+        let (bytes, list_element, root) = list_cfg_buffer(3);
+        let region = Region::new(0, bytes.len()).expect("region");
+        verify_value_at(&bytes, &list_cfg_ty(), list_element, root, region)
+            .expect("a legal in-place List<Schema> root must verify to the field-pointer layer");
+    }
+
+    #[test]
+    fn inplace_list_schema_empty_verifies_clean() {
+        let (bytes, list_element, root) = list_cfg_buffer(0);
+        let region = Region::new(0, bytes.len()).expect("region");
+        verify_value_at(&bytes, &list_cfg_ty(), list_element, root, region)
+            .expect("an empty in-place List<Schema> must verify");
+    }
+
+    #[test]
+    fn inplace_list_schema_corrupt_entry_pointer_rejected() {
+        // Smash `off_0` (the first sub-record pointer) so the Cfg record it
+        // points at lands off-region; the verifier must reject before any
+        // field-pointer is followed.
+        let (mut bytes, list_element, root) = list_cfg_buffer(2);
+        let off0_pos = root + 4;
+        let bogus = (bytes.len() as u32 + 4096).to_le_bytes();
+        bytes[off0_pos..off0_pos + 4].copy_from_slice(&bogus);
+        let region = Region::new(0, bytes.len()).expect("region");
+        let err = verify_value_at(&bytes, &list_cfg_ty(), list_element, root, region)
+            .expect_err("a corrupt sub-record pointer must be rejected");
+        assert!(
+            matches!(
+                err,
+                VerifyError::OutOfRegion { .. } | VerifyError::FixedSlotOutOfRegion { .. }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn inplace_list_schema_corrupt_field_string_pointer_rejected() {
+        // Keep every sub-record pointer legal, but smash one sub-record's
+        // `name` String slot so the String record it points at escapes the
+        // region. This is the field-pointer layer the verifier MUST reach —
+        // the most easily-missed level.
+        let (mut bytes, list_element, root) = list_cfg_buffer(1);
+        // off_0 -> the single Cfg sub-record's fixed area.
+        let mut o0 = [0u8; 4];
+        o0.copy_from_slice(&bytes[root + 4..root + 8]);
+        let sub_base = u32::from_le_bytes(o0) as usize;
+        // Find the `name` slot offset within the Cfg fixed area.
+        let cfg = cfg_schema();
+        let cfg_layout = SchemaLayout::offsets_for(&cfg).expect("cfg layout");
+        let name_fo = cfg_layout
+            .fields
+            .iter()
+            .find(|fo| fo.name == "name")
+            .expect("name field");
+        let name_slot = sub_base + name_fo.offset;
+        let bogus = (bytes.len() as u32 + 8192).to_le_bytes();
+        bytes[name_slot..name_slot + 4].copy_from_slice(&bogus);
+        let region = Region::new(0, bytes.len()).expect("region");
+        let err = verify_value_at(&bytes, &list_cfg_ty(), list_element, root, region)
+            .expect_err("a corrupt sub-record String field pointer must be rejected");
+        assert!(
+            matches!(err, VerifyError::OutOfRegion { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn inplace_list_schema_corrupt_field_list_pointer_rejected() {
+        // Same as above, but smash a sub-record's `tags` (List<String>)
+        // field slot so the list header escapes the region — proves the
+        // verifier follows List field pointers inside the sub-record too.
+        let (mut bytes, list_element, root) = list_cfg_buffer(1);
+        let mut o0 = [0u8; 4];
+        o0.copy_from_slice(&bytes[root + 4..root + 8]);
+        let sub_base = u32::from_le_bytes(o0) as usize;
+        let cfg = cfg_schema();
+        let cfg_layout = SchemaLayout::offsets_for(&cfg).expect("cfg layout");
+        let tags_fo = cfg_layout
+            .fields
+            .iter()
+            .find(|fo| fo.name == "tags")
+            .expect("tags field");
+        let tags_slot = sub_base + tags_fo.offset;
+        let bogus = (bytes.len() as u32 + 8192).to_le_bytes();
+        bytes[tags_slot..tags_slot + 4].copy_from_slice(&bogus);
+        let region = Region::new(0, bytes.len()).expect("region");
+        let err = verify_value_at(&bytes, &list_cfg_ty(), list_element, root, region)
+            .expect_err("a corrupt sub-record List field pointer must be rejected");
+        assert!(
+            matches!(err, VerifyError::OutOfRegion { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn inplace_list_schema_outer_len_lies_rejected() {
+        // Inflate the outer header's element count so the verifier walks
+        // past the real entry array; a per-entry pointer (or its target)
+        // must escape the region loudly.
+        let (mut bytes, list_element, root) = list_cfg_buffer(1);
+        bytes[root..root + 4].copy_from_slice(&9999u32.to_le_bytes());
+        let region = Region::new(0, bytes.len()).expect("region");
+        let err = verify_value_at(&bytes, &list_cfg_ty(), list_element, root, region)
+            .expect_err("a lying outer len must be rejected");
+        assert!(
+            matches!(
+                err,
+                VerifyError::OutOfRegion { .. } | VerifyError::FixedSlotOutOfRegion { .. }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn inplace_list_schema_root_outside_region_rejected() {
+        let (bytes, list_element, root) = list_cfg_buffer(2);
+        let region = Region::new(0, root).expect("region"); // excludes header
+        let err = verify_value_at(&bytes, &list_cfg_ty(), list_element, root, region)
+            .expect_err("a root outside the region must be rejected");
+        assert!(
+            matches!(err, VerifyError::OutOfRegion { .. }),
+            "got {err:?}"
+        );
+    }
 }

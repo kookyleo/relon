@@ -244,15 +244,16 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     ) -> Result<(), LlvmError> {
         if inplace {
             // In-place region-walk return ABI (S1/S2 `List<List<scalar>>`,
-            // S3 `List<String>`), mirroring the cranelift backend. The IR
-            // lowering only sets `inplace` for a pointer-array list value
-            // sourced directly from a `#main` parameter identity — its root
-            // header lives in the input region and the value is
-            // self-contained there (the single-region invariant). Rather
-            // than relocate the non-contiguous in-buffer block (the old
-            // rejecting / segfaulting path on `List<String>`), we pop the
-            // arena-relative root pointer that `Op::LoadListListPtr` /
-            // `Op::LoadListStringPtr` pushed and stash it; the buffer
+            // S3 `List<String>`, S4 `List<Schema>`), mirroring the cranelift
+            // backend. The IR lowering only sets `inplace` for a
+            // pointer-array list value sourced directly from a `#main`
+            // parameter identity — its root header lives in the input region
+            // and the value is self-contained there (the single-region
+            // invariant). Rather than relocate the non-contiguous in-buffer
+            // block (the old rejecting / segfaulting path on `List<String>`),
+            // we pop the arena-relative root pointer that
+            // `Op::LoadListListPtr` / `Op::LoadListStringPtr` /
+            // `Op::LoadListSchemaPtr` pushed and stash it; the buffer
             // epilogue returns it as the negative in-place sentinel. The
             // fixed-area slot at `offset` is left untouched — the host
             // ignores `out_buf` entirely for an in-place return and reads
@@ -262,7 +263,10 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             // `true` flag on any other type is a lowering bug. Only one
             // root return exists per `#main`, so a single stash slot
             // suffices; a second in-place store is a lowering bug.
-            if !matches!(ty, IrType::ListList | IrType::ListString) {
+            if !matches!(
+                ty,
+                IrType::ListList | IrType::ListString | IrType::ListSchema
+            ) {
                 return Err(LlvmError::Codegen(format!(
                     "in-place StoreField on non-pointer-array type {ty:?} — lowering bug",
                 )));
@@ -306,6 +310,17 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             // so reaching here is ABI drift — surface it loudly.
             return Err(LlvmError::Codegen(
                 "non-in-place StoreField { ty: ListList } has no copy path".into(),
+            ));
+        }
+        if matches!(ty, IrType::ListSchema) {
+            // A non-in-place `StoreField { ty: ListSchema }` has no copy
+            // producer today (the only supported `List<Schema>` return is
+            // the in-place param-identity walk handled above; const-pool /
+            // field-sourced `List<Schema>` is capped loudly at lowering), so
+            // reaching here is ABI drift — surface it loudly rather than
+            // fall through to the i64 store path.
+            return Err(LlvmError::Codegen(
+                "non-in-place StoreField { ty: ListSchema } has no copy path".into(),
             ));
         }
         // Phase D.1 fast path: rewrite trailing StoreField into a

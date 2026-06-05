@@ -157,15 +157,16 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         }
         if inplace {
             // In-place region-walk return ABI (S1/S2 `List<List<scalar>>`,
-            // S3 `List<String>`). The IR lowering only sets `inplace` for a
-            // pointer-array list value sourced directly from a `#main`
-            // parameter identity — its root header lives in the input
-            // region and the value is self-contained there (the
+            // S3 `List<String>`, S4 `List<Schema>`). The IR lowering only
+            // sets `inplace` for a pointer-array list value sourced directly
+            // from a `#main` parameter identity — its root header lives in
+            // the input region and the value is self-contained there (the
             // single-region invariant). Rather than relocate the
             // non-contiguous, in-buffer-relative block (the old rigid-copy
             // path that segfaulted on `List<String>`), we pop the
             // arena-relative root pointer (pushed by `LoadListListPtr` /
-            // `LoadListStringPtr`) and stash it; the epilogue returns it as
+            // `LoadListStringPtr` / `LoadListSchemaPtr`) and stash it; the
+            // epilogue returns it as
             // the negative in-place sentinel `-(root_abs + 1)`. The
             // fixed-area slot at `offset` is left untouched — the host
             // ignores `out_buf` entirely for an in-place return and reads
@@ -176,7 +177,10 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
             // root return value exists per `#main`, so a single stash slot
             // suffices; a second in-place store would be a lowering bug
             // (surfaced loudly here rather than silently overwriting).
-            if !matches!(ty, IrType::ListList | IrType::ListString) {
+            if !matches!(
+                ty,
+                IrType::ListList | IrType::ListString | IrType::ListSchema
+            ) {
                 return Err(CraneliftError::Codegen(format!(
                     "in-place StoreField on non-pointer-array type {ty:?} — lowering bug",
                 )));
@@ -212,9 +216,14 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
             ));
         }
         if matches!(ty, IrType::ListSchema) {
-            return Err(CraneliftError::Codegen(format!(
-                "StoreField pointer-indirect type {ty:?} (pointer-array) not yet supported",
-            )));
+            // A non-in-place `StoreField { ty: ListSchema }` has no copy
+            // producer today: the only supported `List<Schema>` return is
+            // the in-place param-identity walk handled above. A const-pool
+            // or field-sourced `List<Schema>` is capped loudly at lowering,
+            // so reaching here is ABI drift — surface it.
+            return Err(CraneliftError::Codegen(
+                "non-in-place StoreField { ty: ListSchema } has no copy path".into(),
+            ));
         }
         let (cr_ty, size, _push_ty) = field_load_shape(ty)?;
         let value = self.pop()?;
