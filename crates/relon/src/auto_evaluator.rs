@@ -60,7 +60,11 @@ pub struct AutoEvaluator {
     /// Mirror slot for the failure path. If the AOT pipeline fails
     /// once we cache the error so repeated `run_main` calls don't
     /// each pay a fresh parse / analyze / lower / codegen attempt.
-    aot_init_err: OnceLock<String>,
+    /// Carries a classification flag (`unsupported_shape`) so
+    /// `run_main` can distinguish "compiled backend can't express this
+    /// shape" (fall back to tree-walk) from a genuine source / host
+    /// error (surface it).
+    aot_init_err: OnceLock<AotInitError>,
     /// v6-fix-D2 default-path: set when the `#main` shape is
     /// trivial scalar — a single scalar-typed parameter plus a
     /// single literal-or-arithmetic body. On such shapes the
@@ -77,6 +81,23 @@ pub struct AutoEvaluator {
     /// cost only on the first call (and the cache fast-restore
     /// covers subsequent ones).
     is_trivial_main: bool,
+}
+
+/// Cached outcome of a failed AOT pipeline build.
+///
+/// The `message` reproduces the original error text for diagnostics;
+/// `unsupported_shape` records whether the failure was a compiled-backend
+/// *capability boundary* (the shape can't be lowered / codegen'd — auto
+/// then falls back to the tree-walk oracle) rather than a genuine source
+/// or host / infrastructure error (which `run_main` surfaces verbatim).
+struct AotInitError {
+    /// Original error text, surfaced unchanged when this is not a
+    /// shape-capability failure.
+    message: String,
+    /// `true` only for compiled-backend capability-boundary errors
+    /// (lowering / codegen / unsupported `#main` signature). See
+    /// [`relon_codegen_cranelift::CraneliftError::is_unsupported_shape`].
+    unsupported_shape: bool,
 }
 
 impl AutoEvaluator {
@@ -126,7 +147,7 @@ impl AutoEvaluator {
     /// the cached error reference if a prior call already failed —
     /// the AOT pipeline is deterministic, so retrying after a failure
     /// would just burn CPU on the same error.
-    fn aot(&self) -> std::result::Result<&dyn Evaluator, &str> {
+    fn aot(&self) -> std::result::Result<&dyn Evaluator, &AotInitError> {
         // Fast path: already built successfully.
         if let Some(aot) = self.aot.get() {
             return Ok(aot.as_ref());
@@ -134,7 +155,7 @@ impl AutoEvaluator {
         // Fast path: already failed; surface cached error without
         // re-running the pipeline.
         if let Some(err) = self.aot_init_err.get() {
-            return Err(err.as_str());
+            return Err(err);
         }
         // Slow path: try to build. Multiple concurrent callers may
         // race here, but `OnceLock::set` will only let one entry in;
@@ -154,13 +175,12 @@ impl AutoEvaluator {
                     .expect("aot slot populated after set / race-loss")
                     .as_ref())
             }
-            Err(msg) => {
-                let _ = self.aot_init_err.set(msg);
+            Err(err) => {
+                let _ = self.aot_init_err.set(err);
                 Err(self
                     .aot_init_err
                     .get()
-                    .expect("aot_init_err slot populated after set / race-loss")
-                    .as_str())
+                    .expect("aot_init_err slot populated after set / race-loss"))
             }
         }
     }
@@ -181,7 +201,7 @@ impl AutoEvaluator {
     /// the `XDG_CACHE_HOME` / `HOME` env vars before constructing
     /// the evaluator.
     #[cfg(feature = "cranelift-aot")]
-    fn build_aot(source: &str) -> Result<Box<dyn Evaluator>, String> {
+    fn build_aot(source: &str) -> Result<Box<dyn Evaluator>, AotInitError> {
         let cache_dir = relon_codegen_cranelift::default_cache_dir();
 
         // 1. Cache-hit fast path: pull a (source, sandbox)-keyed
@@ -208,16 +228,34 @@ impl AutoEvaluator {
         // as a side-effect so the *next* cold start can hit.
         relon_codegen_cranelift::AotEvaluator::from_source_with_cache(source, &cache_dir)
             .map(|aot| Box::new(aot) as Box<dyn Evaluator>)
-            .map_err(|e| e.to_string())
+            .map_err(|e| AotInitError {
+                // Classify before stringifying: only compiled-backend
+                // capability-boundary errors (lowering / codegen /
+                // unsupported `#main` signature) authorise a tree-walk
+                // fallback. Parse / analyze (source errors) and host /
+                // infra faults keep `unsupported_shape = false` so
+                // `run_main` surfaces them.
+                unsupported_shape: e.is_unsupported_shape(),
+                message: e.to_string(),
+            })
     }
 
     /// Stub for builds compiled without `cranelift-aot` (e.g. wasm32
     /// hosts). `run_main` surfaces the cached error; the tree-walker
     /// surface keeps working.
     #[cfg(not(feature = "cranelift-aot"))]
-    fn build_aot(_source: &str) -> Result<Box<dyn Evaluator>, String> {
-        Err("this build was compiled without the `cranelift-aot` feature; rebuild with `--features cranelift-aot` to enable the AOT backend"
-            .to_string())
+    fn build_aot(_source: &str) -> Result<Box<dyn Evaluator>, AotInitError> {
+        // "Feature off" is a build-configuration fault, not a shape
+        // capability boundary — but the tree-walk surface is the only
+        // backend in this build anyway, so `run_main` already routes
+        // there. Keep `unsupported_shape = false`; it never gets read on
+        // this cfg because there is no compiled backend to fall back
+        // *from*.
+        Err(AotInitError {
+            message: "this build was compiled without the `cranelift-aot` feature; rebuild with `--features cranelift-aot` to enable the AOT backend"
+                .to_string(),
+            unsupported_shape: false,
+        })
     }
 }
 
@@ -258,8 +296,27 @@ impl Evaluator for AutoEvaluator {
         }
         match self.aot() {
             Ok(aot) => aot.run_main(args),
-            Err(msg) => Err(RuntimeError::Unsupported {
-                reason: format!("auto backend: cranelift-AOT setup failed: {msg}"),
+            // The compiled backend can't express this `#main` shape
+            // (e.g. a `-> List<P>` return). That's a capability
+            // boundary, not a program error — adapt by running the
+            // tree-walk oracle, which handles every such shape and
+            // produces the authoritative result. The trade-off is the
+            // loss of AOT acceleration for this run, so we log it.
+            Err(err) if err.unsupported_shape => {
+                tracing::info!(
+                    target: "relon::auto_evaluator",
+                    reason = %err.message,
+                    "compiled (cranelift-AOT) backend can't express this #main shape; \
+                     falling back to the tree-walk interpreter — this run forgoes AOT acceleration"
+                );
+                Evaluator::run_main(self.tree_walk.as_ref(), args)
+            }
+            // Genuine source error (parse / analyze) or host /
+            // infrastructure fault (JIT setup, module define, cache
+            // I/O). Surfacing it keeps real problems visible rather
+            // than masking them behind a silent tree-walk run.
+            Err(err) => Err(RuntimeError::Unsupported {
+                reason: format!("auto backend: cranelift-AOT setup failed: {}", err.message),
             }),
         }
     }

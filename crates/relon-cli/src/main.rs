@@ -827,21 +827,61 @@ fn cmd_run(
                         }
                     };
                     phase("default_cache_probe");
+                    // Build the compiled backend (cache hit, or fresh
+                    // from source). On a cache miss the source build can
+                    // fail because the compiled backend can't *express*
+                    // this `#main` shape (e.g. `-> List<P>`) — that is a
+                    // capability boundary, not a program error, so auto
+                    // adapts by falling back to the tree-walk oracle
+                    // instead of surfacing the error. Genuine source
+                    // errors (parse / analyze) and host / infra faults
+                    // (JIT setup, module define, cache I/O) are *not*
+                    // swallowed: they re-surface so the user sees the
+                    // real problem. See `CraneliftError::is_unsupported_shape`.
                     let aot = match aot_opt {
-                        Some(a) => a,
-                        None => AotEvaluator::from_source_with_cache(&content, &cache_dir)
-                            .map_err(|e| {
-                                miette::miette!("auto backend setup: {e}").with_source_code(
-                                    NamedSource::new(file.to_string_lossy(), content.clone()),
-                                )
-                            })?,
+                        Some(a) => Some(a),
+                        None => match AotEvaluator::from_source_with_cache(&content, &cache_dir) {
+                            Ok(a) => Some(a),
+                            Err(e) if e.is_unsupported_shape() => {
+                                // Observable: the user just lost AOT
+                                // acceleration for this run. Mirror the
+                                // existing `[relon-cli] ...` stderr style
+                                // so a plain run still shows it.
+                                eprintln!(
+                                    "[relon-cli] auto backend: compiled (cranelift-AOT) path can't \
+                                     express this #main shape ({e}); falling back to the tree-walk \
+                                     interpreter — this run forgoes AOT acceleration"
+                                );
+                                phase("default_unsupported_tree_walk");
+                                None
+                            }
+                            Err(e) => {
+                                return Err(miette::miette!("auto backend setup: {e}")
+                                    .with_source_code(NamedSource::new(
+                                        file.to_string_lossy(),
+                                        content.clone(),
+                                    )));
+                            }
+                        },
                     };
-                    EvaluatorTrait::run_main(&aot, args_map).map_err(|e| {
-                        Report::new(e).with_source_code(NamedSource::new(
-                            file.to_string_lossy(),
-                            content.clone(),
-                        ))
-                    })?
+                    match aot {
+                        Some(aot) => EvaluatorTrait::run_main(&aot, args_map).map_err(|e| {
+                            Report::new(e).with_source_code(NamedSource::new(
+                                file.to_string_lossy(),
+                                content.clone(),
+                            ))
+                        })?,
+                        // Fallback: tree-walk is the golden oracle. It
+                        // produces the same result the compiled path
+                        // would have, or surfaces the genuine runtime /
+                        // source error if the program is actually wrong.
+                        None => evaluator.run_main(&scope, args_map).map_err(|e| {
+                            Report::new(e).with_source_code(NamedSource::new(
+                                file.to_string_lossy(),
+                                content.clone(),
+                            ))
+                        })?,
+                    }
                 }
             }
             BackendArg::TreeWalk => evaluator.run_main(&scope, args_map).map_err(|e| {

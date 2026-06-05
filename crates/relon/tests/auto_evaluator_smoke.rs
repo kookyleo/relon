@@ -42,10 +42,11 @@ const MAIN_SOURCE: &str = "#main(Int x) -> Int\nabs(x) * 2";
 /// A `#main(...)` shape the cranelift-AOT backend currently rejects (a
 /// nested-list `List<List<Int>>` return — pointer-array-of-pointer-array
 /// materialisation is not lowered on the compiled backends) while the
-/// tree-walker keeps working. Exercises the failure-isolation invariant
-/// for the AOT init slot. The `x: Int` param matches the args the test
-/// pushes; the rejection happens at AOT init (IR lowering), surfacing as
-/// `RuntimeError::Unsupported` regardless of the args.
+/// tree-walker keeps working. The rejection happens at AOT init (IR
+/// lowering); since it is a compiled-backend *capability boundary* (not
+/// a program error), auto adapts by running the tree-walk oracle instead
+/// of surfacing the error. The `x: Int` param matches the args the tests
+/// push.
 const AOT_REJECTED_MAIN: &str = "#main(Int x) -> List<List<Int>>\n[[x]]";
 
 #[test]
@@ -125,25 +126,36 @@ fn run_main_routes_through_aot_and_caches() {
 }
 
 #[test]
-fn aot_init_failure_does_not_poison_tree_walk_surface() {
-    // When the AOT pipeline rejects the source, only `run_main`
-    // should surface the error; `eval` / `eval_root` / `force_thunk`
-    // / `invoke_closure` must keep working off the tree-walker.
+fn aot_unsupported_shape_falls_back_without_poisoning_tree_walk_surface() {
+    // When the AOT pipeline rejects the source because it can't express
+    // the `#main` shape (a capability boundary, not a program error),
+    // `run_main` adapts by routing through the tree-walk oracle and
+    // produces the correct result. The other surface methods (`eval` /
+    // `eval_root` / `force_thunk` / `invoke_closure`) keep working off
+    // the tree-walker throughout.
     let evaluator = AutoEvaluator::new(AOT_REJECTED_MAIN).expect("auto build");
 
     let mut args = HashMap::new();
     args.insert("x".to_string(), Value::Int(7));
 
-    // First `run_main` triggers the AOT pipeline and fails because
-    // closure-typed returns are outside the cranelift AOT envelope
-    // today (Phase C.4 deferred work).
-    let err = evaluator
+    // First `run_main` triggers the AOT pipeline; it rejects the
+    // `List<List<Int>>` return (a shape the compiled backend can't
+    // lower yet), so auto falls back to tree-walk. The answer must
+    // match the tree-walk oracle exactly — `[[7]]`.
+    let out1 = evaluator
         .run_main(args.clone())
-        .expect_err("AOT rejects closure-typed return today");
-    assert!(matches!(err, RuntimeError::Unsupported { .. }));
+        .expect("auto adapts via tree-walk fallback on an unsupported shape");
+    let oracle = new_evaluator(AOT_REJECTED_MAIN, Backend::TreeWalk)
+        .expect("tree-walk build")
+        .run_main(args.clone())
+        .expect("tree-walk oracle run_main");
+    assert_eq!(
+        out1, oracle,
+        "auto fallback must match the tree-walk oracle"
+    );
     assert!(
         evaluator.is_aot_initialised(),
-        "failure path must mark the slot to avoid retrying"
+        "failure path must mark the slot to avoid retrying the pipeline"
     );
 
     // Tree-walk-side methods are unaffected: pull the aux node and
@@ -155,10 +167,12 @@ fn aot_init_failure_does_not_poison_tree_walk_surface() {
         .expect("tree-walk eval still works after AOT failure");
     assert_eq!(out, Value::Int(3));
 
-    // Second `run_main` returns the cached error — same shape, no
-    // re-entry into the pipeline.
-    let err2 = evaluator.run_main(args).expect_err("cached AOT failure");
-    assert!(matches!(err2, RuntimeError::Unsupported { .. }));
+    // Second `run_main` reuses the cached failure classification and
+    // again falls back — same answer, no re-entry into the pipeline.
+    let out2 = evaluator
+        .run_main(args)
+        .expect("cached unsupported-shape failure still falls back");
+    assert_eq!(out2, oracle);
 }
 
 #[test]
