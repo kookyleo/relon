@@ -103,15 +103,15 @@ signature**; each parameter declares one host-pushed slot:
 >   are contiguous and single-base, so the rigid tail copy relocates them
 >   correctly,
 > - **`List<List<scalar>>` identity returns from a `#main` parameter**
->   (`#main(List<List<Int|Float|Bool>> xss) -> List<List<…>> = xss`),
->   **cranelift backend only.** This is the first shape carried by the
->   *in-place region-walk return ABI*: instead of copying the nested
->   pointer-array graph, the machine code reports the arena offset of the
->   result root and the host verifies + decodes it in place in its source
->   region (see the design note below). LLVM still caps this shape, and a
->   parameter-*field* `List<List<scalar>>` (`w.rows`) stays capped — its
->   field load re-encodes the inner rows into a materialised form the
->   in-place reader does not yet decode,
+>   (`#main(List<List<Int|Float|Bool>> xss) -> List<List<…>> = xss`), on
+>   **both the cranelift and llvm backends.** This is the first shape
+>   carried by the *in-place region-walk return ABI*: instead of copying
+>   the nested pointer-array graph, the machine code reports the arena
+>   offset of the result root and the host verifies + decodes it in place
+>   in its source region (see the design note below); both backends share
+>   one host decode pipeline. A parameter-*field* `List<List<scalar>>`
+>   (`w.rows`) stays capped on both — its field load re-encodes the inner
+>   rows into a materialised form the in-place reader does not yet decode,
 > - **`#schema`-branded struct returns** (`#main() -> Cfg { ... }`) whose
 >   fields are any of the above (including literal `String` / `List`
 >   fields),
@@ -131,9 +131,9 @@ signature**; each parameter declares one host-pushed slot:
 >   `List<List<Schema>>`) — the recursive per-entry relocation isn't
 >   modelled,
 > - **returning** a `List<Schema>` from `#main`, a `List<List<scalar>>`
->   on **LLVM** (cranelift's parameter-identity case is supported above),
->   a `List<List<scalar>>` reached through a **parameter field** on either
->   backend, or an anon-`Dict` / struct field of those types. The
+>   reached through a **parameter field** on either backend (the
+>   parameter-*identity* case is supported on both backends above), or an
+>   anon-`Dict` / struct field of those types. The
 >   host-side *decode* is in place — `BufferReader` walks the buffer with
 >   a single base and reconstructs the nested `Value` recursively
 >   (`read_list_record` for `List<Schema>`, `read_list_list` /
@@ -166,8 +166,9 @@ signature**; each parameter declares one host-pushed slot:
 > single-base const-pool block and segfaulted on the scattered param
 > graph.
 >
-> **In-place region-walk return ABI (the honest fix; first slice landed
-> for cranelift `List<List<scalar>>`).** Instead of copying, the machine
+> **In-place region-walk return ABI (the honest fix; `List<List<scalar>>`
+> parameter-identity now landed on both the cranelift and llvm
+> backends).** Instead of copying, the machine
 > code reports the **arena-absolute offset of the result root** to the
 > host via a negative return sentinel: a `run_main` return value `>= 0` is
 > the usual `bytes_written` (decode at `out_ptr`), while a value `< 0`
@@ -191,11 +192,15 @@ signature**; each parameter declares one host-pushed slot:
 > This keeps the load-bearing single-region wall intact (no cross-region
 > copy, no whole-buffer rigid relocation) and turns the entire class of
 > "wrong base / scattered graph" bugs from *silent miscompile* into
-> *explicit verifier failure*. The reader, verifier, and the cranelift
-> `List<List<scalar>>` identity case are wired; the remaining work is
-> extending the same ABI to per-element pointer-array roots
-> (`List<String>` / `List<Schema>`), the LLVM backend, and wasm linear
-> memory — each landed only once it is proven bit-equal to the oracle.
+> *explicit verifier failure*. The host decode pipeline (sentinel →
+> region-select → verifier → decode) lives once in
+> `relon_eval_api::inplace_return` and is shared by both AOT backends, so
+> cranelift and llvm walk the exact same gate. The reader, verifier, and
+> the `List<List<scalar>>` parameter-identity case on **both** native
+> backends are wired; the remaining work is extending the same ABI to
+> per-element pointer-array roots (`List<String>` / `List<Schema>`) and
+> wasm linear memory — each landed only once it is proven bit-equal to
+> the oracle.
 
 ### Boundary Result vs Relon value-level Result
 

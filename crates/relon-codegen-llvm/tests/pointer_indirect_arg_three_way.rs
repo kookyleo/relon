@@ -456,10 +456,10 @@ fn nested_schema_with_list_schema_field_three_way() {
 ///
 /// NOTE: the nested-list **identity return**
 /// `#main(List<List<Int>> xss) -> List<List<Int>> = xss` is now
-/// cranelift-supported via the S1 in-place region-walk return ABI (it
-/// reports the input-region root to the host instead of copying). LLVM
-/// still caps it — S1 is cranelift-only — so that case moved to
-/// [`nested_list_identity_return_cranelift_only`] below.
+/// supported on **both** AOT backends via the in-place region-walk
+/// return ABI (S1 cranelift, S2 llvm — each reports the input-region
+/// root to the host instead of copying). That case moved to
+/// [`nested_list_identity_return_both_backends`] below.
 #[test]
 fn unsupported_pointer_indirect_shapes_loudly_capped() {
     for src in [
@@ -478,20 +478,22 @@ fn unsupported_pointer_indirect_shapes_loudly_capped() {
     }
 }
 
-/// The nested-list identity return is the S1 split: cranelift compiles
-/// it (in-place region-walk return ABI), LLVM still caps it loudly. Pins
-/// the asymmetry so neither half regresses — a cranelift regression would
-/// re-cap a supported shape; an LLVM acceptance would mean S2's three-way
-/// lift landed without the bit-equal proof.
+/// The nested-list identity return is now lifted on **both** AOT
+/// backends (S1 cranelift, S2 llvm) via the in-place region-walk return
+/// ABI. Pins that both compile the shape so neither regresses back to a
+/// loud cap. Bit-equality vs the tree-walk oracle (three-way) is proven
+/// by the differential gate in
+/// `relon-test-harness/tests/return_inplace_list_list.rs`; here we only
+/// assert the backends accept the `#main` shape.
 #[test]
-fn nested_list_identity_return_cranelift_only() {
+fn nested_list_identity_return_both_backends() {
     let src = "#main(List<List<Int>> xss) -> List<List<Int>>\nxss";
     assert!(
         AotEvaluator::from_source(src).is_ok(),
         "cranelift must compile the S1 nested-list identity return"
     );
     assert!(
-        LlvmAotEvaluator::from_source(src).is_err(),
-        "llvm must still loudly cap the nested-list return (S1 is cranelift-only)"
+        LlvmAotEvaluator::from_source(src).is_ok(),
+        "llvm must compile the S2 nested-list identity return (in-place region-walk ABI)"
     );
 }

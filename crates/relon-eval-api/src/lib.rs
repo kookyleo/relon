@@ -39,6 +39,7 @@ pub mod capability;
 pub mod context;
 pub mod decorator;
 pub mod error;
+pub mod inplace_return;
 pub mod layout;
 pub mod module;
 pub mod native_fn;

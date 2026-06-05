@@ -1,9 +1,12 @@
-//! S1 differential gate for the in-place region-walk return ABI.
+//! S1/S2 differential gate for the in-place region-walk return ABI.
 //!
 //! Asserts that a `#main(List<List<scalar>> xss) -> List<List<scalar>> =
 //! xss` identity return produces **bit-identical** output on the
-//! cranelift-AOT backend (which decodes the value in place at its source
-//! region, gated by the host verifier) and the tree-walk golden oracle.
+//! cranelift-AOT backend, the llvm-AOT backend (S2 — gated behind the
+//! `llvm-aot` feature), and the tree-walk golden oracle. Both AOT
+//! backends decode the value in place at its source region through the
+//! one shared host pipeline (`relon_eval_api::inplace_return`): negative
+//! sentinel `-(root_abs+1)` → region-select → verifier → decode.
 //!
 //! Three layers:
 //!  1. Hand-written edge cases (empty outer, empty rows, single element,
@@ -13,8 +16,8 @@
 //!     didn't think of" net.
 //!  3. Loud-cap guards: `List<List<String>>` / `List<Schema>` /
 //!     parameter-*field* `List<List<scalar>>` returns must still decline
-//!     the cranelift shape (they fall back to tree-walk in production),
-//!     never silently mis-decode.
+//!     on **both** AOT backends (they fall back to tree-walk in
+//!     production), never silently mis-decode.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -66,15 +69,24 @@ fn bool_rows(rows: &[&[bool]]) -> Value {
     ))
 }
 
-/// Run the differential and assert cranelift actually compiled the shape
-/// (an in-place return must NOT silently fall back to a skip here — the
-/// whole point of S1 is that cranelift expresses it).
+/// Run the differential and assert the AOT backends actually compiled
+/// the shape (an in-place return must NOT silently fall back to a skip
+/// here — the whole point of S1/S2 is that the backends express it).
+/// cranelift is always asserted; llvm is asserted only when the
+/// `llvm-aot` feature is on (otherwise its leg is a recorded skip and the
+/// default no-LLVM workspace build stays green).
 fn assert_cranelift_inplace(src: &str, v: Value) {
     let report = assert_all_backends_bit_equal(src, args(v));
     assert!(
         report.cranelift_compared,
         "cranelift must compile the in-place List<List<scalar>> return; skipped: {:?}",
         report.cranelift_skip_reason
+    );
+    #[cfg(feature = "llvm-aot")]
+    assert!(
+        report.llvm_compared,
+        "llvm must compile the in-place List<List<scalar>> return; skipped: {:?}",
+        report.llvm_skip_reason
     );
 }
 
@@ -180,27 +192,34 @@ proptest! {
     fn diff_int(val in list_list_int_strat()) {
         let report = assert_all_backends_bit_equal(SRC_INT, args(val));
         prop_assert!(report.cranelift_compared, "cranelift must compile the shape");
+        #[cfg(feature = "llvm-aot")]
+        prop_assert!(report.llvm_compared, "llvm must compile the shape");
     }
 
     #[test]
     fn diff_float(val in list_list_float_strat()) {
         let report = assert_all_backends_bit_equal(SRC_FLOAT, args(val));
         prop_assert!(report.cranelift_compared, "cranelift must compile the shape");
+        #[cfg(feature = "llvm-aot")]
+        prop_assert!(report.llvm_compared, "llvm must compile the shape");
     }
 
     #[test]
     fn diff_bool(val in list_list_bool_strat()) {
         let report = assert_all_backends_bit_equal(SRC_BOOL, args(val));
         prop_assert!(report.cranelift_compared, "cranelift must compile the shape");
+        #[cfg(feature = "llvm-aot")]
+        prop_assert!(report.llvm_compared, "llvm must compile the shape");
     }
 }
 
 // ---- loud-cap guards: unsupported shapes decline, never miscompile ---
 
-/// The shapes S1 does NOT lift must still make the cranelift backend
+/// The shapes S1/S2 do NOT lift must still make **both** AOT backends
 /// **decline** the `#main` shape (a setup error). In production
 /// `Backend::Auto` falls back to the tree-walk oracle; here we assert the
-/// decline is loud (an `Err`), so a silent miscompile can never sneak in.
+/// decline is loud (an `Err`), so a silent miscompile can never sneak in
+/// on either backend.
 #[test]
 fn unsupported_return_shapes_fail_loudly_not_silently() {
     let cap_cases = [
@@ -218,6 +237,15 @@ fn unsupported_return_shapes_fail_loudly_not_silently() {
             Err(other) => panic!("expected a CraneliftAot decline for `{src}`, got {other}"),
             Ok(_) => panic!(
                 "cranelift unexpectedly accepted an unsupported in-place return shape: `{src}` — \
+                 a silent-miscompile path may have opened"
+            ),
+        }
+        #[cfg(feature = "llvm-aot")]
+        match new_evaluator(src, Backend::LlvmAot) {
+            Err(BackendError::LlvmAot(_)) => { /* loud decline — correct */ }
+            Err(other) => panic!("expected an LlvmAot decline for `{src}`, got {other}"),
+            Ok(_) => panic!(
+                "llvm unexpectedly accepted an unsupported in-place return shape: `{src}` — \
                  a silent-miscompile path may have opened"
             ),
         }
