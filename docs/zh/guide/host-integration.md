@@ -96,8 +96,9 @@ host-pushed slot：
 >   注记）；三个后端共用同一条 host 解码管线。wasm 上 host 直接读模块的
 >   **线性内存**得到同一片 arena，并在解码前跑同一份 verifier（四方逐字节
 >   相等：tree-walk == cranelift == llvm == wasm）。入参 **字段** 形式的
->   `List<List<scalar>>`（`w.rows`）在三个后端上仍 cap —— 字段读取会把内层
->   行重编码为 materialized 形态，就地读取器尚不能解码；
+>   `List<List<scalar>>`（`#main(W w) -> List<List<Int>> = w.rows`）在三个
+>   后端上 **同样支持**（F4）：arena-绝对槽约定下，字段读取直接把字段列表根
+>   的 arena-绝对偏移压栈，故与恒等形走同一条就地返回；
 > - **从 `#main` 入参恒等返回 `List<String>`**
 >   （`#main(List<String> ss) -> List<String> = ss`），**cranelift、llvm
 >   与已编译 wasm 三个后端均已支持。** 这是就地区走读返回 ABI 承载的第一个
@@ -106,7 +107,8 @@ host-pushed slot：
 >   内，机器码报根偏移，host verifier 先逐个 String 记录在区内校验、再就地
 >   解码 —— 逐字节等价于 tree-walk oracle（含每个字符串内容；CJK / emoji /
 >   4 KiB 长串亦覆盖，wasm 上同样从线性内存经同一 verifier 读出）。入参
->   **字段** 形式的 `List<String>`（`o.tags`）在三个后端上仍 cap；
+>   **字段** 形式的 `List<String>`（`#main(Outer o) -> List<String> = o.tags`）
+>   在三个后端上 **同样支持**（F4，经同一 arena-绝对字段读取）；
 > - **从 `#main` 入参恒等返回 `List<Schema>`**
 >   （`#main(List<Cfg> items) -> List<Cfg> = items`），**cranelift、llvm
 >   与已编译 wasm 三个后端均已支持。** 这是就地区走读最深的形状：外层
@@ -116,8 +118,9 @@ host-pushed slot：
 >   子记录头 → 每个 String / List 字段的尾记录）再就地把每个元素解成 branded
 >   dict —— 逐字节等价于 tree-walk oracle（含每个子对象每个字段的内容），
 >   wasm 上亦然（同一递归在线性内存上跑）。入参 **字段**
->   形式的 `List<Schema>`（`w.items`）在三个后端上仍 cap；子记录自身再含
->   嵌套 `List<Schema>` / `List<List<…>>` 字段者亦 cap（超出范围 —— 就地子
+>   形式的 `List<Schema>`（`#main(W w) -> List<Cfg> = w.items`）在三个后端上
+>   **同样支持**（F4，经同一 arena-绝对字段读取）；子记录自身再含
+>   嵌套 `List<Schema>` / `List<List<…>>` 字段者仍 cap（超出范围 —— 就地子
 >   记录读取器对其响亮 cap）；
 > - **`#schema` 加品牌的结构体返回**（`#main() -> Cfg { ... }`），字段
 >   可含上述任意类型（含字面量 `String` / `List` 字段）；
@@ -133,11 +136,10 @@ host-pushed slot：
 >   config 请改用 `#schema` 结构体）；
 > - 内层为指针数组元素的嵌套 List（`List<List<String>>` /
 >   `List<List<Schema>>`）—— 递归逐元素重定位尚未建模；
-> - 在两个后端上返回经 **入参字段** 得到的 `List<Schema>` 或
->   `List<List<scalar>>`（入参 **恒等** 形两个后端均已支持，见上）；或返回子
->   记录自身再含嵌套 `List<Schema>` / `List<List<…>>` 字段的 `List<Schema>`。
+> - 返回子记录自身再含嵌套 `List<Schema>` / `List<List<…>>` 字段的
+>   `List<Schema>`（就地子记录读取器对其更深的指针数组响亮 cap）。
 >
->   返回**含该类入参恒等字段的对象** —— 无论对象是**匿名 `Dict`**
+>   返回**含该类入参字段的对象** —— 无论对象是**匿名 `Dict`**
 >   （`-> Dict { servers: servers, n: 1 }`）还是**结构体 `#schema`**
 >   （`#schema Wrapper { servers: List<Server>, n: Int }`，经
 >   `-> Wrapper { servers: servers, n: 7 }` 返回）—— 均**四方**支持
@@ -145,7 +147,9 @@ host-pushed slot：
 >   `List<Schema>`、`List<List<scalar>>`、`List<String>` 或
 >   `List<Int|Float|Bool>`（`List<Schema>` / `List<List<scalar>>` 在
 >   cranelift 为 F1b、llvm 与 wasm 为 F2；F3 增加了结构体路径与标量/String
->   list 字段类型，四方齐通）。对象头建在 `out_buf`，但入参来源字段的数据仍在
+>   list 字段类型，四方齐通）。来源可为入参 **恒等**（`servers`），也可为
+>   （F4）入参 **字段** 走读（`o.items`、`o.tags`）—— 二者都把字段 list 根的
+>   arena-绝对偏移落进槽。对象头建在 `out_buf`，但入参来源字段的数据仍在
 >   `in_buf` —— 这是真正的**跨区**字段指针。在 arena-绝对槽约定下，字段槽
 >   **直接**存入参 list 根的 arena-绝对偏移（不拷贝 —— 注意这与源码内 list
 >   **字面量**字段如 `tags: ["a", "b"]` 不同，后者拷进 `out_buf` 尾区、自洽于
@@ -153,19 +157,18 @@ host-pushed slot：
 >   verifier，把槽指针判区到 input 区并对整张可达图界检（深至每个子记录的
 >   String 字段），再由 `BufferReader::new_at_base` 跨区走读 —— 逐字节等价于
 >   tree-walk oracle。wasm 上 host 从**线性内存**取同一片 arena 并跑同一份
->   verifier 门控的解码，无 wasm 专属路径。所有仍 cap 的情形（入参**字段**来源
->   的 list，或双层嵌套的 `List<List<Schema>>`）下后端均拒绝，绝不把
->   `in_buf` 指针塞进 `out_buf` 槽。host 侧 **解码已就位**：
+>   verifier 门控的解码，无 wasm 专属路径。剩余仍 cap 的情形（双层嵌套的
+>   `List<List<Schema>>` / `List<List<String>>`）下后端均拒绝，绝不存入不支持
+>   的指针数组。host 侧 **解码已就位**：
 >   `BufferReader` 以单一基址走读 buffer，递归重建嵌套 `Value`
 >   （`List<Schema>` 走 `read_list_record` / `read_list_record_at`，
 >   `List<List<scalar>>` 走 `read_list_list` / `read_list_list_at`，就地
->   `List<String>` 走 `read_list_string_at`）。就地返回接线现已覆盖 **逐元素
->   指针数组** 的 `List<String>` 与 `List<Schema>` 入参恒等形（见上）；仍缺
->   materialized 字段读取形态与更深的嵌套元素 list，保持编译期响亮 cap；
-> - **返回来自 `#main` 入参 **字段读取** / 函数调用（而非入参恒等或源码内
->   字面量）的 `List<String>`（或任意指针数组 list）** —— 其字段读取重定位
->   尚未逐字节证明可就地返回，故仍响亮 cap（入参 **恒等** 形 `List<String>`
->   两个后端均已支持，见上）。
+>   `List<String>` 走 `read_list_string_at`）。就地返回接线已覆盖 **逐元素
+>   指针数组** 的 `List<String>` 与 `List<Schema>`，入参 **恒等** 与（F4）
+>   入参 **字段** 走读两形（见上）；仅更深的嵌套元素 list 仍保持编译期响亮 cap。
+> - **返回来自 `#main` 入参函数调用 / 任意表达式（而非入参恒等、入参字段走读
+>   或源码内字面量）的指针数组 list** —— 尚未逐字节证明可就地返回，故仍响亮
+>   cap。
 >
 > 上述形状一律在编译期 **响亮报错**；编译后端绝不吐错数据、绝不崩溃 ——
 > 请把它们路由到 tree-walk 解释器。

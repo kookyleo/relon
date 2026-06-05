@@ -90,6 +90,44 @@ fn assert_cranelift_inplace(src: &str, v: Value) {
     );
 }
 
+// ---- F4: parameter-FIELD List<List<Int>> return (`w.rows`) -----------
+
+const SRC_W_ROWS: &str = "#schema W { rows: List<List<Int>>, n: Int }\n\
+     #main(W w) -> List<List<Int>>\nw.rows";
+
+fn w_rows(rows: &[&[i64]], n: i64) -> HashMap<String, Value> {
+    let map = std::collections::BTreeMap::from([
+        (
+            relon_eval_api::smol_str::SmolStr::from("rows"),
+            int_rows(rows),
+        ),
+        (relon_eval_api::smol_str::SmolStr::from("n"), Value::Int(n)),
+    ]);
+    let w = Value::branded_dict(map, Some("W".into()));
+    let mut m = HashMap::new();
+    m.insert("w".to_string(), w);
+    m
+}
+
+#[test]
+fn param_field_rows_list_list_int() {
+    let report = assert_all_backends_bit_equal(
+        SRC_W_ROWS,
+        w_rows(&[&[1, 2, 3], &[], &[i64::MIN, i64::MAX, -1]], 5),
+    );
+    assert!(report.cranelift_compared, "cranelift must compile w.rows");
+    #[cfg(feature = "llvm-aot")]
+    assert!(report.llvm_compared, "llvm must compile w.rows");
+}
+
+#[test]
+fn param_field_rows_empty() {
+    let report = assert_all_backends_bit_equal(SRC_W_ROWS, w_rows(&[], 0));
+    assert!(report.cranelift_compared, "cranelift must compile w.rows");
+    #[cfg(feature = "llvm-aot")]
+    assert!(report.llvm_compared, "llvm must compile w.rows");
+}
+
 // ---- hand-written edge cases ----------------------------------------
 
 #[test]
@@ -224,12 +262,12 @@ proptest! {
 fn unsupported_return_shapes_fail_loudly_not_silently() {
     let cap_cases = [
         // Inner pointer-array element (String) — in-place reader can't
-        // decode a per-element pointer array yet.
+        // decode a per-element pointer array yet (F5).
         "#main(List<List<String>> xss) -> List<List<String>>\nxss",
-        // Parameter-*field* List<List<Int>> — the field load re-encodes
-        // into the materialised inner form, which would mis-decode; stays
-        // a loud cap until proven bit-equal.
-        "#schema W { List<List<Int>> rows: * }\n#main(W w) -> List<List<Int>>\nw.rows",
+        // Parameter-*field* List<List<String>> — a double pointer array
+        // field is still out of scope (F5).
+        "#schema W { rows: List<List<String>>, n: Int }\n\
+         #main(W w) -> List<List<String>>\nw.rows",
     ];
     for src in cap_cases {
         match new_evaluator(src, Backend::CraneliftAot) {

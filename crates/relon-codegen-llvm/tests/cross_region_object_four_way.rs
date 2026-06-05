@@ -619,6 +619,125 @@ fn branded_struct_list_int_field() {
     );
 }
 
+// ---- F4: object field VALUE is a parameter FIELD (not identity) ------
+//
+// `#main(Outer o) -> Dict { t: o.tags, … }` / `-> Wrapper { items: o.items }`.
+// The object head is built in out_buf; the source list is `o`'s field whose
+// data lives in in_buf — a cross-region link, same as the identity path, but
+// reached through a two-segment field walk. Post-F1 the field-load pushes the
+// field list root's arena-absolute offset directly into the object slot.
+
+fn outer(brand: &str, fields: Vec<(&str, Value)>) -> Value {
+    cfg(brand, fields)
+}
+
+const SRC_OBJ_F_TAGS: &str = "#schema Outer { tags: List<String>, n: Int }\n\
+     #main(Outer o) -> Dict\n{ t: o.tags, k: 1 }";
+
+#[test]
+fn anon_dict_field_from_param_field_tags() {
+    assert_four_way(
+        SRC_OBJ_F_TAGS,
+        args1(
+            "o",
+            outer(
+                "Outer",
+                vec![
+                    (
+                        "tags",
+                        strings(&["", &from_cps(&[0x4E2D, 0x6587]), &"q".repeat(2500)]),
+                    ),
+                    ("n", Value::Int(3)),
+                ],
+            ),
+        ),
+    );
+}
+
+const SRC_OBJ_F_ITEMS: &str = "#schema Server { name: String, port: Int }\n\
+     #schema Outer { items: List<Server>, n: Int }\n\
+     #main(Outer o) -> Dict\n{ items: o.items, k: 2 }";
+
+#[test]
+fn anon_dict_field_from_param_field_items() {
+    assert_four_way(
+        SRC_OBJ_F_ITEMS,
+        args1(
+            "o",
+            outer(
+                "Outer",
+                vec![
+                    (
+                        "items",
+                        list(vec![
+                            cfg("Server", vec![("name", s("")), ("port", Value::Int(0))]),
+                            cfg(
+                                "Server",
+                                vec![
+                                    ("name", s(&from_cps(&[0x4E2D, 0x6587]))),
+                                    ("port", Value::Int(i64::MAX)),
+                                ],
+                            ),
+                        ]),
+                    ),
+                    ("n", Value::Int(4)),
+                ],
+            ),
+        ),
+    );
+}
+
+const SRC_OBJ_F_GRID: &str = "#schema Outer { grid: List<List<Int>>, n: Int }\n\
+     #main(Outer o) -> Dict\n{ g: o.grid, k: 3 }";
+
+#[test]
+fn anon_dict_field_from_param_field_grid() {
+    assert_four_way(
+        SRC_OBJ_F_GRID,
+        args1(
+            "o",
+            outer(
+                "Outer",
+                vec![
+                    (
+                        "grid",
+                        list(vec![iints(&[1, 2]), iints(&[]), iints(&[i64::MIN])]),
+                    ),
+                    ("n", Value::Int(5)),
+                ],
+            ),
+        ),
+    );
+}
+
+const SRC_OBJ_F_WRAP: &str = "#schema Server { name: String, port: Int }\n\
+     #schema Outer { items: List<Server>, n: Int }\n\
+     #schema Wrapper { items: List<Server>, n: Int }\n\
+     #main(Outer o) -> Wrapper { items: o.items, n: 7 }";
+
+#[test]
+fn branded_struct_field_from_param_field_items() {
+    assert_four_way(
+        SRC_OBJ_F_WRAP,
+        args1(
+            "o",
+            outer(
+                "Outer",
+                vec![
+                    (
+                        "items",
+                        list(vec![cfg(
+                            "Server",
+                            vec![("name", s(&from_cps(&[0x1F980]))), ("port", Value::Int(-1))],
+                        )]),
+                    ),
+                    ("n", Value::Int(1)),
+                ],
+            ),
+        ),
+    );
+}
+
 // ---- proptest --------------------------------------------------------
 
 fn string_strat() -> impl Strategy<Value = String> {

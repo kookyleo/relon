@@ -464,10 +464,6 @@ fn nested_schema_with_list_schema_field_three_way() {
 #[test]
 fn unsupported_pointer_indirect_shapes_loudly_capped() {
     for src in [
-        // List<Schema> *return* reached through a parameter **field** —
-        // the field-load rebase is not proven bit-equal for an in-place
-        // return; stays a loud cap (the param-*identity* case is lifted).
-        "#schema P { x: Int }\n#schema W { ps: List<P> }\n#main(W w) -> List<P>\nw.ps",
         // Dict param.
         "#main(Dict<String, Int> d) -> Dict<String, Int>\nd",
         // inner pointer-array element list: List<List<String>> stays a
@@ -520,4 +516,29 @@ fn list_schema_identity_return_both_backends() {
         LlvmAotEvaluator::from_source(src).is_ok(),
         "llvm must compile the S4 List<Schema> identity return (in-place region-walk ABI)"
     );
+}
+
+/// F4: a `List<Schema>` / `List<List<scalar>>` return reached through a
+/// parameter **field** walk (`w.ps`) is lifted on both AOT backends — the
+/// F1 arena-absolute field-load pushes the field list root directly, so it
+/// rides the same in-place return as the identity case. Bit-equality is
+/// proven four-way (incl. wasm) in the four-way suites; here we pin that
+/// both native backends accept the `#main` shape.
+#[test]
+fn param_field_list_return_both_backends() {
+    for src in [
+        "#schema P { x: Int }\n#schema W { ps: List<P>, n: Int }\n\
+         #main(W w) -> List<P>\nw.ps",
+        "#schema W { rows: List<List<Int>>, n: Int }\n\
+         #main(W w) -> List<List<Int>>\nw.rows",
+    ] {
+        assert!(
+            AotEvaluator::from_source(src).is_ok(),
+            "cranelift must compile the F4 parameter-field list return: `{src}`"
+        );
+        assert!(
+            LlvmAotEvaluator::from_source(src).is_ok(),
+            "llvm must compile the F4 parameter-field list return: `{src}`"
+        );
+    }
 }
