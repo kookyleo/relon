@@ -27,7 +27,7 @@ use crate::layout::{OffsetTable, SchemaLayout};
 use crate::schema_canonical::{Field, Schema, TypeRepr};
 use crate::smol_str::SmolStr;
 use crate::value::Value;
-use crate::verifier::{verify_value_at, Region};
+use crate::verifier::{verify_record, verify_record_multi, verify_value_at, MultiRegion, Region};
 use crate::RuntimeError;
 
 /// Arena region boundaries the in-place decode selects between. The
@@ -246,6 +246,66 @@ pub fn decode_inplace_return(
             Ok(Value::List(Arc::new(items)))
         }
     }
+}
+
+/// Gate the **object** (positive-`bytes_written`) return path through the
+/// bounds verifier before its `BufferReader` decode runs — closing the
+/// red-line gap the S5 design flagged (an object return previously trusted
+/// `out_buf` self-containment and ran no verifier at all).
+///
+/// Today every object return is **self-contained in `out_buf`**: the
+/// cross-region object-field lowering is still capped (F1 releases it), so
+/// the head and every pointer it carries are `out_buf`-relative and the
+/// single-region wall over `out_buf` is the correct, tight gate. We run
+/// that gate here unconditionally so the object path can never decode an
+/// unverified buffer.
+///
+/// `out_bytes` is the `out_buf` slice (offsets inside are `out_buf`-
+/// relative); the record head is at offset `0`. A verify failure is a loud
+/// error — the decode must not run.
+///
+/// When F1 lands the first cross-region object shape it will (a) switch
+/// the codegen to arena-absolute pointer values and (b) call
+/// [`verify_object_return_multi`] over the whole arena instead. The
+/// multi-region path already exists and is exercised by the verifier's
+/// cross-region unit tests; it is wired but not yet reachable from a
+/// compiled backend because no cap is released in F0.
+pub fn verify_object_return(
+    backend: &str,
+    out_bytes: &[u8],
+    return_layout: &OffsetTable,
+    return_fields: &[Field],
+) -> Result<(), RuntimeError> {
+    let region = Region::new(0, out_bytes.len()).map_err(|e| {
+        RuntimeError::IoError(format!("{backend} object return region invalid: {e}"))
+    })?;
+    verify_record(out_bytes, return_layout, return_fields, 0, region).map_err(|e| {
+        RuntimeError::IoError(format!(
+            "{backend} object return verifier rejected the out_buf record: {e}"
+        ))
+    })
+}
+
+/// Multi-region sibling of [`verify_object_return`] for the F1+
+/// cross-region object return: gate the object head (anchored at the
+/// arena-absolute `record_base`) and every arena-absolute pointer it
+/// reaches against the four-region [`MultiRegion`] map over the whole
+/// `arena`. Not yet reached from a compiled backend (F0 releases no cap);
+/// provided so F1 wiring is a one-line call, and covered by the verifier's
+/// multi-region cross-region tests.
+pub fn verify_object_return_multi(
+    backend: &str,
+    arena: &[u8],
+    record_base: usize,
+    multi: MultiRegion,
+    return_layout: &OffsetTable,
+    return_fields: &[Field],
+) -> Result<(), RuntimeError> {
+    verify_record_multi(arena, return_layout, return_fields, record_base, multi).map_err(|e| {
+        RuntimeError::IoError(format!(
+            "{backend} cross-region object return verifier rejected the arena (base={record_base}): {e}"
+        ))
+    })
 }
 
 /// Drain every field of `schema` from the sub-record `reader` into a

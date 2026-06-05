@@ -1455,6 +1455,18 @@ impl LlvmAotEvaluator {
             ));
         }
         let out_bytes = &arena[out_ptr..read_end];
+        // Object / fixed-area return path: gate the out_buf record through
+        // the bounds verifier before decoding. Today every such return is
+        // self-contained in out_buf (cross-region object fields are still
+        // capped — F1 releases them), so the single-region wall over
+        // out_buf is the correct, tight gate. This closes the red-line gap
+        // where the object path previously decoded with no verifier at all.
+        relon_eval_api::inplace_return::verify_object_return(
+            "llvm-aot",
+            out_bytes,
+            &schema.return_layout,
+            &schema.return_schema.fields,
+        )?;
         let reader = relon_eval_api::buffer::BufferReader::new(
             &schema.return_layout,
             &schema.return_schema.fields,

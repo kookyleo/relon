@@ -490,3 +490,184 @@ proptest! {
         roundtrip_one(field("m", list(list(TypeRepr::Float))), val);
     }
 }
+
+// --- F0 cross-region object generator (multi-region verifier) ---------
+//
+// The F1 target shape is `-> Dict { servers: List<Cfg>, n: Int }`: an
+// object head built in `out_buf` whose `servers` field points at a
+// parameter-sourced `List<Cfg>` whose header / entries / sub-records /
+// String fields all live in `in_buf`. F0 ships no cap release, so we
+// hand-assemble that cross-region arena (object head in `out`, field data
+// in `in`, every pointer arena-absolute) and drive the multi-region
+// verifier over the whole value space. Legal arenas must verify clean;
+// a corrupted pointer must be rejected loudly (never a panic / over-read).
+
+use relon_eval_api::layout::OffsetTable;
+use relon_eval_api::verifier::{verify_record_multi, MultiRegion};
+
+/// `Cfg { name: String, port: Int }` — the cross-region element schema.
+fn xr_cfg_schema() -> Schema {
+    Schema {
+        name: "Cfg".into(),
+        generics: vec![],
+        fields: vec![
+            field("name", TypeRepr::String),
+            field("port", TypeRepr::Int),
+        ],
+    }
+}
+
+/// `Out { servers: List<Cfg>, n: Int }` — the cross-region object schema.
+fn xr_outer_schema() -> Schema {
+    Schema {
+        name: "Out".into(),
+        generics: vec![],
+        fields: vec![
+            field(
+                "servers",
+                list(TypeRepr::Schema {
+                    schema: Box::new(xr_cfg_schema()),
+                }),
+            ),
+            field("n", TypeRepr::Int),
+        ],
+    }
+}
+
+fn le_u32(v: u32) -> [u8; 4] {
+    v.to_le_bytes()
+}
+
+/// Assemble a cross-region arena for `Out { servers: [Cfg{name,port}..], n }`:
+/// the `in` region holds the whole `List<Cfg>` graph with arena-absolute
+/// pointers; the `out` region holds the object head whose `servers` slot
+/// points (cross-region) at the `in`-region list header. Returns
+/// `(arena, multi, outer_layout, outer_schema, out_record_base, pointer_slot_abs_offsets)`.
+/// `pointer_slot_abs_offsets` lists every arena-absolute byte position that
+/// holds a pointer the verifier follows, so a proptest can corrupt one.
+#[allow(clippy::type_complexity)]
+fn build_xr_arena(
+    servers: &[(String, i64)],
+    n: i64,
+) -> (Vec<u8>, MultiRegion, OffsetTable, Schema, usize, Vec<usize>) {
+    let cfg = xr_cfg_schema();
+    let cfg_layout = SchemaLayout::offsets_for(&cfg).expect("cfg layout");
+    let outer = xr_outer_schema();
+    let outer_layout = SchemaLayout::offsets_for(&outer).expect("outer layout");
+
+    let name_fo = cfg_layout.fields.iter().find(|f| f.name == "name").unwrap();
+    let port_fo = cfg_layout.fields.iter().find(|f| f.name == "port").unwrap();
+
+    // Region-local layout of the `in` buffer:
+    //   [list header len][off_0..off_{k-1}][cfg_0 ..][cfg_{k-1}][name strings..]
+    let k = servers.len();
+    let header_rel = 0usize;
+    let entries_rel = header_rel + 4;
+    let cfgs_rel = entries_rel + k * 4;
+    let cfg_rel = |i: usize| cfgs_rel + i * cfg_layout.root_size;
+    let names_rel = cfgs_rel + k * cfg_layout.root_size;
+    // Compute each name's region-local offset.
+    let mut name_rel = Vec::with_capacity(k);
+    let mut cursor = names_rel;
+    for (s, _) in servers {
+        name_rel.push(cursor);
+        cursor += 4 + s.len();
+    }
+    let in_len = cursor.max(4);
+
+    // Region geometry (disjoint, padded windows).
+    let const_len = 16usize;
+    let in_start = const_len;
+    let in_end = in_start + in_len;
+    let out_start = in_end + 8;
+    let out_len = outer_layout.root_size;
+    let out_end = out_start + out_len;
+    let scratch_start = out_end + 8;
+    let arena_size = scratch_start + 16;
+    let mut arena = vec![0u8; arena_size];
+
+    let mut ptr_slots: Vec<usize> = Vec::new();
+    let put32 = |arena: &mut [u8], abs: usize, v: u32| {
+        arena[abs..abs + 4].copy_from_slice(&le_u32(v));
+    };
+    let put64 = |arena: &mut [u8], abs: usize, v: i64| {
+        arena[abs..abs + 8].copy_from_slice(&v.to_le_bytes());
+    };
+
+    // List header + entry pointers (arena-absolute).
+    put32(&mut arena, in_start + header_rel, k as u32);
+    for i in 0..k {
+        let slot = in_start + entries_rel + i * 4;
+        put32(&mut arena, slot, (in_start + cfg_rel(i)) as u32);
+        ptr_slots.push(slot);
+    }
+    // Each Cfg sub-record: name pointer (arena-absolute) + inline port.
+    for (i, (s, port)) in servers.iter().enumerate() {
+        let name_slot = in_start + cfg_rel(i) + name_fo.offset;
+        put32(&mut arena, name_slot, (in_start + name_rel[i]) as u32);
+        ptr_slots.push(name_slot);
+        put64(&mut arena, in_start + cfg_rel(i) + port_fo.offset, *port);
+        // String record [len][utf8].
+        let rec = in_start + name_rel[i];
+        put32(&mut arena, rec, s.len() as u32);
+        arena[rec + 4..rec + 4 + s.len()].copy_from_slice(s.as_bytes());
+    }
+
+    // Object head in `out`: `servers` -> list header in `in` (cross-region).
+    let servers_fo = outer_layout
+        .fields
+        .iter()
+        .find(|f| f.name == "servers")
+        .unwrap();
+    let n_fo = outer_layout.fields.iter().find(|f| f.name == "n").unwrap();
+    let servers_slot = out_start + servers_fo.offset;
+    put32(&mut arena, servers_slot, (in_start + header_rel) as u32);
+    ptr_slots.push(servers_slot);
+    put64(&mut arena, out_start + n_fo.offset, n);
+
+    let multi = MultiRegion::new(
+        (0, const_len),
+        (in_start, in_end),
+        (out_start, out_end),
+        (scratch_start, arena_size),
+    )
+    .expect("multi region");
+
+    (arena, multi, outer_layout, outer, out_start, ptr_slots)
+}
+
+fn xr_servers_strat() -> impl Strategy<Value = Vec<(String, i64)>> {
+    prop::collection::vec((string_strat(), int_strat()), 0..4)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// A legal cross-region `Dict { servers: List<Cfg>, n }` arena must
+    /// verify clean under the multi-region map for the whole value space.
+    #[test]
+    fn xr_legal_object_verifies(servers in xr_servers_strat(), n in int_strat()) {
+        let (arena, multi, layout, schema, base, _slots) = build_xr_arena(&servers, n);
+        verify_record_multi(&arena, &layout, &schema.fields, base, multi)
+            .map_err(|e| TestCaseError::fail(format!("legal cross-region object rejected: {e}")))?;
+    }
+
+    /// Corrupting any one followed pointer to a far out-of-arena offset
+    /// must make the multi-region verifier reject loudly — never panic,
+    /// never over-read.
+    #[test]
+    fn xr_corrupt_pointer_rejected(
+        servers in xr_servers_strat(),
+        n in int_strat(),
+        which in any::<prop::sample::Index>(),
+    ) {
+        let (mut arena, multi, layout, schema, base, slots) = build_xr_arena(&servers, n);
+        prop_assume!(!slots.is_empty());
+        let idx = which.index(slots.len());
+        let slot = slots[idx];
+        let bogus = (arena.len() as u32) + 4096;
+        arena[slot..slot + 4].copy_from_slice(&le_u32(bogus));
+        let res = verify_record_multi(&arena, &layout, &schema.fields, base, multi);
+        prop_assert!(res.is_err(), "a corrupt cross-region pointer must be rejected, got Ok");
+    }
+}

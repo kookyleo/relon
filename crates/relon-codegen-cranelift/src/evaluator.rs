@@ -1668,6 +1668,19 @@ impl AotEvaluator {
         }
         let out_bytes = &arena[out_ptr as usize..read_end];
 
+        // Object / fixed-area return path: gate the out_buf record through
+        // the bounds verifier before decoding. Today every such return is
+        // self-contained in out_buf (cross-region object fields are still
+        // capped — F1 releases them), so the single-region wall over
+        // out_buf is the correct, tight gate. This closes the red-line gap
+        // where the object path previously decoded with no verifier at all.
+        relon_eval_api::inplace_return::verify_object_return(
+            "cranelift",
+            out_bytes,
+            &bs.return_layout,
+            &bs.return_schema.fields,
+        )?;
+
         let reader = BufferReader::new(&bs.return_layout, &bs.return_schema.fields, out_bytes)
             .map_err(buffer_to_runtime_error)?;
         if is_single_value_wrapper(&bs.return_schema) {
