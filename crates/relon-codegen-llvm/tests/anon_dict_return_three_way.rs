@@ -164,13 +164,15 @@ fn anon_dict_internal_scalar_dropped_consistently() {
 /// compiled backends.
 #[test]
 fn unsupported_return_shapes_fail_loudly_not_silently() {
-    const UNSUPPORTED: &[&str] = &[
+    // Shapes neither AOT backend lifts yet — both must Err loudly.
+    const BOTH_CAP: &[&str] = &[
         // Plain (non-#internal) Dict-valued field — Dict is not a buffer
         // return type; tree-walk would surface it, so it must error.
         "#main() -> Dict\n{ name: \"x\", m: { a: 1, b: 2 } }",
-        // List<Schema> field.
+        // List<Schema> field from a *literal* (not a param identity) — the
+        // const-pool pointer-array-element marshaller does not handle it.
         "#schema P {\n    Int x: *\n}\n#main() -> Dict\n{ name: \"x\", ps: [{x:1},{x:2}] }",
-        // List<List<scalar>> field.
+        // List<List<scalar>> field from a literal.
         "#main() -> Dict\n{ name: \"x\", nested: [[1, 2], [3, 4]] }",
         // Empty list — element type cannot be inferred for marshalling.
         "#main() -> Dict\n{ name: \"x\", empty: [] }",
@@ -188,26 +190,30 @@ fn unsupported_return_shapes_fail_loudly_not_silently() {
         // (`-> S { tags: t }`) is object-field marshalling, a later step,
         // and must still fail loudly at lowering.
         "#schema S {\n    tags: List<String>\n}\n#main(List<String> t) -> S\n{ tags: t }",
-        // ---- S5 cross-region object fields (param-sourced pointer-array
-        // lists inside an anon-Dict / branded-struct return). The object
-        // header lives in `out_buf` but a `List<Schema>` /
-        // `List<List<scalar>>` field sourced by parameter identity points
-        // into `in_buf` — a genuine cross-region field pointer the
-        // single-region verifier + reader cannot follow. The in-place
-        // region-walk ABI (S1–S4) only carries a *single whole-value* root;
-        // an object field has no such carrier. Until a byte-proven
-        // multi-region walk lands (see docs/internal/.return-side-loop-plan.md
-        // S5 design) these MUST cap loudly on both backends rather than
-        // store an in_buf pointer into an out_buf slot (a silent
-        // cross-region wild read).
-        "#schema Server { name: String, port: Int }\n\
-         #main(List<Server> servers) -> Dict\n{ items: servers, n: 1 }",
-        "#main(List<List<Int>> grid) -> Dict\n{ g: grid, n: 1 }",
-        // Same cross-region hazard through a branded-struct field surface.
+        // Cross-region hazard through a branded-struct field surface. F1b
+        // lifts the *anon-Dict* cross-region field (see LLVM_ONLY_CAP); the
+        // branded-struct path routes through `lower_dict_into_record` (not
+        // the anon-Dict walker) and has no cross-region field store yet, so
+        // it stays a loud cap on both backends.
         "#schema Server { name: String }\n#schema Cfg { servers: List<Server> }\n\
          #main(List<Server> servers) -> Cfg\n{ servers: servers }",
     ];
-    for src in UNSUPPORTED {
+    // F1b: cross-region *anon-Dict* object fields (param-sourced
+    // `List<Schema>` / `List<List<scalar>>`) now ship on cranelift — the
+    // object head sits in out_buf and the field slot holds the parameter
+    // list root's arena-absolute offset into in_buf; the host's
+    // multi-region verifier classifies + bounds-checks it before the reader
+    // follows it cross-region (bit-equal to tree-walk, proven in
+    // `relon-test-harness/tests/return_cross_region_object.rs`). The IR
+    // lowering is shared, so llvm reaches the same op but caps loudly at
+    // codegen (the `StoreFieldAtRecord { ListSchema | ListList }` gate);
+    // llvm + wasm land in F2.
+    const LLVM_ONLY_CAP: &[&str] = &[
+        "#schema Server { name: String, port: Int }\n\
+         #main(List<Server> servers) -> Dict\n{ servers: servers, n: 1 }",
+        "#main(List<List<Int>> grid) -> Dict\n{ g: grid, n: 1 }",
+    ];
+    for src in BOTH_CAP {
         let cl = AotEvaluator::from_source(src);
         assert!(
             cl.is_err(),
@@ -217,6 +223,19 @@ fn unsupported_return_shapes_fail_loudly_not_silently() {
         assert!(
             llvm.is_err(),
             "llvm must reject unsupported return shape loudly, but compiled: `{src}`"
+        );
+    }
+    for src in LLVM_ONLY_CAP {
+        let cl = AotEvaluator::from_source(src);
+        assert!(
+            cl.is_ok(),
+            "cranelift must compile the F1b cross-region object shape, but declined: `{src}`"
+        );
+        let llvm = LlvmAotEvaluator::from_source(src);
+        assert!(
+            llvm.is_err(),
+            "F1b is cranelift-only: llvm must reject the cross-region object shape loudly, but \
+             compiled: `{src}`"
         );
     }
 }

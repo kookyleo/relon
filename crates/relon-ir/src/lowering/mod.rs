@@ -739,7 +739,7 @@ fn lower_entry_with_resolver<'a>(
     // the synthesised schema only carries the scalar fields that
     // survive the boundary.
     let anon_dict_plan = if user_return_schema.is_none() {
-        anon_dict_return_plan(sig, root)?
+        anon_dict_return_plan(sig, root, &resolver)?
     } else {
         None
     };
@@ -1229,6 +1229,20 @@ enum AnonDictField {
     /// `Op::ConstListString`); like a Dict field it contributes no
     /// host-visible record slot. `elements` are in source order.
     ListString { name: String, elements: Vec<String> },
+    /// F1b: a host-visible field whose value is a `#main` **parameter
+    /// identity** of pointer-array list type `List<Schema>` /
+    /// `List<List<scalar>>`. The parameter's data lives in the *input*
+    /// region while the object head sits in the *output* region — a
+    /// cross-region link. Under the F1 arena-absolute slot convention
+    /// the field slot stores the parameter list root's arena-absolute
+    /// offset directly (no tail copy); the host's multi-region verifier
+    /// classifies that offset into the input region, bounds-checks the
+    /// whole reachable graph, and the reader follows it cross-region.
+    /// `ty` is the canonical `List<Schema>` / `List<List<scalar>>` type
+    /// (carrying the element schema). The source parameter is reached via
+    /// the field's value node (the `Variable(param)` expr) in
+    /// `lower_anon_dict_body`, so the name need not be stored separately.
+    CrossRegionParamList { name: String, ty: TypeRepr },
 }
 
 /// Try to build an [`AnonDictPlan`] for the entry's body when the
@@ -1252,6 +1266,7 @@ enum AnonDictField {
 fn anon_dict_return_plan(
     sig: &MainSignature,
     root: &Node,
+    resolver: &SchemaResolver<'_>,
 ) -> Result<Option<AnonDictPlan>, LoweringError> {
     let Some(rt) = sig.return_type.as_ref() else {
         return Ok(None);
@@ -1271,6 +1286,16 @@ fn anon_dict_return_plan(
             if let Ok(irt) = type_repr_to_ir_type(&canonical) {
                 param_tys.insert(p.name.as_str(), irt);
             }
+        }
+    }
+    // F1b: full canonical types (carrying element schemas) for every
+    // `#main` parameter, so a host-visible field whose value is a
+    // parameter identity of `List<Schema>` / `List<List<scalar>>` type
+    // can be classified as a cross-region field rather than rejected.
+    let mut param_canonicals: HashMap<&str, TypeRepr> = HashMap::new();
+    for p in &sig.params {
+        if let Some(canonical) = type_node_to_canonical_with_schemas(&p.type_node, resolver) {
+            param_canonicals.insert(p.name.as_str(), canonical);
         }
     }
 
@@ -1395,6 +1420,33 @@ fn anon_dict_return_plan(
                     });
                 }
             }
+            Expr::Variable(path)
+                if !is_internal
+                    && matches!(path.as_slice(), [TokenKey::String(_, _, _)])
+                    && anon_dict_cross_region_param_list(path, &param_canonicals).is_some() =>
+            {
+                // F1b: a host-visible field whose value is a parameter
+                // identity of `List<Schema>` / `List<List<scalar>>` type.
+                // The object head is built in out_buf but the parameter's
+                // list data lives in in_buf — a cross-region link. Under
+                // the F1 arena-absolute slot convention the field slot
+                // stores the parameter list root's arena-absolute offset
+                // (the value `LoadListSchemaPtr` / `LoadListListPtr` pushes
+                // post-F1) directly, with no tail copy; the host's
+                // multi-region verifier classifies the offset into in_buf,
+                // bounds-checks the reachable graph, then the reader
+                // follows it cross-region. Only the in-place reader's
+                // decode envelope is admitted (`List<Schema>` element
+                // sub-records confined to S4-scope field shapes); anything
+                // deeper stays a loud cap.
+                let ty = anon_dict_cross_region_param_list(path, &param_canonicals)
+                    .expect("guarded by the match arm guard")
+                    .clone();
+                fields.push(AnonDictField::CrossRegionParamList {
+                    name: name.clone(),
+                    ty,
+                });
+            }
             _ => {
                 // An `#internal` scalar field is hidden from the host
                 // (the tree-walk oracle drops it). Scalar internals are
@@ -1429,6 +1481,15 @@ fn anon_dict_return_plan(
         .iter()
         .filter_map(|f| match f {
             AnonDictField::Scalar { name, ty } => Some(Field {
+                name: name.clone(),
+                ty: ty.clone(),
+                default: None,
+            }),
+            // F1b: a cross-region parameter-list field is host-visible —
+            // it contributes a real `List<Schema>` / `List<List<scalar>>`
+            // record slot (carrying the same canonical element type the
+            // host reader / verifier rebuild their layouts from).
+            AnonDictField::CrossRegionParamList { name, ty, .. } => Some(Field {
                 name: name.clone(),
                 ty: ty.clone(),
                 default: None,
@@ -2007,6 +2068,87 @@ fn lower_anon_dict_body(
                 });
                 scalar_layout_idx += 1;
             }
+            AnonDictField::CrossRegionParamList { name, ty, .. } => {
+                // F1b: cross-region object field. The value is a `#main`
+                // parameter identity of `List<Schema>` / `List<List<scalar>>`
+                // type whose data lives in the *input* region; the object
+                // head is in the *output* region. We do NOT copy the data
+                // into the output tail (that is exactly what the old
+                // `EmitTailRecordFromAbsoluteAddr` cap rejected as
+                // unsupported for these pointer-array element lists, and a
+                // copy would also lose the cross-region link).
+                //
+                // Under the F1 arena-absolute slot convention every pointer
+                // slot stores an arena-absolute u32 offset. `lower_expr`
+                // over the parameter identity emits `LoadListSchemaPtr` /
+                // `LoadListListPtr`, which post-F1 push the parameter list
+                // root header's arena-absolute offset (the input marshaller
+                // baked `in_ptr` into the slot). We store that offset
+                // directly into the object's field slot via
+                // `StoreFieldAtRecord { ty: ListSchema / ListList }`. The
+                // host's multi-region verifier (which the object positive-
+                // `bytes_written` path now always runs) reads the slot,
+                // classifies the offset into the input region, bounds-checks
+                // the whole reachable graph, and only then does the reader
+                // follow it cross-region — bit-equal to the tree-walk
+                // oracle. An offset that classifies to no region / runs off
+                // its region is a loud verifier error; the decode never runs.
+                let value = user_values.get(name.as_str()).copied().ok_or_else(|| {
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "AnonDictReturn(missing source value for cross-region field `{}`)",
+                            name
+                        ),
+                        range: TokenRange::default(),
+                    }
+                })?;
+                let expected_ir = type_repr_to_ir_type(ty)?;
+                debug_assert!(matches!(expected_ir, IrType::ListSchema | IrType::ListList));
+                lower_expr(&value.expr, value.range, ctx)?;
+                let top = ctx
+                    .tstack
+                    .pop()
+                    .ok_or_else(|| LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "AnonDictReturn(cross-region field `{}` produced no value)",
+                            name
+                        ),
+                        range: value.range,
+                    })?;
+                if top != expected_ir {
+                    return Err(LoweringError::UnsupportedFieldType {
+                        schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+                        field: name.clone(),
+                        ty: format!(
+                            "cross-region field expected {:?}, got {:?}",
+                            expected_ir, top
+                        ),
+                        range: value.range,
+                    });
+                }
+                let layout_field = layout.fields.get(scalar_layout_idx).ok_or_else(|| {
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "AnonDictReturn(cross-region field `{}`: layout index out of range)",
+                            name
+                        ),
+                        range: value.range,
+                    }
+                })?;
+                debug_assert_eq!(&layout_field.name, name);
+                // Store the parameter list root's arena-absolute offset
+                // straight into the slot — no tail copy, the cross-region
+                // link is the point.
+                ctx.out.push(TaggedOp {
+                    op: Op::StoreFieldAtRecord {
+                        record_local_idx: record_local,
+                        offset: layout_field.offset as u32,
+                        ty: expected_ir,
+                    },
+                    range: value.range,
+                });
+                scalar_layout_idx += 1;
+            }
         }
     }
 
@@ -2213,6 +2355,54 @@ fn pointer_array_list_source_is_const_pool(expr: &Expr) -> bool {
 /// the existing const-pool / loud-cap paths.
 fn pointer_array_param_identity_walk(expr: &Expr) -> bool {
     matches!(expr, Expr::Variable(path) if path.len() == 1)
+}
+
+/// F1b: classify a host-visible anon-Dict-return field whose value is a
+/// bare `#main` parameter identity (`servers`) of pointer-array list type
+/// that the cross-region object path can marshal. Returns the parameter's
+/// canonical type when it is:
+///   * `List<Schema{…}>` whose element sub-record stays inside the
+///     in-place reader's decode envelope (`list_schema_subrecord_in_s4_scope`),
+///     or
+///   * `List<List<scalar>>` (the nested-scalar pointer array).
+///
+/// Anything else — a scalar / `List<scalar>` / `List<String>` param (these
+/// already have their own field paths), a deeper nested element list, a
+/// `List<List<String|Schema>>`, or a non-parameter expression — returns
+/// `None`, so the field falls through to the existing scalar classifier and
+/// stays a loud cap. Mirrors the single-value return gate
+/// (`pointer_array_param_identity_walk` + `list_schema_subrecord_in_s4_scope`).
+fn anon_dict_cross_region_param_list<'p>(
+    path: &[TokenKey],
+    param_canonicals: &'p HashMap<&str, TypeRepr>,
+) -> Option<&'p TypeRepr> {
+    let [TokenKey::String(name, _, _)] = path else {
+        return None;
+    };
+    let ty = param_canonicals.get(name.as_str())?;
+    let TypeRepr::List { element } = ty else {
+        return None;
+    };
+    match element.as_ref() {
+        // `List<Schema>` — admit only the S4-scope element sub-record so
+        // the host reader's field decode never reaches an unsupported
+        // pointer-array element field.
+        TypeRepr::Schema { .. } if list_schema_subrecord_in_s4_scope(ty) => Some(ty),
+        // `List<List<scalar>>` — the innermost element must be an
+        // inline-fixed scalar (Int / Float / Bool). A deeper nesting or a
+        // String/Schema inner element is out of scope.
+        TypeRepr::List { element: inner }
+            if {
+                matches!(
+                    inner.as_ref(),
+                    TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool
+                )
+            } =>
+        {
+            Some(ty)
+        }
+        _ => None,
+    }
 }
 
 /// True when a `List<Schema>` return type's per-element sub-record carries

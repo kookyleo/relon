@@ -73,6 +73,70 @@ fn backends_produce_identical_output() {
     assert_eq!(tw, aot, "tree-walk vs cranelift-aot output differs");
 }
 
+/// F1b: a cross-region object return
+/// (`#main(List<Server> servers) -> Dict { servers: servers, n: 1 }`)
+/// with a CJK String field must produce byte-identical JSON on tree-walk
+/// and cranelift-AOT. The object head is built in `out_buf` but the
+/// `servers` field points at parameter data in `in_buf`; the cranelift
+/// path runs the multi-region verifier + cross-region reader, and its
+/// JSON must match the tree-walk oracle exactly.
+#[test]
+fn cross_region_object_cjk_byte_equal_across_backends() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-crossregion-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(
+        &path,
+        "#schema Server { name: String, port: Int }\n\
+         #main(List<Server> servers) -> Dict\n{ servers: servers, n: 1 }\n",
+    )
+    .expect("write fixture");
+
+    // A multibyte CJK name (U+4E2D U+6587), an empty-string element, and an
+    // ASCII one, so the cross-region String + list walk is exercised. The
+    // CJK is built from code points so this source file stays ASCII-only.
+    let cjk: String = [0x4E2Du32, 0x6587u32]
+        .iter()
+        .map(|c| char::from_u32(*c).unwrap())
+        .collect();
+    let args_json = format!(
+        r#"{{"servers":[{{"name":"{cjk}","port":8080}},{{"name":"","port":0}},{{"name":"edge","port":-1}}]}}"#
+    );
+
+    let run = |backend: &str| -> String {
+        let out = Command::new(BINARY)
+            .arg("run")
+            .arg(&path)
+            .arg("--backend")
+            .arg(backend)
+            .arg("--args")
+            .arg(&args_json)
+            .output()
+            .expect("spawn relon CLI");
+        assert!(
+            out.status.success(),
+            "CLI exited non-zero for {backend}: stderr={}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        String::from_utf8(out.stdout).expect("utf-8 stdout")
+    };
+
+    let tw = run("tree-walk");
+    let aot = run("cranelift-aot");
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        tw.contains(&cjk) && tw.contains("8080"),
+        "tree-walk output must carry the CJK field + port: {tw:?}"
+    );
+    assert_eq!(
+        tw, aot,
+        "tree-walk vs cranelift-aot cross-region object JSON differs:\n  tw  = {tw:?}\n  aot = {aot:?}"
+    );
+}
+
 /// `--trust` is honoured by tree-walk + bytecode but is a no-op on the
 /// cranelift-AOT backend (no host-fn registry to grant capabilities
 /// from). It must NOT be silently dropped: the CLI warns on stderr so
