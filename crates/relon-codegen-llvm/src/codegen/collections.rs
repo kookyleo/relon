@@ -261,10 +261,10 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         ty: IrType,
     ) -> Result<(), LlvmError> {
         if matches!(ty, IrType::ListString) {
-            // Pointer-array list: relocate inner offsets into the output
-            // buffer's coordinate system via the shared block copy, then
-            // push the copied header's buffer-relative offset for the
-            // parent record's pointer slot.
+            // Pointer-array list: relocate inner offsets via the shared
+            // block copy (which now produces arena-absolute entries), then
+            // push the copied header's arena-absolute offset for the parent
+            // record's pointer slot (F1 slot convention).
             let header_off = self.pop_int(ip_hint)?;
             let new_header = self.copy_list_string_block(header_off)?;
             self.push(new_header, IrType::I32);
@@ -336,10 +336,10 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         self.builder
             .build_memcpy(dst_ptr, align, src_abs, 1, rec64)
             .map_err(|e| LlvmError::Codegen(format!("EmitTailRecord memcpy: {e}")))?;
-        // Push the pre-bump cursor (buffer-relative offset of the
-        // just-written record) as an i32. Mirrors cranelift's
-        // post-copy `self.push(pre_cursor)`.
-        self.push(pre_cursor, IrType::I32);
+        // Push the record's **arena-absolute** offset (`dst_off = out_ptr +
+        // pre_cursor`, the F1 slot convention) for the parent record's
+        // pointer slot. Mirrors cranelift's post-copy push.
+        self.push(dst_off, IrType::I32);
         Ok(())
     }
 

@@ -27,7 +27,7 @@ use crate::layout::{OffsetTable, SchemaLayout};
 use crate::schema_canonical::{Field, Schema, TypeRepr};
 use crate::smol_str::SmolStr;
 use crate::value::Value;
-use crate::verifier::{verify_record, verify_record_multi, verify_value_at, MultiRegion, Region};
+use crate::verifier::{verify_record_multi, verify_value_at_multi, MultiRegion, VerifyError};
 use crate::RuntimeError;
 
 /// Arena region boundaries the in-place decode selects between. The
@@ -50,6 +50,29 @@ pub struct ArenaRegions {
     pub scratch_base: u32,
     /// Total arena size in bytes.
     pub arena_size: usize,
+}
+
+impl ArenaRegions {
+    /// Build the four-region [`MultiRegion`] map in absolute arena
+    /// coordinates from the dispatch's region boundaries. Every slot
+    /// pointer the F1 ABI emits is arena-absolute, so the verifier walks
+    /// the **whole arena** and classifies each followed span into one of
+    /// `const` / `in` / `out` / `scratch`. The ABI lays the regions out
+    /// disjointly as `[const | pad | in | pad | out | pad | scratch]`; we
+    /// pass each as a half-open `[start, end)` window.
+    pub fn multi_region(&self) -> Result<MultiRegion, VerifyError> {
+        let in_start = self.in_ptr as usize;
+        let in_end = in_start + self.in_len as usize;
+        let out_start = self.out_ptr as usize;
+        let out_end = out_start + self.out_cap as usize;
+        let scratch_start = self.scratch_base as usize;
+        MultiRegion::new(
+            (0, self.const_data_len),
+            (in_start, in_end),
+            (out_start, out_end),
+            (scratch_start, self.arena_size),
+        )
+    }
 }
 
 /// Decode the in-place region-walk return sentinel. The machine code
@@ -142,72 +165,57 @@ pub fn decode_inplace_return(
         }
     };
 
-    // 1. Select the region `root_abs` falls in.
-    let const_end = regions.const_data_len;
-    let in_start = regions.in_ptr as usize;
-    let in_end = in_start + regions.in_len as usize;
-    let out_start = regions.out_ptr as usize;
-    let out_end = out_start + regions.out_cap as usize;
-    let scratch_start = regions.scratch_base as usize;
+    // 1. Build the multi-region map over the whole arena. Under the F1
+    // arena-absolute slot convention every pointer the in-place root
+    // reaches is an arena-absolute offset, so the verifier and reader
+    // both walk the **whole arena** rather than a region slice; the
+    // multi-region map classifies each followed span into the one region
+    // it belongs to (param-sourced data in `in`, copied tails in `out`,
+    // const-pool literals in `const`, scratch). The single-value root
+    // still lives in exactly one region, but a cross-region link is now
+    // legal and bounds-checked region-by-region rather than rejected.
     let arena_size = regions.arena_size;
-    let (region_start, region_end) = if root_abs >= in_start && root_abs < in_end {
-        (in_start, in_end)
-    } else if root_abs >= out_start && root_abs < out_end {
-        (out_start, out_end)
-    } else if root_abs >= scratch_start && root_abs < arena_size {
-        (scratch_start, arena_size)
-    } else if root_abs < const_end {
-        (0, const_end)
-    } else {
+    if arena_size > arena.len() {
         return Err(RuntimeError::IoError(format!(
-            "{backend} in-place return root {root_abs} falls outside every arena region \
-             (const_end={const_end}, in=[{in_start},{in_end}), out=[{out_start},{out_end}), \
-             scratch=[{scratch_start},{arena_size}))"
-        )));
-    };
-
-    if region_end > arena_size || region_end > arena.len() {
-        return Err(RuntimeError::IoError(format!(
-            "{backend} in-place return region exceeds arena bounds"
+            "{backend} in-place return arena_size {arena_size} exceeds arena slice {}",
+            arena.len()
         )));
     }
-    // Region slice; offsets inside are region-relative.
-    let region_bytes = &arena[region_start..region_end];
-    let root_rel = root_abs - region_start;
+    let arena = &arena[..arena_size];
+    let multi = regions.multi_region().map_err(|e| {
+        RuntimeError::IoError(format!(
+            "{backend} in-place return arena regions invalid: {e}"
+        ))
+    })?;
+    if root_abs >= arena_size {
+        return Err(RuntimeError::IoError(format!(
+            "{backend} in-place return root {root_abs} is past arena end {arena_size}"
+        )));
+    }
 
     // 2. Recompute the `ListElementKind` sidecar for the outer
     // `List<List<…>>` from the return layout so the verifier knows the
     // root is a pointer-array header.
     let list_element = return_layout.fields.first().and_then(|fo| fo.list_element);
 
-    // 3. Verify the whole reachable graph stays in-region BEFORE any
-    // decode. A failure is loud and aborts — never a wild read.
-    let region = Region::new(0, region_bytes.len()).map_err(|e| {
-        RuntimeError::IoError(format!("{backend} in-place return region invalid: {e}"))
-    })?;
-    verify_value_at(
-        region_bytes,
-        &return_field.ty,
-        list_element,
-        root_rel,
-        region,
-    )
-    .map_err(|e| {
+    // 3. Verify the whole reachable graph stays inside the arena regions
+    // BEFORE any decode. A failure is loud and aborts — never a wild read.
+    verify_value_at_multi(arena, &return_field.ty, list_element, root_abs, multi).map_err(|e| {
         RuntimeError::IoError(format!(
-            "{backend} in-place return verifier rejected the buffer (root_abs={root_abs}, \
-             region=[{region_start},{region_end})): {e}"
+            "{backend} in-place return verifier rejected the buffer (root_abs={root_abs}): {e}"
         ))
     })?;
 
-    // 4. Verified — decode in place. The reader walks the same region
-    // slice the verifier certified, so an in-place decode is byte-equal
-    // to the field-slot reader the tree-walk oracle's writer produced.
-    let reader = BufferReader::new(return_layout, return_fields, region_bytes)
+    // 4. Verified — decode in place. The reader walks the whole arena the
+    // verifier certified; every slot value is arena-absolute, so an
+    // in-place decode is byte-equal (post-decode) to the field-slot
+    // reader the tree-walk oracle's writer produced.
+    let reader = BufferReader::new(return_layout, return_fields, arena)
         .map_err(|e| RuntimeError::IoError(format!("{backend} buffer: {e}")))?;
     match shape {
         InplaceShape::ListListScalar(inner) => {
             let rows = reader
-                .read_list_list_at(root_rel, &inner)
+                .read_list_list_at(root_abs, &inner)
                 .map_err(|e| RuntimeError::IoError(format!("{backend} buffer: {e}")))?;
             Ok(Value::List(Arc::new(
                 rows.into_iter().map(|r| Value::List(Arc::new(r))).collect(),
@@ -215,7 +223,7 @@ pub fn decode_inplace_return(
         }
         InplaceShape::ListString => {
             let items = reader
-                .read_list_string_at(root_rel)
+                .read_list_string_at(root_abs)
                 .map_err(|e| RuntimeError::IoError(format!("{backend} buffer: {e}")))?;
             Ok(Value::List(Arc::new(
                 items.into_iter().map(|s| Value::String(s.into())).collect(),
@@ -236,7 +244,7 @@ pub fn decode_inplace_return(
                 ))
             })?;
             let sub_readers = reader
-                .read_list_record_at(root_rel, &elem_layout, schema)
+                .read_list_record_at(root_abs, &elem_layout, schema)
                 .map_err(|e| RuntimeError::IoError(format!("{backend} buffer: {e}")))?;
             let mut items = Vec::with_capacity(sub_readers.len());
             for sub in &sub_readers {
@@ -249,50 +257,21 @@ pub fn decode_inplace_return(
 }
 
 /// Gate the **object** (positive-`bytes_written`) return path through the
-/// bounds verifier before its `BufferReader` decode runs — closing the
-/// red-line gap the S5 design flagged (an object return previously trusted
-/// `out_buf` self-containment and ran no verifier at all).
+/// multi-region bounds verifier before its `BufferReader` decode runs —
+/// closing the red-line gap the S5 design flagged (an object return
+/// previously trusted `out_buf` self-containment and ran no verifier at
+/// all).
 ///
-/// Today every object return is **self-contained in `out_buf`**: the
-/// cross-region object-field lowering is still capped (F1 releases it), so
-/// the head and every pointer it carries are `out_buf`-relative and the
-/// single-region wall over `out_buf` is the correct, tight gate. We run
-/// that gate here unconditionally so the object path can never decode an
-/// unverified buffer.
-///
-/// `out_bytes` is the `out_buf` slice (offsets inside are `out_buf`-
-/// relative); the record head is at offset `0`. A verify failure is a loud
-/// error — the decode must not run.
-///
-/// When F1 lands the first cross-region object shape it will (a) switch
-/// the codegen to arena-absolute pointer values and (b) call
-/// [`verify_object_return_multi`] over the whole arena instead. The
-/// multi-region path already exists and is exercised by the verifier's
-/// cross-region unit tests; it is wired but not yet reachable from a
-/// compiled backend because no cap is released in F0.
-pub fn verify_object_return(
-    backend: &str,
-    out_bytes: &[u8],
-    return_layout: &OffsetTable,
-    return_fields: &[Field],
-) -> Result<(), RuntimeError> {
-    let region = Region::new(0, out_bytes.len()).map_err(|e| {
-        RuntimeError::IoError(format!("{backend} object return region invalid: {e}"))
-    })?;
-    verify_record(out_bytes, return_layout, return_fields, 0, region).map_err(|e| {
-        RuntimeError::IoError(format!(
-            "{backend} object return verifier rejected the out_buf record: {e}"
-        ))
-    })
-}
-
-/// Multi-region sibling of [`verify_object_return`] for the F1+
-/// cross-region object return: gate the object head (anchored at the
-/// arena-absolute `record_base`) and every arena-absolute pointer it
-/// reaches against the four-region [`MultiRegion`] map over the whole
-/// `arena`. Not yet reached from a compiled backend (F0 releases no cap);
-/// provided so F1 wiring is a one-line call, and covered by the verifier's
-/// multi-region cross-region tests.
+/// Under the F1 arena-absolute slot convention the object head (anchored
+/// at the arena-absolute `record_base`, i.e. `out_ptr`) and every pointer
+/// it reaches are arena-absolute offsets into the whole `arena`. The
+/// `multi` map confines each followed span to one of `const` / `in` /
+/// `out` / `scratch` and bounds-checks it there: today every object field
+/// is still self-contained in `out_buf` (cross-region object fields stay
+/// capped — F1b releases them), so every span lands in `out`, but the
+/// gate is already cross-region-correct so F1b is a cap flip, not a
+/// verifier change. A verify failure is a loud error — the decode must
+/// not run.
 pub fn verify_object_return_multi(
     backend: &str,
     arena: &[u8],

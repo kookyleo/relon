@@ -34,11 +34,12 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
     /// arena-relative source pointer (an `i32` offset where a
     /// `[len:u32 LE][payload]` record lives), memcpies the record
     /// into the output buffer's tail area at `tail_cursor`, bumps the
-    /// cursor past the record, and pushes the pre-bump cursor (= the
-    /// buffer-relative offset of the just-written record) onto the
+    /// cursor past the record, and pushes the **arena-absolute offset**
+    /// (`out_ptr + pre-bump cursor`) of the just-written record onto the
     /// virtual stack as an `i32`. The pushed value is what subsequent
     /// `Op::StoreFieldAtRecord { ty: String / ListInt / ... }` stores
-    /// into a parent record's pointer slot.
+    /// into a parent record's pointer slot (F1 arena-absolute slot
+    /// convention).
     pub(super) fn emit_tail_record_from_absolute(
         &mut self,
         ty: IrType,

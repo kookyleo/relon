@@ -352,8 +352,9 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
 
     /// Copy a `[len: u32 LE][payload]` pointer-indirect record (String /
     /// List<scalar>) from the arena-relative `src_off_i32` into the
-    /// output buffer's tail area, returning the **pre-bump tail cursor**
-    /// (the buffer-relative offset of the freshly-written record).
+    /// output buffer's tail area, returning the **arena-absolute offset**
+    /// of the freshly-written record (`out_ptr + pre-bump cursor`) — the
+    /// F1 slot convention, ready to stamp into a fixed-area slot.
     ///
     /// The record's *inner* padding is position-dependent: the host /
     /// const-pool protocol lays the payload at `align_up(record_start +
@@ -410,7 +411,9 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         // Reserve the tail slot.
         let pre_cursor = self.emit_tail_alloc(record_size, align)?;
         let out_ptr_i32 = self.get_local(2)?;
-        // dst record start (buffer-relative) = out_ptr + pre_cursor.
+        // dst record start, **arena-absolute** = out_ptr + pre_cursor.
+        // F1 stores the slot value arena-absolute, so this is also the
+        // value returned for the caller to stamp into the fixed-area slot.
         let dst_off = self.builder.ins().iadd(out_ptr_i32, pre_cursor);
         let dst_abs = self.arena_addr(dst_off, 4)?;
         // Header: store the `[len: u32]` prefix at the dst record start.
@@ -429,7 +432,7 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
             src_payload_abs,
             payload_p,
         );
-        Ok(pre_cursor)
+        Ok(dst_off)
     }
 
     /// Lower `Op::StoreField { ty }` for a pointer-indirect type
@@ -446,13 +449,13 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         ty: IrType,
     ) -> Result<(), CraneliftError> {
         let src_off_i32 = self.pop()?;
-        let pre_cursor = self.emit_pointer_indirect_record_copy(src_off_i32, ty)?;
-        // Store pre_cursor (the buffer-relative offset) at the fixed-
-        // area slot `out_ptr + offset`.
+        let record_abs = self.emit_pointer_indirect_record_copy(src_off_i32, ty)?;
+        // Store the record's arena-absolute offset (F1 slot convention)
+        // at the fixed-area slot `out_ptr + offset`.
         let slot_addr = self.buffer_field_addr(2 /* out_ptr */, offset, 4)?;
         self.builder
             .ins()
-            .store(MemFlags::trusted(), pre_cursor, slot_addr, 0);
+            .store(MemFlags::trusted(), record_abs, slot_addr, 0);
         Ok(())
     }
 
@@ -553,19 +556,31 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         self.builder
             .call_memcpy(self.frontend_config, dest, src_abs, size_p);
 
-        // delta = dst_block - src_block_start (multiple of 4).
-        let delta = self.builder.ins().isub(dst_block, src_block_start);
+        // Two deltas. `delta_bufrel = dst_block - src_block_start` maps a
+        // source arena offset to its out_buf-relative position in the
+        // copied block (used to address the entries we rewrite).
+        // `delta_abs = out_ptr + delta_bufrel` maps it all the way to an
+        // **arena-absolute** offset — F1 stores every in-buffer pointer
+        // (slot values and inner pointer-array entries) arena-absolute, so
+        // both the returned header and each relocated entry use `delta_abs`.
+        let delta_bufrel = self.builder.ins().isub(dst_block, src_block_start);
+        let delta_abs = self.builder.ins().iadd(out_ptr_i32, delta_bufrel);
 
-        // new_header_bufrel = header_off + delta.
-        let new_header = self.builder.ins().iadd(header_off, delta);
+        // new_header_bufrel = header_off + delta_bufrel — the copied
+        // header's out_buf-relative position, used only to address the
+        // entry array we rewrite. new_header_abs (the returned slot value)
+        // adds out_ptr.
+        let new_header_bufrel = self.builder.ins().iadd(header_off, delta_bufrel);
+        let new_header_abs = self.builder.ins().iadd(header_off, delta_abs);
 
-        // entries_base (buffer-relative) = new_header + 4; absolute base
-        // = arena_base + out_ptr + entries_base.
-        let entries_base = self.builder.ins().iadd(new_header, four);
+        // entries_base (buffer-relative) = new_header_bufrel + 4; absolute
+        // base = arena_base + out_ptr + entries_base.
+        let entries_base = self.builder.ins().iadd(new_header_bufrel, four);
         let entries_base_p = self.builder.ins().uextend(self.pointer_ty, entries_base);
         let entries_abs = self.builder.ins().iadd(dest0, entries_base_p);
 
-        // Relocation loop: for i in 0..len, *(entries_abs + i*4) += delta.
+        // Relocation loop: for i in 0..len, *(entries_abs + i*4) +=
+        // delta_abs (rewriting each entry to an arena-absolute offset).
         let header_blk = self.builder.create_block();
         let body_blk = self.builder.create_block();
         let done_blk = self.builder.create_block();
@@ -586,7 +601,7 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
             .builder
             .ins()
             .load(I32, MemFlags::trusted(), entry_addr, 0);
-        let new = self.builder.ins().iadd(old, delta);
+        let new = self.builder.ins().iadd(old, delta_abs);
         self.builder
             .ins()
             .store(MemFlags::trusted(), new, entry_addr, 0);
@@ -598,7 +613,7 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         self.builder.seal_block(header_blk);
         self.builder.seal_block(body_blk);
         self.builder.seal_block(done_blk);
-        Ok(new_header)
+        Ok(new_header_abs)
     }
 
     /// Lower `Op::LoadSchemaPtr { offset }`.
@@ -620,16 +635,16 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
                 "LoadSchemaPtr outside buffer-protocol entry shape".into(),
             ));
         }
-        // Read the 4-byte buffer-relative offset at `in_ptr + offset`.
+        // Read the 4-byte arena-absolute offset at `in_ptr + offset`.
+        // F1: the input marshaller already baked `in_ptr` into the slot
+        // (`finish_arena_absolute`), so the loaded value is the schema
+        // instance's arena-absolute base directly — no `+ in_ptr` rebase.
+        // `LoadFieldAtAbsolute` adds `arena_base`.
         let slot_addr = self.buffer_field_addr(0 /* in_ptr */, offset, 4)?;
-        let rel_off = self
+        let abs = self
             .builder
             .ins()
             .load(I32, MemFlags::trusted(), slot_addr, 0);
-        // Lift to the schema instance's buffer-relative base
-        // (`in_ptr + rel_off`). LoadFieldAtAbsolute adds `arena_base`.
-        let in_ptr = self.get_local(0)?;
-        let abs = self.builder.ins().iadd(in_ptr, rel_off);
         self.push(abs);
         Ok(())
     }
@@ -658,15 +673,16 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
                 "Load*Ptr outside buffer-protocol entry shape".into(),
             ));
         }
-        // Read the 4-byte buffer-relative offset at `in_ptr + offset`.
+        // Read the 4-byte arena-absolute offset at `in_ptr + offset`.
+        // F1: the input marshaller baked `in_ptr` into the slot
+        // (`finish_arena_absolute`), so the loaded value is already the
+        // arena-relative record pointer downstream consumers expect — no
+        // `+ in_ptr` rebase.
         let slot_addr = self.buffer_field_addr(0 /* in_ptr */, offset, 4)?;
-        let rel_off = self
+        let arena_rel = self
             .builder
             .ins()
             .load(I32, MemFlags::trusted(), slot_addr, 0);
-        // Rebase to an arena-relative pointer (`in_ptr + rel_off`).
-        let in_ptr = self.get_local(0)?;
-        let arena_rel = self.builder.ins().iadd(in_ptr, rel_off);
         self.push(arena_rel);
         Ok(())
     }
@@ -716,9 +732,10 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
             let off_v = self.builder.ins().iconst(I32, i64::from(offset));
             let composed = self.builder.ins().iadd(base_i32, off_v);
             let addr = self.arena_addr(composed, 4)?;
-            let rel_off = self.builder.ins().load(I32, MemFlags::trusted(), addr, 0);
-            let in_ptr = self.get_local(0)?;
-            let arena_rel = self.builder.ins().iadd(in_ptr, rel_off);
+            // F1: the slot already holds an arena-absolute offset (the
+            // input marshaller baked `in_ptr` in), so the loaded value is
+            // the arena-relative record pointer directly — no `+ in_ptr`.
+            let arena_rel = self.builder.ins().load(I32, MemFlags::trusted(), addr, 0);
             self.push(arena_rel);
             return Ok(());
         }

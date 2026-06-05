@@ -1210,7 +1210,18 @@ impl LlvmAotEvaluator {
                 })?;
             write_value_into_builder(&mut builder, field, value)?;
         }
-        let in_bytes = builder.finish();
+        // F1: bake `in_ptr` into every input pointer slot (arena-absolute
+        // convention), so the JIT body's param reads drop their `+ in_ptr`
+        // rebase. `in_ptr` depends only on const-data length.
+        let in_ptr_pre = relon_util::align_up(
+            u32::try_from(self.const_data.len()).map_err(|_| {
+                RuntimeError::IoError("llvm const-data section exceeds u32 range".into())
+            })?,
+            8,
+        );
+        let in_bytes = builder
+            .finish_arena_absolute(in_ptr_pre)
+            .map_err(buffer_to_runtime_error)?;
 
         // 2. Lay out the arena. Phase E.1 widens the layout to match
         // the cranelift backend: `[const_data | pad | in_buf | pad |
@@ -1454,23 +1465,32 @@ impl LlvmAotEvaluator {
                 "llvm-aot arena too small for return decode".into(),
             ));
         }
-        let out_bytes = &arena[out_ptr..read_end];
-        // Object / fixed-area return path: gate the out_buf record through
-        // the bounds verifier before decoding. Today every such return is
-        // self-contained in out_buf (cross-region object fields are still
-        // capped — F1 releases them), so the single-region wall over
-        // out_buf is the correct, tight gate. This closes the red-line gap
-        // where the object path previously decoded with no verifier at all.
-        relon_eval_api::inplace_return::verify_object_return(
+        let arena = &arena[..regions.arena_size.min(arena.len())];
+        // Object / fixed-area return path: under the F1 arena-absolute slot
+        // convention the object head sits at `out_ptr` and every pointer
+        // slot it carries is an arena-absolute offset, so the reader +
+        // verifier walk the **whole arena** anchored at `out_ptr` rather
+        // than a region-relative `out_buf` slice. The multi-region gate
+        // confines every followed span to one region (today all in `out`,
+        // cross-region object fields stay capped — F1b releases them) and
+        // closes the red-line gap where the object path previously decoded
+        // with no verifier at all.
+        let multi = regions.multi_region().map_err(|e| {
+            RuntimeError::IoError(format!("llvm-aot object return arena regions invalid: {e}"))
+        })?;
+        relon_eval_api::inplace_return::verify_object_return_multi(
             "llvm-aot",
-            out_bytes,
+            arena,
+            out_ptr,
+            multi,
             &schema.return_layout,
             &schema.return_schema.fields,
         )?;
-        let reader = relon_eval_api::buffer::BufferReader::new(
+        let reader = relon_eval_api::buffer::BufferReader::new_at_base(
             &schema.return_layout,
             &schema.return_schema.fields,
-            out_bytes,
+            arena,
+            out_ptr,
         )
         .map_err(buffer_to_runtime_error)?;
         if is_single_value_wrapper(&schema.return_schema) {
@@ -1523,7 +1543,18 @@ impl LlvmAotEvaluator {
                 })?;
             write_value_into_builder(&mut builder, field, value)?;
         }
-        let in_bytes = builder.finish();
+        // F1: bake `in_ptr` into every input pointer slot (arena-absolute
+        // convention) — identical to `run_main_buffer`, so the wasm module
+        // (same IR retargeted) sees the same input bytes.
+        let in_ptr_pre = relon_util::align_up(
+            u32::try_from(self.const_data.len()).map_err(|_| {
+                RuntimeError::IoError("llvm const-data section exceeds u32 range".into())
+            })?,
+            8,
+        );
+        let in_bytes = builder
+            .finish_arena_absolute(in_ptr_pre)
+            .map_err(buffer_to_runtime_error)?;
 
         // Lay out the arena identically to `run_main_buffer`.
         let in_len = in_bytes.len() as u32;

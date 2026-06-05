@@ -50,24 +50,20 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             LlvmError::Codegen("Op::LoadSchemaPtr outside buffer-protocol entry shape".into())
         })?;
         // IR LocalGet(0) == in_ptr (the buffer-protocol entry's input
-        // record base, buffer-relative).
+        // record base).
         let in_ptr_i32 = self.lookup_param(0)?;
-        // Read the 4-byte buffer-relative offset at `in_ptr + offset`.
+        // Read the 4-byte slot at `in_ptr + offset`. F1: the input
+        // marshaller baked `in_ptr` into the slot (`finish_arena_absolute`),
+        // so the loaded value is the schema instance's arena-relative base
+        // directly — no `+ in_ptr` rebase. LoadFieldAtAbsolute adds
+        // `arena_base` itself.
         let slot_addr = self.compute_buffer_addr(arena_base_ptr, in_ptr_i32, offset)?;
-        let name = self.next_name("schemaptr_slot");
-        let rel_off = self
+        let name = self.next_name("schemaptr_abs");
+        let abs = self
             .builder
             .build_load(self.ctx.i32_type(), slot_addr, &name)
             .map_err(|e| LlvmError::Codegen(format!("LoadSchemaPtr slot load: {e}")))?
             .into_int_value();
-        // Lift to the schema instance's absolute (arena-relative) base:
-        // `in_ptr + rel_off`. The result feeds LoadFieldAtAbsolute,
-        // which adds `arena_base` itself.
-        let name = self.next_name("schemaptr_abs");
-        let abs = self
-            .builder
-            .build_int_add(in_ptr_i32, rel_off, &name)
-            .map_err(|e| LlvmError::Codegen(format!("LoadSchemaPtr abs add: {e}")))?;
         self.push(abs, IrType::I32);
         Ok(())
     }

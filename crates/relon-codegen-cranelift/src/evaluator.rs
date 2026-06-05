@@ -1470,7 +1470,19 @@ impl AotEvaluator {
                 })?;
             write_value_into_builder(&mut builder, field, value, &bs.main_schema.name)?;
         }
-        let in_bytes = builder.finish();
+        // `in_ptr` only depends on the const-data length, so we can fix
+        // it before finishing the builder and bake it into every input
+        // slot: F1 stores pointer slots as **arena-absolute** offsets
+        // (`finish_arena_absolute(in_ptr)`), so the machine-code param
+        // reads drop their old `+ in_ptr` rebase. `in_ptr == 0` (no const
+        // data) is a no-op, leaving the buffer byte-identical.
+        let const_data_len = u32::try_from(self.const_data.len()).map_err(|_| {
+            RuntimeError::IoError("cranelift const-data section exceeds u32 range".into())
+        })?;
+        let in_ptr = relon_util::align_up(const_data_len, 8);
+        let in_bytes = builder
+            .finish_arena_absolute(in_ptr)
+            .map_err(buffer_to_runtime_error)?;
 
         // 2. Lay out the arena: [const_data | pad | in_buf | pad |
         // out_buf]. The const-data section holds string / list
@@ -1481,11 +1493,6 @@ impl AotEvaluator {
         let out_cap_min = bs.return_layout.root_size as u32;
         let out_cap_cushion: u32 = 1024;
         let out_cap = relon_util::align_up(out_cap_min.max(64) + out_cap_cushion, 8);
-
-        let const_data_len = u32::try_from(self.const_data.len()).map_err(|_| {
-            RuntimeError::IoError("cranelift const-data section exceeds u32 range".into())
-        })?;
-        let in_ptr = relon_util::align_up(const_data_len, 8);
         let out_ptr = relon_util::align_up(in_ptr + in_len, 8);
         // Reserve a scratch region past the output buffer for the
         // memory stdlib (`concat` / `substring` / …) and list
@@ -1656,9 +1663,12 @@ impl AotEvaluator {
         }
         let bw = bytes_written as usize;
 
-        // 4. Decode the output region back to a `Value`. We always
-        // give the reader at least `return_root_size` bytes — the
-        // wasm side does the same.
+        // 4. Decode the output region back to a `Value`. Under the F1
+        // arena-absolute slot convention the object head sits at `out_ptr`
+        // and every pointer slot it carries is an arena-absolute offset,
+        // so the reader + verifier walk the **whole arena** anchored at
+        // `out_ptr` rather than a region-relative `out_buf` slice. We need
+        // at least `return_root_size` bytes of the fixed area present.
         let read_len = bw.max(bs.return_layout.root_size);
         let read_end = out_ptr as usize + read_len;
         if read_end > arena_size {
@@ -1666,23 +1676,45 @@ impl AotEvaluator {
                 "cranelift arena too small for return decode".into(),
             ));
         }
-        let out_bytes = &arena[out_ptr as usize..read_end];
+        let arena = &arena[..arena_size];
+        let regions = ArenaRegions {
+            const_data_len: self.const_data.len(),
+            in_ptr,
+            in_len,
+            out_ptr,
+            out_cap,
+            scratch_base,
+            arena_size,
+        };
 
-        // Object / fixed-area return path: gate the out_buf record through
-        // the bounds verifier before decoding. Today every such return is
-        // self-contained in out_buf (cross-region object fields are still
-        // capped — F1 releases them), so the single-region wall over
-        // out_buf is the correct, tight gate. This closes the red-line gap
-        // where the object path previously decoded with no verifier at all.
-        relon_eval_api::inplace_return::verify_object_return(
+        // Object / fixed-area return path: gate the record through the
+        // multi-region bounds verifier before decoding. Today every such
+        // return is self-contained in out_buf (cross-region object fields
+        // are still capped — F1b releases them), so every followed span
+        // lands in the `out` region, but the gate is already
+        // cross-region-correct. This closes the red-line gap where the
+        // object path previously decoded with no verifier at all.
+        let multi = regions.multi_region().map_err(|e| {
+            RuntimeError::IoError(format!(
+                "cranelift object return arena regions invalid: {e}"
+            ))
+        })?;
+        relon_eval_api::inplace_return::verify_object_return_multi(
             "cranelift",
-            out_bytes,
+            arena,
+            out_ptr as usize,
+            multi,
             &bs.return_layout,
             &bs.return_schema.fields,
         )?;
 
-        let reader = BufferReader::new(&bs.return_layout, &bs.return_schema.fields, out_bytes)
-            .map_err(buffer_to_runtime_error)?;
+        let reader = BufferReader::new_at_base(
+            &bs.return_layout,
+            &bs.return_schema.fields,
+            arena,
+            out_ptr as usize,
+        )
+        .map_err(buffer_to_runtime_error)?;
         if is_single_value_wrapper(&bs.return_schema) {
             let field = &bs.return_schema.fields[0];
             read_value_from_reader(&reader, field, &bs.return_schema)
