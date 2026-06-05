@@ -279,6 +279,34 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             }
             EntryShape::Buffer => {
                 let i32_t = self.ctx.i32_type();
+                // In-place region-walk return ABI (S2): when the body
+                // stashed a `List<List<scalar>>` root pointer
+                // (`emit_store_field` for `ListList`), the value is
+                // returned *in place* in its source region rather than
+                // copied to `out_buf`. Encode the arena-relative root
+                // offset as the negative sentinel `-(root_abs + 1)` (=
+                // `0 - root - 1`) and return it. The host distinguishes
+                // this from a normal non-negative `bytes_written`: a
+                // negative return is the in-place marker, decoded as
+                // `root_abs = -ret - 1`. `root_abs >= in_ptr >= 8`, so the
+                // sentinel is `<= -9`, disjoint from any legal byte count.
+                // Mirrors the cranelift backend's `emit_return`.
+                if let Some(root) = self.inplace_return_root {
+                    let neg = self
+                        .builder
+                        .build_int_neg(root, "inplace_neg")
+                        .map_err(|e| LlvmError::Codegen(format!("inplace neg: {e}")))?;
+                    let sentinel = self
+                        .builder
+                        .build_int_sub(neg, i32_t.const_int(1, false), "inplace_sentinel")
+                        .map_err(|e| LlvmError::Codegen(format!("inplace sub: {e}")))?;
+                    self.builder
+                        .build_return(Some(&sentinel))
+                        .map_err(|e| LlvmError::Codegen(format!("Return (inplace): {e}")))?;
+                    let cont = self.ctx.append_basic_block(self.func, "after_return_cont");
+                    self.builder.position_at_end(cont);
+                    return Ok(());
+                }
                 // Phase E.1: when the body emitted a pointer-indirect
                 // StoreField (String / List* return) the trampoline
                 // needs to know how many bytes past `out_ptr` the tail

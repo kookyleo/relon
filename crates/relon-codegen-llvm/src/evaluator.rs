@@ -1365,10 +1365,42 @@ impl LlvmAotEvaluator {
         if trap_code != 0 {
             return Err(crate::state::NativeTrap::runtime_error_from_code(trap_code));
         }
+        // In-place region-walk return ABI (S2): a negative return value
+        // is the in-place sentinel `-(root_abs + 1)`. Instead of a value
+        // copied into `out_buf`, the machine code reports the
+        // arena-absolute offset of the return root (today only a
+        // `List<List<scalar>>` value sourced from a `#main` parameter).
+        // We rebase it to its source region, run the bounds verifier over
+        // the whole reachable graph confined to that region, and only on
+        // a clean verify decode the value in place. A verifier failure is
+        // a loud error — we never decode an unverified in-place return.
+        // The decode pipeline (sentinel → region-select → verifier →
+        // decode) is shared with the cranelift backend via
+        // `relon_eval_api::inplace_return`.
         if bytes_written < 0 {
-            return Err(RuntimeError::IoError(format!(
-                "llvm-aot run_main reported negative bytes_written: {bytes_written}"
-            )));
+            let root_abs = relon_eval_api::inplace_return::decode_inplace_sentinel(bytes_written)?;
+            if !is_single_value_wrapper(&schema.return_schema) {
+                return Err(RuntimeError::IoError(
+                    "llvm-aot in-place return on a non-single-value return schema".into(),
+                ));
+            }
+            return relon_eval_api::inplace_return::decode_inplace_list_list_return(
+                "llvm-aot",
+                arena,
+                relon_eval_api::inplace_return::ArenaRegions {
+                    const_data_len: self.const_data.len(),
+                    in_ptr,
+                    in_len,
+                    out_ptr,
+                    out_cap,
+                    scratch_base,
+                    arena_size,
+                },
+                root_abs,
+                &schema.return_schema.fields[0],
+                &schema.return_layout,
+                &schema.return_schema.fields,
+            );
         }
         let bw = bytes_written as usize;
 

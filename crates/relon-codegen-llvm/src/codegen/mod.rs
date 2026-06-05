@@ -1987,6 +1987,18 @@ pub(crate) struct Emit<'ctx, 'b, 'cp> {
     /// statically-known `buffer_return_size`. Mirrors cranelift's
     /// `needs_tail_cursor` flag.
     pub(crate) needs_tail_cursor: bool,
+    /// In-place region-walk return ABI (S2): set by `emit_store_field`
+    /// when the entry returns a `List<List<scalar>>` sourced directly
+    /// from a `#main` parameter. Holds the **arena-relative** i32 offset
+    /// of the root list header (the value `Op::LoadListListPtr` pushed,
+    /// already rebased by `in_ptr`). No bytes are copied into `out_buf`;
+    /// instead the buffer epilogue (`emit_return`) encodes this offset as
+    /// the negative in-place sentinel `-(root_abs + 1)` and returns it,
+    /// telling the host to verify + decode the value in place at its
+    /// source region rather than at `out_ptr`. `None` for every other
+    /// return shape, which keeps the existing `buffer_return_size` /
+    /// tail-cursor epilogue. Mirrors cranelift's `inplace_return_root`.
+    pub(crate) inplace_return_root: Option<IntValue<'ctx>>,
     /// Phase F.W7: ordered list of lambda `FunctionValue`s, indexed by
     /// `fn_table_idx`. `Op::MakeClosure { fn_table_idx }` stamps the
     /// matching index into the closure handle's `fn_table_idx` slot
@@ -2341,6 +2353,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             const_pool,
             inline_frames: Vec::new(),
             needs_tail_cursor: false,
+            inplace_return_root: None,
             last_const_string: None,
             closure_fn_table: Vec::new(),
             record_locals: std::collections::HashMap::new(),

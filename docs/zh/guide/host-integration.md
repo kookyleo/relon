@@ -90,11 +90,12 @@ host-pushed slot：
 >   重定位；
 > - **从 `#main` 入参恒等返回 `List<List<scalar>>`**
 >   （`#main(List<List<Int|Float|Bool>> xss) -> List<List<…>> = xss`），
->   **仅 cranelift 后端。** 这是「就地区走读返回 ABI」承载的第一个形状：
->   机器码不拷贝嵌套指针数组图，而是把结果根的 arena 偏移报给 host，host
->   在其来源区内 **校验后就地解码**（见下方设计注记）。LLVM 仍 cap 此形状；
->   入参 **字段** 形式的 `List<List<scalar>>`（`w.rows`）也仍 cap —— 字段
->   读取会把内层行重编码为 materialized 形态，就地读取器尚不能解码；
+>   **cranelift 与 llvm 两个后端均已支持。** 这是「就地区走读返回 ABI」
+>   承载的第一个形状：机器码不拷贝嵌套指针数组图，而是把结果根的 arena
+>   偏移报给 host，host 在其来源区内 **校验后就地解码**（见下方设计注记）；
+>   两个后端共用同一条 host 解码管线。入参 **字段** 形式的
+>   `List<List<scalar>>`（`w.rows`）在两个后端上仍 cap —— 字段读取会把内层
+>   行重编码为 materialized 形态，就地读取器尚不能解码；
 > - **`#schema` 加品牌的结构体返回**（`#main() -> Cfg { ... }`），字段
 >   可含上述任意类型（含字面量 `String` / `List` 字段）；
 > - **匿名 `-> Dict { ... }` 返回** —— 每个非 `#internal` 字段都会
@@ -109,9 +110,9 @@ host-pushed slot：
 >   config 请改用 `#schema` 结构体）；
 > - 内层为指针数组元素的嵌套 List（`List<List<String>>` /
 >   `List<List<Schema>>`）—— 递归逐元素重定位尚未建模；
-> - 从 `#main` **返回** `List<Schema>`；在 **LLVM** 上返回
->   `List<List<scalar>>`（cranelift 的入参恒等形已支持，见上）；在两个后端
->   上返回经 **入参字段** 得到的 `List<List<scalar>>`；或返回含该类字段的
+> - 从 `#main` **返回** `List<Schema>`；在两个后端上返回经 **入参字段**
+>   得到的 `List<List<scalar>>`（入参 **恒等** 形两个后端均已支持，见上）；
+>   或返回含该类字段的
 >   匿名 `Dict` / 结构体。host 侧 **解码已就位**：`BufferReader` 以单一
 >   基址走读 buffer，递归重建嵌套 `Value`（`List<Schema>` 走
 >   `read_list_record`，`List<List<scalar>>` 走 `read_list_list` /
@@ -136,8 +137,8 @@ host-pushed slot：
 > 路径试图用单一刚性 delta 把该图 *拷贝* 进 `out_buf`，只有连续单基址的
 > const-pool 块才成立，散落的入参图会段错误。
 >
-> **就地区走读返回 ABI（诚实的修法；cranelift `List<List<scalar>>`
-> 首个切片已上线）。** 不再拷贝，机器码通过 **负返回值哨兵** 把 **结果根的
+> **就地区走读返回 ABI（诚实的修法；`List<List<scalar>>` 入参恒等形
+> 已在 cranelift 与 llvm 两个后端上线）。** 不再拷贝，机器码通过 **负返回值哨兵** 把 **结果根的
 > arena 绝对偏移** 报给 host：`run_main` 返回值 `>= 0` 仍是常规
 > `bytes_written`（在 `out_ptr` 处解码），而返回值 `< 0` 编码
 > `-(root_abs + 1)` —— 即「这是就地返回，根头在 arena 偏移 `root_abs`」。
@@ -154,10 +155,13 @@ host-pushed slot：
 >    刚认证过的那块区切片解码。
 >
 > 这样既保住承重的单区墙（不跨区拷贝、不整 buffer 刚性重定位），又把整类
-> 「基址写错 / 散落图」bug 从 *静默错值* 变成 *明确的 verifier 失败*。读取
-> 器、verifier 与 cranelift 的 `List<List<scalar>>` 恒等形已接通；剩下的是
-> 把同一 ABI 扩展到逐元素指针数组根（`List<String>` / `List<Schema>`）、
-> LLVM 后端与 wasm 线性内存 —— 每一步都在逐字节证明等价于 oracle 后才上线。
+> 「基址写错 / 散落图」bug 从 *静默错值* 变成 *明确的 verifier 失败*。host
+> 解码管线（哨兵 → 选区 → verifier → 解码）只在
+> `relon_eval_api::inplace_return` 落一份、由两个 AOT 后端共用，cranelift
+> 与 llvm 走完全相同的总开关。读取器、verifier 与 **两个** native 后端的
+> `List<List<scalar>>` 入参恒等形均已接通；剩下的是把同一 ABI 扩展到逐元素
+> 指针数组根（`List<String>` / `List<Schema>`）与 wasm 线性内存 —— 每一步
+> 都在逐字节证明等价于 oracle 后才上线。
 
 ### 入口边界 Result 与 Relon 值层 Result
 

@@ -261,6 +261,38 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         if matches!(ty, IrType::ListString) {
             return self.emit_store_field_list_string(ip_hint, offset);
         }
+        if matches!(ty, IrType::ListList) {
+            // In-place region-walk return ABI (S2), mirroring the
+            // cranelift backend's `emit_store_field` for `ListList`. The
+            // IR lowering only emits `StoreField { ty: ListList }` for a
+            // `List<List<scalar>>` value sourced directly from a `#main`
+            // parameter (`list_list_source_is_param_walk`) — its root
+            // header lives in the input region and the value is
+            // self-contained there (the single-region invariant). Rather
+            // than relocate the non-contiguous in-buffer block (the old
+            // rejecting path), we pop the arena-relative root pointer that
+            // `Op::LoadListListPtr` pushed and stash it; the buffer
+            // epilogue returns it as the negative in-place sentinel. The
+            // fixed-area slot at `offset` is left untouched — the host
+            // ignores `out_buf` entirely for an in-place return and reads
+            // the root at the reported arena offset.
+            //
+            // Only one root return value exists per `#main`, so a single
+            // stash slot is sufficient; a second ListList store would be a
+            // lowering bug (surfaced loudly here rather than silently
+            // overwriting).
+            if self.inplace_return_root.is_some() {
+                return Err(LlvmError::Codegen(
+                    "multiple ListList StoreField in one #main body — in-place return expects a \
+                     single root value"
+                        .into(),
+                ));
+            }
+            let _ = offset;
+            let root = self.pop_int(ip_hint)?;
+            self.inplace_return_root = Some(root);
+            return Ok(());
+        }
         // Phase D.1 fast path: rewrite trailing StoreField into a
         // store against the i64 ret_slot. Only the single Int return
         // slot is supported — any other offset means the IR is past
