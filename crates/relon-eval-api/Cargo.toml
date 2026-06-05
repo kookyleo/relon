@@ -25,3 +25,11 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+# Property-based round-trip / verifier fuzzing for the binary handshake
+# buffer (`buffer.rs` writer/reader + `verifier.rs`). Generates target
+# return-shape values, writes them through `BufferBuilder`, reads them
+# back, and asserts equality + a clean verifier pass — exercising the
+# recursive host reader landed in a1660b62 across the value space.
+proptest = { workspace = true }

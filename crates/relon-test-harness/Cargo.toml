@@ -11,6 +11,13 @@ keywords = ["relon", "testing", "differential", "evaluator"]
 categories = ["development-tools::testing"]
 publish = false
 
+[features]
+# Off-by-default: pulls the LLVM-AOT backend into the differential so
+# `assert_all_backends_bit_equal` compares all three backends. Default
+# builds (no LLVM 18 dev headers) keep the fixture as a two-way
+# tree-walk vs cranelift compare and record LLVM as skipped.
+llvm-aot = ["relon/llvm-aot"]
+
 [dependencies]
 # Tree-walk reference evaluator + shared Value / RuntimeError surface.
 relon = { workspace = true, features = ["cranelift-aot"] }
