@@ -188,6 +188,24 @@ fn unsupported_return_shapes_fail_loudly_not_silently() {
         // (`-> S { tags: t }`) is object-field marshalling, a later step,
         // and must still fail loudly at lowering.
         "#schema S {\n    tags: List<String>\n}\n#main(List<String> t) -> S\n{ tags: t }",
+        // ---- S5 cross-region object fields (param-sourced pointer-array
+        // lists inside an anon-Dict / branded-struct return). The object
+        // header lives in `out_buf` but a `List<Schema>` /
+        // `List<List<scalar>>` field sourced by parameter identity points
+        // into `in_buf` — a genuine cross-region field pointer the
+        // single-region verifier + reader cannot follow. The in-place
+        // region-walk ABI (S1–S4) only carries a *single whole-value* root;
+        // an object field has no such carrier. Until a byte-proven
+        // multi-region walk lands (see docs/internal/.return-side-loop-plan.md
+        // S5 design) these MUST cap loudly on both backends rather than
+        // store an in_buf pointer into an out_buf slot (a silent
+        // cross-region wild read).
+        "#schema Server { name: String, port: Int }\n\
+         #main(List<Server> servers) -> Dict\n{ items: servers, n: 1 }",
+        "#main(List<List<Int>> grid) -> Dict\n{ g: grid, n: 1 }",
+        // Same cross-region hazard through a branded-struct field surface.
+        "#schema Server { name: String }\n#schema Cfg { servers: List<Server> }\n\
+         #main(List<Server> servers) -> Cfg\n{ servers: servers }",
     ];
     for src in UNSUPPORTED {
         let cl = AotEvaluator::from_source(src);

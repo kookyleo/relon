@@ -132,7 +132,14 @@ host-pushed slot：
 > - 在两个后端上返回经 **入参字段** 得到的 `List<Schema>` 或
 >   `List<List<scalar>>`（入参 **恒等** 形两个后端均已支持，见上）；返回子
 >   记录自身再含嵌套 `List<Schema>` / `List<List<…>>` 字段的 `List<Schema>`；
->   或返回含该类字段的匿名 `Dict` / 结构体。host 侧 **解码已就位**：
+>   或返回**含该类入参恒等字段的匿名 `Dict` / 结构体**
+>   （`-> Dict { items: servers }` / `-> Cfg { servers: servers }`，其中
+>   `servers: List<Server>` 是 `#main` 入参）。对象头建在 `out_buf`，但
+>   入参来源的 `List<Schema>` / `List<List<scalar>>` 字段仍在 `in_buf` ——
+>   这是真正的**跨区**字段指针。就地区走读 ABI 只承载**单个整值**根
+>   （负哨兵），且 verifier 与 reader 均单区，安全的对象字段走读需要一套
+>   尚未建成、可逐字节证明的多区指针约定；在此之前两后端均**响亮 cap**，
+>   绝不把 `in_buf` 指针塞进 `out_buf` 槽。host 侧 **解码已就位**：
 >   `BufferReader` 以单一基址走读 buffer，递归重建嵌套 `Value`
 >   （`List<Schema>` 走 `read_list_record` / `read_list_record_at`，
 >   `List<List<scalar>>` 走 `read_list_list` / `read_list_list_at`，就地
