@@ -1806,6 +1806,15 @@ fn write_value_into_builder(
         (TypeRepr::String, Value::String(s)) => builder
             .write_string(&field.name, s.as_str())
             .map_err(buffer_to_runtime_error),
+        // List-typed `#main` arg: serialise the elements into a
+        // pointer-indirect tail record (the same `[len][payload]` /
+        // pointer-array shape `ConstListInt` / `ConstListString` bake)
+        // and back-patch the 4-byte buffer-relative offset slot the
+        // JIT's `LoadList*Ptr` reads. Mirrors the LLVM backend's
+        // `marshal_list_*_in`. `List<Schema>` stays a loud cap.
+        (TypeRepr::List { element }, Value::List(items)) => {
+            write_list_arg_into_builder(builder, &field.name, element, items)
+        }
         // Schema-typed `#main` arg: a branded `Value::Dict` is written
         // as a sub-record into the parent buffer's tail and the 4-byte
         // buffer-relative offset slot back-patched — exactly the slot
@@ -1869,6 +1878,87 @@ fn write_schema_arg_into_builder(
     builder
         .finish_sub_record(name, child)
         .map_err(buffer_to_runtime_error)
+}
+
+/// Marshal a `List<…>` `#main` arg (or schema List field) into the
+/// buffer. Dispatches on the canonical element type to the matching
+/// `BufferBuilder::write_list_*` writer, each of which appends the
+/// pointer-indirect tail record (`[len][payload]` for scalar elements,
+/// a `[len][off_0]…` pointer array of `[len][utf8]` String records for
+/// `List<String>`) and back-patches the field's buffer-relative offset
+/// slot. Element `Value`s are type-checked against the declared element
+/// type. `List<Schema>` (and any other element) stays a loud cap.
+/// Mirrors the LLVM backend's `marshal_list_*_in`.
+fn write_list_arg_into_builder(
+    builder: &mut BufferBuilder<'_>,
+    name: &str,
+    element: &TypeRepr,
+    items: &[Value],
+) -> Result<(), RuntimeError> {
+    let mismatch = |idx: usize, got: &Value, want: &str| RuntimeError::Unsupported {
+        reason: format!(
+            "cranelift-native: List<{want}> arg `{name}` element #{idx} got {} but expects {want}",
+            got.type_name()
+        ),
+    };
+    match element {
+        TypeRepr::Int => {
+            let mut out = Vec::with_capacity(items.len());
+            for (i, it) in items.iter().enumerate() {
+                match it {
+                    Value::Int(v) => out.push(*v),
+                    other => return Err(mismatch(i, other, "Int")),
+                }
+            }
+            builder
+                .write_list_int(name, &out)
+                .map_err(buffer_to_runtime_error)
+        }
+        TypeRepr::Float => {
+            let mut out = Vec::with_capacity(items.len());
+            for (i, it) in items.iter().enumerate() {
+                match it {
+                    Value::Float(v) => out.push(v.into_inner()),
+                    // Int → Float promotion, matching the scalar arm.
+                    Value::Int(v) => out.push(*v as f64),
+                    other => return Err(mismatch(i, other, "Float")),
+                }
+            }
+            builder
+                .write_list_float(name, &out)
+                .map_err(buffer_to_runtime_error)
+        }
+        TypeRepr::Bool => {
+            let mut out = Vec::with_capacity(items.len());
+            for (i, it) in items.iter().enumerate() {
+                match it {
+                    Value::Bool(v) => out.push(*v),
+                    other => return Err(mismatch(i, other, "Bool")),
+                }
+            }
+            builder
+                .write_list_bool(name, &out)
+                .map_err(buffer_to_runtime_error)
+        }
+        TypeRepr::String => {
+            let mut out: Vec<&str> = Vec::with_capacity(items.len());
+            for (i, it) in items.iter().enumerate() {
+                match it {
+                    Value::String(s) => out.push(s.as_str()),
+                    other => return Err(mismatch(i, other, "String")),
+                }
+            }
+            builder
+                .write_list_string(name, &out)
+                .map_err(buffer_to_runtime_error)
+        }
+        other => Err(RuntimeError::Unsupported {
+            reason: format!(
+                "cranelift-native: List element type {other:?} for arg `{name}` is not yet \
+                 materialised (List<Int/Float/Bool/String> only; List<Schema> is a loud cap)"
+            ),
+        }),
+    }
 }
 
 /// Recursively fill a detached sub-record `child` with the fields of

@@ -30,15 +30,17 @@ pub enum LoweringError {
     /// A `#main` parameter or return type falls outside the structured
     /// buffer-protocol envelope the compiled backends decode. Supported
     /// today: the scalar leaves (`Int` / `Float` / `Bool` / `Null` /
-    /// `String`), `List<scalar>`, user-`#schema` structs with scalar
-    /// fields, and `List<Schema>`. Explicitly NOT supported (loud cap,
-    /// not a silent fallthrough): `Dict<_, _>` params, nested-list
-    /// params (`List<List<…>>`), and other deeply-nested composites —
-    /// their input decoding has no buffer-protocol decode path yet.
+    /// `String`), `List<scalar>`, `List<String>`, and user-`#schema`
+    /// structs whose fields are any of those (scalar / `String` /
+    /// `List<scalar>` / `List<String>`). Explicitly NOT supported (loud
+    /// cap, not a silent fallthrough): `Dict<_, _>` params, nested-list
+    /// params (`List<List<…>>`), `List<Schema>` params/fields, and
+    /// multi-segment nested-schema walks — their input decoding has no
+    /// buffer-protocol decode path yet.
     #[error(
         "unsupported type in #main: `{type_name}` — compiled backends decode scalars, \
-         List<scalar>, schema-struct, and List<Schema>; Dict and nested-list params are \
-         not yet supported"
+         String, List<scalar>, List<String>, and schema structs of those; Dict, nested-list, \
+         and List<Schema> params are not yet supported"
     )]
     UnsupportedTypeInMain {
         /// The offending type name as written in source.

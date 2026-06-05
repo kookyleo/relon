@@ -29,8 +29,6 @@ use relon_ir::ir::IrType;
 use crate::error::CraneliftError;
 use crate::sandbox::{TrapKind, STATE_OFFSET_ARENA_BASE, STATE_OFFSET_ARENA_LEN};
 
-use super::pointer_indirect_record_align;
-
 impl<'a, 'b> super::Codegen<'a, 'b> {
     /// Lower `Op::EmitTailRecordFromAbsoluteAddr { ty }`. Pops an
     /// arena-relative source pointer (an `i32` offset where a
@@ -45,55 +43,20 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         &mut self,
         ty: IrType,
     ) -> Result<(), CraneliftError> {
+        if matches!(ty, IrType::ListString | IrType::ListSchema) {
+            return Err(CraneliftError::Codegen(format!(
+                "EmitTailRecordFromAbsoluteAddr {ty:?} (pointer-array) not yet supported"
+            )));
+        }
         let src_off_i32 = self.pop()?;
-        let arena_base = self.builder.ins().load(
-            self.pointer_ty,
-            MemFlags::trusted(),
-            self.state_ptr,
-            STATE_OFFSET_ARENA_BASE,
-        );
-        let src_off_p = self.builder.ins().uextend(self.pointer_ty, src_off_i32);
-        let src_abs = self.builder.ins().iadd(arena_base, src_off_p);
-        let len_i32 = self
-            .builder
-            .ins()
-            .load(I32, MemFlags::trusted(), src_abs, 0);
-        let record_size = match ty {
-            IrType::String => {
-                let four = self.builder.ins().iconst(I32, 4);
-                self.builder.ins().iadd(len_i32, four)
-            }
-            IrType::ListInt | IrType::ListFloat => {
-                let three = self.builder.ins().iconst(I32, 3);
-                let shifted = self.builder.ins().ishl(len_i32, three);
-                let eight = self.builder.ins().iconst(I32, 8);
-                self.builder.ins().iadd(shifted, eight)
-            }
-            IrType::ListBool => {
-                let four = self.builder.ins().iconst(I32, 4);
-                self.builder.ins().iadd(len_i32, four)
-            }
-            IrType::ListString | IrType::ListSchema => {
-                return Err(CraneliftError::Codegen(format!(
-                    "EmitTailRecordFromAbsoluteAddr {ty:?} (pointer-array) not yet supported"
-                )));
-            }
-            _ => {
-                return Err(CraneliftError::Codegen(format!(
-                    "EmitTailRecordFromAbsoluteAddr unsupported {ty:?}"
-                )));
-            }
-        };
-        let align = pointer_indirect_record_align(ty)?;
-        let pre_cursor = self.emit_tail_alloc(record_size, align)?;
-        let out_ptr_i32 = self.get_local(2)?;
-        let out_ptr = self.builder.ins().uextend(self.pointer_ty, out_ptr_i32);
-        let pre_cursor_p = self.builder.ins().uextend(self.pointer_ty, pre_cursor);
-        let dest0 = self.builder.ins().iadd(arena_base, out_ptr);
-        let dest = self.builder.ins().iadd(dest0, pre_cursor_p);
-        let size_p = self.builder.ins().uextend(self.pointer_ty, record_size);
-        self.builder
-            .call_memcpy(self.frontend_config, dest, src_abs, size_p);
+        // Share the pointer-indirect record copy with
+        // `emit_store_pointer_indirect` so the position-dependent inner
+        // payload alignment is recomputed on each side (a verbatim
+        // `memcpy` would drag the source's pad geometry and corrupt the
+        // 8-aligned `List<Int>` / `List<Float>` payload when a list
+        // *param* is returned by identity — its input-buffer record can
+        // land at a different `% 8` residue than the output slot).
+        let pre_cursor = self.emit_pointer_indirect_record_copy(src_off_i32, ty)?;
         // Push the pre-bump cursor.
         self.push(pre_cursor);
         Ok(())

@@ -5021,7 +5021,15 @@ fn canonical_type_repr<'a>(
         ("String", []) => Ok(TypeRepr::String),
         ("List", [elem]) => {
             let inner = canonical_type_repr(elem, resolver, stack, range)?;
-            if matches!(inner, TypeRepr::Int) {
+            // Scalar / String element lists are materialised by both
+            // compiled backends (`write_list_*` host encoders +
+            // `LoadFieldAtAbsolute` pointer-indirect field decode).
+            // Nested `List<List<…>>` and `List<Schema>` schema fields
+            // stay a loud cap — their element decode is not lowered.
+            if matches!(
+                inner,
+                TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool | TypeRepr::String
+            ) {
                 Ok(TypeRepr::List {
                     element: Box::new(inner),
                 })

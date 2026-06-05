@@ -382,27 +382,32 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         self.emit_trap(mapped)
     }
 
-    // Pointer / list loads from the in_buf — not lowered yet.
-    fn visit_load_string_ptr(&mut self, _offset: u32) -> Result<(), CraneliftError> {
-        unsupported("LoadStringPtr")
+    // Pointer-indirect `#main` param loads from the in_buf: read the
+    // 4-byte buffer-relative slot, rebase by `in_ptr` to an
+    // arena-relative record pointer. All scalar-element / String element
+    // variants share `emit_load_pointer_indirect_param`.
+    fn visit_load_string_ptr(&mut self, offset: u32) -> Result<(), CraneliftError> {
+        self.emit_load_pointer_indirect_param(offset)
     }
 
-    fn visit_load_list_int_ptr(&mut self, _offset: u32) -> Result<(), CraneliftError> {
-        unsupported("LoadListIntPtr")
+    fn visit_load_list_int_ptr(&mut self, offset: u32) -> Result<(), CraneliftError> {
+        self.emit_load_pointer_indirect_param(offset)
     }
 
-    fn visit_load_list_float_ptr(&mut self, _offset: u32) -> Result<(), CraneliftError> {
-        unsupported("LoadListFloatPtr")
+    fn visit_load_list_float_ptr(&mut self, offset: u32) -> Result<(), CraneliftError> {
+        self.emit_load_pointer_indirect_param(offset)
     }
 
-    fn visit_load_list_bool_ptr(&mut self, _offset: u32) -> Result<(), CraneliftError> {
-        unsupported("LoadListBoolPtr")
+    fn visit_load_list_bool_ptr(&mut self, offset: u32) -> Result<(), CraneliftError> {
+        self.emit_load_pointer_indirect_param(offset)
     }
 
-    fn visit_load_list_string_ptr(&mut self, _offset: u32) -> Result<(), CraneliftError> {
-        unsupported("LoadListStringPtr")
+    fn visit_load_list_string_ptr(&mut self, offset: u32) -> Result<(), CraneliftError> {
+        self.emit_load_pointer_indirect_param(offset)
     }
 
+    // `List<Schema>` params would land here; their decode is not lowered
+    // on the cranelift backend yet (loud cap).
     fn visit_load_list_schema_ptr(&mut self, _offset: u32) -> Result<(), CraneliftError> {
         unsupported("LoadListSchemaPtr")
     }
