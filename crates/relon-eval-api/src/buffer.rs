@@ -730,6 +730,34 @@ impl<'a> BufferBuilder<'a> {
         self.bytes
     }
 
+    /// Consume the builder and return the byte buffer with every
+    /// pointer slot rebased from **buffer-relative** to
+    /// **arena-absolute** by adding `arena_base` (the absolute arena
+    /// offset the buffer is about to be copied to — i.e. `in_ptr`).
+    ///
+    /// F1 unifies the in-buffer pointer convention on a single
+    /// arena-absolute basis: the input marshaller knows `in_ptr` at this
+    /// point, so it bakes it into every slot here once, and the machine
+    /// code's param-read drops its old `+ in_ptr` rebase (the slot is
+    /// already arena-absolute). The same recursive walk
+    /// [`finish_sub_record`] uses to paste a child into a parent applies
+    /// — a rebase by `arena_base` is structurally identical to a paste at
+    /// `arena_base`, relocating every nested-schema and pointer-array
+    /// entry too. `arena_base == 0` is a no-op (the slots are already
+    /// correct), so a zero-const-data layout stays byte-identical.
+    pub fn finish_arena_absolute(self, arena_base: u32) -> Result<Vec<u8>, BufferError> {
+        let (mut bytes, reloc) = self.into_parts();
+        if arena_base != 0 {
+            relocate_pointers(&mut bytes, &reloc, 0, arena_base).map_err(|reason| {
+                BufferError::MalformedPayload {
+                    name: "<input marshal arena rebase>".to_string(),
+                    reason,
+                }
+            })?;
+        }
+        Ok(bytes)
+    }
+
     /// Internal sibling of [`Self::finish`] that surrenders the byte
     /// buffer together with the pre-computed relocation cache.
     /// `finish_sub_record` and `ListRecordWriter::finish_entry` use this
@@ -1280,6 +1308,62 @@ impl<'a> BufferReader<'a> {
                         name: fo.name.clone(),
                         ty: f.ty.clone(),
                         offset: fo.offset,
+                        size: fo.size,
+                        kind: fo.kind,
+                        list_element: fo.list_element,
+                    })
+            })
+            .collect();
+        Ok(Self {
+            layout,
+            field_index,
+            bytes,
+        })
+    }
+
+    /// Build a reader whose root record's fixed area is anchored at the
+    /// arena-absolute offset `record_base` inside the whole-arena slice
+    /// `bytes`, rather than at offset `0`.
+    ///
+    /// This is the F1 object-return decode entry point: under the
+    /// arena-absolute slot convention the object head lives at `out_ptr`
+    /// and every pointer slot it carries holds an arena-absolute offset,
+    /// so the reader walks the **whole arena** (`bytes`) and each field
+    /// slot is read at `record_base + fo.offset`. Mirrors the per-entry
+    /// field-index rebase [`Self::read_list_record_at`] /
+    /// [`Self::sub_record`] already perform, so a subsequent
+    /// pointer-indirect read resolves its arena-absolute slot value
+    /// directly against `bytes`.
+    pub fn new_at_base(
+        layout: &'a OffsetTable,
+        fields: &[Field],
+        bytes: &'a [u8],
+        record_base: usize,
+    ) -> Result<Self, BufferError> {
+        let record_end =
+            record_base
+                .checked_add(layout.root_size)
+                .ok_or(BufferError::BufferTooSmall {
+                    have: bytes.len(),
+                    need: usize::MAX,
+                })?;
+        if record_end > bytes.len() {
+            return Err(BufferError::BufferTooSmall {
+                have: bytes.len(),
+                need: record_end,
+            });
+        }
+        let field_index = layout
+            .fields
+            .iter()
+            .filter_map(|fo| {
+                fields
+                    .iter()
+                    .find(|f| f.name == fo.name)
+                    .map(|f| FieldEntry {
+                        name: fo.name.clone(),
+                        ty: f.ty.clone(),
+                        offset: record_base + fo.offset,
                         size: fo.size,
                         kind: fo.kind,
                         list_element: fo.list_element,

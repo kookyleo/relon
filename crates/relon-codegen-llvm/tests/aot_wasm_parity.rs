@@ -370,12 +370,15 @@ fn run_buffer(
         .read(&store, (arena_abs + out_ptr) as usize, &mut out)
         .expect("read out region");
 
-    // Decode each return field at its fixed-area offset. Tail records
-    // are out_ptr-relative — exactly the wire format `BufferReader`
-    // implements (see decode_pointer_header).
+    // Decode each return field at its fixed-area offset. F1 stores every
+    // pointer slot as an **arena-absolute** offset (the unified slot
+    // convention `BufferReader` now walks over the whole arena); the tail
+    // records still live in out_buf, so we rebase an absolute slot value
+    // by `- out_ptr` to index into the `out` (out_buf) slice.
     let read_u32 = |buf: &[u8], at: usize| -> usize {
         u32::from_le_bytes(buf[at..at + 4].try_into().unwrap()) as usize
     };
+    let out_ptr_us = out_ptr as usize;
     let mut decoded = HashMap::new();
     for f in &info.return_fields {
         let off = f.offset as usize;
@@ -389,7 +392,7 @@ fn run_buffer(
             EmittedFieldType::Bool => Decoded::Int(if out[off] != 0 { 1 } else { 0 }),
             EmittedFieldType::Null => Decoded::Int(0),
             EmittedFieldType::String => {
-                let record_start = read_u32(&out, off);
+                let record_start = read_u32(&out, off) - out_ptr_us;
                 let len = read_u32(&out, record_start);
                 let payload = record_start + 4;
                 let s = std::str::from_utf8(&out[payload..payload + len])
@@ -398,7 +401,7 @@ fn run_buffer(
                 Decoded::Str(s)
             }
             EmittedFieldType::ListInt => {
-                let record_start = read_u32(&out, off);
+                let record_start = read_u32(&out, off) - out_ptr_us;
                 let count = read_u32(&out, record_start);
                 // List payload pads the start up to 8 (tail_alignment).
                 let raw = record_start + 4;

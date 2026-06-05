@@ -88,13 +88,12 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         let base = self.pop_int(ip_hint)?;
         let addr = self.compose_abs_addr(base, offset)?;
         // Pointer-indirect schema field (`String` / `List<scalar>` /
-        // `List<String>`): the slot holds a 4-byte **buffer-relative**
-        // offset to the field's tail record, just like a top-level
-        // pointer-indirect `#main` param. Load the i32 slot and rebase
-        // by `in_ptr` so the pushed value is an arena-relative record
-        // pointer every consumer (`ReadStringLen`, list index, String /
-        // List return copy) expects — mirrors
-        // `emit_load_pointer_indirect_param`'s rebase.
+        // `List<String>`): the slot holds a 4-byte offset to the field's
+        // tail record. F1: the input marshaller baked `in_ptr` into the
+        // slot (`finish_arena_absolute`), so the loaded value is already
+        // the arena-relative record pointer every consumer (`ReadStringLen`,
+        // list index, String / List return copy) expects — no `+ in_ptr`
+        // rebase.
         if matches!(
             ty,
             IrType::String
@@ -103,18 +102,12 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 | IrType::ListBool
                 | IrType::ListString
         ) {
-            let name = self.next_name("loadfa_ptr");
-            let raw = self
+            let name = self.next_name("loadfa_ptr_arena_rel");
+            let arena_rel = self
                 .builder
                 .build_load(self.ctx.i32_type(), addr, &name)
                 .map_err(|e| LlvmError::Codegen(format!("LoadFieldAtAbsolute ptr load: {e}")))?
                 .into_int_value();
-            let in_ptr_i32 = self.lookup_param(0)?; // IR LocalGet(0) == in_ptr
-            let name = self.next_name("loadfa_ptr_arena_rel");
-            let arena_rel = self
-                .builder
-                .build_int_add(raw, in_ptr_i32, &name)
-                .map_err(|e| LlvmError::Codegen(format!("LoadFieldAtAbsolute ptr rebase: {e}")))?;
             self.push(arena_rel, ty);
             return Ok(());
         }
@@ -515,20 +508,16 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         })?;
         let in_ptr_i32 = self.lookup_param(0)?; // IR LocalGet(0) == in_ptr
         let addr = self.compute_buffer_addr(arena_base_ptr, in_ptr_i32, offset)?;
-        let name = self.next_name("loadptr");
-        let raw = self
+        // F1: the input marshaller baked `in_ptr` into the slot
+        // (`finish_arena_absolute`), so the loaded value is already the
+        // arena-relative offset the uniform `arena_base + ptr` resolution
+        // every downstream consumer uses expects — no `+ in_ptr` rebase.
+        let name = self.next_name("loadptr_arena_rel");
+        let arena_rel = self
             .builder
             .build_load(self.ctx.i32_type(), addr, &name)
             .map_err(|e| LlvmError::Codegen(format!("Load*Ptr load: {e}")))?
             .into_int_value();
-        // Rebase the input-buffer-relative slot value to an arena-relative
-        // offset so the uniform `arena_base + ptr` resolution every
-        // downstream consumer uses lands inside the input record.
-        let name = self.next_name("loadptr_arena_rel");
-        let arena_rel = self
-            .builder
-            .build_int_add(raw, in_ptr_i32, &name)
-            .map_err(|e| LlvmError::Codegen(format!("Load*Ptr rebase: {e}")))?;
         self.push(arena_rel, ty);
         Ok(())
     }
@@ -992,8 +981,9 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         self.builder
             .build_memcpy(dst_payload_ptr, align, src_payload_ptr, 1, payload64)
             .map_err(|e| LlvmError::Codegen(format!("ptr-indirect payload memcpy: {e}")))?;
-        // Store `aligned` (buffer-relative offset of the new record)
-        // into the fixed-area slot at `out_ptr + offset`.
+        // Store the record's **arena-absolute** offset (`dst_off =
+        // out_ptr + aligned`, the F1 slot convention) into the fixed-area
+        // slot at `out_ptr + offset`.
         let slot_off = self
             .builder
             .build_int_add(
@@ -1004,7 +994,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .map_err(|e| LlvmError::Codegen(format!("ptr-indirect slot off: {e}")))?;
         let slot_addr = self.arena_addr_i32(slot_off)?;
         self.builder
-            .build_store(slot_addr, aligned)
+            .build_store(slot_addr, dst_off)
             .map_err(|e| LlvmError::Codegen(format!("ptr-indirect slot store: {e}")))?;
         // Flag the body so the buffer-protocol epilogue returns the
         // post-bump tail cursor.
@@ -1050,7 +1040,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     ) -> Result<(), LlvmError> {
         let header_off = self.pop_int(ip_hint)?;
         let new_header = self.copy_list_string_block(header_off)?;
-        // new_header_bufrel -> fixed-area slot at out_ptr + offset.
+        // new_header is arena-absolute (F1) -> fixed-area slot at
+        // out_ptr + offset.
         let i32_t = self.ctx.i32_type();
         let out_ptr = self.lookup_param(2)?;
         let slot_off = self
@@ -1192,27 +1183,42 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .build_memcpy(dst_ptr, 4, src_ptr, 1, block64)
             .map_err(|e| LlvmError::Codegen(format!("ListString block memcpy: {e}")))?;
 
-        // delta = dst_block - src_block_start (i32, multiple of 4).
+        // Two deltas. `delta` (= dst_block - src_block_start) maps a source
+        // arena offset to its out_buf-relative position in the copied block
+        // (used to address the entries we rewrite). `delta_abs` (= out_ptr +
+        // delta) maps it all the way to an **arena-absolute** offset — F1
+        // stores every in-buffer pointer (the returned header slot value and
+        // each inner pointer-array entry) arena-absolute, so both use
+        // `delta_abs`.
         let delta = self
             .builder
             .build_int_sub(dst_block, src_block_start, "ls_delta")
             .map_err(|e| LlvmError::Codegen(format!("ListString delta: {e}")))?;
-
-        // new_header_bufrel = header_off + delta.
-        let new_header = self
+        let delta_abs = self
             .builder
-            .build_int_add(header_off, delta, "ls_new_header")
-            .map_err(|e| LlvmError::Codegen(format!("ListString new_header: {e}")))?;
+            .build_int_add(out_ptr, delta, "ls_delta_abs")
+            .map_err(|e| LlvmError::Codegen(format!("ListString delta_abs: {e}")))?;
+
+        // new_header_bufrel = header_off + delta (used only to address the
+        // entry array we rewrite). The returned slot value adds out_ptr.
+        let new_header_bufrel = self
+            .builder
+            .build_int_add(header_off, delta, "ls_new_header_bufrel")
+            .map_err(|e| LlvmError::Codegen(format!("ListString new_header bufrel: {e}")))?;
+        let new_header_abs = self
+            .builder
+            .build_int_add(header_off, delta_abs, "ls_new_header_abs")
+            .map_err(|e| LlvmError::Codegen(format!("ListString new_header abs: {e}")))?;
 
         // Relocation loop: for i in 0..len, the copied header's offset
-        // entry at (out_ptr + new_header + 4 + i*4) is rewritten to
-        // (off_i + delta). `new_header + 4` is the copied offset array's
-        // buffer-relative start.
+        // entry at (out_ptr + new_header_bufrel + 4 + i*4) is rewritten to
+        // (off_i + delta_abs). `new_header_bufrel + 4` is the copied offset
+        // array's buffer-relative start.
         let entries_base = self
             .builder
             .build_int_add(
                 self.builder
-                    .build_int_add(out_ptr, new_header, "ls_entries_hdr")
+                    .build_int_add(out_ptr, new_header_bufrel, "ls_entries_hdr")
                     .map_err(|e| LlvmError::Codegen(format!("ListString entries hdr: {e}")))?,
                 four,
                 "ls_entries_base",
@@ -1264,7 +1270,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .into_int_value();
         let new = self
             .builder
-            .build_int_add(old, delta, "ls_entry_new")
+            .build_int_add(old, delta_abs, "ls_entry_new")
             .map_err(|e| LlvmError::Codegen(format!("ListString entry reloc: {e}")))?;
         self.builder
             .build_store(entry_addr, new)
@@ -1284,6 +1290,6 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
 
         self.builder.position_at_end(loop_done);
         self.needs_tail_cursor = true;
-        Ok(new_header)
+        Ok(new_header_abs)
     }
 }
