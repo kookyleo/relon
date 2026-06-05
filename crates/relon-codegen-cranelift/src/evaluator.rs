@@ -2094,6 +2094,42 @@ fn read_value_from_reader(
                     ))
                 })
                 .map_err(buffer_to_runtime_error),
+            // `List<Schema>`: walk the pointer array into one sub-reader
+            // per entry (`read_list_record` shares the same buffer base),
+            // then drain each entry's fields into a branded dict via the
+            // same `read_record_into_map` the top-level record return
+            // uses. The recursion runs entirely in safe Rust against the
+            // single shared buffer window — no machine-code re-pack.
+            TypeRepr::Schema { schema } => {
+                let elem_layout = SchemaLayout::offsets_for(schema).map_err(|e| {
+                    RuntimeError::Unsupported {
+                        reason: format!(
+                            "cranelift-native: List<Schema> element `{}` layout: {e}",
+                            schema.name
+                        ),
+                    }
+                })?;
+                let sub_readers = reader
+                    .read_list_record(&field.name, &elem_layout, schema)
+                    .map_err(buffer_to_runtime_error)?;
+                let mut items = Vec::with_capacity(sub_readers.len());
+                for sub in &sub_readers {
+                    let map = read_record_into_map(sub, schema)?;
+                    items.push(Value::branded_dict(map, Some(schema.name.clone())));
+                }
+                Ok(Value::List(Arc::new(items)))
+            }
+            // `List<List<scalar>>`: decode the nested pointer-array into
+            // `Vec<Vec<Value>>` via the shared-base reader, then re-wrap
+            // each inner row as a `Value::List`.
+            TypeRepr::List { .. } => reader
+                .read_list_list(&field.name)
+                .map(|rows| {
+                    Value::List(Arc::new(
+                        rows.into_iter().map(|r| Value::List(Arc::new(r))).collect(),
+                    ))
+                })
+                .map_err(buffer_to_runtime_error),
             other => Err(RuntimeError::Unsupported {
                 reason: format!(
                     "cranelift-native: cannot decode list field `{field}` of element type `{ty:?}` in schema `{schema}`",

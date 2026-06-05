@@ -102,15 +102,35 @@ host-pushed slot：
 >   config 请改用 `#schema` 结构体）；
 > - 内层为指针数组元素的嵌套 List（`List<List<String>>` /
 >   `List<List<Schema>>`）—— 递归逐元素重定位尚未建模；
-> - 从 `#main` **返回** `List<Schema>` / `List<List<…>>`，或返回含该类
->   字段的匿名 `Dict` / 结构体（入参解码已支持；返回方向的递归写出
->   重定位尚未支持）；
+> - 从 `#main` **返回** `List<Schema>` / `List<List<scalar>>`，或返回含
+>   该类字段的匿名 `Dict` / 结构体。host 侧 **解码已就位**：`BufferReader`
+>   以单一基址走读整块 buffer，递归重建嵌套 `Value`（`List<Schema>` 走
+>   `read_list_record`，`List<List<scalar>>` 走 `read_list_list`），因此
+>   只要编译后端产出这类返回，host 即可与 oracle 逐字节一致地读回。仍缺的
+>   是 **机器码写出（output store）**：把非连续、跨区的结果图重定位进返回
+>   记录，需要递归的跨 buffer relocator（见下方设计注记）。在此之前这些
+>   返回保持编译期响亮 cap；
 > - **返回来自 `#main` 入参 / 字段读取 / 函数调用（而非源码内字面量）的
 >   `List<String>`（或任意指针数组 list）** —— 这类值位于输入 buffer 内，
 >   内部偏移是非连续、整 buffer 相对的，刚性尾拷贝无法重定位。
 >
 > 上述形状一律在编译期 **响亮报错**；编译后端绝不吐错数据、绝不崩溃 ——
 > 请把它们路由到 tree-walk 解释器。
+
+> [!NOTE]
+> **为什么写出（output store）才是难点，以及计划中的修法。** arena 是一整
+> 块连续内存：`[const_data | in_buf @ in_ptr | out_buf @ out_ptr |
+> scratch]`。运行中的机器码里每个指针都是 *arena 基址相对*（`arena_base +
+> ptr` 即可解引用），所以 `in_buf` 里的入参图与 const-pool 字面量共享同一套
+> 坐标。但 host 解码返回时只把 **out_buf 切片** 交给 `BufferReader`，于是
+> 返回指针被当成 *out_buf 相对*。一个入参恒等返回（`#main(List<P> xs) ->
+> List<P> = xs`）整图都在 `in_buf` 内、内部偏移是 `in_buf` 相对的；当前返回
+> 路径试图用单一刚性 delta 把该图 *拷贝* 进 `out_buf`，只有连续单基址的
+> const-pool 块才成立，散落的入参图会段错误。诚实的修法是 **「host 就地走
+> 读」**：不再拷贝，把结果根写成 host 用 **统一 arena 基址** 能解析的指针，
+> 让本就能递归走读的 `BufferReader` 从数据真实所在处重建 `Value`。读取这一半
+> 已完成；剩下的是 codegen + 单一基址的返回 ABI ——故意不半成品上线，因为基
+> 址写错就是静默错值。
 
 ### 入口边界 Result 与 Relon 值层 Result
 
