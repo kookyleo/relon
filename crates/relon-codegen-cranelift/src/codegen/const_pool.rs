@@ -585,7 +585,7 @@ impl OpVisitor for ConstPool {
     fn visit_load_field(&mut self, _: u32, _: IrType) -> Result<(), CraneliftError> {
         Ok(())
     }
-    fn visit_store_field(&mut self, _: u32, _: IrType) -> Result<(), CraneliftError> {
+    fn visit_store_field(&mut self, _: u32, _: IrType, _: bool) -> Result<(), CraneliftError> {
         Ok(())
     }
     fn visit_dict_get_by_string_key(

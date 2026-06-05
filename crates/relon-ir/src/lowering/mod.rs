@@ -878,28 +878,34 @@ fn lower_entry_with_resolver<'a>(
         // relocate; it would segfault / return corrupt data. Reject it
         // loudly here so the silent-miscompile path is unreachable.
         //
-        // S1 exception (in-place region-walk return ABI, cranelift only):
-        // a `List<List<scalar>>` value sourced **directly from a `#main`
-        // parameter** (identity return `xss`, or a parameter-field path
-        // `o.field`) is *not* copied at all. The lowering still emits the
-        // trailing `StoreField { ty: ListList }`, but the cranelift
-        // backend lowers that store to the in-place return sentinel
-        // (`-(root_abs + 1)`): it reports the arena-absolute offset of the
-        // root list header (which the param load already produced) to the
-        // host instead of relocating the block. The host selects the
-        // region the root lands in, runs the bounds verifier over the
-        // whole reachable graph, and only then decodes in place. Because
-        // the value is self-contained in the input region (the
+        // In-place region-walk return ABI (S1/S2 cranelift+llvm): a
+        // `List<List<scalar>>` value, or (S3) a `List<String>` value,
+        // sourced **directly from a `#main` parameter identity**
+        // (`xss` / `ss`) is *not* copied at all. The lowering emits the
+        // trailing `StoreField { ty, inplace: true }`, and both AOT
+        // backends lower that store to the in-place return sentinel
+        // (`-(root_abs + 1)`): they report the arena-absolute offset of
+        // the root list header (which the `Load*Ptr` param load already
+        // produced) to the host instead of relocating the block. The host
+        // selects the region the root lands in, runs the bounds verifier
+        // over the whole reachable graph, and only then decodes in place.
+        // Because the value is self-contained in the input region (the
         // single-region invariant: no const-pool / element-construction
-        // producer for `List<List>`), the walk never crosses a region.
-        // List<String> / List<Schema> (non-const) stay capped — they have
-        // a per-element pointer-array whose in-place return is a later
-        // step.
-        let is_inplace_param_listlist =
-            ret_ir_ty == IrType::ListList && list_list_source_is_param_walk(&root.expr);
+        // producer for these param-sourced shapes), the walk never crosses
+        // a region.
+        //
+        // A parameter-**field** path (`o.field`) is intentionally NOT an
+        // identity walk: a `List<List>` / `List<String>` reached through a
+        // schema field is re-encoded by the field-load path into a
+        // different inner form (truncated i32 row handles / re-laid
+        // records) the in-place reader would decode wrong, so it stays a
+        // loud cap. `List<Schema>` and const-pool `List<String>` literals
+        // keep the existing copy / loud-cap paths (`inplace: false`).
+        let is_inplace_param_walk = matches!(ret_ir_ty, IrType::ListList | IrType::ListString)
+            && pointer_array_param_identity_walk(&root.expr);
         if pointer_array_list_ir_type(ret_ir_ty)
             && !pointer_array_list_source_is_const_pool(&root.expr)
-            && !is_inplace_param_listlist
+            && !is_inplace_param_walk
         {
             return Err(LoweringError::UnsupportedTypeInMain {
                 type_name: format!(
@@ -925,6 +931,7 @@ fn lower_entry_with_resolver<'a>(
             op: Op::StoreField {
                 offset: ret_offset,
                 ty: ret_ir_ty,
+                inplace: is_inplace_param_walk,
             },
             range: sig.range,
         });
@@ -2131,28 +2138,29 @@ fn pointer_array_list_source_is_const_pool(expr: &Expr) -> bool {
 }
 
 /// True when `expr` is a bare `#main` parameter **identity** reference
-/// (`xss`, a single-segment `Expr::Variable`) — the value lowers to a
-/// single `LoadListListPtr` that pushes the input-region root header's
-/// arena-relative offset.
+/// (`xss` / `ss`, a single-segment `Expr::Variable`) — the value lowers
+/// to a single `Load*Ptr` (`LoadListListPtr` / `LoadListStringPtr`) that
+/// pushes the input-region root header's arena-relative offset.
 ///
-/// This is the S1 trigger for the in-place region-walk return ABI: the
-/// `List<List<scalar>>` value is self-contained in the input buffer and
-/// its outer/inner pointer-array layout is exactly what the host writer
-/// emitted, so the cranelift backend reports the root's arena-absolute
-/// offset and the host verifies + decodes it in place — bit-equal to the
-/// tree-walk oracle.
+/// This is the trigger for the in-place region-walk return ABI (S1/S2
+/// `List<List<scalar>>`, S3 `List<String>`): the pointer-array value is
+/// self-contained in the input buffer and its outer/inner layout is
+/// exactly what the host writer emitted, so both AOT backends report the
+/// root's arena-absolute offset and the host verifies + decodes it in
+/// place — bit-equal to the tree-walk oracle, including every string's
+/// bytes.
 ///
-/// A parameter-**field** walk (`w.rows`) is intentionally **NOT**
-/// accepted here. A `List<List<scalar>>` reached through a schema field
-/// is re-encoded by the field-load path into the materialised inner form
-/// (i64 element slots carrying truncated i32 row handles, per the W16/W19
-/// index lowering), which the in-place reader decodes wrong (the inner
-/// scalar bytes shift). Rather than ship a silent miscompile it stays a
-/// loud cap until a later step proves it bit-equal. Everything else (a
-/// list literal, comprehension, call, binary expression) is likewise not
-/// an identity param walk and keeps the existing const-pool / loud-cap
-/// paths.
-fn list_list_source_is_param_walk(expr: &Expr) -> bool {
+/// A parameter-**field** walk (`w.rows` / `o.tags`) is intentionally
+/// **NOT** accepted here. A pointer-array list reached through a schema
+/// field is re-encoded by the field-load path into a different inner form
+/// (materialised i64 row handles for `List<List>`; for `List<String>` the
+/// field-load rebase path has not been proven bit-equal for an in-place
+/// return), which the in-place reader would decode wrong. Rather than
+/// ship a silent miscompile it stays a loud cap until a later step proves
+/// it bit-equal. Everything else (a list literal, comprehension, call,
+/// binary expression) is likewise not an identity param walk and keeps
+/// the existing const-pool / loud-cap paths.
+fn pointer_array_param_identity_walk(expr: &Expr) -> bool {
     matches!(expr, Expr::Variable(path) if path.len() == 1)
 }
 

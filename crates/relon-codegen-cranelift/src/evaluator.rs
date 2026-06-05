@@ -24,7 +24,7 @@ use cranelift_jit::JITModule;
 
 use relon_eval_api::buffer::{BufferBuilder, BufferError, BufferReader};
 use relon_eval_api::inplace_return::{
-    decode_inplace_list_list_return, decode_inplace_sentinel, ArenaRegions,
+    decode_inplace_return, decode_inplace_sentinel, ArenaRegions,
 };
 use relon_eval_api::layout::{OffsetTable, SchemaLayout};
 use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
@@ -1619,11 +1619,12 @@ impl AotEvaluator {
             scratch_base,
             /*caps=*/ 0,
         )?;
-        // In-place region-walk return ABI (S1): a negative return value
-        // is the in-place sentinel `-(root_abs + 1)`. Instead of a value
-        // copied into `out_buf`, the machine code reports the
-        // arena-absolute offset of the return root (today only a
-        // `List<List<scalar>>` value sourced from a `#main` parameter).
+        // In-place region-walk return ABI (S1/S2/S3): a negative return
+        // value is the in-place sentinel `-(root_abs + 1)`. Instead of a
+        // value copied into `out_buf`, the machine code reports the
+        // arena-absolute offset of the return root — a `List<List<scalar>>`
+        // or `List<String>` value sourced from a `#main` parameter
+        // identity.
         // We rebase it to its source region, run the bounds verifier over
         // the whole reachable graph confined to that region, and only on
         // a clean verify decode the value in place. A verifier failure is
@@ -1635,7 +1636,7 @@ impl AotEvaluator {
                     "cranelift in-place return on a non-single-value return schema".into(),
                 ));
             }
-            return decode_inplace_list_list_return(
+            return decode_inplace_return(
                 "cranelift",
                 arena,
                 ArenaRegions {

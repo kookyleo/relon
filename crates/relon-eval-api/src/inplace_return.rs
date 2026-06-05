@@ -1,16 +1,16 @@
 //! Backend-shared host side of the in-place region-walk return ABI
-//! (S1/S2). When a compiled `#main` returns a `List<List<scalar>>`
-//! sourced directly from a parameter, the machine code does **not**
-//! copy the value into `out_buf`. Instead the epilogue reports the
-//! arena-absolute offset of the return root via the negative sentinel
-//! `-(root_abs + 1)`. The host then:
+//! (S1/S2 `List<List<scalar>>`, S3 `List<String>`). When a compiled
+//! `#main` returns a parameter-sourced pointer-array list, the machine
+//! code does **not** copy the value into `out_buf`. Instead the epilogue
+//! reports the arena-absolute offset of the return root via the negative
+//! sentinel `-(root_abs + 1)`. The host then:
 //!
 //! 1. recovers `root_abs` from the sentinel ([`decode_inplace_sentinel`]),
 //! 2. selects the arena region `root_abs` lands in,
 //! 3. runs the bounds [`verify_value_at`] over the whole reachable graph
 //!    confined to that region — **a verify failure aborts the decode**,
-//! 4. only on a clean verify decodes the value in place via
-//!    [`BufferReader::read_list_list_at`].
+//! 4. only on a clean verify decodes the value in place via the matching
+//!    positional reader (`read_list_list_at` / `read_list_string_at`).
 //!
 //! Both the cranelift and llvm backends call into this one
 //! implementation, so the sentinel → region-select → verifier → decode
@@ -73,24 +73,24 @@ pub fn decode_inplace_sentinel(ret: i32) -> Result<usize, RuntimeError> {
     })
 }
 
-/// Decode an in-place region-walk return for a single-value
-/// `List<List<scalar>>` return (S1/S2). The machine code reported
-/// `root_abs` (the arena-absolute offset of the return root) via the
-/// negative sentinel; the caller already recovered it with
+/// Decode an in-place region-walk return for a single-value return whose
+/// root is a parameter-sourced pointer-array list: `List<List<scalar>>`
+/// (S1/S2) or `List<String>` (S3). The machine code reported `root_abs`
+/// (the arena-absolute offset of the return root) via the negative
+/// sentinel; the caller already recovered it with
 /// [`decode_inplace_sentinel`].
 ///
-/// `return_field` is the single return-schema field (declared type
-/// `List<List<scalar>>`); `return_layout` / `return_fields` are the
-/// matching return [`OffsetTable`] and fields the [`BufferReader`]
-/// decodes against. `backend` is a short label (`"cranelift"` /
-/// `"llvm"`) for diagnostics.
+/// `return_field` is the single return-schema field; `return_layout` /
+/// `return_fields` are the matching return [`OffsetTable`] and fields the
+/// [`BufferReader`] decodes against. `backend` is a short label
+/// (`"cranelift"` / `"llvm"`) for diagnostics.
 ///
 /// This is backend-agnostic: it owns the region-select + verifier +
 /// decode pipeline so both AOT backends share exactly one host
-/// implementation. Region selection / verify gate are written to
-/// generalise to the S3+ shapes (List<String> / List<Schema> / object
-/// fields) that will also report an in-place root.
-pub fn decode_inplace_list_list_return(
+/// implementation. It dispatches on the return field's declared type so a
+/// single sentinel path covers every in-place shape; an unexpected type
+/// reaching here is a lowering/ABI drift bug surfaced loudly.
+pub fn decode_inplace_return(
     backend: &str,
     arena: &[u8],
     regions: ArenaRegions,
@@ -99,20 +99,32 @@ pub fn decode_inplace_list_list_return(
     return_layout: &OffsetTable,
     return_fields: &[Field],
 ) -> Result<Value, RuntimeError> {
-    // The return must carry a `List<List<scalar>>`. Anything else
-    // reaching here is a lowering/ABI drift bug — surface it loudly.
-    let inner = match &return_field.ty {
+    // The return must be a pointer-array list the in-place ABI emits:
+    // `List<List<scalar>>` or `List<String>`. Classify it up front so the
+    // region/verify pipeline below is shape-agnostic and only the final
+    // decode branches. Anything else is ABI drift — surface it loudly.
+    enum InplaceShape {
+        /// `List<List<scalar>>`; carries the innermost scalar element type.
+        ListListScalar(TypeRepr),
+        /// `List<String>`.
+        ListString,
+    }
+    let shape = match &return_field.ty {
         TypeRepr::List { element } => match element.as_ref() {
-            TypeRepr::List { element: inner } => inner.as_ref().clone(),
+            TypeRepr::List { element: inner } => {
+                InplaceShape::ListListScalar(inner.as_ref().clone())
+            }
+            TypeRepr::String => InplaceShape::ListString,
             other => {
                 return Err(RuntimeError::IoError(format!(
-                    "{backend} in-place return: expected List<List<scalar>>, inner was {other:?}"
+                    "{backend} in-place return: unsupported list element {other:?} \
+                     (expected List<scalar> or String)"
                 )));
             }
         },
         other => {
             return Err(RuntimeError::IoError(format!(
-                "{backend} in-place return: expected List<List<scalar>>, got {other:?}"
+                "{backend} in-place return: expected a pointer-array List, got {other:?}"
             )));
         }
     };
@@ -175,13 +187,26 @@ pub fn decode_inplace_list_list_return(
     })?;
 
     // 4. Verified — decode in place. The reader walks the same region
-    // slice the verifier certified.
+    // slice the verifier certified, so an in-place decode is byte-equal
+    // to the field-slot reader the tree-walk oracle's writer produced.
     let reader = BufferReader::new(return_layout, return_fields, region_bytes)
         .map_err(|e| RuntimeError::IoError(format!("{backend} buffer: {e}")))?;
-    let rows = reader
-        .read_list_list_at(root_rel, &inner)
-        .map_err(|e| RuntimeError::IoError(format!("{backend} buffer: {e}")))?;
-    Ok(Value::List(Arc::new(
-        rows.into_iter().map(|r| Value::List(Arc::new(r))).collect(),
-    )))
+    match shape {
+        InplaceShape::ListListScalar(inner) => {
+            let rows = reader
+                .read_list_list_at(root_rel, &inner)
+                .map_err(|e| RuntimeError::IoError(format!("{backend} buffer: {e}")))?;
+            Ok(Value::List(Arc::new(
+                rows.into_iter().map(|r| Value::List(Arc::new(r))).collect(),
+            )))
+        }
+        InplaceShape::ListString => {
+            let items = reader
+                .read_list_string_at(root_rel)
+                .map_err(|e| RuntimeError::IoError(format!("{backend} buffer: {e}")))?;
+            Ok(Value::List(Arc::new(
+                items.into_iter().map(|s| Value::String(s.into())).collect(),
+            )))
+        }
+    }
 }

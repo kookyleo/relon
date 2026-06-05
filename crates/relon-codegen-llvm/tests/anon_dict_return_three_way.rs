@@ -180,12 +180,13 @@ fn unsupported_return_shapes_fail_loudly_not_silently() {
         "#schema P {\n    Int x: *\n}\n#main() -> List<P>\n[{x:1},{x:2}]",
         "#main() -> List<List<Int>>\n[[1, 2], [3, 4]]",
         // Pointer-array list returns sourced from a parameter (NOT a
-        // const-pool list literal). These previously routed through the
-        // rigid-block `copy_list_string_block` and SEGFAULTED — the
-        // source block is non-contiguous / whole-input-buffer-relative.
-        // Must now fail loudly at lowering. Covers the top-level return,
-        // the branded-struct field, and the anon-Dict field surfaces.
-        "#main(List<String> ss) -> List<String>\nss",
+        // const-pool list literal) inside an OBJECT field. The top-level
+        // `#main(List<String> ss) -> List<String> = ss` identity is now
+        // lifted by the S3 in-place region-walk return (proven bit-equal in
+        // `relon-test-harness/tests/return_inplace_list_string.rs`), so it
+        // is no longer in this cap list. The branded-struct *field* surface
+        // (`-> S { tags: t }`) is object-field marshalling, a later step,
+        // and must still fail loudly at lowering.
         "#schema S {\n    tags: List<String>\n}\n#main(List<String> t) -> S\n{ tags: t }",
     ];
     for src in UNSUPPORTED {

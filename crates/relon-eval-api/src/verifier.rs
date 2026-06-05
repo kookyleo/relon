@@ -888,4 +888,120 @@ mod tests {
             "got {err:?}"
         );
     }
+
+    // ---- in-place `List<String>` root (S3 String-element layer) ---------
+
+    /// Build a single-field `Ret { value: List<String> }` buffer, the
+    /// shape the S3 in-place return decodes. Returns the bytes plus the
+    /// `value` slot's `(list_element, root header offset)` so a test can
+    /// drive `verify_value_at` directly the way the host does — the root
+    /// header is `[len][off_0..]` and each `off_i` points at a String
+    /// `[slen][utf8]` record.
+    fn list_string_buffer(items: &[&str]) -> (Vec<u8>, Option<ListElementKind>, usize) {
+        let schema = Schema {
+            name: "Ret".into(),
+            generics: vec![],
+            fields: vec![field("value", list(TypeRepr::String))],
+        };
+        let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+        let mut b = BufferBuilder::new(&layout, &schema.fields);
+        b.write_list_string("value", items).expect("write list str");
+        let bytes = b.finish();
+        let fo = &layout.fields[0];
+        let mut slot = [0u8; 4];
+        slot.copy_from_slice(&bytes[fo.offset..fo.offset + 4]);
+        let header_off = u32::from_le_bytes(slot) as usize;
+        (bytes, fo.list_element, header_off)
+    }
+
+    #[test]
+    fn inplace_list_string_verifies_clean() {
+        // Empty string, ascii, multibyte (built from code points so the
+        // source stays ascii) — all must verify in-region.
+        let multibyte: String = [0x4E2Du32, 0x6587]
+            .iter()
+            .map(|c| char::from_u32(*c).unwrap())
+            .collect();
+        let items = ["", "x", "abc", multibyte.as_str()];
+        let (bytes, list_element, root) = list_string_buffer(&items);
+        let region = Region::new(0, bytes.len()).expect("region");
+        verify_value_at(&bytes, &list(TypeRepr::String), list_element, root, region)
+            .expect("a legal in-place List<String> root must verify");
+    }
+
+    #[test]
+    fn inplace_list_string_corrupt_entry_pointer_rejected() {
+        // Smash `off_0` (the first entry pointer) so the String record it
+        // points at lands off-buffer; the verifier must reject loudly
+        // rather than let the decode over-read a String record.
+        let (mut bytes, list_element, root) = list_string_buffer(&["a", "bb"]);
+        let off0_pos = root + 4;
+        let bogus = (bytes.len() as u32 + 4096).to_le_bytes();
+        bytes[off0_pos..off0_pos + 4].copy_from_slice(&bogus);
+        let region = Region::new(0, bytes.len()).expect("region");
+        let err = verify_value_at(&bytes, &list(TypeRepr::String), list_element, root, region)
+            .expect_err("a corrupt entry pointer must be rejected");
+        assert!(
+            matches!(err, VerifyError::OutOfRegion { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn inplace_list_string_overlong_str_len_rejected() {
+        // Keep the entry pointers legal but inflate one String record's
+        // length prefix so its utf8 payload span runs off the region —
+        // the String-element bounds check must catch it.
+        let (mut bytes, list_element, root) = list_string_buffer(&["ada", "bob"]);
+        // off_0 lives at root+4; it points at the first String record's
+        // `[slen][utf8]`. Overwrite that record's slen with a huge value.
+        let mut o0 = [0u8; 4];
+        o0.copy_from_slice(&bytes[root + 4..root + 8]);
+        let rec0 = u32::from_le_bytes(o0) as usize;
+        bytes[rec0..rec0 + 4].copy_from_slice(&0xFFFF_F000u32.to_le_bytes());
+        let region = Region::new(0, bytes.len()).expect("region");
+        let err = verify_value_at(&bytes, &list(TypeRepr::String), list_element, root, region)
+            .expect_err("an overlong String len must be rejected");
+        assert!(
+            matches!(
+                err,
+                VerifyError::OutOfRegion {
+                    what: "string payload",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn inplace_list_string_outer_len_lies_rejected() {
+        // Inflate the outer header's element count so the verifier walks
+        // past the real entry array into unrelated bytes; the per-entry
+        // pointer read (or its target) must escape the region loudly.
+        let (mut bytes, list_element, root) = list_string_buffer(&["a"]);
+        bytes[root..root + 4].copy_from_slice(&9999u32.to_le_bytes());
+        let region = Region::new(0, bytes.len()).expect("region");
+        let err = verify_value_at(&bytes, &list(TypeRepr::String), list_element, root, region)
+            .expect_err("a lying outer len must be rejected");
+        assert!(
+            matches!(err, VerifyError::OutOfRegion { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn inplace_list_string_root_outside_region_rejected() {
+        // Legal whole-buffer header, but the asserted region ends before
+        // it: the single-region catch turns "root in the wrong region"
+        // into a loud error rather than a decode.
+        let (bytes, list_element, root) = list_string_buffer(&["a", "b"]);
+        let region = Region::new(0, root).expect("region"); // excludes header
+        let err = verify_value_at(&bytes, &list(TypeRepr::String), list_element, root, region)
+            .expect_err("a root outside the region must be rejected");
+        assert!(
+            matches!(err, VerifyError::OutOfRegion { .. }),
+            "got {err:?}"
+        );
+    }
 }

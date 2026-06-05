@@ -455,6 +455,20 @@ pub enum Op {
         /// Slot type. Determines the wasm store opcode (`i64.store`,
         /// `f64.store`, `i32.store8`).
         ty: IrType,
+        /// In-place region-walk return marker. When `true` the store's
+        /// source is a `#main` parameter-identity pointer-array value
+        /// (`List<List<scalar>>`, S1/S2; `List<String>`, S3) that is
+        /// self-contained in the input region. The backend does **not**
+        /// copy the block into `out_buf`; it stashes the arena-relative
+        /// root pointer and reports it via the negative in-place sentinel
+        /// `-(root_abs + 1)`, leaving the fixed-area slot untouched. When
+        /// `false` the store copies the value into the output buffer's
+        /// tail (the const-pool `List<String>` literal path, scalar
+        /// stores, etc.). The host decode side dispatches on the same
+        /// sentinel/return-type. Only pointer-array list types are ever
+        /// marked in-place; a `true` flag on any other type is a lowering
+        /// bug the backend rejects loudly.
+        inplace: bool,
     },
 
     /// F-D8-B: source-level `dict[key]` subscript surfaced to the IR
@@ -1772,7 +1786,8 @@ mod effect_tests {
         assert_eq!(
             Op::StoreField {
                 offset: 0,
-                ty: IrType::I64
+                ty: IrType::I64,
+                inplace: false
             }
             .effect_class(),
             EffectClass::RecoverableWrite

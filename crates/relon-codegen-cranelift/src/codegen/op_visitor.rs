@@ -145,8 +145,13 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         self.emit_load_field(offset, ty)
     }
 
-    fn visit_store_field(&mut self, offset: u32, ty: IrType) -> Result<(), CraneliftError> {
-        self.emit_store_field(offset, ty)
+    fn visit_store_field(
+        &mut self,
+        offset: u32,
+        ty: IrType,
+        inplace: bool,
+    ) -> Result<(), CraneliftError> {
+        self.emit_store_field(offset, ty, inplace)
     }
 
     // Subscript ops — not lowered by cranelift today.
