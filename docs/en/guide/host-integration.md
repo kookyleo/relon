@@ -104,37 +104,44 @@ signature**; each parameter declares one host-pushed slot:
 >   correctly,
 > - **`List<List<scalar>>` identity returns from a `#main` parameter**
 >   (`#main(List<List<Int|Float|Bool>> xss) -> List<List<…>> = xss`), on
->   **both the cranelift and llvm backends.** This is the first shape
->   carried by the *in-place region-walk return ABI*: instead of copying
->   the nested pointer-array graph, the machine code reports the arena
->   offset of the result root and the host verifies + decodes it in place
->   in its source region (see the design note below); both backends share
->   one host decode pipeline. A parameter-*field* `List<List<scalar>>`
->   (`w.rows`) stays capped on both — its field load re-encodes the inner
+>   **the cranelift, llvm, and compiled-wasm backends.** This is the first
+>   shape carried by the *in-place region-walk return ABI*: instead of
+>   copying the nested pointer-array graph, the machine code reports the
+>   arena offset of the result root and the host verifies + decodes it in
+>   place in its source region (see the design note below); all backends
+>   share one host decode pipeline. On wasm the host reads the same arena
+>   straight out of the module's **linear memory** and runs the same
+>   verifier before decoding (four-way bit-equal: tree-walk == cranelift ==
+>   llvm == wasm). A parameter-*field* `List<List<scalar>>`
+>   (`w.rows`) stays capped on all — its field load re-encodes the inner
 >   rows into a materialised form the in-place reader does not yet decode,
 > - **`List<String>` identity returns from a `#main` parameter**
->   (`#main(List<String> ss) -> List<String> = ss`), on **both the
->   cranelift and llvm backends.** This is the first *per-element
+>   (`#main(List<String> ss) -> List<String> = ss`), on **the cranelift,
+>   llvm, and compiled-wasm backends.** This is the first *per-element
 >   pointer-array* shape carried by the in-place region-walk return ABI
 >   (the formation that previously segfaulted under the rigid tail copy):
 >   the outer `[len][off_i]` header and each `off_i`'s `[len][utf8]` String
 >   record live in the input region, so the machine code reports the root
 >   offset and the host verifier walks every per-entry String record
 >   in-region before decoding it in place — bit-equal to the tree-walk
->   oracle including each string's bytes. A parameter-*field* `List<String>`
->   (`o.tags`) stays capped on both,
+>   oracle including each string's bytes (CJK / emoji / 4 KiB strings
+>   included, and on wasm read out of linear memory through the same
+>   verifier). A parameter-*field* `List<String>`
+>   (`o.tags`) stays capped on all,
 > - **`List<Schema>` identity returns from a `#main` parameter**
->   (`#main(List<Cfg> items) -> List<Cfg> = items`), on **both the
->   cranelift and llvm backends.** This is the deepest in-place region-walk
->   shape: the outer `[len][off_i]` header points at per-element schema
->   sub-records, each of which itself carries `String` / `List<scalar>` /
->   `List<String>` pointer fields (plus inline scalars at varied offsets).
+>   (`#main(List<Cfg> items) -> List<Cfg> = items`), on **the cranelift,
+>   llvm, and compiled-wasm backends.** This is the deepest in-place
+>   region-walk shape: the outer `[len][off_i]` header points at per-element
+>   schema sub-records, each of which itself carries `String` /
+>   `List<scalar>` / `List<String>` pointer fields (plus inline scalars at
+>   varied offsets).
 >   The machine code reports the root offset and the host verifier recurses
 >   to **every sub-record field pointer** (each entry → its sub-record's
 >   fixed area → each String / List field's tail record) before decoding
 >   each element into a branded dict in place — bit-equal to the tree-walk
->   oracle including every sub-object's field bytes. A parameter-*field*
->   `List<Schema>` (`w.items`) stays capped on both, as does a sub-record
+>   oracle including every sub-object's field bytes, on wasm too (the same
+>   recursion runs over linear memory). A parameter-*field*
+>   `List<Schema>` (`w.items`) stays capped on all, as does a sub-record
 >   that itself carries a nested `List<Schema>` / `List<List<…>>` field
 >   (out of scope — the in-place sub-record reader caps it),
 > - **`#schema`-branded struct returns** (`#main() -> Cfg { ... }`) whose

@@ -82,3 +82,7 @@ wasmtime = "45"
 # `WasiP1Ctx`) — NOT a relon-custom `Linker::func_wrap` env import. Dev-only,
 # pinned to the same major as `wasmtime` so the two share a runtime.
 wasmtime-wasi = "45"
+# S6 four-way in-place return gate: `tests/inplace_return_four_way.rs`
+# fuzzes random `List<List>` / `List<String>` / `List<Schema>` values
+# through the LLVM→wasm32→wasmtime pipeline against the tree-walk oracle.
+proptest = { workspace = true }

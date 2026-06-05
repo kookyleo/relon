@@ -2213,6 +2213,7 @@ dependencies = [
  "inkwell",
  "libc",
  "ordered-float",
+ "proptest",
  "relon-analyzer",
  "relon-codegen-cranelift",
  "relon-eval-api",

@@ -90,29 +90,33 @@ host-pushed slot：
 >   重定位；
 > - **从 `#main` 入参恒等返回 `List<List<scalar>>`**
 >   （`#main(List<List<Int|Float|Bool>> xss) -> List<List<…>> = xss`），
->   **cranelift 与 llvm 两个后端均已支持。** 这是「就地区走读返回 ABI」
->   承载的第一个形状：机器码不拷贝嵌套指针数组图，而是把结果根的 arena
->   偏移报给 host，host 在其来源区内 **校验后就地解码**（见下方设计注记）；
->   两个后端共用同一条 host 解码管线。入参 **字段** 形式的
->   `List<List<scalar>>`（`w.rows`）在两个后端上仍 cap —— 字段读取会把内层
+>   **cranelift、llvm 与已编译 wasm 三个后端均已支持。** 这是「就地区走读
+>   返回 ABI」承载的第一个形状：机器码不拷贝嵌套指针数组图，而是把结果根的
+>   arena 偏移报给 host，host 在其来源区内 **校验后就地解码**（见下方设计
+>   注记）；三个后端共用同一条 host 解码管线。wasm 上 host 直接读模块的
+>   **线性内存**得到同一片 arena，并在解码前跑同一份 verifier（四方逐字节
+>   相等：tree-walk == cranelift == llvm == wasm）。入参 **字段** 形式的
+>   `List<List<scalar>>`（`w.rows`）在三个后端上仍 cap —— 字段读取会把内层
 >   行重编码为 materialized 形态，就地读取器尚不能解码；
 > - **从 `#main` 入参恒等返回 `List<String>`**
->   （`#main(List<String> ss) -> List<String> = ss`），**cranelift 与 llvm
->   两个后端均已支持。** 这是就地区走读返回 ABI 承载的第一个 **逐元素指针
->   数组** 形状（也正是旧刚性尾拷贝会段错误的那种形状）：外层
+>   （`#main(List<String> ss) -> List<String> = ss`），**cranelift、llvm
+>   与已编译 wasm 三个后端均已支持。** 这是就地区走读返回 ABI 承载的第一个
+>   **逐元素指针数组** 形状（也正是旧刚性尾拷贝会段错误的那种形状）：外层
 >   `[len][off_i]` 头与各 `off_i` 指向的 `[len][utf8]` String 记录都在输入区
 >   内，机器码报根偏移，host verifier 先逐个 String 记录在区内校验、再就地
->   解码 —— 逐字节等价于 tree-walk oracle（含每个字符串内容）。入参 **字段**
->   形式的 `List<String>`（`o.tags`）在两个后端上仍 cap；
+>   解码 —— 逐字节等价于 tree-walk oracle（含每个字符串内容；CJK / emoji /
+>   4 KiB 长串亦覆盖，wasm 上同样从线性内存经同一 verifier 读出）。入参
+>   **字段** 形式的 `List<String>`（`o.tags`）在三个后端上仍 cap；
 > - **从 `#main` 入参恒等返回 `List<Schema>`**
->   （`#main(List<Cfg> items) -> List<Cfg> = items`），**cranelift 与 llvm
->   两个后端均已支持。** 这是就地区走读最深的形状：外层 `[len][off_i]` 头指
->   向每个 schema 子记录，子记录自身又带 `String` / `List<scalar>` /
->   `List<String>` 指针字段（及不同偏移的内联标量）。机器码报根偏移，host
->   verifier 递归走到 **每个子记录的字段指针层**（每个 off_i → 子记录头 →
->   每个 String / List 字段的尾记录）再就地把每个元素解成 branded dict ——
->   逐字节等价于 tree-walk oracle（含每个子对象每个字段的内容）。入参 **字段**
->   形式的 `List<Schema>`（`w.items`）在两个后端上仍 cap；子记录自身再含
+>   （`#main(List<Cfg> items) -> List<Cfg> = items`），**cranelift、llvm
+>   与已编译 wasm 三个后端均已支持。** 这是就地区走读最深的形状：外层
+>   `[len][off_i]` 头指向每个 schema 子记录，子记录自身又带 `String` /
+>   `List<scalar>` / `List<String>` 指针字段（及不同偏移的内联标量）。机器码
+>   报根偏移，host verifier 递归走到 **每个子记录的字段指针层**（每个 off_i →
+>   子记录头 → 每个 String / List 字段的尾记录）再就地把每个元素解成 branded
+>   dict —— 逐字节等价于 tree-walk oracle（含每个子对象每个字段的内容），
+>   wasm 上亦然（同一递归在线性内存上跑）。入参 **字段**
+>   形式的 `List<Schema>`（`w.items`）在三个后端上仍 cap；子记录自身再含
 >   嵌套 `List<Schema>` / `List<List<…>>` 字段者亦 cap（超出范围 —— 就地子
 >   记录读取器对其响亮 cap）；
 > - **`#schema` 加品牌的结构体返回**（`#main() -> Cfg { ... }`），字段
