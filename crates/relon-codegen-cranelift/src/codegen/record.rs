@@ -43,10 +43,17 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         &mut self,
         ty: IrType,
     ) -> Result<(), CraneliftError> {
-        if matches!(
-            ty,
-            IrType::ListString | IrType::ListSchema | IrType::ListList
-        ) {
+        if matches!(ty, IrType::ListString) {
+            // Pointer-array list: the source block carries inner
+            // arena-relative offsets that must be relocated into the
+            // output buffer's coordinate system. Share the rigid-block
+            // copy + relocation with the top-level `StoreField` path.
+            let header_off = self.pop()?;
+            let new_header = self.copy_list_string_block(header_off)?;
+            self.push(new_header);
+            return Ok(());
+        }
+        if matches!(ty, IrType::ListSchema | IrType::ListList) {
             return Err(CraneliftError::Codegen(format!(
                 "EmitTailRecordFromAbsoluteAddr {ty:?} (pointer-array) not yet supported"
             )));

@@ -426,6 +426,30 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
     /// `BufferReader::read_list_string` walks.
     pub(super) fn emit_store_list_string(&mut self, offset: u32) -> Result<(), CraneliftError> {
         let header_off = self.pop()?;
+        let new_header = self.copy_list_string_block(header_off)?;
+        // new_header_bufrel -> fixed-area slot.
+        let slot_addr = self.buffer_field_addr(2 /* out_ptr */, offset, 4)?;
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), new_header, slot_addr, 0);
+        Ok(())
+    }
+
+    /// Copy a `List<String>` pointer-array block (`[str_0]...[str_{N-1}]
+    /// [header]`, see [`Self::emit_store_list_string`]) referenced by the
+    /// arena-relative `header_off` into the output buffer's tail area,
+    /// relocate every inner offset into the buffer's coordinate system,
+    /// and return the **buffer-relative offset of the copied header**.
+    ///
+    /// Shared by the top-level `StoreField { ty: ListString }` path
+    /// (which stores the returned offset into a fixed-area slot) and the
+    /// `EmitTailRecordFromAbsoluteAddr { ty: ListString }` path (which
+    /// pushes it for a parent record's pointer slot). Mirrors the LLVM
+    /// backend's `copy_list_string_block`.
+    pub(super) fn copy_list_string_block(
+        &mut self,
+        header_off: CValue,
+    ) -> Result<CValue, CraneliftError> {
         let arena_base = self.builder.ins().load(
             self.pointer_ty,
             MemFlags::trusted(),
@@ -475,12 +499,8 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         // delta = dst_block - src_block_start (multiple of 4).
         let delta = self.builder.ins().isub(dst_block, src_block_start);
 
-        // new_header_bufrel = header_off + delta -> fixed-area slot.
+        // new_header_bufrel = header_off + delta.
         let new_header = self.builder.ins().iadd(header_off, delta);
-        let slot_addr = self.buffer_field_addr(2 /* out_ptr */, offset, 4)?;
-        self.builder
-            .ins()
-            .store(MemFlags::trusted(), new_header, slot_addr, 0);
 
         // entries_base (buffer-relative) = new_header + 4; absolute base
         // = arena_base + out_ptr + entries_base.
@@ -521,7 +541,7 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         self.builder.seal_block(header_blk);
         self.builder.seal_block(body_blk);
         self.builder.seal_block(done_blk);
-        Ok(())
+        Ok(new_header)
     }
 
     /// Lower `Op::LoadSchemaPtr { offset }`.

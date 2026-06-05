@@ -79,6 +79,16 @@ host-pushed slot：
 >   与前缀 `Inner inner: *` —— 每个中间段会先 rebase 到其子记录基址，
 >   再读里层字段。
 >
+> **返回方向**上，编译后端会把 body 输出的 `Value` 重新 marshal 回
+> buffer，与 tree-walk oracle 逐字节一致，覆盖：
+>
+> - 标量、`String`、`List<scalar>`、`List<String>` 顶层返回；
+> - **`#schema` 加品牌的结构体返回**（`#main() -> Cfg { ... }`），字段
+>   可含上述任意类型（含 `String` / `List` 字段）；
+> - **匿名 `-> Dict { ... }` 返回** —— 每个非 `#internal` 字段都会
+>   marshal 进返回记录，含 `String`、`List<scalar>`、`List<String>` 字段；
+>   `#internal` 字段不进入 host 可见面（与 oracle 一致）。
+>
 > 编译后端仍 **暂不支持**（前置阶段以明确的 `unsupported type in
 > #main` / `layout v1 does not yet support list element` 报错，绝不静默
 > 回退；这类形状请改用 tree-walk 解释器）：
@@ -87,8 +97,9 @@ host-pushed slot：
 >   config 请改用 `#schema` 结构体）；
 > - 内层为指针数组元素的嵌套 List（`List<List<String>>` /
 >   `List<List<Schema>>`）—— 递归逐元素重定位尚未建模；
-> - 从 `#main` **返回** `List<Schema>` / `List<List<…>>`（入参解码已支持，
->   返回方向的写出尚未支持）。
+> - 从 `#main` **返回** `List<Schema>` / `List<List<…>>`，或返回含该类
+>   字段的匿名 `Dict`（入参解码已支持；返回方向的递归写出重定位尚未
+>   支持 —— 响亮报错，绝不吐错数据）。
 
 ### 入口边界 Result 与 Relon 值层 Result
 

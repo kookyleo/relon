@@ -986,13 +986,43 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         ip_hint: &str,
         offset: u32,
     ) -> Result<(), LlvmError> {
+        let header_off = self.pop_int(ip_hint)?;
+        let new_header = self.copy_list_string_block(header_off)?;
+        // new_header_bufrel -> fixed-area slot at out_ptr + offset.
+        let i32_t = self.ctx.i32_type();
+        let out_ptr = self.lookup_param(2)?;
+        let slot_off = self
+            .builder
+            .build_int_add(
+                out_ptr,
+                i32_t.const_int(u64::from(offset), false),
+                "ls_slot_off",
+            )
+            .map_err(|e| LlvmError::Codegen(format!("ListString slot off: {e}")))?;
+        let slot_addr = self.arena_addr_i32(slot_off)?;
+        self.builder
+            .build_store(slot_addr, new_header)
+            .map_err(|e| LlvmError::Codegen(format!("ListString slot store: {e}")))?;
+        Ok(())
+    }
+
+    /// Copy a `List<String>` pointer-array block referenced by the
+    /// arena-relative `header_off` into the output buffer's tail and
+    /// relocate every inner offset, returning the buffer-relative offset
+    /// of the copied header. Shared by the top-level `StoreField { ty:
+    /// ListString }` path and the `EmitTailRecordFromAbsoluteAddr { ty:
+    /// ListString }` (record-field) path. Mirrors the cranelift backend's
+    /// `copy_list_string_block`.
+    pub(crate) fn copy_list_string_block(
+        &mut self,
+        header_off: inkwell::values::IntValue<'ctx>,
+    ) -> Result<inkwell::values::IntValue<'ctx>, LlvmError> {
         let _arena_base_ptr = self.arena_base_ptr.ok_or_else(|| {
             LlvmError::Codegen("StoreField (ListString) outside buffer entry".into())
         })?;
         let state_ptr = self.state_ptr.ok_or_else(|| {
             LlvmError::Codegen("StoreField (ListString): missing state ptr".into())
         })?;
-        let header_off = self.pop_int(ip_hint)?;
         let i32_t = self.ctx.i32_type();
         let i8_t = self.ctx.i8_type();
         let i64_t = self.ctx.i64_type();
@@ -1106,23 +1136,11 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .build_int_sub(dst_block, src_block_start, "ls_delta")
             .map_err(|e| LlvmError::Codegen(format!("ListString delta: {e}")))?;
 
-        // new_header_bufrel = header_off + delta -> fixed-area slot.
+        // new_header_bufrel = header_off + delta.
         let new_header = self
             .builder
             .build_int_add(header_off, delta, "ls_new_header")
             .map_err(|e| LlvmError::Codegen(format!("ListString new_header: {e}")))?;
-        let slot_off = self
-            .builder
-            .build_int_add(
-                out_ptr,
-                i32_t.const_int(u64::from(offset), false),
-                "ls_slot_off",
-            )
-            .map_err(|e| LlvmError::Codegen(format!("ListString slot off: {e}")))?;
-        let slot_addr = self.arena_addr_i32(slot_off)?;
-        self.builder
-            .build_store(slot_addr, new_header)
-            .map_err(|e| LlvmError::Codegen(format!("ListString slot store: {e}")))?;
 
         // Relocation loop: for i in 0..len, the copied header's offset
         // entry at (out_ptr + new_header + 4 + i*4) is rewritten to
@@ -1204,6 +1222,6 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
 
         self.builder.position_at_end(loop_done);
         self.needs_tail_cursor = true;
-        Ok(())
+        Ok(new_header)
     }
 }

@@ -91,6 +91,18 @@ signature**; each parameter declares one host-pushed slot:
 >   `Inner inner: *` — and each intermediate segment rebases to its
 >   sub-record before the leaf field read.
 >
+> On the **return** side the compiled backends marshal the body's output
+> `Value` back into the buffer bit-identically to the tree-walk oracle
+> for:
+>
+> - scalar leaves, `String`, `List<scalar>`, and `List<String>` returns,
+> - **`#schema`-branded struct returns** (`#main() -> Cfg { ... }`) whose
+>   fields are any of the above (including `String` / `List` fields),
+> - **anonymous `-> Dict { ... }` returns** — each non-`#internal` field
+>   is marshalled into the return record, including `String`,
+>   `List<scalar>`, and `List<String>` fields. (`#internal` fields stay
+>   off the host-visible surface, matching the oracle.)
+>
 > Still **not yet** supported on the compiled backends (rejected up
 > front with a clear `unsupported type in #main` / `layout v1 does not
 > yet support list element` error rather than silently falling back —
@@ -101,8 +113,10 @@ signature**; each parameter declares one host-pushed slot:
 > - inner pointer-array element lists (`List<List<String>>` /
 >   `List<List<Schema>>`) — the recursive per-entry relocation isn't
 >   modelled,
-> - **returning** a `List<Schema>` / `List<List<…>>` from `#main`
->   (the input decode is supported; the output store side is not).
+> - **returning** a `List<Schema>` / `List<List<…>>` from `#main`, or an
+>   anon-`Dict` field of those types (the input decode is supported; the
+>   recursive output-store relocation is not — it fails loudly, never
+>   returns wrong data).
 
 ### Boundary Result vs Relon value-level Result
 

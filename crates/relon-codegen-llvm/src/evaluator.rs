@@ -1825,6 +1825,12 @@ fn read_value_from_reader(
         TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::Int) => {
             marshal_list_int_out(reader, &field.name)
         }
+        TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::Float) => {
+            marshal_list_float_out(reader, &field.name)
+        }
+        TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::Bool) => {
+            marshal_list_bool_out(reader, &field.name)
+        }
         TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::String) => {
             marshal_list_string_out(reader, &field.name)
         }
@@ -1909,6 +1915,36 @@ fn marshal_list_int_out(
     reader
         .read_list_int(name)
         .map(|v| Value::list(v.into_iter().map(Value::Int).collect()))
+        .map_err(buffer_to_runtime_error)
+}
+
+/// `List<Float>` return-value decode. Mirrors [`marshal_list_int_out`]
+/// over the `[len][pad to 8][f64 LE …]` record `read_list_float` walks.
+fn marshal_list_float_out(
+    reader: &relon_eval_api::buffer::BufferReader<'_>,
+    name: &str,
+) -> Result<Value, RuntimeError> {
+    reader
+        .read_list_float(name)
+        .map(|v| {
+            Value::list(
+                v.into_iter()
+                    .map(|f| Value::Float(OrderedFloat(f)))
+                    .collect(),
+            )
+        })
+        .map_err(buffer_to_runtime_error)
+}
+
+/// `List<Bool>` return-value decode. Mirrors [`marshal_list_int_out`]
+/// over the `[len][u8 …]` record `read_list_bool` walks.
+fn marshal_list_bool_out(
+    reader: &relon_eval_api::buffer::BufferReader<'_>,
+    name: &str,
+) -> Result<Value, RuntimeError> {
+    reader
+        .read_list_bool(name)
+        .map(|v| Value::list(v.into_iter().map(Value::Bool).collect()))
         .map_err(buffer_to_runtime_error)
 }
 
