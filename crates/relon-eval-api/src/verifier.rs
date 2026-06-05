@@ -194,6 +194,39 @@ pub fn verify_record(
     verify_record_inner(bytes, layout, fields, record_base, region, 0)
 }
 
+/// Verify a **bare value** reachable from a direct pointer offset,
+/// rather than from a record's fixed-area slot. This is the entry point
+/// the in-place region-walk return ABI calls: the machine code reports
+/// the arena-absolute offset of a value's root (e.g. a
+/// `List<List<scalar>>` header) and the host rebases it to a
+/// region-relative offset, then asks the verifier to certify the whole
+/// reachable graph stays inside `region` before any decode.
+///
+/// `ty` is the declared type of the value at `root` (a pointer-indirect
+/// type — `String` / `List<…>` / `Schema`); `list_element` is the
+/// matching [`ListElementKind`] sidecar for a `List` root (recomputed by
+/// the caller from the return layout). `root` is region-relative (an
+/// offset into `bytes`, with `bytes` covering at least `region.end`).
+///
+/// A clean `Ok(())` means a subsequent direct in-place decode of the
+/// same value will not dereference outside `region`. Any escape is a
+/// loud [`VerifyError`] — the decode must not run.
+pub fn verify_value_at(
+    bytes: &[u8],
+    ty: &TypeRepr,
+    list_element: Option<ListElementKind>,
+    root: usize,
+    region: Region,
+) -> Result<(), VerifyError> {
+    if bytes.len() < region.end {
+        return Err(VerifyError::BufferShorterThanRegion {
+            have: bytes.len(),
+            end: region.end,
+        });
+    }
+    verify_pointer_target(bytes, "<in-place root>", ty, list_element, root, region, 0)
+}
+
 fn verify_record_inner(
     bytes: &[u8],
     layout: &OffsetTable,
@@ -757,5 +790,102 @@ mod tests {
             err,
             VerifyError::DegenerateRegion { start: 10, end: 4 }
         ));
+    }
+
+    // ---- in-place region-walk return ABI (`verify_value_at`) ------------
+
+    /// Build a single-field `Ret { value: List<List<Int>> }` buffer, the
+    /// shape the S1 in-place return decodes. Returns the bytes plus the
+    /// `value` slot's `(list_element, root header offset)` so a test can
+    /// drive `verify_value_at` directly the way the host does.
+    fn list_list_int_buffer() -> (Vec<u8>, Option<ListElementKind>, usize) {
+        let schema = Schema {
+            name: "Ret".into(),
+            generics: vec![],
+            fields: vec![field("value", list(list(TypeRepr::Int)))],
+        };
+        let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+        let mut b = BufferBuilder::new(&layout, &schema.fields);
+        // Build the `Value` rows the host writer consumes:
+        // `[[1, 2], [3], []]`.
+        let rows: Vec<crate::value::Value> = vec![
+            crate::value::Value::List(std::sync::Arc::new(vec![
+                crate::value::Value::Int(1),
+                crate::value::Value::Int(2),
+            ])),
+            crate::value::Value::List(std::sync::Arc::new(vec![crate::value::Value::Int(3)])),
+            crate::value::Value::List(std::sync::Arc::new(vec![])),
+        ];
+        crate::buffer::write_nested_scalar_list(&mut b, "value", &TypeRepr::Int, &rows)
+            .expect("write nested list");
+        let bytes = b.finish();
+        // The fixed-area slot for `value` holds the buffer-relative offset
+        // of the outer pointer-array header — exactly the `root_abs` the
+        // machine code reports (rebased to region-relative).
+        let fo = &layout.fields[0];
+        let mut slot = [0u8; 4];
+        slot.copy_from_slice(&bytes[fo.offset..fo.offset + 4]);
+        let header_off = u32::from_le_bytes(slot) as usize;
+        (bytes, fo.list_element, header_off)
+    }
+
+    #[test]
+    fn inplace_list_list_verifies_clean() {
+        let (bytes, list_element, root) = list_list_int_buffer();
+        let region = Region::new(0, bytes.len()).expect("region");
+        verify_value_at(
+            &bytes,
+            &list(list(TypeRepr::Int)),
+            list_element,
+            root,
+            region,
+        )
+        .expect("a legal in-place List<List<Int>> root must verify");
+    }
+
+    #[test]
+    fn inplace_corrupt_inner_pointer_rejected() {
+        // Corrupt one outer entry pointer so an inner row dereferences
+        // off-buffer; `verify_value_at` must reject loudly, not over-read.
+        let (mut bytes, list_element, root) = list_list_int_buffer();
+        // Outer header at `root`: `[len][off_0][off_1][off_2]`. Smash
+        // `off_0` (first entry) to a far offset.
+        let off0_pos = root + 4;
+        let bogus = (bytes.len() as u32 + 4096).to_le_bytes();
+        bytes[off0_pos..off0_pos + 4].copy_from_slice(&bogus);
+        let region = Region::new(0, bytes.len()).expect("region");
+        let err = verify_value_at(
+            &bytes,
+            &list(list(TypeRepr::Int)),
+            list_element,
+            root,
+            region,
+        )
+        .expect_err("a corrupt inner pointer must be rejected loudly");
+        assert!(
+            matches!(err, VerifyError::OutOfRegion { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn inplace_root_outside_region_rejected() {
+        // The root header is legal whole-buffer, but the asserted region
+        // ends before it — the single-region catch turns "root in the
+        // wrong region" into a loud error instead of a decode.
+        let (bytes, list_element, root) = list_list_int_buffer();
+        let region = Region::new(0, root).expect("region"); // excludes header
+        let err = verify_value_at(
+            &bytes,
+            &list(list(TypeRepr::Int)),
+            list_element,
+            root,
+            region,
+        )
+        .expect_err("a root outside the region must be rejected");
+        assert!(
+            matches!(err, VerifyError::OutOfRegion { .. }),
+            "got {err:?}"
+        );
     }
 }

@@ -123,19 +123,22 @@ fn schema_struct_read_bool_field_three_way() {
     assert_eq!(assert_three_way(SRC, args), Value::Bool(true));
 }
 
-/// `Dict<_, _>` and nested-list `#main` params are an intentional,
-/// **loud** cap (no silent fallthrough): the shared IR lowering rejects
-/// the entry signature before any backend codegen. This pins that
-/// verdict so the cap can't regress into a silent mis-compile.
+/// `Dict<_, _>` `#main` params are an intentional, **loud** cap (no
+/// silent fallthrough): the shared IR lowering rejects the entry
+/// signature before any backend codegen. This pins that verdict so the
+/// cap can't regress into a silent mis-compile.
+///
+/// The nested-list **identity return**
+/// (`#main(List<List<Int>> xss) -> List<List<Int>> = xss`) used to live
+/// here as a both-backend cap, but the S1 in-place region-walk return
+/// ABI lifted it on cranelift (LLVM still caps it). That asymmetric case
+/// now lives in
+/// `pointer_indirect_arg_three_way::nested_list_identity_return_cranelift_only`.
 #[test]
-fn dict_and_nested_list_params_loudly_capped() {
-    for src in [
-        "#main(Dict<String, Int> d) -> Dict<String, Int>\nd",
-        "#main(List<List<Int>> xss) -> List<List<Int>>\nxss",
-    ] {
-        let cl = AotEvaluator::from_source(src);
-        assert!(cl.is_err(), "cranelift must loudly reject `{src}`, got Ok");
-        let llvm = LlvmAotEvaluator::from_source(src);
-        assert!(llvm.is_err(), "llvm must loudly reject `{src}`, got Ok");
-    }
+fn dict_param_loudly_capped() {
+    let src = "#main(Dict<String, Int> d) -> Dict<String, Int>\nd";
+    let cl = AotEvaluator::from_source(src);
+    assert!(cl.is_err(), "cranelift must loudly reject `{src}`, got Ok");
+    let llvm = LlvmAotEvaluator::from_source(src);
+    assert!(llvm.is_err(), "llvm must loudly reject `{src}`, got Ok");
 }

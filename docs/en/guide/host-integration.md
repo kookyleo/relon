@@ -102,6 +102,16 @@ signature**; each parameter declares one host-pushed slot:
 >   (`["a", "b", …]`) — a const-pool block whose inner string pointers
 >   are contiguous and single-base, so the rigid tail copy relocates them
 >   correctly,
+> - **`List<List<scalar>>` identity returns from a `#main` parameter**
+>   (`#main(List<List<Int|Float|Bool>> xss) -> List<List<…>> = xss`),
+>   **cranelift backend only.** This is the first shape carried by the
+>   *in-place region-walk return ABI*: instead of copying the nested
+>   pointer-array graph, the machine code reports the arena offset of the
+>   result root and the host verifies + decodes it in place in its source
+>   region (see the design note below). LLVM still caps this shape, and a
+>   parameter-*field* `List<List<scalar>>` (`w.rows`) stays capped — its
+>   field load re-encodes the inner rows into a materialised form the
+>   in-place reader does not yet decode,
 > - **`#schema`-branded struct returns** (`#main() -> Cfg { ... }`) whose
 >   fields are any of the above (including literal `String` / `List`
 >   fields),
@@ -120,17 +130,18 @@ signature**; each parameter declares one host-pushed slot:
 > - inner pointer-array element lists (`List<List<String>>` /
 >   `List<List<Schema>>`) — the recursive per-entry relocation isn't
 >   modelled,
-> - **returning** a `List<Schema>` / `List<List<scalar>>` from `#main`, or
->   an anon-`Dict` / struct field of those types. The host-side *decode*
->   is now in place — `BufferReader` walks the whole buffer with a single
->   base and reconstructs the nested `Value` recursively (`read_list_record`
->   for `List<Schema>`, `read_list_list` for `List<List<scalar>>`), so the
->   moment a compiled producer emits one of these returns the host reads it
->   back bit-identically to the oracle. What is still missing is the
->   *machine-code output store*: relocating a non-contiguous, cross-region
->   result graph into the return record without a recursive cross-buffer
->   relocator (see the design note below). Until that lands these returns
->   stay a loud compile-time cap,
+> - **returning** a `List<Schema>` from `#main`, a `List<List<scalar>>`
+>   on **LLVM** (cranelift's parameter-identity case is supported above),
+>   a `List<List<scalar>>` reached through a **parameter field** on either
+>   backend, or an anon-`Dict` / struct field of those types. The
+>   host-side *decode* is in place — `BufferReader` walks the buffer with
+>   a single base and reconstructs the nested `Value` recursively
+>   (`read_list_record` for `List<Schema>`, `read_list_list` /
+>   `read_list_list_at` for `List<List<scalar>>`). What is still missing
+>   for these is the in-place return wiring for a *per-element
+>   pointer-array* (`List<Schema>` / `List<String>` rows) or the
+>   materialised field-load form; until that lands they stay a loud
+>   compile-time cap,
 > - **returning a `List<String>` (or any pointer-array list) sourced from
 >   a `#main` parameter / field load / call** rather than an in-source
 >   literal — such a value lives in the input buffer with non-contiguous,
@@ -146,19 +157,45 @@ signature**; each parameter declares one host-pushed slot:
 > @ out_ptr | scratch]`. Inside the running machine code every pointer is
 > *arena-base-relative* (`arena_base + ptr` dereferences it), so a param
 > graph in `in_buf` and a const-pool literal share one coordinate system.
-> The host, however, decodes the return by handing `BufferReader` only the
+> For a normal return the host decodes by handing `BufferReader` the
 > **out_buf slice** — so a returned pointer is read as *out_buf-relative*.
 > A param-identity pointer-array return (`#main(List<P> xs) -> List<P> =
-> xs`) lives entirely in `in_buf` with `in_buf`-relative inner offsets;
-> the current return path tries to *copy* that graph into `out_buf` with a
-> single rigid delta, which only works for a contiguous, single-base
-> const-pool block and segfaults on the scattered param graph. The honest
-> fix is **"host walks in place"**: stop copying, write the result root as
-> a pointer the host resolves against the **single arena-wide base**, and
-> let `BufferReader` (which already walks recursively) reconstruct the
-> `Value` from wherever the graph lives. The reader half of that is done;
-> the remaining work is the codegen + a one-base return ABI, deliberately
-> not shipped half-wired because a wrong base is a silent miscompile.
+> xs`) instead lives entirely in `in_buf` with `in_buf`-relative inner
+> offsets; the old return path tried to *copy* that graph into `out_buf`
+> with a single rigid delta, which only works for a contiguous,
+> single-base const-pool block and segfaulted on the scattered param
+> graph.
+>
+> **In-place region-walk return ABI (the honest fix; first slice landed
+> for cranelift `List<List<scalar>>`).** Instead of copying, the machine
+> code reports the **arena-absolute offset of the result root** to the
+> host via a negative return sentinel: a `run_main` return value `>= 0` is
+> the usual `bytes_written` (decode at `out_ptr`), while a value `< 0`
+> encodes `-(root_abs + 1)` — "the return is in place; its root header is
+> at arena offset `root_abs`." The host then:
+>
+> 1. **selects the region** `root_abs` falls in by comparing it against
+>    the arena layout boundaries (`const_data` / `in_buf` / `out_buf` /
+>    `scratch`) — the single-region invariant guarantees the value is
+>    self-contained in exactly one, so a value's inner offsets are
+>    region-relative inside that region's slice;
+> 2. **runs the bounds verifier** (`verifier::verify_value_at`) over the
+>    whole reachable graph, confined to that region. A pointer that
+>    escapes the region — or any length / offset that runs off the end —
+>    is a **loud error**, never a wild read. This is the gate: the host
+>    does not decode an unverified in-place return;
+> 3. only on a clean verify **decodes in place** via the same
+>    `BufferReader` the out_buf path uses (`read_list_list_at` for the
+>    nested-list root), against the region slice the verifier certified.
+>
+> This keeps the load-bearing single-region wall intact (no cross-region
+> copy, no whole-buffer rigid relocation) and turns the entire class of
+> "wrong base / scattered graph" bugs from *silent miscompile* into
+> *explicit verifier failure*. The reader, verifier, and the cranelift
+> `List<List<scalar>>` identity case are wired; the remaining work is
+> extending the same ABI to per-element pointer-array roots
+> (`List<String>` / `List<Schema>`), the LLVM backend, and wasm linear
+> memory — each landed only once it is proven bit-equal to the oracle.
 
 ### Boundary Result vs Relon value-level Result
 

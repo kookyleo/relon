@@ -163,6 +163,36 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         if matches!(ty, IrType::ListString) {
             return self.emit_store_list_string(offset);
         }
+        if matches!(ty, IrType::ListList) {
+            // In-place region-walk return ABI (S1). The IR lowering only
+            // emits `StoreField { ty: ListList }` for a `List<List<scalar>>`
+            // value sourced directly from a `#main` parameter — its root
+            // header lives in the input region and the value is
+            // self-contained there (the single-region invariant). Rather
+            // than relocate the non-contiguous, in-buffer-relative block
+            // (the old rigid-copy path that segfaulted on this shape), we
+            // pop the arena-relative root pointer and stash it; the
+            // epilogue returns it as the negative in-place sentinel. The
+            // fixed-area slot at `offset` is left untouched — the host
+            // ignores `out_buf` entirely for an in-place return and reads
+            // the root at the reported arena offset.
+            //
+            // Only one root return value exists per `#main`, so a single
+            // stash slot is sufficient; a second ListList store would be a
+            // lowering bug (surfaced loudly here rather than silently
+            // overwriting).
+            if self.inplace_return_root.is_some() {
+                return Err(CraneliftError::Codegen(
+                    "multiple ListList StoreField in one #main body — in-place return expects a \
+                     single root value"
+                        .into(),
+                ));
+            }
+            let _ = offset;
+            let root = self.pop()?;
+            self.inplace_return_root = Some(root);
+            return Ok(());
+        }
         if matches!(ty, IrType::ListSchema) {
             return Err(CraneliftError::Codegen(format!(
                 "StoreField pointer-indirect type {ty:?} (pointer-array) not yet supported",
@@ -637,6 +667,16 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
     ) -> Result<(), CraneliftError> {
         // Pointer-indirect field leaves: load the 4-byte buffer-relative
         // slot, rebase by `in_ptr` to an arena-relative record pointer.
+        //
+        // `ListList` is intentionally NOT included: a `List<List<scalar>>`
+        // reached through a schema field is re-encoded into the
+        // materialised inner form (i64 slots carrying truncated i32 row
+        // handles), which the in-place reader decodes wrong. The IR
+        // lowering caps a parameter-field `List<List>` return loudly (see
+        // `list_list_source_is_param_walk`), so this op never carries a
+        // `ListList` for a return today; keeping it out of the rebase set
+        // makes any future field-`ListList` lowering fail loud here rather
+        // than silently mis-decode.
         if matches!(
             ty,
             IrType::String

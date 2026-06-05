@@ -35,3 +35,7 @@ relon-parser = { workspace = true }
 # v5-γ tests isolate the on-disk cache to a tempfile-rooted directory
 # so concurrent cargo-test threads cannot stomp on each other.
 tempfile = "3"
+# S1 return-side differential: generate `List<List<scalar>>` arg values
+# and assert cranelift == tree-walk bit-for-bit (auto-shrinking).
+proptest = { workspace = true }
+ordered-float = { workspace = true }
