@@ -1532,13 +1532,12 @@ fn write_value_into_builder(
         (TypeRepr::Float, Value::Int(v)) => marshal_float_in(builder, &field.name, *v as f64),
         (TypeRepr::Bool, Value::Bool(v)) => marshal_bool_in(builder, &field.name, *v),
         (TypeRepr::Null, Value::Null) => marshal_null_in(builder, &field.name),
+        (TypeRepr::String, Value::String(s)) => marshal_string_in(builder, &field.name, s),
         (TypeRepr::Schema { schema }, Value::Dict(dict)) => {
             marshal_schema_in(builder, &field.name, schema, dict)
         }
-        (TypeRepr::List { element }, Value::List(items))
-            if matches!(element.as_ref(), TypeRepr::Int) =>
-        {
-            marshal_list_int_in(builder, &field.name, items)
+        (TypeRepr::List { element }, Value::List(items)) => {
+            marshal_list_in(builder, &field.name, element, items)
         }
         // ----- add new leaf marshalling arm above this line -----
         (ty, v) => Err(RuntimeError::Unsupported {
@@ -1589,35 +1588,102 @@ fn marshal_null_in(
     builder.write_null(name).map_err(buffer_to_runtime_error)
 }
 
-/// S2.② `List<Int>` `#main` arg marshalling. The pointer-indirect
-/// `BufferBuilder::write_list_int` appends a `[len: u32 LE][pad to 8]
-/// [i64 LE …]` record into the parent buffer's tail area and back-patches
-/// the 4-byte buffer-relative offset slot — the same record shape the
-/// ConstPool `add_list_int` blob bakes, so a list `#main` arg and a const
-/// list return share one tail-record protocol. The element `Value`s must
-/// each be `Value::Int` (the schema arm already gated `element == Int`).
-fn marshal_list_int_in(
+/// Top-level / schema `String` `#main` arg marshalling. The
+/// pointer-indirect `BufferBuilder::write_string` appends a
+/// `[len: u32 LE][utf8]` record into the parent buffer's tail area and
+/// back-patches the 4-byte buffer-relative offset slot the JIT's
+/// `LoadStringPtr` reads — the same record shape `ConstString` bakes.
+fn marshal_string_in(
     builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
     name: &str,
+    s: &str,
+) -> Result<(), RuntimeError> {
+    builder
+        .write_string(name, s)
+        .map_err(buffer_to_runtime_error)
+}
+
+/// `List<…>` `#main` arg marshalling. Dispatches on the canonical
+/// element type to the matching pointer-indirect `write_list_*` writer,
+/// each of which appends the tail record (`[len][payload]` for scalar
+/// elements, a `[len][off_0]…` pointer array of `[len][utf8]` String
+/// records for `List<String>`) into the parent buffer's tail area and
+/// back-patches the 4-byte buffer-relative offset slot the JIT's
+/// `LoadList*Ptr` / pointer-indirect `LoadFieldAtAbsolute` reads — the
+/// same shapes the ConstPool `add_list_*` blobs bake, so a list `#main`
+/// arg and a const list return share one tail-record protocol. Element
+/// `Value`s are type-checked against the declared element type;
+/// `List<Schema>` (and any other element) stays a loud cap.
+fn marshal_list_in(
+    builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
+    name: &str,
+    element: &relon_eval_api::schema_canonical::TypeRepr,
     items: &[Value],
 ) -> Result<(), RuntimeError> {
-    let mut ints = Vec::with_capacity(items.len());
-    for it in items {
-        match it {
-            Value::Int(v) => ints.push(*v),
-            other => {
-                return Err(RuntimeError::Unsupported {
-                    reason: format!(
-                        "llvm-aot: List<Int> arg `{name}` element got {} but expects Int",
-                        other.type_name()
-                    ),
-                });
+    use relon_eval_api::schema_canonical::TypeRepr;
+    let mismatch = |idx: usize, got: &Value, want: &str| RuntimeError::Unsupported {
+        reason: format!(
+            "llvm-aot: List<{want}> arg `{name}` element #{idx} got {} but expects {want}",
+            got.type_name()
+        ),
+    };
+    match element {
+        TypeRepr::Int => {
+            let mut out = Vec::with_capacity(items.len());
+            for (i, it) in items.iter().enumerate() {
+                match it {
+                    Value::Int(v) => out.push(*v),
+                    other => return Err(mismatch(i, other, "Int")),
+                }
             }
+            builder
+                .write_list_int(name, &out)
+                .map_err(buffer_to_runtime_error)
         }
+        TypeRepr::Float => {
+            let mut out = Vec::with_capacity(items.len());
+            for (i, it) in items.iter().enumerate() {
+                match it {
+                    Value::Float(v) => out.push(v.into_inner()),
+                    Value::Int(v) => out.push(*v as f64),
+                    other => return Err(mismatch(i, other, "Float")),
+                }
+            }
+            builder
+                .write_list_float(name, &out)
+                .map_err(buffer_to_runtime_error)
+        }
+        TypeRepr::Bool => {
+            let mut out = Vec::with_capacity(items.len());
+            for (i, it) in items.iter().enumerate() {
+                match it {
+                    Value::Bool(v) => out.push(*v),
+                    other => return Err(mismatch(i, other, "Bool")),
+                }
+            }
+            builder
+                .write_list_bool(name, &out)
+                .map_err(buffer_to_runtime_error)
+        }
+        TypeRepr::String => {
+            let mut out: Vec<&str> = Vec::with_capacity(items.len());
+            for (i, it) in items.iter().enumerate() {
+                match it {
+                    Value::String(s) => out.push(s.as_str()),
+                    other => return Err(mismatch(i, other, "String")),
+                }
+            }
+            builder
+                .write_list_string(name, &out)
+                .map_err(buffer_to_runtime_error)
+        }
+        other => Err(RuntimeError::Unsupported {
+            reason: format!(
+                "llvm-aot: List element type {other:?} for arg `{name}` is not yet materialised \
+                 (List<Int/Float/Bool/String> only; List<Schema> is a loud cap)"
+            ),
+        }),
     }
-    builder
-        .write_list_int(name, &ints)
-        .map_err(buffer_to_runtime_error)
 }
 
 /// Phase 0b: Schema-typed `#main` arg marshalling. A branded

@@ -87,6 +87,37 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     ) -> Result<(), LlvmError> {
         let base = self.pop_int(ip_hint)?;
         let addr = self.compose_abs_addr(base, offset)?;
+        // Pointer-indirect schema field (`String` / `List<scalar>` /
+        // `List<String>`): the slot holds a 4-byte **buffer-relative**
+        // offset to the field's tail record, just like a top-level
+        // pointer-indirect `#main` param. Load the i32 slot and rebase
+        // by `in_ptr` so the pushed value is an arena-relative record
+        // pointer every consumer (`ReadStringLen`, list index, String /
+        // List return copy) expects — mirrors
+        // `emit_load_pointer_indirect_param`'s rebase.
+        if matches!(
+            ty,
+            IrType::String
+                | IrType::ListInt
+                | IrType::ListFloat
+                | IrType::ListBool
+                | IrType::ListString
+        ) {
+            let name = self.next_name("loadfa_ptr");
+            let raw = self
+                .builder
+                .build_load(self.ctx.i32_type(), addr, &name)
+                .map_err(|e| LlvmError::Codegen(format!("LoadFieldAtAbsolute ptr load: {e}")))?
+                .into_int_value();
+            let in_ptr_i32 = self.lookup_param(0)?; // IR LocalGet(0) == in_ptr
+            let name = self.next_name("loadfa_ptr_arena_rel");
+            let arena_rel = self
+                .builder
+                .build_int_add(raw, in_ptr_i32, &name)
+                .map_err(|e| LlvmError::Codegen(format!("LoadFieldAtAbsolute ptr rebase: {e}")))?;
+            self.push(arena_rel, ty);
+            return Ok(());
+        }
         if ty == IrType::F64 {
             let name = self.next_name("loadfa_f64");
             let f = self

@@ -267,20 +267,56 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         Ok(aligned)
     }
 
-    /// Lower `Op::StoreField { ty }` for a pointer-indirect type
-    /// (`String` / `ListInt` / `ListFloat` / `ListBool`). Pops the
-    /// source pointer (an arena-relative i32 offset where a
-    /// `[len:u32 LE][payload]` record lives), memcpies the record into
-    /// `out_ptr + tail_cursor`, writes `tail_cursor` (the buffer-
-    /// relative offset of the just-written record) into the fixed-
-    /// area slot at `offset`, and bumps `tail_cursor`.
-    pub(super) fn emit_store_pointer_indirect(
+    /// Compute `align_up(value + add, align)` as an i32 cranelift value.
+    /// `align` is a power of two (the record alignments are 4 / 8); for
+    /// `align <= 1` the rounding is a no-op. Mirrors the LLVM backend's
+    /// `align_up_const`. Used by the pointer-indirect record copy to
+    /// resolve a record's inner payload position
+    /// (`align_up(record_start + 4, align)`) from either the source or
+    /// destination record start.
+    fn align_up_i32(&mut self, value: CValue, add: u32, align: u32) -> CValue {
+        let summed = if add == 0 {
+            value
+        } else {
+            let a = self.builder.ins().iconst(I32, i64::from(add));
+            self.builder.ins().iadd(value, a)
+        };
+        if align <= 1 {
+            return summed;
+        }
+        let bump = self.builder.ins().iconst(I32, i64::from(align as i32 - 1));
+        let mask = self
+            .builder
+            .ins()
+            .iconst(I32, i64::from(!(align as i32 - 1)));
+        let bumped = self.builder.ins().iadd(summed, bump);
+        self.builder.ins().band(bumped, mask)
+    }
+
+    /// Copy a `[len: u32 LE][payload]` pointer-indirect record (String /
+    /// List<scalar>) from the arena-relative `src_off_i32` into the
+    /// output buffer's tail area, returning the **pre-bump tail cursor**
+    /// (the buffer-relative offset of the freshly-written record).
+    ///
+    /// The record's *inner* padding is position-dependent: the host /
+    /// const-pool protocol lays the payload at `align_up(record_start +
+    /// 4, align)`, so the header→payload gap differs between the source
+    /// record (wherever the input marshaller / const-pool put it) and
+    /// the freshly-aligned destination slot. A verbatim `memcpy` of the
+    /// whole record drags the source's pad geometry into the destination
+    /// and misaligns the payload whenever the two record starts have
+    /// different `% align` residues (e.g. a `List<Int>` input arg whose
+    /// record landed 4-aligned-but-not-8 has its payload at header+4,
+    /// while the 8-aligned output slot expects header+8). So the `[len]`
+    /// header and the payload are copied *separately*, the payload read
+    /// from / written to each side's own `align_up(start + 4, align)`
+    /// position. Mirrors the LLVM backend's
+    /// `emit_store_field_pointer_indirect`.
+    pub(super) fn emit_pointer_indirect_record_copy(
         &mut self,
-        offset: u32,
+        src_off_i32: CValue,
         ty: IrType,
-    ) -> Result<(), CraneliftError> {
-        let src_off_i32 = self.pop()?;
-        // Compute record_size from the in-record length prefix.
+    ) -> Result<CValue, CraneliftError> {
         let arena_base = self.builder.ins().load(
             self.pointer_ty,
             MemFlags::trusted(),
@@ -289,48 +325,71 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         );
         let src_off_p = self.builder.ins().uextend(self.pointer_ty, src_off_i32);
         let src_abs = self.builder.ins().iadd(arena_base, src_off_p);
-        // Load element / byte count from src+0.
+        // Load element / byte count from the record's `[len: u32]` head.
         let len_i32 = self
             .builder
             .ins()
             .load(I32, MemFlags::trusted(), src_abs, 0);
-        let record_size = match ty {
-            IrType::String => {
-                // record_size = payload_len + 4
+        let (record_size, payload_bytes) = match ty {
+            IrType::String | IrType::ListBool => {
+                // payload is 1 byte/element; record_size = len + 4.
                 let four = self.builder.ins().iconst(I32, 4);
-                self.builder.ins().iadd(len_i32, four)
+                (self.builder.ins().iadd(len_i32, four), len_i32)
             }
             IrType::ListInt | IrType::ListFloat => {
-                // record_size = 8 + 8 * element_count
+                // payload is 8 bytes/element; record_size = 8 + 8*len.
                 let three = self.builder.ins().iconst(I32, 3);
-                let shifted = self.builder.ins().ishl(len_i32, three);
+                let payload = self.builder.ins().ishl(len_i32, three);
                 let eight = self.builder.ins().iconst(I32, 8);
-                self.builder.ins().iadd(shifted, eight)
-            }
-            IrType::ListBool => {
-                // record_size = 4 + element_count
-                let four = self.builder.ins().iconst(I32, 4);
-                self.builder.ins().iadd(len_i32, four)
+                (self.builder.ins().iadd(payload, eight), payload)
             }
             _ => {
                 return Err(CraneliftError::Codegen(format!(
-                    "emit_store_pointer_indirect: unsupported {ty:?}"
+                    "emit_pointer_indirect_record_copy: unsupported {ty:?}"
                 )));
             }
         };
         let align = pointer_indirect_record_align(ty)?;
         // Reserve the tail slot.
         let pre_cursor = self.emit_tail_alloc(record_size, align)?;
-        // Compute absolute dest = arena_base + out_ptr + pre_cursor.
         let out_ptr_i32 = self.get_local(2)?;
-        let out_ptr = self.builder.ins().uextend(self.pointer_ty, out_ptr_i32);
-        let pre_cursor_p = self.builder.ins().uextend(self.pointer_ty, pre_cursor);
-        let dest0 = self.builder.ins().iadd(arena_base, out_ptr);
-        let dest = self.builder.ins().iadd(dest0, pre_cursor_p);
-        // memcpy(dest, src_abs, record_size).
-        let size_p = self.builder.ins().uextend(self.pointer_ty, record_size);
+        // dst record start (buffer-relative) = out_ptr + pre_cursor.
+        let dst_off = self.builder.ins().iadd(out_ptr_i32, pre_cursor);
+        let dst_abs = self.arena_addr(dst_off, 4)?;
+        // Header: store the `[len: u32]` prefix at the dst record start.
         self.builder
-            .call_memcpy(self.frontend_config, dest, src_abs, size_p);
+            .ins()
+            .store(MemFlags::trusted(), len_i32, dst_abs, 0);
+        // Payload copied from / to each side's recomputed payload start.
+        let src_payload_off = self.align_up_i32(src_off_i32, 4, align);
+        let src_payload_abs = self.arena_addr(src_payload_off, 0)?;
+        let dst_payload_off = self.align_up_i32(dst_off, 4, align);
+        let dst_payload_abs = self.arena_addr(dst_payload_off, 0)?;
+        let payload_p = self.builder.ins().uextend(self.pointer_ty, payload_bytes);
+        self.builder.call_memcpy(
+            self.frontend_config,
+            dst_payload_abs,
+            src_payload_abs,
+            payload_p,
+        );
+        Ok(pre_cursor)
+    }
+
+    /// Lower `Op::StoreField { ty }` for a pointer-indirect type
+    /// (`String` / `ListInt` / `ListFloat` / `ListBool`). Pops the
+    /// source pointer (an arena-relative i32 offset where a
+    /// `[len:u32 LE][payload]` record lives), copies the record into
+    /// `out_ptr + tail_cursor` (via
+    /// [`Self::emit_pointer_indirect_record_copy`]), writes the
+    /// resulting buffer-relative offset into the fixed-area slot at
+    /// `offset`, and bumps `tail_cursor`.
+    pub(super) fn emit_store_pointer_indirect(
+        &mut self,
+        offset: u32,
+        ty: IrType,
+    ) -> Result<(), CraneliftError> {
+        let src_off_i32 = self.pop()?;
+        let pre_cursor = self.emit_pointer_indirect_record_copy(src_off_i32, ty)?;
         // Store pre_cursor (the buffer-relative offset) at the fixed-
         // area slot `out_ptr + offset`.
         let slot_addr = self.buffer_field_addr(2 /* out_ptr */, offset, 4)?;
@@ -498,26 +557,90 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         Ok(())
     }
 
+    /// Lower a pointer-indirect `#main` parameter load (`LoadStringPtr`
+    /// / `LoadListIntPtr` / `LoadListFloatPtr` / `LoadListBoolPtr` /
+    /// `LoadListStringPtr`).
+    ///
+    /// A `String` / `List<…>` `#main` parameter arrives in the input
+    /// buffer as a 4-byte **buffer-relative** offset stored at
+    /// `in_ptr + offset`; the offset points at the parameter's tail
+    /// record (`[len: u32 LE][payload]` for String / List<scalar>, a
+    /// `[len][off_0]…` pointer array for List<String>). Every downstream
+    /// consumer on the operand stack (`ReadStringLen`, the
+    /// pointer-indirect `EmitTailRecordFromAbsoluteAddr` tail copy, the
+    /// `List<String>` index path) treats a pointer as **arena-relative**
+    /// — the same coordinate `ConstString` / `ConstListInt` produce — so
+    /// we rebase the loaded slot by `in_ptr` once here at the source.
+    /// Mirrors the LLVM backend's `emit_load_pointer_indirect_param`.
+    pub(super) fn emit_load_pointer_indirect_param(
+        &mut self,
+        offset: u32,
+    ) -> Result<(), CraneliftError> {
+        if !matches!(self.entry_shape, EntryShape::BufferProtocol) {
+            return Err(CraneliftError::Codegen(
+                "Load*Ptr outside buffer-protocol entry shape".into(),
+            ));
+        }
+        // Read the 4-byte buffer-relative offset at `in_ptr + offset`.
+        let slot_addr = self.buffer_field_addr(0 /* in_ptr */, offset, 4)?;
+        let rel_off = self
+            .builder
+            .ins()
+            .load(I32, MemFlags::trusted(), slot_addr, 0);
+        // Rebase to an arena-relative pointer (`in_ptr + rel_off`).
+        let in_ptr = self.get_local(0)?;
+        let arena_rel = self.builder.ins().iadd(in_ptr, rel_off);
+        self.push(arena_rel);
+        Ok(())
+    }
+
     /// Lower `Op::LoadFieldAtAbsolute { offset, ty }`. Stack:
     /// `[i32 base] -> [T]`. Pops a buffer-relative base address (pushed
     /// by `LoadSchemaPtr`), composes `arena_base + base + offset`,
     /// loads a value of `ty`, and pushes it. Mirrors
     /// [`Codegen::emit_load_field`] but the base pointer comes off the
-    /// stack rather than from `in_ptr`. Scalar leaves only:
-    /// pointer-indirect field types (`String` / `List*` / nested
-    /// `Schema`) surface as `Unsupported` since their materialisation
-    /// (`LoadStringPtr` etc.) is not yet lowered on the cranelift side.
+    /// stack rather than from `in_ptr`.
+    ///
+    /// Scalar leaves load directly. Pointer-indirect field types
+    /// (`String` / `List<scalar>` / `List<String>`) store a 4-byte
+    /// **buffer-relative** offset in the field slot, exactly like a
+    /// top-level pointer-indirect `#main` param; we load that i32 slot
+    /// and rebase it by `in_ptr` so the pushed value is an arena-relative
+    /// record pointer the downstream consumers (`ReadStringLen`,
+    /// list-index, String/List return copy) expect. Multi-segment
+    /// nested-schema walks (`o.inner.x`, the inner segment ty `I32`)
+    /// remain out of scope here — see the report's honesty note.
     pub(super) fn emit_load_field_at_absolute(
         &mut self,
         offset: u32,
         ty: IrType,
     ) -> Result<(), CraneliftError> {
+        // Pointer-indirect field leaves: load the 4-byte buffer-relative
+        // slot, rebase by `in_ptr` to an arena-relative record pointer.
+        if matches!(
+            ty,
+            IrType::String
+                | IrType::ListInt
+                | IrType::ListFloat
+                | IrType::ListBool
+                | IrType::ListString
+        ) {
+            let base_i32 = self.pop()?;
+            let off_v = self.builder.ins().iconst(I32, i64::from(offset));
+            let composed = self.builder.ins().iadd(base_i32, off_v);
+            let addr = self.arena_addr(composed, 4)?;
+            let rel_off = self.builder.ins().load(I32, MemFlags::trusted(), addr, 0);
+            let in_ptr = self.get_local(0)?;
+            let arena_rel = self.builder.ins().iadd(in_ptr, rel_off);
+            self.push(arena_rel);
+            return Ok(());
+        }
         match ty {
             IrType::I64 | IrType::F64 | IrType::I32 | IrType::Bool | IrType::Null => {}
             other => {
                 return Err(CraneliftError::Codegen(format!(
-                    "LoadFieldAtAbsolute: pointer-indirect field type {other:?} not yet \
-                     materialised on the cranelift backend (scalar schema fields only)"
+                    "LoadFieldAtAbsolute: field type {other:?} not yet materialised on the \
+                     cranelift backend (scalars, String, List<scalar>, List<String>)"
                 )));
             }
         }

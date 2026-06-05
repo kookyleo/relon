@@ -39,11 +39,14 @@ const LIB_SOURCE: &str = r#"{ host: "localhost", port: 8080 }"#;
 /// W11-shaped `#main(Int x) -> Int\nx + 1` source directly.
 const MAIN_SOURCE: &str = "#main(Int x) -> Int\nabs(x) * 2";
 
-/// A `#main(...)` shape the cranelift-AOT backend currently rejects
-/// (closure-bearing higher-order list op — `Op::CallClosure` is
-/// Phase C.4 deferred) while the tree-walker keeps working.
-/// Exercises the failure-isolation invariant for the AOT init slot.
-const AOT_REJECTED_MAIN: &str = "#main(List<Int> xs) -> List<Int>\nxs.map((Int n) => n * 2)";
+/// A `#main(...)` shape the cranelift-AOT backend currently rejects (a
+/// nested-list `List<List<Int>>` return — pointer-array-of-pointer-array
+/// materialisation is not lowered on the compiled backends) while the
+/// tree-walker keeps working. Exercises the failure-isolation invariant
+/// for the AOT init slot. The `x: Int` param matches the args the test
+/// pushes; the rejection happens at AOT init (IR lowering), surfacing as
+/// `RuntimeError::Unsupported` regardless of the args.
+const AOT_REJECTED_MAIN: &str = "#main(Int x) -> List<List<Int>>\n[[x]]";
 
 #[test]
 fn backend_default_is_auto() {
