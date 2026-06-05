@@ -465,6 +465,77 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         Ok(())
     }
 
+    /// Lower `Op::LoadSchemaPtr { offset }`.
+    ///
+    /// A schema-typed `#main` parameter arrives in the input buffer as
+    /// a 4-byte buffer-relative offset stored at `in_ptr + offset`.
+    /// This op lifts that slot to the schema instance's buffer-relative
+    /// base address: it reads the 4-byte slot, then adds `in_ptr` so a
+    /// downstream `LoadFieldAtAbsolute` (which composes `arena_base +
+    /// base + field_offset`) lands on the matching field. Mirrors the
+    /// LLVM backend's `emit_load_schema_ptr`.
+    ///
+    /// The pushed value is the buffer-relative i32 base; the IR-level
+    /// schema brand is tracked by the lowering pass, not by an
+    /// operand-stack tag.
+    pub(super) fn emit_load_schema_ptr(&mut self, offset: u32) -> Result<(), CraneliftError> {
+        if !matches!(self.entry_shape, EntryShape::BufferProtocol) {
+            return Err(CraneliftError::Codegen(
+                "LoadSchemaPtr outside buffer-protocol entry shape".into(),
+            ));
+        }
+        // Read the 4-byte buffer-relative offset at `in_ptr + offset`.
+        let slot_addr = self.buffer_field_addr(0 /* in_ptr */, offset, 4)?;
+        let rel_off = self
+            .builder
+            .ins()
+            .load(I32, MemFlags::trusted(), slot_addr, 0);
+        // Lift to the schema instance's buffer-relative base
+        // (`in_ptr + rel_off`). LoadFieldAtAbsolute adds `arena_base`.
+        let in_ptr = self.get_local(0)?;
+        let abs = self.builder.ins().iadd(in_ptr, rel_off);
+        self.push(abs);
+        Ok(())
+    }
+
+    /// Lower `Op::LoadFieldAtAbsolute { offset, ty }`. Stack:
+    /// `[i32 base] -> [T]`. Pops a buffer-relative base address (pushed
+    /// by `LoadSchemaPtr`), composes `arena_base + base + offset`,
+    /// loads a value of `ty`, and pushes it. Mirrors
+    /// [`Codegen::emit_load_field`] but the base pointer comes off the
+    /// stack rather than from `in_ptr`. Scalar leaves only:
+    /// pointer-indirect field types (`String` / `List*` / nested
+    /// `Schema`) surface as `Unsupported` since their materialisation
+    /// (`LoadStringPtr` etc.) is not yet lowered on the cranelift side.
+    pub(super) fn emit_load_field_at_absolute(
+        &mut self,
+        offset: u32,
+        ty: IrType,
+    ) -> Result<(), CraneliftError> {
+        match ty {
+            IrType::I64 | IrType::F64 | IrType::I32 | IrType::Bool | IrType::Null => {}
+            other => {
+                return Err(CraneliftError::Codegen(format!(
+                    "LoadFieldAtAbsolute: pointer-indirect field type {other:?} not yet \
+                     materialised on the cranelift backend (scalar schema fields only)"
+                )));
+            }
+        }
+        let (cr_ty, size, _push_ty) = field_load_shape(ty)?;
+        let base_i32 = self.pop()?;
+        // composed buffer-relative offset = base + field_offset.
+        let off_v = self.builder.ins().iconst(I32, i64::from(offset));
+        let composed = self.builder.ins().iadd(base_i32, off_v);
+        let addr = self.arena_addr(composed, size)?;
+        let loaded = self.builder.ins().load(cr_ty, MemFlags::trusted(), addr, 0);
+        let val = match ty {
+            IrType::Bool | IrType::Null => self.builder.ins().uextend(I32, loaded),
+            _ => loaded,
+        };
+        self.push(val);
+        Ok(())
+    }
+
     /// Lower `Op::ReadStringLen`. Pops an i32 arena-relative pointer
     /// (a String or List* record's base), loads the leading 4-byte
     /// length prefix, and pushes it widened to i64. The bounds check

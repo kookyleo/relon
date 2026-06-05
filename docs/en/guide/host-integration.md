@@ -68,6 +68,17 @@ signature**; each parameter declares one host-pushed slot:
   signature: missing field → `MissingMainArg`; extra field →
   `UnexpectedMainArg`; type mismatch → `MainArgTypeMismatch`.
 
+> **Compiled backends — structured inputs.** The compiled executors
+> (cranelift-native / llvm-native / compiled wasm) decode structured
+> `#main` parameters over their buffer protocol, not just scalars:
+> scalar leaves (`Int` / `Float` / `Bool` / `Null` / `String`),
+> `List<scalar>`, and **user-`#schema` struct parameters with scalar
+> fields** all flow through bit-identically to the tree-walk oracle.
+> `Dict<_, _>` and nested-list (`List<List<…>>`) parameters are **not
+> yet** supported on the compiled backends and are rejected up front
+> with a clear `unsupported type in #main` error rather than silently
+> falling back — use the tree-walk evaluator for those shapes.
+
 ### Boundary Result vs Relon value-level Result
 
 The host's `run_main` call returns a Rust-side

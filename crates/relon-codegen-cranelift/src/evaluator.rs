@@ -1806,6 +1806,16 @@ fn write_value_into_builder(
         (TypeRepr::String, Value::String(s)) => builder
             .write_string(&field.name, s.as_str())
             .map_err(buffer_to_runtime_error),
+        // Schema-typed `#main` arg: a branded `Value::Dict` is written
+        // as a sub-record into the parent buffer's tail and the 4-byte
+        // buffer-relative offset slot back-patched — exactly the slot
+        // the JIT's `LoadSchemaPtr` reads. Mirrors the LLVM backend's
+        // `marshal_schema_in`. Nested schema fields recurse through this
+        // same arm; `finish_sub_record` relocates the child's pointer
+        // slots into the parent's coordinate system.
+        (TypeRepr::Schema { schema }, Value::Dict(dict)) => {
+            write_schema_arg_into_builder(builder, &field.name, schema, dict)
+        }
         _ => Err(RuntimeError::MainArgTypeMismatch {
             name: field.name.clone(),
             expected: format!("{:?}", field.ty),
@@ -1832,6 +1842,60 @@ fn write_value_into_builder(
             }
         }),
     }
+}
+
+/// Marshal a schema-typed `#main` arg (a branded `Value::Dict`) into
+/// the parent buffer. Opens a detached sub-record builder via
+/// [`BufferBuilder::sub_record`], fills it field-by-field through
+/// [`write_schema_fields_into_builder`], then commits it with
+/// [`BufferBuilder::finish_sub_record`] (which appends the child to the
+/// parent's tail, back-patches the offset slot, and relocates the
+/// child's own pointer slots). Mirrors the LLVM backend's
+/// `marshal_schema_in` so both backends produce byte-identical input
+/// buffers for the same args.
+fn write_schema_arg_into_builder(
+    builder: &mut BufferBuilder<'_>,
+    name: &str,
+    schema: &Schema,
+    dict: &relon_eval_api::ValueDict,
+) -> Result<(), RuntimeError> {
+    let sub_layout = SchemaLayout::offsets_for(schema).map_err(|e| RuntimeError::Unsupported {
+        reason: format!("cranelift-native: schema arg `{name}` layout: {e}"),
+    })?;
+    let mut child = builder
+        .sub_record(name, &sub_layout, &schema.fields)
+        .map_err(buffer_to_runtime_error)?;
+    write_schema_fields_into_builder(&mut child, schema, dict, name)?;
+    builder
+        .finish_sub_record(name, child)
+        .map_err(buffer_to_runtime_error)
+}
+
+/// Recursively fill a detached sub-record `child` with the fields of
+/// `schema`, pulling each value out of the branded `dict`. Nested
+/// `Schema`-typed fields recurse through [`write_value_into_builder`]'s
+/// Schema arm, which re-enters this helper one layer down. The schema
+/// name is threaded only for error messages. Mirrors the LLVM
+/// backend's `write_schema_into_builder`.
+fn write_schema_fields_into_builder(
+    child: &mut BufferBuilder<'_>,
+    schema: &Schema,
+    dict: &relon_eval_api::ValueDict,
+    parent_field: &str,
+) -> Result<(), RuntimeError> {
+    for sub_field in &schema.fields {
+        let sub_value =
+            dict.map
+                .get(sub_field.name.as_str())
+                .ok_or_else(|| RuntimeError::Unsupported {
+                    reason: format!(
+                        "cranelift-native: schema arg `{parent_field}` is missing field `{}`",
+                        sub_field.name
+                    ),
+                })?;
+        write_value_into_builder(child, sub_field, sub_value, &schema.name)?;
+    }
+    Ok(())
 }
 
 /// Decode a single field via [`BufferReader`]. Stage 3 widens this to

@@ -27,11 +27,19 @@ pub enum LoweringError {
         /// Canonical id of the module looked up in the workspace.
         module: String,
     },
-    /// A `#main` parameter or return type is something other than
-    /// `Int` / `Float`. v1.beta restricts the entry signature to
-    /// scalar numerics so the binary handshake stays trivial; later
-    /// phases extend this to `String` / `Bool` / schemas.
-    #[error("unsupported type in #main: `{type_name}` (Phase 1.beta supports Int / Float only)")]
+    /// A `#main` parameter or return type falls outside the structured
+    /// buffer-protocol envelope the compiled backends decode. Supported
+    /// today: the scalar leaves (`Int` / `Float` / `Bool` / `Null` /
+    /// `String`), `List<scalar>`, user-`#schema` structs with scalar
+    /// fields, and `List<Schema>`. Explicitly NOT supported (loud cap,
+    /// not a silent fallthrough): `Dict<_, _>` params, nested-list
+    /// params (`List<List<…>>`), and other deeply-nested composites —
+    /// their input decoding has no buffer-protocol decode path yet.
+    #[error(
+        "unsupported type in #main: `{type_name}` — compiled backends decode scalars, \
+         List<scalar>, schema-struct, and List<Schema>; Dict and nested-list params are \
+         not yet supported"
+    )]
     UnsupportedTypeInMain {
         /// The offending type name as written in source.
         type_name: String,

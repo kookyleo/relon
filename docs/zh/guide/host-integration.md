@@ -61,6 +61,15 @@ host-pushed slot：
   `MissingMainArg`；多字段 → `UnexpectedMainArg`；类型不匹配 →
   `MainArgTypeMismatch`。
 
+> **编译后端 — 结构化入参。** 编译执行器（cranelift-native /
+> llvm-native / 编译版 wasm）的 buffer 协议现已支持结构化 `#main`
+> 入参，而不仅是标量：标量叶子（`Int` / `Float` / `Bool` / `Null` /
+> `String`）、`List<scalar>`，以及 **带标量字段的用户 `#schema`
+> 结构体入参**，都与 tree-walk oracle 逐字节一致地流入。`Dict<_, _>`
+> 与嵌套 List（`List<List<…>>`）入参在编译后端 **暂不支持**，会在前置
+> 阶段以明确的 `unsupported type in #main` 报错（绝不静默回退）——这类
+> 形状请改用 tree-walk 解释器。
+
 ### 入口边界 Result 与 Relon 值层 Result
 
 宿主调用 `run_main` 拿到的是 Rust 一侧的
