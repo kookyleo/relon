@@ -1952,13 +1952,60 @@ fn write_list_arg_into_builder(
                 .write_list_string(name, &out)
                 .map_err(buffer_to_runtime_error)
         }
+        TypeRepr::Schema { schema } => {
+            write_list_schema_arg_into_builder(builder, name, schema, items)
+        }
+        TypeRepr::List { element: inner } => {
+            relon_eval_api::buffer::write_nested_scalar_list(builder, name, inner, items)
+                .map_err(buffer_to_runtime_error)
+        }
         other => Err(RuntimeError::Unsupported {
             reason: format!(
                 "cranelift-native: List element type {other:?} for arg `{name}` is not yet \
-                 materialised (List<Int/Float/Bool/String> only; List<Schema> is a loud cap)"
+                 materialised (List<Int/Float/Bool/String/Schema> + List<List<scalar>>)"
             ),
         }),
     }
+}
+
+/// Marshal a `List<Schema>` arg: each element is a branded
+/// `Value::Dict` written as a sub-record into the parent buffer's tail
+/// through [`relon_eval_api::buffer::ListRecordWriter`]. The list
+/// header's per-entry offsets and the inner sub-records' own pointer
+/// slots are relocated into the parent's coordinate system by
+/// `finish_entry` / `finish_list_record`. Mirrors the LLVM backend's
+/// `marshal_list_schema_in`.
+fn write_list_schema_arg_into_builder(
+    builder: &mut BufferBuilder<'_>,
+    name: &str,
+    schema: &Schema,
+    items: &[Value],
+) -> Result<(), RuntimeError> {
+    let elem_layout = SchemaLayout::offsets_for(schema).map_err(|e| RuntimeError::Unsupported {
+        reason: format!("cranelift-native: List<Schema> arg `{name}` element layout: {e}"),
+    })?;
+    let mut writer = builder
+        .list_record_writer(name, &elem_layout, schema)
+        .map_err(buffer_to_runtime_error)?;
+    for (i, it) in items.iter().enumerate() {
+        let Value::Dict(dict) = it else {
+            return Err(RuntimeError::Unsupported {
+                reason: format!(
+                    "cranelift-native: List<Schema> arg `{name}` element #{i} got {} but expects \
+                     a branded record",
+                    it.type_name()
+                ),
+            });
+        };
+        let mut child = writer.start_entry();
+        write_schema_fields_into_builder(&mut child, schema, dict, name)?;
+        writer
+            .finish_entry(builder, child)
+            .map_err(buffer_to_runtime_error)?;
+    }
+    builder
+        .finish_list_record(writer)
+        .map_err(buffer_to_runtime_error)
 }
 
 /// Recursively fill a detached sub-record `child` with the fields of

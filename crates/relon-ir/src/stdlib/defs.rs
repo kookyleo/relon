@@ -130,6 +130,15 @@ pub(super) fn list_schema_length() -> StdlibFunction {
     )
 }
 
+pub(super) fn list_list_length() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_list_length",
+        vec![IrType::ListList],
+        IrType::I64,
+        list_length_record_header_body,
+    )
+}
+
 /// Shared body for every `list_<T>_length` shape — they all read the
 /// leading `u32 LE` length prefix of the record header. Hoisted so the
 /// lazy-build cache can reuse the same builder pointer across the

@@ -17,13 +17,22 @@
 //! to arena-relative) or `Op::LoadFieldAtAbsolute` with a pointer-
 //! indirect field type (schema fields, same rebase).
 //!
-//! Scope / loud caps (see the report's honesty note): `List<Schema>`
-//! params/fields, nested `List<List<…>>`, multi-segment nested-schema
-//! walks (`o.inner.x`), and `Dict` params stay loudly rejected — no
-//! silent fallthrough. The `len(...)` free-call alias does not lower on
-//! the compiled backends for `List<String>`; the cross-backend consumer
-//! here is the `.length()` method form (`list_string_length`), which
-//! lowers identically on all three executors.
+//! `List<Schema>` params/fields and nested `List<List<scalar>>`
+//! params/fields are also materialised: each element is a pointer-array
+//! entry naming a tail-area record (a schema sub-record / an inner list
+//! record), laid out by the host's `list_record_writer` /
+//! `write_nested_scalar_list` and consumed through the `[len]` header
+//! (`.length()` → `list_schema_length` / `list_list_length`) or a
+//! sibling scalar field read.
+//!
+//! Scope / loud caps (see the report's honesty note): the *return* side
+//! of those pointer-array lists (`StoreField(ListSchema/ListList)`),
+//! inner pointer-array element lists (`List<List<String>>`),
+//! multi-segment nested-schema walks (`o.inner.x`), and `Dict` params
+//! stay loudly rejected — no silent fallthrough. The `len(...)`
+//! free-call alias does not lower on the compiled backends for
+//! `List<String>`; the cross-backend consumer here is the `.length()`
+//! method form, which lowers identically on all three executors.
 
 use std::collections::HashMap;
 
@@ -220,23 +229,131 @@ fn schema_list_int_field_three_way() {
     assert_eq!(assert_three_way(SRC, args), Value::Int(3));
 }
 
+// ------------------ List<Schema> params / fields (stage 4) ------------
+
+/// `#main(List<Cfg> items) -> Int = items.length()` — a `List<Schema>`
+/// param. `LoadListSchemaPtr` rebases the buffer-relative header slot;
+/// each element is a schema sub-record written into the input buffer's
+/// tail through the host's `list_record_writer`, its own pointer slots
+/// relocated by `finish_entry`. The `[len]` header read by
+/// `list_schema_length` proves the pointer-array materialised.
+#[test]
+fn list_schema_param_length_three_way() {
+    const SRC: &str = "#schema Cfg { name: String, port: Int }\n\
+                       #main(List<Cfg> items) -> Int\nitems.length()";
+    let args = HashMap::from([(
+        "items".to_string(),
+        Value::list(vec![
+            schema_val("Cfg", vec![("name", s("a")), ("port", Value::Int(1))]),
+            schema_val("Cfg", vec![("name", s("bb")), ("port", Value::Int(2))]),
+        ]),
+    )]);
+    assert_eq!(assert_three_way(SRC, args), Value::Int(2));
+}
+
+/// `#main(Cfg cfg) -> Int = cfg.port` where `Cfg` carries a
+/// `List<Inner>` field — the whole struct (including the `List<Schema>`
+/// field) must marshal into the input buffer, even though the body only
+/// reads the scalar `port`. Proves the schema-field `List<Schema>`
+/// encode path (host `write_value_into_builder` List arm → schema
+/// element writer) is bit-equal across backends.
+#[test]
+fn schema_list_schema_field_three_way() {
+    const SRC: &str = "#schema Inner { x: Int }\n\
+                       #schema Cfg { items: List<Inner>, port: Int }\n\
+                       #main(Cfg cfg) -> Int\ncfg.port";
+    let args = HashMap::from([(
+        "cfg".to_string(),
+        schema_val(
+            "Cfg",
+            vec![
+                (
+                    "items",
+                    Value::list(vec![
+                        schema_val("Inner", vec![("x", Value::Int(10))]),
+                        schema_val("Inner", vec![("x", Value::Int(20))]),
+                        schema_val("Inner", vec![("x", Value::Int(30))]),
+                    ]),
+                ),
+                ("port", Value::Int(99)),
+            ],
+        ),
+    )]);
+    assert_eq!(assert_three_way(SRC, args), Value::Int(99));
+}
+
+// --------------- nested List<List<scalar>> params / fields ------------
+
+/// `#main(List<List<Int>> xss) -> Int = xss.length()` — a nested list
+/// param. `LoadListListPtr` rebases the outer header; each element is an
+/// inner `[len][i64...]` list record laid out by the host's
+/// `write_nested_scalar_list`. The outer `[len]` count is read by
+/// `list_list_length`.
+#[test]
+fn nested_list_int_param_length_three_way() {
+    const SRC: &str = "#main(List<List<Int>> xss) -> Int\nxss.length()";
+    let args = HashMap::from([(
+        "xss".to_string(),
+        Value::list(vec![
+            Value::list(vec![Value::Int(1), Value::Int(2)]),
+            Value::list(vec![Value::Int(3)]),
+            Value::list(vec![Value::Int(4), Value::Int(5), Value::Int(6)]),
+            Value::list(vec![]),
+        ]),
+    )]);
+    assert_eq!(assert_three_way(SRC, args), Value::Int(4));
+}
+
+/// `#main(Cfg cfg) -> Int = cfg.port` where `Cfg` carries a
+/// `List<List<Int>>` field — exercises the nested-list schema-field
+/// encode path. The body reads `port`; the nested field is materialised
+/// into the buffer and must be bit-equal across backends.
+#[test]
+fn schema_nested_list_field_three_way() {
+    const SRC: &str = "#schema Cfg { grid: List<List<Int>>, port: Int }\n\
+                       #main(Cfg cfg) -> Int\ncfg.port";
+    let args = HashMap::from([(
+        "cfg".to_string(),
+        schema_val(
+            "Cfg",
+            vec![
+                (
+                    "grid",
+                    Value::list(vec![
+                        Value::list(vec![Value::Int(1), Value::Int(2)]),
+                        Value::list(vec![Value::Int(3), Value::Int(4)]),
+                    ]),
+                ),
+                ("port", Value::Int(7)),
+            ],
+        ),
+    )]);
+    assert_eq!(assert_three_way(SRC, args), Value::Int(7));
+}
+
 // ----------------------------- loud caps ------------------------------
 
-/// `List<Schema>` params/fields, nested `List<List<…>>`, and `Dict`
-/// params stay loudly rejected on both compiled backends — no silent
-/// mis-compile. Pins the cap so it can't regress.
+/// Shapes that stay loudly rejected on both compiled backends — no
+/// silent mis-compile. Pins the cap so it can't regress.
+///
+/// Materialised this round: `List<Schema>` / `List<List<scalar>>`
+/// params + schema fields consumed through `.length()` / a sibling
+/// scalar read. Still capped: the *return* side of those pointer-array
+/// lists (`StoreField(ListSchema/ListList)` is unsupported), inner
+/// pointer-array element lists (`List<List<String>>`), and `Dict`
+/// params (analyzer dead-end).
 #[test]
 fn unsupported_pointer_indirect_shapes_loudly_capped() {
     for src in [
-        // List<Schema> param: decode not lowered (LoadListSchemaPtr).
+        // List<Schema> *return* (StoreField pointer-array not lowered).
         "#schema P { x: Int }\n#main(List<P> ps) -> List<P>\nps",
-        // nested list param.
+        // nested list *return*.
         "#main(List<List<Int>> xss) -> List<List<Int>>\nxss",
         // Dict param.
         "#main(Dict<String, Int> d) -> Dict<String, Int>\nd",
-        // schema field whose type is a List<Schema> (nested decode).
-        "#schema Inner { x: Int }\n#schema Cfg { items: List<Inner>, port: Int }\n\
-         #main(Cfg cfg) -> Int\ncfg.port",
+        // inner pointer-array element list: List<List<String>> stays a
+        // loud cap (recursive pointer-array relocation not modelled).
+        "#main(List<List<String>> xss) -> Int\nxss.length()",
     ] {
         let cl = AotEvaluator::from_source(src);
         assert!(cl.is_err(), "cranelift must loudly reject `{src}`, got Ok");

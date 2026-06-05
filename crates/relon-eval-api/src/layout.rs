@@ -335,12 +335,24 @@ fn list_layout_decision(
                 }),
             })
         }
-        // Reject nested lists / options / results / nulls — v1 doesn't
-        // model these element shapes.
-        TypeRepr::List { .. } => Err(LayoutError::UnsupportedListElement {
-            field: field_name.to_string(),
-            inner: "List",
-        }),
+        // Nested `List<List<…>>`: each element is itself a `[len]
+        // [payload]` list record addressed through a `u32` entry in the
+        // pointer array, exactly like `List<String>` / `List<Schema>`.
+        // The inner list record's own alignment depends on its element
+        // (8 for Int/Float, 4 otherwise); the entry slots are 4-byte
+        // offsets so the pointer array's `elem_alignment` is the inner
+        // record's start alignment. Validating the inner element here
+        // keeps the recursion bounded to shapes the writer/reader and
+        // `relocate_pointers` actually materialise.
+        TypeRepr::List { element: inner } => {
+            let inner_align = inner_list_record_alignment(field_name, inner)?;
+            Ok(FieldLayoutDecision {
+                kind: FieldKind::PointerIndirect { tail_alignment: 4 },
+                list_element: Some(ListElementKind::PointerArray {
+                    elem_alignment: inner_align,
+                }),
+            })
+        }
         TypeRepr::Option { .. } => Err(LayoutError::UnsupportedListElement {
             field: field_name.to_string(),
             inner: "Option",
@@ -358,6 +370,49 @@ fn list_layout_decision(
         TypeRepr::Closure { .. } => Err(LayoutError::UnsupportedListElement {
             field: field_name.to_string(),
             inner: "Closure",
+        }),
+    }
+}
+
+/// Start alignment of the `[len: u32][payload]` record an inner
+/// `List<inner>` element occupies. Mirrors the `tail_alignment` each
+/// scalar/String/Schema list field carries: `List<Int>` / `List<Float>`
+/// records start 8-aligned so the i64/f64 payload lands aligned, every
+/// other list record (Bool / String / Schema / a further nested List)
+/// starts 4-aligned. Rejects element shapes the writer/reader don't
+/// materialise so the nesting can't silently produce an undecodable
+/// buffer.
+fn inner_list_record_alignment(field_name: &str, inner: &TypeRepr) -> Result<usize, LayoutError> {
+    match inner {
+        // Inner *inline-fixed* element lists (`List<List<Int>>` /
+        // `List<List<Float>>` / `List<List<Bool>>`): each inner record
+        // is a self-contained `[len][payload]` with no internal pointer
+        // slots, so the outer pointer array's per-entry rebase is the
+        // only relocation needed. Int/Float records start 8-aligned for
+        // the aligned payload; Bool records start 4-aligned.
+        TypeRepr::Int | TypeRepr::Float => Ok(8),
+        TypeRepr::Bool => Ok(4),
+        // Inner *pointer-array* element lists (`List<List<String>>`,
+        // `List<List<Schema>>`) and deeper nesting carry their own
+        // internal pointer slots; rebasing them needs a recursive
+        // pointer-array relocation the v1 reloc walker does not model.
+        // Stay a loud cap rather than emit a buffer whose inner offsets
+        // are off by `paste_base`.
+        TypeRepr::String | TypeRepr::Schema { .. } | TypeRepr::List { .. } => {
+            Err(LayoutError::UnsupportedListElement {
+                field: field_name.to_string(),
+                inner: "List<pointer-array element>",
+            })
+        }
+        other => Err(LayoutError::UnsupportedListElement {
+            field: field_name.to_string(),
+            inner: match other {
+                TypeRepr::Option { .. } => "Option",
+                TypeRepr::Result { .. } => "Result",
+                TypeRepr::Null => "Null",
+                TypeRepr::Closure { .. } => "Closure",
+                _ => "List",
+            },
         }),
     }
 }
@@ -674,10 +729,10 @@ mod tests {
     }
 
     #[test]
-    fn list_of_nested_list_is_rejected() {
-        // List<List<Int>> waits for v3+. The error surfaces via the
-        // dedicated UnsupportedListElement variant so the host SDK can
-        // distinguish a top-level rejection from an element-level one.
+    fn list_of_nested_scalar_list_is_pointer_array() {
+        // `List<List<Int>>`: each element is an inner `[len][pad][i64]`
+        // record (8-aligned start) addressed through the outer pointer
+        // array, exactly like `List<String>` / `List<Schema>`.
         let schema = Schema {
             name: "Nested".into(),
             generics: vec![],
@@ -690,10 +745,37 @@ mod tests {
                 },
             )],
         };
+        let table = SchemaLayout::offsets_for(&schema).expect("nested scalar list accepted");
+        assert_eq!(
+            table.fields[0].list_element,
+            Some(ListElementKind::PointerArray { elem_alignment: 8 })
+        );
+    }
+
+    #[test]
+    fn list_of_inner_pointer_array_list_is_rejected() {
+        // `List<List<String>>`: the inner list record is itself a
+        // pointer array carrying internal slots the v1 reloc walker
+        // can't rebase — stays a loud cap via UnsupportedListElement.
+        let schema = Schema {
+            name: "Nested".into(),
+            generics: vec![],
+            fields: vec![field(
+                "xs",
+                TypeRepr::List {
+                    element: Box::new(TypeRepr::List {
+                        element: Box::new(TypeRepr::String),
+                    }),
+                },
+            )],
+        };
         let err = SchemaLayout::offsets_for(&schema).expect_err("must reject");
         assert!(matches!(
             err,
-            LayoutError::UnsupportedListElement { inner: "List", .. }
+            LayoutError::UnsupportedListElement {
+                inner: "List<pointer-array element>",
+                ..
+            }
         ));
     }
 

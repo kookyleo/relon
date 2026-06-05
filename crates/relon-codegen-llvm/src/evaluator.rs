@@ -1677,13 +1677,72 @@ fn marshal_list_in(
                 .write_list_string(name, &out)
                 .map_err(buffer_to_runtime_error)
         }
+        TypeRepr::Schema { schema } => marshal_list_schema_in(builder, name, schema, items),
+        TypeRepr::List { element: inner } => marshal_list_list_in(builder, name, inner, items),
         other => Err(RuntimeError::Unsupported {
             reason: format!(
                 "llvm-aot: List element type {other:?} for arg `{name}` is not yet materialised \
-                 (List<Int/Float/Bool/String> only; List<Schema> is a loud cap)"
+                 (List<Int/Float/Bool/String/Schema> + List<List<scalar>>)"
             ),
         }),
     }
+}
+
+/// Marshal a `List<Schema>` arg: each element is a branded
+/// `Value::Dict` written as a sub-record into the parent buffer's tail
+/// through [`relon_eval_api::buffer::ListRecordWriter`]. The list
+/// header's per-entry offsets and the inner sub-records' own pointer
+/// slots are relocated into the parent's coordinate system by
+/// `finish_entry` / `finish_list_record`. Mirrors the cranelift backend.
+fn marshal_list_schema_in(
+    builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
+    name: &str,
+    schema: &relon_eval_api::schema_canonical::Schema,
+    items: &[Value],
+) -> Result<(), RuntimeError> {
+    let elem_layout = relon_eval_api::layout::SchemaLayout::offsets_for(schema).map_err(|e| {
+        RuntimeError::Unsupported {
+            reason: format!("llvm-aot: List<Schema> arg `{name}` element layout: {e}"),
+        }
+    })?;
+    let mut writer = builder
+        .list_record_writer(name, &elem_layout, schema)
+        .map_err(buffer_to_runtime_error)?;
+    for (i, it) in items.iter().enumerate() {
+        let Value::Dict(dict) = it else {
+            return Err(RuntimeError::Unsupported {
+                reason: format!(
+                    "llvm-aot: List<Schema> arg `{name}` element #{i} got {} but expects a \
+                     branded record",
+                    it.type_name()
+                ),
+            });
+        };
+        let mut child = writer.start_entry();
+        write_schema_into_builder(&mut child, schema, dict, name)?;
+        writer
+            .finish_entry(builder, child)
+            .map_err(buffer_to_runtime_error)?;
+    }
+    builder
+        .finish_list_record(writer)
+        .map_err(buffer_to_runtime_error)
+}
+
+/// Marshal a nested `List<List<scalar>>` arg. Each element is itself a
+/// `Value::List` of inline-fixed scalars (`Int` / `Float` / `Bool`)
+/// serialised into a `[len][payload]` inner record; the outer header is
+/// a pointer array of offsets to those records. Mirrors the cranelift
+/// backend; inner pointer-array element lists (`List<List<String>>`)
+/// stay a loud cap at the layout pass.
+fn marshal_list_list_in(
+    builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
+    name: &str,
+    inner: &relon_eval_api::schema_canonical::TypeRepr,
+    items: &[Value],
+) -> Result<(), RuntimeError> {
+    relon_eval_api::buffer::write_nested_scalar_list(builder, name, inner, items)
+        .map_err(buffer_to_runtime_error)
 }
 
 /// Phase 0b: Schema-typed `#main` arg marshalling. A branded

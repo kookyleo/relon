@@ -237,6 +237,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 | IrType::ListBool
                 | IrType::ListString
                 | IrType::ListSchema
+                | IrType::ListList
                 | IrType::Closure
                 | IrType::Dict => 32,
             };

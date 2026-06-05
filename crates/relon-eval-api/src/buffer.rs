@@ -502,6 +502,91 @@ impl<'a> BufferBuilder<'a> {
         Ok(())
     }
 
+    /// Write a nested `List<List<inner>>` into `field_name`'s tail
+    /// area, where `inner` is an inline-fixed scalar element
+    /// (`Int` / `Float` / `Bool`).
+    ///
+    /// Layout mirrors `List<String>` / `List<Schema>`: a header
+    /// `[len: u32 LE][off_0]...[off_(n-1)]` whose `off_i` are
+    /// buffer-relative offsets to per-element inner list records. Each
+    /// inner record is the same `[len: u32 LE][payload]` shape
+    /// [`Self::write_list_int`] / `write_list_float` / `write_list_bool`
+    /// produce, so an inner-record reader decodes them bit-identically.
+    /// The inner records carry no pointer slots of their own, so no
+    /// per-element relocation beyond the header's `off_i` rebase is
+    /// needed when the buffer is later pasted into a parent.
+    ///
+    /// `encode_inner` serialises one element's payload bytes and returns
+    /// `(element_count, inner_alignment)`; the caller drives it once per
+    /// inner list. Returns the count actually written.
+    pub fn write_list_list_with<F>(
+        &mut self,
+        field_name: &str,
+        inner_count: usize,
+        mut encode_inner: F,
+    ) -> Result<(), BufferError>
+    where
+        F: FnMut(usize, &mut Vec<u8>) -> Result<(usize, usize), BufferError>,
+    {
+        let entry = self
+            .field_index
+            .iter()
+            .find(|e| e.name == field_name)
+            .ok_or_else(|| BufferError::UnknownField {
+                name: field_name.to_string(),
+            })?;
+        let is_nested_list = matches!(&entry.ty, TypeRepr::List { element }
+            if matches!(element.as_ref(), TypeRepr::List { .. }));
+        if !is_nested_list || !matches!(entry.kind, FieldKind::PointerIndirect { .. }) {
+            return Err(BufferError::TypeMismatch {
+                name: field_name.to_string(),
+                declared: type_label(&entry.ty),
+                requested: "List<List<…>>",
+            });
+        }
+        let slot_offset = entry.offset;
+        if inner_count > u32::MAX as usize {
+            return Err(BufferError::ValueTooLarge {
+                name: field_name.to_string(),
+                len: inner_count,
+            });
+        }
+        // Reserve the header `[len][off_0]...` first; back-patch each
+        // `off_i` after the matching inner record lands.
+        self.pad_to(4);
+        let header_offset = self.bytes.len();
+        self.bytes
+            .extend_from_slice(&u32::try_from(inner_count).unwrap().to_le_bytes());
+        let entries_start = self.bytes.len();
+        self.bytes.resize(entries_start + inner_count * 4, 0);
+        let mut offsets: Vec<u32> = Vec::with_capacity(inner_count);
+        for i in 0..inner_count {
+            let mut payload = Vec::new();
+            let (elem_count, inner_alignment) = encode_inner(i, &mut payload)?;
+            let rec_offset = self.append_tail_record_with_inner_alignment(
+                4,
+                inner_alignment.max(1),
+                elem_count,
+                &payload,
+            );
+            let rec_u32 = u32::try_from(rec_offset).map_err(|_| BufferError::ValueTooLarge {
+                name: format!("{field_name}[{i}]"),
+                len: rec_offset,
+            })?;
+            offsets.push(rec_u32);
+        }
+        for (i, off) in offsets.iter().enumerate() {
+            let dst = entries_start + i * 4;
+            self.bytes[dst..dst + 4].copy_from_slice(&off.to_le_bytes());
+        }
+        let ptr = u32::try_from(header_offset).map_err(|_| BufferError::ValueTooLarge {
+            name: field_name.to_string(),
+            len: header_offset,
+        })?;
+        self.bytes[slot_offset..slot_offset + 4].copy_from_slice(&ptr.to_le_bytes());
+        Ok(())
+    }
+
     /// Start writing a `List<Schema>` element. Returns a list-record
     /// writer the caller drives one entry at a time; the actual list
     /// header pointer is patched into the parent slot when
@@ -1074,6 +1159,83 @@ fn relocate_list_pointer_array(
         cursor += 4;
     }
     Ok(())
+}
+
+/// Marshal a nested `List<List<scalar>>` arg / schema field into
+/// `field_name`'s tail area, given the inner element [`TypeRepr`] and
+/// the outer `Value::List` items (each element itself a `Value::List`
+/// of inline-fixed scalars). Shared by both compiled backends so they
+/// emit byte-identical input buffers. Inner pointer-array element lists
+/// (`List<List<String>>` / `List<List<Schema>>`) are rejected by the
+/// layout pass before reaching here; this routine only handles the
+/// inline-fixed innermost elements (`Int` / `Float` / `Bool`).
+pub fn write_nested_scalar_list(
+    builder: &mut BufferBuilder<'_>,
+    field_name: &str,
+    inner: &TypeRepr,
+    items: &[crate::value::Value],
+) -> Result<(), BufferError> {
+    use crate::value::Value;
+    builder.write_list_list_with(field_name, items.len(), |i, payload| {
+        let Value::List(inner_items) = &items[i] else {
+            return Err(BufferError::TypeMismatch {
+                name: format!("{field_name}[{i}]"),
+                declared: "List<List<…>>",
+                requested: "List",
+            });
+        };
+        match inner {
+            TypeRepr::Int => {
+                for it in inner_items.iter() {
+                    let Value::Int(v) = it else {
+                        return Err(BufferError::TypeMismatch {
+                            name: format!("{field_name}[{i}]"),
+                            declared: "List<Int>",
+                            requested: "List<Int>",
+                        });
+                    };
+                    payload.extend_from_slice(&v.to_le_bytes());
+                }
+                Ok((inner_items.len(), 8))
+            }
+            TypeRepr::Float => {
+                for it in inner_items.iter() {
+                    let f = match it {
+                        Value::Float(v) => v.into_inner(),
+                        // Int → Float promotion, matching the scalar arm.
+                        Value::Int(v) => *v as f64,
+                        _ => {
+                            return Err(BufferError::TypeMismatch {
+                                name: format!("{field_name}[{i}]"),
+                                declared: "List<Float>",
+                                requested: "List<Float>",
+                            })
+                        }
+                    };
+                    payload.extend_from_slice(&f.to_le_bytes());
+                }
+                Ok((inner_items.len(), 8))
+            }
+            TypeRepr::Bool => {
+                for it in inner_items.iter() {
+                    let Value::Bool(v) = it else {
+                        return Err(BufferError::TypeMismatch {
+                            name: format!("{field_name}[{i}]"),
+                            declared: "List<Bool>",
+                            requested: "List<Bool>",
+                        });
+                    };
+                    payload.push(u8::from(*v));
+                }
+                Ok((inner_items.len(), 4))
+            }
+            _ => Err(BufferError::TypeMismatch {
+                name: field_name.to_string(),
+                declared: "List<List<scalar>>",
+                requested: "List<List<pointer-array element>>",
+            }),
+        }
+    })
 }
 
 /// Type-checked reader over a record buffer plus optional tail area.
@@ -2601,5 +2763,81 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Nested `List<List<Int>>`: the header's `[len][off_i]` pointer
+    /// array names per-element inner `[len][pad][i64...]` records.
+    /// Decodes the buffer by hand (no reader API for nested lists yet)
+    /// to pin the exact byte layout the compiled backends consume.
+    #[test]
+    fn write_nested_scalar_list_int_layout() {
+        use crate::value::Value;
+        let schema = Schema {
+            name: "Grid".into(),
+            generics: vec![],
+            fields: vec![field(
+                "xss",
+                TypeRepr::List {
+                    element: Box::new(TypeRepr::List {
+                        element: Box::new(TypeRepr::Int),
+                    }),
+                },
+            )],
+        };
+        let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+        let mut b = BufferBuilder::new(&layout, &schema.fields);
+        let items = vec![
+            Value::List(vec![Value::Int(1), Value::Int(2)].into()),
+            Value::List(vec![Value::Int(3)].into()),
+            Value::List(vec![].into()),
+        ];
+        write_nested_scalar_list(&mut b, "xss", &TypeRepr::Int, &items).expect("write");
+        let bytes = b.finish();
+
+        // Field slot at offset 0 → header offset.
+        let read_u32 =
+            |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let header = read_u32(0);
+        assert_eq!(read_u32(header), 3, "outer len");
+        // Each inner record: [len:u32][pad to 8][i64 x len].
+        let decode_inner = |rec: usize| -> Vec<i64> {
+            let n = read_u32(rec);
+            let payload = (rec + 4).next_multiple_of(8);
+            (0..n)
+                .map(|i| {
+                    let at = payload + i * 8;
+                    i64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+                })
+                .collect()
+        };
+        let off0 = read_u32(header + 4);
+        let off1 = read_u32(header + 8);
+        let off2 = read_u32(header + 12);
+        assert_eq!(decode_inner(off0), vec![1, 2]);
+        assert_eq!(decode_inner(off1), vec![3]);
+        assert_eq!(decode_inner(off2), Vec::<i64>::new());
+    }
+
+    /// `write_nested_scalar_list` rejects an inner pointer-array element
+    /// (`List<List<String>>`) loudly — the recursive relocation isn't
+    /// modelled, so it must never silently produce a buffer.
+    #[test]
+    fn nested_list_inner_string_rejected() {
+        use crate::value::Value;
+        let schema = Schema {
+            name: "Grid".into(),
+            generics: vec![],
+            fields: vec![field(
+                "xss",
+                TypeRepr::List {
+                    element: Box::new(TypeRepr::List {
+                        element: Box::new(TypeRepr::String),
+                    }),
+                },
+            )],
+        };
+        // Layout itself refuses the inner pointer-array element.
+        assert!(SchemaLayout::offsets_for(&schema).is_err());
+        let _ = Value::Int(0);
     }
 }

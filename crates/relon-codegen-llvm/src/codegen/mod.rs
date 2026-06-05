@@ -1278,6 +1278,7 @@ fn ir_ty_to_llvm_abi<'ctx>(ctx: &'ctx Context, ty: IrType) -> Option<BasicTypeEn
         | IrType::ListBool
         | IrType::ListString
         | IrType::ListSchema
+        | IrType::ListList
         | IrType::Closure
         | IrType::Dict => Some(ctx.i32_type().into()),
     }
@@ -2508,6 +2509,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             | IrType::ListBool
             | IrType::ListString
             | IrType::ListSchema
+            | IrType::ListList
             | IrType::Closure
             | IrType::Dict => self.ctx.i32_type().into(),
         };
@@ -2747,6 +2749,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                     | IrType::ListBool
                     | IrType::ListString
                     | IrType::ListSchema
+                    | IrType::ListList
                     | IrType::Closure
                     | IrType::Dict => self.ctx.i32_type().into(),
                 };
@@ -2880,6 +2883,9 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             }
             Op::LoadListSchemaPtr { offset } => {
                 self.emit_load_pointer_indirect_param(*offset, IrType::ListSchema)?
+            }
+            Op::LoadListListPtr { offset } => {
+                self.emit_load_pointer_indirect_param(*offset, IrType::ListList)?
             }
 
             // ---- ReadStringLen (Phase 2 — backs `length(s)` / `len(xs)`) ----
@@ -3177,6 +3183,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             | IrType::ListBool
             | IrType::ListString
             | IrType::ListSchema
+            | IrType::ListList
             | IrType::Closure
             | IrType::Dict => 32,
         };
@@ -3233,6 +3240,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             | IrType::ListBool
             | IrType::ListString
             | IrType::ListSchema
+            | IrType::ListList
             | IrType::Closure
             | IrType::Dict => Ok(self.ctx.i32_type()),
         }

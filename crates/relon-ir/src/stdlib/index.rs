@@ -113,6 +113,7 @@ pub fn stdlib_method_index(receiver_ty: IrType, name: &str) -> Option<u32> {
         (IrType::ListBool, "length") => stdlib_function_index("list_bool_length"),
         (IrType::ListString, "length") => stdlib_function_index("list_string_length"),
         (IrType::ListSchema, "length") => stdlib_function_index("list_schema_length"),
+        (IrType::ListList, "length") => stdlib_function_index("list_list_length"),
         _ => None,
     }
 }

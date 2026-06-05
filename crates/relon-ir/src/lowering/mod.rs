@@ -1024,14 +1024,17 @@ fn type_node_to_canonical_with_schemas(
     // Phase 10-c: `List<User>` — the head is `List` with a single
     // generic naming a user schema. Recurse into the generic via
     // `with_schemas` so the inner schema lookup succeeds, then wrap
-    // it in a List variant.
+    // it in a List variant. Also accepts a nested `List<List<…>>`
+    // generic (the inner is itself a `List`), so a `#main(List<List<Int>>
+    // xss)` param canonicalises; the layout pass enforces that the
+    // innermost element is an inline-fixed scalar.
     if t.path.len() == 1
         && t.path[0].as_str() == "List"
         && t.generics.len() == 1
         && t.variant_fields.is_none()
     {
         let inner = type_node_to_canonical_with_schemas(&t.generics[0], resolver)?;
-        if matches!(inner, TypeRepr::Schema { .. }) {
+        if matches!(inner, TypeRepr::Schema { .. } | TypeRepr::List { .. }) {
             return Some(TypeRepr::List {
                 element: Box::new(inner),
             });
@@ -1803,6 +1806,7 @@ fn type_repr_to_ir_type(t: &TypeRepr) -> Result<IrType, LoweringError> {
             TypeRepr::Bool => Ok(IrType::ListBool),
             TypeRepr::String => Ok(IrType::ListString),
             TypeRepr::Schema { .. } => Ok(IrType::ListSchema),
+            TypeRepr::List { .. } => Ok(IrType::ListList),
             _ => Err(LoweringError::UnsupportedTypeInMain {
                 type_name: format!("{t:?}"),
                 range: TokenRange::default(),
@@ -5024,11 +5028,23 @@ fn canonical_type_repr<'a>(
             // Scalar / String element lists are materialised by both
             // compiled backends (`write_list_*` host encoders +
             // `LoadFieldAtAbsolute` pointer-indirect field decode).
-            // Nested `List<List<…>>` and `List<Schema>` schema fields
-            // stay a loud cap — their element decode is not lowered.
+            // `List<Schema>` and nested `List<List<…>>` element lists
+            // are pointer arrays whose entries are themselves records
+            // (a schema sub-record / an inner list record); the host
+            // encoders recurse through `list_record_writer` /
+            // `write_list_arg_into_builder`, the layout pass models the
+            // per-entry pointer array, and `relocate_pointers` rebases
+            // the inner slots. The element decode is consumed through
+            // the `[len]` header (`.length()`) — the only cross-backend
+            // consumer that lowers for these shapes.
             if matches!(
                 inner,
-                TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool | TypeRepr::String
+                TypeRepr::Int
+                    | TypeRepr::Float
+                    | TypeRepr::Bool
+                    | TypeRepr::String
+                    | TypeRepr::Schema { .. }
+                    | TypeRepr::List { .. }
             ) {
                 Ok(TypeRepr::List {
                     element: Box::new(inner),
@@ -5814,6 +5830,9 @@ fn lower_variable(
                 offset: binding.offset,
             },
             (IrType::ListSchema, _) => Op::LoadListSchemaPtr {
+                offset: binding.offset,
+            },
+            (IrType::ListList, _) => Op::LoadListListPtr {
                 offset: binding.offset,
             },
             _ => Op::LoadField {
