@@ -92,8 +92,9 @@ pub use codegen::WorldMode;
 pub use error::LlvmError;
 pub use evaluator::{
     CodegenTarget, EmitObjectInfo, EmittedEntryShape, EmittedField, EmittedFieldType,
-    LlvmAotEvaluator,
+    LlvmAotEvaluator, WasmBufferDispatch,
 };
+pub use relon_eval_api::inplace_return::ArenaRegions;
 pub use sandbox::{CapabilityVtable, SandboxConfig, SandboxTrapKind};
 pub use state::HostFnRegistry;
 pub use vtable::{populate_global_mappings, VtableSlot};

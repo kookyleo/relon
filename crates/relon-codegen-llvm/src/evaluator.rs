@@ -36,6 +36,7 @@ use inkwell::targets::{
 use inkwell::OptimizationLevel;
 
 use ordered_float::OrderedFloat;
+use relon_eval_api::inplace_return::ArenaRegions;
 use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
 use relon_parser::Node;
 
@@ -1365,21 +1366,69 @@ impl LlvmAotEvaluator {
         if trap_code != 0 {
             return Err(crate::state::NativeTrap::runtime_error_from_code(trap_code));
         }
+        // Decode the buffer return out of the arena. The decode is
+        // backend-shared and arena-source-agnostic (host JIT arena here;
+        // wasm linear memory in the wasm-evaluator path) — see
+        // [`Self::decode_buffer_return`].
+        self.decode_buffer_return(
+            schema,
+            arena,
+            ArenaRegions {
+                const_data_len: self.const_data.len(),
+                in_ptr,
+                in_len,
+                out_ptr,
+                out_cap,
+                scratch_base,
+                arena_size,
+            },
+            bytes_written,
+        )
+    }
+
+    /// Decode a buffer-protocol return out of an arena, given the raw
+    /// i32 the entry returned (`bytes_written` / sentinel) and the arena
+    /// region boundaries.
+    ///
+    /// This is the **single** post-call decode the native JIT path and
+    /// the wasm-evaluator path share. It is deliberately source-agnostic:
+    /// `arena` is just `&[u8]` (the host JIT arena, or a slice of wasm
+    /// linear memory rebased to the arena origin), and every region
+    /// offset in `regions` is arena-relative, so the wasm host can hand
+    /// the same view and offsets the JIT path computes.
+    ///
+    /// Two paths, identical to the historical inline decode:
+    /// - **negative** `ret`: the in-place region-walk sentinel
+    ///   `-(root_abs + 1)`. We recover `root_abs`, then defer entirely to
+    ///   the backend-shared `relon_eval_api::inplace_return` pipeline
+    ///   (region-select → **verifier** → in-place decode). The verifier
+    ///   is non-negotiable: an unverified buffer is never decoded, on the
+    ///   wasm linear-memory path exactly as on the host path.
+    /// - **non-negative** `ret`: the fixed-area / tail-cursor return; the
+    ///   `BufferReader` walks `out_buf`.
+    fn decode_buffer_return(
+        &self,
+        schema: &BufferSchema,
+        arena: &[u8],
+        regions: ArenaRegions,
+        ret: i32,
+    ) -> Result<Value, RuntimeError> {
         // In-place region-walk return ABI (S2): a negative return value
         // is the in-place sentinel `-(root_abs + 1)`. Instead of a value
         // copied into `out_buf`, the machine code reports the
-        // arena-absolute offset of the return root — a `List<List<scalar>>`
-        // or `List<String>` value sourced from a `#main` parameter
-        // identity.
+        // arena-relative offset of the return root — a `List<List<scalar>>`,
+        // `List<String>`, or `List<Schema>` value sourced from a `#main`
+        // parameter identity.
         // We rebase it to its source region, run the bounds verifier over
         // the whole reachable graph confined to that region, and only on
         // a clean verify decode the value in place. A verifier failure is
         // a loud error — we never decode an unverified in-place return.
         // The decode pipeline (sentinel → region-select → verifier →
         // decode) is shared with the cranelift backend via
-        // `relon_eval_api::inplace_return`.
-        if bytes_written < 0 {
-            let root_abs = relon_eval_api::inplace_return::decode_inplace_sentinel(bytes_written)?;
+        // `relon_eval_api::inplace_return`, and reused verbatim by the
+        // wasm host (the arena is then a slice of wasm linear memory).
+        if ret < 0 {
+            let root_abs = relon_eval_api::inplace_return::decode_inplace_sentinel(ret)?;
             if !is_single_value_wrapper(&schema.return_schema) {
                 return Err(RuntimeError::IoError(
                     "llvm-aot in-place return on a non-single-value return schema".into(),
@@ -1388,31 +1437,24 @@ impl LlvmAotEvaluator {
             return relon_eval_api::inplace_return::decode_inplace_return(
                 "llvm-aot",
                 arena,
-                relon_eval_api::inplace_return::ArenaRegions {
-                    const_data_len: self.const_data.len(),
-                    in_ptr,
-                    in_len,
-                    out_ptr,
-                    out_cap,
-                    scratch_base,
-                    arena_size,
-                },
+                regions,
                 root_abs,
                 &schema.return_schema.fields[0],
                 &schema.return_layout,
                 &schema.return_schema.fields,
             );
         }
-        let bw = bytes_written as usize;
+        let bw = ret as usize;
 
         let read_len = bw.max(schema.return_layout.root_size);
-        let read_end = out_ptr as usize + read_len;
-        if read_end > arena_size {
+        let out_ptr = regions.out_ptr as usize;
+        let read_end = out_ptr + read_len;
+        if read_end > regions.arena_size || read_end > arena.len() {
             return Err(RuntimeError::IoError(
                 "llvm-aot arena too small for return decode".into(),
             ));
         }
-        let out_bytes = &arena[out_ptr as usize..read_end];
+        let out_bytes = &arena[out_ptr..read_end];
         let reader = relon_eval_api::buffer::BufferReader::new(
             &schema.return_layout,
             &schema.return_schema.fields,
@@ -1430,6 +1472,123 @@ impl LlvmAotEvaluator {
             ))
         }
     }
+
+    /// Plan a wasm buffer-protocol dispatch: pack the `#main` args into
+    /// the input record and compute the same arena layout
+    /// `run_main_buffer` lays for the host JIT.
+    ///
+    /// The wasm host (wasmtime) lays the returned [`WasmBufferDispatch`]
+    /// into linear memory, invokes the exported buffer entry, then hands
+    /// the post-call arena view back to [`Self::wasm_buffer_decode`]. The
+    /// arena layout, the const-data prefix, and the input packing are
+    /// **byte-identical** to the host path, so the wasm module — which is
+    /// the same LLVM IR retargeted to wasm32 — observes exactly the arena
+    /// the JIT body was emitted against. The single divergence is the
+    /// arena's absolute base in memory (a host `Vec` vs. a wasm
+    /// linear-memory offset), which the wasm body absorbs through its
+    /// `arena_base` global; every offset here is arena-relative.
+    pub fn wasm_buffer_plan(
+        &self,
+        args: &HashMap<String, Value>,
+    ) -> Result<WasmBufferDispatch, RuntimeError> {
+        let schema = self
+            .buffer_schema
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Unsupported {
+                reason: "llvm-aot: wasm_buffer_plan called without schema metadata".into(),
+            })?;
+
+        // Pack the input record exactly as `run_main_buffer` does.
+        let mut builder = relon_eval_api::buffer::BufferBuilder::new(
+            &schema.main_layout,
+            &schema.main_schema.fields,
+        );
+        for field in &schema.main_schema.fields {
+            let value = args
+                .get(&field.name)
+                .ok_or_else(|| RuntimeError::Unsupported {
+                    reason: format!("llvm-aot: missing #main arg `{}`", field.name),
+                })?;
+            write_value_into_builder(&mut builder, field, value)?;
+        }
+        let in_bytes = builder.finish();
+
+        // Lay out the arena identically to `run_main_buffer`.
+        let in_len = in_bytes.len() as u32;
+        let out_root_size = schema.return_layout.root_size as u32;
+        let needs_pointer_indirect_return = return_needs_tail_region(&schema.return_schema);
+        let tail_cap: u32 = if needs_pointer_indirect_return {
+            65_536
+        } else {
+            0
+        };
+        let out_cap = relon_util::align_up(out_root_size.max(8) + tail_cap + 16, 8);
+        let const_data_len = u32::try_from(self.const_data.len()).map_err(|_| {
+            RuntimeError::IoError("llvm const-data section exceeds u32 range".into())
+        })?;
+        let in_ptr = relon_util::align_up(const_data_len, 8);
+        let out_ptr = relon_util::align_up(in_ptr + in_len, 8);
+        let scratch_base = relon_util::align_up(out_ptr + out_cap, 8);
+        let scratch_size: u32 = 1_048_576;
+        let arena_size = (scratch_base + scratch_size) as usize;
+
+        Ok(WasmBufferDispatch {
+            const_data: self.const_data.clone(),
+            in_bytes,
+            regions: ArenaRegions {
+                const_data_len: self.const_data.len(),
+                in_ptr,
+                in_len,
+                out_ptr,
+                out_cap,
+                scratch_base,
+                arena_size,
+            },
+        })
+    }
+
+    /// Decode a wasm buffer-protocol return. `arena` is a slice of the
+    /// wasm linear memory **rebased to the arena origin** (i.e.
+    /// `&memory[arena_abs .. arena_abs + arena_size]`), so the
+    /// arena-relative offsets in `regions` and the arena-relative root in
+    /// the negative sentinel resolve exactly as they do on the host JIT
+    /// path. `ret` is the i32 the wasm entry returned.
+    ///
+    /// This routes through the **same** [`Self::decode_buffer_return`] the
+    /// host path uses — the in-place sentinel still runs the
+    /// `relon_eval_api::inplace_return` verifier over the linear-memory
+    /// slice before any decode. There is no wasm-specific decode or
+    /// wasm-specific verifier.
+    pub fn wasm_buffer_decode(
+        &self,
+        arena: &[u8],
+        regions: ArenaRegions,
+        ret: i32,
+    ) -> Result<Value, RuntimeError> {
+        let schema = self
+            .buffer_schema
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Unsupported {
+                reason: "llvm-aot: wasm_buffer_decode called without schema metadata".into(),
+            })?;
+        self.decode_buffer_return(schema, arena, regions, ret)
+    }
+}
+
+/// A planned wasm buffer-protocol dispatch produced by
+/// [`LlvmAotEvaluator::wasm_buffer_plan`]: the const-data prefix, the
+/// packed input record, and the full arena region layout. The wasm host
+/// lays `const_data` at arena offset 0 and `in_bytes` at
+/// `regions.in_ptr`, invokes the entry symbol it emitted, then decodes
+/// via [`LlvmAotEvaluator::wasm_buffer_decode`].
+#[derive(Debug, Clone)]
+pub struct WasmBufferDispatch {
+    /// Const-pool blob; laid at arena offset 0 (before `in_ptr`).
+    pub const_data: Vec<u8>,
+    /// Packed input record; laid at `regions.in_ptr`.
+    pub in_bytes: Vec<u8>,
+    /// Arena region boundaries (all arena-relative).
+    pub regions: ArenaRegions,
 }
 
 impl Evaluator for LlvmAotEvaluator {
@@ -2508,8 +2667,34 @@ impl LlvmAotEvaluator {
         // for type tags Phase 2 hasn't wired marshalling for yet —
         // the build.rs binding side can't generate a Rust wrapper
         // for an unknown leaf type.
-        let main_fields = lower_field_descriptors(&schema.main_schema, &schema.main_layout)?;
-        let return_fields = lower_field_descriptors(&schema.return_schema, &schema.return_layout)?;
+        //
+        // This strict projection only matters to the **build.rs binding
+        // generator**, which consumes `main_fields` / `return_fields` to
+        // stamp the typed Rust wrapper — that path is `Native` only. The
+        // `Wasm32` target feeds the **wasm-evaluator host**, which packs
+        // its input and decodes its return through `wasm_buffer_plan` /
+        // `wasm_buffer_decode` (driven by the full `BufferSchema`), never
+        // these erased descriptors. So a `#main` carrying a pointer-array
+        // list param/return the binding can't marshal (e.g. an in-place
+        // `List<List<scalar>>` / `List<String>` / `List<Schema>` identity)
+        // must still emit a runnable wasm body. We therefore only enforce
+        // the binding-marshallability gate on `Native`; on `Wasm32` an
+        // unbindable leaf yields an empty descriptor vec (the wasm host
+        // ignores it) rather than aborting the emit.
+        let descriptors_strict = matches!(target, CodegenTarget::Native);
+        let (main_fields, return_fields) = if descriptors_strict {
+            (
+                lower_field_descriptors(&schema.main_schema, &schema.main_layout)?,
+                lower_field_descriptors(&schema.return_schema, &schema.return_layout)?,
+            )
+        } else {
+            (
+                lower_field_descriptors(&schema.main_schema, &schema.main_layout)
+                    .unwrap_or_default(),
+                lower_field_descriptors(&schema.return_schema, &schema.return_layout)
+                    .unwrap_or_default(),
+            )
+        };
 
         let entry_idx = ir
             .entry_func_index
