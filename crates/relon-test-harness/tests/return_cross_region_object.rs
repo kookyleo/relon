@@ -553,28 +553,58 @@ fn cross_region_object_field_from_param_field() {
     assert_cross_region(src_tags, args1("o", o2));
 }
 
-/// Shapes still beyond F4 must cap on both native backends (loud decline).
-/// F4 released the parameter-*field* list source (`w.items` / `o.tags`);
-/// what remains capped is the doubly-nested pointer-array
-/// (`List<List<Schema>>` / `List<List<String>>`, F5).
+/// F5: the doubly-nested pointer-array object fields (`List<List<Schema>>`
+/// / `List<List<String>>`, by parameter identity AND parameter-field walk)
+/// now compile + decode bit-equal on every backend. Pins that neither
+/// regresses to a cap.
 #[test]
-fn beyond_f4_still_capped() {
+fn f5_double_pointer_array_object_field_compiles() {
+    let multibyte = "\u{4E2D}\u{6587}";
+    // List<List<Server>> field by parameter identity.
+    let src_schema = "#schema Server { name: String }\n\
+         #main(List<List<Server>> xs) -> Dict\n{ xs: xs, n: 1 }";
+    let xs = list(vec![
+        list(vec![cfg("Server", vec![("name", s("a"))])]),
+        list(vec![]),
+        list(vec![cfg("Server", vec![("name", s(multibyte))])]),
+    ]);
+    assert_cross_region(src_schema, args1("xs", xs));
+
+    // Parameter-field List<List<String>>.
+    let src_field = "#schema W { rows: List<List<String>>, n: Int }\n\
+         #main(W w) -> Dict\n{ rows: w.rows, n: 1 }";
+    let w = cfg(
+        "W",
+        vec![
+            (
+                "rows",
+                list(vec![list(vec![s(""), s(multibyte)]), list(vec![s("z")])]),
+            ),
+            ("n", Value::Int(2)),
+        ],
+    );
+    assert_cross_region(src_field, args1("w", w));
+}
+
+/// Shapes still beyond F5 must cap on both native backends (loud decline):
+/// the `o.inner.tags` ≥3-segment nested-schema field chain (F4 admits only
+/// a single-segment field walk) and `Dict<_,_>` params (an analyzer
+/// dead-end with no input decode path).
+#[test]
+fn beyond_f5_still_capped() {
     let cap_cases = [
-        // List<List<Schema>> field — inner pointer-array-of-pointer-array,
-        // out of scope (F5).
-        "#schema Server { name: String }\n\
-         #main(List<List<Server>> xs) -> Dict\n{ xs: xs, n: 1 }",
-        // Parameter-*field* List<List<String>> — double pointer array field,
-        // out of scope (F5).
-        "#schema W { rows: List<List<String>>, n: Int }\n\
-         #main(W w) -> Dict\n{ rows: w.rows, n: 1 }",
+        // ≥3-segment nested-schema field chain.
+        "#schema Inner { tags: List<String> }\n#schema Outer { inner: Inner }\n\
+         #main(Outer o) -> Dict\n{ t: o.inner.tags, n: 1 }",
+        // Dict param — analyzer dead-end.
+        "#main(Dict<String, Int> d) -> Dict\n{ n: 1 }",
     ];
     for src in cap_cases {
         match new_evaluator(src, Backend::CraneliftAot) {
             Err(BackendError::CraneliftAot(_)) => { /* loud decline — correct */ }
             Err(other) => panic!("expected a CraneliftAot decline for `{src}`, got {other}"),
             Ok(_) => panic!(
-                "cranelift unexpectedly accepted a beyond-F3 shape: `{src}` — a silent \
+                "cranelift unexpectedly accepted a beyond-F5 shape: `{src}` — a silent \
                  miscompile path may have opened"
             ),
         }
@@ -582,7 +612,7 @@ fn beyond_f4_still_capped() {
         match new_evaluator(src, Backend::LlvmAot) {
             Err(BackendError::LlvmAot(_)) => { /* loud decline — correct */ }
             Err(other) => panic!("expected an LlvmAot decline for `{src}`, got {other}"),
-            Ok(_) => panic!("llvm unexpectedly accepted a beyond-F3 shape: `{src}`"),
+            Ok(_) => panic!("llvm unexpectedly accepted a beyond-F5 shape: `{src}`"),
         }
     }
 }

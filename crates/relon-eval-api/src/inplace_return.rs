@@ -143,12 +143,24 @@ pub fn decode_inplace_return(
         ListString,
         /// `List<Schema>`; carries the per-element sub-record schema.
         ListSchema(&'a Schema),
+        /// F5: a doubly-nested pointer-array list — `List<List<String>>`
+        /// / `List<List<Schema>>` (and deeper). Carries the **outer list
+        /// element** type (`List<String>` / `List<Schema>`); the unified
+        /// recursive reader walks one level deeper than the scalar path.
+        ListListPointerArray(&'a TypeRepr),
     }
     let shape = match &return_field.ty {
         TypeRepr::List { element } => match element.as_ref() {
-            TypeRepr::List { element: inner } => {
-                InplaceShape::ListListScalar(inner.as_ref().clone())
-            }
+            TypeRepr::List { element: inner } => match inner.as_ref() {
+                // Inner inline-fixed scalar: the S1/S2 path.
+                TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool => {
+                    InplaceShape::ListListScalar(inner.as_ref().clone())
+                }
+                // Inner pointer-array element (String / Schema / deeper
+                // List): the F5 recursive path. `element` is the outer
+                // list element (`List<String>` / `List<Schema>`).
+                _ => InplaceShape::ListListPointerArray(element.as_ref()),
+            },
             TypeRepr::String => InplaceShape::ListString,
             TypeRepr::Schema { schema } => InplaceShape::ListSchema(schema.as_ref()),
             other => {
@@ -228,6 +240,18 @@ pub fn decode_inplace_return(
             Ok(Value::List(Arc::new(
                 items.into_iter().map(|s| Value::String(s.into())).collect(),
             )))
+        }
+        InplaceShape::ListListPointerArray(outer_element) => {
+            // The verifier already certified the whole graph (outer
+            // entries → inner list headers → inner entries → String /
+            // sub-record / String-field layer). Decode in place via the
+            // unified recursive reader: `root_abs` is the outer header, and
+            // `outer_element` (`List<String>` / `List<Schema>`) drives one
+            // level of recursion per outer entry.
+            let rows = reader
+                .read_list_value_at(root_abs, outer_element)
+                .map_err(|e| RuntimeError::IoError(format!("{backend} buffer: {e}")))?;
+            Ok(Value::List(Arc::new(rows)))
         }
         InplaceShape::ListSchema(schema) => {
             // The verifier already certified the whole graph: outer

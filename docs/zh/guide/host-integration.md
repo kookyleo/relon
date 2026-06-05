@@ -67,13 +67,16 @@ host-pushed slot：
 >
 > - 标量叶子（`Int` / `Float` / `Bool` / `Null`）；
 > - **`String`** 入参（如 host 读好、喂进来的文件内容）；
-> - **`List<scalar>`**、**`List<String>`**、**`List<Schema>`** 与嵌套
->   **`List<List<scalar>>`** 入参（经 `.length()` 或同级标量字段读出消费；
->   元素的内层记录 —— schema 子记录 / 内层 list 记录 —— 会物化进 buffer
->   tail 区，并重定位进父 buffer 坐标系）；
+> - **`List<scalar>`**、**`List<String>`**、**`List<Schema>`**、嵌套
+>   **`List<List<scalar>>`**，以及双层指针数组 **`List<List<String>>`** /
+>   **`List<List<Schema>>`** 入参（经 `.length()` 或同级标量字段读出消费；
+>   元素的内层记录 —— schema 子记录、内层 string/scalar list 记录，或内层
+>   指针数组 list —— 会物化进 buffer tail 区，并递归重定位进父 buffer
+>   坐标系）；
 > - **用户 `#schema` 结构体入参**，其字段为标量、`String`、
->   `List<scalar>`、`List<String>`、`List<Schema>` 或 `List<List<scalar>>`
->   —— 即整包结构化 config 记录，含字符串、列表、record 列表与嵌套列表字段；
+>   `List<scalar>`、`List<String>`、`List<Schema>`、`List<List<scalar>>`，
+>   或双层 `List<List<String>>` / `List<List<Schema>>` —— 即整包结构化
+>   config 记录，含字符串、列表、record 列表与嵌套列表字段；
 > - **嵌套 `#schema` 结构体字段** 的多段链式读取（`o.inner.x`，乃至
 >   更深的 `c.b.a.v`）。两种字段声明写法都可用 —— 值位 `inner: Inner`
 >   与前缀 `Inner inner: *` —— 每个中间段会先 rebase 到其子记录基址，
@@ -122,6 +125,18 @@ host-pushed slot：
 >   **同样支持**（F4，经同一 arena-绝对字段读取）；子记录自身再含
 >   嵌套 `List<Schema>` / `List<List<…>>` 字段者仍 cap（超出范围 —— 就地子
 >   记录读取器对其响亮 cap）；
+> - **从 `#main` 入参返回 `List<List<String>>` / `List<List<Schema>>`**
+>   （`#main(List<List<String>> xss) -> List<List<String>> = xss`，及
+>   `List<List<Cfg>>` 形），**cranelift、llvm 与已编译 wasm 三个后端均已
+>   支持**（F5）。这是**双层**指针数组形状：外层 `[len][off_i]` 头指向内层
+>   指针数组 list 记录，每个内层记录自身又是 `[len][inner_off_j]` 头，其
+>   entry 指向 `String` / schema 子记录。递归输入 marshaller 写出整张图，
+>   重定位 walker 把内层指针数组再下钻一层 rebase，机器码报外层根偏移；host
+>   verifier 递归走到**最内层每条记录**（外层 entry → 内层 list 头 → 内层
+>   entry → String / schema 记录）再就地解码 —— 逐字节等价于 tree-walk
+>   oracle（含每个内层元素的内容，CJK / 空 / 超长），wasm 上亦然。入参
+>   **恒等**、入参 **字段** 走读（`#main(W w) -> List<List<String>> = w.rows`）
+>   与作对象字段（匿名 `Dict` / 结构体）均支持；
 > - **`#schema` 加品牌的结构体返回**（`#main() -> Cfg { ... }`），字段
 >   可含上述任意类型（含字面量 `String` / `List` 字段）；
 > - **匿名 `-> Dict { ... }` 返回** —— 每个非 `#internal` 字段都会
@@ -134,10 +149,10 @@ host-pushed slot：
 >
 > - `Dict<_, _>` 入参（analyzer 无法给 `d["x"]` 下标定类型；结构化
 >   config 请改用 `#schema` 结构体）；
-> - 内层为指针数组元素的嵌套 List（`List<List<String>>` /
->   `List<List<Schema>>`）—— 递归逐元素重定位尚未建模；
 > - 返回子记录自身再含嵌套 `List<Schema>` / `List<List<…>>` 字段的
->   `List<Schema>`（就地子记录读取器对其更深的指针数组响亮 cap）。
+>   `List<Schema>`（就地子记录读取器对其更深的指针数组响亮 cap）；
+> - `≥3` 段嵌套 schema **字段链**走读返回（`o.inner.tags`）—— 就地返回
+>   路径只接单段入参字段走读。
 >
 >   返回**含该类入参字段的对象** —— 无论对象是**匿名 `Dict`**
 >   （`-> Dict { servers: servers, n: 1 }`）还是**结构体 `#schema`**
@@ -157,15 +172,17 @@ host-pushed slot：
 >   verifier，把槽指针判区到 input 区并对整张可达图界检（深至每个子记录的
 >   String 字段），再由 `BufferReader::new_at_base` 跨区走读 —— 逐字节等价于
 >   tree-walk oracle。wasm 上 host 从**线性内存**取同一片 arena 并跑同一份
->   verifier 门控的解码，无 wasm 专属路径。剩余仍 cap 的情形（双层嵌套的
->   `List<List<Schema>>` / `List<List<String>>`）下后端均拒绝，绝不存入不支持
->   的指针数组。host 侧 **解码已就位**：
+>   verifier 门控的解码，无 wasm 专属路径。双层嵌套的
+>   `List<List<Schema>>` / `List<List<String>>` 对象字段**同样支持**（F5）：
+>   内层指针数组被再下钻一层重定位、verify 与读取。host 侧 **解码已就位**：
 >   `BufferReader` 以单一基址走读 buffer，递归重建嵌套 `Value`
 >   （`List<Schema>` 走 `read_list_record` / `read_list_record_at`，
 >   `List<List<scalar>>` 走 `read_list_list` / `read_list_list_at`，就地
->   `List<String>` 走 `read_list_string_at`）。就地返回接线已覆盖 **逐元素
->   指针数组** 的 `List<String>` 与 `List<Schema>`，入参 **恒等** 与（F4）
->   入参 **字段** 走读两形（见上）；仅更深的嵌套元素 list 仍保持编译期响亮 cap。
+>   `List<String>` 走 `read_list_string_at`，双层指针数组走递归
+>   `read_list_value` / `read_list_value_at`）。就地返回接线已覆盖 **逐元素
+>   指针数组** 的 `List<String>` / `List<Schema>` 及双层
+>   `List<List<String>>` / `List<List<Schema>>`，入参 **恒等** 与（F4/F5）
+>   入参 **字段** 走读两形（见上）。
 > - **返回来自 `#main` 入参函数调用 / 任意表达式（而非入参恒等、入参字段走读
 >   或源码内字面量）的指针数组 list** —— 尚未逐字节证明可就地返回，故仍响亮
 >   cap。

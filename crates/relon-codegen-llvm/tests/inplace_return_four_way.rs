@@ -640,6 +640,109 @@ fn f_grid_list_list_int() {
 // parameter-field list returns (plain `Value` equality).
 
 // ====================================================================
+// F5: doubly-nested pointer-array returns (`List<List<String>>` /
+// `List<List<Schema>>`). The outer pointer array's entries are themselves
+// pointer-array list records; the recursive input marshaller, relocation
+// walker (`PtrArrayElem::InnerList`), multi-region verifier, and in-place
+// reader follow them one level deeper. Same negative in-place sentinel +
+// same shared host decode — wasm rides the IR with no per-target change.
+// ====================================================================
+
+const SRC_LL_STRING: &str = "#main(List<List<String>> xss) -> List<List<String>>\nxss";
+
+fn str_rows(rows: &[&[&str]]) -> Value {
+    Value::List(Arc::new(
+        rows.iter()
+            .map(|r| {
+                Value::List(Arc::new(
+                    r.iter().map(|s| Value::String((*s).into())).collect(),
+                ))
+            })
+            .collect(),
+    ))
+}
+
+#[test]
+fn f5_ll_string_empty_outer() {
+    assert_four_way(SRC_LL_STRING, args1("xss", str_rows(&[])));
+}
+
+#[test]
+fn f5_ll_string_empty_inner() {
+    assert_four_way(SRC_LL_STRING, args1("xss", str_rows(&[&[], &[]])));
+}
+
+#[test]
+fn f5_ll_string_single() {
+    assert_four_way(SRC_LL_STRING, args1("xss", str_rows(&[&["x"]])));
+}
+
+#[test]
+fn f5_ll_string_mixed_cjk_empty_long() {
+    // U+4E2D U+6587 ("zhongwen"), U+1F980 (crab), plus empty + long runs.
+    let cjk = "\u{4E2D}\u{6587}";
+    let emoji = "\u{1F980}";
+    let long = "y".repeat(3000);
+    assert_four_way(
+        SRC_LL_STRING,
+        args1(
+            "xss",
+            str_rows(&[&["a", "", cjk], &[], &[emoji, long.as_str(), "z"]]),
+        ),
+    );
+}
+
+const SRC_F5_FIELD: &str = "#schema W { rows: List<List<String>>, n: Int }\n\
+                            #main(W w) -> List<List<String>>\nw.rows";
+
+fn w_srows(rows: &[&[&str]], n: i64) -> Value {
+    let map = std::collections::BTreeMap::from([
+        (
+            relon_eval_api::smol_str::SmolStr::from("rows"),
+            str_rows(rows),
+        ),
+        (relon_eval_api::smol_str::SmolStr::from("n"), Value::Int(n)),
+    ]);
+    Value::branded_dict(map, Some("W".into()))
+}
+
+#[test]
+fn f5_param_field_ll_string() {
+    assert_four_way(
+        SRC_F5_FIELD,
+        args1("w", w_srows(&[&["", "\u{4E2D}"], &[], &["zz"]], 4)),
+    );
+}
+
+const SRC_LL_SCHEMA: &str = "#schema Cfg { String name: *, Int port: * }\n\
+                             #main(List<List<Cfg>> xss) -> List<List<Cfg>>\nxss";
+
+fn cfg_v(name: &str, port: i64) -> Value {
+    let map = std::collections::BTreeMap::from([
+        (
+            relon_eval_api::smol_str::SmolStr::from("name"),
+            Value::String(name.into()),
+        ),
+        (
+            relon_eval_api::smol_str::SmolStr::from("port"),
+            Value::Int(port),
+        ),
+    ]);
+    Value::branded_dict(map, Some("Cfg".into()))
+}
+
+#[test]
+fn f5_ll_schema_mixed() {
+    let cjk = "\u{4E2D}\u{6587}";
+    let rows = Value::List(Arc::new(vec![
+        Value::List(Arc::new(vec![cfg_v("a", 1), cfg_v(cjk, 2)])),
+        Value::List(Arc::new(vec![])),
+        Value::List(Arc::new(vec![cfg_v("z", i64::MIN)])),
+    ]));
+    assert_four_way(SRC_LL_SCHEMA, args1("xss", rows));
+}
+
+// ====================================================================
 // proptest differential — the "shapes you didn't think of" net.
 // Smaller case count than the native three-way: each wasm case shells out
 // to wasm-ld + spins up a wasmtime instance.
@@ -673,6 +776,53 @@ fn list_string_strat() -> impl Strategy<Value = Value> {
     prop::collection::vec(string_strat(), 0..6).prop_map(|v| {
         Value::List(Arc::new(
             v.into_iter().map(|s| Value::String(s.into())).collect(),
+        ))
+    })
+}
+
+fn list_list_string_strat() -> impl Strategy<Value = Value> {
+    prop::collection::vec(prop::collection::vec(string_strat(), 0..4), 0..4).prop_map(|rows| {
+        Value::List(Arc::new(
+            rows.into_iter()
+                .map(|r| {
+                    Value::List(Arc::new(
+                        r.into_iter().map(|s| Value::String(s.into())).collect(),
+                    ))
+                })
+                .collect(),
+        ))
+    })
+}
+
+fn list_list_schema_strat() -> impl Strategy<Value = Value> {
+    prop::collection::vec(
+        prop::collection::vec((string_strat(), int_strat()), 0..3),
+        0..3,
+    )
+    .prop_map(|rows| {
+        Value::List(Arc::new(
+            rows.into_iter()
+                .map(|inner| {
+                    Value::List(Arc::new(
+                        inner
+                            .into_iter()
+                            .map(|(n, p)| {
+                                let map = std::collections::BTreeMap::from([
+                                    (
+                                        relon_eval_api::smol_str::SmolStr::from("name"),
+                                        Value::String(n.into()),
+                                    ),
+                                    (
+                                        relon_eval_api::smol_str::SmolStr::from("port"),
+                                        Value::Int(p),
+                                    ),
+                                ]);
+                                Value::branded_dict(map, Some("Cfg".into()))
+                            })
+                            .collect(),
+                    ))
+                })
+                .collect(),
         ))
     })
 }
@@ -767,6 +917,24 @@ proptest! {
             prop_assert_eq!(res.map_err(TestCaseError::fail)?, oracle);
         }
     }
+
+    // F5 doubly-nested pointer arrays — the "shapes you didn't think of"
+    // net for the recursive marshaller / verifier / reader.
+    #[test]
+    fn diff_list_list_string(val in list_list_string_strat()) {
+        let oracle = run_tree_walk(SRC_LL_STRING, args1("xss", val.clone()));
+        if let Some(res) = run_wasm(SRC_LL_STRING, &args1("xss", val)) {
+            prop_assert_eq!(res.map_err(TestCaseError::fail)?, oracle);
+        }
+    }
+
+    #[test]
+    fn diff_list_list_schema(val in list_list_schema_strat()) {
+        let oracle = run_tree_walk(SRC_LL_SCHEMA, args1("xss", val.clone()));
+        if let Some(res) = run_wasm(SRC_LL_SCHEMA, &args1("xss", val)) {
+            prop_assert_eq!(res.map_err(TestCaseError::fail)?, oracle);
+        }
+    }
 }
 
 // ====================================================================
@@ -822,19 +990,24 @@ fn verifier_rejects_out_of_region_root_loudly() {
 // wasm32 emit decline loudly on the shared IR lowering, never miscompile.
 // ====================================================================
 
-/// `List<List<String>>` / `List<List<Schema>>` double-pointer-array
-/// returns are still capped (F5), both as a top-level parameter identity
-/// and as a parameter-*field* walk — F4 lifts the inner-scalar / String /
-/// Schema list field shapes, NOT the double pointer array. The wasm32 emit
-/// path shares the `relon-ir` lowering with the native backends, so the
-/// decline is symmetric — assert wasm32 emit returns `Err`.
+/// Shapes the in-place ABI still does NOT lift must make the wasm32 emit
+/// decline loudly on the shared IR lowering, never miscompile. The wasm32
+/// emit path shares the `relon-ir` lowering with the native backends, so
+/// the decline is symmetric — assert wasm32 emit returns `Err`.
+///
+/// F5 lifts the doubly-nested pointer-array shapes (`List<List<String>>` /
+/// `List<List<Schema>>`), so those are NO LONGER here; the remaining caps
+/// are the `o.inner.tags` ≥3-segment nested-schema field chain (F4 only
+/// admits a single-segment field walk) and `Dict<_,_>` params (an
+/// analyzer dead-end with no buffer-protocol decode path).
 #[test]
 fn capped_shapes_decline_on_wasm_emit_not_silently() {
     let cap_cases = [
-        "#main(List<List<String>> xss) -> List<List<String>>\nxss",
-        // F5 field walk: a double-pointer-array field is still capped.
-        "#schema W { rows: List<List<String>>, n: Int }\n\
-         #main(W w) -> List<List<String>>\nw.rows",
+        // ≥3-segment nested-schema field chain — out of scope.
+        "#schema Inner { tags: List<String> }\n#schema Outer { inner: Inner }\n\
+         #main(Outer o) -> List<String>\no.inner.tags",
+        // Dict param — analyzer dead-end, no input decode path.
+        "#main(Dict<String, Int> d) -> Int\n1",
     ];
     let dir = std::env::temp_dir();
     for src in cap_cases {

@@ -181,10 +181,6 @@ fn unsupported_return_shapes_fail_loudly_not_silently() {
         // Top-level List<Schema> / List<List> returns from a *literal*.
         "#schema P {\n    Int x: *\n}\n#main() -> List<P>\n[{x:1},{x:2}]",
         "#main() -> List<List<Int>>\n[[1, 2], [3, 4]]",
-        // Doubly-nested pointer-array (`List<List<Schema>>`) field — out of
-        // scope (F5).
-        "#schema Server { name: String }\n\
-         #main(List<List<Server>> xs) -> Dict\n{ xs: xs, n: 1 }",
     ];
     // F2/F3: cross-region object fields sourced by parameter identity now
     // ship on cranelift AND llvm (wasm shares the IR + the same store path).
@@ -219,6 +215,12 @@ fn unsupported_return_shapes_fail_loudly_not_silently() {
          #main(Outer o) -> List<String>\no.tags",
         "#schema Outer { grid: List<List<Int>>, n: Int }\n\
          #main(Outer o) -> List<List<Int>>\no.grid",
+        // F5: doubly-nested pointer-array object field (`List<List<Schema>>`
+        // / `List<List<String>>`) sourced by parameter identity — the inner
+        // pointer arrays are relocated + verified + read one level deeper.
+        "#schema Server { name: String }\n\
+         #main(List<List<Server>> xs) -> Dict\n{ xs: xs, n: 1 }",
+        "#main(List<List<String>> g) -> Dict\n{ g: g, n: 1 }",
     ];
     for src in BOTH_CAP {
         let cl = AotEvaluator::from_source(src);

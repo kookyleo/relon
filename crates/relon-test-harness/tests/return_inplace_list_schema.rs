@@ -322,20 +322,24 @@ proptest! {
 
 // ---- loud-cap guards: unsupported shapes decline, never miscompile ---
 
-/// Shapes S4 does NOT lift must still make **both** AOT backends decline
-/// the `#main` shape (a setup error). In production `Backend::Auto` falls
-/// back to the tree-walk oracle; here we assert the decline is loud.
+/// Shapes still beyond F5 must make **both** AOT backends decline the
+/// `#main` shape (a setup error). In production `Backend::Auto` falls back
+/// to the tree-walk oracle; here we assert the decline is loud.
+///
+/// F5 lifted the `List<List<Schema>>` double pointer array; what remains
+/// is a `List<Schema>` whose sub-record carries a nested `List<Schema>`
+/// field (out of the S4 sub-record decode scope) and the `Dict` param
+/// dead-end.
 #[test]
 fn unsupported_return_shapes_fail_loudly_not_silently() {
     let cap_cases = [
-        // List<List<Schema>> — inner pointer-array-of-pointer-array; the
-        // in-place reader does not decode a nested Schema pointer array (F5).
-        "#schema Cfg { name: String }\n#main(List<List<Cfg>> xs) -> List<List<Cfg>>\nxs",
         // Sub-record carrying a nested List<Schema> field — out of S4
-        // scope (the in-place sub-record decoder caps deeper pointer-array
-        // element fields).
+        // scope (`list_schema_subrecord_in_s4_scope` rejects a sub-record
+        // whose field is itself a pointer-array-of-schema).
         "#schema Inner { x: Int }\n#schema Cfg { kids: List<Inner> }\n\
          #main(List<Cfg> items) -> List<Cfg>\nitems",
+        // Dict param — analyzer dead-end.
+        "#main(Dict<String, Int> d) -> Int\n1",
     ];
     for src in cap_cases {
         match new_evaluator(src, Backend::CraneliftAot) {

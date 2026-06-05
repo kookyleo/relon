@@ -2034,8 +2034,19 @@ fn write_list_arg_into_builder(
             write_list_schema_arg_into_builder(builder, name, schema, items)
         }
         TypeRepr::List { element: inner } => {
-            relon_eval_api::buffer::write_nested_scalar_list(builder, name, inner, items)
-                .map_err(buffer_to_runtime_error)
+            // `List<List<scalar>>` keeps the inline-fixed inner-record
+            // writer; `List<List<String|Schema|List>>` (F5) routes through
+            // the recursive doubly-nested pointer-array marshaller.
+            match inner.as_ref() {
+                TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool => {
+                    relon_eval_api::buffer::write_nested_scalar_list(builder, name, inner, items)
+                        .map_err(buffer_to_runtime_error)
+                }
+                _ => relon_eval_api::buffer::write_nested_pointer_array_list(
+                    builder, name, inner, items,
+                )
+                .map_err(buffer_to_runtime_error),
+            }
         }
         other => Err(RuntimeError::Unsupported {
             reason: format!(
@@ -2197,17 +2208,25 @@ fn read_value_from_reader(
                 }
                 Ok(Value::List(Arc::new(items)))
             }
-            // `List<List<scalar>>`: decode the nested pointer-array into
-            // `Vec<Vec<Value>>` via the shared-base reader, then re-wrap
-            // each inner row as a `Value::List`.
-            TypeRepr::List { .. } => reader
-                .read_list_list(&field.name)
-                .map(|rows| {
-                    Value::List(Arc::new(
-                        rows.into_iter().map(|r| Value::List(Arc::new(r))).collect(),
-                    ))
-                })
-                .map_err(buffer_to_runtime_error),
+            // `List<List<…>>`: decode the nested pointer-array. The inner
+            // inline-fixed scalar case keeps the dedicated `read_list_list`
+            // reader; `List<List<String|Schema>>` (F5) routes through the
+            // recursive `read_list_value` so the inner pointer arrays are
+            // followed one level deeper.
+            TypeRepr::List { element: inner } => match inner.as_ref() {
+                TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool => reader
+                    .read_list_list(&field.name)
+                    .map(|rows| {
+                        Value::List(Arc::new(
+                            rows.into_iter().map(|r| Value::List(Arc::new(r))).collect(),
+                        ))
+                    })
+                    .map_err(buffer_to_runtime_error),
+                _ => reader
+                    .read_list_value(&field.name, element.as_ref())
+                    .map(|rows| Value::List(Arc::new(rows)))
+                    .map_err(buffer_to_runtime_error),
+            },
             other => Err(RuntimeError::Unsupported {
                 reason: format!(
                     "cranelift-native: cannot decode list field `{field}` of element type `{ty:?}` in schema `{schema}`",

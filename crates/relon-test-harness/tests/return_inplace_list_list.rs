@@ -251,23 +251,123 @@ proptest! {
     }
 }
 
+// ---- F5: doubly-nested pointer-array returns -------------------------
+//
+// `List<List<String>>` / `List<List<Schema>>` — the outer pointer array's
+// entries are themselves pointer-array list records; the recursive input
+// marshaller, relocation walker (`PtrArrayElem::InnerList`), multi-region
+// verifier, and in-place reader all follow them one level deeper. Proven
+// bit-equal vs the tree-walk oracle across every backend.
+
+const SRC_LL_STRING: &str = "#main(List<List<String>> xss) -> List<List<String>>\nxss";
+const SRC_W_SROWS: &str = "#schema W { rows: List<List<String>>, n: Int }\n\
+     #main(W w) -> List<List<String>>\nw.rows";
+const SRC_LL_SCHEMA: &str = "#schema Cfg { name: String, port: Int }\n\
+     #main(List<List<Cfg>> xss) -> List<List<Cfg>>\nxss";
+
+fn s(x: &str) -> Value {
+    Value::String(x.into())
+}
+
+fn str_rows(rows: &[&[&str]]) -> Value {
+    Value::List(Arc::new(
+        rows.iter()
+            .map(|r| Value::List(Arc::new(r.iter().map(|x| s(x)).collect())))
+            .collect(),
+    ))
+}
+
+fn cfg(name: &str, port: i64) -> Value {
+    let map = std::collections::BTreeMap::from([
+        (relon_eval_api::smol_str::SmolStr::from("name"), s(name)),
+        (
+            relon_eval_api::smol_str::SmolStr::from("port"),
+            Value::Int(port),
+        ),
+    ]);
+    Value::branded_dict(map, Some("Cfg".into()))
+}
+
+fn assert_f5(src: &str, args_map: HashMap<String, Value>) {
+    let report = assert_all_backends_bit_equal(src, args_map);
+    assert!(
+        report.cranelift_compared,
+        "cranelift must compile the F5 double-pointer-array return; skipped: {:?}",
+        report.cranelift_skip_reason
+    );
+    #[cfg(feature = "llvm-aot")]
+    assert!(
+        report.llvm_compared,
+        "llvm must compile the F5 double-pointer-array return; skipped: {:?}",
+        report.llvm_skip_reason
+    );
+}
+
+#[test]
+fn f5_list_list_string_empty_outer() {
+    assert_f5(SRC_LL_STRING, args(str_rows(&[])));
+}
+
+#[test]
+fn f5_list_list_string_empty_inner() {
+    assert_f5(SRC_LL_STRING, args(str_rows(&[&[], &[]])));
+}
+
+#[test]
+fn f5_list_list_string_single() {
+    assert_f5(SRC_LL_STRING, args(str_rows(&[&["x"]])));
+}
+
+#[test]
+fn f5_list_list_string_mixed_cjk_empty_long() {
+    let cjk = "\u{4E2D}\u{6587}";
+    let long = "y".repeat(3000);
+    let rows = str_rows(&[&["a", "", cjk], &[], &[long.as_str(), "z"]]);
+    assert_f5(SRC_LL_STRING, args(rows));
+}
+
+#[test]
+fn f5_param_field_list_list_string() {
+    let map = std::collections::BTreeMap::from([
+        (
+            relon_eval_api::smol_str::SmolStr::from("rows"),
+            str_rows(&[&["", "\u{4E2D}"], &["zz"]]),
+        ),
+        (relon_eval_api::smol_str::SmolStr::from("n"), Value::Int(7)),
+    ]);
+    let w = Value::branded_dict(map, Some("W".into()));
+    let mut m = HashMap::new();
+    m.insert("w".to_string(), w);
+    assert_f5(SRC_W_SROWS, m);
+}
+
+#[test]
+fn f5_list_list_schema_mixed() {
+    let cjk = "\u{4E2D}\u{6587}";
+    let rows = Value::List(Arc::new(vec![
+        Value::List(Arc::new(vec![cfg("a", 1), cfg(cjk, 2)])),
+        Value::List(Arc::new(vec![])),
+        Value::List(Arc::new(vec![cfg("z", i64::MIN)])),
+    ]));
+    assert_f5(SRC_LL_SCHEMA, args(rows));
+}
+
 // ---- loud-cap guards: unsupported shapes decline, never miscompile ---
 
-/// The shapes S1/S2 do NOT lift must still make **both** AOT backends
-/// **decline** the `#main` shape (a setup error). In production
-/// `Backend::Auto` falls back to the tree-walk oracle; here we assert the
-/// decline is loud (an `Err`), so a silent miscompile can never sneak in
-/// on either backend.
+/// Shapes still beyond F5 must make **both** AOT backends **decline** the
+/// `#main` shape (a setup error). In production `Backend::Auto` falls back
+/// to the tree-walk oracle; here we assert the decline is loud (an `Err`),
+/// so a silent miscompile can never sneak in. The remaining caps are the
+/// `o.inner.tags` ≥3-segment nested-schema field chain (F4 admits only a
+/// single-segment field walk) and `Dict<_,_>` params (analyzer dead-end).
 #[test]
 fn unsupported_return_shapes_fail_loudly_not_silently() {
     let cap_cases = [
-        // Inner pointer-array element (String) — in-place reader can't
-        // decode a per-element pointer array yet (F5).
-        "#main(List<List<String>> xss) -> List<List<String>>\nxss",
-        // Parameter-*field* List<List<String>> — a double pointer array
-        // field is still out of scope (F5).
-        "#schema W { rows: List<List<String>>, n: Int }\n\
-         #main(W w) -> List<List<String>>\nw.rows",
+        // ≥3-segment nested-schema field chain.
+        "#schema Inner { tags: List<String> }\n#schema Outer { inner: Inner }\n\
+         #main(Outer o) -> List<String>\no.inner.tags",
+        // Dict param — analyzer dead-end.
+        "#main(Dict<String, Int> d) -> Int\n1",
     ];
     for src in cap_cases {
         match new_evaluator(src, Backend::CraneliftAot) {

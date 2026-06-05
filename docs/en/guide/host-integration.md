@@ -76,14 +76,17 @@ signature**; each parameter declares one host-pushed slot:
 > - scalar leaves (`Int` / `Float` / `Bool` / `Null`),
 > - **`String`** parameters (e.g. file contents the host read and pushes
 >   in),
-> - **`List<scalar>`**, **`List<String>`**, **`List<Schema>`**, and
->   nested **`List<List<scalar>>`** parameters (consumed through
->   `.length()` / a sibling scalar field read; the inner records — a
->   schema sub-record / an inner list record — are materialised into the
->   buffer's tail and relocated into the parent's coordinate system),
+> - **`List<scalar>`**, **`List<String>`**, **`List<Schema>`**, nested
+>   **`List<List<scalar>>`**, and the doubly-nested pointer-array
+>   **`List<List<String>>`** / **`List<List<Schema>>`** parameters
+>   (consumed through `.length()` / a sibling scalar field read; the inner
+>   records — a schema sub-record, an inner string/scalar list record, or
+>   an inner pointer-array list — are materialised into the buffer's tail
+>   and recursively relocated into the parent's coordinate system),
 > - **user-`#schema` struct parameters** whose fields are scalars,
->   `String`, `List<scalar>`, `List<String>`, `List<Schema>`, or
->   `List<List<scalar>>` — the whole structured config record, including
+>   `String`, `List<scalar>`, `List<String>`, `List<Schema>`,
+>   `List<List<scalar>>`, or the doubly-nested `List<List<String>>` /
+>   `List<List<Schema>>` — the whole structured config record, including
 >   string, list, list-of-record, and nested-list fields,
 > - **nested-`#schema` struct fields** read through a multi-segment walk
 >   (`o.inner.x`, and deeper such as `c.b.a.v`). Both field-declaration
@@ -149,6 +152,22 @@ signature**; each parameter declares one host-pushed slot:
 >   A sub-record that itself carries a nested `List<Schema>` /
 >   `List<List<…>>` field stays out of scope (the in-place sub-record reader
 >   caps it),
+> - **`List<List<String>>` / `List<List<Schema>>` returns from a `#main`
+>   parameter** (`#main(List<List<String>> xss) -> List<List<String>> = xss`,
+>   and the `List<List<Cfg>>` form), on **the cranelift, llvm, and
+>   compiled-wasm backends** (F5). This is the *doubly-nested* pointer-array
+>   shape: the outer `[len][off_i]` header points at inner pointer-array list
+>   records, each of which is itself a `[len][inner_off_j]` header whose
+>   entries name `String` / schema-sub-record records. The recursive input
+>   marshaller writes the whole graph, the relocation walker rebases the
+>   inner pointer arrays one level deeper, and the machine code reports the
+>   outer root offset; the host verifier recurses to **every innermost
+>   record** (outer entry → inner list header → inner entry → String / schema
+>   record) before decoding in place — bit-equal to the tree-walk oracle
+>   including every inner element's bytes (CJK / empty / long), on wasm too.
+>   Supported as a parameter **identity**, a parameter **field** walk
+>   (`#main(W w) -> List<List<String>> = w.rows`), and as an object field
+>   (anon-`Dict` / branded struct),
 > - **`#schema`-branded struct returns** (`#main() -> Cfg { ... }`) whose
 >   fields are any of the above (including literal `String` / `List`
 >   fields),
@@ -164,12 +183,12 @@ signature**; each parameter declares one host-pushed slot:
 >
 > - `Dict<_, _>` parameters (the analyzer cannot type `d["x"]` index
 >   reads; use a `#schema` struct for structured config instead),
-> - inner pointer-array element lists (`List<List<String>>` /
->   `List<List<Schema>>`) — the recursive per-entry relocation isn't
->   modelled,
 > - a `List<Schema>` return whose sub-record carries a nested
 >   `List<Schema>` / `List<List<…>>` field (the in-place sub-record reader
->   caps the deeper pointer array).
+>   caps the deeper pointer array), and
+> - a `≥3`-segment nested-schema **field-walk** return (`o.inner.tags`) —
+>   only a single-segment parameter-field walk is admitted on the in-place
+>   return path.
 >
 >   An **object field** sourced by a parameter — whether the object
 >   is an **anon-`Dict`** (`-> Dict { servers: servers, n: 1 }`) or a
@@ -195,10 +214,10 @@ signature**; each parameter declares one host-pushed slot:
 >   every sub-record String field), then `BufferReader::new_at_base` follows
 >   it cross-region — bit-equal to the tree-walk oracle. On wasm the host
 >   reads the same arena out of linear memory and runs the same
->   verifier-gated decode, so there is no wasm-specific path. The remaining
->   still-capped case (a doubly-nested `List<List<Schema>>` /
->   `List<List<String>>`) makes the backend refuse rather than store an
->   unsupported pointer array. The host-side
+>   verifier-gated decode, so there is no wasm-specific path. The
+>   doubly-nested `List<List<Schema>>` / `List<List<String>>` object field
+>   is **also supported** (F5): the inner pointer arrays are relocated,
+>   verified, and read one level deeper. The host-side
 >   *decode* is in
 >   place — `BufferReader` walks the buffer with a single base and
 >   reconstructs the nested `Value` recursively (`read_list_record` /

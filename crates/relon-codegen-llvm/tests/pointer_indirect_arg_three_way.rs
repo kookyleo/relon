@@ -449,8 +449,9 @@ fn nested_schema_with_list_schema_field_three_way() {
 ///
 /// Materialised this round: `List<Schema>` / `List<List<scalar>>`
 /// params + schema fields consumed through `.length()` / a sibling
-/// scalar read. Still capped: inner pointer-array element lists
-/// (`List<List<String>>`), and `Dict` params (analyzer dead-end).
+/// scalar read. F5 also materialises the inner pointer-array element
+/// lists (`List<List<String>>` / `List<List<Schema>>`). Still capped:
+/// `Dict` params (analyzer dead-end with no input decode path).
 ///
 /// NOTE: the nested-list **identity return**
 /// `#main(List<List<Int>> xss) -> List<List<Int>> = xss` and the
@@ -464,17 +465,35 @@ fn nested_schema_with_list_schema_field_three_way() {
 #[test]
 fn unsupported_pointer_indirect_shapes_loudly_capped() {
     for src in [
-        // Dict param.
+        // Dict param — analyzer dead-end.
         "#main(Dict<String, Int> d) -> Dict<String, Int>\nd",
-        // inner pointer-array element list: List<List<String>> stays a
-        // loud cap (recursive pointer-array relocation not modelled).
-        "#main(List<List<String>> xss) -> Int\nxss.length()",
+        // ≥3-segment nested-schema field chain (`o.inner.tags`) — F4 admits
+        // only a single-segment field walk.
+        "#schema Inner { tags: List<String> }\n#schema Outer { inner: Inner }\n\
+         #main(Outer o) -> List<String>\no.inner.tags",
     ] {
         let cl = AotEvaluator::from_source(src);
         assert!(cl.is_err(), "cranelift must loudly reject `{src}`, got Ok");
         let llvm = LlvmAotEvaluator::from_source(src);
         assert!(llvm.is_err(), "llvm must loudly reject `{src}`, got Ok");
     }
+}
+
+/// F5: a `List<List<String>>` param consumed through `.length()` now
+/// materialises on both AOT backends (the param layouts + marshals; the
+/// scalar `.length()` read needs no in-place return). Pins that neither
+/// backend regresses to a loud cap.
+#[test]
+fn nested_pointer_array_param_length_both_backends() {
+    let src = "#main(List<List<String>> xss) -> Int\nxss.length()";
+    assert!(
+        AotEvaluator::from_source(src).is_ok(),
+        "cranelift must compile the List<List<String>> param length read"
+    );
+    assert!(
+        LlvmAotEvaluator::from_source(src).is_ok(),
+        "llvm must compile the List<List<String>> param length read"
+    );
 }
 
 /// The nested-list identity return is now lifted on **both** AOT

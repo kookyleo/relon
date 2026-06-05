@@ -1167,11 +1167,12 @@ fn build_main_return_schema(
         })?;
     // S4: a `-> List<Schema>` return resolves through the schema-aware
     // canonicaliser (the narrow `type_node_to_canonical` has no resolver
-    // and so can't name a user schema). Only the *single* `List<Schema>`
-    // shape is admitted here; `List<List<Schema>>` and deeper nested
-    // schema lists stay rejected (they fall through to the loud cap).
+    // and so can't name a user schema). F5: `List<List<String>>` /
+    // `List<List<Schema>>` (and deeper nested lists) resolve through the
+    // schema-aware nested-list canonicaliser; the layout pass is the final
+    // arbiter of materialisable inner element types.
     let ty = type_node_to_canonical(rt)
-        .or_else(|| return_list_list_scalar_canonical(rt))
+        .or_else(|| return_nested_list_canonical(rt, Some(resolver)))
         .or_else(|| return_list_schema_canonical(rt, resolver))
         .ok_or_else(|| LoweringError::UnsupportedTypeInMain {
             type_name: type_head_for_display(rt),
@@ -2223,20 +2224,35 @@ fn type_node_to_canonical(t: &TypeNode) -> Option<TypeRepr> {
     }
 }
 
-/// Return-side canonicalizer for the `List<List<scalar>>` return type
-/// (`#main(...) -> List<List<Int|Float|Bool>>`). The scalar
-/// [`type_node_to_canonical`] only accepts a single level of list, so a
-/// nested-list **return** head falls through to here. We accept it only
-/// when the innermost element is an inline-fixed scalar (Int / Float /
-/// Bool) — that is the one shape the in-place region-walk return ABI
-/// (S1) decodes. A `List<List<String>>` / `List<List<Schema>>` inner
-/// (pointer-array element) returns `None` and the return type stays a
-/// loud cap. This is deliberately narrow and return-only: parameter
-/// canonicalisation already handles nested lists via
-/// [`type_node_to_canonical_with_schemas`], and widening the shared
+/// Return-side canonicalizer for the `List<List<…>>` return type
+/// (`#main(...) -> List<List<Int|Float|Bool|String|Schema|List<…>>>`). The
+/// scalar [`type_node_to_canonical`] only accepts a single level of list,
+/// so a nested-list **return** head falls through to here.
+///
+/// S1/S2 admitted the inline-fixed scalar inner (`List<List<Int>>`); F5
+/// widens this to the doubly-nested **pointer-array** shapes
+/// (`List<List<String>>` / `List<List<Schema>>`, and deeper
+/// `List<List<List<…>>>`): the recursive input marshaller, relocation
+/// walker, multi-region verifier, and in-place reader all decode them
+/// bit-equal. The outer head must be `List<…>` whose generic is itself a
+/// `List<…>`; the inner is resolved through the schema-aware
+/// canonicaliser so a `List<List<Schema>>` inner schema lookup succeeds.
+/// The layout pass (`inner_list_record_alignment`) is the final arbiter of
+/// which inner element types are materialisable — an unsupported leaf
+/// (Option / Result / Closure) is still a loud cap there.
+///
+/// Return-only: parameter canonicalisation already handles nested lists
+/// via [`type_node_to_canonical_with_schemas`], and widening the shared
 /// scalar canonicalizer would mis-accept nested lists in unrelated
 /// surfaces (native-fn signatures, etc.).
-fn return_list_list_scalar_canonical(t: &TypeNode) -> Option<TypeRepr> {
+///
+/// A [`SchemaResolver`] (`Some`) lets a `List<List<Schema>>` return type
+/// resolve its inner user schema; `None` resolves only scalar / String
+/// inner elements via the resolver-free [`type_node_to_canonical`].
+fn return_nested_list_canonical(
+    t: &TypeNode,
+    resolver: Option<&SchemaResolver<'_>>,
+) -> Option<TypeRepr> {
     if t.path.len() != 1
         || t.path[0].as_str() != "List"
         || t.generics.len() != 1
@@ -2244,19 +2260,15 @@ fn return_list_list_scalar_canonical(t: &TypeNode) -> Option<TypeRepr> {
     {
         return None;
     }
-    // Outer is `List<…>`; the generic must itself be `List<scalar>`.
-    let inner = type_node_to_canonical(&t.generics[0])?;
+    // Outer is `List<…>`; the generic must itself be a `List<…>`.
+    let inner = match resolver {
+        Some(r) => type_node_to_canonical_with_schemas(&t.generics[0], r)?,
+        None => type_node_to_canonical(&t.generics[0])?,
+    };
     match &inner {
-        TypeRepr::List { element }
-            if matches!(
-                element.as_ref(),
-                TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool
-            ) =>
-        {
-            Some(TypeRepr::List {
-                element: Box::new(inner),
-            })
-        }
+        TypeRepr::List { .. } => Some(TypeRepr::List {
+            element: Box::new(inner),
+        }),
         _ => None,
     }
 }
@@ -2437,19 +2449,31 @@ fn pointer_array_param_field_walk<'s>(
 ///   * `List<Schema{…}>` confined to the S4 sub-record decode scope
 ///     (`list_schema_subrecord_in_s4_scope`).
 ///
-/// A `List<List<String|Schema>>` (double pointer array, F5) or any
-/// non-list type returns `false`, keeping it a loud cap.
+/// F5 widens this to the double pointer array `List<List<String>>` /
+/// `List<List<Schema>>` (and deeper nested lists): the recursive input
+/// marshaller, relocation walker, multi-region verifier, and in-place
+/// reader all follow them cross-region bit-equal. A leaf type the layout
+/// pass cannot materialise (Option / Result / Closure) returns `false`,
+/// keeping it a loud cap.
 fn cross_region_list_envelope(ty: &TypeRepr) -> bool {
     let TypeRepr::List { element } = ty else {
         return false;
     };
-    match element.as_ref() {
+    cross_region_list_element_ok(element.as_ref())
+}
+
+/// `true` when a `List<element>` element type is one the cross-region
+/// host marshaller / verifier / reader handle. Recurses for nested lists
+/// so `List<List<String>>` / `List<List<List<…>>>` are admitted to the
+/// depth the layout pass materialises; a `List<Schema>` element still goes
+/// through the S4 sub-record envelope.
+fn cross_region_list_element_ok(element: &TypeRepr) -> bool {
+    match element {
         TypeRepr::String | TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool => true,
-        TypeRepr::Schema { .. } => list_schema_subrecord_in_s4_scope(ty),
-        TypeRepr::List { element: inner } => matches!(
-            inner.as_ref(),
-            TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool
-        ),
+        TypeRepr::Schema { .. } => list_schema_subrecord_in_s4_scope(&TypeRepr::List {
+            element: Box::new(element.clone()),
+        }),
+        TypeRepr::List { element: inner } => cross_region_list_element_ok(inner.as_ref()),
         _ => false,
     }
 }

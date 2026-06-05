@@ -1460,6 +1460,125 @@ mod tests {
         );
     }
 
+    // ---- F5 doubly-nested pointer array (`List<List<String>>`) ----------
+    //
+    // The verifier must recurse all the way to the **innermost** String
+    // record: outer entry -> inner list header -> inner entry -> String
+    // record. These adversarial probes smash a pointer at each depth and
+    // assert a loud reject (never a wild read past the region).
+
+    fn list_str(items: &[&str]) -> crate::value::Value {
+        crate::value::Value::List(std::sync::Arc::new(
+            items
+                .iter()
+                .map(|s| crate::value::Value::String((*s).into()))
+                .collect(),
+        ))
+    }
+
+    /// Build a `Ret { value: List<List<String>> }` buffer and return the
+    /// bytes plus the `value` slot's `(list_element, outer header offset)`.
+    fn list_list_string_buffer() -> (Vec<u8>, Option<ListElementKind>, usize) {
+        let schema = Schema {
+            name: "Ret".into(),
+            generics: vec![],
+            fields: vec![field("value", list(list(TypeRepr::String)))],
+        };
+        let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+        let mut b = BufferBuilder::new(&layout, &schema.fields);
+        let rows = vec![list_str(&["a", "", "bb"]), list_str(&[]), list_str(&["zz"])];
+        crate::buffer::write_nested_pointer_array_list(&mut b, "value", &TypeRepr::String, &rows)
+            .expect("write nested pointer-array list");
+        let bytes = b.finish();
+        let fo = &layout.fields[0];
+        let mut slot = [0u8; 4];
+        slot.copy_from_slice(&bytes[fo.offset..fo.offset + 4]);
+        let header_off = u32::from_le_bytes(slot) as usize;
+        (bytes, fo.list_element, header_off)
+    }
+
+    fn list_list_string_ty() -> TypeRepr {
+        list(list(TypeRepr::String))
+    }
+
+    #[test]
+    fn inplace_list_list_string_verifies_clean() {
+        let (bytes, le, root) = list_list_string_buffer();
+        let region = Region::new(0, bytes.len()).expect("region");
+        verify_value_at(&bytes, &list_list_string_ty(), le, root, region)
+            .expect("a legal List<List<String>> must verify to the innermost String");
+    }
+
+    #[test]
+    fn inplace_list_list_string_corrupt_outer_entry_rejected() {
+        // Smash the first outer entry pointer so the inner list header it
+        // names lands off-region.
+        let (mut bytes, le, root) = list_list_string_buffer();
+        let off0 = root + 4;
+        let bogus = (bytes.len() as u32 + 4096).to_le_bytes();
+        bytes[off0..off0 + 4].copy_from_slice(&bogus);
+        let region = Region::new(0, bytes.len()).expect("region");
+        let err = verify_value_at(&bytes, &list_list_string_ty(), le, root, region)
+            .expect_err("a corrupt outer entry must be rejected");
+        assert!(
+            matches!(err, VerifyError::OutOfRegion { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn inplace_list_list_string_corrupt_inner_entry_rejected() {
+        // Follow the first outer entry to its inner list header, then smash
+        // that header's first entry (which points at a String record) so the
+        // String record escapes the region. Proves the verifier recurses
+        // outer -> inner header -> inner entry.
+        let (mut bytes, le, root) = list_list_string_buffer();
+        // outer off_0 -> inner header.
+        let mut o0 = [0u8; 4];
+        o0.copy_from_slice(&bytes[root + 4..root + 8]);
+        let inner_header = u32::from_le_bytes(o0) as usize;
+        // inner header: [len][inner_off_0]…; smash inner_off_0.
+        let inner_off0 = inner_header + 4;
+        let bogus = (bytes.len() as u32 + 8192).to_le_bytes();
+        bytes[inner_off0..inner_off0 + 4].copy_from_slice(&bogus);
+        let region = Region::new(0, bytes.len()).expect("region");
+        let err = verify_value_at(&bytes, &list_list_string_ty(), le, root, region)
+            .expect_err("a corrupt inner entry must be rejected");
+        assert!(
+            matches!(err, VerifyError::OutOfRegion { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn inplace_list_list_string_overlong_innermost_str_rejected() {
+        // Reach the innermost String record (outer_0 -> inner header ->
+        // inner_off_0 -> String record) and inflate its length prefix so the
+        // utf8 payload runs off the region. The deepest-level bounds check
+        // must catch it — proof the recursion reaches the String layer.
+        let (mut bytes, le, root) = list_list_string_buffer();
+        let mut o0 = [0u8; 4];
+        o0.copy_from_slice(&bytes[root + 4..root + 8]);
+        let inner_header = u32::from_le_bytes(o0) as usize;
+        let mut i0 = [0u8; 4];
+        i0.copy_from_slice(&bytes[inner_header + 4..inner_header + 8]);
+        let str_rec = u32::from_le_bytes(i0) as usize;
+        bytes[str_rec..str_rec + 4].copy_from_slice(&0xFFFF_F000u32.to_le_bytes());
+        let region = Region::new(0, bytes.len()).expect("region");
+        let err = verify_value_at(&bytes, &list_list_string_ty(), le, root, region)
+            .expect_err("an overlong innermost String must be rejected");
+        assert!(
+            matches!(
+                err,
+                VerifyError::OutOfRegion {
+                    what: "string payload",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
     // ---- multi-region walk (F0 cross-region safety net) -----------------
     //
     // These build a synthetic arena by hand the way the F1 cross-region
