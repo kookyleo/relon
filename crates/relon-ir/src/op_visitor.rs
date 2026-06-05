@@ -177,6 +177,7 @@ pub trait OpVisitor {
     fn visit_load_list_bool_ptr(&mut self, offset: u32) -> Result<Self::Output, Self::Error>;
     fn visit_load_list_string_ptr(&mut self, offset: u32) -> Result<Self::Output, Self::Error>;
     fn visit_load_list_schema_ptr(&mut self, offset: u32) -> Result<Self::Output, Self::Error>;
+    fn visit_load_list_list_ptr(&mut self, offset: u32) -> Result<Self::Output, Self::Error>;
     fn visit_load_schema_ptr(&mut self, offset: u32) -> Result<Self::Output, Self::Error>;
     fn visit_load_field_at_absolute(
         &mut self,
@@ -330,6 +331,7 @@ pub fn walk_op<V: OpVisitor>(op: &Op, visitor: &mut V) -> Result<V::Output, V::E
         Op::LoadListBoolPtr { offset } => visitor.visit_load_list_bool_ptr(*offset),
         Op::LoadListStringPtr { offset } => visitor.visit_load_list_string_ptr(*offset),
         Op::LoadListSchemaPtr { offset } => visitor.visit_load_list_schema_ptr(*offset),
+        Op::LoadListListPtr { offset } => visitor.visit_load_list_list_ptr(*offset),
         Op::Return => visitor.visit_return(),
         Op::AllocRootRecord { record_local_idx } => {
             visitor.visit_alloc_root_record(*record_local_idx)
@@ -673,6 +675,11 @@ mod tests {
         fn visit_load_list_schema_ptr(&mut self, _: u32) -> Result<(), ()> {
             self.calls += 1;
             self.last = "LoadListSchemaPtr";
+            Ok(())
+        }
+        fn visit_load_list_list_ptr(&mut self, _: u32) -> Result<(), ()> {
+            self.calls += 1;
+            self.last = "LoadListListPtr";
             Ok(())
         }
         fn visit_load_schema_ptr(&mut self, _: u32) -> Result<(), ()> {

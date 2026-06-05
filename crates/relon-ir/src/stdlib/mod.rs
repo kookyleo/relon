@@ -310,12 +310,16 @@ mod glob_match_index_tests {
         assert_eq!(stdlib_method_index(IrType::String, "glob_match"), Some(idx));
     }
 
-    /// The bundled stdlib count grows by exactly one for the
-    /// `glob_match` addition (was 37 pre-2026-05-21, now 38). Pinning
-    /// the count catches accidental double-registrations.
+    /// The bundled stdlib count. `glob_match` (37) and `contains` (36)
+    /// keep their pinned slots; `list_list_length` was appended at the
+    /// tail (index 38) so the nested-`List<List<…>>.length()` shape has
+    /// a body without shifting any position-pinned index. Pinning the
+    /// count catches accidental double-registrations.
     #[test]
-    fn glob_match_extends_bundle_to_38_entries() {
-        assert_eq!(stdlib_function_count(), 38);
+    fn bundle_has_39_entries() {
+        assert_eq!(stdlib_function_count(), 39);
+        assert_eq!(stdlib_function_index("glob_match"), Some(37));
+        assert_eq!(stdlib_function_index("list_list_length"), Some(38));
     }
 }
 

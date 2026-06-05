@@ -678,6 +678,9 @@ impl OpVisitor for ConstPool {
     fn visit_load_list_schema_ptr(&mut self, _: u32) -> Result<(), CraneliftError> {
         Ok(())
     }
+    fn visit_load_list_list_ptr(&mut self, _: u32) -> Result<(), CraneliftError> {
+        Ok(())
+    }
     fn visit_load_schema_ptr(&mut self, _: u32) -> Result<(), CraneliftError> {
         Ok(())
     }

@@ -32,15 +32,17 @@ pub enum LoweringError {
     /// today: the scalar leaves (`Int` / `Float` / `Bool` / `Null` /
     /// `String`), `List<scalar>`, `List<String>`, and user-`#schema`
     /// structs whose fields are any of those (scalar / `String` /
-    /// `List<scalar>` / `List<String>`). Explicitly NOT supported (loud
-    /// cap, not a silent fallthrough): `Dict<_, _>` params, nested-list
-    /// params (`List<List<…>>`), `List<Schema>` params/fields, and
-    /// multi-segment nested-schema walks — their input decoding has no
-    /// buffer-protocol decode path yet.
+    /// `List<scalar>` / `List<String>` / `List<Schema>` /
+    /// `List<List<scalar>>`). Explicitly NOT supported (loud cap, not a
+    /// silent fallthrough): `Dict<_, _>` params, inner pointer-array
+    /// element lists (`List<List<String>>`), the *return* side of
+    /// pointer-array lists, and multi-segment nested-schema walks —
+    /// their input decoding has no buffer-protocol decode path yet.
     #[error(
         "unsupported type in #main: `{type_name}` — compiled backends decode scalars, \
-         String, List<scalar>, List<String>, and schema structs of those; Dict, nested-list, \
-         and List<Schema> params are not yet supported"
+         String, List<scalar>, List<String>, List<Schema>, List<List<scalar>>, and schema \
+         structs of those; Dict params and inner pointer-array element lists \
+         (`List<List<String>>`) are not yet supported"
     )]
     UnsupportedTypeInMain {
         /// The offending type name as written in source.

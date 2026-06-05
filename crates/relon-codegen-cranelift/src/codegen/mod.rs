@@ -839,6 +839,7 @@ fn ir_ty_to_cl(ty: IrType) -> Result<cranelift_codegen::ir::Type, CraneliftError
         | IrType::ListBool
         | IrType::ListString
         | IrType::ListSchema
+        | IrType::ListList
         | IrType::Closure
         | IrType::Dict => I32,
     })
@@ -871,6 +872,7 @@ pub(super) fn field_load_shape(
         | IrType::ListBool
         | IrType::ListString
         | IrType::ListSchema
+        | IrType::ListList
         | IrType::Closure
         | IrType::Dict => Ok((I32, 4, IrType::I32)),
     }
@@ -934,9 +936,11 @@ pub(super) fn pointer_indirect_record_align(ty: IrType) -> Result<u32, Cranelift
     match ty {
         IrType::String | IrType::ListBool => Ok(4),
         IrType::ListInt | IrType::ListFloat => Ok(8),
-        IrType::ListString | IrType::ListSchema | IrType::Closure => Err(CraneliftError::Codegen(
-            format!("pointer-indirect record alignment for {ty:?} not yet supported"),
-        )),
+        IrType::ListString | IrType::ListSchema | IrType::ListList | IrType::Closure => {
+            Err(CraneliftError::Codegen(format!(
+                "pointer-indirect record alignment for {ty:?} not yet supported"
+            )))
+        }
         _ => Err(CraneliftError::Codegen(format!(
             "type {ty:?} is not pointer-indirect"
         ))),

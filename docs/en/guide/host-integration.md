@@ -76,10 +76,15 @@ signature**; each parameter declares one host-pushed slot:
 > - scalar leaves (`Int` / `Float` / `Bool` / `Null`),
 > - **`String`** parameters (e.g. file contents the host read and pushes
 >   in),
-> - **`List<scalar>`** and **`List<String>`** parameters,
+> - **`List<scalar>`**, **`List<String>`**, **`List<Schema>`**, and
+>   nested **`List<List<scalar>>`** parameters (consumed through
+>   `.length()` / a sibling scalar field read; the inner records — a
+>   schema sub-record / an inner list record — are materialised into the
+>   buffer's tail and relocated into the parent's coordinate system),
 > - **user-`#schema` struct parameters** whose fields are scalars,
->   `String`, or `List<scalar>` / `List<String>` — the whole structured
->   config record, including string and list fields,
+>   `String`, `List<scalar>`, `List<String>`, `List<Schema>`, or
+>   `List<List<scalar>>` — the whole structured config record, including
+>   string, list, list-of-record, and nested-list fields,
 > - **nested-`#schema` struct fields** read through a multi-segment walk
 >   (`o.inner.x`, and deeper such as `c.b.a.v`). Both field-declaration
 >   spellings work — the value-position `inner: Inner` and the prefix
@@ -87,15 +92,17 @@ signature**; each parameter declares one host-pushed slot:
 >   sub-record before the leaf field read.
 >
 > Still **not yet** supported on the compiled backends (rejected up
-> front with a clear `unsupported type in #main` / `LoadListSchemaPtr` /
-> `LoadFieldAtAbsolute` error rather than silently falling back — use the
-> tree-walk evaluator for those shapes):
+> front with a clear `unsupported type in #main` / `layout v1 does not
+> yet support list element` error rather than silently falling back —
+> use the tree-walk evaluator for those shapes):
 >
 > - `Dict<_, _>` parameters (the analyzer cannot type `d["x"]` index
 >   reads; use a `#schema` struct for structured config instead),
-> - nested-list parameters (`List<List<…>>`),
-> - `List<Schema>` parameters and schema fields (including a `List<Schema>`
->   field reached through an otherwise-supported nested-schema walk).
+> - inner pointer-array element lists (`List<List<String>>` /
+>   `List<List<Schema>>`) — the recursive per-entry relocation isn't
+>   modelled,
+> - **returning** a `List<Schema>` / `List<List<…>>` from `#main`
+>   (the input decode is supported; the output store side is not).
 
 ### Boundary Result vs Relon value-level Result
 

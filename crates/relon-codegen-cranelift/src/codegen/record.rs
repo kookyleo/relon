@@ -43,7 +43,10 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         &mut self,
         ty: IrType,
     ) -> Result<(), CraneliftError> {
-        if matches!(ty, IrType::ListString | IrType::ListSchema) {
+        if matches!(
+            ty,
+            IrType::ListString | IrType::ListSchema | IrType::ListList
+        ) {
             return Err(CraneliftError::Codegen(format!(
                 "EmitTailRecordFromAbsoluteAddr {ty:?} (pointer-array) not yet supported"
             )));
@@ -159,6 +162,7 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
             | IrType::ListBool
             | IrType::ListString
             | IrType::ListSchema
+            | IrType::ListList
             | IrType::Closure
             | IrType::Dict => 4,
             IrType::Bool | IrType::Null => 1,
@@ -200,6 +204,7 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
             | IrType::ListBool
             | IrType::ListString
             | IrType::ListSchema
+            | IrType::ListList
             | IrType::Closure
             | IrType::Dict => {
                 self.builder

@@ -291,7 +291,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                     .build_int_add(shifted, eight, "tail_rec_size8")
                     .map_err(|e| LlvmError::Codegen(format!("EmitTailRecord size8: {e}")))?
             }
-            IrType::ListString | IrType::ListSchema => {
+            IrType::ListString | IrType::ListSchema | IrType::ListList => {
                 return Err(LlvmError::Codegen(format!(
                     "EmitTailRecordFromAbsoluteAddr {ty:?} (pointer-array) not yet supported"
                 )));
@@ -440,6 +440,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             | IrType::ListBool
             | IrType::ListString
             | IrType::ListSchema
+            | IrType::ListList
             | IrType::Closure
             | IrType::Dict => {
                 self.builder

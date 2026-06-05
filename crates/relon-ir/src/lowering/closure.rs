@@ -145,6 +145,7 @@ fn resolve_capture(
             IrType::ListBool => Op::LoadListBoolPtr { offset: p.offset },
             IrType::ListString => Op::LoadListStringPtr { offset: p.offset },
             IrType::ListSchema => Op::LoadListSchemaPtr { offset: p.offset },
+            IrType::ListList => Op::LoadListListPtr { offset: p.offset },
             other => Op::LoadField {
                 offset: p.offset,
                 ty: other,
@@ -360,6 +361,7 @@ pub(super) fn lower_closure_as_value(
             | IrType::ListBool
             | IrType::ListString
             | IrType::ListSchema
+            | IrType::ListList
             | IrType::Closure
             | IrType::Dict => inner.out.push(TaggedOp {
                 op: Op::LoadI32AtAbsolute { offset: *offset },

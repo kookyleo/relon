@@ -406,10 +406,22 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         self.emit_load_pointer_indirect_param(offset)
     }
 
-    // `List<Schema>` params would land here; their decode is not lowered
-    // on the cranelift backend yet (loud cap).
-    fn visit_load_list_schema_ptr(&mut self, _offset: u32) -> Result<(), CraneliftError> {
-        unsupported("LoadListSchemaPtr")
+    // `List<Schema>` params: the in_buf slot holds a 4-byte
+    // buffer-relative offset to the list header (`[len][off_0]...`),
+    // exactly like `List<String>` / nested `List<List<…>>`. Rebasing
+    // it to an arena-relative pointer is identical for every
+    // pointer-array list; the `[len]` header read (`.length()`) then
+    // works off the shared `ReadStringLen` path. Matches the LLVM
+    // backend, which routes `LoadListSchemaPtr` through the same
+    // `emit_load_pointer_indirect_param`.
+    fn visit_load_list_schema_ptr(&mut self, offset: u32) -> Result<(), CraneliftError> {
+        self.emit_load_pointer_indirect_param(offset)
+    }
+
+    // Nested `List<List<…>>` params: same pointer-array rebase as every
+    // other list load (load the buffer-relative slot, add `in_ptr`).
+    fn visit_load_list_list_ptr(&mut self, offset: u32) -> Result<(), CraneliftError> {
+        self.emit_load_pointer_indirect_param(offset)
     }
 
     fn visit_load_schema_ptr(&mut self, offset: u32) -> Result<(), CraneliftError> {

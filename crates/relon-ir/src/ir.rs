@@ -78,6 +78,15 @@ pub enum IrType {
     /// the lowering / codegen pass tracks the schema separately
     /// through the field's declared `TypeRepr`.
     ListSchema,
+    /// Nested `List<List<…>>`: pointer to a `[len: u32 LE][off_0: u32
+    /// LE]...` record whose entries each name a buffer-relative inner
+    /// list record (`[len][payload]`). Same wasm slot shape as the
+    /// other list pointers; the distinct tag drives `.length()`
+    /// dispatch (`list_list_length`) and keeps the element-of-element
+    /// type honest at IR level. The innermost element is an inline-fixed
+    /// scalar (`Int` / `Float` / `Bool`); inner pointer-array element
+    /// lists stay a loud cap at the layout pass.
+    ListList,
     /// Phase 10-a: pointer to an 8-byte closure handle record laid
     /// out in scratch memory as `[fn_table_idx: u32 LE][captures_ptr:
     /// u32 LE]`. Same wasm-side representation as `String` /
@@ -121,6 +130,7 @@ impl IrType {
             | IrType::ListBool
             | IrType::ListString
             | IrType::ListSchema
+            | IrType::ListList
             | IrType::Closure
             | IrType::Dict => IrType::I32,
         }
@@ -137,6 +147,7 @@ impl IrType {
                 | IrType::ListBool
                 | IrType::ListString
                 | IrType::ListSchema
+                | IrType::ListList
         )
     }
 }
@@ -676,6 +687,15 @@ pub enum Op {
     /// from the input buffer at `offset` bytes for a list of branded
     /// sub-records. Stack: `[] -> [ListSchema]`.
     LoadListSchemaPtr {
+        /// Byte offset of the pointer slot inside the input buffer.
+        offset: u32,
+    },
+    /// Load a `[len: u32 LE][off_0: u32]...` pointer from the input
+    /// buffer at `offset` bytes for a nested `List<List<…>>`. Stack:
+    /// `[] -> [ListList]`. Same emission shape as the other
+    /// pointer-array list loads — the entries name inner list records
+    /// rather than String / sub-record payloads.
+    LoadListListPtr {
         /// Byte offset of the pointer slot inside the input buffer.
         offset: u32,
     },
@@ -1639,6 +1659,7 @@ impl Op {
             | Op::LoadListBoolPtr { .. }
             | Op::LoadListStringPtr { .. }
             | Op::LoadListSchemaPtr { .. }
+            | Op::LoadListListPtr { .. }
             | Op::LoadFieldAtAbsolute { .. }
             | Op::LoadSchemaPtr { .. }
             | Op::LoadI32AtAbsolute { .. }

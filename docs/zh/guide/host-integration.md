@@ -67,24 +67,28 @@ host-pushed slot：
 >
 > - 标量叶子（`Int` / `Float` / `Bool` / `Null`）；
 > - **`String`** 入参（如 host 读好、喂进来的文件内容）；
-> - **`List<scalar>`** 与 **`List<String>`** 入参；
+> - **`List<scalar>`**、**`List<String>`**、**`List<Schema>`** 与嵌套
+>   **`List<List<scalar>>`** 入参（经 `.length()` 或同级标量字段读出消费；
+>   元素的内层记录 —— schema 子记录 / 内层 list 记录 —— 会物化进 buffer
+>   tail 区，并重定位进父 buffer 坐标系）；
 > - **用户 `#schema` 结构体入参**，其字段为标量、`String`、
->   `List<scalar>` 或 `List<String>` —— 即整包结构化 config 记录，
->   含字符串与列表字段；
+>   `List<scalar>`、`List<String>`、`List<Schema>` 或 `List<List<scalar>>`
+>   —— 即整包结构化 config 记录，含字符串、列表、record 列表与嵌套列表字段；
 > - **嵌套 `#schema` 结构体字段** 的多段链式读取（`o.inner.x`，乃至
 >   更深的 `c.b.a.v`）。两种字段声明写法都可用 —— 值位 `inner: Inner`
 >   与前缀 `Inner inner: *` —— 每个中间段会先 rebase 到其子记录基址，
 >   再读里层字段。
 >
 > 编译后端仍 **暂不支持**（前置阶段以明确的 `unsupported type in
-> #main` / `LoadListSchemaPtr` / `LoadFieldAtAbsolute` 报错，绝不静默
+> #main` / `layout v1 does not yet support list element` 报错，绝不静默
 > 回退；这类形状请改用 tree-walk 解释器）：
 >
 > - `Dict<_, _>` 入参（analyzer 无法给 `d["x"]` 下标定类型；结构化
 >   config 请改用 `#schema` 结构体）；
-> - 嵌套 List 入参（`List<List<…>>`）；
-> - `List<Schema>` 入参与 schema 字段（含经由可支持的嵌套 schema 链
->   抵达、但本身为 `List<Schema>` 的字段）。
+> - 内层为指针数组元素的嵌套 List（`List<List<String>>` /
+>   `List<List<Schema>>`）—— 递归逐元素重定位尚未建模；
+> - 从 `#main` **返回** `List<Schema>` / `List<List<…>>`（入参解码已支持，
+>   返回方向的写出尚未支持）。
 
 ### 入口边界 Result 与 Relon 值层 Result
 
