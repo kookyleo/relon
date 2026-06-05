@@ -70,14 +70,27 @@ signature**; each parameter declares one host-pushed slot:
 
 > **Compiled backends — structured inputs.** The compiled executors
 > (cranelift-native / llvm-native / compiled wasm) decode structured
-> `#main` parameters over their buffer protocol, not just scalars:
-> scalar leaves (`Int` / `Float` / `Bool` / `Null` / `String`),
-> `List<scalar>`, and **user-`#schema` struct parameters with scalar
-> fields** all flow through bit-identically to the tree-walk oracle.
-> `Dict<_, _>` and nested-list (`List<List<…>>`) parameters are **not
-> yet** supported on the compiled backends and are rejected up front
-> with a clear `unsupported type in #main` error rather than silently
-> falling back — use the tree-walk evaluator for those shapes.
+> `#main` parameters over their buffer protocol, not just scalars. All
+> of the following flow through bit-identically to the tree-walk oracle:
+>
+> - scalar leaves (`Int` / `Float` / `Bool` / `Null`),
+> - **`String`** parameters (e.g. file contents the host read and pushes
+>   in),
+> - **`List<scalar>`** and **`List<String>`** parameters,
+> - **user-`#schema` struct parameters** whose fields are scalars,
+>   `String`, or `List<scalar>` / `List<String>` — the whole structured
+>   config record, including string and list fields.
+>
+> Still **not yet** supported on the compiled backends (rejected up
+> front with a clear `unsupported type in #main` / `LoadListSchemaPtr` /
+> `LoadFieldAtAbsolute` error rather than silently falling back — use the
+> tree-walk evaluator for those shapes):
+>
+> - `Dict<_, _>` parameters (the analyzer cannot type `d["x"]` index
+>   reads; use a `#schema` struct for structured config instead),
+> - nested-list parameters (`List<List<…>>`),
+> - `List<Schema>` parameters and schema fields,
+> - multi-segment nested-schema walks (`o.inner.x`).
 
 ### Boundary Result vs Relon value-level Result
 
