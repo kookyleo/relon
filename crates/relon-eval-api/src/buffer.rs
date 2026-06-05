@@ -1697,7 +1697,6 @@ impl<'a> BufferReader<'a> {
         &self,
         field_name: &str,
     ) -> Result<Vec<Vec<crate::value::Value>>, BufferError> {
-        use crate::value::Value;
         let entry = self.find_entry(field_name)?;
         let inner = match &entry.ty {
             TypeRepr::List { element } => match element.as_ref() {
@@ -1745,6 +1744,79 @@ impl<'a> BufferReader<'a> {
         // Outer pointer-array header: `[len][off_0]…`. `inner_alignment
         // = 0` keeps the payload start at `header + 4` (the off array).
         let (count, entries_start) = self.decode_pointer_header(field_name, entry.offset, 0)?;
+        self.decode_list_list_rows(field_name, &inner, inner_align, count, entries_start)
+    }
+
+    /// Decode a `List<List<scalar>>` value whose **outer pointer-array
+    /// header** sits at `header_off` (a direct offset into `self.bytes`),
+    /// rather than being reached through a record's fixed-area slot.
+    ///
+    /// This is the reader half of the in-place region-walk return ABI
+    /// (S1). The machine code returns the arena-absolute offset of the
+    /// root list header; the host rebases it to a region-relative offset,
+    /// runs [`crate::verifier::verify_value_at`] over the whole reachable
+    /// graph, and only then calls this to decode in place. `inner` is the
+    /// innermost scalar element type (`Int` / `Float` / `Bool`) drained
+    /// from the return layout. The decode shares
+    /// [`Self::decode_list_list_rows`] with the field-slot
+    /// [`Self::read_list_list`] path, so a top-level and an in-place
+    /// decode of the same bytes are bit-identical.
+    pub fn read_list_list_at(
+        &self,
+        header_off: usize,
+        inner: &TypeRepr,
+    ) -> Result<Vec<Vec<crate::value::Value>>, BufferError> {
+        let inner_align: usize = match inner {
+            TypeRepr::Int | TypeRepr::Float => 8,
+            TypeRepr::Bool => 1,
+            other => {
+                return Err(BufferError::MalformedPayload {
+                    name: "<in-place root>".to_string(),
+                    reason: match other {
+                        TypeRepr::String | TypeRepr::Schema { .. } | TypeRepr::List { .. } => {
+                            "nested list inner element is a pointer-array type (unsupported)"
+                        }
+                        _ => "nested list inner element is not an inline-fixed scalar",
+                    },
+                });
+            }
+        };
+        // The header sits directly at `header_off`: `[len][off_0]…`.
+        // `entries_start = header_off + 4`; bounds-check the length
+        // prefix against the buffer end first.
+        if header_off
+            .checked_add(4)
+            .map(|end| end > self.bytes.len())
+            .unwrap_or(true)
+        {
+            return Err(BufferError::MalformedPayload {
+                name: "<in-place root>".to_string(),
+                reason: "in-place list header length prefix exceeds buffer end",
+            });
+        }
+        let mut len_buf = [0u8; 4];
+        len_buf.copy_from_slice(&self.bytes[header_off..header_off + 4]);
+        let count = u32::from_le_bytes(len_buf) as usize;
+        let entries_start = header_off + 4;
+        self.decode_list_list_rows("<in-place root>", inner, inner_align, count, entries_start)
+    }
+
+    /// Shared row-decode for both the field-slot
+    /// ([`Self::read_list_list`]) and direct-offset
+    /// ([`Self::read_list_list_at`]) nested-list paths. Walks `count`
+    /// pointer-array entries from `entries_start`, following each to its
+    /// inner `[len][pad to inner_align][payload]` record and decoding the
+    /// payload per the innermost scalar `inner` type. Every offset and
+    /// length is bounds-checked against `self.bytes` before any read.
+    fn decode_list_list_rows(
+        &self,
+        field_name: &str,
+        inner: &TypeRepr,
+        inner_align: usize,
+        count: usize,
+        entries_start: usize,
+    ) -> Result<Vec<Vec<crate::value::Value>>, BufferError> {
+        use crate::value::Value;
         let mut out: Vec<Vec<Value>> = Vec::with_capacity(count);
         for i in 0..count {
             let cursor =
@@ -1778,7 +1850,7 @@ impl<'a> BufferReader<'a> {
                 rec_start + 4
             };
             let mut inner_vec: Vec<Value> = Vec::with_capacity(inner_count);
-            match &inner {
+            match inner {
                 TypeRepr::Int => {
                     let end = payload_start
                         .checked_add(inner_count.checked_mul(8).ok_or_else(|| {

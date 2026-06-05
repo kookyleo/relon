@@ -569,24 +569,44 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
                 self.builder.ins().return_(&[v]);
             }
             EntryShape::BufferProtocol => {
-                // Mirrors the wasm-side epilogue: for bodies that
-                // touched the tail-cursor (pointer-indirect stores /
-                // dict construction) return the post-bump cursor;
-                // otherwise return the precomputed `return_root_size`
-                // so the host trampoline reads the full fixed area.
-                let value = if self.needs_tail_cursor {
-                    self.builder.ins().load(
-                        I32,
-                        MemFlags::trusted(),
-                        self.state_ptr,
-                        STATE_OFFSET_TAIL_CURSOR,
-                    )
+                // In-place region-walk return ABI (S1): when the body
+                // stashed a `List<List<scalar>>` root pointer
+                // (`emit_store_field` for `ListList`), the value is
+                // returned *in place* in its source region rather than
+                // copied to `out_buf`. We encode the arena-relative root
+                // offset `root_abs` as the negative sentinel
+                // `-(root_abs + 1)` (= `0 - root - 1`) and return it. The
+                // host distinguishes this from a normal non-negative
+                // `bytes_written`: a negative return is the in-place
+                // marker, decoded as `root_abs = -ret - 1`. `root_abs`
+                // points into the input region (`in_ptr <= root_abs`), so
+                // it is always `>= 8`, making the sentinel `<= -9` and
+                // disjoint from any legal byte count.
+                if let Some(root) = self.inplace_return_root {
+                    let neg = self.builder.ins().ineg(root);
+                    let one = self.builder.ins().iconst(I32, 1);
+                    let sentinel = self.builder.ins().isub(neg, one);
+                    self.builder.ins().return_(&[sentinel]);
                 } else {
-                    self.builder
-                        .ins()
-                        .iconst(I32, i64::from(self.return_root_size))
-                };
-                self.builder.ins().return_(&[value]);
+                    // Mirrors the wasm-side epilogue: for bodies that
+                    // touched the tail-cursor (pointer-indirect stores /
+                    // dict construction) return the post-bump cursor;
+                    // otherwise return the precomputed `return_root_size`
+                    // so the host trampoline reads the full fixed area.
+                    let value = if self.needs_tail_cursor {
+                        self.builder.ins().load(
+                            I32,
+                            MemFlags::trusted(),
+                            self.state_ptr,
+                            STATE_OFFSET_TAIL_CURSOR,
+                        )
+                    } else {
+                        self.builder
+                            .ins()
+                            .iconst(I32, i64::from(self.return_root_size))
+                    };
+                    self.builder.ins().return_(&[value]);
+                }
             }
         }
         // After the explicit return, the current block is filled.

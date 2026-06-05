@@ -25,6 +25,7 @@ use cranelift_jit::JITModule;
 use relon_eval_api::buffer::{BufferBuilder, BufferError, BufferReader};
 use relon_eval_api::layout::{OffsetTable, SchemaLayout};
 use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
+use relon_eval_api::verifier::{verify_value_at, Region};
 use relon_eval_api::{
     ClosureData, Evaluator, RelonFunction, RuntimeError, Scope, SmolStr, Thunk, Value,
 };
@@ -1616,10 +1617,28 @@ impl AotEvaluator {
             scratch_base,
             /*caps=*/ 0,
         )?;
+        // In-place region-walk return ABI (S1): a negative return value
+        // is the in-place sentinel `-(root_abs + 1)`. Instead of a value
+        // copied into `out_buf`, the machine code reports the
+        // arena-absolute offset of the return root (today only a
+        // `List<List<scalar>>` value sourced from a `#main` parameter).
+        // We rebase it to its source region, run the bounds verifier over
+        // the whole reachable graph confined to that region, and only on
+        // a clean verify decode the value in place. A verifier failure is
+        // a loud error — we never decode an unverified in-place return.
         if bytes_written < 0 {
-            return Err(RuntimeError::IoError(format!(
-                "cranelift run_main reported negative bytes_written: {bytes_written}"
-            )));
+            let root_abs = decode_inplace_sentinel(bytes_written)?;
+            return self.decode_inplace_return(
+                bs,
+                arena,
+                arena_size,
+                in_ptr,
+                in_len,
+                out_ptr,
+                out_cap,
+                scratch_base,
+                root_abs,
+            );
         }
         let bw = bytes_written as usize;
 
@@ -1648,6 +1667,160 @@ impl AotEvaluator {
             ))
         }
     }
+
+    /// Decode an in-place region-walk return (S1). The machine code
+    /// reported `root_abs`, the arena-absolute offset of the return
+    /// root, via the negative sentinel. This:
+    ///
+    /// 1. Picks the **arena region** `root_abs` lands in by comparison
+    ///    against the layout boundaries (`const_data` / `in_buf` /
+    ///    `out_buf` / `scratch`). The single-region invariant guarantees
+    ///    the value is self-contained in that one region; the verifier
+    ///    proves it.
+    /// 2. Slices the arena to that region and rebases `root_abs` to a
+    ///    region-relative offset. Pointer offsets inside the region are
+    ///    region-relative (the writer emits buffer-relative offsets and
+    ///    the machine code only rebases the top-level slot it loads), so
+    ///    a region slice makes every inner offset slice-relative too.
+    /// 3. Runs [`verify_value_at`] over the whole reachable graph,
+    ///    confined to the region. **A verify failure aborts the decode**
+    ///    — this is the gate that turns a stray / cross-region offset
+    ///    into a loud error instead of a wild read.
+    /// 4. Only on a clean verify decodes the value in place via
+    ///    [`BufferReader::read_list_list_at`].
+    ///
+    /// Today only a single-value `List<List<scalar>>` return reaches
+    /// here (the IR lowering caps every other in-place shape). The region
+    /// selection / verify gate are written to generalise to the S2+
+    /// shapes (List<String> / List<Schema> / object fields) that will
+    /// also report an in-place root.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_inplace_return(
+        &self,
+        bs: &BufferSchema,
+        arena: &[u8],
+        arena_size: usize,
+        in_ptr: u32,
+        in_len: u32,
+        out_ptr: u32,
+        out_cap: u32,
+        scratch_base: u32,
+        root_abs: usize,
+    ) -> Result<Value, RuntimeError> {
+        // The return must be a single-value wrapper carrying a
+        // `List<List<scalar>>`. Anything else reaching here is a
+        // lowering/ABI drift bug — surface it loudly.
+        if !is_single_value_wrapper(&bs.return_schema) {
+            return Err(RuntimeError::IoError(
+                "cranelift in-place return on a non-single-value return schema".into(),
+            ));
+        }
+        let field = &bs.return_schema.fields[0];
+        let inner = match &field.ty {
+            TypeRepr::List { element } => match element.as_ref() {
+                TypeRepr::List { element: inner } => inner.as_ref().clone(),
+                other => {
+                    return Err(RuntimeError::IoError(format!(
+                        "cranelift in-place return: expected List<List<scalar>>, inner was {other:?}"
+                    )));
+                }
+            },
+            other => {
+                return Err(RuntimeError::IoError(format!(
+                    "cranelift in-place return: expected List<List<scalar>>, got {other:?}"
+                )));
+            }
+        };
+
+        // 1. Select the region `root_abs` falls in. The arena layout is
+        // `[const_data | pad | in_buf | pad | out_buf | pad | scratch]`.
+        // For S1 the root is always the param-sourced in_buf list, but
+        // we select generically so S2+ can return out_buf / scratch
+        // roots through the same gate.
+        let const_end = self.const_data.len();
+        let in_start = in_ptr as usize;
+        let in_end = in_start + in_len as usize;
+        let out_start = out_ptr as usize;
+        let out_end = out_start + out_cap as usize;
+        let scratch_start = scratch_base as usize;
+        let (region_start, region_end) = if root_abs >= in_start && root_abs < in_end {
+            (in_start, in_end)
+        } else if root_abs >= out_start && root_abs < out_end {
+            (out_start, out_end)
+        } else if root_abs >= scratch_start && root_abs < arena_size {
+            (scratch_start, arena_size)
+        } else if root_abs < const_end {
+            (0, const_end)
+        } else {
+            return Err(RuntimeError::IoError(format!(
+                "cranelift in-place return root {root_abs} falls outside every arena region \
+                 (const_end={const_end}, in=[{in_start},{in_end}), out=[{out_start},{out_end}), \
+                 scratch=[{scratch_start},{arena_size}))"
+            )));
+        };
+
+        if region_end > arena_size {
+            return Err(RuntimeError::IoError(
+                "cranelift in-place return region exceeds arena size".into(),
+            ));
+        }
+        // Region slice; offsets inside are region-relative.
+        let region_bytes = &arena[region_start..region_end];
+        let root_rel = root_abs - region_start;
+
+        // 2. Recompute the `ListElementKind` sidecar for the outer
+        // `List<List<…>>` from the return layout so the verifier knows
+        // the root is a pointer-array header.
+        let list_element = bs
+            .return_layout
+            .fields
+            .first()
+            .and_then(|fo| fo.list_element);
+
+        // 3. Verify the whole reachable graph stays in-region BEFORE any
+        // decode. A failure is loud and aborts — never a wild read.
+        let region = Region::new(0, region_bytes.len()).map_err(|e| {
+            RuntimeError::IoError(format!("cranelift in-place return region invalid: {e}"))
+        })?;
+        verify_value_at(region_bytes, &field.ty, list_element, root_rel, region).map_err(|e| {
+            RuntimeError::IoError(format!(
+                "cranelift in-place return verifier rejected the buffer (root_abs={root_abs}, \
+                 region=[{region_start},{region_end})): {e}"
+            ))
+        })?;
+
+        // 4. Verified — decode in place. The reader walks the same
+        // region slice the verifier certified.
+        let reader = BufferReader::new(&bs.return_layout, &bs.return_schema.fields, region_bytes)
+            .map_err(buffer_to_runtime_error)?;
+        let rows = reader
+            .read_list_list_at(root_rel, &inner)
+            .map_err(buffer_to_runtime_error)?;
+        Ok(Value::List(Arc::new(
+            rows.into_iter().map(|r| Value::List(Arc::new(r))).collect(),
+        )))
+    }
+}
+
+/// Decode the in-place region-walk return sentinel. The machine code
+/// encodes an in-place return as `-(root_abs + 1)` (a value `<= -9`,
+/// since `root_abs >= in_ptr >= 8`). Recover `root_abs = -ret - 1`,
+/// rejecting a sentinel that doesn't round-trip into a non-negative
+/// offset (a corrupt / impossible encoding).
+fn decode_inplace_sentinel(ret: i32) -> Result<usize, RuntimeError> {
+    // `ret` is negative here. `-(ret as i64) - 1` is the root offset;
+    // i64 math avoids the `i32::MIN` negation overflow.
+    let root = -(ret as i64) - 1;
+    if root < 0 {
+        return Err(RuntimeError::IoError(format!(
+            "cranelift in-place return sentinel {ret} decodes to a negative root offset"
+        )));
+    }
+    usize::try_from(root).map_err(|_| {
+        RuntimeError::IoError(format!(
+            "cranelift in-place return sentinel {ret} decodes to an out-of-range root offset"
+        ))
+    })
 }
 
 thread_local! {

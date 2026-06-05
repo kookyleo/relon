@@ -877,8 +877,29 @@ fn lower_entry_with_resolver<'a>(
         // buffer-relative block the rigid-delta return copy cannot
         // relocate; it would segfault / return corrupt data. Reject it
         // loudly here so the silent-miscompile path is unreachable.
+        //
+        // S1 exception (in-place region-walk return ABI, cranelift only):
+        // a `List<List<scalar>>` value sourced **directly from a `#main`
+        // parameter** (identity return `xss`, or a parameter-field path
+        // `o.field`) is *not* copied at all. The lowering still emits the
+        // trailing `StoreField { ty: ListList }`, but the cranelift
+        // backend lowers that store to the in-place return sentinel
+        // (`-(root_abs + 1)`): it reports the arena-absolute offset of the
+        // root list header (which the param load already produced) to the
+        // host instead of relocating the block. The host selects the
+        // region the root lands in, runs the bounds verifier over the
+        // whole reachable graph, and only then decodes in place. Because
+        // the value is self-contained in the input region (the
+        // single-region invariant: no const-pool / element-construction
+        // producer for `List<List>`), the walk never crosses a region.
+        // List<String> / List<Schema> (non-const) stay capped — they have
+        // a per-element pointer-array whose in-place return is a later
+        // step.
+        let is_inplace_param_listlist =
+            ret_ir_ty == IrType::ListList && list_list_source_is_param_walk(&root.expr);
         if pointer_array_list_ir_type(ret_ir_ty)
             && !pointer_array_list_source_is_const_pool(&root.expr)
+            && !is_inplace_param_listlist
         {
             return Err(LoweringError::UnsupportedTypeInMain {
                 type_name: format!(
@@ -1109,10 +1130,12 @@ fn build_main_return_schema(sig: &MainSignature) -> Result<Schema, LoweringError
             type_name: "<missing>".to_string(),
             range: sig.range,
         })?;
-    let ty = type_node_to_canonical(rt).ok_or_else(|| LoweringError::UnsupportedTypeInMain {
-        type_name: type_head_for_display(rt),
-        range: rt.range,
-    })?;
+    let ty = type_node_to_canonical(rt)
+        .or_else(|| return_list_list_scalar_canonical(rt))
+        .ok_or_else(|| LoweringError::UnsupportedTypeInMain {
+            type_name: type_head_for_display(rt),
+            range: rt.range,
+        })?;
     Ok(Schema {
         name: MAIN_RETURN_SCHEMA_NAME.to_string(),
         generics: vec![],
@@ -1999,6 +2022,44 @@ fn type_node_to_canonical(t: &TypeNode) -> Option<TypeRepr> {
     }
 }
 
+/// Return-side canonicalizer for the `List<List<scalar>>` return type
+/// (`#main(...) -> List<List<Int|Float|Bool>>`). The scalar
+/// [`type_node_to_canonical`] only accepts a single level of list, so a
+/// nested-list **return** head falls through to here. We accept it only
+/// when the innermost element is an inline-fixed scalar (Int / Float /
+/// Bool) — that is the one shape the in-place region-walk return ABI
+/// (S1) decodes. A `List<List<String>>` / `List<List<Schema>>` inner
+/// (pointer-array element) returns `None` and the return type stays a
+/// loud cap. This is deliberately narrow and return-only: parameter
+/// canonicalisation already handles nested lists via
+/// [`type_node_to_canonical_with_schemas`], and widening the shared
+/// scalar canonicalizer would mis-accept nested lists in unrelated
+/// surfaces (native-fn signatures, etc.).
+fn return_list_list_scalar_canonical(t: &TypeNode) -> Option<TypeRepr> {
+    if t.path.len() != 1
+        || t.path[0].as_str() != "List"
+        || t.generics.len() != 1
+        || t.variant_fields.is_some()
+    {
+        return None;
+    }
+    // Outer is `List<…>`; the generic must itself be `List<scalar>`.
+    let inner = type_node_to_canonical(&t.generics[0])?;
+    match &inner {
+        TypeRepr::List { element }
+            if matches!(
+                element.as_ref(),
+                TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool
+            ) =>
+        {
+            Some(TypeRepr::List {
+                element: Box::new(inner),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// True when an [`IrType`] is materialised through a buffer-relative
 /// pointer slot rather than stored inline in a record's fixed area —
 /// String and every `List<_>` variant. Such fields require an
@@ -2067,6 +2128,32 @@ fn pointer_array_list_source_is_const_pool(expr: &Expr) -> bool {
     // element classifier earlier), so requiring String literals here is
     // exactly the const-`ListString` provenance.
     !items.is_empty() && items.iter().all(|n| matches!(&*n.expr, Expr::String(_)))
+}
+
+/// True when `expr` is a bare `#main` parameter **identity** reference
+/// (`xss`, a single-segment `Expr::Variable`) — the value lowers to a
+/// single `LoadListListPtr` that pushes the input-region root header's
+/// arena-relative offset.
+///
+/// This is the S1 trigger for the in-place region-walk return ABI: the
+/// `List<List<scalar>>` value is self-contained in the input buffer and
+/// its outer/inner pointer-array layout is exactly what the host writer
+/// emitted, so the cranelift backend reports the root's arena-absolute
+/// offset and the host verifies + decodes it in place — bit-equal to the
+/// tree-walk oracle.
+///
+/// A parameter-**field** walk (`w.rows`) is intentionally **NOT**
+/// accepted here. A `List<List<scalar>>` reached through a schema field
+/// is re-encoded by the field-load path into the materialised inner form
+/// (i64 element slots carrying truncated i32 row handles, per the W16/W19
+/// index lowering), which the in-place reader decodes wrong (the inner
+/// scalar bytes shift). Rather than ship a silent miscompile it stays a
+/// loud cap until a later step proves it bit-equal. Everything else (a
+/// list literal, comprehension, call, binary expression) is likewise not
+/// an identity param walk and keeps the existing const-pool / loud-cap
+/// paths.
+fn list_list_source_is_param_walk(expr: &Expr) -> bool {
+    matches!(expr, Expr::Variable(path) if path.len() == 1)
 }
 
 /// Map a canonical [`TypeRepr`] to the matching [`IrType`]. Used both

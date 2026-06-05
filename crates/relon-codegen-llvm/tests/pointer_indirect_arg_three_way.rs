@@ -449,17 +449,22 @@ fn nested_schema_with_list_schema_field_three_way() {
 ///
 /// Materialised this round: `List<Schema>` / `List<List<scalar>>`
 /// params + schema fields consumed through `.length()` / a sibling
-/// scalar read. Still capped: the *return* side of those pointer-array
-/// lists (`StoreField(ListSchema/ListList)` is unsupported), inner
-/// pointer-array element lists (`List<List<String>>`), and `Dict`
-/// params (analyzer dead-end).
+/// scalar read. Still capped: the *return* side of `List<Schema>`
+/// (`StoreField(ListSchema)` is unsupported), inner pointer-array
+/// element lists (`List<List<String>>`), and `Dict` params (analyzer
+/// dead-end).
+///
+/// NOTE: the nested-list **identity return**
+/// `#main(List<List<Int>> xss) -> List<List<Int>> = xss` is now
+/// cranelift-supported via the S1 in-place region-walk return ABI (it
+/// reports the input-region root to the host instead of copying). LLVM
+/// still caps it — S1 is cranelift-only — so that case moved to
+/// [`nested_list_identity_return_cranelift_only`] below.
 #[test]
 fn unsupported_pointer_indirect_shapes_loudly_capped() {
     for src in [
         // List<Schema> *return* (StoreField pointer-array not lowered).
         "#schema P { x: Int }\n#main(List<P> ps) -> List<P>\nps",
-        // nested list *return*.
-        "#main(List<List<Int>> xss) -> List<List<Int>>\nxss",
         // Dict param.
         "#main(Dict<String, Int> d) -> Dict<String, Int>\nd",
         // inner pointer-array element list: List<List<String>> stays a
@@ -471,4 +476,22 @@ fn unsupported_pointer_indirect_shapes_loudly_capped() {
         let llvm = LlvmAotEvaluator::from_source(src);
         assert!(llvm.is_err(), "llvm must loudly reject `{src}`, got Ok");
     }
+}
+
+/// The nested-list identity return is the S1 split: cranelift compiles
+/// it (in-place region-walk return ABI), LLVM still caps it loudly. Pins
+/// the asymmetry so neither half regresses — a cranelift regression would
+/// re-cap a supported shape; an LLVM acceptance would mean S2's three-way
+/// lift landed without the bit-equal proof.
+#[test]
+fn nested_list_identity_return_cranelift_only() {
+    let src = "#main(List<List<Int>> xss) -> List<List<Int>>\nxss";
+    assert!(
+        AotEvaluator::from_source(src).is_ok(),
+        "cranelift must compile the S1 nested-list identity return"
+    );
+    assert!(
+        LlvmAotEvaluator::from_source(src).is_err(),
+        "llvm must still loudly cap the nested-list return (S1 is cranelift-only)"
+    );
 }

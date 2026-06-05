@@ -635,6 +635,7 @@ fn lower_module_into<M: CrModule>(
             needs_tail_cursor: matches!(entry_shape, EntryShape::BufferProtocol)
                 && body_needs_tail_cursor(&entry.body),
             return_root_size,
+            inplace_return_root: None,
             mode: CodegenMode::Entry,
         };
 
@@ -775,6 +776,9 @@ fn lower_module_into<M: CrModule>(
                 record_locals: HashMap::new(),
                 needs_tail_cursor: false,
                 return_root_size: 0,
+                // Lambdas never carry the buffer-protocol in-place return
+                // ABI (that is an entry-only `StoreField { ListList }`).
+                inplace_return_root: None,
                 mode: CodegenMode::Lambda {
                     captures_ptr,
                     lambda_param_tys: &lambda.params,
@@ -1067,6 +1071,18 @@ struct Codegen<'a, 'b> {
     /// prologue uses the same value to bias `tail_cursor` to the
     /// first byte past the fixed area when tail records are present.
     return_root_size: u32,
+    /// In-place region-walk return ABI (S1): set by
+    /// `emit_store_field` when the entry returns a `List<List<scalar>>`
+    /// sourced directly from a `#main` parameter. Holds the
+    /// **arena-relative** offset of the root list header (the value a
+    /// `LoadListListPtr` / `LoadFieldAtAbsolute { ListList }` pushed). No
+    /// bytes are copied into `out_buf`; instead the epilogue
+    /// (`emit_return`) encodes this offset as the negative in-place
+    /// sentinel `-(root_abs + 1)` and returns it, telling the host to
+    /// verify + decode the value in place at its source region rather
+    /// than at `out_ptr`. `None` for every other return shape, which
+    /// keeps the existing `bytes_written` epilogue.
+    inplace_return_root: Option<CValue>,
     /// Stage 5 Phase C.4: when this Codegen is lowering a *lambda*
     /// body (not the entry function), `captures_ptr` carries the
     /// Entry vs lambda mode. Encodes the two cases that previously

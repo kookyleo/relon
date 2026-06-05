@@ -2389,6 +2389,8 @@ dependencies = [
 name = "relon-test-harness"
 version = "0.1.0"
 dependencies = [
+ "ordered-float",
+ "proptest",
  "relon",
  "relon-analyzer",
  "relon-eval-api",
