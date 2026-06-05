@@ -407,16 +407,16 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         unsupported("LoadListSchemaPtr")
     }
 
-    fn visit_load_schema_ptr(&mut self, _offset: u32) -> Result<(), CraneliftError> {
-        unsupported("LoadSchemaPtr")
+    fn visit_load_schema_ptr(&mut self, offset: u32) -> Result<(), CraneliftError> {
+        self.emit_load_schema_ptr(offset)
     }
 
     fn visit_load_field_at_absolute(
         &mut self,
-        _offset: u32,
-        _ty: IrType,
+        offset: u32,
+        ty: IrType,
     ) -> Result<(), CraneliftError> {
-        unsupported("LoadFieldAtAbsolute")
+        self.emit_load_field_at_absolute(offset, ty)
     }
 
     fn visit_read_string_len(&mut self) -> Result<(), CraneliftError> {
