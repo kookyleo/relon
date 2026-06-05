@@ -95,13 +95,20 @@ signature**; each parameter declares one host-pushed slot:
 > `Value` back into the buffer bit-identically to the tree-walk oracle
 > for:
 >
-> - scalar leaves, `String`, `List<scalar>`, and `List<String>` returns,
+> - scalar leaves, `String`, and `List<scalar>` (`List<Int/Float/Bool>`)
+>   returns — including identity-returning a scalar-list `#main`
+>   parameter, whose tail record is a single inline-fixed block,
+> - `List<String>` returns **sourced from an in-source list literal**
+>   (`["a", "b", …]`) — a const-pool block whose inner string pointers
+>   are contiguous and single-base, so the rigid tail copy relocates them
+>   correctly,
 > - **`#schema`-branded struct returns** (`#main() -> Cfg { ... }`) whose
->   fields are any of the above (including `String` / `List` fields),
+>   fields are any of the above (including literal `String` / `List`
+>   fields),
 > - **anonymous `-> Dict { ... }` returns** — each non-`#internal` field
 >   is marshalled into the return record, including `String`,
->   `List<scalar>`, and `List<String>` fields. (`#internal` fields stay
->   off the host-visible surface, matching the oracle.)
+>   `List<scalar>`, and literal `List<String>` fields. (`#internal` fields
+>   stay off the host-visible surface, matching the oracle.)
 >
 > Still **not yet** supported on the compiled backends (rejected up
 > front with a clear `unsupported type in #main` / `layout v1 does not
@@ -114,9 +121,16 @@ signature**; each parameter declares one host-pushed slot:
 >   `List<List<Schema>>`) — the recursive per-entry relocation isn't
 >   modelled,
 > - **returning** a `List<Schema>` / `List<List<…>>` from `#main`, or an
->   anon-`Dict` field of those types (the input decode is supported; the
->   recursive output-store relocation is not — it fails loudly, never
->   returns wrong data).
+>   anon-`Dict` / struct field of those types (the input decode is
+>   supported; the recursive output-store relocation is not),
+> - **returning a `List<String>` (or any pointer-array list) sourced from
+>   a `#main` parameter / field load / call** rather than an in-source
+>   literal — such a value lives in the input buffer with non-contiguous,
+>   whole-buffer-relative offsets the rigid tail copy cannot relocate.
+>
+> All of the above fail **loudly** at compile time; the compiled
+> backends never return wrong data or crash for them — route those shapes
+> through the tree-walk evaluator.
 
 ### Boundary Result vs Relon value-level Result
 
