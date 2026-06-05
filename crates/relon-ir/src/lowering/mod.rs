@@ -757,7 +757,7 @@ fn lower_entry_with_resolver<'a>(
     } else if let Some(ref plan) = anon_dict_plan {
         plan.schema.clone()
     } else {
-        build_main_return_schema(sig)?
+        build_main_return_schema(sig, &resolver)?
     };
     let main_layout = SchemaLayout::offsets_for(&main_schema)?;
     let return_layout = SchemaLayout::offsets_for(&return_schema)?;
@@ -879,9 +879,10 @@ fn lower_entry_with_resolver<'a>(
         // loudly here so the silent-miscompile path is unreachable.
         //
         // In-place region-walk return ABI (S1/S2 cranelift+llvm): a
-        // `List<List<scalar>>` value, or (S3) a `List<String>` value,
-        // sourced **directly from a `#main` parameter identity**
-        // (`xss` / `ss`) is *not* copied at all. The lowering emits the
+        // `List<List<scalar>>` value, (S3) a `List<String>` value, or
+        // (S4) a `List<Schema>` value — each sourced **directly from a
+        // `#main` parameter identity** (`xss` / `ss` / `items`) — is
+        // *not* copied at all. The lowering emits the
         // trailing `StoreField { ty, inplace: true }`, and both AOT
         // backends lower that store to the in-place return sentinel
         // (`-(root_abs + 1)`): they report the arena-absolute offset of
@@ -899,10 +900,23 @@ fn lower_entry_with_resolver<'a>(
         // schema field is re-encoded by the field-load path into a
         // different inner form (truncated i32 row handles / re-laid
         // records) the in-place reader would decode wrong, so it stays a
-        // loud cap. `List<Schema>` and const-pool `List<String>` literals
-        // keep the existing copy / loud-cap paths (`inplace: false`).
-        let is_inplace_param_walk = matches!(ret_ir_ty, IrType::ListList | IrType::ListString)
-            && pointer_array_param_identity_walk(&root.expr);
+        // loud cap. Const-pool `List<String>` literals keep the existing
+        // copy path (`inplace: false`).
+        // For `List<Schema>` (S4) the in-place sub-record reader only
+        // decodes scalar / String / List<scalar> / List<String> fields.
+        // A sub-record carrying a *deeper* pointer-array element field
+        // (`List<Schema>` / `List<List<…>>` inside the element) is out of
+        // S4 scope: leaving it `inplace` would emit the sentinel but the
+        // host decode would error at runtime. Gate it here so it stays a
+        // loud cap at lowering (S5 territory) instead.
+        let is_inplace_param_walk = pointer_array_param_identity_walk(&root.expr)
+            && match ret_ir_ty {
+                IrType::ListList | IrType::ListString => true,
+                IrType::ListSchema => {
+                    list_schema_subrecord_in_s4_scope(&return_schema.fields[0].ty)
+                }
+                _ => false,
+            };
         if pointer_array_list_ir_type(ret_ir_ty)
             && !pointer_array_list_source_is_const_pool(&root.expr)
             && !is_inplace_param_walk
@@ -1129,7 +1143,10 @@ fn type_node_to_canonical_with_schemas(
 /// pin the failure shape — but the error string now points users at
 /// the Phase C lifting work so they don't grep blindly through the
 /// lowering pass when they meet it.
-fn build_main_return_schema(sig: &MainSignature) -> Result<Schema, LoweringError> {
+fn build_main_return_schema(
+    sig: &MainSignature,
+    resolver: &SchemaResolver<'_>,
+) -> Result<Schema, LoweringError> {
     let rt = sig
         .return_type
         .as_ref()
@@ -1137,8 +1154,14 @@ fn build_main_return_schema(sig: &MainSignature) -> Result<Schema, LoweringError
             type_name: "<missing>".to_string(),
             range: sig.range,
         })?;
+    // S4: a `-> List<Schema>` return resolves through the schema-aware
+    // canonicaliser (the narrow `type_node_to_canonical` has no resolver
+    // and so can't name a user schema). Only the *single* `List<Schema>`
+    // shape is admitted here; `List<List<Schema>>` and deeper nested
+    // schema lists stay rejected (they fall through to the loud cap).
     let ty = type_node_to_canonical(rt)
         .or_else(|| return_list_list_scalar_canonical(rt))
+        .or_else(|| return_list_schema_canonical(rt, resolver))
         .ok_or_else(|| LoweringError::UnsupportedTypeInMain {
             type_name: type_head_for_display(rt),
             range: rt.range,
@@ -2067,6 +2090,34 @@ fn return_list_list_scalar_canonical(t: &TypeNode) -> Option<TypeRepr> {
     }
 }
 
+/// Canonicalise a `-> List<Schema>` return type (S4). The outer head must
+/// be `List<…>` with exactly one generic that names a user `#schema`; the
+/// inner schema is resolved through the schema-aware canonicaliser. A
+/// `List<List<…>>` or `List<scalar>` / `List<String>` generic returns
+/// `None` here so those keep their own dedicated paths (the scalar/string
+/// list canonicalisers, or the loud cap for nested schema lists).
+///
+/// Scoped narrowly to the single `List<Schema>` shape: the inner element
+/// must be a `TypeRepr::Schema`, never itself a `List`. That keeps
+/// `List<List<Schema>>` (a pointer-array-of-pointer-array the in-place
+/// reader does not decode) rejected as `UnsupportedTypeInMain`.
+fn return_list_schema_canonical(t: &TypeNode, resolver: &SchemaResolver<'_>) -> Option<TypeRepr> {
+    if t.path.len() != 1
+        || t.path[0].as_str() != "List"
+        || t.generics.len() != 1
+        || t.variant_fields.is_some()
+    {
+        return None;
+    }
+    let inner = type_node_to_canonical_with_schemas(&t.generics[0], resolver)?;
+    match &inner {
+        TypeRepr::Schema { .. } => Some(TypeRepr::List {
+            element: Box::new(inner),
+        }),
+        _ => None,
+    }
+}
+
 /// True when an [`IrType`] is materialised through a buffer-relative
 /// pointer slot rather than stored inline in a record's fixed area —
 /// String and every `List<_>` variant. Such fields require an
@@ -2143,12 +2194,12 @@ fn pointer_array_list_source_is_const_pool(expr: &Expr) -> bool {
 /// pushes the input-region root header's arena-relative offset.
 ///
 /// This is the trigger for the in-place region-walk return ABI (S1/S2
-/// `List<List<scalar>>`, S3 `List<String>`): the pointer-array value is
-/// self-contained in the input buffer and its outer/inner layout is
-/// exactly what the host writer emitted, so both AOT backends report the
-/// root's arena-absolute offset and the host verifies + decodes it in
-/// place — bit-equal to the tree-walk oracle, including every string's
-/// bytes.
+/// `List<List<scalar>>`, S3 `List<String>`, S4 `List<Schema>`): the
+/// pointer-array value is self-contained in the input buffer and its
+/// outer/inner layout is exactly what the host writer emitted, so both
+/// AOT backends report the root's arena-absolute offset and the host
+/// verifies + decodes it in place — bit-equal to the tree-walk oracle,
+/// including every string's bytes and every sub-record field.
 ///
 /// A parameter-**field** walk (`w.rows` / `o.tags`) is intentionally
 /// **NOT** accepted here. A pointer-array list reached through a schema
@@ -2162,6 +2213,37 @@ fn pointer_array_list_source_is_const_pool(expr: &Expr) -> bool {
 /// the existing const-pool / loud-cap paths.
 fn pointer_array_param_identity_walk(expr: &Expr) -> bool {
     matches!(expr, Expr::Variable(path) if path.len() == 1)
+}
+
+/// True when a `List<Schema>` return type's per-element sub-record carries
+/// only fields the S4 in-place sub-record reader can decode: the scalar
+/// leaves (`Int` / `Float` / `Bool` / `Null` / `String`), `List<scalar>`,
+/// and `List<String>`. A sub-record field that is itself a pointer-array
+/// *element* list (`List<Schema>` / `List<List<…>>`) is **out of S4 scope**
+/// — the in-place reader (`read_record_field`) caps it loudly — so the
+/// in-place return must NOT be taken; the caller keeps it a loud cap at
+/// lowering (S5 territory) rather than emit a sentinel the host can't
+/// decode. `ty` is the full `List<Schema{…}>` return type (the element
+/// schema is canonicalised inline, so the field set is available here).
+fn list_schema_subrecord_in_s4_scope(ty: &TypeRepr) -> bool {
+    let TypeRepr::List { element } = ty else {
+        return false;
+    };
+    let TypeRepr::Schema { schema } = element.as_ref() else {
+        return false;
+    };
+    schema.fields.iter().all(|f| match &f.ty {
+        TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool | TypeRepr::Null | TypeRepr::String => {
+            true
+        }
+        TypeRepr::List { element } => matches!(
+            element.as_ref(),
+            TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool | TypeRepr::String
+        ),
+        // Nested Schema field, Option / Result / Closure, or a deeper
+        // pointer-array element list — out of S4 scope.
+        _ => false,
+    })
 }
 
 /// Map a canonical [`TypeRepr`] to the matching [`IrType`]. Used both

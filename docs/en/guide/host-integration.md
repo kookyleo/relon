@@ -123,6 +123,20 @@ signature**; each parameter declares one host-pushed slot:
 >   in-region before decoding it in place — bit-equal to the tree-walk
 >   oracle including each string's bytes. A parameter-*field* `List<String>`
 >   (`o.tags`) stays capped on both,
+> - **`List<Schema>` identity returns from a `#main` parameter**
+>   (`#main(List<Cfg> items) -> List<Cfg> = items`), on **both the
+>   cranelift and llvm backends.** This is the deepest in-place region-walk
+>   shape: the outer `[len][off_i]` header points at per-element schema
+>   sub-records, each of which itself carries `String` / `List<scalar>` /
+>   `List<String>` pointer fields (plus inline scalars at varied offsets).
+>   The machine code reports the root offset and the host verifier recurses
+>   to **every sub-record field pointer** (each entry → its sub-record's
+>   fixed area → each String / List field's tail record) before decoding
+>   each element into a branded dict in place — bit-equal to the tree-walk
+>   oracle including every sub-object's field bytes. A parameter-*field*
+>   `List<Schema>` (`w.items`) stays capped on both, as does a sub-record
+>   that itself carries a nested `List<Schema>` / `List<List<…>>` field
+>   (out of scope — the in-place sub-record reader caps it),
 > - **`#schema`-branded struct returns** (`#main() -> Cfg { ... }`) whose
 >   fields are any of the above (including literal `String` / `List`
 >   fields),
@@ -141,18 +155,20 @@ signature**; each parameter declares one host-pushed slot:
 > - inner pointer-array element lists (`List<List<String>>` /
 >   `List<List<Schema>>`) — the recursive per-entry relocation isn't
 >   modelled,
-> - **returning** a `List<Schema>` from `#main`, a `List<List<scalar>>`
->   reached through a **parameter field** on either backend (the
->   parameter-*identity* case is supported on both backends above), or an
->   anon-`Dict` / struct field of those types. The
->   host-side *decode* is in place — `BufferReader` walks the buffer with
->   a single base and reconstructs the nested `Value` recursively
->   (`read_list_record` for `List<Schema>`, `read_list_list` /
+> - **returning** a `List<Schema>` or `List<List<scalar>>` reached through
+>   a **parameter field** on either backend (the parameter-*identity* case
+>   is supported on both backends above), a `List<Schema>` whose sub-record
+>   carries a nested `List<Schema>` / `List<List<…>>` field, or an
+>   anon-`Dict` / struct field of those types. The host-side *decode* is in
+>   place — `BufferReader` walks the buffer with a single base and
+>   reconstructs the nested `Value` recursively (`read_list_record` /
+>   `read_list_record_at` for `List<Schema>`, `read_list_list` /
 >   `read_list_list_at` for `List<List<scalar>>`, `read_list_string_at`
 >   for an in-place `List<String>`). The in-place return wiring now covers
->   the *per-element pointer-array* `List<String>` parameter-identity shape
->   (above); still missing for `List<Schema>` rows and the materialised
->   field-load form, which stay a loud compile-time cap,
+>   the *per-element pointer-array* `List<String>` and `List<Schema>`
+>   parameter-identity shapes (above); still missing for the materialised
+>   field-load form and deeper-nested element lists, which stay a loud
+>   compile-time cap,
 > - **returning a `List<String>` (or any pointer-array list) sourced from a
 >   `#main` parameter *field load* / call** rather than a parameter
 >   identity or an in-source literal — such a value's field-load rebase is
@@ -179,9 +195,9 @@ signature**; each parameter declares one host-pushed slot:
 > single-base const-pool block and segfaulted on the scattered param
 > graph.
 >
-> **In-place region-walk return ABI (the honest fix; `List<List<scalar>>`
-> and `List<String>` parameter-identity now landed on both the cranelift
-> and llvm backends).** Instead of copying, the machine
+> **In-place region-walk return ABI (the honest fix; `List<List<scalar>>`,
+> `List<String>`, and `List<Schema>` parameter-identity now landed on both
+> the cranelift and llvm backends).** Instead of copying, the machine
 > code reports the **arena-absolute offset of the result root** to the
 > host via a negative return sentinel: a `run_main` return value `>= 0` is
 > the usual `bytes_written` (decode at `out_ptr`), while a value `< 0`
@@ -200,8 +216,10 @@ signature**; each parameter declares one host-pushed slot:
 >    does not decode an unverified in-place return;
 > 3. only on a clean verify **decodes in place** via the same
 >    `BufferReader` the out_buf path uses (`read_list_list_at` for a
->    nested-list root, `read_list_string_at` for a `List<String>` root),
->    against the region slice the verifier certified.
+>    nested-list root, `read_list_string_at` for a `List<String>` root,
+>    `read_list_record_at` for a `List<Schema>` root — each sub-record
+>    drained into a branded dict), against the region slice the verifier
+>    certified.
 >
 > This keeps the load-bearing single-region wall intact (no cross-region
 > copy, no whole-buffer rigid relocation) and turns the entire class of
@@ -210,11 +228,12 @@ signature**; each parameter declares one host-pushed slot:
 > region-select → verifier → decode) lives once in
 > `relon_eval_api::inplace_return` and is shared by both AOT backends, so
 > cranelift and llvm walk the exact same gate. The reader, verifier, and
-> the `List<List<scalar>>` and `List<String>` parameter-identity cases on
-> **both** native backends are wired; the remaining work is extending the
-> same ABI to the other per-element pointer-array root (`List<Schema>`),
-> object-field returns of these shapes, and wasm linear memory — each
-> landed only once it is proven bit-equal to the oracle.
+> the `List<List<scalar>>`, `List<String>`, and `List<Schema>`
+> parameter-identity cases on **both** native backends are wired (the
+> verifier recurses through every `List<Schema>` sub-record field pointer);
+> the remaining work is extending the same ABI to object-field returns of
+> these shapes and wasm linear memory — each landed only once it is proven
+> bit-equal to the oracle.
 
 ### Boundary Result vs Relon value-level Result
 
