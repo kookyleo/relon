@@ -260,6 +260,16 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         ip_hint: &str,
         ty: IrType,
     ) -> Result<(), LlvmError> {
+        if matches!(ty, IrType::ListString) {
+            // Pointer-array list: relocate inner offsets into the output
+            // buffer's coordinate system via the shared block copy, then
+            // push the copied header's buffer-relative offset for the
+            // parent record's pointer slot.
+            let header_off = self.pop_int(ip_hint)?;
+            let new_header = self.copy_list_string_block(header_off)?;
+            self.push(new_header, IrType::I32);
+            return Ok(());
+        }
         let src_off_i32 = self.pop_int(ip_hint)?;
         let i32_t = self.ctx.i32_type();
         // Read the record's leading `[len: u32]` header to size the
@@ -291,7 +301,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                     .build_int_add(shifted, eight, "tail_rec_size8")
                     .map_err(|e| LlvmError::Codegen(format!("EmitTailRecord size8: {e}")))?
             }
-            IrType::ListString | IrType::ListSchema | IrType::ListList => {
+            IrType::ListSchema | IrType::ListList => {
                 return Err(LlvmError::Codegen(format!(
                     "EmitTailRecordFromAbsoluteAddr {ty:?} (pointer-array) not yet supported"
                 )));

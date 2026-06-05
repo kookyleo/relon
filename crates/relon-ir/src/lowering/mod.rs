@@ -1214,8 +1214,30 @@ fn anon_dict_return_plan(
                 range: root.range,
             });
         };
+        // A field carrying a `#internal` pragma is hidden from the
+        // host-visible return surface (the tree-walk oracle drops it
+        // too — see the W7 dict-probe `#internal keys` workload).
+        // Non-`#internal` collection fields, by contrast, MUST be
+        // marshalled into the return buffer to match the oracle; a
+        // List literal that is *not* internal becomes a host-visible
+        // `List<elem>` field rather than a silently-dropped internal
+        // let-binding.
+        let is_internal = node_marked_internal(value);
         match &*value.expr {
             Expr::Closure { params, .. } => {
+                // A closure value can never cross the host boundary, so
+                // it is only legal as an internal helper binding. A
+                // non-`#internal` closure field would otherwise be
+                // silently dropped from the host output (the tree-walk
+                // oracle errors on returning a closure), so reject it.
+                if !is_internal {
+                    return Err(LoweringError::ClosureAcrossBoundary {
+                        context: format!(
+                            "anon-Dict-return field `{name}` is a closure but not `#internal`"
+                        ),
+                        range: value.range,
+                    });
+                }
                 // Default each unannotated param to I64; honor a
                 // `(k: Bool) =>` style annotation when the user
                 // supplied one.
@@ -1247,6 +1269,22 @@ fn anon_dict_return_plan(
                 // `{String -> Int}` shape is accepted in P1 — any
                 // other entry shape surfaces UnsupportedExpr so the
                 // edge stays honest (P2/P3 widen value/key types).
+                //
+                // A non-`#internal` dict-valued field has no compiled-
+                // backend marshalling today (Dict is not a return type
+                // on the buffer protocol), and the tree-walk oracle
+                // *would* surface it — so leaving it as an internal
+                // binding silently drops host-visible data. Reject it
+                // loudly instead.
+                if !is_internal {
+                    return Err(LoweringError::UnsupportedFieldType {
+                        schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+                        field: name.clone(),
+                        ty: "Dict-valued anon-Dict-return field is only supported as `#internal`"
+                            .to_string(),
+                        range: value.range,
+                    });
+                }
                 let entries = classify_anon_dict_str_int_field(inner_pairs, value.range, name)?;
                 dict_field_names.insert(name.as_str());
                 fields.push(AnonDictField::DictStrInt {
@@ -1255,20 +1293,47 @@ fn anon_dict_return_plan(
                 });
             }
             Expr::List(items) => {
-                // W5-P4: a `["a", "b", ...]` list-of-string literal
-                // becomes a `ListString` internal let-binding (the
-                // `#internal keys` field of the dict-probe workload).
-                // Only the all-String-literal shape is accepted; any
-                // other element surfaces UnsupportedExpr so the edge
-                // stays honest (non-String list fields are out of
-                // scope for this surface).
-                let elements = classify_anon_dict_list_string_field(items, value.range, name)?;
-                fields.push(AnonDictField::ListString {
-                    name: name.clone(),
-                    elements,
-                });
+                if is_internal {
+                    // W5-P4: a `#internal ["a", "b", ...]` list-of-string
+                    // literal becomes a `ListString` internal let-binding
+                    // (the `#internal keys` field of the dict-probe
+                    // workload). Only the all-String-literal shape is
+                    // accepted; any other element surfaces UnsupportedExpr
+                    // so the edge stays honest.
+                    let elements = classify_anon_dict_list_string_field(items, value.range, name)?;
+                    fields.push(AnonDictField::ListString {
+                        name: name.clone(),
+                        elements,
+                    });
+                } else {
+                    // Host-visible list field: classify the element type
+                    // (`List<Int/Float/Bool/String>`) and emit a real
+                    // record field. The body walker lowers the list
+                    // literal to a const-pool record and marshals it into
+                    // the return buffer's tail (pointer-indirect). Any
+                    // shape the marshaller cannot handle (mixed / empty /
+                    // nested element lists / schema elements) surfaces a
+                    // loud error rather than silently dropping the field.
+                    let list_ty = classify_anon_dict_list_field(items, value.range, name)?;
+                    fields.push(AnonDictField::Scalar {
+                        name: name.clone(),
+                        ty: list_ty,
+                    });
+                }
             }
             _ => {
+                // An `#internal` scalar field is hidden from the host
+                // (the tree-walk oracle drops it). Scalar internals are
+                // not referenceable by siblings on this surface — a
+                // `Variable(name)` against one already loud-errors in
+                // `classify_anon_dict_scalar_field_irt` — so there is no
+                // let-binding to keep; just drop it. Without this skip
+                // the field would surface to the host while tree-walk
+                // omits it (a silent field-set divergence). The value is
+                // pure, so dropping it changes no observable behaviour.
+                if is_internal {
+                    continue;
+                }
                 let ty = classify_anon_dict_scalar_field(
                     &value.expr,
                     value.range,
@@ -1420,6 +1485,85 @@ fn classify_anon_dict_list_string_field(
         elements.push(s.clone());
     }
     Ok(elements)
+}
+
+/// True when a dict-field value node carries a `#internal` pragma. The
+/// anon-Dict-return path uses this to keep `#internal` collection /
+/// closure fields off the host-visible return surface (matching the
+/// tree-walk oracle, which also drops them) while still marshalling
+/// every non-`#internal` field.
+fn node_marked_internal(node: &Node) -> bool {
+    node.directives
+        .iter()
+        .any(|d| d.name == relon_parser::directive::INTERNAL)
+}
+
+/// Classify a host-visible list-literal anon-Dict-return field into a
+/// `List<elem>` [`TypeRepr`] by sniffing the element shape. Mirrors the
+/// `Expr::List` arm of [`lower_expr`] (which picks `ConstListInt` /
+/// `ConstListFloat` / `ConstListBool` / `ConstListString` from the same
+/// first-element type). Only homogeneous scalar / String element lists
+/// are accepted; empty lists (no element to type), mixed-type lists, and
+/// lists of lists / schemas surface a loud error so an unmarshallable
+/// field never silently disappears from the host output.
+fn classify_anon_dict_list_field(
+    items: &[Node],
+    range: TokenRange,
+    field_name: &str,
+) -> Result<TypeRepr, LoweringError> {
+    let Some(first) = items.first() else {
+        return Err(LoweringError::UnsupportedFieldType {
+            schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+            field: field_name.to_string(),
+            ty: "empty list field — element type cannot be inferred for the return marshaller"
+                .to_string(),
+            range,
+        });
+    };
+    let element = match &*first.expr {
+        Expr::Int(_) => TypeRepr::Int,
+        Expr::Float(_) => TypeRepr::Float,
+        Expr::Bool(_) => TypeRepr::Bool,
+        Expr::String(_) => TypeRepr::String,
+        other => {
+            return Err(LoweringError::UnsupportedFieldType {
+                schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+                field: field_name.to_string(),
+                ty: format!(
+                    "list element `{}` — only homogeneous List<Int/Float/Bool/String> fields are \
+                     marshalled in anon-Dict returns",
+                    other.kind()
+                ),
+                range,
+            });
+        }
+    };
+    // Enforce homogeneity up front so a mixed list (which `lower_expr`
+    // would reject deeper, or worse mis-type) fails here with a precise
+    // field name rather than a generic codegen error.
+    for node in &items[1..] {
+        let ok = matches!(
+            (&element, &*node.expr),
+            (TypeRepr::Int, Expr::Int(_))
+                | (TypeRepr::Float, Expr::Float(_))
+                | (TypeRepr::Bool, Expr::Bool(_))
+                | (TypeRepr::String, Expr::String(_))
+        );
+        if !ok {
+            return Err(LoweringError::UnsupportedFieldType {
+                schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+                field: field_name.to_string(),
+                ty: format!(
+                    "heterogeneous list field (expected all {element:?} elements, found `{}`)",
+                    node.expr.kind()
+                ),
+                range,
+            });
+        }
+    }
+    Ok(TypeRepr::List {
+        element: Box::new(element),
+    })
 }
 
 fn classify_anon_dict_scalar_field_irt(
@@ -1735,11 +1879,33 @@ fn lower_anon_dict_body(
                     }
                 })?;
                 debug_assert_eq!(&layout_field.name, name);
+                // Pointer-indirect fields (String / List<scalar> /
+                // List<String>) push an *absolute* arena address from
+                // `lower_expr` (a `ConstString` / `ConstList*` record or
+                // a `Load*Ptr` param). They must be copied into the
+                // return buffer's tail area first — the fixed-area slot
+                // stores a *buffer-relative* offset, not the absolute
+                // address. This mirrors the branded-dict path
+                // (`lower_dict_field_value`): emit
+                // `EmitTailRecordFromAbsoluteAddr { ty }` to perform the
+                // copy, then store the resulting i32 offset. Without
+                // this the slot held the raw arena pointer and the host
+                // reader dereferenced garbage → a silent empty
+                // String / List (the W7-anon-dict mis-compile).
+                let store_ty = if pointer_indirect_ir_type(expected_ir) {
+                    ctx.out.push(TaggedOp {
+                        op: Op::EmitTailRecordFromAbsoluteAddr { ty: expected_ir },
+                        range: value.range,
+                    });
+                    IrType::I32
+                } else {
+                    expected_ir
+                };
                 ctx.out.push(TaggedOp {
                     op: Op::StoreFieldAtRecord {
                         record_local_idx: record_local,
                         offset: layout_field.offset as u32,
-                        ty: expected_ir,
+                        ty: store_ty,
                     },
                     range: value.range,
                 });
@@ -1788,6 +1954,24 @@ fn type_node_to_canonical(t: &TypeNode) -> Option<TypeRepr> {
         }
         _ => None,
     }
+}
+
+/// True when an [`IrType`] is materialised through a buffer-relative
+/// pointer slot rather than stored inline in a record's fixed area —
+/// String and every `List<_>` variant. Such fields require an
+/// `EmitTailRecordFromAbsoluteAddr` copy into the return buffer's tail
+/// before the fixed-area slot can receive the (buffer-relative) offset.
+fn pointer_indirect_ir_type(t: IrType) -> bool {
+    matches!(
+        t,
+        IrType::String
+            | IrType::ListInt
+            | IrType::ListFloat
+            | IrType::ListBool
+            | IrType::ListString
+            | IrType::ListSchema
+            | IrType::ListList
+    )
 }
 
 /// Map a canonical [`TypeRepr`] to the matching [`IrType`]. Used both
