@@ -134,16 +134,22 @@ host-pushed slot：
 > - 内层为指针数组元素的嵌套 List（`List<List<String>>` /
 >   `List<List<Schema>>`）—— 递归逐元素重定位尚未建模；
 > - 在两个后端上返回经 **入参字段** 得到的 `List<Schema>` 或
->   `List<List<scalar>>`（入参 **恒等** 形两个后端均已支持，见上）；返回子
->   记录自身再含嵌套 `List<Schema>` / `List<List<…>>` 字段的 `List<Schema>`；
->   或返回**含该类入参恒等字段的匿名 `Dict` / 结构体**
->   （`-> Dict { items: servers }` / `-> Cfg { servers: servers }`，其中
->   `servers: List<Server>` 是 `#main` 入参）。对象头建在 `out_buf`，但
->   入参来源的 `List<Schema>` / `List<List<scalar>>` 字段仍在 `in_buf` ——
->   这是真正的**跨区**字段指针。就地区走读 ABI 只承载**单个整值**根
->   （负哨兵），且 verifier 与 reader 均单区，安全的对象字段走读需要一套
->   尚未建成、可逐字节证明的多区指针约定；在此之前两后端均**响亮 cap**，
->   绝不把 `in_buf` 指针塞进 `out_buf` 槽。host 侧 **解码已就位**：
+>   `List<List<scalar>>`（入参 **恒等** 形两个后端均已支持，见上）；或返回子
+>   记录自身再含嵌套 `List<Schema>` / `List<List<…>>` 字段的 `List<Schema>`。
+>
+>   返回**含该类入参恒等字段的匿名 `Dict`**
+>   （`-> Dict { servers: servers, n: 1 }`，其中 `servers: List<Server>`
+>   是 `#main` 入参）现已在 **cranelift** 上支持（F1b）。对象头建在
+>   `out_buf`，但入参来源字段的数据仍在 `in_buf` —— 这是真正的**跨区**字段
+>   指针。在 arena-绝对槽约定下，字段槽**直接**存入参 list 根的 arena-绝对
+>   偏移（不拷贝）；解码前 host 先以 `out_ptr` 为锚对**整 arena** 跑**多区**
+>   对象 verifier，把槽指针判区到 input 区并对整张可达图界检（深至每个子记录
+>   的 String 字段），再由 `BufferReader::new_at_base` 跨区走读 —— 逐字节等价
+>   于 tree-walk oracle。**llvm 与 wasm 对该形状仍响亮 cap**（共享 IR 会撞到
+>   codegen 门），留后续（F2）。**结构体**字段面
+>   （`-> Cfg { servers: servers }`）在两后端上亦仍响亮 cap —— 它走另一条
+>   lowering 路径，尚无跨区字段存储。所有仍 cap 的情形下后端均拒绝，绝不把
+>   `in_buf` 指针塞进 `out_buf` 槽。host 侧 **解码已就位**：
 >   `BufferReader` 以单一基址走读 buffer，递归重建嵌套 `Value`
 >   （`List<Schema>` 走 `read_list_record` / `read_list_record_at`，
 >   `List<List<scalar>>` 走 `read_list_list` / `read_list_list_at`，就地

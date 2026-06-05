@@ -164,19 +164,28 @@ signature**; each parameter declares one host-pushed slot:
 >   modelled,
 > - **returning** a `List<Schema>` or `List<List<scalar>>` reached through
 >   a **parameter field** on either backend (the parameter-*identity* case
->   is supported on both backends above), a `List<Schema>` whose sub-record
->   carries a nested `List<Schema>` / `List<List<…>>` field, or an
->   anon-`Dict` / struct **field** of those types sourced by parameter
->   identity (`-> Dict { items: servers }` / `-> Cfg { servers: servers }`
->   where `servers: List<Server>` is a `#main` param). The object header is
->   built in `out_buf`, but a parameter-sourced `List<Schema>` /
->   `List<List<scalar>>` field still lives in `in_buf` — a genuine
->   **cross-region** field pointer. The in-place region-walk ABI carries
->   only a *single whole-value* root (the negative sentinel), and the
->   verifier + reader are single-region, so a safe object-field walk would
->   need a byte-proven multi-region pointer convention that is not yet
->   built; until then these cap loudly on **both** backends rather than
->   store an `in_buf` pointer into an `out_buf` slot. The host-side
+>   is supported on both backends above), or a `List<Schema>` whose
+>   sub-record carries a nested `List<Schema>` / `List<List<…>>` field.
+>
+>   An **anon-`Dict` field** of `List<Schema>` / `List<List<scalar>>` type
+>   sourced by parameter identity (`-> Dict { servers: servers, n: 1 }`
+>   where `servers: List<Server>` is a `#main` param) is now supported on
+>   **cranelift** (F1b). The object header is built in `out_buf`, but the
+>   parameter-sourced field's data lives in `in_buf` — a genuine
+>   **cross-region** field pointer. Under the arena-absolute slot
+>   convention the field slot stores the parameter list root's
+>   arena-absolute offset directly (no copy); before any decode the host
+>   runs the **multi-region** object verifier over the whole arena anchored
+>   at `out_ptr`, which classifies the slot pointer into the input region
+>   and bounds-checks the entire reachable graph (down to every sub-record
+>   String field), then `BufferReader::new_at_base` follows it cross-region
+>   — bit-equal to the tree-walk oracle. **llvm + wasm still cap this shape
+>   loudly** (the shared IR reaches a codegen gate); they land in a
+>   follow-up (F2). The **branded-struct** field surface
+>   (`-> Cfg { servers: servers }`) also stays a loud cap on both backends
+>   — it routes through a different lowering path that has no cross-region
+>   field store yet. In every still-capped case the backend refuses rather
+>   than store an `in_buf` pointer into an `out_buf` slot. The host-side
 >   *decode* is in
 >   place — `BufferReader` walks the buffer with a single base and
 >   reconstructs the nested `Value` recursively (`read_list_record` /
