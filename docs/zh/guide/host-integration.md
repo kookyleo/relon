@@ -82,12 +82,17 @@ host-pushed slot：
 > **返回方向**上，编译后端会把 body 输出的 `Value` 重新 marshal 回
 > buffer，与 tree-walk oracle 逐字节一致，覆盖：
 >
-> - 标量、`String`、`List<scalar>`、`List<String>` 顶层返回；
+> - 标量、`String`、`List<scalar>`（`List<Int/Float/Bool>`）顶层返回 ——
+>   含直接 identity 返回标量 list 入参（其尾记录是单块 inline-fixed，
+>   任意来源都能整块拷贝）；
+> - **来自源码内 list 字面量**（`["a", "b", …]`）的 `List<String>` 返回 ——
+>   这是 const-pool 块，内部 string 指针连续且单一基址，刚性尾拷贝能正确
+>   重定位；
 > - **`#schema` 加品牌的结构体返回**（`#main() -> Cfg { ... }`），字段
->   可含上述任意类型（含 `String` / `List` 字段）；
+>   可含上述任意类型（含字面量 `String` / `List` 字段）；
 > - **匿名 `-> Dict { ... }` 返回** —— 每个非 `#internal` 字段都会
->   marshal 进返回记录，含 `String`、`List<scalar>`、`List<String>` 字段；
->   `#internal` 字段不进入 host 可见面（与 oracle 一致）。
+>   marshal 进返回记录，含 `String`、`List<scalar>`、字面量 `List<String>`
+>   字段；`#internal` 字段不进入 host 可见面（与 oracle 一致）。
 >
 > 编译后端仍 **暂不支持**（前置阶段以明确的 `unsupported type in
 > #main` / `layout v1 does not yet support list element` 报错，绝不静默
@@ -98,8 +103,14 @@ host-pushed slot：
 > - 内层为指针数组元素的嵌套 List（`List<List<String>>` /
 >   `List<List<Schema>>`）—— 递归逐元素重定位尚未建模；
 > - 从 `#main` **返回** `List<Schema>` / `List<List<…>>`，或返回含该类
->   字段的匿名 `Dict`（入参解码已支持；返回方向的递归写出重定位尚未
->   支持 —— 响亮报错，绝不吐错数据）。
+>   字段的匿名 `Dict` / 结构体（入参解码已支持；返回方向的递归写出
+>   重定位尚未支持）；
+> - **返回来自 `#main` 入参 / 字段读取 / 函数调用（而非源码内字面量）的
+>   `List<String>`（或任意指针数组 list）** —— 这类值位于输入 buffer 内，
+>   内部偏移是非连续、整 buffer 相对的，刚性尾拷贝无法重定位。
+>
+> 上述形状一律在编译期 **响亮报错**；编译后端绝不吐错数据、绝不崩溃 ——
+> 请把它们路由到 tree-walk 解释器。
 
 ### 入口边界 Result 与 Relon 值层 Result
 

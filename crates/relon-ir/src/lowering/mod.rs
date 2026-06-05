@@ -868,6 +868,28 @@ fn lower_entry_with_resolver<'a>(
         lower_anon_dict_body(&plan, &return_layout, dict_pairs, record_local, &mut ctx)?;
     } else {
         // Scalar-return path: existing v1 shape.
+        let ret_ir_ty = type_repr_to_ir_type(&return_schema.fields[0].ty)?;
+        // Pointer-array list returns (`List<String>` / `List<Schema>` /
+        // `List<List<_>>`) are only marshalled correctly when the value
+        // is a const-pool `ConstListString` block (a String-literal
+        // list). Any other source — a `#main` param identity-return, a
+        // field load, a call — produces a non-contiguous, whole-input-
+        // buffer-relative block the rigid-delta return copy cannot
+        // relocate; it would segfault / return corrupt data. Reject it
+        // loudly here so the silent-miscompile path is unreachable.
+        if pointer_array_list_ir_type(ret_ir_ty)
+            && !pointer_array_list_source_is_const_pool(&root.expr)
+        {
+            return Err(LoweringError::UnsupportedTypeInMain {
+                type_name: format!(
+                    "{:?} return sourced from `{}` — pointer-array list returns are only \
+                     marshalled from in-source list literals, not parameters / loads / calls",
+                    return_schema.fields[0].ty,
+                    root.expr.kind()
+                ),
+                range: sig.range,
+            });
+        }
         lower_expr(&root.expr, root.range, &mut ctx)?;
 
         // Trailing StoreField for the single root return value. Pops
@@ -878,7 +900,6 @@ fn lower_entry_with_resolver<'a>(
             .first()
             .map(|f| f.offset as u32)
             .unwrap_or(0);
-        let ret_ir_ty = type_repr_to_ir_type(&return_schema.fields[0].ty)?;
         ctx.out.push(TaggedOp {
             op: Op::StoreField {
                 offset: ret_offset,
@@ -1852,8 +1873,30 @@ fn lower_anon_dict_body(
                         range: TokenRange::default(),
                     }
                 })?;
-                lower_expr(&value.expr, value.range, ctx)?;
                 let expected_ir = type_repr_to_ir_type(ty)?;
+                // Same pointer-array-list provenance guard as the
+                // top-level and branded-struct return paths: a
+                // `List<String>` (or any pointer-array list) anon-Dict
+                // field is only marshalled correctly from a const-pool
+                // list literal. The host-visible classifier already only
+                // admits list literals, but gate defensively so a future
+                // widening of the classifier can't silently reintroduce
+                // the rigid-copy miscompile.
+                if pointer_array_list_ir_type(expected_ir)
+                    && !pointer_array_list_source_is_const_pool(&value.expr)
+                {
+                    return Err(LoweringError::UnsupportedFieldType {
+                        schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+                        field: name.clone(),
+                        ty: format!(
+                            "{expected_ir:?} sourced from `{}` — pointer-array list fields are \
+                             only marshalled from in-source list literals",
+                            value.expr.kind()
+                        ),
+                        range: value.range,
+                    });
+                }
+                lower_expr(&value.expr, value.range, ctx)?;
                 let top = ctx
                     .tstack
                     .pop()
@@ -1972,6 +2015,58 @@ fn pointer_indirect_ir_type(t: IrType) -> bool {
             | IrType::ListSchema
             | IrType::ListList
     )
+}
+
+/// True when `t` is a **pointer-array** list type (`List<String>` /
+/// `List<Schema>` / `List<List<_>>`) — i.e. its tail record is a
+/// `[len][off_0]…[off_{N-1}]` header whose entries point at *further*
+/// records carrying their own inner pointers.
+///
+/// These are the shapes the return marshaller cannot relocate
+/// correctly for an arbitrary source: the compiled return path copies
+/// the source block with a single rigid `delta` (see the cranelift
+/// `copy_list_string_block` / `emit_tail_record_from_absolute`), which
+/// is only sound when the whole reachable block is **contiguous** and
+/// its inner offsets share one base — the layout the const-pool
+/// `Op::ConstListString` emits. A pointer-array list sourced from a
+/// `#main` parameter (or any non-const-pool producer) lives in the
+/// input buffer with whole-buffer-relative, non-contiguous offsets;
+/// feeding it through the rigid-block copy reads `off_0` as the block
+/// start and computes a bogus span, segfaulting or returning corrupt
+/// data. `List<Int/Float/Bool>` are *not* pointer-array (their payload
+/// is one inline-fixed `[len][payload]` record), so identity-return of
+/// a scalar-list param stays correct and is excluded here.
+fn pointer_array_list_ir_type(t: IrType) -> bool {
+    matches!(
+        t,
+        IrType::ListString | IrType::ListSchema | IrType::ListList
+    )
+}
+
+/// True when `expr` deterministically lowers to a **const-pool**
+/// pointer-array list record — today only a list literal whose every
+/// element is a String literal (`["a", "b", …]` → `Op::ConstListString`).
+/// That is the one provenance whose tail block is contiguous and
+/// single-base, so the rigid-block return copy is provably correct.
+///
+/// Everything else that can yield a `ListString` value at runtime — a
+/// `#main` parameter reference, a field/index load, a function call, a
+/// comprehension — produces a block the rigid copy cannot relocate
+/// (see [`pointer_array_list_ir_type`]). The return marshaller must
+/// reject those loudly rather than emit the silent-miscompile / segfault
+/// path. `List<Schema>` / `List<List<_>>` have *no* const-pool producer
+/// at all, so this returns `false` for every source carrying them — they
+/// stay a loud cap unconditionally.
+fn pointer_array_list_source_is_const_pool(expr: &Expr) -> bool {
+    let Expr::List(items) = expr else {
+        return false;
+    };
+    // An all-String-literal list lowers to `Op::ConstListString`. A
+    // mixed / empty / nested list does not reach a pointer-array
+    // `ListString` return (it types as a scalar list or fails the
+    // element classifier earlier), so requiring String literals here is
+    // exactly the const-`ListString` provenance.
+    !items.is_empty() && items.iter().all(|n| matches!(&*n.expr, Expr::String(_)))
 }
 
 /// Map a canonical [`TypeRepr`] to the matching [`IrType`]. Used both
@@ -5780,6 +5875,41 @@ fn lower_dict_field_value(
             Ok(())
         }
         (TypeRepr::String, _) | (TypeRepr::List { .. }, _) => {
+            // Pointer-array list fields (`List<String>` / `List<Schema>`
+            // / `List<List<_>>`) inside a branded-struct return are only
+            // marshalled correctly from a const-pool `ConstListString`
+            // block. A value sourced from a `#main` parameter / load /
+            // call lives in the input buffer with non-contiguous,
+            // whole-buffer-relative offsets the rigid-delta tail copy
+            // (`EmitTailRecordFromAbsoluteAddr`) cannot relocate — it
+            // would segfault / corrupt. Reject loudly before lowering so
+            // the silent path is unreachable. (`List<Int/Float/Bool>` is
+            // inline-fixed and copies correctly from any source, so the
+            // pointer-*array* check excludes it.)
+            if let TypeRepr::List { element } = &canonical.ty {
+                let field_ir = match element.as_ref() {
+                    TypeRepr::String => IrType::ListString,
+                    TypeRepr::Schema { .. } => IrType::ListSchema,
+                    TypeRepr::List { .. } => IrType::ListList,
+                    _ => IrType::ListInt,
+                };
+                if pointer_array_list_ir_type(field_ir)
+                    && !pointer_array_list_source_is_const_pool(&value.expr)
+                {
+                    return Err(LoweringError::UnsupportedFieldType {
+                        schema: schema.name.clone(),
+                        field: canonical.name.clone(),
+                        ty: format!(
+                            "{:?} sourced from `{}` — pointer-array list fields are only \
+                             marshalled from in-source list literals, not parameters / loads / \
+                             calls",
+                            canonical.ty,
+                            value.expr.kind()
+                        ),
+                        range,
+                    });
+                }
+            }
             // Recursively lower the value to produce an absolute
             // pointer (ConstString / ConstListInt / LoadStringPtr /
             // ...). Then copy the record into the parent's tail

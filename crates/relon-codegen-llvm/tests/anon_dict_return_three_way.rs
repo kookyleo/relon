@@ -179,6 +179,14 @@ fn unsupported_return_shapes_fail_loudly_not_silently() {
         // Top-level List<Schema> / List<List> returns.
         "#schema P {\n    Int x: *\n}\n#main() -> List<P>\n[{x:1},{x:2}]",
         "#main() -> List<List<Int>>\n[[1, 2], [3, 4]]",
+        // Pointer-array list returns sourced from a parameter (NOT a
+        // const-pool list literal). These previously routed through the
+        // rigid-block `copy_list_string_block` and SEGFAULTED — the
+        // source block is non-contiguous / whole-input-buffer-relative.
+        // Must now fail loudly at lowering. Covers the top-level return,
+        // the branded-struct field, and the anon-Dict field surfaces.
+        "#main(List<String> ss) -> List<String>\nss",
+        "#schema S {\n    tags: List<String>\n}\n#main(List<String> t) -> S\n{ tags: t }",
     ];
     for src in UNSUPPORTED {
         let cl = AotEvaluator::from_source(src);
