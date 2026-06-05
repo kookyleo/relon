@@ -198,17 +198,15 @@ fn unsupported_return_shapes_fail_loudly_not_silently() {
         "#schema Server { name: String }\n#schema Cfg { servers: List<Server> }\n\
          #main(List<Server> servers) -> Cfg\n{ servers: servers }",
     ];
-    // F1b: cross-region *anon-Dict* object fields (param-sourced
-    // `List<Schema>` / `List<List<scalar>>`) now ship on cranelift — the
-    // object head sits in out_buf and the field slot holds the parameter
-    // list root's arena-absolute offset into in_buf; the host's
-    // multi-region verifier classifies + bounds-checks it before the reader
-    // follows it cross-region (bit-equal to tree-walk, proven in
-    // `relon-test-harness/tests/return_cross_region_object.rs`). The IR
-    // lowering is shared, so llvm reaches the same op but caps loudly at
-    // codegen (the `StoreFieldAtRecord { ListSchema | ListList }` gate);
-    // llvm + wasm land in F2.
-    const LLVM_ONLY_CAP: &[&str] = &[
+    // F2: cross-region *anon-Dict* object fields (param-sourced
+    // `List<Schema>` / `List<List<scalar>>`) now ship on cranelift AND llvm
+    // (wasm shares the IR + the same store path) — the object head sits in
+    // out_buf and the field slot holds the parameter list root's
+    // arena-absolute offset into in_buf; the host's multi-region verifier
+    // classifies + bounds-checks it before the reader follows it
+    // cross-region (bit-equal to tree-walk, proven four-way in
+    // `relon-test-harness/tests/return_cross_region_object.rs`).
+    const BOTH_COMPILE: &[&str] = &[
         "#schema Server { name: String, port: Int }\n\
          #main(List<Server> servers) -> Dict\n{ servers: servers, n: 1 }",
         "#main(List<List<Int>> grid) -> Dict\n{ g: grid, n: 1 }",
@@ -225,17 +223,16 @@ fn unsupported_return_shapes_fail_loudly_not_silently() {
             "llvm must reject unsupported return shape loudly, but compiled: `{src}`"
         );
     }
-    for src in LLVM_ONLY_CAP {
+    for src in BOTH_COMPILE {
         let cl = AotEvaluator::from_source(src);
         assert!(
             cl.is_ok(),
-            "cranelift must compile the F1b cross-region object shape, but declined: `{src}`"
+            "cranelift must compile the F1b/F2 cross-region object shape, but declined: `{src}`"
         );
         let llvm = LlvmAotEvaluator::from_source(src);
         assert!(
-            llvm.is_err(),
-            "F1b is cranelift-only: llvm must reject the cross-region object shape loudly, but \
-             compiled: `{src}`"
+            llvm.is_ok(),
+            "F2: llvm must compile the cross-region object shape, but declined: `{src}`"
         );
     }
 }

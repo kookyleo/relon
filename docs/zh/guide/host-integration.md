@@ -139,15 +139,16 @@ host-pushed slot：
 >
 >   返回**含该类入参恒等字段的匿名 `Dict`**
 >   （`-> Dict { servers: servers, n: 1 }`，其中 `servers: List<Server>`
->   是 `#main` 入参）现已在 **cranelift** 上支持（F1b）。对象头建在
+>   是 `#main` 入参）现已**四方**支持 —— tree-walk == cranelift == llvm ==
+>   编译 wasm（cranelift 为 F1b，llvm 与 wasm 为 F2）。对象头建在
 >   `out_buf`，但入参来源字段的数据仍在 `in_buf` —— 这是真正的**跨区**字段
 >   指针。在 arena-绝对槽约定下，字段槽**直接**存入参 list 根的 arena-绝对
 >   偏移（不拷贝）；解码前 host 先以 `out_ptr` 为锚对**整 arena** 跑**多区**
 >   对象 verifier，把槽指针判区到 input 区并对整张可达图界检（深至每个子记录
 >   的 String 字段），再由 `BufferReader::new_at_base` 跨区走读 —— 逐字节等价
->   于 tree-walk oracle。**llvm 与 wasm 对该形状仍响亮 cap**（共享 IR 会撞到
->   codegen 门），留后续（F2）。**结构体**字段面
->   （`-> Cfg { servers: servers }`）在两后端上亦仍响亮 cap —— 它走另一条
+>   于 tree-walk oracle。wasm 上 host 从**线性内存**取同一片 arena 并跑同一份
+>   verifier 门控的解码，无 wasm 专属路径。**结构体**字段面
+>   （`-> Cfg { servers: servers }`）在所有后端上仍响亮 cap —— 它走另一条
 >   lowering 路径，尚无跨区字段存储。所有仍 cap 的情形下后端均拒绝，绝不把
 >   `in_buf` 指针塞进 `out_buf` 槽。host 侧 **解码已就位**：
 >   `BufferReader` 以单一基址走读 buffer，递归重建嵌套 `Value`

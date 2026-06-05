@@ -12,11 +12,13 @@
 //! on a clean verify does `BufferReader::new_at_base` + `read_value_from_reader`
 //! follow it cross-region.
 //!
-//! Scope (F1b): cranelift only. The IR lowering is shared, so the llvm +
-//! wasm backends reach the same op; they cap loudly at codegen (the
-//! `StoreFieldAtRecord { ListSchema | ListList }` gate) and land in F2. We
-//! assert here that cranelift bit-equals the tree-walk oracle and that llvm
-//! declines (loud cap, never a silent miscompile).
+//! Scope (F2): cranelift AND llvm (and wasm, which shares the llvm codegen
+//! path — its four-way leg lives in
+//! `relon-codegen-llvm/tests/cross_region_object_four_way.rs`). The IR
+//! lowering is shared and the `StoreFieldAtRecord { ListSchema | ListList }`
+//! store writes the parameter list root's arena-absolute offset verbatim
+//! into the object slot on every backend. We assert here that both native
+//! compiled backends (cranelift + llvm) bit-equal the tree-walk oracle.
 //!
 //! Layers:
 //!  1. Hand-written cases: `List<Schema>` field + scalar field; `List<List<Int>>`
@@ -66,8 +68,8 @@ fn list(items: Vec<Value>) -> Value {
 }
 
 /// Run the differential and assert cranelift compiled the cross-region
-/// object shape (it must NOT silently fall back to a skip), while llvm is
-/// allowed to decline (F1b is cranelift-only; llvm caps loudly until F2).
+/// object shape (it must NOT silently fall back to a skip). F2: llvm must
+/// also compile + bit-equal it (the differential panics on any divergence).
 fn assert_cross_region(src: &str, args: HashMap<String, Value>) {
     let report = assert_all_backends_bit_equal(src, args);
     assert!(
@@ -75,13 +77,14 @@ fn assert_cross_region(src: &str, args: HashMap<String, Value>) {
         "cranelift must compile the cross-region object return; skipped: {:?}",
         report.cranelift_skip_reason
     );
-    // F1b: llvm must NOT compile this shape yet — it caps loudly at codegen.
-    // (When the feature is off the leg is skipped for an unrelated reason, so
-    // only assert the cap when the feature is compiled in.)
+    // F2: llvm now ships this shape too — it must participate (and the
+    // differential already asserted bit-equality). Only enforce when the
+    // feature is compiled in.
     #[cfg(feature = "llvm-aot")]
     assert!(
-        !report.llvm_compared,
-        "F1b is cranelift-only: llvm must decline the cross-region object shape, but it compiled"
+        report.llvm_compared,
+        "F2: llvm must compile the cross-region object shape; skipped: {:?}",
+        report.llvm_skip_reason
     );
 }
 
@@ -290,7 +293,7 @@ proptest! {
         let report = assert_all_backends_bit_equal(src, args1("servers", servers));
         prop_assert!(report.cranelift_compared, "cranelift must compile the cross-region shape");
         #[cfg(feature = "llvm-aot")]
-        prop_assert!(!report.llvm_compared, "F1b: llvm must decline the cross-region shape");
+        prop_assert!(report.llvm_compared, "F2: llvm must compile the cross-region shape");
     }
 
     #[test]
@@ -299,39 +302,34 @@ proptest! {
         let report = assert_all_backends_bit_equal(src, args1("grid", grid));
         prop_assert!(report.cranelift_compared, "cranelift must compile the cross-region grid shape");
         #[cfg(feature = "llvm-aot")]
-        prop_assert!(!report.llvm_compared, "F1b: llvm must decline the cross-region grid shape");
+        prop_assert!(report.llvm_compared, "F2: llvm must compile the cross-region grid shape");
     }
 }
 
 // ---- loud-cap guards ------------------------------------------------
 
-/// F1b ships cranelift only; llvm (and wasm, which shares the llvm codegen
-/// path) must decline the cross-region object shape loudly — never a silent
-/// miscompile. Also pins that shapes still beyond F1b stay capped on both
-/// backends.
+/// F2 ships the cross-region object shape on cranelift AND llvm (wasm
+/// shares the llvm codegen path; its four-way leg lives in
+/// `relon-codegen-llvm/tests/cross_region_object_four_way.rs`). Both native
+/// backends must accept it — a decline here would mean a regression back to
+/// the F1b cranelift-only state.
 #[test]
-fn llvm_declines_cross_region_object() {
+fn both_backends_compile_cross_region_object() {
     let cross_region = [
         "#schema Server { name: String, port: Int }\n\
          #main(List<Server> servers) -> Dict\n{ servers: servers, n: 1 }",
         "#main(List<List<Int>> grid) -> Dict\n{ g: grid, n: 1 }",
     ];
     for src in cross_region {
-        // cranelift accepts (F1b).
         assert!(
             new_evaluator(src, Backend::CraneliftAot).is_ok(),
             "cranelift must compile the cross-region object shape: `{src}`"
         );
-        // llvm declines loudly (F2 territory).
         #[cfg(feature = "llvm-aot")]
-        match new_evaluator(src, Backend::LlvmAot) {
-            Err(BackendError::LlvmAot(_)) => { /* loud decline — correct */ }
-            Err(other) => panic!("expected an LlvmAot decline for `{src}`, got {other}"),
-            Ok(_) => panic!(
-                "llvm unexpectedly accepted the cross-region object shape `{src}` — F1b is \
-                 cranelift-only; a silent llvm cross-region path may have opened"
-            ),
-        }
+        assert!(
+            new_evaluator(src, Backend::LlvmAot).is_ok(),
+            "F2: llvm must compile the cross-region object shape: `{src}`"
+        );
     }
 }
 

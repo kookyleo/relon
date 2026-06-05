@@ -2069,6 +2069,30 @@ fn read_value_from_reader(
         TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::String) => {
             marshal_list_string_out(reader, &field.name)
         }
+        // F2: cross-region object field `List<Schema>` — the field slot
+        // holds the parameter list root's arena-absolute offset into in_buf
+        // (no tail copy). `verify_object_return_multi` already classified +
+        // bounds-checked the whole reachable graph; the reader walks the
+        // pointer array (shared arena window, anchored at `out_ptr`) into one
+        // sub-reader per element, draining each into a branded dict. Mirrors
+        // the cranelift `read_value_from_reader` arm — same shared
+        // `relon-eval-api` `BufferReader`, just from the llvm/wasm host.
+        TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::Schema { .. }) => {
+            let TypeRepr::Schema { schema } = element.as_ref() else {
+                unreachable!("guarded by the match arm");
+            };
+            marshal_list_schema_out(reader, &field.name, schema)
+        }
+        // F2: cross-region object field `List<List<scalar>>` — the nested
+        // pointer-array decode, re-wrapping each inner row as a `Value::List`.
+        TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::List { .. }) => reader
+            .read_list_list(&field.name)
+            .map(|rows| {
+                Value::List(Arc::new(
+                    rows.into_iter().map(|r| Value::List(Arc::new(r))).collect(),
+                ))
+            })
+            .map_err(buffer_to_runtime_error),
         // ----- add new leaf marshalling arm above this line -----
         other => Err(RuntimeError::Unsupported {
             reason: format!(
@@ -2221,6 +2245,39 @@ fn marshal_schema_out(
         .map_err(buffer_to_runtime_error)?;
     let map = read_record_into_map(&sub_reader, schema)?;
     Ok(Value::branded_dict(map, Some(schema.name.clone())))
+}
+
+/// F2: `List<Schema>` object-field decode. The field slot holds the
+/// parameter list root's arena-absolute offset (a cross-region pointer into
+/// in_buf); `verify_object_return_multi` already bounds-checked the whole
+/// reachable graph, so the reader walks the pointer array into one
+/// sub-reader per element (sharing the parent's arena window) and drains
+/// each element's fields into a branded `Value::Dict`. Mirrors
+/// `marshal_schema_out` over the element schema and the cranelift backend's
+/// `List<Schema>` arm — the same shared `relon-eval-api` reader, just
+/// invoked from the llvm/wasm host.
+fn marshal_list_schema_out(
+    reader: &relon_eval_api::buffer::BufferReader<'_>,
+    name: &str,
+    schema: &relon_eval_api::schema_canonical::Schema,
+) -> Result<Value, RuntimeError> {
+    let elem_layout = relon_eval_api::layout::SchemaLayout::offsets_for(schema).map_err(|e| {
+        RuntimeError::Unsupported {
+            reason: format!(
+                "llvm-aot: List<Schema> element `{}` layout: {e}",
+                schema.name
+            ),
+        }
+    })?;
+    let sub_readers = reader
+        .read_list_record(name, &elem_layout, schema)
+        .map_err(buffer_to_runtime_error)?;
+    let mut items = Vec::with_capacity(sub_readers.len());
+    for sub in &sub_readers {
+        let map = read_record_into_map(sub, schema)?;
+        items.push(Value::branded_dict(map, Some(schema.name.clone())));
+    }
+    Ok(Value::List(Arc::new(items)))
 }
 
 /// Phase E.1: does the return schema include any pointer-indirect
