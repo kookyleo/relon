@@ -508,26 +508,66 @@ fn both_backends_compile_cross_region_object() {
     }
 }
 
-/// Shapes still beyond F3 must cap on both native backends (loud decline).
-/// F3 released branded-struct fields + scalar/String list object fields; what
-/// remains capped is the parameter-*field* list source (`w.items` / `o.tags`,
-/// F4) and the doubly-nested pointer-array (`List<List<Schema>>`, F5).
+/// F4: a cross-region object field whose VALUE is a parameter *field* walk
+/// (`o.items` / `o.tags`), not a parameter identity. Bit-equal across
+/// tree-walk / cranelift / llvm (four-way incl. wasm in
+/// `relon-codegen-llvm/tests/cross_region_object_four_way.rs`).
 #[test]
-fn beyond_f3_still_capped() {
+fn cross_region_object_field_from_param_field() {
+    let src_items = "#schema Server { name: String, port: Int }\n\
+         #schema Outer { items: List<Server>, n: Int }\n\
+         #main(Outer o) -> Dict\n{ items: o.items, k: 2 }";
+    let o = cfg(
+        "Outer",
+        vec![
+            (
+                "items",
+                list(vec![
+                    cfg("Server", vec![("name", s("")), ("port", Value::Int(0))]),
+                    cfg(
+                        "Server",
+                        vec![
+                            ("name", s("\u{4E2D}\u{6587}")),
+                            ("port", Value::Int(i64::MAX)),
+                        ],
+                    ),
+                ]),
+            ),
+            ("n", Value::Int(3)),
+        ],
+    );
+    assert_cross_region(src_items, args1("o", o));
+
+    let src_tags = "#schema Outer { tags: List<String>, n: Int }\n\
+         #main(Outer o) -> Dict\n{ t: o.tags, k: 1 }";
+    let o2 = cfg(
+        "Outer",
+        vec![
+            (
+                "tags",
+                list(vec![s(""), s("\u{4E2D}"), s(&"x".repeat(2000))]),
+            ),
+            ("n", Value::Int(5)),
+        ],
+    );
+    assert_cross_region(src_tags, args1("o", o2));
+}
+
+/// Shapes still beyond F4 must cap on both native backends (loud decline).
+/// F4 released the parameter-*field* list source (`w.items` / `o.tags`);
+/// what remains capped is the doubly-nested pointer-array
+/// (`List<List<Schema>>` / `List<List<String>>`, F5).
+#[test]
+fn beyond_f4_still_capped() {
     let cap_cases = [
-        // Parameter-*field* List<Schema> inside an anon-Dict — the field-load
-        // rebase path is not an identity walk; stays capped (F4).
-        "#schema Server { name: String }\n#schema W { items: List<Server> }\n\
-         #main(W w) -> Dict\n{ servers: w.items, n: 1 }",
-        // Parameter-*field* List<Schema> inside a branded struct — same
-        // field-load source, stays capped (F4).
-        "#schema Server { name: String }\n#schema W { items: List<Server> }\n\
-         #schema Cfg { servers: List<Server> }\n\
-         #main(W w) -> Cfg\n{ servers: w.items }",
         // List<List<Schema>> field — inner pointer-array-of-pointer-array,
         // out of scope (F5).
         "#schema Server { name: String }\n\
          #main(List<List<Server>> xs) -> Dict\n{ xs: xs, n: 1 }",
+        // Parameter-*field* List<List<String>> — double pointer array field,
+        // out of scope (F5).
+        "#schema W { rows: List<List<String>>, n: Int }\n\
+         #main(W w) -> Dict\n{ rows: w.rows, n: 1 }",
     ];
     for src in cap_cases {
         match new_evaluator(src, Backend::CraneliftAot) {

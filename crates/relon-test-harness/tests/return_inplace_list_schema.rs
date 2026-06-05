@@ -205,6 +205,58 @@ fn many_records() {
     assert_inplace(SRC_NAME_PORT, cfg_list(items));
 }
 
+// ---- F4: parameter-FIELD List<Schema> return (`w.items`) -------------
+//
+// `#main(W w) -> List<Cfg>\nw.items` — the returned list is `w`'s field,
+// reached through a two-segment field walk. Post-F1 the field-load pushes
+// the field list root's arena-absolute offset, identical to the param
+// identity in-place return. Proven bit-equal across tree-walk / cranelift
+// / llvm here (and four-way incl. wasm in the llvm crate).
+
+const SRC_W_ITEMS: &str = "#schema Cfg { name: String, port: Int }\n\
+     #schema W { items: List<Cfg>, n: Int }\n\
+     #main(W w) -> List<Cfg>\nw.items";
+
+fn w_items(items: Vec<Value>, n: i64) -> HashMap<String, Value> {
+    let w = cfg("W", vec![("items", cfg_list(items)), ("n", Value::Int(n))]);
+    let mut m = HashMap::new();
+    m.insert("w".to_string(), w);
+    m
+}
+
+#[test]
+fn param_field_items_empty() {
+    let report = assert_all_backends_bit_equal(SRC_W_ITEMS, w_items(vec![], 0));
+    assert!(report.cranelift_compared, "cranelift must compile w.items");
+    #[cfg(feature = "llvm-aot")]
+    assert!(report.llvm_compared, "llvm must compile w.items");
+}
+
+#[test]
+fn param_field_items_cjk_long_behind_scalar() {
+    let long = "z".repeat(5000);
+    let report = assert_all_backends_bit_equal(
+        SRC_W_ITEMS,
+        w_items(
+            vec![
+                cfg("Cfg", vec![("name", s("")), ("port", Value::Int(0))]),
+                cfg(
+                    "Cfg",
+                    vec![
+                        ("name", s(&from_cps(&[0x4E2D, 0x6587]))),
+                        ("port", Value::Int(i64::MAX)),
+                    ],
+                ),
+                cfg("Cfg", vec![("name", s(&long)), ("port", Value::Int(-9))]),
+            ],
+            7,
+        ),
+    );
+    assert!(report.cranelift_compared, "cranelift must compile w.items");
+    #[cfg(feature = "llvm-aot")]
+    assert!(report.llvm_compared, "llvm must compile w.items");
+}
+
 // ---- proptest: random schema field set / order / values --------------
 
 /// A small fixed schema whose field *order* and *types* are varied at the
@@ -276,12 +328,8 @@ proptest! {
 #[test]
 fn unsupported_return_shapes_fail_loudly_not_silently() {
     let cap_cases = [
-        // Parameter-*field* List<Schema> — the field-load rebase path is
-        // not proven bit-equal for an in-place return; stays a loud cap.
-        "#schema Cfg { name: String }\n#schema W { items: List<Cfg> }\n\
-         #main(W w) -> List<Cfg>\nw.items",
         // List<List<Schema>> — inner pointer-array-of-pointer-array; the
-        // in-place reader does not decode a nested Schema pointer array.
+        // in-place reader does not decode a nested Schema pointer array (F5).
         "#schema Cfg { name: String }\n#main(List<List<Cfg>> xs) -> List<List<Cfg>>\nxs",
         // Sub-record carrying a nested List<Schema> field — out of S4
         // scope (the in-place sub-record decoder caps deeper pointer-array

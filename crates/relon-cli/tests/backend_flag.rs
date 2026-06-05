@@ -197,6 +197,67 @@ fn cross_region_branded_struct_cjk_byte_equal_across_backends() {
     );
 }
 
+/// F4: a top-level parameter-**field** list return
+/// (`#main(Outer o) -> List<Server>\no.items`) with a CJK String field
+/// must produce byte-identical JSON on tree-walk and cranelift-AOT. The
+/// returned list is `o`'s field, reached through a field walk; post-F1 the
+/// field-load pushes the field list root's arena-absolute offset and the
+/// in-place region-walk return + verifier decode it cross-region.
+#[test]
+fn param_field_list_return_cjk_byte_equal_across_backends() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-paramfield-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(
+        &path,
+        "#schema Server { name: String, port: Int }\n\
+         #schema Outer { items: List<Server>, n: Int }\n\
+         #main(Outer o) -> List<Server>\no.items\n",
+    )
+    .expect("write fixture");
+
+    let cjk: String = [0x4E2Du32, 0x6587u32]
+        .iter()
+        .map(|c| char::from_u32(*c).unwrap())
+        .collect();
+    let args_json = format!(
+        r#"{{"o":{{"items":[{{"name":"{cjk}","port":8080}},{{"name":"","port":0}},{{"name":"edge","port":-1}}],"n":3}}}}"#
+    );
+
+    let run = |backend: &str| -> String {
+        let out = Command::new(BINARY)
+            .arg("run")
+            .arg(&path)
+            .arg("--backend")
+            .arg(backend)
+            .arg("--args")
+            .arg(&args_json)
+            .output()
+            .expect("spawn relon CLI");
+        assert!(
+            out.status.success(),
+            "CLI exited non-zero for {backend}: stderr={}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        String::from_utf8(out.stdout).expect("utf-8 stdout")
+    };
+
+    let tw = run("tree-walk");
+    let aot = run("cranelift-aot");
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        tw.contains(&cjk) && tw.contains("8080"),
+        "tree-walk output must carry the CJK field + port: {tw:?}"
+    );
+    assert_eq!(
+        tw, aot,
+        "tree-walk vs cranelift-aot parameter-field list JSON differs:\n  tw  = {tw:?}\n  aot = {aot:?}"
+    );
+}
+
 /// `--trust` is honoured by tree-walk + bytecode but is a no-op on the
 /// cranelift-AOT backend (no host-fn registry to grant capabilities
 /// from). It must NOT be silently dropped: the CLI warns on stderr so

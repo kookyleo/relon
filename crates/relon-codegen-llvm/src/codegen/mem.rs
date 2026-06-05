@@ -88,12 +88,16 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         let base = self.pop_int(ip_hint)?;
         let addr = self.compose_abs_addr(base, offset)?;
         // Pointer-indirect schema field (`String` / `List<scalar>` /
-        // `List<String>`): the slot holds a 4-byte offset to the field's
-        // tail record. F1: the input marshaller baked `in_ptr` into the
-        // slot (`finish_arena_absolute`), so the loaded value is already
-        // the arena-relative record pointer every consumer (`ReadStringLen`,
-        // list index, String / List return copy) expects — no `+ in_ptr`
-        // rebase.
+        // `List<String>` / `List<Schema>` / `List<List<scalar>>`): the slot
+        // holds a 4-byte offset to the field's tail record. F1: the input
+        // marshaller baked `in_ptr` into the slot recursively
+        // (`finish_arena_absolute`), so the loaded value is already the
+        // arena-absolute record root pointer every consumer (`ReadStringLen`,
+        // list index, the in-place return sentinel / cross-region object
+        // slot) expects — no `+ in_ptr` rebase, no re-encode. F4 adds
+        // `ListSchema` / `ListList` here so a parameter-field list return
+        // (`o.items` / `o.grid`) is bit-equal to tree-walk; mirrors the
+        // cranelift `emit_load_field_at_absolute`.
         if matches!(
             ty,
             IrType::String
@@ -101,6 +105,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 | IrType::ListFloat
                 | IrType::ListBool
                 | IrType::ListString
+                | IrType::ListSchema
+                | IrType::ListList
         ) {
             let name = self.next_name("loadfa_ptr_arena_rel");
             let arena_rel = self

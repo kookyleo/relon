@@ -909,7 +909,18 @@ fn lower_entry_with_resolver<'a>(
         // S4 scope: leaving it `inplace` would emit the sentinel but the
         // host decode would error at runtime. Gate it here so it stays a
         // loud cap at lowering (S5 territory) instead.
-        let is_inplace_param_walk = pointer_array_param_identity_walk(&root.expr)
+        // F4: a parameter **field** walk (`o.tags` / `o.items` / `o.grid`,
+        // where `o` is a schema-typed `#main` param and the field is a
+        // pointer-array list) is now an in-place region-walk return too.
+        // Post-F1 the input marshaller bakes `in_ptr` into *every* pointer
+        // slot (`finish_arena_absolute` relocates recursively), so the
+        // field-load (`LoadFieldAtAbsolute`) pushes the field list root's
+        // arena-absolute offset directly — exactly the value the single-root
+        // sentinel + multi-region verifier + reader consume. No re-encode
+        // happens on the field-load path, so the historical S3/S4 rebase
+        // cap is resolved by the F1 flip (proven byte-equal to tree-walk).
+        let is_inplace_param_walk = (pointer_array_param_identity_walk(&root.expr)
+            || pointer_array_param_field_walk(&root.expr, &main_schema).is_some())
             && match ret_ir_ty {
                 IrType::ListList | IrType::ListString => true,
                 IrType::ListSchema => {
@@ -1422,7 +1433,11 @@ fn anon_dict_return_plan(
             }
             Expr::Variable(path)
                 if !is_internal
-                    && matches!(path.as_slice(), [TokenKey::String(_, _, _)])
+                    && matches!(
+                        path.as_slice(),
+                        [TokenKey::String(_, _, _)]
+                            | [TokenKey::String(_, _, _), TokenKey::String(_, _, _)]
+                    )
                     && anon_dict_cross_region_param_list(path, &param_canonicals).is_some() =>
             {
                 // F1b: a host-visible field whose value is a parameter
@@ -2357,18 +2372,86 @@ fn pointer_array_list_source_is_const_pool(expr: &Expr) -> bool {
 /// verifies + decodes it in place — bit-equal to the tree-walk oracle,
 /// including every string's bytes and every sub-record field.
 ///
-/// A parameter-**field** walk (`w.rows` / `o.tags`) is intentionally
-/// **NOT** accepted here. A pointer-array list reached through a schema
-/// field is re-encoded by the field-load path into a different inner form
-/// (materialised i64 row handles for `List<List>`; for `List<String>` the
-/// field-load rebase path has not been proven bit-equal for an in-place
-/// return), which the in-place reader would decode wrong. Rather than
-/// ship a silent miscompile it stays a loud cap until a later step proves
-/// it bit-equal. Everything else (a list literal, comprehension, call,
-/// binary expression) is likewise not an identity param walk and keeps
-/// the existing const-pool / loud-cap paths.
+/// A parameter-**field** walk (`o.tags` / `o.items` / `o.grid`) is the
+/// F4 sibling, handled by [`pointer_array_param_field_walk`]. Post-F1 the
+/// field-load no longer re-encodes the inner form: every pointer slot is
+/// arena-absolute (the input marshaller bakes `in_ptr` recursively), so
+/// `LoadFieldAtAbsolute` pushes the field list root's arena-absolute
+/// offset directly — bit-equal to tree-walk under the same single-root
+/// sentinel + verifier + reader the identity walk uses. Everything else
+/// (a list literal, comprehension, call, binary expression) is not a
+/// param walk and keeps the existing const-pool / loud-cap paths.
 fn pointer_array_param_identity_walk(expr: &Expr) -> bool {
     matches!(expr, Expr::Variable(path) if path.len() == 1)
+}
+
+/// F4: detect a two-segment `#main` parameter **field** walk (`o.tags`
+/// where `o: Outer` is a schema-typed param and `tags: List<…>` is a
+/// pointer-array list field), returning the field's canonical `TypeRepr`
+/// when matched. The field type is resolved through `main_schema` (the
+/// param schema set, element schemas inlined).
+///
+/// Admission mirrors the identity walk envelope ([`anon_dict_cross_region_param_list`]):
+/// `List<String>`, `List<Int|Float|Bool>` (inline-fixed scalar list),
+/// `List<List<scalar>>` (nested-scalar pointer array), and `List<Schema>`
+/// confined to the S4 sub-record decode scope. A deeper nesting
+/// (`List<List<String|Schema>>`) or a non-list / non-pointer-array field
+/// returns `None`, so the caller keeps it a loud cap.
+///
+/// Why this is safe (the F1 flip resolved the S3/S4 rebase cap): the
+/// field-load path no longer materialises a re-encoded inner form. The
+/// slot at `param_root + field_offset` holds an arena-absolute u32 (the
+/// input marshaller's recursive `finish_arena_absolute` relocated it),
+/// and `LoadFieldAtAbsolute` loads it verbatim. That offset IS the field
+/// list root the verifier classifies (into the input region) and the
+/// reader follows cross-region — proven byte-equal to the tree-walk
+/// oracle on cranelift / llvm / wasm. Only single-segment field access is
+/// admitted; a deeper chain (`o.inner.tags`) is not in scope.
+fn pointer_array_param_field_walk<'s>(
+    expr: &Expr,
+    main_schema: &'s Schema,
+) -> Option<&'s TypeRepr> {
+    let Expr::Variable(path) = expr else {
+        return None;
+    };
+    let [TokenKey::String(p, _, _), TokenKey::String(f, _, _)] = path.as_slice() else {
+        return None;
+    };
+    let param = main_schema.fields.iter().find(|fl| &fl.name == p)?;
+    let TypeRepr::Schema { schema } = &param.ty else {
+        return None;
+    };
+    let field = schema.fields.iter().find(|fl| &fl.name == f)?;
+    cross_region_list_envelope(&field.ty).then_some(&field.ty)
+}
+
+/// The cross-region list-field admission envelope, shared by every
+/// classifier that decides whether a parameter-sourced `List<…>` value
+/// (identity `servers` or field walk `o.tags`) is one the host's
+/// multi-region verifier + reader can follow cross-region:
+///   * `List<String>` — pointer array of String records,
+///   * `List<Int|Float|Bool>` — inline-fixed scalar list,
+///   * `List<List<scalar>>` — nested-scalar pointer array (inner element
+///     must be an inline-fixed scalar; a deeper nesting or String / Schema
+///     inner element is out of scope), or
+///   * `List<Schema{…}>` confined to the S4 sub-record decode scope
+///     (`list_schema_subrecord_in_s4_scope`).
+///
+/// A `List<List<String|Schema>>` (double pointer array, F5) or any
+/// non-list type returns `false`, keeping it a loud cap.
+fn cross_region_list_envelope(ty: &TypeRepr) -> bool {
+    let TypeRepr::List { element } = ty else {
+        return false;
+    };
+    match element.as_ref() {
+        TypeRepr::String | TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool => true,
+        TypeRepr::Schema { .. } => list_schema_subrecord_in_s4_scope(ty),
+        TypeRepr::List { element: inner } => matches!(
+            inner.as_ref(),
+            TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool
+        ),
+        _ => false,
+    }
 }
 
 /// F1b / F3: classify a host-visible anon-Dict-return field whose value is
@@ -2398,41 +2481,31 @@ fn pointer_array_param_identity_walk(expr: &Expr) -> bool {
 /// `None`, so the field falls through to the existing scalar classifier and
 /// stays a loud cap. Mirrors the single-value return gate
 /// (`pointer_array_param_identity_walk` + `list_schema_subrecord_in_s4_scope`).
+/// F4 widens this to also accept a two-segment parameter **field** walk
+/// (`o.tags` where `o` is a schema-typed param and `tags` is a
+/// pointer-array list field), resolved through the param's element schema.
+/// Both the identity and field walks land the same arena-absolute slot
+/// offset on the object field (the field-load no longer re-encodes
+/// post-F1), so the host decode is unchanged.
 fn anon_dict_cross_region_param_list<'p>(
     path: &[TokenKey],
     param_canonicals: &'p HashMap<&str, TypeRepr>,
 ) -> Option<&'p TypeRepr> {
-    let [TokenKey::String(name, _, _)] = path else {
-        return None;
-    };
-    let ty = param_canonicals.get(name.as_str())?;
-    let TypeRepr::List { element } = ty else {
-        return None;
-    };
-    match element.as_ref() {
-        // `List<Schema>` — admit only the S4-scope element sub-record so
-        // the host reader's field decode never reaches an unsupported
-        // pointer-array element field.
-        TypeRepr::Schema { .. } if list_schema_subrecord_in_s4_scope(ty) => Some(ty),
-        // `List<List<scalar>>` — the innermost element must be an
-        // inline-fixed scalar (Int / Float / Bool). A deeper nesting or a
-        // String/Schema inner element is out of scope.
-        TypeRepr::List { element: inner }
-            if {
-                matches!(
-                    inner.as_ref(),
-                    TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool
-                )
-            } =>
-        {
-            Some(ty)
+    match path {
+        // Identity walk (`servers` / `tags`): the param's own list type.
+        [TokenKey::String(name, _, _)] => {
+            let ty = param_canonicals.get(name.as_str())?;
+            cross_region_list_envelope(ty).then_some(ty)
         }
-        // F3: `List<String>` (pointer-array-of-string) and `List<scalar>`
-        // (inline-fixed Int / Float / Bool). The parameter data lives in
-        // the input region; the cross-region slot stores its arena-absolute
-        // offset, which the verifier + `read_list_string` / `read_list_*`
-        // readers follow cross-region.
-        TypeRepr::String | TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool => Some(ty),
+        // F4 field walk (`o.tags`): the param must be a schema and the
+        // named field a pointer-array list inside the envelope.
+        [TokenKey::String(p, _, _), TokenKey::String(f, _, _)] => {
+            let TypeRepr::Schema { schema } = param_canonicals.get(p.as_str())? else {
+                return None;
+            };
+            let field = schema.fields.iter().find(|fl| &fl.name == f)?;
+            cross_region_list_envelope(&field.ty).then_some(&field.ty)
+        }
         _ => None,
     }
 }
@@ -2449,10 +2522,14 @@ fn anon_dict_cross_region_param_list<'p>(
 /// two paths reach the field — the field type / value-shape admission rules
 /// and the resulting arena-absolute slot store are identical. The element
 /// type envelope matches: `List<Schema>` confined to S4 sub-record scope,
-/// `List<List<scalar>>`, `List<String>`, and `List<Int|Float|Bool>`. The
-/// value must be a single-segment `Variable` resolving to a `#main` param
-/// whose `IrType` is the matching pointer-array / list type — a literal /
-/// load / call is **not** a cross-region identity walk and keeps the
+/// `List<List<scalar>>`, `List<String>`, and `List<Int|Float|Bool>`.
+///
+/// The value may be either a single-segment `Variable` resolving to a
+/// `#main` param whose `IrType` matches the field (the F3 identity walk),
+/// or — F4 — a two-segment param **field** walk (`w.items`) where the
+/// param is a schema and the named field's IR list type matches. Both
+/// land the same arena-absolute slot offset on the struct field post-F1.
+/// A literal / load / call is **not** a cross-region walk and keeps the
 /// existing const-pool / loud-cap paths.
 fn branded_field_cross_region_param_list(
     field_ty: &TypeRepr,
@@ -2462,39 +2539,49 @@ fn branded_field_cross_region_param_list(
     let TypeRepr::List { element } = field_ty else {
         return false;
     };
+    if !cross_region_list_envelope(field_ty) {
+        return false;
+    }
     // Field element-type envelope (mirrors `anon_dict_cross_region_param_list`).
     let field_ir = match element.as_ref() {
-        TypeRepr::Schema { .. } if list_schema_subrecord_in_s4_scope(field_ty) => {
-            IrType::ListSchema
-        }
-        TypeRepr::List { element: inner }
-            if matches!(
-                inner.as_ref(),
-                TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool
-            ) =>
-        {
-            IrType::ListList
-        }
+        TypeRepr::Schema { .. } => IrType::ListSchema,
+        TypeRepr::List { .. } => IrType::ListList,
         TypeRepr::String => IrType::ListString,
         TypeRepr::Int => IrType::ListInt,
         TypeRepr::Float => IrType::ListFloat,
         TypeRepr::Bool => IrType::ListBool,
-        // A `List<Schema>` outside S4 scope, a deeper-nested element list, or
-        // a `List<List<String|Schema>>` is out of scope — not cross-region.
         _ => return false,
     };
-    // The value must be a bare `#main` parameter identity whose IR list type
-    // matches the field. A param-field walk (`w.items`) or any other source
-    // is not an identity walk and stays on the existing paths.
     let Expr::Variable(path) = &*value.expr else {
         return false;
     };
-    let [TokenKey::String(name, _, _)] = path.as_slice() else {
-        return false;
-    };
-    ctx.params
-        .iter()
-        .any(|b| b.name == *name && b.ty == field_ir)
+    match path.as_slice() {
+        // F3 identity walk: a bare `#main` param whose IR list type matches.
+        [TokenKey::String(name, _, _)] => ctx
+            .params
+            .iter()
+            .any(|b| b.name == *name && b.ty == field_ir),
+        // F4 field walk (`w.items`): the param must be a schema and the
+        // named field a list whose IR type matches the struct field. The
+        // field-load pushes the field list root's arena-absolute offset
+        // post-F1, identical to the identity walk's slot value.
+        [TokenKey::String(p, _, _), TokenKey::String(f, _, _)] => {
+            let Some(binding) = ctx.params.iter().find(|b| b.name == *p) else {
+                return false;
+            };
+            let Some(schema) = binding.schema.as_ref() else {
+                return false;
+            };
+            let Some(field) = schema.fields.iter().find(|fl| &fl.name == f) else {
+                return false;
+            };
+            cross_region_list_envelope(&field.ty)
+                && type_repr_to_ir_type(&field.ty)
+                    .map(|ir| ir == field_ir)
+                    .unwrap_or(false)
+        }
+        _ => false,
+    }
 }
 
 /// True when a `List<Schema>` return type's per-element sub-record carries

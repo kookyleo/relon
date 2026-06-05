@@ -695,31 +695,32 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
     /// stack rather than from `in_ptr`.
     ///
     /// Scalar leaves load directly. Pointer-indirect field types
-    /// (`String` / `List<scalar>` / `List<String>`) store a 4-byte
-    /// **buffer-relative** offset in the field slot, exactly like a
-    /// top-level pointer-indirect `#main` param; we load that i32 slot
-    /// and rebase it by `in_ptr` so the pushed value is an arena-relative
-    /// record pointer the downstream consumers (`ReadStringLen`,
-    /// list-index, String/List return copy) expect. Multi-segment
-    /// nested-schema walks (`o.inner.x`, the inner segment ty `I32`)
-    /// remain out of scope here — see the report's honesty note.
+    /// (`String` / `List<scalar>` / `List<String>` / `List<Schema>` /
+    /// `List<List<scalar>>`) store a 4-byte **arena-absolute** offset in
+    /// the field slot (post-F1 the input marshaller's recursive
+    /// `finish_arena_absolute` rebased every pointer slot, nested ones
+    /// included). We load that i32 slot verbatim — it IS the field record's
+    /// arena-absolute root pointer the downstream consumers (`ReadStringLen`,
+    /// list-index, the in-place return sentinel / cross-region object slot)
+    /// expect. No re-encode happens here, which is why the F4 parameter-field
+    /// list return (`o.tags` / `o.items` / `o.grid`) is bit-equal to
+    /// tree-walk. Multi-segment nested-schema walks (`o.inner.x`, the inner
+    /// segment ty `I32`) remain out of scope here — see the report's
+    /// honesty note.
     pub(super) fn emit_load_field_at_absolute(
         &mut self,
         offset: u32,
         ty: IrType,
     ) -> Result<(), CraneliftError> {
-        // Pointer-indirect field leaves: load the 4-byte buffer-relative
-        // slot, rebase by `in_ptr` to an arena-relative record pointer.
+        // Pointer-indirect field leaves: load the 4-byte arena-absolute slot
+        // verbatim (the input marshaller baked `in_ptr` in recursively).
         //
-        // `ListList` is intentionally NOT included: a `List<List<scalar>>`
-        // reached through a schema field is re-encoded into the
-        // materialised inner form (i64 slots carrying truncated i32 row
-        // handles), which the in-place reader decodes wrong. The IR
-        // lowering caps a parameter-field `List<List>` return loudly (see
-        // `list_list_source_is_param_walk`), so this op never carries a
-        // `ListList` for a return today; keeping it out of the rebase set
-        // makes any future field-`ListList` lowering fail loud here rather
-        // than silently mis-decode.
+        // `ListSchema` / `ListList` are included (F4): the slot holds the
+        // field list root's arena-absolute offset exactly like the scalar
+        // pointer-array leaves. No materialised inner form is produced on
+        // this path — the historical "re-encode" cap was an artifact of the
+        // pre-F1 region-relative convention; the F1 flip resolved it
+        // (proven byte-equal to tree-walk on this field-load path).
         if matches!(
             ty,
             IrType::String
@@ -727,6 +728,8 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
                 | IrType::ListFloat
                 | IrType::ListBool
                 | IrType::ListString
+                | IrType::ListSchema
+                | IrType::ListList
         ) {
             let base_i32 = self.pop()?;
             let off_v = self.builder.ins().iconst(I32, i64::from(offset));

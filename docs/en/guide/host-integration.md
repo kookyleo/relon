@@ -113,8 +113,10 @@ signature**; each parameter declares one host-pushed slot:
 >   straight out of the module's **linear memory** and runs the same
 >   verifier before decoding (four-way bit-equal: tree-walk == cranelift ==
 >   llvm == wasm). A parameter-*field* `List<List<scalar>>`
->   (`w.rows`) stays capped on all — its field load re-encodes the inner
->   rows into a materialised form the in-place reader does not yet decode,
+>   (`#main(W w) -> List<List<Int>> = w.rows`) is **also supported** on all
+>   three (F4): under the arena-absolute slot convention the field load
+>   pushes the field list root's arena-absolute offset directly, so it
+>   rides the same in-place return as the identity case,
 > - **`List<String>` identity returns from a `#main` parameter**
 >   (`#main(List<String> ss) -> List<String> = ss`), on **the cranelift,
 >   llvm, and compiled-wasm backends.** This is the first *per-element
@@ -127,7 +129,8 @@ signature**; each parameter declares one host-pushed slot:
 >   oracle including each string's bytes (CJK / emoji / 4 KiB strings
 >   included, and on wasm read out of linear memory through the same
 >   verifier). A parameter-*field* `List<String>`
->   (`o.tags`) stays capped on all,
+>   (`#main(Outer o) -> List<String> = o.tags`) is **also supported** on
+>   all three (F4) via the same arena-absolute field-load,
 > - **`List<Schema>` identity returns from a `#main` parameter**
 >   (`#main(List<Cfg> items) -> List<Cfg> = items`), on **the cranelift,
 >   llvm, and compiled-wasm backends.** This is the deepest in-place
@@ -141,9 +144,11 @@ signature**; each parameter declares one host-pushed slot:
 >   each element into a branded dict in place — bit-equal to the tree-walk
 >   oracle including every sub-object's field bytes, on wasm too (the same
 >   recursion runs over linear memory). A parameter-*field*
->   `List<Schema>` (`w.items`) stays capped on all, as does a sub-record
->   that itself carries a nested `List<Schema>` / `List<List<…>>` field
->   (out of scope — the in-place sub-record reader caps it),
+>   `List<Schema>` (`#main(W w) -> List<Cfg> = w.items`) is **also
+>   supported** on all three (F4) via the same arena-absolute field-load.
+>   A sub-record that itself carries a nested `List<Schema>` /
+>   `List<List<…>>` field stays out of scope (the in-place sub-record reader
+>   caps it),
 > - **`#schema`-branded struct returns** (`#main() -> Cfg { ... }`) whose
 >   fields are any of the above (including literal `String` / `List`
 >   fields),
@@ -162,12 +167,11 @@ signature**; each parameter declares one host-pushed slot:
 > - inner pointer-array element lists (`List<List<String>>` /
 >   `List<List<Schema>>`) — the recursive per-entry relocation isn't
 >   modelled,
-> - **returning** a `List<Schema>` or `List<List<scalar>>` reached through
->   a **parameter field** on either backend (the parameter-*identity* case
->   is supported on both backends above), or a `List<Schema>` whose
->   sub-record carries a nested `List<Schema>` / `List<List<…>>` field.
+> - a `List<Schema>` return whose sub-record carries a nested
+>   `List<Schema>` / `List<List<…>>` field (the in-place sub-record reader
+>   caps the deeper pointer array).
 >
->   An **object field** sourced by parameter identity — whether the object
+>   An **object field** sourced by a parameter — whether the object
 >   is an **anon-`Dict`** (`-> Dict { servers: servers, n: 1 }`) or a
 >   **branded `#schema` struct** (`#schema Wrapper { servers: List<Server>,
 >   n: Int }` returned via `-> Wrapper { servers: servers, n: 7 }`) — is
@@ -175,7 +179,10 @@ signature**; each parameter declares one host-pushed slot:
 >   The field may be `List<Schema>`, `List<List<scalar>>`, `List<String>`,
 >   or `List<Int|Float|Bool>` (F1b/F2 on cranelift/llvm/wasm for
 >   `List<Schema>` / `List<List<scalar>>`; F3 added the branded-struct path
->   and the scalar/String list field types on all four). The object header
+>   and the scalar/String list field types on all four). The source may be a
+>   parameter **identity** (`servers`) **or** — F4 — a parameter **field**
+>   walk (`o.items`, `o.tags`): both land the field list root's
+>   arena-absolute offset in the slot. The object header
 >   is built in `out_buf`, but the parameter-sourced field's data lives in
 >   `in_buf` — a genuine **cross-region** field pointer. Under the
 >   arena-absolute slot convention the field slot stores the parameter list
@@ -188,26 +195,24 @@ signature**; each parameter declares one host-pushed slot:
 >   every sub-record String field), then `BufferReader::new_at_base` follows
 >   it cross-region — bit-equal to the tree-walk oracle. On wasm the host
 >   reads the same arena out of linear memory and runs the same
->   verifier-gated decode, so there is no wasm-specific path. In every
->   still-capped case (a parameter-*field* list source, or a doubly-nested
->   `List<List<Schema>>`) the backend refuses rather than store an `in_buf`
->   pointer into an `out_buf` slot. The host-side
+>   verifier-gated decode, so there is no wasm-specific path. The remaining
+>   still-capped case (a doubly-nested `List<List<Schema>>` /
+>   `List<List<String>>`) makes the backend refuse rather than store an
+>   unsupported pointer array. The host-side
 >   *decode* is in
 >   place — `BufferReader` walks the buffer with a single base and
 >   reconstructs the nested `Value` recursively (`read_list_record` /
 >   `read_list_record_at` for `List<Schema>`, `read_list_list` /
 >   `read_list_list_at` for `List<List<scalar>>`, `read_list_string_at`
->   for an in-place `List<String>`). The in-place return wiring now covers
+>   for an in-place `List<String>`). The in-place return wiring covers
 >   the *per-element pointer-array* `List<String>` and `List<Schema>`
->   parameter-identity shapes (above); still missing for the materialised
->   field-load form and deeper-nested element lists, which stay a loud
->   compile-time cap,
-> - **returning a `List<String>` (or any pointer-array list) sourced from a
->   `#main` parameter *field load* / call** rather than a parameter
->   identity or an in-source literal — such a value's field-load rebase is
->   not yet proven bit-equal for an in-place return, so it stays a loud cap
->   (the parameter-*identity* `List<String>` case is supported on both
->   backends above).
+>   shapes from both a parameter **identity** and (F4) a parameter
+>   **field** walk (above); still missing only for deeper-nested element
+>   lists, which stay a loud compile-time cap.
+> - **returning a pointer-array list sourced from a `#main` parameter call
+>   / arbitrary expression** (rather than a parameter identity, a parameter
+>   field walk, or an in-source literal) — such a value is not proven
+>   bit-equal for an in-place return, so it stays a loud cap.
 >
 > All of the above fail **loudly** at compile time; the compiled
 > backends never return wrong data or crash for them — route those shapes

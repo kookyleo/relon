@@ -178,14 +178,9 @@ fn unsupported_return_shapes_fail_loudly_not_silently() {
         "#main() -> Dict\n{ name: \"x\", empty: [] }",
         // Heterogeneous list.
         "#main() -> Dict\n{ name: \"x\", mixed: [1, \"a\"] }",
-        // Top-level List<Schema> / List<List> returns.
+        // Top-level List<Schema> / List<List> returns from a *literal*.
         "#schema P {\n    Int x: *\n}\n#main() -> List<P>\n[{x:1},{x:2}]",
         "#main() -> List<List<Int>>\n[[1, 2], [3, 4]]",
-        // Parameter-*field* List<Schema> sources (`w.items`) inside an
-        // object — the field-load rebase path is not a param identity walk;
-        // stays capped (F4).
-        "#schema Server { name: String }\n#schema W { items: List<Server> }\n\
-         #main(W w) -> Dict\n{ servers: w.items, n: 1 }",
         // Doubly-nested pointer-array (`List<List<Schema>>`) field — out of
         // scope (F5).
         "#schema Server { name: String }\n\
@@ -213,6 +208,17 @@ fn unsupported_return_shapes_fail_loudly_not_silently() {
         // F3: anon-Dict scalar/String list fields sourced by param identity.
         "#main(List<String> tags) -> Dict\n{ tags: tags, n: 1 }",
         "#main(List<Int> xs) -> Dict\n{ xs: xs, n: 1 }",
+        // F4: object field sourced by a parameter *field* walk (`w.items`).
+        // Post-F1 the field-load pushes the field list root's arena-absolute
+        // offset; the cross-region store + multi-region verifier/reader are
+        // identical to the identity path (proven four-way bit-equal).
+        "#schema Server { name: String }\n#schema W { items: List<Server> }\n\
+         #main(W w) -> Dict\n{ servers: w.items, n: 1 }",
+        // F4: top-level parameter-field list returns.
+        "#schema Outer { tags: List<String>, n: Int }\n\
+         #main(Outer o) -> List<String>\no.tags",
+        "#schema Outer { grid: List<List<Int>>, n: Int }\n\
+         #main(Outer o) -> List<List<Int>>\no.grid",
     ];
     for src in BOTH_CAP {
         let cl = AotEvaluator::from_source(src);

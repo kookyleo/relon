@@ -489,6 +489,157 @@ fn lschema_many_with_cjk_and_empty_host() {
 }
 
 // ====================================================================
+// F4: parameter-FIELD list returns (`o.tags` / `o.items` / `o.grid`).
+//
+// `o` is a schema-typed `#main` param; the returned list is one of its
+// pointer-array fields. Post-F1 the input marshaller bakes `in_ptr` into
+// every pointer slot recursively, so the field-load (`LoadFieldAtAbsolute`)
+// pushes the field list root's arena-absolute offset directly — exactly
+// the value the single-root in-place sentinel + multi-region verifier +
+// reader consume. This resolves the S3/S4 `o.tags` / `w.items` rebase cap.
+// ====================================================================
+
+fn outer_str(field: &str, tags: Value, n: i64) -> Value {
+    let map = std::collections::BTreeMap::from([
+        (relon_eval_api::smol_str::SmolStr::from(field), tags),
+        (relon_eval_api::smol_str::SmolStr::from("n"), Value::Int(n)),
+    ]);
+    Value::branded_dict(map, Some("Outer".into()))
+}
+
+// tags BEHIND a leading scalar (offset stress: the list field is not at
+// offset 0 — exercises the field-offset composition in LoadFieldAtAbsolute).
+const SRC_F_TAGS: &str = "#schema Outer { tags: List<String>, n: Int }\n\
+                          #main(Outer o) -> List<String>\no.tags";
+const SRC_F_TAGS_BEHIND: &str = "#schema Outer { n: Int, tags: List<String> }\n\
+                                 #main(Outer o) -> List<String>\no.tags";
+
+#[test]
+fn f_tags_empty() {
+    assert_four_way(SRC_F_TAGS, args1("o", outer_str("tags", str_list(&[]), 0)));
+}
+
+#[test]
+fn f_tags_single() {
+    assert_four_way(
+        SRC_F_TAGS,
+        args1("o", outer_str("tags", str_list(&["x"]), 1)),
+    );
+}
+
+#[test]
+fn f_tags_cjk_empty_long_behind_scalar() {
+    let long = "a".repeat(4096);
+    let cjk = "\u{4E2D}\u{6587}".repeat(512);
+    assert_four_way(
+        SRC_F_TAGS_BEHIND,
+        args1(
+            "o",
+            outer_str(
+                "tags",
+                str_list(&["", "\u{4E2D}\u{6587}", long.as_str(), cjk.as_str(), ""]),
+                7,
+            ),
+        ),
+    );
+}
+
+const SRC_F_NUMS: &str = "#schema Outer { nums: List<Int>, n: Int }\n\
+                          #main(Outer o) -> List<Int>\no.nums";
+
+#[test]
+fn f_nums_inline_scalar_field() {
+    assert_four_way(
+        SRC_F_NUMS,
+        args1("o", {
+            let map = std::collections::BTreeMap::from([
+                (
+                    relon_eval_api::smol_str::SmolStr::from("nums"),
+                    Value::List(Arc::new(
+                        [i64::MIN, 0, i64::MAX, -1]
+                            .into_iter()
+                            .map(Value::Int)
+                            .collect(),
+                    )),
+                ),
+                (relon_eval_api::smol_str::SmolStr::from("n"), Value::Int(2)),
+            ]);
+            Value::branded_dict(map, Some("Outer".into()))
+        }),
+    );
+}
+
+const SRC_F_ITEMS: &str = "#schema Server { host: String, port: Int }\n\
+                           #schema Outer { items: List<Server>, n: Int }\n\
+                           #main(Outer o) -> List<Server>\no.items";
+
+fn outer_items(items: Vec<Value>, n: i64) -> Value {
+    let map = std::collections::BTreeMap::from([
+        (
+            relon_eval_api::smol_str::SmolStr::from("items"),
+            Value::List(Arc::new(items)),
+        ),
+        (relon_eval_api::smol_str::SmolStr::from("n"), Value::Int(n)),
+    ]);
+    Value::branded_dict(map, Some("Outer".into()))
+}
+
+#[test]
+fn f_items_list_schema_empty() {
+    assert_four_way(SRC_F_ITEMS, args1("o", outer_items(vec![], 0)));
+}
+
+#[test]
+fn f_items_list_schema_many_cjk() {
+    assert_four_way(
+        SRC_F_ITEMS,
+        args1(
+            "o",
+            outer_items(
+                vec![
+                    server("", 0),
+                    server("\u{6570}\u{636E}\u{5E93}", 5432),
+                    server("h", i64::MAX),
+                    server("y", i64::MIN),
+                ],
+                9,
+            ),
+        ),
+    );
+}
+
+const SRC_F_GRID: &str = "#schema Outer { grid: List<List<Int>>, n: Int }\n\
+                          #main(Outer o) -> List<List<Int>>\no.grid";
+
+fn outer_grid(rows: &[&[i64]], n: i64) -> Value {
+    let map = std::collections::BTreeMap::from([
+        (
+            relon_eval_api::smol_str::SmolStr::from("grid"),
+            int_rows(rows),
+        ),
+        (relon_eval_api::smol_str::SmolStr::from("n"), Value::Int(n)),
+    ]);
+    Value::branded_dict(map, Some("Outer".into()))
+}
+
+#[test]
+fn f_grid_list_list_int() {
+    assert_four_way(
+        SRC_F_GRID,
+        args1(
+            "o",
+            outer_grid(&[&[1, 2, 3], &[], &[i64::MIN, i64::MAX]], 3),
+        ),
+    );
+}
+
+// F4 as an OBJECT field value (cross-region object field whose source is a
+// parameter field, not a parameter identity) is covered four-way in
+// `cross_region_object_four_way.rs`, where the Dict comparator normalises
+// the synthesised return brand. This file carries only the top-level
+// parameter-field list returns (plain `Value` equality).
+
+// ====================================================================
 // proptest differential — the "shapes you didn't think of" net.
 // Smaller case count than the native three-way: each wasm case shells out
 // to wasm-ld + spins up a wasmtime instance.
@@ -576,6 +727,46 @@ proptest! {
             prop_assert_eq!(res.map_err(TestCaseError::fail)?, oracle);
         }
     }
+
+    // F4 parameter-field walks: wrap each generated list in an `Outer`
+    // schema and return the field. The list root reached through the field
+    // load must decode bit-equal to the tree-walk oracle.
+    #[test]
+    fn diff_field_tags(val in list_string_strat()) {
+        let arg = outer_str("tags", val, 0);
+        let oracle = run_tree_walk(SRC_F_TAGS, args1("o", arg.clone()));
+        if let Some(res) = run_wasm(SRC_F_TAGS, &args1("o", arg)) {
+            prop_assert_eq!(res.map_err(TestCaseError::fail)?, oracle);
+        }
+    }
+
+    #[test]
+    fn diff_field_grid(val in list_list_int_strat()) {
+        let map = std::collections::BTreeMap::from([
+            (relon_eval_api::smol_str::SmolStr::from("grid"), val),
+            (relon_eval_api::smol_str::SmolStr::from("n"), Value::Int(0)),
+        ]);
+        let arg = Value::branded_dict(map, Some("Outer".into()));
+        let oracle = run_tree_walk(SRC_F_GRID, args1("o", arg.clone()));
+        if let Some(res) = run_wasm(SRC_F_GRID, &args1("o", arg)) {
+            prop_assert_eq!(res.map_err(TestCaseError::fail)?, oracle);
+        }
+    }
+
+    #[test]
+    fn diff_field_items(val in list_schema_strat()) {
+        // list_schema_strat builds Server{host,port} records; reuse them as
+        // `Outer.items` (the F_ITEMS schema declares host/port too).
+        let map = std::collections::BTreeMap::from([
+            (relon_eval_api::smol_str::SmolStr::from("items"), val),
+            (relon_eval_api::smol_str::SmolStr::from("n"), Value::Int(0)),
+        ]);
+        let arg = Value::branded_dict(map, Some("Outer".into()));
+        let oracle = run_tree_walk(SRC_F_ITEMS, args1("o", arg.clone()));
+        if let Some(res) = run_wasm(SRC_F_ITEMS, &args1("o", arg)) {
+            prop_assert_eq!(res.map_err(TestCaseError::fail)?, oracle);
+        }
+    }
 }
 
 // ====================================================================
@@ -631,15 +822,19 @@ fn verifier_rejects_out_of_region_root_loudly() {
 // wasm32 emit decline loudly on the shared IR lowering, never miscompile.
 // ====================================================================
 
-/// `List<List<String>>` parameter identity (inner pointer-array element)
-/// and a parameter-*field* `List<List<Int>>` are still capped. The wasm32
-/// emit path shares the `relon-ir` lowering with the native backends, so
-/// the decline is symmetric — assert wasm32 emit returns `Err`.
+/// `List<List<String>>` / `List<List<Schema>>` double-pointer-array
+/// returns are still capped (F5), both as a top-level parameter identity
+/// and as a parameter-*field* walk — F4 lifts the inner-scalar / String /
+/// Schema list field shapes, NOT the double pointer array. The wasm32 emit
+/// path shares the `relon-ir` lowering with the native backends, so the
+/// decline is symmetric — assert wasm32 emit returns `Err`.
 #[test]
 fn capped_shapes_decline_on_wasm_emit_not_silently() {
     let cap_cases = [
         "#main(List<List<String>> xss) -> List<List<String>>\nxss",
-        "#schema W { List<List<Int>> rows: * }\n#main(W w) -> List<List<Int>>\nw.rows",
+        // F5 field walk: a double-pointer-array field is still capped.
+        "#schema W { rows: List<List<String>>, n: Int }\n\
+         #main(W w) -> List<List<String>>\nw.rows",
     ];
     let dir = std::env::temp_dir();
     for src in cap_cases {
