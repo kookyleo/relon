@@ -169,9 +169,10 @@ signature**; each parameter declares one host-pushed slot:
 >
 >   An **anon-`Dict` field** of `List<Schema>` / `List<List<scalar>>` type
 >   sourced by parameter identity (`-> Dict { servers: servers, n: 1 }`
->   where `servers: List<Server>` is a `#main` param) is now supported on
->   **cranelift** (F1b). The object header is built in `out_buf`, but the
->   parameter-sourced field's data lives in `in_buf` — a genuine
+>   where `servers: List<Server>` is a `#main` param) is now supported
+>   **four-way** — tree-walk == cranelift == llvm == compiled wasm (F1b on
+>   cranelift, F2 on llvm + wasm). The object header is built in `out_buf`,
+>   but the parameter-sourced field's data lives in `in_buf` — a genuine
 >   **cross-region** field pointer. Under the arena-absolute slot
 >   convention the field slot stores the parameter list root's
 >   arena-absolute offset directly (no copy); before any decode the host
@@ -179,10 +180,10 @@ signature**; each parameter declares one host-pushed slot:
 >   at `out_ptr`, which classifies the slot pointer into the input region
 >   and bounds-checks the entire reachable graph (down to every sub-record
 >   String field), then `BufferReader::new_at_base` follows it cross-region
->   — bit-equal to the tree-walk oracle. **llvm + wasm still cap this shape
->   loudly** (the shared IR reaches a codegen gate); they land in a
->   follow-up (F2). The **branded-struct** field surface
->   (`-> Cfg { servers: servers }`) also stays a loud cap on both backends
+>   — bit-equal to the tree-walk oracle. On wasm the host reads the same
+>   arena out of linear memory and runs the same verifier-gated decode, so
+>   there is no wasm-specific path. The **branded-struct** field surface
+>   (`-> Cfg { servers: servers }`) still stays a loud cap on every backend
 >   — it routes through a different lowering path that has no cross-region
 >   field store yet. In every still-capped case the backend refuses rather
 >   than store an `in_buf` pointer into an `out_buf` slot. The host-side

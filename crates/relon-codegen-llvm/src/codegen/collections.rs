@@ -382,22 +382,18 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             })?;
             return Ok(());
         }
-        // F1b scope gate (llvm stays capped until F2): a cross-region
-        // object field stores the *arena-absolute* offset of a parameter's
-        // `List<Schema>` / `List<List<scalar>>` root (in_buf) into an
-        // out_buf slot. The cranelift backend ships this (proven bit-equal
-        // three-way); the llvm + wasm four-way proof is a follow-up (F2).
-        // The IR lowering is shared, so the op reaches here on llvm too —
-        // cap it loudly rather than emit an unverified cross-region store.
-        // `StoreFieldAtRecord { ty: ListSchema | ListList }` has no other
-        // producer today, so this gate is precise.
-        if matches!(ty, IrType::ListSchema | IrType::ListList) {
-            return Err(LlvmError::Codegen(format!(
-                "cross-region object field of type {ty:?} (parameter-sourced pointer-array list \
-                 in an object return) is not yet supported on the llvm backend — F1b ships this \
-                 on cranelift only; llvm/wasm land in F2"
-            )));
-        }
+        // F2: a cross-region object field stores the *arena-absolute*
+        // offset of a parameter's `List<Schema>` / `List<List<scalar>>`
+        // root (in_buf) directly into an out_buf slot — the cross-region
+        // link IS the stored value, no tail copy. Under the F1 slot
+        // convention `LoadListSchemaPtr` / `LoadListListPtr` already push
+        // the arena-absolute root offset, and the `ListSchema | ListList`
+        // arm of the store below writes that i32 verbatim into the slot.
+        // The host object-return path runs `verify_object_return_multi` +
+        // `new_at_base` over the whole arena: `classify_span` lands the
+        // slot offset in in_buf, bounds-checks the reachable graph, then
+        // the reader follows it cross-region. Identical to cranelift (F1b),
+        // now four-way bit-equal (tree-walk == cranelift == llvm == wasm).
         let arena_base_ptr = self.arena_base_ptr.ok_or_else(|| {
             LlvmError::Codegen("StoreFieldAtRecord outside buffer-protocol entry".into())
         })?;
