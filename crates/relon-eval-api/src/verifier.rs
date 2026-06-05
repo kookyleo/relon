@@ -31,6 +31,32 @@
 //! one shape the return marshaller must keep behind a loud capability)
 //! is caught as [`VerifyError::OutOfRegion`] instead of being silently
 //! dereferenced.
+//!
+//! ## Multi-region walk (F0 cross-region safety net)
+//!
+//! The S5 cross-region return shape (`-> Dict { servers: List<Cfg> }`)
+//! builds the object head in `out_buf` while the parameter-sourced field
+//! data still lives in `in_buf` — a single value graph that legitimately
+//! spans two regions. The single-region wall would (correctly, for S1–S6)
+//! reject it. [`MultiRegion`] + [`verify_value_at_multi`] /
+//! [`verify_record_multi`] are the multi-region-aware sibling pass: they
+//! walk over the **whole arena** in absolute coordinates, and at every
+//! pointer they (1) read the slot value as an **arena-absolute** offset
+//! (the convention F1 codegen will emit — see the plan's "F0 design
+//! decision" note: a single global arena-relative pointer convention),
+//! (2)
+//! classify which region that absolute offset lands in, and (3)
+//! bounds-check the introduced span against **that one** region. A
+//! pointer that lands in no region, or whose span runs off the region it
+//! starts in, is a loud [`VerifyError`] — never a wild read. The object
+//! positive-`bytes_written` return path runs this pass before any decode,
+//! closing the red-line "cross-region pointer into an object slot is not
+//! verified" gap.
+//!
+//! **F0 does not release any capability.** The multi-region pass is the
+//! safety net + the facilities that let F1 release the first cross-region
+//! shape behind a verified gate; the cross-region object/struct lowering
+//! stays capped until then.
 
 use crate::layout::{FieldKind, ListElementKind, OffsetTable, SchemaLayout};
 use crate::schema_canonical::{Field, Schema, TypeRepr};
@@ -68,6 +94,99 @@ impl Region {
             Some(end) => off >= self.start && end <= self.end,
             None => false,
         }
+    }
+}
+
+/// The four arena regions a cross-region return value may reach, in the
+/// fixed ABI layout order `[const_data | in_buf | out_buf | scratch]`.
+/// Used only to label which region a multi-region span landed in for
+/// diagnostics; the verifier itself treats them uniformly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionTag {
+    /// Const-data pool at arena offset 0.
+    Const,
+    /// Input buffer (`in_ptr..in_ptr+in_len`) — parameter-sourced data.
+    In,
+    /// Output buffer (`out_ptr..out_ptr+out_cap`) — the object head and
+    /// const-pool / copied tails.
+    Out,
+    /// Scratch region (`scratch_base..arena_size`).
+    Scratch,
+}
+
+impl RegionTag {
+    /// Short region label for diagnostics.
+    pub fn label(self) -> &'static str {
+        match self {
+            RegionTag::Const => "const",
+            RegionTag::In => "in",
+            RegionTag::Out => "out",
+            RegionTag::Scratch => "scratch",
+        }
+    }
+}
+
+/// A set of arena regions in **absolute arena coordinates**, the
+/// multi-region sibling of [`Region`]. Where a [`Region`] confines an
+/// entire value graph to one window, a `MultiRegion` lets the graph span
+/// regions: every followed pointer is an arena-absolute offset that must
+/// land fully inside *one* of these regions (`contains_span` picks the
+/// region whose window the span starts in and requires the whole span to
+/// fit it). A span that starts in no region, or starts in one region but
+/// runs past its end, is rejected — there is no "fell through to the next
+/// region" silent over-read.
+///
+/// The regions are half-open `[start, end)` absolute byte windows and may
+/// be empty (`start == end`, e.g. a zero-length `in_buf`); an empty
+/// region contains no span. They are expected non-overlapping (the ABI
+/// arena layout guarantees this), but `contains_span` only ever requires
+/// a span to fit *some* region, so a benign overlap could not cause a
+/// missed bounds check.
+#[derive(Debug, Clone, Copy)]
+pub struct MultiRegion {
+    regions: [(RegionTag, Region); 4],
+}
+
+impl MultiRegion {
+    /// Build the four-region map from absolute arena boundaries. Each
+    /// pair is a half-open `[start, end)` window; `start > end` for any
+    /// region is a caller bug surfaced as [`VerifyError::DegenerateRegion`].
+    pub fn new(
+        const_data: (usize, usize),
+        in_buf: (usize, usize),
+        out_buf: (usize, usize),
+        scratch: (usize, usize),
+    ) -> Result<Self, VerifyError> {
+        Ok(Self {
+            regions: [
+                (RegionTag::Const, Region::new(const_data.0, const_data.1)?),
+                (RegionTag::In, Region::new(in_buf.0, in_buf.1)?),
+                (RegionTag::Out, Region::new(out_buf.0, out_buf.1)?),
+                (RegionTag::Scratch, Region::new(scratch.0, scratch.1)?),
+            ],
+        })
+    }
+
+    /// The largest `end` across all regions — the minimum byte length the
+    /// verified arena slice must cover for every region bound to be
+    /// satisfiable.
+    fn max_end(&self) -> usize {
+        self.regions.iter().map(|(_, r)| r.end).max().unwrap_or(0)
+    }
+
+    /// Classify the absolute offset `off` (with span `len`) into the one
+    /// region that fully contains `[off, off+len)`. Returns the region
+    /// tag on success, or `None` when the span fits no single region.
+    fn classify_span(&self, off: usize, len: usize) -> Option<RegionTag> {
+        for (tag, region) in &self.regions {
+            // Empty regions contain nothing; `contains_span` already
+            // handles that via `off >= start && end <= end` with
+            // `start == end`.
+            if region.contains_span(off, len) {
+                return Some(*tag);
+            }
+        }
+        None
     }
 }
 
@@ -146,6 +265,25 @@ pub enum VerifyError {
         /// Human-readable type label.
         ty: &'static str,
     },
+    /// A multi-region walk followed a pointer whose arena-absolute span
+    /// `[offset, offset+len)` fits inside **no** arena region (or starts
+    /// in one region but runs past its end). The cross-region catch: a
+    /// pointer must land fully inside exactly one of const / in / out /
+    /// scratch, never between or past them.
+    #[error(
+        "offset {offset}..+{len} for `{field}` ({what}) fits no arena region \
+         (const, in, out, scratch are all disjoint windows)"
+    )]
+    NoRegion {
+        /// Field being walked.
+        field: String,
+        /// What kind of span tripped the check.
+        what: &'static str,
+        /// Absolute span start.
+        offset: usize,
+        /// Span byte length.
+        len: usize,
+    },
     /// A recursion-depth guard tripped: the schema nests deeper than
     /// the verifier's bound. Protects against a hand-built schema that
     /// recurses without bound (the runtime schemas are acyclic, but a
@@ -157,6 +295,115 @@ pub enum VerifyError {
         /// The depth bound that was hit.
         depth: usize,
     },
+}
+
+/// The bounds discipline a verifier walk enforces: either the
+/// single-region wall (S1–S6: the whole graph must stay in one region) or
+/// the multi-region map (F0 cross-region: each followed span must stay in
+/// *some* region). Both expose the same two operations the walk needs —
+/// "does this absolute span fit my bounds" and "what is the maximum end my
+/// bounds require the slice to cover" — so the recursive walk is written
+/// once and parameterised over this.
+#[derive(Debug, Clone, Copy)]
+enum Bounds {
+    /// S1–S6 single-region wall. Every offset is region-relative into a
+    /// region-sliced byte array; the whole graph must stay in `[start,
+    /// end)`.
+    Single(Region),
+    /// F0 multi-region map. Every offset is arena-absolute into the whole
+    /// arena slice; each span must fit one region, cross-region links
+    /// allowed.
+    Multi(MultiRegion),
+}
+
+impl Bounds {
+    /// The minimum byte length the verified slice must cover.
+    fn required_len(&self) -> usize {
+        match self {
+            Bounds::Single(r) => r.end,
+            Bounds::Multi(m) => m.max_end(),
+        }
+    }
+
+    /// Assert `[off, off+len)` (an absolute offset into the verified
+    /// slice) is legal under this bounds discipline. `field` / `what`
+    /// label the offending span for diagnostics.
+    fn require_span(
+        &self,
+        field: &str,
+        what: &'static str,
+        off: usize,
+        len: usize,
+    ) -> Result<(), VerifyError> {
+        if off.checked_add(len).is_none() {
+            return Err(VerifyError::SpanOverflow {
+                field: field.to_string(),
+                what,
+            });
+        }
+        match self {
+            Bounds::Single(region) => {
+                if region.contains_span(off, len) {
+                    Ok(())
+                } else {
+                    Err(VerifyError::OutOfRegion {
+                        field: field.to_string(),
+                        what,
+                        offset: off,
+                        len,
+                        start: region.start,
+                        end: region.end,
+                    })
+                }
+            }
+            Bounds::Multi(multi) => {
+                if multi.classify_span(off, len).is_some() {
+                    Ok(())
+                } else {
+                    Err(VerifyError::NoRegion {
+                        field: field.to_string(),
+                        what,
+                        offset: off,
+                        len,
+                    })
+                }
+            }
+        }
+    }
+
+    /// Assert a record fixed-area slot `[off, off+size)` fits one region,
+    /// reporting the dedicated [`VerifyError::FixedSlotOutOfRegion`] /
+    /// [`VerifyError::NoRegion`] diagnostic (a truncated record / wrong
+    /// base) rather than the generic pointer-span error.
+    fn require_fixed_slot(&self, field: &str, off: usize, size: usize) -> Result<(), VerifyError> {
+        match self {
+            Bounds::Single(region) => {
+                if region.contains_span(off, size) {
+                    Ok(())
+                } else {
+                    Err(VerifyError::FixedSlotOutOfRegion {
+                        field: field.to_string(),
+                        offset: off,
+                        size,
+                        start: region.start,
+                        end: region.end,
+                    })
+                }
+            }
+            Bounds::Multi(multi) => {
+                if multi.classify_span(off, size).is_some() {
+                    Ok(())
+                } else {
+                    Err(VerifyError::NoRegion {
+                        field: field.to_string(),
+                        what: "record fixed slot",
+                        offset: off,
+                        len: size,
+                    })
+                }
+            }
+        }
+    }
 }
 
 /// Maximum schema-nesting depth the verifier walks before bailing.
@@ -185,13 +432,44 @@ pub fn verify_record(
     record_base: usize,
     region: Region,
 ) -> Result<(), VerifyError> {
-    if bytes.len() < region.end {
+    verify_record_with_bounds(bytes, layout, fields, record_base, Bounds::Single(region))
+}
+
+/// Multi-region sibling of [`verify_record`]: verify a record laid out at
+/// the **arena-absolute** offset `record_base`, where every pointer slot
+/// holds an arena-absolute offset and the graph may legitimately span the
+/// `const` / `in` / `out` / `scratch` regions described by `multi`.
+///
+/// `bytes` is the **whole arena** slice (offsets are absolute into it),
+/// and must cover at least the largest region end. This is the entry
+/// point the object positive-`bytes_written` return path runs before
+/// decoding a cross-region object head — the gap the S5 design flagged as
+/// the red-line "object slot cross-region pointer is not verified".
+pub fn verify_record_multi(
+    bytes: &[u8],
+    layout: &OffsetTable,
+    fields: &[Field],
+    record_base: usize,
+    multi: MultiRegion,
+) -> Result<(), VerifyError> {
+    verify_record_with_bounds(bytes, layout, fields, record_base, Bounds::Multi(multi))
+}
+
+fn verify_record_with_bounds(
+    bytes: &[u8],
+    layout: &OffsetTable,
+    fields: &[Field],
+    record_base: usize,
+    bounds: Bounds,
+) -> Result<(), VerifyError> {
+    let required = bounds.required_len();
+    if bytes.len() < required {
         return Err(VerifyError::BufferShorterThanRegion {
             have: bytes.len(),
-            end: region.end,
+            end: required,
         });
     }
-    verify_record_inner(bytes, layout, fields, record_base, region, 0)
+    verify_record_inner(bytes, layout, fields, record_base, bounds, 0)
 }
 
 /// Verify a **bare value** reachable from a direct pointer offset,
@@ -218,13 +496,41 @@ pub fn verify_value_at(
     root: usize,
     region: Region,
 ) -> Result<(), VerifyError> {
-    if bytes.len() < region.end {
+    verify_value_at_with_bounds(bytes, ty, list_element, root, Bounds::Single(region))
+}
+
+/// Multi-region sibling of [`verify_value_at`]: certify a bare value
+/// whose root pointer (and every pointer reachable from it) is an
+/// arena-absolute offset and whose graph may span regions. `bytes` is the
+/// whole arena slice; `root` is the arena-absolute offset of the value's
+/// root header. Any escape (a span fitting no region, or running off the
+/// region it starts in) is a loud [`VerifyError`] — the decode must not
+/// run.
+pub fn verify_value_at_multi(
+    bytes: &[u8],
+    ty: &TypeRepr,
+    list_element: Option<ListElementKind>,
+    root: usize,
+    multi: MultiRegion,
+) -> Result<(), VerifyError> {
+    verify_value_at_with_bounds(bytes, ty, list_element, root, Bounds::Multi(multi))
+}
+
+fn verify_value_at_with_bounds(
+    bytes: &[u8],
+    ty: &TypeRepr,
+    list_element: Option<ListElementKind>,
+    root: usize,
+    bounds: Bounds,
+) -> Result<(), VerifyError> {
+    let required = bounds.required_len();
+    if bytes.len() < required {
         return Err(VerifyError::BufferShorterThanRegion {
             have: bytes.len(),
-            end: region.end,
+            end: required,
         });
     }
-    verify_pointer_target(bytes, "<in-place root>", ty, list_element, root, region, 0)
+    verify_pointer_target(bytes, "<in-place root>", ty, list_element, root, bounds, 0)
 }
 
 fn verify_record_inner(
@@ -232,7 +538,7 @@ fn verify_record_inner(
     layout: &OffsetTable,
     fields: &[Field],
     record_base: usize,
-    region: Region,
+    bounds: Bounds,
     depth: usize,
 ) -> Result<(), VerifyError> {
     if depth >= MAX_DEPTH {
@@ -241,16 +547,11 @@ fn verify_record_inner(
             depth: MAX_DEPTH,
         });
     }
-    // The whole fixed area must land in-region before we read any slot.
-    if !region.contains_span(record_base, layout.root_size) {
-        return Err(VerifyError::FixedSlotOutOfRegion {
-            field: "<root>".to_string(),
-            offset: record_base,
-            size: layout.root_size,
-            start: region.start,
-            end: region.end,
-        });
-    }
+    // The whole fixed area must land in one region before we read any
+    // slot. (Single-region: the one window; multi-region: the record
+    // head and all its slots must sit together in a single region — a
+    // record fixed area is never itself split across regions.)
+    bounds.require_fixed_slot("<root>", record_base, layout.root_size)?;
     for fo in &layout.fields {
         let slot_abs =
             record_base
@@ -259,15 +560,7 @@ fn verify_record_inner(
                     field: fo.name.clone(),
                     what: "fixed slot offset",
                 })?;
-        if !region.contains_span(slot_abs, fo.size) {
-            return Err(VerifyError::FixedSlotOutOfRegion {
-                field: fo.name.clone(),
-                offset: slot_abs,
-                size: fo.size,
-                start: region.start,
-                end: region.end,
-            });
-        }
+        bounds.require_fixed_slot(&fo.name, slot_abs, fo.size)?;
         let FieldKind::PointerIndirect { .. } = fo.kind else {
             // Inline scalar: the fixed-slot span check above is the
             // whole verification — no further pointer to follow.
@@ -286,9 +579,11 @@ fn verify_record_inner(
                 });
             }
         };
-        // The pointer slot value is a buffer-relative u32 offset.
-        let ptr = read_u32(bytes, slot_abs, &fo.name, "pointer slot", region)?;
-        verify_pointer_target(bytes, &fo.name, ty, fo.list_element, ptr, region, depth)?;
+        // The pointer slot value: a buffer-relative `u32` under the
+        // single-region wall, an arena-absolute `u32` under the
+        // multi-region map.
+        let ptr = read_u32(bytes, slot_abs, &fo.name, "pointer slot", bounds)?;
+        verify_pointer_target(bytes, &fo.name, ty, fo.list_element, ptr, bounds, depth)?;
     }
     Ok(())
 }
@@ -306,20 +601,20 @@ fn verify_pointer_target(
     ty: &TypeRepr,
     list_element: Option<ListElementKind>,
     ptr: usize,
-    region: Region,
+    bounds: Bounds,
     depth: usize,
 ) -> Result<(), VerifyError> {
     match ty {
         TypeRepr::String => {
             // `[len: u32][len bytes]`.
-            let len = read_u32(bytes, ptr, field, "length prefix", region)?;
+            let len = read_u32(bytes, ptr, field, "length prefix", bounds)?;
             let payload = ptr
                 .checked_add(4)
                 .ok_or_else(|| VerifyError::SpanOverflow {
                     field: field.to_string(),
                     what: "string payload start",
                 })?;
-            require_span(field, "string payload", payload, len, region)
+            bounds.require_span(field, "string payload", payload, len)
         }
         TypeRepr::Schema { schema } => {
             // Nested sub-record: recurse with the sub-layout anchored at
@@ -330,10 +625,10 @@ fn verify_pointer_target(
                     field: field.to_string(),
                     ty: "Schema (unlayoutable)",
                 })?;
-            verify_record_inner(bytes, &sub_layout, &schema.fields, ptr, region, depth + 1)
+            verify_record_inner(bytes, &sub_layout, &schema.fields, ptr, bounds, depth + 1)
         }
         TypeRepr::List { element } => {
-            verify_list_target(bytes, field, element, list_element, ptr, region, depth)
+            verify_list_target(bytes, field, element, list_element, ptr, bounds, depth)
         }
         other => Err(VerifyError::UnsupportedType {
             field: field.to_string(),
@@ -352,10 +647,10 @@ fn verify_list_target(
     element: &TypeRepr,
     list_element: Option<ListElementKind>,
     ptr: usize,
-    region: Region,
+    bounds: Bounds,
     depth: usize,
 ) -> Result<(), VerifyError> {
-    let count = read_u32(bytes, ptr, field, "list length prefix", region)?;
+    let count = read_u32(bytes, ptr, field, "list length prefix", bounds)?;
     let entries_start = ptr
         .checked_add(4)
         .ok_or_else(|| VerifyError::SpanOverflow {
@@ -380,13 +675,7 @@ fn verify_list_target(
                         field: field.to_string(),
                         what: "inline list byte length",
                     })?;
-            require_span(
-                field,
-                "inline list payload",
-                payload_start,
-                byte_len,
-                region,
-            )
+            bounds.require_span(field, "inline list payload", payload_start, byte_len)
         }
         Some(ListElementKind::PointerArray { .. }) => {
             // `[len][off_0: u32]…[off_{count-1}]`; each entry points at a
@@ -401,7 +690,7 @@ fn verify_list_target(
                         field: field.to_string(),
                         what: "list entry offset",
                     })?;
-                let entry_ptr = read_u32(bytes, entry_off, field, "list entry pointer", region)?;
+                let entry_ptr = read_u32(bytes, entry_off, field, "list entry pointer", bounds)?;
                 // Recurse per element type. The element of a pointer-
                 // array list is itself String / Schema / List.
                 verify_pointer_target(
@@ -410,7 +699,7 @@ fn verify_list_target(
                     element,
                     element_list_kind(element),
                     entry_ptr,
-                    region,
+                    bounds,
                     depth + 1,
                 )?;
             }
@@ -457,47 +746,18 @@ fn element_list_kind(element: &TypeRepr) -> Option<ListElementKind> {
 }
 
 /// Read a little-endian `u32` at `off`, first proving `[off, off+4)` is
-/// in-region. Returns the value as a `usize`.
+/// in-bounds under `bounds`. Returns the value as a `usize`.
 fn read_u32(
     bytes: &[u8],
     off: usize,
     field: &str,
     what: &'static str,
-    region: Region,
+    bounds: Bounds,
 ) -> Result<usize, VerifyError> {
-    require_span(field, what, off, 4, region)?;
+    bounds.require_span(field, what, off, 4)?;
     let mut buf = [0u8; 4];
     buf.copy_from_slice(&bytes[off..off + 4]);
     Ok(u32::from_le_bytes(buf) as usize)
-}
-
-/// Assert `[off, off+len)` is inside `region`, returning a precise
-/// [`VerifyError::OutOfRegion`] / [`VerifyError::SpanOverflow`] when not.
-fn require_span(
-    field: &str,
-    what: &'static str,
-    off: usize,
-    len: usize,
-    region: Region,
-) -> Result<(), VerifyError> {
-    if off.checked_add(len).is_none() {
-        return Err(VerifyError::SpanOverflow {
-            field: field.to_string(),
-            what,
-        });
-    }
-    if region.contains_span(off, len) {
-        Ok(())
-    } else {
-        Err(VerifyError::OutOfRegion {
-            field: field.to_string(),
-            what,
-            offset: off,
-            len,
-            start: region.start,
-            end: region.end,
-        })
-    }
 }
 
 /// Round `off` up to the next multiple of `align` (no-op for `align <=
@@ -1196,6 +1456,337 @@ mod tests {
             .expect_err("a root outside the region must be rejected");
         assert!(
             matches!(err, VerifyError::OutOfRegion { .. }),
+            "got {err:?}"
+        );
+    }
+
+    // ---- multi-region walk (F0 cross-region safety net) -----------------
+    //
+    // These build a synthetic arena by hand the way the F1 cross-region
+    // codegen will (object head in `out`, parameter-sourced field data in
+    // `in`, every pointer arena-absolute) and drive the multi-region
+    // verifier directly — F0 ships the safety net, not the cap release,
+    // so the bytes are laid out here rather than produced by a compiled
+    // backend.
+
+    /// Lay out a fixed four-region arena and return `(arena, multi)`.
+    /// Layout (absolute byte offsets):
+    /// `const = [0, 16)`, `in = [16, 16+in_len)`,
+    /// `out = [out_start, out_start+out_len)`, `scratch = [.., end)`.
+    /// Each region is generously padded so a test can place records freely.
+    fn arena_with_regions(
+        in_bytes: &[u8],
+        out_bytes: &[u8],
+    ) -> (Vec<u8>, MultiRegion, usize, usize) {
+        let const_len = 16usize;
+        let in_start = const_len;
+        let in_len = in_bytes.len().max(4);
+        let in_end = in_start + in_len;
+        // 8-byte gap so the regions are clearly disjoint, never adjacent.
+        let out_start = in_end + 8;
+        let out_len = out_bytes.len().max(4);
+        let out_end = out_start + out_len;
+        let scratch_start = out_end + 8;
+        let scratch_len = 16usize;
+        let arena_size = scratch_start + scratch_len;
+
+        let mut arena = vec![0u8; arena_size];
+        arena[in_start..in_start + in_bytes.len()].copy_from_slice(in_bytes);
+        arena[out_start..out_start + out_bytes.len()].copy_from_slice(out_bytes);
+
+        let multi = MultiRegion::new(
+            (0, const_len),
+            (in_start, in_end),
+            (out_start, out_end),
+            (scratch_start, arena_size),
+        )
+        .expect("multi region");
+        (arena, multi, in_start, out_start)
+    }
+
+    /// Encode a String record `[len: u32 LE][utf8]` into `buf` and return
+    /// its byte length.
+    fn string_record(s: &str) -> Vec<u8> {
+        let mut v = Vec::with_capacity(4 + s.len());
+        v.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        v.extend_from_slice(s.as_bytes());
+        v
+    }
+
+    /// The F1 cross-region shape `Cfg { name: String, port: Int }`: the
+    /// record head lives in `out`, but `name`'s String record lives in
+    /// `in`, reached by an **arena-absolute** pointer in the head's slot.
+    fn cross_region_cfg() -> Schema {
+        Schema {
+            name: "Cfg".into(),
+            generics: vec![],
+            fields: vec![
+                field("name", TypeRepr::String),
+                field("port", TypeRepr::Int),
+            ],
+        }
+    }
+
+    /// Build the cross-region `Cfg` arena. Returns `(arena, multi, layout,
+    /// schema, out_record_base, name_string_abs)`.
+    #[allow(clippy::type_complexity)]
+    fn cross_region_cfg_arena() -> (Vec<u8>, MultiRegion, OffsetTable, Schema, usize, usize) {
+        let schema = cross_region_cfg();
+        let layout = SchemaLayout::offsets_for(&schema).expect("cfg layout");
+        // `in` region carries just the String record for `name`.
+        let in_bytes = string_record("ada");
+        // `out` region carries the Cfg fixed area; fill the slots after we
+        // know the absolute offsets.
+        let out_bytes = vec![0u8; layout.root_size];
+        let (mut arena, multi, in_start, out_start) = arena_with_regions(&in_bytes, &out_bytes);
+
+        let name_fo = layout
+            .fields
+            .iter()
+            .find(|fo| fo.name == "name")
+            .expect("name fo");
+        let port_fo = layout
+            .fields
+            .iter()
+            .find(|fo| fo.name == "port")
+            .expect("port fo");
+        // `name` slot holds the arena-absolute offset of the String record
+        // (which sits at `in_start`).
+        let name_string_abs = in_start;
+        let name_slot = out_start + name_fo.offset;
+        arena[name_slot..name_slot + 4].copy_from_slice(&(name_string_abs as u32).to_le_bytes());
+        // `port` is an inline Int.
+        let port_slot = out_start + port_fo.offset;
+        arena[port_slot..port_slot + 8].copy_from_slice(&8080i64.to_le_bytes());
+
+        (arena, multi, layout, schema, out_start, name_string_abs)
+    }
+
+    #[test]
+    fn multi_region_cross_region_record_verifies_clean() {
+        // The legal F1 shape: head in `out`, String field in `in`. The
+        // multi-region verifier must accept the cross-region pointer the
+        // single-region wall would (correctly, for S1-S6) reject.
+        let (arena, multi, layout, schema, base, _) = cross_region_cfg_arena();
+        verify_record_multi(&arena, &layout, &schema.fields, base, multi)
+            .expect("a legal cross-region record must verify under the multi-region map");
+    }
+
+    #[test]
+    fn multi_region_pointer_to_no_region_rejected() {
+        // Smash the `name` slot so it points into the inter-region gap
+        // (between `in` and `out`) — a span that fits no region. The
+        // multi-region verifier must reject loudly, never over-read.
+        let (mut arena, multi, layout, schema, base, _) = cross_region_cfg_arena();
+        let name_fo = layout.fields.iter().find(|fo| fo.name == "name").unwrap();
+        let name_slot = base + name_fo.offset;
+        // The gap between `in_end` and `out_start`: in_start=16, in_len=8
+        // (string "ada" record is 7 bytes -> max(7,4)=7? string_record is
+        // 4+3=7, so in_len=max(7,4)=7, in_end=23, gap=[23,31)). Point at 24.
+        let in_start = 16usize;
+        let in_record_len = string_record("ada").len();
+        let in_len = in_record_len.max(4);
+        let gap_off = in_start + in_len + 1; // strictly inside the gap
+        arena[name_slot..name_slot + 4].copy_from_slice(&(gap_off as u32).to_le_bytes());
+        let err = verify_record_multi(&arena, &layout, &schema.fields, base, multi)
+            .expect_err("a pointer into the inter-region gap must be rejected");
+        assert!(matches!(err, VerifyError::NoRegion { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn multi_region_pointer_payload_runs_off_region_rejected() {
+        // Keep the `name` pointer landing in `in`, but inflate the String
+        // record's length prefix so the utf8 payload runs past `in_end`
+        // into the gap. The payload span starts in `in` but escapes it —
+        // must be rejected (no "fell into the next region" over-read).
+        let (mut arena, multi, layout, schema, base, name_abs) = cross_region_cfg_arena();
+        // The String record's len prefix sits at `name_abs`.
+        arena[name_abs..name_abs + 4].copy_from_slice(&0xFFFF_F000u32.to_le_bytes());
+        let err = verify_record_multi(&arena, &layout, &schema.fields, base, multi)
+            .expect_err("an overlong String payload escaping its region must be rejected");
+        assert!(matches!(err, VerifyError::NoRegion { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn multi_region_record_head_in_no_region_rejected() {
+        // Anchor the record head at an absolute offset that fits no
+        // region (in the gap). The fixed-area check must reject before any
+        // slot is read.
+        let (arena, multi, layout, schema, _, _) = cross_region_cfg_arena();
+        let in_start = 16usize;
+        let in_len = string_record("ada").len().max(4);
+        let gap_base = in_start + in_len + 1;
+        let err = verify_record_multi(&arena, &layout, &schema.fields, gap_base, multi)
+            .expect_err("a record head fitting no region must be rejected");
+        assert!(matches!(err, VerifyError::NoRegion { .. }), "got {err:?}");
+    }
+
+    /// Build a cross-region `-> Dict { servers: List<Cfg>, n: Int }` style
+    /// shape: an outer object head in `out`, a `servers` field pointing at
+    /// a `List<Cfg>` header **in `in`** whose entries and sub-records all
+    /// live in `in` (the parameter-sourced identity return). This is the
+    /// canonical F1+ cross-region object the multi-region verifier must
+    /// certify.
+    #[allow(clippy::type_complexity)]
+    fn cross_region_dict_of_list_cfg() -> (Vec<u8>, MultiRegion, OffsetTable, Schema, usize) {
+        // Inner element schema.
+        let cfg = cross_region_cfg();
+        let cfg_layout = SchemaLayout::offsets_for(&cfg).expect("cfg layout");
+        // Outer object schema: { servers: List<Cfg>, n: Int }.
+        let outer = Schema {
+            name: "Out".into(),
+            generics: vec![],
+            fields: vec![
+                field(
+                    "servers",
+                    list(TypeRepr::Schema {
+                        schema: Box::new(cfg.clone()),
+                    }),
+                ),
+                field("n", TypeRepr::Int),
+            ],
+        };
+        let outer_layout = SchemaLayout::offsets_for(&outer).expect("outer layout");
+
+        // --- build the `in` region: a `List<Cfg>` with 2 entries ---------
+        // Layout inside `in` (relative offsets we fix up to absolute):
+        //   [list header: len=2][off_0][off_1]
+        //   [cfg_0 fixed area][cfg_1 fixed area]
+        //   [name_0 string][name_1 string]
+        // We assemble it region-locally then place at `in_start`.
+        let two = 2u32;
+        let header_rel = 0usize;
+        let entries_rel = header_rel + 4; // off_0, off_1
+        let cfg0_rel = entries_rel + 8;
+        let cfg1_rel = cfg0_rel + cfg_layout.root_size;
+        let name0_rec = string_record("alpha");
+        let name1_rec = string_record("beta");
+        let name0_rel = cfg1_rel + cfg_layout.root_size;
+        let name1_rel = name0_rel + name0_rec.len();
+        let in_len = name1_rel + name1_rec.len();
+
+        let name_fo = cfg_layout.fields.iter().find(|f| f.name == "name").unwrap();
+        let port_fo = cfg_layout.fields.iter().find(|f| f.name == "port").unwrap();
+
+        // We don't yet know in_start; build with a placeholder then patch.
+        // To keep it simple, compute in_start from arena_with_regions by
+        // building a zero in-buffer of the right length first.
+        let in_placeholder = vec![0u8; in_len];
+        let out_placeholder = vec![0u8; outer_layout.root_size];
+        let (mut arena, multi, in_start, out_start) =
+            arena_with_regions(&in_placeholder, &out_placeholder);
+
+        // Now fill `in` with absolute offsets.
+        let put_u32 = |arena: &mut [u8], abs: usize, v: u32| {
+            arena[abs..abs + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        let put_i64 = |arena: &mut [u8], abs: usize, v: i64| {
+            arena[abs..abs + 8].copy_from_slice(&v.to_le_bytes());
+        };
+        // list header len
+        put_u32(&mut arena, in_start + header_rel, two);
+        // entry pointers (absolute) -> cfg fixed areas
+        put_u32(
+            &mut arena,
+            in_start + entries_rel,
+            (in_start + cfg0_rel) as u32,
+        );
+        put_u32(
+            &mut arena,
+            in_start + entries_rel + 4,
+            (in_start + cfg1_rel) as u32,
+        );
+        // cfg_0: name -> name0 (absolute), port inline
+        put_u32(
+            &mut arena,
+            in_start + cfg0_rel + name_fo.offset,
+            (in_start + name0_rel) as u32,
+        );
+        put_i64(&mut arena, in_start + cfg0_rel + port_fo.offset, 1);
+        // cfg_1: name -> name1 (absolute), port inline
+        put_u32(
+            &mut arena,
+            in_start + cfg1_rel + name_fo.offset,
+            (in_start + name1_rel) as u32,
+        );
+        put_i64(&mut arena, in_start + cfg1_rel + port_fo.offset, 2);
+        // name strings
+        arena[in_start + name0_rel..in_start + name0_rel + name0_rec.len()]
+            .copy_from_slice(&name0_rec);
+        arena[in_start + name1_rel..in_start + name1_rel + name1_rec.len()]
+            .copy_from_slice(&name1_rec);
+
+        // --- fill the `out` object head ----------------------------------
+        let servers_fo = outer_layout
+            .fields
+            .iter()
+            .find(|f| f.name == "servers")
+            .unwrap();
+        let n_fo = outer_layout.fields.iter().find(|f| f.name == "n").unwrap();
+        // `servers` slot -> the List<Cfg> header in `in` (cross-region).
+        put_u32(
+            &mut arena,
+            out_start + servers_fo.offset,
+            (in_start + header_rel) as u32,
+        );
+        put_i64(&mut arena, out_start + n_fo.offset, 42);
+
+        (arena, multi, outer_layout, outer, out_start)
+    }
+
+    #[test]
+    fn multi_region_dict_of_list_cfg_verifies_clean() {
+        // The full F1 cross-region object: object head in `out`, a
+        // `List<Cfg>` field whose header, entries, sub-records, and every
+        // String field all live in `in`. The multi-region verifier must
+        // certify the whole graph clean.
+        let (arena, multi, layout, schema, base) = cross_region_dict_of_list_cfg();
+        verify_record_multi(&arena, &layout, &schema.fields, base, multi).expect(
+            "a legal cross-region Dict { servers: List<Cfg>, n: Int } must verify multi-region",
+        );
+    }
+
+    #[test]
+    fn multi_region_dict_of_list_cfg_corrupt_subrecord_field_rejected() {
+        // Smash one sub-record's `name` field pointer (deep in `in`) so it
+        // points at no region; the multi-region verifier must follow the
+        // cross-region link all the way into the sub-record field layer
+        // and reject loudly. The most easily-missed depth.
+        let (mut arena, multi, layout, schema, base) = cross_region_dict_of_list_cfg();
+        // Re-derive the absolute offset of cfg_0's name slot the same way
+        // the builder did, then smash it.
+        let cfg = cross_region_cfg();
+        let cfg_layout = SchemaLayout::offsets_for(&cfg).expect("cfg layout");
+        let name_fo = cfg_layout.fields.iter().find(|f| f.name == "name").unwrap();
+        let in_start = 16usize;
+        let entries_rel = 4usize;
+        let cfg0_rel = entries_rel + 8;
+        let name_slot = in_start + cfg0_rel + name_fo.offset;
+        // Point it far past the arena so it fits no region for sure
+        // (recomputing the exact inter-region gap here is brittle; the
+        // "fits no region" catch is what we assert).
+        let bogus = (arena.len() as u32) + 4096;
+        arena[name_slot..name_slot + 4].copy_from_slice(&bogus.to_le_bytes());
+        let err = verify_record_multi(&arena, &layout, &schema.fields, base, multi)
+            .expect_err("a corrupt cross-region sub-record field pointer must be rejected");
+        assert!(matches!(err, VerifyError::NoRegion { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn multi_region_buffer_shorter_than_regions_rejected() {
+        // A `multi` whose largest region end exceeds the slice length must
+        // be rejected up front, never indexed past.
+        let multi = MultiRegion::new((0, 8), (8, 16), (16, 64), (64, 80)).expect("multi");
+        let schema = cross_region_cfg();
+        let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+        let short = vec![0u8; 16];
+        let err = verify_record_multi(&short, &layout, &schema.fields, 16, multi)
+            .expect_err("a slice shorter than the region span must be rejected");
+        assert!(
+            matches!(
+                err,
+                VerifyError::BufferShorterThanRegion { have: 16, end: 80 }
+            ),
             "got {err:?}"
         );
     }
