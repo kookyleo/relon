@@ -120,9 +120,17 @@ signature**; each parameter declares one host-pushed slot:
 > - inner pointer-array element lists (`List<List<String>>` /
 >   `List<List<Schema>>`) — the recursive per-entry relocation isn't
 >   modelled,
-> - **returning** a `List<Schema>` / `List<List<…>>` from `#main`, or an
->   anon-`Dict` / struct field of those types (the input decode is
->   supported; the recursive output-store relocation is not),
+> - **returning** a `List<Schema>` / `List<List<scalar>>` from `#main`, or
+>   an anon-`Dict` / struct field of those types. The host-side *decode*
+>   is now in place — `BufferReader` walks the whole buffer with a single
+>   base and reconstructs the nested `Value` recursively (`read_list_record`
+>   for `List<Schema>`, `read_list_list` for `List<List<scalar>>`), so the
+>   moment a compiled producer emits one of these returns the host reads it
+>   back bit-identically to the oracle. What is still missing is the
+>   *machine-code output store*: relocating a non-contiguous, cross-region
+>   result graph into the return record without a recursive cross-buffer
+>   relocator (see the design note below). Until that lands these returns
+>   stay a loud compile-time cap,
 > - **returning a `List<String>` (or any pointer-array list) sourced from
 >   a `#main` parameter / field load / call** rather than an in-source
 >   literal — such a value lives in the input buffer with non-contiguous,
@@ -131,6 +139,26 @@ signature**; each parameter declares one host-pushed slot:
 > All of the above fail **loudly** at compile time; the compiled
 > backends never return wrong data or crash for them — route those shapes
 > through the tree-walk evaluator.
+
+> [!NOTE]
+> **Why the output store is the hard half (and the planned fix).** The
+> arena is one contiguous block: `[const_data | in_buf @ in_ptr | out_buf
+> @ out_ptr | scratch]`. Inside the running machine code every pointer is
+> *arena-base-relative* (`arena_base + ptr` dereferences it), so a param
+> graph in `in_buf` and a const-pool literal share one coordinate system.
+> The host, however, decodes the return by handing `BufferReader` only the
+> **out_buf slice** — so a returned pointer is read as *out_buf-relative*.
+> A param-identity pointer-array return (`#main(List<P> xs) -> List<P> =
+> xs`) lives entirely in `in_buf` with `in_buf`-relative inner offsets;
+> the current return path tries to *copy* that graph into `out_buf` with a
+> single rigid delta, which only works for a contiguous, single-base
+> const-pool block and segfaults on the scattered param graph. The honest
+> fix is **"host walks in place"**: stop copying, write the result root as
+> a pointer the host resolves against the **single arena-wide base**, and
+> let `BufferReader` (which already walks recursively) reconstruct the
+> `Value` from wherever the graph lives. The reader half of that is done;
+> the remaining work is the codegen + a one-base return ABI, deliberately
+> not shipped half-wired because a wrong base is a silent miscompile.
 
 ### Boundary Result vs Relon value-level Result
 

@@ -1676,6 +1676,187 @@ impl<'a> BufferReader<'a> {
         Ok(out)
     }
 
+    /// Read a `List<List<scalar>>` from `field_name` as a vector of
+    /// inner `Vec<Value>`s. The outer slot points at a pointer-array
+    /// header `[len][off_0]…[off_{N-1}]` whose entries name per-element
+    /// inner records `[len: u32][pad to inner_align][payload]` — exactly
+    /// what [`write_nested_scalar_list`] / `write_list_list_with` emit.
+    /// Each inner record is decoded per the innermost scalar type
+    /// (`Int` / `Float` / `Bool`); inner pointer-array elements
+    /// (`List<List<String>>` / `List<List<Schema>>`) are rejected by the
+    /// layout pass before any buffer is produced, so they never reach
+    /// here and are surfaced as a hard error if they somehow do.
+    ///
+    /// The walk is the reader-side mirror of the writer and shares the
+    /// same single buffer base: every `off_i` and inner `[len]` prefix is
+    /// resolved against `self.bytes`, so a sub-reader produced by
+    /// [`Self::read_list_record`] / [`Self::sub_record`] (which re-bases
+    /// the field index but keeps the same `bytes` slice) decodes a nested
+    /// list field bit-identically to a top-level one.
+    pub fn read_list_list(
+        &self,
+        field_name: &str,
+    ) -> Result<Vec<Vec<crate::value::Value>>, BufferError> {
+        use crate::value::Value;
+        let entry = self.find_entry(field_name)?;
+        let inner = match &entry.ty {
+            TypeRepr::List { element } => match element.as_ref() {
+                TypeRepr::List { element: inner } => inner.as_ref().clone(),
+                _ => {
+                    return Err(BufferError::TypeMismatch {
+                        name: field_name.to_string(),
+                        declared: type_label(&entry.ty),
+                        requested: "List<List<…>>",
+                    });
+                }
+            },
+            other => {
+                return Err(BufferError::TypeMismatch {
+                    name: field_name.to_string(),
+                    declared: type_label(other),
+                    requested: "List<List<…>>",
+                });
+            }
+        };
+        if !matches!(entry.kind, FieldKind::PointerIndirect { .. }) {
+            return Err(BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "expected pointer-indirect kind",
+            });
+        }
+        // Per-inner-record alignment between the `[len]` prefix and the
+        // payload, matching `write_nested_scalar_list`: Int / Float pad
+        // the payload to 8, Bool packs at 1 (no pad past the 4-byte len).
+        let inner_align: usize = match &inner {
+            TypeRepr::Int | TypeRepr::Float => 8,
+            TypeRepr::Bool => 1,
+            other => {
+                return Err(BufferError::MalformedPayload {
+                    name: field_name.to_string(),
+                    reason: match other {
+                        TypeRepr::String | TypeRepr::Schema { .. } | TypeRepr::List { .. } => {
+                            "nested list inner element is a pointer-array type (unsupported)"
+                        }
+                        _ => "nested list inner element is not an inline-fixed scalar",
+                    },
+                });
+            }
+        };
+        // Outer pointer-array header: `[len][off_0]…`. `inner_alignment
+        // = 0` keeps the payload start at `header + 4` (the off array).
+        let (count, entries_start) = self.decode_pointer_header(field_name, entry.offset, 0)?;
+        let mut out: Vec<Vec<Value>> = Vec::with_capacity(count);
+        for i in 0..count {
+            let cursor =
+                entries_start
+                    .checked_add(i * 4)
+                    .ok_or_else(|| BufferError::MalformedPayload {
+                        name: field_name.to_string(),
+                        reason: "nested list entry cursor overflows usize",
+                    })?;
+            if cursor + 4 > self.bytes.len() {
+                return Err(BufferError::MalformedPayload {
+                    name: field_name.to_string(),
+                    reason: "nested list entry pointer exceeds buffer end",
+                });
+            }
+            let mut entry_buf = [0u8; 4];
+            entry_buf.copy_from_slice(&self.bytes[cursor..cursor + 4]);
+            let rec_start = u32::from_le_bytes(entry_buf) as usize;
+            if rec_start + 4 > self.bytes.len() {
+                return Err(BufferError::MalformedPayload {
+                    name: field_name.to_string(),
+                    reason: "nested list inner len prefix exceeds buffer end",
+                });
+            }
+            let mut len_buf = [0u8; 4];
+            len_buf.copy_from_slice(&self.bytes[rec_start..rec_start + 4]);
+            let inner_count = u32::from_le_bytes(len_buf) as usize;
+            let payload_start = if inner_align > 1 {
+                (rec_start + 4).next_multiple_of(inner_align)
+            } else {
+                rec_start + 4
+            };
+            let mut inner_vec: Vec<Value> = Vec::with_capacity(inner_count);
+            match &inner {
+                TypeRepr::Int => {
+                    let end = payload_start
+                        .checked_add(inner_count.checked_mul(8).ok_or_else(|| {
+                            BufferError::MalformedPayload {
+                                name: field_name.to_string(),
+                                reason: "nested Int payload byte length overflows usize",
+                            }
+                        })?)
+                        .ok_or_else(|| BufferError::MalformedPayload {
+                            name: field_name.to_string(),
+                            reason: "nested Int payload end overflows usize",
+                        })?;
+                    if end > self.bytes.len() {
+                        return Err(BufferError::MalformedPayload {
+                            name: field_name.to_string(),
+                            reason: "nested Int payload exceeds buffer end",
+                        });
+                    }
+                    let mut c = payload_start;
+                    for _ in 0..inner_count {
+                        let mut b = [0u8; 8];
+                        b.copy_from_slice(&self.bytes[c..c + 8]);
+                        inner_vec.push(Value::Int(i64::from_le_bytes(b)));
+                        c += 8;
+                    }
+                }
+                TypeRepr::Float => {
+                    let end = payload_start
+                        .checked_add(inner_count.checked_mul(8).ok_or_else(|| {
+                            BufferError::MalformedPayload {
+                                name: field_name.to_string(),
+                                reason: "nested Float payload byte length overflows usize",
+                            }
+                        })?)
+                        .ok_or_else(|| BufferError::MalformedPayload {
+                            name: field_name.to_string(),
+                            reason: "nested Float payload end overflows usize",
+                        })?;
+                    if end > self.bytes.len() {
+                        return Err(BufferError::MalformedPayload {
+                            name: field_name.to_string(),
+                            reason: "nested Float payload exceeds buffer end",
+                        });
+                    }
+                    let mut c = payload_start;
+                    for _ in 0..inner_count {
+                        let mut b = [0u8; 8];
+                        b.copy_from_slice(&self.bytes[c..c + 8]);
+                        inner_vec.push(Value::Float(ordered_float::OrderedFloat(
+                            f64::from_le_bytes(b),
+                        )));
+                        c += 8;
+                    }
+                }
+                TypeRepr::Bool => {
+                    let end = payload_start.checked_add(inner_count).ok_or_else(|| {
+                        BufferError::MalformedPayload {
+                            name: field_name.to_string(),
+                            reason: "nested Bool payload end overflows usize",
+                        }
+                    })?;
+                    if end > self.bytes.len() {
+                        return Err(BufferError::MalformedPayload {
+                            name: field_name.to_string(),
+                            reason: "nested Bool payload exceeds buffer end",
+                        });
+                    }
+                    for k in 0..inner_count {
+                        inner_vec.push(Value::Bool(self.bytes[payload_start + k] != 0));
+                    }
+                }
+                _ => unreachable!("inner_align guard already rejected non-scalar inner"),
+            }
+            out.push(inner_vec);
+        }
+        Ok(out)
+    }
+
     /// Decode the buffer-relative pointer slot for a nested branded
     /// dict field. Returns a fresh [`BufferReader`] anchored at the
     /// sub-record's fixed-area base, sharing the parent's underlying
@@ -2816,6 +2997,71 @@ mod tests {
         assert_eq!(decode_inner(off0), vec![1, 2]);
         assert_eq!(decode_inner(off1), vec![3]);
         assert_eq!(decode_inner(off2), Vec::<i64>::new());
+    }
+
+    /// `read_list_list` is the reader-side mirror of
+    /// `write_nested_scalar_list`: round-tripping any nested scalar list
+    /// through the writer and back yields the exact input rows. The
+    /// written `Value`s are the oracle, so this pins the host walk
+    /// bit-for-bit independent of any compiled backend.
+    #[test]
+    fn read_list_list_roundtrips_nested_scalars() {
+        use crate::value::Value;
+        let cases: &[(TypeRepr, Vec<Value>)] = &[
+            (
+                TypeRepr::Int,
+                vec![
+                    Value::List(vec![Value::Int(1), Value::Int(2)].into()),
+                    Value::List(vec![Value::Int(-7)].into()),
+                    Value::List(vec![].into()),
+                    Value::List(vec![Value::Int(i64::MAX), Value::Int(i64::MIN)].into()),
+                ],
+            ),
+            (
+                TypeRepr::Float,
+                vec![
+                    Value::List(
+                        vec![
+                            Value::Float(ordered_float::OrderedFloat(1.5)),
+                            Value::Float(ordered_float::OrderedFloat(-0.25)),
+                        ]
+                        .into(),
+                    ),
+                    Value::List(vec![].into()),
+                ],
+            ),
+            (
+                TypeRepr::Bool,
+                vec![
+                    Value::List(
+                        vec![Value::Bool(true), Value::Bool(false), Value::Bool(true)].into(),
+                    ),
+                    Value::List(vec![Value::Bool(false)].into()),
+                ],
+            ),
+        ];
+        for (inner, items) in cases {
+            let schema = Schema {
+                name: "Grid".into(),
+                generics: vec![],
+                fields: vec![field(
+                    "xss",
+                    TypeRepr::List {
+                        element: Box::new(TypeRepr::List {
+                            element: Box::new(inner.clone()),
+                        }),
+                    },
+                )],
+            };
+            let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+            let mut b = BufferBuilder::new(&layout, &schema.fields);
+            write_nested_scalar_list(&mut b, "xss", inner, items).expect("write");
+            let bytes = b.finish();
+            let reader = BufferReader::new(&layout, &schema.fields, &bytes).expect("reader");
+            let rows = reader.read_list_list("xss").expect("read_list_list");
+            let got: Vec<Value> = rows.into_iter().map(|r| Value::List(r.into())).collect();
+            assert_eq!(&got, items, "nested {inner:?} list roundtrip mismatch");
+        }
     }
 
     /// `write_nested_scalar_list` rejects an inner pointer-array element
