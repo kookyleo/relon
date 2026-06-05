@@ -2869,7 +2869,11 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
 
             // ---- buffer-protocol I/O ----
             Op::LoadField { offset, ty } => self.emit_load_field(*offset, *ty)?,
-            Op::StoreField { offset, ty } => self.emit_store_field(&ip_hint, *offset, *ty)?,
+            Op::StoreField {
+                offset,
+                ty,
+                inplace,
+            } => self.emit_store_field(&ip_hint, *offset, *ty, *inplace)?,
 
             // ---- pointer-indirect param loads (Phase 2 relon-rs surface) ----
             // String / List* `#main` parameters arrive in the input

@@ -896,6 +896,10 @@ pub(super) fn field_load_shape(
 fn body_needs_tail_cursor(body: &[TaggedOp]) -> bool {
     for tagged in body {
         match &tagged.op {
+            // An in-place return store copies nothing into the tail (it
+            // reports the param-region root via the sentinel), so it does
+            // not force a tail cursor; only the copy-path pointer-indirect
+            // stores do.
             Op::StoreField {
                 ty:
                     IrType::String
@@ -904,6 +908,7 @@ fn body_needs_tail_cursor(body: &[TaggedOp]) -> bool {
                     | IrType::ListBool
                     | IrType::ListString
                     | IrType::ListSchema,
+                inplace: false,
                 ..
             } => return true,
             Op::AllocRootRecord { .. }

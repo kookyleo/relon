@@ -1576,6 +1576,88 @@ impl<'a> BufferReader<'a> {
         Ok(out)
     }
 
+    /// Read a `List<String>` whose pointer-array header sits **directly**
+    /// at `header_off` (rather than behind a named fixed-area slot). This
+    /// is the in-place region-walk return entry point (S3): the machine
+    /// code reports the arena-relative offset of the outer
+    /// `[len][off_0]…[off_{N-1}]` header, the host rebases it to
+    /// `header_off`, and — after the verifier certifies the whole graph
+    /// stays in-region — this walks the same bytes [`read_list_string`]
+    /// would, so a top-level (field-slot) and an in-place decode of the
+    /// same buffer are byte-identical, including each string's content.
+    ///
+    /// Every offset / length is bounds-checked against the buffer end
+    /// before any read (the verifier already proved the tighter
+    /// single-region bound); a non-UTF-8 payload is a loud error, matching
+    /// [`read_list_string`] and the `Value::String` invariant (Relon
+    /// strings are always valid UTF-8).
+    pub fn read_list_string_at(&self, header_off: usize) -> Result<Vec<&'a str>, BufferError> {
+        // Header: `[len: u32][off_0]…`. `entries_start = header_off + 4`.
+        if header_off
+            .checked_add(4)
+            .map(|end| end > self.bytes.len())
+            .unwrap_or(true)
+        {
+            return Err(BufferError::MalformedPayload {
+                name: "<in-place root>".to_string(),
+                reason: "in-place list-string header length prefix exceeds buffer end",
+            });
+        }
+        let mut len_buf = [0u8; 4];
+        len_buf.copy_from_slice(&self.bytes[header_off..header_off + 4]);
+        let count = u32::from_le_bytes(len_buf) as usize;
+        let entries_start = header_off + 4;
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let cursor =
+                entries_start
+                    .checked_add(i * 4)
+                    .ok_or_else(|| BufferError::MalformedPayload {
+                        name: "<in-place root>".to_string(),
+                        reason: "in-place list-string entry cursor overflows usize",
+                    })?;
+            if cursor + 4 > self.bytes.len() {
+                return Err(BufferError::MalformedPayload {
+                    name: "<in-place root>".to_string(),
+                    reason: "in-place list-string entry pointer exceeds buffer end",
+                });
+            }
+            let mut entry_buf = [0u8; 4];
+            entry_buf.copy_from_slice(&self.bytes[cursor..cursor + 4]);
+            let record_start = u32::from_le_bytes(entry_buf) as usize;
+            if record_start + 4 > self.bytes.len() {
+                return Err(BufferError::MalformedPayload {
+                    name: "<in-place root>".to_string(),
+                    reason: "in-place list-string len prefix exceeds buffer end",
+                });
+            }
+            let mut sl_buf = [0u8; 4];
+            sl_buf.copy_from_slice(&self.bytes[record_start..record_start + 4]);
+            let str_len = u32::from_le_bytes(sl_buf) as usize;
+            let payload_start = record_start + 4;
+            let payload_end = payload_start.checked_add(str_len).ok_or_else(|| {
+                BufferError::MalformedPayload {
+                    name: "<in-place root>".to_string(),
+                    reason: "in-place list-string payload end overflows usize",
+                }
+            })?;
+            if payload_end > self.bytes.len() {
+                return Err(BufferError::MalformedPayload {
+                    name: "<in-place root>".to_string(),
+                    reason: "in-place list-string payload exceeds buffer end",
+                });
+            }
+            let s = std::str::from_utf8(&self.bytes[payload_start..payload_end]).map_err(|_| {
+                BufferError::MalformedPayload {
+                    name: "<in-place root>".to_string(),
+                    reason: "in-place list-string payload is not valid utf-8",
+                }
+            })?;
+            out.push(s);
+        }
+        Ok(out)
+    }
+
     /// Read a `List<Schema>` from `field_name`. Returns a vector of
     /// [`BufferReader`]s, one per entry, each anchored at the
     /// matching sub-record's fixed area. The readers share the parent

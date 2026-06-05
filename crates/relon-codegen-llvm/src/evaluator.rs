@@ -1368,8 +1368,9 @@ impl LlvmAotEvaluator {
         // In-place region-walk return ABI (S2): a negative return value
         // is the in-place sentinel `-(root_abs + 1)`. Instead of a value
         // copied into `out_buf`, the machine code reports the
-        // arena-absolute offset of the return root (today only a
-        // `List<List<scalar>>` value sourced from a `#main` parameter).
+        // arena-absolute offset of the return root — a `List<List<scalar>>`
+        // or `List<String>` value sourced from a `#main` parameter
+        // identity.
         // We rebase it to its source region, run the bounds verifier over
         // the whole reachable graph confined to that region, and only on
         // a clean verify decode the value in place. A verifier failure is
@@ -1384,7 +1385,7 @@ impl LlvmAotEvaluator {
                     "llvm-aot in-place return on a non-single-value return schema".into(),
                 ));
             }
-            return relon_eval_api::inplace_return::decode_inplace_list_list_return(
+            return relon_eval_api::inplace_return::decode_inplace_return(
                 "llvm-aot",
                 arena,
                 relon_eval_api::inplace_return::ArenaRegions {

@@ -112,6 +112,17 @@ signature**; each parameter declares one host-pushed slot:
 >   one host decode pipeline. A parameter-*field* `List<List<scalar>>`
 >   (`w.rows`) stays capped on both — its field load re-encodes the inner
 >   rows into a materialised form the in-place reader does not yet decode,
+> - **`List<String>` identity returns from a `#main` parameter**
+>   (`#main(List<String> ss) -> List<String> = ss`), on **both the
+>   cranelift and llvm backends.** This is the first *per-element
+>   pointer-array* shape carried by the in-place region-walk return ABI
+>   (the formation that previously segfaulted under the rigid tail copy):
+>   the outer `[len][off_i]` header and each `off_i`'s `[len][utf8]` String
+>   record live in the input region, so the machine code reports the root
+>   offset and the host verifier walks every per-entry String record
+>   in-region before decoding it in place — bit-equal to the tree-walk
+>   oracle including each string's bytes. A parameter-*field* `List<String>`
+>   (`o.tags`) stays capped on both,
 > - **`#schema`-branded struct returns** (`#main() -> Cfg { ... }`) whose
 >   fields are any of the above (including literal `String` / `List`
 >   fields),
@@ -137,15 +148,17 @@ signature**; each parameter declares one host-pushed slot:
 >   host-side *decode* is in place — `BufferReader` walks the buffer with
 >   a single base and reconstructs the nested `Value` recursively
 >   (`read_list_record` for `List<Schema>`, `read_list_list` /
->   `read_list_list_at` for `List<List<scalar>>`). What is still missing
->   for these is the in-place return wiring for a *per-element
->   pointer-array* (`List<Schema>` / `List<String>` rows) or the
->   materialised field-load form; until that lands they stay a loud
->   compile-time cap,
-> - **returning a `List<String>` (or any pointer-array list) sourced from
->   a `#main` parameter / field load / call** rather than an in-source
->   literal — such a value lives in the input buffer with non-contiguous,
->   whole-buffer-relative offsets the rigid tail copy cannot relocate.
+>   `read_list_list_at` for `List<List<scalar>>`, `read_list_string_at`
+>   for an in-place `List<String>`). The in-place return wiring now covers
+>   the *per-element pointer-array* `List<String>` parameter-identity shape
+>   (above); still missing for `List<Schema>` rows and the materialised
+>   field-load form, which stay a loud compile-time cap,
+> - **returning a `List<String>` (or any pointer-array list) sourced from a
+>   `#main` parameter *field load* / call** rather than a parameter
+>   identity or an in-source literal — such a value's field-load rebase is
+>   not yet proven bit-equal for an in-place return, so it stays a loud cap
+>   (the parameter-*identity* `List<String>` case is supported on both
+>   backends above).
 >
 > All of the above fail **loudly** at compile time; the compiled
 > backends never return wrong data or crash for them — route those shapes
@@ -167,8 +180,8 @@ signature**; each parameter declares one host-pushed slot:
 > graph.
 >
 > **In-place region-walk return ABI (the honest fix; `List<List<scalar>>`
-> parameter-identity now landed on both the cranelift and llvm
-> backends).** Instead of copying, the machine
+> and `List<String>` parameter-identity now landed on both the cranelift
+> and llvm backends).** Instead of copying, the machine
 > code reports the **arena-absolute offset of the result root** to the
 > host via a negative return sentinel: a `run_main` return value `>= 0` is
 > the usual `bytes_written` (decode at `out_ptr`), while a value `< 0`
@@ -186,8 +199,9 @@ signature**; each parameter declares one host-pushed slot:
 >    is a **loud error**, never a wild read. This is the gate: the host
 >    does not decode an unverified in-place return;
 > 3. only on a clean verify **decodes in place** via the same
->    `BufferReader` the out_buf path uses (`read_list_list_at` for the
->    nested-list root), against the region slice the verifier certified.
+>    `BufferReader` the out_buf path uses (`read_list_list_at` for a
+>    nested-list root, `read_list_string_at` for a `List<String>` root),
+>    against the region slice the verifier certified.
 >
 > This keeps the load-bearing single-region wall intact (no cross-region
 > copy, no whole-buffer rigid relocation) and turns the entire class of
@@ -196,11 +210,11 @@ signature**; each parameter declares one host-pushed slot:
 > region-select → verifier → decode) lives once in
 > `relon_eval_api::inplace_return` and is shared by both AOT backends, so
 > cranelift and llvm walk the exact same gate. The reader, verifier, and
-> the `List<List<scalar>>` parameter-identity case on **both** native
-> backends are wired; the remaining work is extending the same ABI to
-> per-element pointer-array roots (`List<String>` / `List<Schema>`) and
-> wasm linear memory — each landed only once it is proven bit-equal to
-> the oracle.
+> the `List<List<scalar>>` and `List<String>` parameter-identity cases on
+> **both** native backends are wired; the remaining work is extending the
+> same ABI to the other per-element pointer-array root (`List<Schema>`),
+> object-field returns of these shapes, and wasm linear memory — each
+> landed only once it is proven bit-equal to the oracle.
 
 ### Boundary Result vs Relon value-level Result
 

@@ -240,7 +240,45 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         ip_hint: &str,
         offset: u32,
         ty: IrType,
+        inplace: bool,
     ) -> Result<(), LlvmError> {
+        if inplace {
+            // In-place region-walk return ABI (S1/S2 `List<List<scalar>>`,
+            // S3 `List<String>`), mirroring the cranelift backend. The IR
+            // lowering only sets `inplace` for a pointer-array list value
+            // sourced directly from a `#main` parameter identity — its root
+            // header lives in the input region and the value is
+            // self-contained there (the single-region invariant). Rather
+            // than relocate the non-contiguous in-buffer block (the old
+            // rejecting / segfaulting path on `List<String>`), we pop the
+            // arena-relative root pointer that `Op::LoadListListPtr` /
+            // `Op::LoadListStringPtr` pushed and stash it; the buffer
+            // epilogue returns it as the negative in-place sentinel. The
+            // fixed-area slot at `offset` is left untouched — the host
+            // ignores `out_buf` entirely for an in-place return and reads
+            // the root at the reported arena offset, gated by the verifier.
+            //
+            // Only pointer-array list types are ever marked in-place; a
+            // `true` flag on any other type is a lowering bug. Only one
+            // root return exists per `#main`, so a single stash slot
+            // suffices; a second in-place store is a lowering bug.
+            if !matches!(ty, IrType::ListList | IrType::ListString) {
+                return Err(LlvmError::Codegen(format!(
+                    "in-place StoreField on non-pointer-array type {ty:?} — lowering bug",
+                )));
+            }
+            if self.inplace_return_root.is_some() {
+                return Err(LlvmError::Codegen(
+                    "multiple in-place StoreField in one #main body — in-place return expects a \
+                     single root value"
+                        .into(),
+                ));
+            }
+            let _ = offset;
+            let root = self.pop_int(ip_hint)?;
+            self.inplace_return_root = Some(root);
+            return Ok(());
+        }
         // Phase E.1: pointer-indirect types (String / List*) route to
         // the tail-cursor protocol — bump-allocate inside the output
         // buffer's tail region, memcpy the record there, and stamp
@@ -262,36 +300,13 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             return self.emit_store_field_list_string(ip_hint, offset);
         }
         if matches!(ty, IrType::ListList) {
-            // In-place region-walk return ABI (S2), mirroring the
-            // cranelift backend's `emit_store_field` for `ListList`. The
-            // IR lowering only emits `StoreField { ty: ListList }` for a
-            // `List<List<scalar>>` value sourced directly from a `#main`
-            // parameter (`list_list_source_is_param_walk`) — its root
-            // header lives in the input region and the value is
-            // self-contained there (the single-region invariant). Rather
-            // than relocate the non-contiguous in-buffer block (the old
-            // rejecting path), we pop the arena-relative root pointer that
-            // `Op::LoadListListPtr` pushed and stash it; the buffer
-            // epilogue returns it as the negative in-place sentinel. The
-            // fixed-area slot at `offset` is left untouched — the host
-            // ignores `out_buf` entirely for an in-place return and reads
-            // the root at the reported arena offset.
-            //
-            // Only one root return value exists per `#main`, so a single
-            // stash slot is sufficient; a second ListList store would be a
-            // lowering bug (surfaced loudly here rather than silently
-            // overwriting).
-            if self.inplace_return_root.is_some() {
-                return Err(LlvmError::Codegen(
-                    "multiple ListList StoreField in one #main body — in-place return expects a \
-                     single root value"
-                        .into(),
-                ));
-            }
-            let _ = offset;
-            let root = self.pop_int(ip_hint)?;
-            self.inplace_return_root = Some(root);
-            return Ok(());
+            // A non-in-place `StoreField { ty: ListList }` has no copy
+            // producer today (every `List<List>` return is either the
+            // in-place param walk handled above or a loud cap at lowering),
+            // so reaching here is ABI drift — surface it loudly.
+            return Err(LlvmError::Codegen(
+                "non-in-place StoreField { ty: ListList } has no copy path".into(),
+            ));
         }
         // Phase D.1 fast path: rewrite trailing StoreField into a
         // store against the i64 ret_slot. Only the single Int return

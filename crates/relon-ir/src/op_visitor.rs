@@ -98,7 +98,12 @@ pub trait OpVisitor {
 
     // Field load / store on the implicit `in_buf` / `out_buf` slots.
     fn visit_load_field(&mut self, offset: u32, ty: IrType) -> Result<Self::Output, Self::Error>;
-    fn visit_store_field(&mut self, offset: u32, ty: IrType) -> Result<Self::Output, Self::Error>;
+    fn visit_store_field(
+        &mut self,
+        offset: u32,
+        ty: IrType,
+        inplace: bool,
+    ) -> Result<Self::Output, Self::Error>;
 
     // Subscript ops (F-D8-B).
     fn visit_dict_get_by_string_key(
@@ -293,7 +298,11 @@ pub fn walk_op<V: OpVisitor>(op: &Op, visitor: &mut V) -> Result<V::Output, V::E
         Op::LetGet { idx, ty } => visitor.visit_let_get(*idx, *ty),
         Op::LetSet { idx, ty } => visitor.visit_let_set(*idx, *ty),
         Op::LoadField { offset, ty } => visitor.visit_load_field(*offset, *ty),
-        Op::StoreField { offset, ty } => visitor.visit_store_field(*offset, *ty),
+        Op::StoreField {
+            offset,
+            ty,
+            inplace,
+        } => visitor.visit_store_field(*offset, *ty, *inplace),
         Op::DictGetByStringKey {
             shape_hash,
             value_ty,
@@ -511,7 +520,7 @@ mod tests {
             self.last = "LoadField";
             Ok(())
         }
-        fn visit_store_field(&mut self, _: u32, _: IrType) -> Result<(), ()> {
+        fn visit_store_field(&mut self, _: u32, _: IrType, _: bool) -> Result<(), ()> {
             self.calls += 1;
             self.last = "StoreField";
             Ok(())

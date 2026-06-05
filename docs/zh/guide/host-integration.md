@@ -96,6 +96,14 @@ host-pushed slot：
 >   两个后端共用同一条 host 解码管线。入参 **字段** 形式的
 >   `List<List<scalar>>`（`w.rows`）在两个后端上仍 cap —— 字段读取会把内层
 >   行重编码为 materialized 形态，就地读取器尚不能解码；
+> - **从 `#main` 入参恒等返回 `List<String>`**
+>   （`#main(List<String> ss) -> List<String> = ss`），**cranelift 与 llvm
+>   两个后端均已支持。** 这是就地区走读返回 ABI 承载的第一个 **逐元素指针
+>   数组** 形状（也正是旧刚性尾拷贝会段错误的那种形状）：外层
+>   `[len][off_i]` 头与各 `off_i` 指向的 `[len][utf8]` String 记录都在输入区
+>   内，机器码报根偏移，host verifier 先逐个 String 记录在区内校验、再就地
+>   解码 —— 逐字节等价于 tree-walk oracle（含每个字符串内容）。入参 **字段**
+>   形式的 `List<String>`（`o.tags`）在两个后端上仍 cap；
 > - **`#schema` 加品牌的结构体返回**（`#main() -> Cfg { ... }`），字段
 >   可含上述任意类型（含字面量 `String` / `List` 字段）；
 > - **匿名 `-> Dict { ... }` 返回** —— 每个非 `#internal` 字段都会
@@ -116,12 +124,14 @@ host-pushed slot：
 >   匿名 `Dict` / 结构体。host 侧 **解码已就位**：`BufferReader` 以单一
 >   基址走读 buffer，递归重建嵌套 `Value`（`List<Schema>` 走
 >   `read_list_record`，`List<List<scalar>>` 走 `read_list_list` /
->   `read_list_list_at`）。这些形状仍缺的是 **逐元素指针数组根**
->   （`List<Schema>` / `List<String>` 行）或 materialized 字段读取形态的
->   就地返回接线；在此之前保持编译期响亮 cap；
-> - **返回来自 `#main` 入参 / 字段读取 / 函数调用（而非源码内字面量）的
->   `List<String>`（或任意指针数组 list）** —— 这类值位于输入 buffer 内，
->   内部偏移是非连续、整 buffer 相对的，刚性尾拷贝无法重定位。
+>   `read_list_list_at`，就地 `List<String>` 走 `read_list_string_at`）。
+>   就地返回接线现已覆盖 **逐元素指针数组** 的 `List<String>` 入参恒等形
+>   （见上）；仍缺 `List<Schema>` 行与 materialized 字段读取形态，保持编译期
+>   响亮 cap；
+> - **返回来自 `#main` 入参 **字段读取** / 函数调用（而非入参恒等或源码内
+>   字面量）的 `List<String>`（或任意指针数组 list）** —— 其字段读取重定位
+>   尚未逐字节证明可就地返回，故仍响亮 cap（入参 **恒等** 形 `List<String>`
+>   两个后端均已支持，见上）。
 >
 > 上述形状一律在编译期 **响亮报错**；编译后端绝不吐错数据、绝不崩溃 ——
 > 请把它们路由到 tree-walk 解释器。
@@ -137,8 +147,8 @@ host-pushed slot：
 > 路径试图用单一刚性 delta 把该图 *拷贝* 进 `out_buf`，只有连续单基址的
 > const-pool 块才成立，散落的入参图会段错误。
 >
-> **就地区走读返回 ABI（诚实的修法；`List<List<scalar>>` 入参恒等形
-> 已在 cranelift 与 llvm 两个后端上线）。** 不再拷贝，机器码通过 **负返回值哨兵** 把 **结果根的
+> **就地区走读返回 ABI（诚实的修法；`List<List<scalar>>` 与 `List<String>`
+> 入参恒等形均已在 cranelift 与 llvm 两个后端上线）。** 不再拷贝，机器码通过 **负返回值哨兵** 把 **结果根的
 > arena 绝对偏移** 报给 host：`run_main` 返回值 `>= 0` 仍是常规
 > `bytes_written`（在 `out_ptr` 处解码），而返回值 `< 0` 编码
 > `-(root_abs + 1)` —— 即「这是就地返回，根头在 arena 偏移 `root_abs`」。
@@ -151,17 +161,17 @@ host-pushed slot：
 >    限定在该区内。任何越区指针、或跑出末尾的长度 / 偏移都 **响亮报错**，
 >    绝不乱读。这是总开关：未过校验 host 绝不解码；
 > 3. 仅在校验通过后 **就地解码**，复用与 out_buf 路径相同的
->    `BufferReader`（嵌套 list 根走 `read_list_list_at`），针对 verifier
->    刚认证过的那块区切片解码。
+>    `BufferReader`（嵌套 list 根走 `read_list_list_at`，`List<String>` 根走
+>    `read_list_string_at`），针对 verifier 刚认证过的那块区切片解码。
 >
 > 这样既保住承重的单区墙（不跨区拷贝、不整 buffer 刚性重定位），又把整类
 > 「基址写错 / 散落图」bug 从 *静默错值* 变成 *明确的 verifier 失败*。host
 > 解码管线（哨兵 → 选区 → verifier → 解码）只在
 > `relon_eval_api::inplace_return` 落一份、由两个 AOT 后端共用，cranelift
 > 与 llvm 走完全相同的总开关。读取器、verifier 与 **两个** native 后端的
-> `List<List<scalar>>` 入参恒等形均已接通；剩下的是把同一 ABI 扩展到逐元素
-> 指针数组根（`List<String>` / `List<Schema>`）与 wasm 线性内存 —— 每一步
-> 都在逐字节证明等价于 oracle 后才上线。
+> `List<List<scalar>>` 与 `List<String>` 入参恒等形均已接通；剩下的是把同一
+> ABI 扩展到另一种逐元素指针数组根（`List<Schema>`）、这些形状的对象字段返回
+> 与 wasm 线性内存 —— 每一步都在逐字节证明等价于 oracle 后才上线。
 
 ### 入口边界 Result 与 Relon 值层 Result
 
