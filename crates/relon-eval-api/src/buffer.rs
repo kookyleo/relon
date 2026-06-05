@@ -54,6 +54,71 @@ pub(crate) struct RelocSlot {
     /// `String` / `List<scalar>` slots where the tail record carries no
     /// further pointers.
     nested: Option<Arc<RelocLayout>>,
+    /// For a `PointerArray` list slot, the recursive descriptor of what
+    /// each entry points at — so the relocation walker can rebase the
+    /// entries' own internal pointers (`List<Schema>` sub-records,
+    /// `List<List<String|Schema>>` inner pointer-array lists). `None` for
+    /// inline-fixed / scalar element lists whose entries carry no further
+    /// pointers. This is the F5 piece: it lets a doubly-nested
+    /// pointer-array list (`List<List<String>>`) be relocated to one level
+    /// deeper than the `nested` schema cache alone could reach.
+    list_elem: Option<PtrArrayElem>,
+}
+
+/// Recursive descriptor of one `PointerArray` list level's element, used
+/// by the relocation walker to rebase the pointers an entry introduces.
+/// Built once from the field's declared [`TypeRepr`] at builder
+/// construction; mirrors the depth the verifier / reader recurse to.
+#[derive(Debug)]
+pub(crate) enum PtrArrayElem {
+    /// `List<String>` elements: each entry points at a `[len][utf8]`
+    /// String record with no further pointers — entry-pointer rebase only.
+    String,
+    /// `List<Schema>` elements: each entry points at a sub-record whose
+    /// own pointer slots are rebased via the cached [`RelocLayout`].
+    Schema(Arc<RelocLayout>),
+    /// `List<List<…>>` elements: each entry points at an **inner list
+    /// header** that is itself a pointer array. Recurse one level: rebase
+    /// the inner header's entries (and, for the inner element, whatever
+    /// `inner` describes) too. This is what lifts the `List<List<String>>`
+    /// / `List<List<Schema>>` cap — the inner pointer array's entries would
+    /// otherwise keep their child-buffer-relative offsets and dereference
+    /// `paste_base` bytes off.
+    InnerList {
+        /// Element descriptor of the inner list (`String` / `Schema` /
+        /// a still-deeper `InnerList`).
+        inner: Box<PtrArrayElem>,
+    },
+}
+
+/// Build the recursive [`PtrArrayElem`] descriptor for a pointer-array
+/// list whose declared element type is `element`. Returns `None` for an
+/// inline-fixed element (`Int` / `Float` / `Bool`) where no per-entry
+/// recursion is needed — the entry-pointer rebase the walker always does
+/// suffices.
+fn ptr_array_elem_for(element: &TypeRepr) -> Option<PtrArrayElem> {
+    match element {
+        TypeRepr::String => Some(PtrArrayElem::String),
+        TypeRepr::Schema { schema } => SchemaLayout::offsets_for(schema)
+            .ok()
+            .map(|sub| PtrArrayElem::Schema(RelocLayout::build(&sub, &schema.fields))),
+        // A `List<inner>` element. Only recurse when the inner list is
+        // itself a **pointer array** carrying internal pointers
+        // (`List<List<String|Schema|List>>`): then each entry points at an
+        // inner pointer-array header whose own entries must be rebased. An
+        // inner *inline-fixed* scalar list (`List<List<Int>>`) is a
+        // self-contained `[len][payload]` record with no internal pointers,
+        // so the outer entry-pointer rebase is all that is needed —
+        // recursing into it would mis-treat the i64 payload as entry
+        // pointers and corrupt the buffer.
+        TypeRepr::List { element: inner } => {
+            ptr_array_elem_for(inner).map(|inner_desc| PtrArrayElem::InnerList {
+                inner: Box::new(inner_desc),
+            })
+        }
+        // Inline-fixed scalar element: entry-pointer rebase only.
+        _ => None,
+    }
 }
 
 /// Pre-computed relocation table for a [`BufferBuilder`]'s schema.
@@ -109,10 +174,19 @@ impl RelocLayout {
                 },
                 _ => None,
             });
+            // For a list field, pre-compute the recursive element
+            // descriptor so the relocation walker can rebase pointers one
+            // (or more) level deeper than `nested` alone reaches — the
+            // `List<List<String|Schema>>` inner pointer arrays.
+            let list_elem = declared.and_then(|f| match &f.ty {
+                TypeRepr::List { element } => ptr_array_elem_for(element),
+                _ => None,
+            });
             slots.push(RelocSlot {
                 offset: fo.offset,
                 list_element: fo.list_element,
                 nested,
+                list_elem,
             });
         }
         Arc::new(Self { slots })
@@ -988,6 +1062,196 @@ impl<'a> BufferBuilder<'a> {
         record_offset
     }
 
+    /// Append a `List<element>` payload (a pointer-array `[len][off_i]…`
+    /// header plus the per-element records it points at, or an inline
+    /// `[len][payload]` record for inline-fixed scalar elements) at the
+    /// current tail end, **without** wiring any fixed-area field slot, and
+    /// return the buffer-relative offset of the header. The returned
+    /// offset is the value a field / entry slot should hold to reach this
+    /// list. Recurses for `List<List<…>>` so a doubly-nested pointer array
+    /// is laid out bit-identically to the field-slot writers (the reader
+    /// and verifier walk the same shape). Every emitted offset is
+    /// child-buffer-relative, so the existing relocation walk rebases the
+    /// whole graph when the buffer is later pasted / arena-rebased.
+    ///
+    /// This is the recursive input marshaller behind `List<List<String>>`
+    /// / `List<List<Schema>>` params (F5): the layout pass admits those
+    /// shapes and the relocation walker's `PtrArrayElem::InnerList`
+    /// descriptor rebases the inner pointer arrays.
+    fn append_list_payload(
+        &mut self,
+        element: &TypeRepr,
+        items: &[crate::value::Value],
+    ) -> Result<usize, BufferError> {
+        use crate::value::Value;
+        let count = items.len();
+        if count > u32::MAX as usize {
+            return Err(BufferError::ValueTooLarge {
+                name: "<nested list>".to_string(),
+                len: count,
+            });
+        }
+        match element {
+            // Inline-fixed scalar element: one self-contained
+            // `[len][pad][payload]` record, byte-identical to
+            // `write_list_int` / `write_list_float` / `write_list_bool`.
+            TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool => {
+                let (inner_align, mut payload) = (
+                    match element {
+                        TypeRepr::Int | TypeRepr::Float => 8usize,
+                        _ => 4usize,
+                    },
+                    Vec::<u8>::new(),
+                );
+                for (i, it) in items.iter().enumerate() {
+                    match (element, it) {
+                        (TypeRepr::Int, Value::Int(v)) => {
+                            payload.extend_from_slice(&v.to_le_bytes())
+                        }
+                        (TypeRepr::Float, Value::Float(v)) => {
+                            payload.extend_from_slice(&v.into_inner().to_le_bytes())
+                        }
+                        (TypeRepr::Float, Value::Int(v)) => {
+                            payload.extend_from_slice(&(*v as f64).to_le_bytes())
+                        }
+                        (TypeRepr::Bool, Value::Bool(v)) => payload.push(u8::from(*v)),
+                        (_, other) => {
+                            return Err(BufferError::TypeMismatch {
+                                name: format!("<nested list>[{i}]"),
+                                declared: "List<scalar>",
+                                requested: other.type_name(),
+                            })
+                        }
+                    }
+                }
+                Ok(self.append_tail_record_with_inner_alignment(4, inner_align, count, &payload))
+            }
+            // `List<String>`: pointer-array header whose entries point at
+            // `[len][utf8]` String records — identical to
+            // `write_list_string`.
+            TypeRepr::String => {
+                self.pad_to(4);
+                let header_offset = self.bytes.len();
+                self.bytes.extend_from_slice(&(count as u32).to_le_bytes());
+                let entries_start = self.bytes.len();
+                self.bytes.resize(entries_start + count * 4, 0);
+                let mut offsets: Vec<u32> = Vec::with_capacity(count);
+                for (i, it) in items.iter().enumerate() {
+                    let Value::String(s) = it else {
+                        return Err(BufferError::TypeMismatch {
+                            name: format!("<nested list>[{i}]"),
+                            declared: "List<String>",
+                            requested: it.type_name(),
+                        });
+                    };
+                    let bytes = s.as_str().as_bytes();
+                    if bytes.len() > u32::MAX as usize {
+                        return Err(BufferError::ValueTooLarge {
+                            name: format!("<nested list>[{i}]"),
+                            len: bytes.len(),
+                        });
+                    }
+                    let off = self.append_tail_record(4, bytes.len(), bytes);
+                    offsets.push(u32::try_from(off).map_err(|_| BufferError::ValueTooLarge {
+                        name: "<nested list>".to_string(),
+                        len: off,
+                    })?);
+                }
+                for (i, off) in offsets.iter().enumerate() {
+                    let dst = entries_start + i * 4;
+                    self.bytes[dst..dst + 4].copy_from_slice(&off.to_le_bytes());
+                }
+                Ok(header_offset)
+            }
+            // `List<List<…>>`: pointer-array header whose entries point at
+            // inner list headers — recurse.
+            TypeRepr::List { element: inner } => {
+                self.pad_to(4);
+                let header_offset = self.bytes.len();
+                self.bytes.extend_from_slice(&(count as u32).to_le_bytes());
+                let entries_start = self.bytes.len();
+                self.bytes.resize(entries_start + count * 4, 0);
+                let mut offsets: Vec<u32> = Vec::with_capacity(count);
+                for (i, it) in items.iter().enumerate() {
+                    let Value::List(inner_items) = it else {
+                        return Err(BufferError::TypeMismatch {
+                            name: format!("<nested list>[{i}]"),
+                            declared: "List<List<…>>",
+                            requested: it.type_name(),
+                        });
+                    };
+                    let off = self.append_list_payload(inner, inner_items)?;
+                    offsets.push(u32::try_from(off).map_err(|_| BufferError::ValueTooLarge {
+                        name: "<nested list>".to_string(),
+                        len: off,
+                    })?);
+                }
+                for (i, off) in offsets.iter().enumerate() {
+                    let dst = entries_start + i * 4;
+                    self.bytes[dst..dst + 4].copy_from_slice(&off.to_le_bytes());
+                }
+                Ok(header_offset)
+            }
+            // `List<Schema>`: pointer-array header whose entries point at
+            // schema sub-records. Each sub-record is built in a detached
+            // child builder, relocated to its entry offset (so its own
+            // pointer slots become buffer-relative), and pasted — exactly
+            // the bytes `ListRecordWriter` produces.
+            TypeRepr::Schema { schema } => {
+                let sub_layout = SchemaLayout::offsets_for(schema).map_err(|_| {
+                    BufferError::MalformedPayload {
+                        name: "<nested list>".to_string(),
+                        reason: "inner List<Schema> element schema is not layoutable",
+                    }
+                })?;
+                let elem_align = sub_layout.root_align.max(1);
+                self.pad_to(4);
+                let header_offset = self.bytes.len();
+                self.bytes.extend_from_slice(&(count as u32).to_le_bytes());
+                let entries_start = self.bytes.len();
+                self.bytes.resize(entries_start + count * 4, 0);
+                let mut offsets: Vec<u32> = Vec::with_capacity(count);
+                for (i, it) in items.iter().enumerate() {
+                    let Value::Dict(dict) = it else {
+                        return Err(BufferError::TypeMismatch {
+                            name: format!("<nested list>[{i}]"),
+                            declared: "List<Schema>",
+                            requested: it.type_name(),
+                        });
+                    };
+                    let mut child = BufferBuilder::new(&sub_layout, &schema.fields);
+                    write_schema_record_into_builder(&mut child, schema, dict)?;
+                    let (mut child_bytes, child_reloc) = child.into_parts();
+                    self.pad_to(elem_align);
+                    let entry_offset = self.bytes.len();
+                    let ptr =
+                        u32::try_from(entry_offset).map_err(|_| BufferError::ValueTooLarge {
+                            name: "<nested list>".to_string(),
+                            len: entry_offset,
+                        })?;
+                    relocate_pointers(&mut child_bytes, &child_reloc, 0, ptr).map_err(
+                        |reason| BufferError::MalformedPayload {
+                            name: format!("<nested list>[{i}]"),
+                            reason,
+                        },
+                    )?;
+                    self.bytes.extend_from_slice(&child_bytes);
+                    offsets.push(ptr);
+                }
+                for (i, off) in offsets.iter().enumerate() {
+                    let dst = entries_start + i * 4;
+                    self.bytes[dst..dst + 4].copy_from_slice(&off.to_le_bytes());
+                }
+                Ok(header_offset)
+            }
+            other => Err(BufferError::TypeMismatch {
+                name: "<nested list>".to_string(),
+                declared: type_label(other),
+                requested: "List<scalar/String/Schema/List>",
+            }),
+        }
+    }
+
     /// Grow the buffer with zero bytes until its length is a multiple
     /// of `align`. No-op when already aligned.
     fn pad_to(&mut self, align: usize) {
@@ -1125,7 +1389,7 @@ fn relocate_pointers(
                 relocate_list_pointer_array(
                     bytes,
                     original as usize,
-                    slot.nested.as_deref(),
+                    slot.list_elem.as_ref(),
                     paste_base,
                 )?;
             }
@@ -1139,16 +1403,24 @@ fn relocate_pointers(
     Ok(())
 }
 
-/// Rebase every entry of a `List<String>` / `List<Schema>` pointer
-/// array. `record_start` is the byte offset of the list's tail record
-/// (the `[len: u32][off_0: u32]...` header). Walks the `len` entries,
-/// adds `paste_base` to each, and — for Schema element types — recurses
-/// into the per-element sub-record so its own pointer slots are
-/// rebased too.
+/// Rebase every entry of a `List<String>` / `List<Schema>` /
+/// `List<List<…>>` pointer array. `record_start` is the byte offset of
+/// the list's tail record (the `[len: u32][off_0: u32]...` header). Walks
+/// the `len` entries, adds `paste_base` to each, and recurses per the
+/// element descriptor `elem`:
+///
+/// * `Schema` — into the per-element sub-record's [`RelocLayout`] so its
+///   own pointer slots are rebased too.
+/// * `InnerList` — the entry points at an **inner list header** that is
+///   itself a pointer array; recurse into it one level deeper (this is
+///   the `List<List<String|Schema>>` relocation the v1 walker lacked).
+/// * `String` / `None` — the entry's target carries no internal pointer
+///   (an inline-fixed inner scalar list, or a String record), so the
+///   entry-pointer rebase above is all that is needed.
 fn relocate_list_pointer_array(
     bytes: &mut [u8],
     record_start: usize,
-    element_reloc: Option<&RelocLayout>,
+    elem: Option<&PtrArrayElem>,
     paste_base: u32,
 ) -> Result<(), &'static str> {
     if record_start
@@ -1177,12 +1449,24 @@ fn relocate_list_pointer_array(
             .checked_add(paste_base)
             .ok_or("relocated list-entry pointer overflows u32")?;
         bytes[cursor..cursor + 4].copy_from_slice(&relocated.to_le_bytes());
-        // Recurse into Schema entries so their own pointer-indirect
-        // slots (e.g. an inner String) get rebased. `element_reloc` is
-        // `None` for `List<String>` / `List<Int>` etc. where entries
-        // don't carry further pointers.
-        if let Some(element_reloc) = element_reloc {
-            relocate_pointers(bytes, element_reloc, original as usize, paste_base)?;
+        // Recurse per element descriptor so each entry's own internal
+        // pointers are rebased. `original` is the entry's pre-relocation
+        // (child-buffer-relative) offset — the coordinate the inner
+        // pointers were written against — so the inner walk continues to
+        // add `paste_base` exactly once.
+        match elem {
+            Some(PtrArrayElem::Schema(element_reloc)) => {
+                relocate_pointers(bytes, element_reloc, original as usize, paste_base)?;
+            }
+            Some(PtrArrayElem::InnerList { inner }) => {
+                relocate_list_pointer_array(
+                    bytes,
+                    original as usize,
+                    Some(inner.as_ref()),
+                    paste_base,
+                )?;
+            }
+            Some(PtrArrayElem::String) | None => {}
         }
         cursor += 4;
     }
@@ -1264,6 +1548,188 @@ pub fn write_nested_scalar_list(
             }),
         }
     })
+}
+
+/// Marshal a `List<List<String>>` / `List<List<Schema>>` (F5: a doubly-
+/// nested pointer-array list, where each outer element is itself a
+/// pointer-array list) into `field_name`'s tail area. `inner_element` is
+/// the **innermost** element type (`String` / `Schema` / a deeper
+/// `List<…>`), matching the `marshal_list_list_in` dispatch contract;
+/// `items` are the outer `Value::List` rows (each itself a
+/// `List<inner_element>`). The whole nested structure is written at
+/// child-buffer-relative offsets and the field's pointer slot patched to
+/// the outer header — the relocation walker's `PtrArrayElem::InnerList`
+/// descriptor rebases the inner pointer arrays on the later arena rebase.
+///
+/// Shared by both compiled backends so they emit byte-identical input
+/// buffers. The layout pass admits these shapes (`inner_list_record_
+/// alignment`); the inline-fixed `List<List<scalar>>` case keeps using
+/// [`write_nested_scalar_list`].
+pub fn write_nested_pointer_array_list(
+    builder: &mut BufferBuilder<'_>,
+    field_name: &str,
+    inner_element: &TypeRepr,
+    items: &[crate::value::Value],
+) -> Result<(), BufferError> {
+    // The field slot must be a pointer-indirect `List<List<…>>` slot.
+    let slot_offset = {
+        let entry = builder
+            .field_index
+            .iter()
+            .find(|e| e.name == field_name)
+            .ok_or_else(|| BufferError::UnknownField {
+                name: field_name.to_string(),
+            })?;
+        let is_nested = matches!(&entry.ty, TypeRepr::List { element: outer }
+            if matches!(outer.as_ref(), TypeRepr::List { .. }));
+        if !is_nested || !matches!(entry.kind, FieldKind::PointerIndirect { .. }) {
+            return Err(BufferError::TypeMismatch {
+                name: field_name.to_string(),
+                declared: type_label(&entry.ty),
+                requested: "List<List<String|Schema>>",
+            });
+        }
+        entry.offset
+    };
+    // `inner_element` is the innermost element (`String` / `Schema`).
+    // Build the outer pointer array whose entries each point at an inner
+    // `List<inner_element>` written by recursion.
+    let header = append_outer_pointer_array(builder, inner_element, items)?;
+    let ptr = u32::try_from(header).map_err(|_| BufferError::ValueTooLarge {
+        name: field_name.to_string(),
+        len: header,
+    })?;
+    builder.bytes[slot_offset..slot_offset + 4].copy_from_slice(&ptr.to_le_bytes());
+    Ok(())
+}
+
+/// Write the outer pointer-array header for a `List<List<inner_element>>`
+/// whose **innermost** element type is `inner_element` (`String` /
+/// `Schema` / a deeper `List<…>`), returning the header's buffer-relative
+/// offset. Each outer entry is a `List<inner_element>` value
+/// (`Value::List`), serialised via [`BufferBuilder::append_list_payload`].
+///
+/// Mirrors the marshaller dispatch contract (`marshal_list_list_in`):
+/// `inner_element` is the inner-list element, **not** the outer list
+/// element — so for `List<List<String>>` the callers pass `String`.
+fn append_outer_pointer_array(
+    builder: &mut BufferBuilder<'_>,
+    inner_element: &TypeRepr,
+    items: &[crate::value::Value],
+) -> Result<usize, BufferError> {
+    use crate::value::Value;
+    let count = items.len();
+    if count > u32::MAX as usize {
+        return Err(BufferError::ValueTooLarge {
+            name: "<nested list>".to_string(),
+            len: count,
+        });
+    }
+    builder.pad_to(4);
+    let header_offset = builder.bytes.len();
+    builder
+        .bytes
+        .extend_from_slice(&(count as u32).to_le_bytes());
+    let entries_start = builder.bytes.len();
+    builder.bytes.resize(entries_start + count * 4, 0);
+    let mut offsets: Vec<u32> = Vec::with_capacity(count);
+    for (i, it) in items.iter().enumerate() {
+        let Value::List(inner_items) = it else {
+            return Err(BufferError::TypeMismatch {
+                name: format!("<nested list>[{i}]"),
+                declared: "List<List<…>>",
+                requested: it.type_name(),
+            });
+        };
+        // Each outer entry is a `List<inner_element>`; serialise it.
+        let off = builder.append_list_payload(inner_element, inner_items)?;
+        offsets.push(u32::try_from(off).map_err(|_| BufferError::ValueTooLarge {
+            name: "<nested list>".to_string(),
+            len: off,
+        })?);
+    }
+    for (i, off) in offsets.iter().enumerate() {
+        let dst = entries_start + i * 4;
+        builder.bytes[dst..dst + 4].copy_from_slice(&off.to_le_bytes());
+    }
+    Ok(header_offset)
+}
+
+/// Write every field of a `#schema` record (`schema`) from a branded
+/// `Value::Dict` into `child`. Generic over field type — scalars,
+/// `String`, `List<scalar/String/Schema/List>`, and nested `Schema`
+/// sub-records — so the recursive nested-list marshaller has one
+/// self-contained schema writer that produces bytes identical to the
+/// per-backend `write_value_into_builder`. A missing / mistyped field is
+/// a loud error.
+fn write_schema_record_into_builder(
+    child: &mut BufferBuilder<'_>,
+    schema: &Schema,
+    dict: &crate::value::ValueDict,
+) -> Result<(), BufferError> {
+    for field in &schema.fields {
+        let value =
+            dict.map
+                .get(field.name.as_str())
+                .ok_or_else(|| BufferError::MalformedPayload {
+                    name: field.name.clone(),
+                    reason: "schema record is missing a declared field",
+                })?;
+        write_schema_field_into_builder(child, field, value)?;
+    }
+    Ok(())
+}
+
+/// Write one schema field (`field`) carrying `value` into `child`.
+fn write_schema_field_into_builder(
+    child: &mut BufferBuilder<'_>,
+    field: &Field,
+    value: &crate::value::Value,
+) -> Result<(), BufferError> {
+    use crate::value::Value;
+    let name = field.name.as_str();
+    match (&field.ty, value) {
+        (TypeRepr::Int, Value::Int(v)) => child.write_int(name, *v),
+        (TypeRepr::Float, Value::Float(v)) => child.write_float(name, v.into_inner()),
+        (TypeRepr::Float, Value::Int(v)) => child.write_float(name, *v as f64),
+        (TypeRepr::Bool, Value::Bool(v)) => child.write_bool(name, *v),
+        (TypeRepr::Null, Value::Null) => child.write_null(name),
+        (TypeRepr::String, Value::String(s)) => child.write_string(name, s.as_str()),
+        (TypeRepr::List { element }, Value::List(items)) => {
+            // Reuse the recursive list payload writer and patch the field
+            // slot, mirroring the dedicated `write_list_*` writers.
+            let slot_offset = child
+                .field_index
+                .iter()
+                .find(|e| e.name == name)
+                .map(|e| e.offset)
+                .ok_or_else(|| BufferError::UnknownField {
+                    name: name.to_string(),
+                })?;
+            let header = child.append_list_payload(element, items)?;
+            let ptr = u32::try_from(header).map_err(|_| BufferError::ValueTooLarge {
+                name: name.to_string(),
+                len: header,
+            })?;
+            child.bytes[slot_offset..slot_offset + 4].copy_from_slice(&ptr.to_le_bytes());
+            Ok(())
+        }
+        (TypeRepr::Schema { schema }, Value::Dict(sub)) => {
+            let sub_layout =
+                SchemaLayout::offsets_for(schema).map_err(|_| BufferError::MalformedPayload {
+                    name: name.to_string(),
+                    reason: "nested schema field is not layoutable",
+                })?;
+            let mut grandchild = child.sub_record(name, &sub_layout, &schema.fields)?;
+            write_schema_record_into_builder(&mut grandchild, schema, sub)?;
+            child.finish_sub_record(name, grandchild)
+        }
+        (_, other) => Err(BufferError::TypeMismatch {
+            name: name.to_string(),
+            declared: type_label(&field.ty),
+            requested: other.type_name(),
+        }),
+    }
 }
 
 /// Type-checked reader over a record buffer plus optional tail area.
@@ -1939,6 +2405,390 @@ impl<'a> BufferReader<'a> {
             });
         }
         Ok(out)
+    }
+
+    /// Recursively decode a `List<element>` whose **header sits directly
+    /// at `header_off`** (a region-relative offset into `self.bytes`) into
+    /// a `Vec<Value>`, dispatching on the declared `element` type. This is
+    /// the unified in-place list reader behind the F5 doubly-nested
+    /// pointer-array shapes (`List<List<String>>` / `List<List<Schema>>`):
+    /// the outer call reads the outer pointer array, and each entry —
+    /// being itself a `List<inner>` — recurses one level deeper, exactly
+    /// the depth the verifier already certified. Every offset / length is
+    /// bounds-checked against `self.bytes`; a non-UTF-8 String payload is a
+    /// loud error. The produced values are bit-identical to the field-slot
+    /// readers the tree-walk oracle's writer feeds.
+    pub fn read_list_value_at(
+        &self,
+        header_off: usize,
+        element: &TypeRepr,
+    ) -> Result<Vec<crate::value::Value>, BufferError> {
+        use crate::value::Value;
+        match element {
+            // Inline-fixed scalar inner list / pointer-array String /
+            // nested-list element: dispatch through the existing readers.
+            TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool => {
+                // A `List<scalar>` whose header is at `header_off`:
+                // `[len][pad][payload]`. Decode directly.
+                self.read_inline_scalar_list_at(header_off, element)
+            }
+            TypeRepr::String => Ok(self
+                .read_list_string_at(header_off)?
+                .into_iter()
+                .map(|s| Value::String(s.into()))
+                .collect()),
+            TypeRepr::List { element: inner } => {
+                // Outer pointer array; recurse per entry into the inner
+                // list it points at.
+                let (count, entries_start) = self.read_pointer_array_header(header_off)?;
+                let mut out = Vec::with_capacity(count);
+                for i in 0..count {
+                    let entry = self.read_entry_pointer(entries_start, i)?;
+                    let inner_vals = self.read_list_value_at(entry, inner)?;
+                    out.push(Value::List(std::sync::Arc::new(inner_vals)));
+                }
+                Ok(out)
+            }
+            TypeRepr::Schema { schema } => {
+                // Outer pointer array; each entry points at a sub-record's
+                // fixed area. Decode each at its absolute base recursively.
+                let elem_layout = SchemaLayout::offsets_for(schema).map_err(|_| {
+                    BufferError::MalformedPayload {
+                        name: "<in-place root>".to_string(),
+                        reason: "inner List<Schema> element schema is not layoutable",
+                    }
+                })?;
+                let (count, entries_start) = self.read_pointer_array_header(header_off)?;
+                let mut out = Vec::with_capacity(count);
+                for i in 0..count {
+                    let sub_base = self.read_entry_pointer(entries_start, i)?;
+                    let sub_end = sub_base.checked_add(elem_layout.root_size).ok_or_else(|| {
+                        BufferError::MalformedPayload {
+                            name: "<in-place root>".to_string(),
+                            reason: "in-place sub-record end overflows usize",
+                        }
+                    })?;
+                    if sub_end > self.bytes.len() {
+                        return Err(BufferError::MalformedPayload {
+                            name: "<in-place root>".to_string(),
+                            reason: "in-place sub-record exceeds buffer end",
+                        });
+                    }
+                    out.push(self.read_record_at(sub_base, &elem_layout, schema)?);
+                }
+                Ok(out)
+            }
+            other => Err(BufferError::TypeMismatch {
+                name: "<in-place root>".to_string(),
+                declared: type_label(other),
+                requested: "List<scalar/String/Schema/List>",
+            }),
+        }
+    }
+
+    /// Field-slot entry point for the recursive list reader: resolve the
+    /// pointer-indirect `field_name` slot to its list header offset, then
+    /// decode through [`Self::read_list_value_at`]. `element` is the
+    /// outer list's element type. Used by the object / sub-record decode
+    /// path so a `List<List<String|Schema>>` field decodes to the same
+    /// `Vec<Value>` the in-place return path produces.
+    pub fn read_list_value(
+        &self,
+        field_name: &str,
+        element: &TypeRepr,
+    ) -> Result<Vec<crate::value::Value>, BufferError> {
+        let entry = self.find_entry(field_name)?;
+        if !matches!(entry.kind, FieldKind::PointerIndirect { .. }) {
+            return Err(BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "expected pointer-indirect list slot",
+            });
+        }
+        let header_off = self.read_slot_pointer(entry.offset)?;
+        self.read_list_value_at(header_off, element)
+    }
+
+    /// Read the `[len][off_i]…` pointer-array header at `header_off`,
+    /// returning `(count, entries_start)` after bounds-checking the length
+    /// prefix.
+    fn read_pointer_array_header(&self, header_off: usize) -> Result<(usize, usize), BufferError> {
+        if header_off
+            .checked_add(4)
+            .map(|end| end > self.bytes.len())
+            .unwrap_or(true)
+        {
+            return Err(BufferError::MalformedPayload {
+                name: "<in-place root>".to_string(),
+                reason: "in-place list header length prefix exceeds buffer end",
+            });
+        }
+        let mut len_buf = [0u8; 4];
+        len_buf.copy_from_slice(&self.bytes[header_off..header_off + 4]);
+        let count = u32::from_le_bytes(len_buf) as usize;
+        Ok((count, header_off + 4))
+    }
+
+    /// Read the `i`-th entry pointer (a `u32`) of a pointer array whose
+    /// entries start at `entries_start`, bounds-checked.
+    fn read_entry_pointer(&self, entries_start: usize, i: usize) -> Result<usize, BufferError> {
+        let cursor =
+            entries_start
+                .checked_add(i * 4)
+                .ok_or_else(|| BufferError::MalformedPayload {
+                    name: "<in-place root>".to_string(),
+                    reason: "in-place list entry cursor overflows usize",
+                })?;
+        if cursor + 4 > self.bytes.len() {
+            return Err(BufferError::MalformedPayload {
+                name: "<in-place root>".to_string(),
+                reason: "in-place list entry pointer exceeds buffer end",
+            });
+        }
+        let mut entry_buf = [0u8; 4];
+        entry_buf.copy_from_slice(&self.bytes[cursor..cursor + 4]);
+        Ok(u32::from_le_bytes(entry_buf) as usize)
+    }
+
+    /// Decode a `List<scalar>` whose `[len][pad][payload]` record sits at
+    /// `header_off`, dispatching on the scalar element type. Mirrors the
+    /// field-slot `read_list_int` / `read_list_float` / `read_list_bool`
+    /// element decode.
+    fn read_inline_scalar_list_at(
+        &self,
+        header_off: usize,
+        element: &TypeRepr,
+    ) -> Result<Vec<crate::value::Value>, BufferError> {
+        use crate::value::Value;
+        if header_off
+            .checked_add(4)
+            .map(|end| end > self.bytes.len())
+            .unwrap_or(true)
+        {
+            return Err(BufferError::MalformedPayload {
+                name: "<in-place root>".to_string(),
+                reason: "inline scalar list header length prefix exceeds buffer end",
+            });
+        }
+        let mut len_buf = [0u8; 4];
+        len_buf.copy_from_slice(&self.bytes[header_off..header_off + 4]);
+        let count = u32::from_le_bytes(len_buf) as usize;
+        let (elem_size, align): (usize, usize) = match element {
+            TypeRepr::Int | TypeRepr::Float => (8, 8),
+            TypeRepr::Bool => (1, 1),
+            other => {
+                return Err(BufferError::TypeMismatch {
+                    name: "<in-place root>".to_string(),
+                    declared: type_label(other),
+                    requested: "List<scalar>",
+                })
+            }
+        };
+        let payload_start = if align > 1 {
+            (header_off + 4).next_multiple_of(align)
+        } else {
+            header_off + 4
+        };
+        let byte_len =
+            count
+                .checked_mul(elem_size)
+                .ok_or_else(|| BufferError::MalformedPayload {
+                    name: "<in-place root>".to_string(),
+                    reason: "inline scalar list byte length overflows usize",
+                })?;
+        let end =
+            payload_start
+                .checked_add(byte_len)
+                .ok_or_else(|| BufferError::MalformedPayload {
+                    name: "<in-place root>".to_string(),
+                    reason: "inline scalar list payload end overflows usize",
+                })?;
+        if end > self.bytes.len() {
+            return Err(BufferError::MalformedPayload {
+                name: "<in-place root>".to_string(),
+                reason: "inline scalar list payload exceeds buffer end",
+            });
+        }
+        let mut out = Vec::with_capacity(count);
+        for k in 0..count {
+            let off = payload_start + k * elem_size;
+            match element {
+                TypeRepr::Int => {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&self.bytes[off..off + 8]);
+                    out.push(Value::Int(i64::from_le_bytes(b)));
+                }
+                TypeRepr::Float => {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&self.bytes[off..off + 8]);
+                    out.push(Value::Float(ordered_float::OrderedFloat(
+                        f64::from_le_bytes(b),
+                    )));
+                }
+                TypeRepr::Bool => out.push(Value::Bool(self.bytes[off] != 0)),
+                _ => unreachable!("scalar element validated above"),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Decode a `#schema` sub-record whose fixed area sits at the
+    /// arena/region offset `record_base` into a branded `Value::Dict`,
+    /// reading each field at `record_base + fo.offset`. Generic over field
+    /// type — scalars, `String`, `List<…>` (via the recursive
+    /// [`Self::read_list_value_at`]), and nested `Schema` — so a
+    /// `List<List<Schema>>` element or a sub-record carrying a
+    /// `List<List<String>>` field decodes to the same `Value` the
+    /// tree-walk oracle produces. Bounds are checked at each pointer
+    /// dereference; the verifier has already certified the whole graph.
+    fn read_record_at(
+        &self,
+        record_base: usize,
+        layout: &OffsetTable,
+        schema: &Schema,
+    ) -> Result<crate::value::Value, BufferError> {
+        use crate::smol_str::SmolStr;
+        use crate::value::Value;
+        let mut map = std::collections::BTreeMap::new();
+        for field in &schema.fields {
+            let fo = layout
+                .fields
+                .iter()
+                .find(|fo| fo.name == field.name)
+                .ok_or_else(|| BufferError::MalformedPayload {
+                    name: field.name.clone(),
+                    reason: "schema field missing from layout",
+                })?;
+            let slot_abs = record_base.checked_add(fo.offset).ok_or_else(|| {
+                BufferError::MalformedPayload {
+                    name: field.name.clone(),
+                    reason: "field slot offset overflows usize",
+                }
+            })?;
+            let v = self.read_field_at(slot_abs, &field.ty)?;
+            map.insert(SmolStr::from(field.name.as_str()), v);
+        }
+        Ok(Value::branded_dict(map, Some(schema.name.clone())))
+    }
+
+    /// Decode one field of declared type `ty` whose fixed-area slot sits
+    /// at the absolute offset `slot_abs`. Scalars read inline; pointer-
+    /// indirect fields (`String` / `List<…>` / `Schema`) read the `u32`
+    /// slot and recurse.
+    fn read_field_at(
+        &self,
+        slot_abs: usize,
+        ty: &TypeRepr,
+    ) -> Result<crate::value::Value, BufferError> {
+        use crate::value::Value;
+        let read_inline = |abs: usize, len: usize| -> Result<&[u8], BufferError> {
+            let end = abs
+                .checked_add(len)
+                .ok_or_else(|| BufferError::MalformedPayload {
+                    name: "<sub-record field>".to_string(),
+                    reason: "inline field span overflows usize",
+                })?;
+            if end > self.bytes.len() {
+                return Err(BufferError::MalformedPayload {
+                    name: "<sub-record field>".to_string(),
+                    reason: "inline field span exceeds buffer end",
+                });
+            }
+            Ok(&self.bytes[abs..end])
+        };
+        match ty {
+            TypeRepr::Int => {
+                let b = read_inline(slot_abs, 8)?;
+                Ok(Value::Int(i64::from_le_bytes(b.try_into().unwrap())))
+            }
+            TypeRepr::Float => {
+                let b = read_inline(slot_abs, 8)?;
+                Ok(Value::Float(ordered_float::OrderedFloat(
+                    f64::from_le_bytes(b.try_into().unwrap()),
+                )))
+            }
+            TypeRepr::Bool => {
+                let b = read_inline(slot_abs, 1)?;
+                Ok(Value::Bool(b[0] != 0))
+            }
+            TypeRepr::Null => Ok(Value::Null),
+            TypeRepr::String => {
+                let ptr = self.read_slot_pointer(slot_abs)?;
+                Ok(Value::String(self.read_string_record_at(ptr)?.into()))
+            }
+            TypeRepr::List { element } => {
+                let header = self.read_slot_pointer(slot_abs)?;
+                let vals = self.read_list_value_at(header, element)?;
+                Ok(Value::List(std::sync::Arc::new(vals)))
+            }
+            TypeRepr::Schema { schema } => {
+                let sub_layout = SchemaLayout::offsets_for(schema).map_err(|_| {
+                    BufferError::MalformedPayload {
+                        name: "<sub-record field>".to_string(),
+                        reason: "nested schema field is not layoutable",
+                    }
+                })?;
+                let sub_base = self.read_slot_pointer(slot_abs)?;
+                self.read_record_at(sub_base, &sub_layout, schema)
+            }
+            other => Err(BufferError::TypeMismatch {
+                name: "<sub-record field>".to_string(),
+                declared: type_label(other),
+                requested: "scalar/String/List/Schema",
+            }),
+        }
+    }
+
+    /// Read a `u32` pointer slot at the absolute offset `slot_abs`,
+    /// bounds-checked, returning the pointed-at offset.
+    fn read_slot_pointer(&self, slot_abs: usize) -> Result<usize, BufferError> {
+        if slot_abs
+            .checked_add(4)
+            .map(|end| end > self.bytes.len())
+            .unwrap_or(true)
+        {
+            return Err(BufferError::MalformedPayload {
+                name: "<sub-record field>".to_string(),
+                reason: "pointer slot exceeds buffer end",
+            });
+        }
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&self.bytes[slot_abs..slot_abs + 4]);
+        Ok(u32::from_le_bytes(b) as usize)
+    }
+
+    /// Read a `[len: u32][utf8]` String record at `record_off`,
+    /// bounds-checked, validating UTF-8.
+    fn read_string_record_at(&self, record_off: usize) -> Result<&'a str, BufferError> {
+        if record_off
+            .checked_add(4)
+            .map(|end| end > self.bytes.len())
+            .unwrap_or(true)
+        {
+            return Err(BufferError::MalformedPayload {
+                name: "<sub-record field>".to_string(),
+                reason: "string len prefix exceeds buffer end",
+            });
+        }
+        let mut b = [0u8; 4];
+        b.copy_from_slice(&self.bytes[record_off..record_off + 4]);
+        let len = u32::from_le_bytes(b) as usize;
+        let start = record_off + 4;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| BufferError::MalformedPayload {
+                name: "<sub-record field>".to_string(),
+                reason: "string payload end overflows usize",
+            })?;
+        if end > self.bytes.len() {
+            return Err(BufferError::MalformedPayload {
+                name: "<sub-record field>".to_string(),
+                reason: "string payload exceeds buffer end",
+            });
+        }
+        std::str::from_utf8(&self.bytes[start..end]).map_err(|_| BufferError::MalformedPayload {
+            name: "<sub-record field>".to_string(),
+            reason: "string payload is not valid utf-8",
+        })
     }
 
     /// Read a `List<List<scalar>>` from `field_name` as a vector of
@@ -3401,26 +4251,68 @@ mod tests {
         }
     }
 
-    /// `write_nested_scalar_list` rejects an inner pointer-array element
-    /// (`List<List<String>>`) loudly — the recursive relocation isn't
-    /// modelled, so it must never silently produce a buffer.
+    /// F5: `write_nested_pointer_array_list` marshals a `List<List<String>>`
+    /// and `read_list_value` decodes it back bit-identically, including
+    /// empty inner / outer lists and an empty / multibyte string. The
+    /// doubly-nested pointer array round-trips through one buffer.
     #[test]
-    fn nested_list_inner_string_rejected() {
+    fn nested_list_inner_string_roundtrips() {
         use crate::value::Value;
+        let inner_str = TypeRepr::List {
+            element: Box::new(TypeRepr::String),
+        };
         let schema = Schema {
             name: "Grid".into(),
             generics: vec![],
             fields: vec![field(
                 "xss",
                 TypeRepr::List {
-                    element: Box::new(TypeRepr::List {
-                        element: Box::new(TypeRepr::String),
-                    }),
+                    element: Box::new(inner_str.clone()),
                 },
             )],
         };
-        // Layout itself refuses the inner pointer-array element.
-        assert!(SchemaLayout::offsets_for(&schema).is_err());
-        let _ = Value::Int(0);
+        let layout = SchemaLayout::offsets_for(&schema).expect("List<List<String>> layout");
+        let multibyte: String = [0x4E2Du32, 0x6587]
+            .iter()
+            .map(|c| char::from_u32(*c).unwrap())
+            .collect();
+        let rows: Vec<Value> = vec![
+            Value::List(std::sync::Arc::new(vec![
+                Value::String("a".into()),
+                Value::String("".into()),
+                Value::String(multibyte.as_str().into()),
+            ])),
+            Value::List(std::sync::Arc::new(vec![])),
+            Value::List(std::sync::Arc::new(vec![Value::String("zz".into())])),
+        ];
+        let mut b = BufferBuilder::new(&layout, &schema.fields);
+        // The marshaller's `element` is the *innermost* element (String),
+        // mirroring the `marshal_list_list_in` dispatch contract.
+        write_nested_pointer_array_list(&mut b, "xss", &TypeRepr::String, &rows)
+            .expect("write nested");
+        let bytes = b.finish();
+        // Read it back through the field slot (the reader's `element` is
+        // the *outer* list element, `List<String>`), then via the in-place
+        // root.
+        let reader = BufferReader::new(&layout, &schema.fields, &bytes).expect("reader");
+        let got = reader
+            .read_list_value("xss", &inner_str)
+            .expect("read field");
+        assert_eq!(
+            Value::List(std::sync::Arc::new(got)),
+            Value::List(std::sync::Arc::new(rows.clone()))
+        );
+        // And via the direct header offset (the in-place return path).
+        let fo = &layout.fields[0];
+        let mut slot = [0u8; 4];
+        slot.copy_from_slice(&bytes[fo.offset..fo.offset + 4]);
+        let header = u32::from_le_bytes(slot) as usize;
+        let got2 = reader
+            .read_list_value_at(header, &inner_str)
+            .expect("read at header");
+        assert_eq!(
+            Value::List(std::sync::Arc::new(got2)),
+            Value::List(std::sync::Arc::new(rows))
+        );
     }
 }

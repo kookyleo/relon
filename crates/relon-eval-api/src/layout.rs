@@ -393,16 +393,30 @@ fn inner_list_record_alignment(field_name: &str, inner: &TypeRepr) -> Result<usi
         TypeRepr::Int | TypeRepr::Float => Ok(8),
         TypeRepr::Bool => Ok(4),
         // Inner *pointer-array* element lists (`List<List<String>>`,
-        // `List<List<Schema>>`) and deeper nesting carry their own
-        // internal pointer slots; rebasing them needs a recursive
-        // pointer-array relocation the v1 reloc walker does not model.
-        // Stay a loud cap rather than emit a buffer whose inner offsets
-        // are off by `paste_base`.
-        TypeRepr::String | TypeRepr::Schema { .. } | TypeRepr::List { .. } => {
-            Err(LayoutError::UnsupportedListElement {
-                field: field_name.to_string(),
-                inner: "List<pointer-array element>",
-            })
+        // `List<List<Schema>>`, and deeper `List<List<List<…>>>`): each
+        // inner record is itself a `[len][off_j]…` pointer-array header
+        // carrying internal pointers. The header starts 4-aligned (its
+        // entry slots are 4-byte offsets); the recursive `relocate_list_
+        // pointer_array` walk (driven by the `PtrArrayElem::InnerList`
+        // descriptor) rebases the inner entries — and any String / Schema
+        // they reach — one level deeper, so the buffer stays self-coherent
+        // after a paste / arena rebase. The `List<List<Schema>>` inner
+        // header is still a 4-aligned pointer array (the *entries* point
+        // at sub-records whose own alignment the writer pads to); validate
+        // the inner-inner element so an unsupported leaf is still a loud
+        // cap rather than a mis-laid buffer.
+        TypeRepr::String => Ok(4),
+        TypeRepr::Schema { schema } => {
+            // Force a sub-layout so an unlayoutable element schema is a
+            // loud error here, not a silent mis-encode downstream.
+            SchemaLayout::offsets_for(schema)?;
+            Ok(4)
+        }
+        TypeRepr::List { element: deeper } => {
+            // Validate the still-deeper element recursively; the header
+            // itself is a 4-aligned pointer array.
+            inner_list_record_alignment(field_name, deeper)?;
+            Ok(4)
         }
         other => Err(LayoutError::UnsupportedListElement {
             field: field_name.to_string(),
@@ -753,10 +767,10 @@ mod tests {
     }
 
     #[test]
-    fn list_of_inner_pointer_array_list_is_rejected() {
-        // `List<List<String>>`: the inner list record is itself a
-        // pointer array carrying internal slots the v1 reloc walker
-        // can't rebase — stays a loud cap via UnsupportedListElement.
+    fn list_of_inner_pointer_array_list_is_accepted() {
+        // F5: `List<List<String>>` is now materialisable — the inner list
+        // record is a 4-aligned pointer array, rebased by the recursive
+        // `relocate_list_pointer_array` walk (`PtrArrayElem::InnerList`).
         let schema = Schema {
             name: "Nested".into(),
             generics: vec![],
@@ -769,14 +783,38 @@ mod tests {
                 },
             )],
         };
-        let err = SchemaLayout::offsets_for(&schema).expect_err("must reject");
-        assert!(matches!(
-            err,
-            LayoutError::UnsupportedListElement {
-                inner: "List<pointer-array element>",
-                ..
-            }
-        ));
+        let table = SchemaLayout::offsets_for(&schema).expect("List<List<String>> accepted");
+        // Outer slot is a pointer array; its entries are 4-byte offsets to
+        // inner list headers (themselves 4-aligned pointer arrays).
+        assert_eq!(
+            table.fields[0].list_element,
+            Some(ListElementKind::PointerArray { elem_alignment: 4 })
+        );
+    }
+
+    #[test]
+    fn list_of_inner_list_with_unsupported_leaf_is_rejected() {
+        // The leaf must still be materialisable: `List<List<Option<…>>>`
+        // (a non-pointer-array, non-scalar leaf) stays a loud cap.
+        let schema = Schema {
+            name: "Nested".into(),
+            generics: vec![],
+            fields: vec![field(
+                "xs",
+                TypeRepr::List {
+                    element: Box::new(TypeRepr::List {
+                        element: Box::new(TypeRepr::Option {
+                            inner: Box::new(TypeRepr::Int),
+                        }),
+                    }),
+                },
+            )],
+        };
+        let err = SchemaLayout::offsets_for(&schema).expect_err("unsupported leaf must reject");
+        assert!(
+            matches!(err, LayoutError::UnsupportedListElement { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]

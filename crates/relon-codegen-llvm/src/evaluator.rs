@@ -1976,8 +1976,18 @@ fn marshal_list_list_in(
     inner: &relon_eval_api::schema_canonical::TypeRepr,
     items: &[Value],
 ) -> Result<(), RuntimeError> {
-    relon_eval_api::buffer::write_nested_scalar_list(builder, name, inner, items)
-        .map_err(buffer_to_runtime_error)
+    use relon_eval_api::schema_canonical::TypeRepr;
+    // `List<List<scalar>>` keeps the inline-fixed inner-record writer;
+    // `List<List<String|Schema|List>>` (F5) routes through the recursive
+    // doubly-nested pointer-array marshaller.
+    match inner {
+        TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool => {
+            relon_eval_api::buffer::write_nested_scalar_list(builder, name, inner, items)
+                .map_err(buffer_to_runtime_error)
+        }
+        _ => relon_eval_api::buffer::write_nested_pointer_array_list(builder, name, inner, items)
+            .map_err(buffer_to_runtime_error),
+    }
 }
 
 /// Phase 0b: Schema-typed `#main` arg marshalling. A branded
@@ -2085,14 +2095,27 @@ fn read_value_from_reader(
         }
         // F2: cross-region object field `List<List<scalar>>` — the nested
         // pointer-array decode, re-wrapping each inner row as a `Value::List`.
-        TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::List { .. }) => reader
-            .read_list_list(&field.name)
-            .map(|rows| {
-                Value::List(Arc::new(
-                    rows.into_iter().map(|r| Value::List(Arc::new(r))).collect(),
-                ))
-            })
-            .map_err(buffer_to_runtime_error),
+        // F5: `List<List<String|Schema>>` routes through the recursive
+        // `read_list_value` so the inner pointer arrays are followed.
+        TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::List { .. }) => {
+            let TypeRepr::List { element: inner } = element.as_ref() else {
+                unreachable!("guarded by the match arm");
+            };
+            match inner.as_ref() {
+                TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool => reader
+                    .read_list_list(&field.name)
+                    .map(|rows| {
+                        Value::List(Arc::new(
+                            rows.into_iter().map(|r| Value::List(Arc::new(r))).collect(),
+                        ))
+                    })
+                    .map_err(buffer_to_runtime_error),
+                _ => reader
+                    .read_list_value(&field.name, element.as_ref())
+                    .map(|rows| Value::List(Arc::new(rows)))
+                    .map_err(buffer_to_runtime_error),
+            }
+        }
         // ----- add new leaf marshalling arm above this line -----
         other => Err(RuntimeError::Unsupported {
             reason: format!(

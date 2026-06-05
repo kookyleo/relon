@@ -246,16 +246,22 @@ fn param_field_tags_empty() {
 
 // ---- loud-cap guards: unsupported shapes decline, never miscompile ---
 
-/// Shapes S3 does NOT lift must still make **both** AOT backends decline
-/// the `#main` shape (a setup error). In production `Backend::Auto` falls
-/// back to the tree-walk oracle; here we assert the decline is loud (an
-/// `Err`), so a silent miscompile can never sneak in on either backend.
+/// Shapes still beyond F5 must make **both** AOT backends decline the
+/// `#main` shape (a setup error). In production `Backend::Auto` falls back
+/// to the tree-walk oracle; here we assert the decline is loud (an `Err`),
+/// so a silent miscompile can never sneak in on either backend.
+///
+/// F5 lifted `List<List<String>>`; the remaining cap here is the
+/// `Dict<_,_>` param analyzer dead-end.
 #[test]
 fn unsupported_return_shapes_fail_loudly_not_silently() {
     let cap_cases = [
-        // List<List<String>> — inner pointer-array-of-pointer-array; the
-        // in-place reader does not decode a nested String pointer array (F5).
-        "#main(List<List<String>> xss) -> List<List<String>>\nxss",
+        // Dict param — analyzer dead-end with no input decode path.
+        "#main(Dict<String, Int> d) -> Int\n1",
+        // ≥3-segment nested-schema field chain — F4 admits only a
+        // single-segment field walk.
+        "#schema Inner { tags: List<String> }\n#schema Outer { inner: Inner }\n\
+         #main(Outer o) -> List<String>\no.inner.tags",
     ];
     for src in cap_cases {
         match new_evaluator(src, Backend::CraneliftAot) {
