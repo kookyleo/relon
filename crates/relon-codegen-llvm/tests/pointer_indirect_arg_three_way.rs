@@ -17,10 +17,15 @@
 //! to arena-relative) or `Op::LoadFieldAtAbsolute` with a pointer-
 //! indirect field type (schema fields, same rebase).
 //!
+//! Multi-segment nested-schema walks (`o.inner.x`) now resolve end-to-end
+//! through chained `LoadSchemaPtr` / `LoadFieldAtAbsolute` rebases (see the
+//! `nested_schema_*` cases below).
+//!
 //! Scope / loud caps (see the report's honesty note): `List<Schema>`
-//! params/fields, nested `List<List<…>>`, multi-segment nested-schema
-//! walks (`o.inner.x`), and `Dict` params stay loudly rejected — no
-//! silent fallthrough. The `len(...)` free-call alias does not lower on
+//! params/fields, nested `List<List<…>>`, and `Dict` params stay loudly
+//! rejected — no silent fallthrough. A nested schema whose field is itself
+//! a `List<Schema>` also stays rejected (the inner list-of-schema decode
+//! is unimplemented). The `len(...)` free-call alias does not lower on
 //! the compiled backends for `List<String>`; the cross-backend consumer
 //! here is the `.length()` method form (`list_string_length`), which
 //! lowers identically on all three executors.
@@ -220,6 +225,78 @@ fn schema_list_int_field_three_way() {
     assert_eq!(assert_three_way(SRC, args), Value::Int(3));
 }
 
+// --------------- nested schema field walks (stage 4) ------------------
+
+/// `#main(Outer o) -> Int = o.inner.x + o.tag` — a multi-segment walk
+/// through a nested `#schema` field. `o.inner` rebases to the inner
+/// record's base (pointer-indirect `LoadFieldAtAbsolute`), then `.x`
+/// reads a scalar off that base. The value-position field spelling
+/// (`inner: Inner`) desugars to the prefix form (`Inner inner: *`).
+#[test]
+fn nested_schema_field_three_way() {
+    const SRC: &str = "#schema Inner { x: Int }\n\
+                       #schema Outer { inner: Inner, tag: Int }\n\
+                       #main(Outer o) -> Int\no.inner.x + o.tag";
+    let args = HashMap::from([(
+        "o".to_string(),
+        schema_val(
+            "Outer",
+            vec![
+                ("inner", schema_val("Inner", vec![("x", Value::Int(7))])),
+                ("tag", Value::Int(3)),
+            ],
+        ),
+    )]);
+    assert_eq!(assert_three_way(SRC, args), Value::Int(10));
+}
+
+/// The prefix spelling (`Inner inner: *`) of the same nested walk — pins
+/// that both field-declaration forms agree across all three backends.
+#[test]
+fn nested_schema_field_prefix_form_three_way() {
+    const SRC: &str = "#schema Inner { Int x: * }\n\
+                       #schema Outer { Inner inner: *, Int tag: * }\n\
+                       #main(Outer o) -> Int\no.inner.x + o.tag";
+    let args = HashMap::from([(
+        "o".to_string(),
+        schema_val(
+            "Outer",
+            vec![
+                ("inner", schema_val("Inner", vec![("x", Value::Int(7))])),
+                ("tag", Value::Int(3)),
+            ],
+        ),
+    )]);
+    assert_eq!(assert_three_way(SRC, args), Value::Int(10));
+}
+
+/// Three-deep walk (`c.b.a.v`) — each intermediate segment rebases to a
+/// further-nested sub-record before the leaf scalar read.
+#[test]
+fn nested_schema_field_three_levels_three_way() {
+    const SRC: &str = "#schema A { v: Int }\n\
+                       #schema B { a: A }\n\
+                       #schema C { b: B, k: Int }\n\
+                       #main(C c) -> Int\nc.b.a.v + c.k";
+    let args = HashMap::from([(
+        "c".to_string(),
+        schema_val(
+            "C",
+            vec![
+                (
+                    "b",
+                    schema_val(
+                        "B",
+                        vec![("a", schema_val("A", vec![("v", Value::Int(40))]))],
+                    ),
+                ),
+                ("k", Value::Int(2)),
+            ],
+        ),
+    )]);
+    assert_eq!(assert_three_way(SRC, args), Value::Int(42));
+}
+
 // ----------------------------- loud caps ------------------------------
 
 /// `List<Schema>` params/fields, nested `List<List<…>>`, and `Dict`
@@ -237,6 +314,11 @@ fn unsupported_pointer_indirect_shapes_loudly_capped() {
         // schema field whose type is a List<Schema> (nested decode).
         "#schema Inner { x: Int }\n#schema Cfg { items: List<Inner>, port: Int }\n\
          #main(Cfg cfg) -> Int\ncfg.port",
+        // nested schema reachable through a multi-segment walk whose own
+        // field is a List<Schema> — the nested-walk support must not
+        // accidentally green-light the unimplemented inner list decode.
+        "#schema Leaf { x: Int }\n#schema Mid { items: List<Leaf> }\n\
+         #schema Outer { mid: Mid, tag: Int }\n#main(Outer o) -> Int\no.tag",
     ] {
         let cl = AotEvaluator::from_source(src);
         assert!(cl.is_err(), "cranelift must loudly reject `{src}`, got Ok");

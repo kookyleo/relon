@@ -526,17 +526,27 @@ fn collect_fields(pairs: &[(TokenKey, Node)], def: &mut SchemaDef, tree: &mut An
             // analyzable; runtime owns them.
             continue;
         };
-        let is_wildcard = matches!(&*value.expr, Expr::Wildcard);
         // A field is "typed" if either:
         //   1. It carries a static prefix (`String name: *`) — then
         //      `value.type_hint` is `Some(_)`.
         //   2. The value position itself is a `Type` expression
         //      (`name: String`) — equivalent to `String name: *`.
-        let value_as_type = if let Expr::Type(t) = &*value.expr {
-            Some(t.clone())
-        } else {
-            None
+        //   3. The value position is a bare schema-name reference
+        //      (`inner: Inner`). Built-in type names parse straight into
+        //      `Expr::Type`, but a user `#schema Inner` is only an
+        //      identifier to the parser, so `inner: Inner` lands as an
+        //      `Expr::Variable(["Inner"])`. Lift the type-name form into a
+        //      `TypeNode` so the value-position spelling desugars to the
+        //      same `Inner inner: *` the prefix form produces — this is
+        //      what unblocks nested-schema field walks (`o.inner.x`).
+        let value_as_type = match &*value.expr {
+            Expr::Type(t) => Some(t.clone()),
+            Expr::Variable(_) => type_name_from_value_variable(value),
+            _ => None,
         };
+        // A lifted type-name field carries the same "no inline predicate"
+        // shape as the canonical `Type field: *` wildcard form.
+        let is_wildcard = matches!(&*value.expr, Expr::Wildcard) || value_as_type.is_some();
         let mut type_hint = value.type_hint.clone().or_else(|| value_as_type.clone());
 
         // Schema-field-position `#brand X y: *` is the directive-form
@@ -583,6 +593,35 @@ fn collect_fields(pairs: &[(TokenKey, Node)], def: &mut SchemaDef, tree: &mut An
             doc_comment: value.doc_comment.clone(),
         });
     }
+}
+
+/// Lift a value-position schema-field type-name reference (`inner: Inner`)
+/// into a [`TypeNode`]. Built-in type names (`String`, `List<…>`, …) are
+/// committed to `Expr::Type` by the parser, so the only `Expr::Variable`
+/// shapes that reach here are user identifiers. We accept a single bare
+/// segment whose initial is uppercase — the lexical convention for a
+/// type/schema name — and reject everything else (multi-segment paths,
+/// dynamic segments, lowercase value/predicate references like
+/// `port: someSibling`). Conservative on purpose: a false lift would turn
+/// a predicate field into a phantom typed field.
+fn type_name_from_value_variable(value: &Node) -> Option<TypeNode> {
+    let Expr::Variable(path) = &*value.expr else {
+        return None;
+    };
+    let [TokenKey::String(name, _, false)] = path.as_slice() else {
+        return None;
+    };
+    if !name.chars().next().is_some_and(char::is_uppercase) {
+        return None;
+    }
+    Some(TypeNode {
+        path: vec![name.clone()],
+        generics: Vec::new(),
+        is_optional: false,
+        range: value.range,
+        variant_fields: None,
+        doc_comment: None,
+    })
 }
 
 /// `#expect ...` / `#brand X`-directive-marked entries inside a schema
