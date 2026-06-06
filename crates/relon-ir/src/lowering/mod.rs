@@ -56,9 +56,10 @@ use peephole::{
     emit_list_float_literal_materialize, emit_list_int_literal_materialize,
     emit_list_value_materialize, list_has_computed_element, list_is_float_shaped, match_bare_range,
     match_materializable_outer_map, probe_expr_ir_ty, try_lower_len_filter_range,
-    try_lower_list_filter, try_lower_list_len, try_lower_list_sum_range, try_lower_list_sum_value,
-    try_lower_materialized_list_reduce, try_lower_nested_range_map_reduce,
-    try_lower_range_chain_len, try_lower_range_chain_reduce,
+    try_lower_list_filter, try_lower_list_len, try_lower_list_map, try_lower_list_reduce,
+    try_lower_list_sum_range, try_lower_list_sum_value, try_lower_materialized_list_reduce,
+    try_lower_nested_range_map_reduce, try_lower_range_chain_len, try_lower_range_chain_reduce,
+    try_lower_range_value,
 };
 
 /// Per-function lowering state shared across the recursive walk.
@@ -3302,6 +3303,12 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
         Expr::Binary(op, lhs, rhs) => lower_binary(*op, lhs, rhs, range, ctx),
         Expr::Ternary { cond, then, els } => lower_ternary(cond, then, els, range, ctx),
         Expr::Where { expr, bindings } => lower_where(expr, bindings, range, ctx),
+        Expr::Comprehension {
+            element,
+            id,
+            iterable,
+            condition,
+        } => lower_comprehension(element, id, iterable, condition.as_ref(), range, ctx),
         Expr::FnCall { path, args } => lower_fn_call(path, args, range, ctx),
         Expr::Closure { .. } => Err(cap!(
             "lower_expr.closure_across_boundary",
@@ -3607,6 +3614,15 @@ fn lower_fn_call(
     if let Some(()) = try_lower_list_filter(path, args, range, ctx)? {
         return Ok(());
     }
+    // Wave R3: general `_list_map(xs, f)` — materialise / resolve the
+    // list source, then dispatch the transform closure per element
+    // through the bundled `list_int_map` body (`Op::CallClosure` over the
+    // proven four-way closure substrate). Sits beside `_list_filter`
+    // here; the method forms `xs.map(f)` route through `stdlib_method_index`
+    // at the bottom of the dispatch (both land on `list_int_map`).
+    if let Some(()) = try_lower_list_map(path, args, range, ctx)? {
+        return Ok(());
+    }
     // review-improvement-160 bytecode M3 phase 2: peephole-desugar
     // `list.sum(range(end))` / `list.sum(range(start, end))` into an
     // explicit `Op::Loop` accumulator before normal lowering kicks in.
@@ -3685,6 +3701,25 @@ fn lower_fn_call(
     // the range-chain reduce so a `range(...)` receiver still elides; it
     // only fires when the receiver is a bare list-typed let.
     if let Some(()) = try_lower_materialized_list_reduce(path, args, range, ctx)? {
+        return Ok(());
+    }
+    // Wave R3: general `_list_reduce(xs, init, f)` — fold an arbitrary
+    // `List<Int>` source to an `Int` accumulator via the bundled
+    // `list_int_fold` body (matches the tree-walk `ListReduce` order +
+    // checked-add overflow). Runs after the `.reduce` method peepholes so
+    // the eliding range-chain / nested-matmul folds keep their scalar
+    // loops; this only fires for the underscore free-call form.
+    if let Some(()) = try_lower_list_reduce(path, args, range, ctx)? {
+        return Ok(());
+    }
+    // Wave R3: general `range(a, b)` as a materialised `List<Int>` value
+    // (not folded inside an eliding consumer). Runs LAST among the
+    // free-call peepholes so the `list.sum(range(...))` /
+    // `_len(_list_filter(range(...)))` / `range(...).len()` elisions above
+    // keep their allocation-free loops; only a bare `range(...)` whose
+    // result is actually used as a list (returned, indexed, `.map`/
+    // `.filter`/`reduce`'d) reaches here and gets a real record.
+    if let Some(()) = try_lower_range_value(path, args, range, ctx)? {
         return Ok(());
     }
     // Final path segment is the method / function name. Earlier
@@ -3917,6 +3952,130 @@ fn lower_fn_call(
         range,
     });
     ctx.tstack.push(stdlib_meta.ret);
+    Ok(())
+}
+
+/// Wave R3: lower a list comprehension `[ element for id in iterable
+/// (if condition)? ]` by desugaring onto the bundled `list_int_filter`
+/// then `list_int_map` higher-order bodies — the same machinery the
+/// `xs.filter(...)` / `xs.map(...)` method forms use.
+///
+/// Semantics (matched byte-exactly to the tree-walk `Expr::Comprehension`
+/// driver in `relon-evaluator::eval`): iterate `iterable`'s elements in
+/// order; when a `condition` is present, keep only the elements for which
+/// `condition` (evaluated with `id` bound to the element) is truthy; emit
+/// `element` (evaluated with `id` bound to the element) for each surviving
+/// element. Filter-then-map composes to exactly this: `list_int_filter`
+/// retains the passing source elements (unchanged), then `list_int_map`
+/// computes `element` from each survivor.
+///
+/// The loop variable `id` becomes the synthesised closure parameter, so
+/// any outer reference inside `condition` / `element` (a `#main` param, a
+/// where-bound value) resolves through the closure's free-variable
+/// capture path exactly as a hand-written `iterable.filter((id) =>
+/// condition).map((id) => element)` would. Only the `List<Int>` element
+/// shape is supported in the AOT envelope today (the bundled HOF bodies
+/// are i64-typed); other element shapes stay capped.
+fn lower_comprehension(
+    element: &Node,
+    id: &str,
+    iterable: &Node,
+    condition: Option<&Node>,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    // 1. Lower the iterable to a `List<Int>` handle. `range(n)`, a
+    //    where-bound list, a `#main` `List<Int>` param, and nested
+    //    comprehensions / map / filter results all land here as
+    //    `IrType::ListInt`.
+    lower_expr(&iterable.expr, iterable.range, ctx)?;
+    let src_ty = ctx.tstack.last().copied();
+    if src_ty != Some(IrType::ListInt) {
+        return Err(cap!(
+            "lower_comprehension.unsupported_expr.1",
+            LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "comprehension iterable must be a List<Int> in the AOT envelope, got {:?}",
+                    src_ty
+                ),
+                range: iterable.range,
+            }
+        ));
+    }
+
+    // Helper: synthesise a single-param closure `(id) => body` over the
+    // loop variable and emit `Op::Call(<builtin>)` against a list source
+    // already sitting on top of the vstack.
+    fn emit_hof_with_synthetic_closure(
+        builtin: &'static str,
+        id: &str,
+        body: &Node,
+        range: TokenRange,
+        ctx: &mut LowerCtx<'_>,
+    ) -> Result<(), LoweringError> {
+        let fn_idx = stdlib_function_index(builtin).ok_or_else(|| {
+            cap!(
+                "lower_comprehension.unknown_stdlib_method.1",
+                LoweringError::UnknownStdlibMethod {
+                    name: builtin.to_string(),
+                    arity: 2,
+                    range,
+                }
+            )
+        })?;
+        let meta = builtin_stdlib().get(fn_idx as usize).ok_or_else(|| {
+            cap!(
+                "lower_comprehension.unknown_stdlib_method.2",
+                LoweringError::UnknownStdlibMethod {
+                    name: builtin.to_string(),
+                    arity: 2,
+                    range,
+                }
+            )
+        })?;
+        let params = meta.params.clone();
+        let ret = meta.ret;
+        let (param_tys_c, ret_ty_c) =
+            stdlib_closure_arg_signature(builtin, 1).ok_or_else(|| {
+                cap!(
+                    "lower_comprehension.unsupported_expr.2",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!("{builtin} closure signature missing"),
+                        range,
+                    }
+                )
+            })?;
+        let closure_expr = Expr::Closure {
+            params: vec![relon_parser::ClosureParam {
+                name: id.to_string(),
+                type_hint: None,
+                range: body.range,
+            }],
+            return_type: None,
+            body: body.clone(),
+        };
+        lower_closure_as_value(&closure_expr, body.range, &param_tys_c, ret_ty_c, ctx)?;
+        ctx.tstack.pop(); // closure
+        ctx.tstack.pop(); // source list handle
+        ctx.out.push(TaggedOp {
+            op: Op::Call {
+                fn_index: fn_idx,
+                arg_count: 2,
+                param_tys: params,
+                ret_ty: ret,
+            },
+            range,
+        });
+        ctx.tstack.push(ret);
+        Ok(())
+    }
+
+    // 2. Optional filter pass `(id) => condition`.
+    if let Some(cond) = condition {
+        emit_hof_with_synthetic_closure("list_int_filter", id, cond, range, ctx)?;
+    }
+    // 3. Map pass `(id) => element`.
+    emit_hof_with_synthetic_closure("list_int_map", id, element, range, ctx)?;
     Ok(())
 }
 

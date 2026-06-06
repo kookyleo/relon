@@ -104,6 +104,11 @@ pub fn stdlib_method_index(receiver_ty: IrType, name: &str) -> Option<u32> {
         (IrType::ListInt, "map") => stdlib_function_index("list_int_map"),
         (IrType::ListInt, "filter") => stdlib_function_index("list_int_filter"),
         (IrType::ListInt, "fold") => stdlib_function_index("list_int_fold"),
+        // Wave R3: the tree-walk surface name for the fold is `reduce`
+        // (`xs.reduce(init, (acc, x) => ...)`); route it onto the same
+        // `list_int_fold` body so the method form composes with the
+        // `_list_reduce` free-call peephole. `fold` stays as an alias.
+        (IrType::ListInt, "reduce") => stdlib_function_index("list_int_fold"),
         // Phase 10-c length dispatch for the new list types. Each
         // length body just reads the leading `[len: u32 LE]` of the
         // record (all list shapes share the same header), but routes
