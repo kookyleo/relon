@@ -131,11 +131,14 @@ fn resolve_capture(
         // by Phase 10-a — closure values cannot carry the analyzer's
         // brand machinery yet.
         if p.schema_brand.is_some() {
-            return Err(LoweringError::UnsupportedClosureCapture {
-                name: name.to_string(),
-                ty: p.ty,
-                range,
-            });
+            return Err(cap!(
+                "resolve_capture.unsupported_closure_capture",
+                LoweringError::UnsupportedClosureCapture {
+                    name: name.to_string(),
+                    ty: p.ty,
+                    range,
+                }
+            ));
         }
         // Use the matching load shape for the param's IR type.
         let load_op = match p.ty {
@@ -240,23 +243,29 @@ pub(super) fn lower_closure_as_value(
         ..
     } = closure_expr
     else {
-        return Err(LoweringError::UnsupportedExpr {
-            kind: format!(
-                "lower_closure_as_value(non-closure `{}`)",
-                closure_expr.kind()
-            ),
-            range: closure_range,
-        });
+        return Err(cap!(
+            "lower_closure_as_value.unsupported_expr.1",
+            LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "lower_closure_as_value(non-closure `{}`)",
+                    closure_expr.kind()
+                ),
+                range: closure_range,
+            }
+        ));
     };
     if lambda_params.len() != expected_param_tys.len() {
-        return Err(LoweringError::UnsupportedExpr {
-            kind: format!(
-                "Closure(arity-mismatch: expected {}, got {})",
-                expected_param_tys.len(),
-                lambda_params.len()
-            ),
-            range: closure_range,
-        });
+        return Err(cap!(
+            "lower_closure_as_value.unsupported_expr.2",
+            LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "Closure(arity-mismatch: expected {}, got {})",
+                    expected_param_tys.len(),
+                    lambda_params.len()
+                ),
+                range: closure_range,
+            }
+        ));
     }
 
     // -----------------------------------------------------------------
@@ -443,22 +452,26 @@ pub(super) fn lower_closure_as_value(
 
     // Body lowering.
     lower_expr(&lambda_body.expr, lambda_body.range, &mut inner)?;
-    let body_ty = inner
-        .tstack
-        .last()
-        .copied()
-        .ok_or_else(|| LoweringError::UnsupportedExpr {
-            kind: "Closure(empty-body-stack)".to_string(),
-            range: lambda_body.range,
-        })?;
+    let body_ty = inner.tstack.last().copied().ok_or_else(|| {
+        cap!(
+            "lower_closure_as_value.unsupported_expr.3",
+            LoweringError::UnsupportedExpr {
+                kind: "Closure(empty-body-stack)".to_string(),
+                range: lambda_body.range,
+            }
+        )
+    })?;
     if body_ty.wasm_slot() != expected_ret_ty.wasm_slot() {
-        return Err(LoweringError::StdlibArgTypeMismatch {
-            name: "closure-return".to_string(),
-            arg_idx: 0,
-            got: body_ty,
-            expected: expected_ret_ty,
-            range: lambda_body.range,
-        });
+        return Err(cap!(
+            "lower_closure_as_value.stdlib_arg_type_mismatch",
+            LoweringError::StdlibArgTypeMismatch {
+                name: "closure-return".to_string(),
+                arg_idx: 0,
+                got: body_ty,
+                expected: expected_ret_ty,
+                range: lambda_body.range,
+            }
+        ));
     }
     inner.out.push(TaggedOp {
         op: Op::Return,

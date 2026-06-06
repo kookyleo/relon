@@ -60,6 +60,7 @@ use relon::{new_evaluator, Backend, BackendError};
 use relon_eval_api::{Evaluator, RuntimeError, Value};
 
 pub mod corpus;
+pub mod ledger;
 pub mod three_way;
 
 /// Backend tier identifiers used by the corpus support-claim ratchet.

@@ -270,9 +270,14 @@ pub(super) fn try_lower_materialized_list_reduce(
         .rev()
         .find(|b| b.name == recv_name)
         .map(|b| b.idx)
-        .ok_or_else(|| LoweringError::UnresolvedVariable {
-            name: recv_name.clone(),
-            range,
+        .ok_or_else(|| {
+            cap!(
+                "try_lower_materialized_list_reduce.unresolved_variable",
+                LoweringError::UnresolvedVariable {
+                    name: recv_name.clone(),
+                    range,
+                }
+            )
         })?;
     ctx.out.push(TaggedOp {
         op: Op::LetGet {
@@ -369,14 +374,15 @@ pub(super) fn try_lower_materialized_list_reduce(
 
     // acc = <init>.
     lower_expr(&init_node.expr, init_node.range, ctx)?;
-    let acc_ty = ctx
-        .tstack
-        .last()
-        .copied()
-        .ok_or_else(|| LoweringError::UnsupportedExpr {
-            kind: "materialised-list reduce: init produced no value".to_string(),
-            range: init_node.range,
-        })?;
+    let acc_ty = ctx.tstack.last().copied().ok_or_else(|| {
+        cap!(
+            "try_lower_materialized_list_reduce.unsupported_expr.1",
+            LoweringError::UnsupportedExpr {
+                kind: "materialised-list reduce: init produced no value".to_string(),
+                range: init_node.range,
+            }
+        )
+    })?;
     ctx.out.push(TaggedOp {
         op: Op::LetSet {
             idx: acc_i,
@@ -527,25 +533,29 @@ pub(super) fn try_lower_materialized_list_reduce(
 
     // Lower the reduce body — leaves the new acc on top.
     lower_expr(&body.expr, body.range, ctx)?;
-    let produced = ctx
-        .tstack
-        .last()
-        .copied()
-        .ok_or_else(|| LoweringError::UnsupportedExpr {
-            kind: "materialised-list reduce: body produced no value".to_string(),
-            range: body.range,
-        })?;
+    let produced = ctx.tstack.last().copied().ok_or_else(|| {
+        cap!(
+            "try_lower_materialized_list_reduce.unsupported_expr.2",
+            LoweringError::UnsupportedExpr {
+                kind: "materialised-list reduce: body produced no value".to_string(),
+                range: body.range,
+            }
+        )
+    })?;
     if produced.wasm_slot() != acc_ty.wasm_slot() {
         ctx.lets.pop();
         ctx.lets.pop();
         let _ = std::mem::replace(&mut ctx.out, saved_outer);
-        return Err(LoweringError::UnsupportedExpr {
-            kind: format!(
-                "materialised-list reduce: body returned {:?}, expected init type {:?}",
-                produced, acc_ty
-            ),
-            range: body.range,
-        });
+        return Err(cap!(
+            "try_lower_materialized_list_reduce.unsupported_expr.3",
+            LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "materialised-list reduce: body returned {:?}, expected init type {:?}",
+                    produced, acc_ty
+                ),
+                range: body.range,
+            }
+        ));
     }
     ctx.lets.pop(); // elem
     ctx.lets.pop(); // acc
@@ -1336,13 +1346,16 @@ fn combine_operator_to_op(op: Operator, range: TokenRange) -> Result<Op, Lowerin
         Operator::Add => Ok(Op::Add(IrType::I64)),
         Operator::Sub => Ok(Op::Sub(IrType::I64)),
         Operator::Mul => Ok(Op::Mul(IrType::I64)),
-        other => Err(LoweringError::UnsupportedExpr {
-            kind: format!(
-                "nested range.map reduce: unsupported combine operator {:?}",
-                other
-            ),
-            range,
-        }),
+        other => Err(cap!(
+            "combine_operator_to_op.unsupported_expr",
+            LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "nested range.map reduce: unsupported combine operator {:?}",
+                    other
+                ),
+                range,
+            }
+        )),
     }
 }
 
@@ -1562,18 +1575,24 @@ pub(super) fn try_lower_list_filter(
 
     // Resolve the bundled `list_int_filter` slot.
     let filter_idx = stdlib_function_index("list_int_filter").ok_or_else(|| {
-        LoweringError::UnknownStdlibMethod {
-            name: "list_int_filter".to_string(),
-            arity: 2,
-            range,
-        }
+        cap!(
+            "try_lower_list_filter.unknown_stdlib_method.1",
+            LoweringError::UnknownStdlibMethod {
+                name: "list_int_filter".to_string(),
+                arity: 2,
+                range,
+            }
+        )
     })?;
     let filter_meta = builtin_stdlib().get(filter_idx as usize).ok_or_else(|| {
-        LoweringError::UnknownStdlibMethod {
-            name: "list_int_filter".to_string(),
-            arity: 2,
-            range,
-        }
+        cap!(
+            "try_lower_list_filter.unknown_stdlib_method.2",
+            LoweringError::UnknownStdlibMethod {
+                name: "list_int_filter".to_string(),
+                arity: 2,
+                range,
+            }
+        )
     })?;
     let filter_params = filter_meta.params.clone();
     let filter_ret = filter_meta.ret;
@@ -1581,10 +1600,13 @@ pub(super) fn try_lower_list_filter(
     // Lower the predicate closure (`(I64) -> Bool`).
     let (param_tys_c, ret_ty_c) =
         stdlib_closure_arg_signature("list_int_filter", 1).ok_or_else(|| {
-            LoweringError::UnsupportedExpr {
-                kind: "list_int_filter closure signature missing".to_string(),
-                range,
-            }
+            cap!(
+                "try_lower_list_filter.unsupported_expr",
+                LoweringError::UnsupportedExpr {
+                    kind: "list_int_filter closure signature missing".to_string(),
+                    range,
+                }
+            )
         })?;
     lower_closure_as_value(
         &args[1].value.expr,
@@ -1651,18 +1673,24 @@ pub(super) fn try_lower_list_sum_value(
     ctx.tstack.extend(arg_stack);
 
     let sum_idx = stdlib_function_index("list_int_sum").ok_or_else(|| {
-        LoweringError::UnknownStdlibMethod {
-            name: "list_int_sum".to_string(),
-            arity: 1,
-            range,
-        }
+        cap!(
+            "try_lower_list_sum_value.unknown_stdlib_method.1",
+            LoweringError::UnknownStdlibMethod {
+                name: "list_int_sum".to_string(),
+                arity: 1,
+                range,
+            }
+        )
     })?;
     let sum_meta = builtin_stdlib().get(sum_idx as usize).ok_or_else(|| {
-        LoweringError::UnknownStdlibMethod {
-            name: "list_int_sum".to_string(),
-            arity: 1,
-            range,
-        }
+        cap!(
+            "try_lower_list_sum_value.unknown_stdlib_method.2",
+            LoweringError::UnknownStdlibMethod {
+                name: "list_int_sum".to_string(),
+                arity: 1,
+                range,
+            }
+        )
     })?;
     let sum_params = sum_meta.params.clone();
     let sum_ret = sum_meta.ret;
@@ -1746,9 +1774,14 @@ pub(super) fn emit_list_float_literal_materialize(
     range: TokenRange,
     ctx: &mut LowerCtx<'_>,
 ) -> Result<(), LoweringError> {
-    let count = i32::try_from(items.len()).map_err(|_| LoweringError::UnsupportedExpr {
-        kind: "List<Float>(literal too long for i32 count)".to_string(),
-        range,
+    let count = i32::try_from(items.len()).map_err(|_| {
+        cap!(
+            "emit_list_float_literal_materialize.unsupported_expr.1",
+            LoweringError::UnsupportedExpr {
+                kind: "List<Float>(literal too long for i32 count)".to_string(),
+                range,
+            }
+        )
     })?;
     let base_i = ctx.next_let_idx;
     let payload_i = ctx.next_let_idx + 1;
@@ -1853,9 +1886,14 @@ pub(super) fn emit_list_float_literal_materialize(
             range,
         });
         ctx.tstack.push(IrType::I32);
-        let byte_off = i32::try_from(i * 8).map_err(|_| LoweringError::UnsupportedExpr {
-            kind: "List<Float>(element offset overflow)".to_string(),
-            range,
+        let byte_off = i32::try_from(i * 8).map_err(|_| {
+            cap!(
+                "emit_list_float_literal_materialize.unsupported_expr.2",
+                LoweringError::UnsupportedExpr {
+                    kind: "List<Float>(element offset overflow)".to_string(),
+                    range,
+                }
+            )
         })?;
         ctx.out.push(TaggedOp {
             op: Op::ConstI32(byte_off),
@@ -1874,14 +1912,15 @@ pub(super) fn emit_list_float_literal_materialize(
         // the runtime Int->Float promotion + the const-list arm's
         // `[1, 2.0]` widening).
         lower_expr(&item.expr, item.range, ctx)?;
-        let elem_ty = ctx
-            .tstack
-            .last()
-            .copied()
-            .ok_or_else(|| LoweringError::UnsupportedExpr {
-                kind: "List<Float>(element produced no value)".to_string(),
-                range: item.range,
-            })?;
+        let elem_ty = ctx.tstack.last().copied().ok_or_else(|| {
+            cap!(
+                "emit_list_float_literal_materialize.unsupported_expr.3",
+                LoweringError::UnsupportedExpr {
+                    kind: "List<Float>(element produced no value)".to_string(),
+                    range: item.range,
+                }
+            )
+        })?;
         match elem_ty {
             IrType::F64 => {}
             IrType::I64 => {
@@ -1893,10 +1932,15 @@ pub(super) fn emit_list_float_literal_materialize(
                 ctx.tstack.push(IrType::F64);
             }
             other => {
-                return Err(LoweringError::UnsupportedExpr {
-                    kind: format!("List<Float>(element #{i} lowered to {other:?}, expected Float)"),
-                    range: item.range,
-                });
+                return Err(cap!(
+                    "emit_list_float_literal_materialize.unsupported_expr.4",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "List<Float>(element #{i} lowered to {other:?}, expected Float)"
+                        ),
+                        range: item.range,
+                    }
+                ));
             }
         }
         ctx.out.push(TaggedOp {
@@ -1944,9 +1988,14 @@ pub(super) fn emit_list_int_literal_materialize(
     range: TokenRange,
     ctx: &mut LowerCtx<'_>,
 ) -> Result<(), LoweringError> {
-    let count = i32::try_from(items.len()).map_err(|_| LoweringError::UnsupportedExpr {
-        kind: "List<Int>(literal too long for i32 count)".to_string(),
-        range,
+    let count = i32::try_from(items.len()).map_err(|_| {
+        cap!(
+            "emit_list_int_literal_materialize.unsupported_expr.1",
+            LoweringError::UnsupportedExpr {
+                kind: "List<Int>(literal too long for i32 count)".to_string(),
+                range,
+            }
+        )
     })?;
     let base_i = ctx.next_let_idx;
     let payload_i = ctx.next_let_idx + 1;
@@ -2050,9 +2099,14 @@ pub(super) fn emit_list_int_literal_materialize(
             range,
         });
         ctx.tstack.push(IrType::I32);
-        let byte_off = i32::try_from(i * 8).map_err(|_| LoweringError::UnsupportedExpr {
-            kind: "List<Int>(element offset overflow)".to_string(),
-            range,
+        let byte_off = i32::try_from(i * 8).map_err(|_| {
+            cap!(
+                "emit_list_int_literal_materialize.unsupported_expr.2",
+                LoweringError::UnsupportedExpr {
+                    kind: "List<Int>(element offset overflow)".to_string(),
+                    range,
+                }
+            )
         })?;
         ctx.out.push(TaggedOp {
             op: Op::ConstI32(byte_off),
@@ -2069,21 +2123,25 @@ pub(super) fn emit_list_int_literal_materialize(
 
         // value = lowered element; require it to be Int-shaped (I64).
         lower_expr(&item.expr, item.range, ctx)?;
-        let elem_ty = ctx
-            .tstack
-            .last()
-            .copied()
-            .ok_or_else(|| LoweringError::UnsupportedExpr {
-                kind: "List<Int>(element produced no value)".to_string(),
-                range: item.range,
-            })?;
+        let elem_ty = ctx.tstack.last().copied().ok_or_else(|| {
+            cap!(
+                "emit_list_int_literal_materialize.unsupported_expr.3",
+                LoweringError::UnsupportedExpr {
+                    kind: "List<Int>(element produced no value)".to_string(),
+                    range: item.range,
+                }
+            )
+        })?;
         match elem_ty {
             IrType::I64 => {}
             other => {
-                return Err(LoweringError::UnsupportedExpr {
-                    kind: format!("List<Int>(element #{i} lowered to {other:?}, expected Int)"),
-                    range: item.range,
-                });
+                return Err(cap!(
+                    "emit_list_int_literal_materialize.unsupported_expr.4",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!("List<Int>(element #{i} lowered to {other:?}, expected Int)"),
+                        range: item.range,
+                    }
+                ));
             }
         }
         ctx.out.push(TaggedOp {
@@ -2140,14 +2198,15 @@ pub(super) fn probe_expr_ir_ty(
     let lets_len = ctx.lets.len();
     let next_let = ctx.next_let_idx;
     lower_expr(&node.expr, node.range, ctx)?;
-    let ty = ctx
-        .tstack
-        .last()
-        .copied()
-        .ok_or_else(|| LoweringError::UnsupportedExpr {
-            kind: "List(computed element produced no value during type probe)".to_string(),
-            range: node.range,
-        })?;
+    let ty = ctx.tstack.last().copied().ok_or_else(|| {
+        cap!(
+            "probe_expr_ir_ty.unsupported_expr",
+            LoweringError::UnsupportedExpr {
+                kind: "List(computed element produced no value during type probe)".to_string(),
+                range: node.range,
+            }
+        )
+    })?;
     // Roll back all side effects so the real materialiser re-lowers the
     // element from scratch (no duplicate ops, no leaked let slots).
     ctx.out.truncate(out_len);
@@ -2673,11 +2732,15 @@ pub(super) fn emit_list_value_materialize(
         return emit_range_materialize(range_args, range, ctx);
     }
     let Some((range_args, param, inner_body)) = match_materializable_outer_map(value_expr) else {
-        return Err(LoweringError::UnsupportedExpr {
-            kind: "where-bound list value is neither a bare range nor a range().map((p) => ...)"
-                .to_string(),
-            range,
-        });
+        return Err(cap!(
+            "emit_list_value_materialize.unsupported_expr.1",
+            LoweringError::UnsupportedExpr {
+                kind:
+                    "where-bound list value is neither a bare range nor a range().map((p) => ...)"
+                        .to_string(),
+                range,
+            }
+        ));
     };
 
     // Slot plan (all distinct, single-typed for their lifetime — the
@@ -3003,10 +3066,13 @@ pub(super) fn emit_list_value_materialize(
         || match_materializable_outer_map(&inner_body.expr).is_some();
     if inner_is_list {
         emit_list_value_materialize(&inner_body.expr, inner_body.range, ctx)?;
-        let produced = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
-            kind: "where-bound 2D materialise: inner row produced no value".to_string(),
-            range: inner_body.range,
-        })?;
+        let produced = ctx.tstack.pop().ok_or(cap!(
+            "emit_list_value_materialize.unsupported_expr.2",
+            LoweringError::UnsupportedExpr {
+                kind: "where-bound 2D materialise: inner row produced no value".to_string(),
+                range: inner_body.range,
+            }
+        ))?;
         debug_assert_eq!(produced, IrType::ListInt);
         // Widen the i32 row handle into the i64 element slot.
         ctx.out.push(TaggedOp {
@@ -3018,21 +3084,27 @@ pub(super) fn emit_list_value_materialize(
         });
     } else {
         lower_expr(&inner_body.expr, inner_body.range, ctx)?;
-        let produced = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
-            kind: "where-bound list materialise: map body produced no value".to_string(),
-            range: inner_body.range,
-        })?;
+        let produced = ctx.tstack.pop().ok_or(cap!(
+            "emit_list_value_materialize.unsupported_expr.3",
+            LoweringError::UnsupportedExpr {
+                kind: "where-bound list materialise: map body produced no value".to_string(),
+                range: inner_body.range,
+            }
+        ))?;
         if produced != IrType::I64 {
             // Restore the op stream before surfacing the diagnostic.
             ctx.lets.pop();
             let _ = std::mem::replace(&mut ctx.out, saved_outer);
-            return Err(LoweringError::UnsupportedExpr {
-                kind: format!(
+            return Err(cap!(
+                "emit_list_value_materialize.unsupported_expr.4",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
                     "where-bound list materialise: map body must be Int- or list-valued, got {:?}",
                     produced
                 ),
-                range: inner_body.range,
-            });
+                    range: inner_body.range,
+                }
+            ));
         }
         ctx.out.push(TaggedOp {
             op: Op::LetSet {
@@ -3398,13 +3470,15 @@ fn emit_range_pipeline_loop(
         }
         RangeConsumer::Reduce { init, .. } => {
             lower_expr(&init.expr, init.range, ctx)?;
-            ctx.tstack
-                .last()
-                .copied()
-                .ok_or_else(|| LoweringError::UnsupportedExpr {
-                    kind: "range-chain reduce: init expression produced no value".to_string(),
-                    range: init.range,
-                })?
+            ctx.tstack.last().copied().ok_or_else(|| {
+                cap!(
+                    "emit_range_pipeline_loop.unsupported_expr.1",
+                    LoweringError::UnsupportedExpr {
+                        kind: "range-chain reduce: init expression produced no value".to_string(),
+                        range: init.range,
+                    }
+                )
+            })?
         }
     };
     ctx.out.push(TaggedOp {
@@ -3495,17 +3569,18 @@ fn emit_range_pipeline_loop(
         });
         let body_node = stage.closure_body;
         lower_expr(&body_node.expr, body_node.range, ctx)?;
-        let produced_ty =
-            ctx.tstack
-                .last()
-                .copied()
-                .ok_or_else(|| LoweringError::UnsupportedExpr {
+        let produced_ty = ctx.tstack.last().copied().ok_or_else(|| {
+            cap!(
+                "emit_range_pipeline_loop.unsupported_expr.2",
+                LoweringError::UnsupportedExpr {
                     kind: format!(
                         "range-chain {}: closure body produced no value",
                         stage.method
                     ),
                     range: body_node.range,
-                })?;
+                }
+            )
+        })?;
         ctx.lets.pop();
         match stage.method {
             "map" => {
@@ -3532,13 +3607,16 @@ fn emit_range_pipeline_loop(
                     ctx.out = saved_iter;
                     let _ = std::mem::take(&mut ctx.out);
                     ctx.out = saved_outer;
-                    return Err(LoweringError::UnsupportedExpr {
-                        kind: format!(
-                            "range-chain filter predicate must return Bool, got {:?}",
-                            produced_ty
-                        ),
-                        range,
-                    });
+                    return Err(cap!(
+                        "emit_range_pipeline_loop.unsupported_expr.3",
+                        LoweringError::UnsupportedExpr {
+                            kind: format!(
+                                "range-chain filter predicate must return Bool, got {:?}",
+                                produced_ty
+                            ),
+                            range,
+                        }
+                    ));
                 }
                 // The predicate left a Bool on top. Branch to the
                 // "next-iter" block on FALSE so the consumer update
@@ -3566,10 +3644,13 @@ fn emit_range_pipeline_loop(
                 // current_value passes through unchanged.
             }
             other => {
-                return Err(LoweringError::UnsupportedExpr {
-                    kind: format!("range-chain: unsupported method `{}`", other),
-                    range,
-                });
+                return Err(cap!(
+                    "emit_range_pipeline_loop.unsupported_expr.4",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!("range-chain: unsupported method `{}`", other),
+                        range,
+                    }
+                ));
             }
         }
     }
@@ -3591,13 +3672,16 @@ fn emit_range_pipeline_loop(
                 ctx.out = saved_iter;
                 let _ = std::mem::take(&mut ctx.out);
                 ctx.out = saved_outer;
-                return Err(LoweringError::UnsupportedExpr {
-                    kind: format!(
-                        "list.sum(range(...).map(...)) requires Int-valued element; got {:?}",
-                        current_value_ty
-                    ),
-                    range,
-                });
+                return Err(cap!(
+                    "emit_range_pipeline_loop.unsupported_expr.5",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "list.sum(range(...).map(...)) requires Int-valued element; got {:?}",
+                            current_value_ty
+                        ),
+                        range,
+                    }
+                ));
             }
             // acc_i += element
             ctx.out.push(TaggedOp {
@@ -3667,13 +3751,16 @@ fn emit_range_pipeline_loop(
                 ctx.out = saved_iter;
                 let _ = std::mem::take(&mut ctx.out);
                 ctx.out = saved_outer;
-                return Err(LoweringError::UnsupportedExpr {
-                    kind: format!(
-                        "range-chain reduce requires 2-arg closure (acc, elem); got {}",
-                        params.len()
-                    ),
-                    range,
-                });
+                return Err(cap!(
+                    "emit_range_pipeline_loop.unsupported_expr.6",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "range-chain reduce requires 2-arg closure (acc, elem); got {}",
+                            params.len()
+                        ),
+                        range,
+                    }
+                ));
             }
             // Bind acc into a fresh let under params[0].name. Source
             // value: current acc_i contents.
@@ -3726,26 +3813,30 @@ fn emit_range_pipeline_loop(
             // Lower the closure body — leaves the new acc value on
             // top of the vstack.
             lower_expr(&body.expr, body.range, ctx)?;
-            let produced =
-                ctx.tstack
-                    .last()
-                    .copied()
-                    .ok_or_else(|| LoweringError::UnsupportedExpr {
+            let produced = ctx.tstack.last().copied().ok_or_else(|| {
+                cap!(
+                    "emit_range_pipeline_loop.unsupported_expr.7",
+                    LoweringError::UnsupportedExpr {
                         kind: "range-chain reduce: body produced no value".to_string(),
                         range: body.range,
-                    })?;
+                    }
+                )
+            })?;
             if produced.wasm_slot() != acc_ty.wasm_slot() {
                 let _ = std::mem::take(&mut ctx.out);
                 ctx.out = saved_iter;
                 let _ = std::mem::take(&mut ctx.out);
                 ctx.out = saved_outer;
-                return Err(LoweringError::UnsupportedExpr {
-                    kind: format!(
-                        "range-chain reduce: body returned {:?}, expected init type {:?}",
-                        produced, acc_ty
-                    ),
-                    range: body.range,
-                });
+                return Err(cap!(
+                    "emit_range_pipeline_loop.unsupported_expr.8",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "range-chain reduce: body returned {:?}, expected init type {:?}",
+                            produced, acc_ty
+                        ),
+                        range: body.range,
+                    }
+                ));
             }
             ctx.lets.pop(); // elem
             ctx.lets.pop(); // acc
