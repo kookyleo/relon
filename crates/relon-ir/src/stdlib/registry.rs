@@ -35,6 +35,7 @@ use super::normalization::{
     nfkc_string, nfkd_string,
 };
 use super::signatures::StdlibFunction;
+use super::string_ops::{ends_with_string, len_string_to_int, replace_string};
 
 /// Return the ordered list of builtin stdlib functions. The order is
 /// part of the wire format — new entries must be **appended** so the
@@ -250,6 +251,34 @@ pub fn builtin_stdlib() -> &'static [StdlibFunction] {
             ceil_float_to_int(),
             round_float_to_int(),
             sqrt_float(),
+            // Wave R8: scalar / Bool / String-returning string stdlib.
+            // Appended at the tail (indices 52+) so every position-pinned
+            // index above stays put — existing-construct cranelift/llvm
+            // bytes are unchanged, so GENERATOR_VERSION does not move.
+            // Each body is purely byte-level (record header read, byte
+            // loads/stores, scratch alloc + memcpy, `BitAnd` char-boundary
+            // test) — no UTF-8 decode or `Op::Trap` — so it lowers four-way
+            // (tree-walk == cranelift == llvm-native == llvm-wasm),
+            // byte-exact with the tree-walk oracle.
+            //   * `52` — `len(String) -> Int` (free-call byte length;
+            //             same op-stream as `length`).
+            //   * `53` — `ends_with(String, String) -> Bool` (suffix
+            //             byte compare; sibling to `starts_with`).
+            //   * `54` — `replace(String, String, String) -> String`
+            //             (non-overlapping byte substring replace-all,
+            //             empty-`from` inserts at every char boundary).
+            // `trim` / `trim_start` / `trim_end` stay capped: a
+            // `char::is_whitespace()`-exact trim needs the UTF-8 decoder +
+            // `__is_whitespace` helper + `Op::Trap { InvalidUtf8 }` seam
+            // the LLVM-native / wasm backends do not lower (same seam that
+            // keeps `upper` / `title` / `nfd` at tree-walk + cranelift —
+            // see `relon-codegen-llvm/tests/phase0b_unicode.rs`).
+            // `matches` stays capped (needs the full `regex` engine, no
+            // wasm-portable body); `split` stays capped (List<String>
+            // result — wasm has no in-place List<String> decoder yet).
+            len_string_to_int(),
+            ends_with_string(),
+            replace_string(),
         ]
     })
 }
