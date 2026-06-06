@@ -879,5 +879,53 @@ pub fn all_cases() -> Vec<CorpusCase> {
             tier: Tier::StdlibSimple,
             supported_by: TW_CR,
         },
+        // ---- Wave R5: static arm selection of strict-mode `match` ----
+        // The scrutinee's IR type is statically known, so the winning arm
+        // is selected at compile time (no runtime brand dispatch). The
+        // scrutinee is still evaluated + discarded for trap / ordering
+        // parity (the R4 `type(v)` discard pattern), then the selected
+        // arm's body is lowered as the result. `String`-returning shapes
+        // ride `TW_CR` (bytecode rejects String return; the trace recipe
+        // catalogue has no match shape) exactly like the R4 entries.
+        //
+        // A builtin-scalar pattern (`Int`) against an `Int` scrutinee
+        // matches; the wildcard never fires.
+        CorpusCase {
+            name: "r5_match_int_arm",
+            source: "#main(Int n) -> String\nn match { Int: \"int\", *: \"other\" }",
+            args_factory: || one_int("n", 5),
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        // A non-literal arm body (`n * 2`) lowered as real IR — proves the
+        // selected body is general codegen, not a folded constant. Int
+        // return rides `TW_CR_BC` (bytecode handles Int return).
+        CorpusCase {
+            name: "r5_match_int_body_arith",
+            source: "#main(Int n) -> Int\nn match { Int: n * 2, *: 0 }",
+            args_factory: || one_int("n", 7),
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR_BC,
+        },
+        // Source ordering: two arms both statically match; the FIRST wins.
+        CorpusCase {
+            name: "r5_match_ordering_first_wins",
+            source: "#main(Int n) -> String\nn match { Int: \"a\", Int: \"b\", *: \"c\" }",
+            args_factory: || one_int("n", 3),
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        // A builtin-scalar pattern naming a DIFFERENT scalar than the
+        // static type (`Int` arm vs a `String` scrutinee) provably never
+        // matches; the wildcard wins.
+        CorpusCase {
+            name: "r5_match_scalar_mismatch_falls_to_wildcard",
+            source: "#main(String s) -> String\ns match { Int: \"int\", *: \"other\" }",
+            args_factory: || {
+                HashMap::from([("s".to_string(), Value::String("hi".into()))])
+            },
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
     ]
 }

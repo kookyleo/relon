@@ -1677,4 +1677,30 @@ pub const LEDGER: &[LedgerEntry] = &[
         corpus: "",
         reason: "stdlib call argument type disagrees with the declared signature",
     },
+    LedgerEntry {
+        id: "lower_match.unsupported_expr.1",
+        site: "lowering/mod.rs::lower_match",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "match arm not statically decidable (coarsening/generic/branded-builtin \
+                 pattern); dynamic brand dispatch deferred to R6",
+    },
+    LedgerEntry {
+        id: "lower_match.unsupported_expr.2",
+        site: "lowering/mod.rs::lower_match",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "match with no statically-matching arm would trap TypeMismatch; no \
+                 cross-backend trap code surfaces that RuntimeError yet",
+    },
+    LedgerEntry {
+        id: "lower_match.unsupported_expr.3",
+        site: "lowering/mod.rs::lower_match",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "match scrutinee produced no IR value during real lowering; defensive cap",
+    },
 ];

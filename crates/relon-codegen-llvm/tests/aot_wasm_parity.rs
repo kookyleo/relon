@@ -530,6 +530,16 @@ const FAST: &[Fast] = &[
         src: "#main(Int n) -> Int\nrange(n).reduce(1, (acc, i) => acc * (i + 1))",
         args: &[8],
     },
+    // Wave R5 — static match arm selection with a NON-literal selected
+    // body (`n * 2`). The `Int` scrutinee statically picks the first arm;
+    // the wildcard never fires. The body lowers to real arithmetic IR
+    // (not a folded constant), so the FastInt entry proves the selected
+    // body is general codegen on the native + wasm legs.
+    Fast {
+        name: "r5_match_int_body_arith",
+        src: "#main(Int n) -> Int\nn match { Int: n * 2, *: 0 }",
+        args: &[7],
+    },
 ];
 
 #[test]
@@ -687,6 +697,69 @@ fn r4_type_list_coarsen_aligns_native_via_wasmtime() {
     match out.get("value") {
         Some(Decoded::Str(s)) => assert_eq!(*s, want, "r4 type(list) wasm != native"),
         other => panic!("r4 type(list) decoded {other:?}"),
+    }
+}
+
+/// Wave R5 — static match arm selection. An `Int` scrutinee statically
+/// satisfies the `Int` arm, so the lowering selects `"int"` at compile
+/// time (the wildcard never fires). The scrutinee is still evaluated +
+/// discarded for trap / ordering parity, then the selected arm's String
+/// body is the result. Verified byte-equal on the wasm32 leg against the
+/// native LLVM oracle (itself bit-aligned to tree-walk + cranelift).
+#[test]
+fn r5_match_int_arm_aligns_native_via_wasmtime() {
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping r5 match int arm");
+        return;
+    }
+    let src = "#main(Int n) -> String\nn match { Int: \"int\", *: \"other\" }";
+    let n = 5i64;
+    let want = match native_run(src, HashMap::from([("n".to_string(), Value::Int(n))])) {
+        Value::String(s) => s,
+        other => panic!("native expected String, got {other:?}"),
+    };
+    assert_eq!(want, "int", "native r5 match int-arm oracle drifted");
+    let (bytes, info) = build("r5_match_int_arm", src);
+    let in_record = pack_single_int(&info, n);
+    let out = run_buffer(&bytes, "relon_parity_r5_match_int_arm", &info, &in_record);
+    match out.get("value") {
+        Some(Decoded::Str(s)) => assert_eq!(*s, want, "r5 match int-arm wasm != native"),
+        other => panic!("r5 match int-arm decoded {other:?}"),
+    }
+}
+
+/// Wave R5 — a builtin-scalar pattern naming a DIFFERENT scalar than the
+/// static type (`Float` arm vs an `Int` scrutinee) provably never
+/// matches, so the wildcard wins and the lowering selects `"other"`.
+/// Proves the "arm provably never matches → skip" decision agrees with
+/// the runtime `check_type` on the native + wasm legs.
+#[test]
+fn r5_match_scalar_mismatch_aligns_native_via_wasmtime() {
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping r5 match scalar mismatch");
+        return;
+    }
+    let src = "#main(Int n) -> String\nn match { Float: \"f\", *: \"other\" }";
+    let n = 9i64;
+    let want = match native_run(src, HashMap::from([("n".to_string(), Value::Int(n))])) {
+        Value::String(s) => s,
+        other => panic!("native expected String, got {other:?}"),
+    };
+    assert_eq!(
+        want, "other",
+        "native r5 match scalar-mismatch oracle drifted"
+    );
+    let (bytes, info) = build("r5_match_scalar_mismatch", src);
+    let in_record = pack_single_int(&info, n);
+    let out = run_buffer(
+        &bytes,
+        "relon_parity_r5_match_scalar_mismatch",
+        &info,
+        &in_record,
+    );
+    match out.get("value") {
+        Some(Decoded::Str(s)) => assert_eq!(*s, want, "r5 match scalar-mismatch wasm != native"),
+        other => panic!("r5 match scalar-mismatch decoded {other:?}"),
     }
 }
 
