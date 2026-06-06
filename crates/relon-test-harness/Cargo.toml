@@ -29,6 +29,9 @@ relon-ir = { workspace = true }
 
 thiserror = { workspace = true }
 serde_json = { workspace = true }
+# `Value::Float` corpus args (Wave R4 `type(Float)` case) need an
+# `OrderedFloat` literal in the library-side corpus table.
+ordered-float = { workspace = true }
 
 [dev-dependencies]
 relon-parser = { workspace = true }
