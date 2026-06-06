@@ -21,7 +21,7 @@ use cranelift_codegen::ir::types::{I32, I64};
 use cranelift_codegen::ir::InstBuilder;
 use ordered_float::OrderedFloat;
 
-use relon_ir::ir::{ClosureCapture, IrType, TaggedOp, TrapKind as IrTrapKind};
+use relon_ir::ir::{ClosureCapture, F64UnaryOp, IrType, TaggedOp, TrapKind as IrTrapKind};
 use relon_ir::OpVisitor;
 
 use crate::error::CraneliftError;
@@ -259,6 +259,12 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
 
     fn visit_convert_i64_to_f64(&mut self) -> Result<(), CraneliftError> {
         self.emit_convert_i64_to_f64()
+    }
+    fn visit_f64_to_i64_sat(&mut self) -> Result<(), CraneliftError> {
+        self.emit_f64_to_i64_sat()
+    }
+    fn visit_f64_unary(&mut self, op: F64UnaryOp) -> Result<(), CraneliftError> {
+        self.emit_f64_unary(op)
     }
 
     // Comparison.

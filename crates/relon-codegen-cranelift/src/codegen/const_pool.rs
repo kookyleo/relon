@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 
 use ordered_float::OrderedFloat;
-use relon_ir::ir::{ClosureCapture, IrType, Module as IrModule, TaggedOp, TrapKind};
+use relon_ir::ir::{ClosureCapture, F64UnaryOp, IrType, Module as IrModule, TaggedOp, TrapKind};
 use relon_ir::{walk_body, OpVisitor};
 
 use crate::error::CraneliftError;
@@ -625,6 +625,12 @@ impl OpVisitor for ConstPool {
         Ok(())
     }
     fn visit_convert_i64_to_f64(&mut self) -> Result<(), CraneliftError> {
+        Ok(())
+    }
+    fn visit_f64_to_i64_sat(&mut self) -> Result<(), CraneliftError> {
+        Ok(())
+    }
+    fn visit_f64_unary(&mut self, _: F64UnaryOp) -> Result<(), CraneliftError> {
         Ok(())
     }
     fn visit_eq(&mut self, _: IrType) -> Result<(), CraneliftError> {

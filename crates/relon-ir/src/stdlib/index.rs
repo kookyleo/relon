@@ -53,6 +53,10 @@ pub fn stdlib_function_count() -> u32 {
 pub fn stdlib_method_index(receiver_ty: IrType, name: &str) -> Option<u32> {
     match (receiver_ty, name) {
         (IrType::String, "length") => stdlib_function_index("length"),
+        // Wave R7: `s.len()` is the tree-walk surface alias for
+        // `s.length()` (both registered on `String` in the evaluator);
+        // route it to the same bundled `length` body.
+        (IrType::String, "len") => stdlib_function_index("length"),
         (IrType::ListInt, "length") => stdlib_function_index("list_int_length"),
         (IrType::String, "is_empty") => stdlib_function_index("is_empty"),
         // Phase 4.c-2: String / List<Int> method-form dispatch.

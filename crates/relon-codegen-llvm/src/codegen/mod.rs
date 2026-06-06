@@ -2858,6 +2858,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             Op::Mod(ty) => self.emit_binop(&ip_hint, *ty, BinOp::Mod)?,
             Op::BitAnd(ty) => self.emit_binop(&ip_hint, *ty, BinOp::BitAnd)?,
             Op::ConvertI64ToF64 => self.emit_convert_i64_to_f64(&ip_hint)?,
+            Op::F64ToI64Sat => self.emit_f64_to_i64_sat(&ip_hint)?,
+            Op::F64Unary(op) => self.emit_f64_unary(&ip_hint, *op)?,
 
             // ---- comparisons ----
             Op::Eq(ty) => self.emit_cmp(&ip_hint, *ty, IntPredicate::EQ)?,

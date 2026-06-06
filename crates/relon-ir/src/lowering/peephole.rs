@@ -1526,6 +1526,141 @@ pub(super) fn try_lower_list_len(
     Ok(Some(()))
 }
 
+/// Wave R7: scalar-returning Float math stdlib — `abs` / `floor` /
+/// `ceil` / `round` / `sqrt` as free calls (`floor(x)`) or methods
+/// (`x.floor()`). These cap on the compiled backends through the generic
+/// `stdlib_function_index` path because the polymorphic numeric domain
+/// (the bundled `abs` is `Int -> Int`, and `floor`/`ceil`/`round`/`sqrt`
+/// have no bundled body until R7) cannot be selected by name alone.
+///
+/// The peephole lowers the single argument speculatively, inspects its
+/// IR type, and dispatches to the body whose semantics match the
+/// tree-walk oracle for that operand type:
+///
+///   * `abs` — `I64` → bundled int `abs` (index 2, `n.abs()`); `F64` →
+///     `abs_float` (`f64::abs`).
+///   * `floor`/`ceil`/`round` — `I64` → identity (oracle returns the Int
+///     unchanged); `F64` → the matching `*_float_to_int` body
+///     (`f64::floor`/`ceil`/`round_ties_even` then saturating `as i64`).
+///   * `sqrt` — `F64` → `sqrt_float`; `I64` → widen with
+///     `ConvertI64ToF64` first (oracle coerces via `as f64`) then
+///     `sqrt_float`.
+///
+/// Returns `Ok(Some(()))` on a committed lowering, `Ok(None)` when the
+/// shape does not match (caller falls through to the generic dispatch,
+/// which caps loudly for unsupported operand types). `pow` is
+/// deliberately NOT handled — it needs a `pow` libcall with no native
+/// wasm instruction, so it stays capped.
+pub(super) fn try_lower_scalar_math(
+    method_name: &str,
+    receiver_segments: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    // These are registered ONLY as free functions in the tree-walk
+    // evaluator (`abs`/`floor`/`ceil`/`round`/`sqrt`), never as methods.
+    // Reject the method form (`x.floor()`) so the compiled backends stay
+    // byte-equal with the oracle, which raises `function_not_found` for
+    // it.
+    let name = method_name;
+    if !receiver_segments.is_empty() {
+        return Ok(None);
+    }
+    if !matches!(name, "abs" | "floor" | "ceil" | "round" | "sqrt") {
+        return Ok(None);
+    }
+    if args.len() != 1 || args[0].name.is_some() {
+        return Ok(None);
+    }
+
+    // Speculatively lower the operand into a scratch stream so a
+    // non-numeric / failed lowering rolls back cleanly.
+    let saved_out = std::mem::take(&mut ctx.out);
+    let saved_stack = std::mem::take(&mut ctx.tstack);
+    let saved_next_let = ctx.next_let_idx;
+    let saved_lambda_len = ctx.lambda_table.borrow().len();
+    let lower_res = lower_expr(&args[0].value.expr, args[0].value.range, ctx);
+    let produced = ctx.tstack.last().copied();
+    let operand_ok = lower_res.is_ok() && matches!(produced, Some(IrType::I64) | Some(IrType::F64));
+    if !operand_ok {
+        ctx.out = saved_out;
+        ctx.tstack = saved_stack;
+        ctx.next_let_idx = saved_next_let;
+        ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+        return Ok(None);
+    }
+    let operand_ty = produced.expect("checked Some above");
+
+    // Commit: splice the operand stream onto the outer ctx.
+    let arg_stream = std::mem::replace(&mut ctx.out, saved_out);
+    ctx.out.extend(arg_stream);
+    let arg_stack = std::mem::replace(&mut ctx.tstack, saved_stack);
+    ctx.tstack.extend(arg_stack);
+
+    // Helper: emit an `Op::Call` to a bundled stdlib body by name,
+    // replacing the single operand on the vstack with the body's return.
+    let emit_body_call = |ctx: &mut LowerCtx<'_>, body_name: &str| -> Result<(), LoweringError> {
+        let fn_index = stdlib_function_index(body_name).ok_or_else(|| {
+            cap!(
+                "try_lower_scalar_math.unknown_stdlib_method.1",
+                LoweringError::UnknownStdlibMethod {
+                    name: body_name.to_string(),
+                    arity: 1,
+                    range,
+                }
+            )
+        })?;
+        let meta = builtin_stdlib().get(fn_index as usize).ok_or_else(|| {
+            cap!(
+                "try_lower_scalar_math.unknown_stdlib_method.2",
+                LoweringError::UnknownStdlibMethod {
+                    name: body_name.to_string(),
+                    arity: 1,
+                    range,
+                }
+            )
+        })?;
+        ctx.tstack.pop();
+        ctx.out.push(TaggedOp {
+            op: Op::Call {
+                fn_index,
+                arg_count: 1,
+                param_tys: meta.params.clone(),
+                ret_ty: meta.ret,
+            },
+            range,
+        });
+        ctx.tstack.push(meta.ret);
+        Ok(())
+    };
+
+    match (name, operand_ty) {
+        // abs: route to the operand-typed body.
+        ("abs", IrType::I64) => emit_body_call(ctx, "abs")?,
+        ("abs", IrType::F64) => emit_body_call(ctx, "abs_float")?,
+        // floor/ceil/round on an Int are identity (oracle returns the
+        // Int unchanged); leave the I64 operand on the vstack.
+        ("floor" | "ceil" | "round", IrType::I64) => {}
+        ("floor", IrType::F64) => emit_body_call(ctx, "floor")?,
+        ("ceil", IrType::F64) => emit_body_call(ctx, "ceil")?,
+        ("round", IrType::F64) => emit_body_call(ctx, "round")?,
+        // sqrt always returns Float; widen an Int operand first.
+        ("sqrt", IrType::F64) => emit_body_call(ctx, "sqrt")?,
+        ("sqrt", IrType::I64) => {
+            ctx.out.push(TaggedOp {
+                op: Op::ConvertI64ToF64,
+                range,
+            });
+            ctx.tstack.pop();
+            ctx.tstack.push(IrType::F64);
+            emit_body_call(ctx, "sqrt")?;
+        }
+        _ => unreachable!("operand_ty constrained to I64|F64 above"),
+    }
+    Ok(Some(()))
+}
+
 /// AOT-4 (W16 slice): general `_list_filter(xs, (x) => <pred>)` over an
 /// arbitrary `List<Int>`-typed first argument (vs the fused
 /// `_len(_list_filter(range(...)))` peephole, which only handles a bare

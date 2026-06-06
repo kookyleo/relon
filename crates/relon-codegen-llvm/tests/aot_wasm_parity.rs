@@ -597,6 +597,16 @@ fn native_run(src: &str, args: HashMap<String, Value>) -> Value {
     ev.run_main(args).expect("native run_main")
 }
 
+/// Wave R7: pack a single `Float` `#main` param into its declared
+/// fixed-area slot as little-endian f64 bits (the buffer protocol rides
+/// f64 as raw bits, same as the operand stack).
+fn pack_single_float(info: &EmitObjectInfo, value: f64) -> Vec<u8> {
+    let mut rec = vec![0u8; info.main_root_size as usize];
+    let off = info.main_fields[0].offset as usize;
+    rec[off..off + 8].copy_from_slice(&value.to_le_bytes());
+    rec
+}
+
 /// w3 — `range(n).map(i => "a").reduce("", (acc, s) => acc + s)` → String.
 #[test]
 fn w3_string_return_aligns_native_via_wasmtime() {
@@ -1291,4 +1301,113 @@ fn w5_full_dict_probe_aligns_native_via_wasmtime() {
         Some(&Decoded::Int(want)),
         "w5-full wasm dict-probe != native oracle"
     );
+}
+
+// ===========================================================
+// Wave R7 — scalar-returning Float math stdlib on wasm32.
+//
+// `floor` / `ceil` / `round` (Float -> Int via the new
+// `Op::F64Unary` + `Op::F64ToI64Sat` intrinsics) and `sqrt` / `abs`
+// (Float -> Float) ride the buffer protocol's fixed-area scalar slot,
+// so the wasm leg decodes the result directly (the same path the R3b
+// `r3b_float_reduce` Float-scalar return uses). Native LLVM-AOT is the
+// oracle; the corresponding tree-walk == cranelift legs are proven in
+// the `relon-test-harness` corpus (`r7_*`). `pow` is intentionally not
+// here — it needs a `pow` libcall with no native wasm instruction.
+// ===========================================================
+
+/// Shared driver: build `src` (single `Float x` param returning an Int
+/// scalar), run the wasm32 leg, and assert the decoded `value` matches
+/// the native Int oracle.
+fn r7_check_int(name: &str, src: &str, x: f64) {
+    let want = match native_run(
+        src,
+        HashMap::from([("x".to_string(), Value::Float(x.into()))]),
+    ) {
+        Value::Int(v) => v,
+        other => panic!("[{name}] native expected Int, got {other:?}"),
+    };
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping {name}");
+        return;
+    }
+    let (bytes, info) = build(name, src);
+    let in_record = pack_single_float(&info, x);
+    let out = run_buffer(&bytes, &format!("relon_parity_{name}"), &info, &in_record);
+    match out.get("value") {
+        Some(Decoded::Int(v)) => assert_eq!(*v, want, "[{name}] wasm Int != native"),
+        other => panic!("[{name}] decoded {other:?}"),
+    }
+}
+
+/// Shared driver for a Float-scalar result: compares the IEEE-754 bit
+/// pattern so `NaN` / `±0.0` edges stay exact.
+fn r7_check_float(name: &str, src: &str, x: f64) {
+    let want = match native_run(
+        src,
+        HashMap::from([("x".to_string(), Value::Float(x.into()))]),
+    ) {
+        Value::Float(f) => f.into_inner(),
+        other => panic!("[{name}] native expected Float, got {other:?}"),
+    };
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping {name}");
+        return;
+    }
+    let (bytes, info) = build(name, src);
+    let in_record = pack_single_float(&info, x);
+    let out = run_buffer(&bytes, &format!("relon_parity_{name}"), &info, &in_record);
+    match out.get("value") {
+        Some(Decoded::Float(v)) => assert_eq!(
+            v.to_bits(),
+            want.to_bits(),
+            "[{name}] wasm Float bits != native"
+        ),
+        other => panic!("[{name}] decoded {other:?}"),
+    }
+}
+
+#[test]
+fn r7_floor_aligns_native_via_wasmtime() {
+    r7_check_int("r7_floor", "#main(Float x) -> Int\nfloor(x)", 3.7);
+}
+
+#[test]
+fn r7_floor_neg_aligns_native_via_wasmtime() {
+    r7_check_int("r7_floor_neg", "#main(Float x) -> Int\nfloor(x)", -3.2);
+}
+
+#[test]
+fn r7_ceil_aligns_native_via_wasmtime() {
+    r7_check_int("r7_ceil", "#main(Float x) -> Int\nceil(x)", 3.2);
+}
+
+#[test]
+fn r7_round_ties_even_down_aligns_native_via_wasmtime() {
+    // 2.5 rounds to 2 under ties-to-even (the oracle's
+    // `round_ties_even`), NOT 3 (C `round` ties-away).
+    r7_check_int("r7_round_even_down", "#main(Float x) -> Int\nround(x)", 2.5);
+}
+
+#[test]
+fn r7_round_ties_even_up_aligns_native_via_wasmtime() {
+    // 3.5 rounds to 4 under ties-to-even.
+    r7_check_int("r7_round_even_up", "#main(Float x) -> Int\nround(x)", 3.5);
+}
+
+#[test]
+fn r7_sqrt_aligns_native_via_wasmtime() {
+    r7_check_float("r7_sqrt", "#main(Float x) -> Float\nsqrt(x)", 9.0);
+}
+
+#[test]
+fn r7_sqrt_negative_is_nan_aligns_native_via_wasmtime() {
+    // sqrt of a negative is NaN per IEEE-754 (oracle does not error);
+    // the bit-pattern comparison in `r7_check_float` pins the NaN.
+    r7_check_float("r7_sqrt_neg", "#main(Float x) -> Float\nsqrt(x)", -1.0);
+}
+
+#[test]
+fn r7_abs_float_aligns_native_via_wasmtime() {
+    r7_check_float("r7_abs_float", "#main(Float x) -> Float\nabs(x)", -5.5);
 }

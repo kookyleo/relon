@@ -5,10 +5,10 @@
 //! out of the monolithic emitter (Phase 0a); each `emit_*` is invoked
 //! by the central `lower_op` dispatch in `super`.
 
-use inkwell::values::IntValue;
+use inkwell::values::{BasicMetadataValueEnum, IntValue};
 use inkwell::{FloatPredicate, IntPredicate};
 
-use relon_ir::ir::IrType;
+use relon_ir::ir::{F64UnaryOp, IrType};
 
 use crate::error::LlvmError;
 
@@ -137,6 +137,109 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .map_err(|e| LlvmError::Codegen(format!("ConvertI64ToF64 result bitcast: {e}")))?
             .into_int_value();
         self.push(bits, IrType::F64);
+        Ok(())
+    }
+
+    /// Wave R7: declare-or-get a `double(double)` LLVM float intrinsic by
+    /// name (e.g. `llvm.floor.f64`). Idempotent — repeated emits reuse
+    /// the single module declaration, mirroring `declare_llvm_trap`.
+    fn get_f64_unary_intrinsic(&self, name: &str) -> inkwell::values::FunctionValue<'ctx> {
+        if let Some(f) = self.module.get_function(name) {
+            return f;
+        }
+        let f64_t = self.ctx.f64_type();
+        let fn_ty = f64_t.fn_type(&[f64_t.into()], false);
+        self.module.add_function(name, fn_ty, None)
+    }
+
+    /// `Op::F64ToI64Sat` (Wave R7) — pop the operand-stack i64 bits, cast
+    /// to `double`, and convert to a signed `i64` via the
+    /// `llvm.fptosi.sat.i64.f64` saturating intrinsic. The saturating
+    /// form (NOT the plain `fptosi`, whose out-of-range / NaN result is
+    /// poison) reproduces Rust's `f64 as i64` cast that the tree-walk
+    /// `floor` / `ceil` / `round` oracles use: clamp to `i64::MIN` /
+    /// `i64::MAX` on overflow, `0` for `NaN`.
+    pub(crate) fn emit_f64_to_i64_sat(&mut self, ip_hint: &str) -> Result<(), LlvmError> {
+        let bits = self.pop_int(ip_hint)?;
+        let f64_t = self.ctx.f64_type();
+        let i64_t = self.ctx.i64_type();
+        let f = self
+            .builder
+            .build_bit_cast(bits, f64_t, &self.next_name("fptosi_a"))
+            .map_err(|e| LlvmError::Codegen(format!("F64ToI64Sat bitcast: {e}")))?
+            .into_float_value();
+        // `llvm.fptosi.sat.i64.f64 : double -> i64`.
+        let intr = {
+            let name = "llvm.fptosi.sat.i64.f64";
+            if let Some(g) = self.module.get_function(name) {
+                g
+            } else {
+                let fn_ty = i64_t.fn_type(&[f64_t.into()], false);
+                self.module.add_function(name, fn_ty, None)
+            }
+        };
+        let args: [BasicMetadataValueEnum; 1] = [f.into()];
+        let call_site = self
+            .builder
+            .build_call(intr, &args, &self.next_name("fptosi_sat"))
+            .map_err(|e| LlvmError::Codegen(format!("F64ToI64Sat call: {e}")))?;
+        let r = match call_site.try_as_basic_value() {
+            inkwell::values::ValueKind::Basic(inkwell::values::BasicValueEnum::IntValue(v)) => v,
+            other => {
+                return Err(LlvmError::Codegen(format!(
+                    "F64ToI64Sat: intrinsic returned {other:?}, expected i64"
+                )));
+            }
+        };
+        self.push(r, IrType::I64);
+        Ok(())
+    }
+
+    /// `Op::F64Unary(op)` (Wave R7) — pop the operand-stack i64 bits, cast
+    /// to `double`, call the matching LLVM float intrinsic, and push the
+    /// result back as i64 bits (the AOT-1 "f64 rides as i64 bits"
+    /// convention). Each intrinsic's IEEE-754 semantics match the
+    /// tree-walk oracle (`floor` / `ceil` / `round_ties_even` via
+    /// `llvm.roundeven` / `sqrt` / `abs` via `llvm.fabs`).
+    pub(crate) fn emit_f64_unary(
+        &mut self,
+        ip_hint: &str,
+        op: F64UnaryOp,
+    ) -> Result<(), LlvmError> {
+        let bits = self.pop_int(ip_hint)?;
+        let f64_t = self.ctx.f64_type();
+        let f = self
+            .builder
+            .build_bit_cast(bits, f64_t, &self.next_name("funary_a"))
+            .map_err(|e| LlvmError::Codegen(format!("F64Unary bitcast: {e}")))?
+            .into_float_value();
+        let intr_name = match op {
+            F64UnaryOp::Floor => "llvm.floor.f64",
+            F64UnaryOp::Ceil => "llvm.ceil.f64",
+            F64UnaryOp::Nearest => "llvm.roundeven.f64",
+            F64UnaryOp::Sqrt => "llvm.sqrt.f64",
+            F64UnaryOp::Abs => "llvm.fabs.f64",
+        };
+        let intr = self.get_f64_unary_intrinsic(intr_name);
+        let args: [BasicMetadataValueEnum; 1] = [f.into()];
+        let call_site = self
+            .builder
+            .build_call(intr, &args, &self.next_name("funary"))
+            .map_err(|e| LlvmError::Codegen(format!("F64Unary call: {e}")))?;
+        let rf = match call_site.try_as_basic_value() {
+            inkwell::values::ValueKind::Basic(inkwell::values::BasicValueEnum::FloatValue(v)) => v,
+            other => {
+                return Err(LlvmError::Codegen(format!(
+                    "F64Unary: intrinsic returned {other:?}, expected double"
+                )));
+            }
+        };
+        let out_bits = self
+            .builder
+            .build_bit_cast(rf, self.ctx.i64_type(), &self.next_name("funary_bits"))
+            .map_err(|e| LlvmError::Codegen(format!("F64Unary result bitcast: {e}")))?
+            .into_int_value();
+        self.push(out_bits, IrType::F64);
         Ok(())
     }
 

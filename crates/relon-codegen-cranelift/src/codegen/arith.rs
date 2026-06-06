@@ -18,6 +18,8 @@ use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{F64, I32, I64};
 use cranelift_codegen::ir::InstBuilder;
 
+use relon_ir::ir::F64UnaryOp;
+
 use crate::error::CraneliftError;
 use crate::sandbox::TrapKind;
 
@@ -287,6 +289,37 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
     pub(super) fn emit_convert_i64_to_f64(&mut self) -> Result<(), CraneliftError> {
         let a = self.pop()?;
         let r = self.builder.ins().fcvt_from_sint(F64, a);
+        self.push(r);
+        Ok(())
+    }
+
+    /// `Op::F64ToI64Sat` (Wave R7) — pop one `F64` cranelift value, push
+    /// its `fcvt_to_sint_sat` truncation as an `I64`. The *saturating*
+    /// conversion matches Rust's `f64 as i64` (the tree-walk oracle for
+    /// `floor` / `ceil` / `round`): out-of-range operands clamp to
+    /// `i64::MIN` / `i64::MAX` and `NaN` maps to `0`, rather than the
+    /// trapping `fcvt_to_sint`.
+    pub(super) fn emit_f64_to_i64_sat(&mut self) -> Result<(), CraneliftError> {
+        let a = self.pop()?;
+        let r = self.builder.ins().fcvt_to_sint_sat(I64, a);
+        self.push(r);
+        Ok(())
+    }
+
+    /// `Op::F64Unary(op)` (Wave R7) — pop one `F64` cranelift value, push
+    /// the native float-intrinsic result. Each arm maps to the cranelift
+    /// instruction whose IEEE-754 semantics match the tree-walk oracle
+    /// (`floor` / `ceil` / `nearest` = round-ties-even / `sqrt` /
+    /// `fabs`).
+    pub(super) fn emit_f64_unary(&mut self, op: F64UnaryOp) -> Result<(), CraneliftError> {
+        let a = self.pop()?;
+        let r = match op {
+            F64UnaryOp::Floor => self.builder.ins().floor(a),
+            F64UnaryOp::Ceil => self.builder.ins().ceil(a),
+            F64UnaryOp::Nearest => self.builder.ins().nearest(a),
+            F64UnaryOp::Sqrt => self.builder.ins().sqrt(a),
+            F64UnaryOp::Abs => self.builder.ins().fabs(a),
+        };
         self.push(r);
         Ok(())
     }

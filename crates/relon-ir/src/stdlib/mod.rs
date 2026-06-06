@@ -314,12 +314,13 @@ mod glob_match_index_tests {
     /// keep their pinned slots; `list_list_length` was appended at index
     /// 38. Wave R3b appended the typed `List<Float>` / cross-type HOF
     /// bodies at indices 39..43; Wave R3c appended the String-result list
-    /// `map` family at indices 44..46 — all at the tail so every
+    /// `map` family at indices 44..46; Wave R7 appended the scalar Float
+    /// math bodies at indices 47..51 — all at the tail so every
     /// position-pinned index above stays put. Pinning the count catches
     /// accidental double-registrations.
     #[test]
-    fn bundle_has_47_entries() {
-        assert_eq!(stdlib_function_count(), 47);
+    fn bundle_has_52_entries() {
+        assert_eq!(stdlib_function_count(), 52);
         assert_eq!(stdlib_function_index("glob_match"), Some(37));
         assert_eq!(stdlib_function_index("list_list_length"), Some(38));
         // Wave R3b tail appends (order-pinned wire format).
@@ -332,6 +333,12 @@ mod glob_match_index_tests {
         assert_eq!(stdlib_function_index("list_string_map"), Some(44));
         assert_eq!(stdlib_function_index("list_int_map_to_string"), Some(45));
         assert_eq!(stdlib_function_index("list_float_map_to_string"), Some(46));
+        // Wave R7 tail appends (scalar Float math).
+        assert_eq!(stdlib_function_index("abs_float"), Some(47));
+        assert_eq!(stdlib_function_index("floor"), Some(48));
+        assert_eq!(stdlib_function_index("ceil"), Some(49));
+        assert_eq!(stdlib_function_index("round"), Some(50));
+        assert_eq!(stdlib_function_index("sqrt"), Some(51));
     }
 }
 

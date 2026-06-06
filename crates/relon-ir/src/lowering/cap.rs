@@ -214,6 +214,8 @@ pub const LOWERING_CAP_IDS: &[&str] = &[
     "try_lower_materialized_list_reduce.unsupported_expr.2",
     "try_lower_materialized_list_reduce.unsupported_expr.3",
     "combine_operator_to_op.unsupported_expr",
+    "try_lower_scalar_math.unknown_stdlib_method.1",
+    "try_lower_scalar_math.unknown_stdlib_method.2",
     "try_lower_list_filter.unknown_stdlib_method.1",
     "try_lower_list_filter.unknown_stdlib_method.2",
     "try_lower_list_filter.unsupported_expr",

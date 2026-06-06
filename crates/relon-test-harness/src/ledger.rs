@@ -1342,6 +1342,22 @@ pub const LEDGER: &[LedgerEntry] = &[
         reason: "expression shape has no IR/codegen lowering path yet",
     },
     LedgerEntry {
+        id: "try_lower_scalar_math.unknown_stdlib_method.1",
+        site: "lowering/peephole.rs::try_lower_scalar_math",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "internal guard: bundled scalar-math (abs/floor/ceil/round/sqrt) slot missing from registry",
+    },
+    LedgerEntry {
+        id: "try_lower_scalar_math.unknown_stdlib_method.2",
+        site: "lowering/peephole.rs::try_lower_scalar_math",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "internal guard: bundled scalar-math (abs/floor/ceil/round/sqrt) metadata missing from registry",
+    },
+    LedgerEntry {
         id: "try_lower_list_filter.unknown_stdlib_method.1",
         site: "lowering/peephole.rs::try_lower_list_filter",
         category: Category::ExprShape,

@@ -4043,6 +4043,17 @@ fn lower_fn_call(
         }
     };
     let receiver_segments = &path[..path.len() - 1];
+    // Wave R7: scalar-returning Float math (`abs`/`floor`/`ceil`/`round`/
+    // `sqrt`) — operand-type-aware dispatch over the new float-intrinsic
+    // bundled bodies. Runs before the generic name-keyed dispatch (which
+    // caps these for a Float operand because the bundled `abs` is
+    // `Int->Int` and the others had no body pre-R7). Falls through on a
+    // non-numeric operand / unmatched name, which then caps loudly.
+    if let Some(()) =
+        peephole::try_lower_scalar_math(method_name, receiver_segments, args, range, ctx)?
+    {
+        return Ok(());
+    }
     let arity = if receiver_segments.is_empty() {
         // Free-call form. Each `CallArg` value contributes one
         // argument; named args are rejected here (Phase 4.a/4.b

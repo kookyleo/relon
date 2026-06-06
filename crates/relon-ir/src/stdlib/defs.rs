@@ -16,7 +16,7 @@
 //! [`super::normalization`]. The ordered list pinning every entry's
 //! wasm slot lives in [`super::registry::builtin_stdlib`].
 
-use crate::ir::{IrType, Op, TaggedOp, TrapKind};
+use crate::ir::{F64UnaryOp, IrType, Op, TaggedOp, TrapKind};
 use relon_parser::TokenRange;
 
 use super::signatures::StdlibFunction;
@@ -226,6 +226,90 @@ pub(super) fn abs_int() -> StdlibFunction {
                 op: Op::Return,
                 range,
             },
+        ]
+    })
+}
+
+/// Wave R7: `abs(x: Float) -> Float`.
+///
+/// The bundled `abs` (index 2) is `Int -> Int`; this is the Float
+/// overload reached when the speculative scalar-math peephole sees a
+/// `Float` argument. Body is a single `F64Unary(Abs)` (`llvm.fabs.f64`
+/// / cranelift `fabs` / wasm `f64.abs`) — clears the sign bit, so
+/// `abs(-0.0) == 0.0` and `abs(NaN)` stays `NaN`, matching the
+/// tree-walk oracle (`f64::abs`).
+pub(super) fn abs_float() -> StdlibFunction {
+    StdlibFunction::new("abs_float", vec![IrType::F64], IrType::F64, || {
+        vec![
+            tt(Op::LocalGet(0)),
+            tt(Op::F64Unary(F64UnaryOp::Abs)),
+            tt(Op::Return),
+        ]
+    })
+}
+
+/// Wave R7: `floor(x: Float) -> Int`.
+///
+/// `F64Unary(Floor)` then `F64ToI64Sat`, reproducing the tree-walk
+/// oracle `f64::floor() as i64` (round toward -inf, then Rust's
+/// saturating float→int cast). Result type is `Int`, matching the
+/// oracle (`MathFloor` returns `Value::Int`).
+pub(super) fn floor_float_to_int() -> StdlibFunction {
+    StdlibFunction::new("floor", vec![IrType::F64], IrType::I64, || {
+        vec![
+            tt(Op::LocalGet(0)),
+            tt(Op::F64Unary(F64UnaryOp::Floor)),
+            tt(Op::F64ToI64Sat),
+            tt(Op::Return),
+        ]
+    })
+}
+
+/// Wave R7: `ceil(x: Float) -> Int`.
+///
+/// `F64Unary(Ceil)` then `F64ToI64Sat` — oracle `f64::ceil() as i64`.
+pub(super) fn ceil_float_to_int() -> StdlibFunction {
+    StdlibFunction::new("ceil", vec![IrType::F64], IrType::I64, || {
+        vec![
+            tt(Op::LocalGet(0)),
+            tt(Op::F64Unary(F64UnaryOp::Ceil)),
+            tt(Op::F64ToI64Sat),
+            tt(Op::Return),
+        ]
+    })
+}
+
+/// Wave R7: `round(x: Float) -> Int`.
+///
+/// `F64Unary(Nearest)` (round-to-nearest, ties-to-even) then
+/// `F64ToI64Sat` — oracle `f64::round_ties_even() as i64`. The IEEE
+/// default ties-to-even is deliberate: the tree-walk `MathRound` uses
+/// `round_ties_even`, NOT `round` (ties-away). cranelift `nearest` /
+/// wasm `f64.nearest` / LLVM `llvm.roundeven.f64` all implement
+/// ties-to-even.
+pub(super) fn round_float_to_int() -> StdlibFunction {
+    StdlibFunction::new("round", vec![IrType::F64], IrType::I64, || {
+        vec![
+            tt(Op::LocalGet(0)),
+            tt(Op::F64Unary(F64UnaryOp::Nearest)),
+            tt(Op::F64ToI64Sat),
+            tt(Op::Return),
+        ]
+    })
+}
+
+/// Wave R7: `sqrt(x: Float) -> Float`.
+///
+/// Single `F64Unary(Sqrt)` — oracle `<f64>.sqrt()`. A negative operand
+/// yields `NaN` per IEEE-754 (the oracle does NOT error), and the
+/// native `sqrt` instruction on every backend produces the same NaN
+/// bit pattern.
+pub(super) fn sqrt_float() -> StdlibFunction {
+    StdlibFunction::new("sqrt", vec![IrType::F64], IrType::F64, || {
+        vec![
+            tt(Op::LocalGet(0)),
+            tt(Op::F64Unary(F64UnaryOp::Sqrt)),
+            tt(Op::Return),
         ]
     })
 }
