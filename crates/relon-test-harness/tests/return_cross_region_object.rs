@@ -586,23 +586,47 @@ fn f5_double_pointer_array_object_field_compiles() {
     assert_cross_region(src_field, args1("w", w));
 }
 
-/// Shapes still beyond F6 must cap on both native backends (loud decline).
-/// F6 lifted the deep nested-schema field chain to a pointer-array leaf
-/// (`o.inner.tags`, as a top-level return and as an object field). The
-/// remaining caps: a deep chain whose object-field leaf is a `List<Schema>`
-/// whose element sub-record carries a nested-list field (past the in-place
-/// sub-record reader's S4 decode scope) and `Dict<_,_>` params (an analyzer
-/// dead-end with no input decode path).
+/// F7: a deep-chain object field whose leaf `List<Cell>` element
+/// sub-record itself carries a `List<List<Int>>` field — exactly the shape
+/// that was capped through F6 — is now four-way bit-equal (the element
+/// decode and the lowering admission recurse to any depth). This was the
+/// last return-side functional cap.
+#[test]
+fn f7_deep_chain_object_field_nested_list_in_element() {
+    let src = "#schema Cell { rows: List<List<Int>>, k: Int }\n\
+         #schema Inner { cells: List<Cell>, n: Int }\n\
+         #schema Outer { inner: Inner, m: Int }\n\
+         #main(Outer o) -> Dict\n{ c: o.inner.cells, n: 1 }";
+    let cell = |rows: &[&[i64]], k: i64| {
+        let r = list(rows.iter().map(|x| iints(x)).collect());
+        cfg("Cell", vec![("rows", r), ("k", Value::Int(k))])
+    };
+    let inner = cfg(
+        "Inner",
+        vec![
+            (
+                "cells",
+                list(vec![
+                    cell(&[], 0),
+                    cell(&[&[1, 2], &[], &[i64::MIN, i64::MAX]], 7),
+                ]),
+            ),
+            ("n", Value::Int(2)),
+        ],
+    );
+    let outer = cfg("Outer", vec![("inner", inner), ("m", Value::Int(3))]);
+    assert_cross_region(src, args1("o", outer));
+}
+
+/// Shapes the in-place ABI still does NOT lift must cap on both native
+/// backends (loud decline). F7 lifted the last return-side functional axis
+/// (the element sub-record carrying `List<Schema>` / `List<List>` fields,
+/// recursive to any depth). The only shape left is the `Dict<_,_>` param —
+/// an analyzer dead-end with no input decode path.
 #[test]
 fn beyond_f5_still_capped() {
     let cap_cases = [
-        // Deep chain object field whose leaf `List<Cell>` element sub-record
-        // carries a `List<List<Int>>` field — out of the S4 decode scope.
-        "#schema Cell { rows: List<List<Int>>, k: Int }\n\
-         #schema Inner { cells: List<Cell>, n: Int }\n\
-         #schema Outer { inner: Inner, m: Int }\n\
-         #main(Outer o) -> Dict\n{ c: o.inner.cells, n: 1 }",
-        // Dict param — analyzer dead-end.
+        // Dict param — analyzer dead-end. The only return-side cap left.
         "#main(Dict<String, Int> d) -> Dict\n{ n: 1 }",
     ];
     for src in cap_cases {

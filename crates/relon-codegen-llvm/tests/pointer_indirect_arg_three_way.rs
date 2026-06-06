@@ -450,8 +450,10 @@ fn nested_schema_with_list_schema_field_three_way() {
 /// Materialised this round: `List<Schema>` / `List<List<scalar>>`
 /// params + schema fields consumed through `.length()` / a sibling
 /// scalar read. F5 also materialises the inner pointer-array element
-/// lists (`List<List<String>>` / `List<List<Schema>>`). Still capped:
-/// `Dict` params (analyzer dead-end with no input decode path).
+/// lists (`List<List<String>>` / `List<List<Schema>>`), F6 the deep
+/// nested-schema field chain, and F7 the element sub-record carrying
+/// `List<Schema>` / `List<List>` fields (recursive to any depth). Still
+/// capped: `Dict` params (analyzer dead-end with no input decode path).
 ///
 /// NOTE: the nested-list **identity return**
 /// `#main(List<List<Int>> xss) -> List<List<Int>> = xss` and the
@@ -464,23 +466,12 @@ fn nested_schema_with_list_schema_field_three_way() {
 /// [`list_schema_identity_return_both_backends`] below.
 #[test]
 fn unsupported_pointer_indirect_shapes_loudly_capped() {
-    for src in [
-        // Dict param — analyzer dead-end.
-        "#main(Dict<String, Int> d) -> Dict<String, Int>\nd",
-        // Deep nested-schema field chain (F6) is now lifted for a
-        // pointer-array leaf; what stays capped is a chain whose leaf is a
-        // `List<Schema>` element sub-record carrying a nested-list field
-        // (past the in-place sub-record reader's S4 decode scope).
-        "#schema Cell { rows: List<List<Int>>, k: Int }\n\
-         #schema Inner { cells: List<Cell>, n: Int }\n\
-         #schema Outer { inner: Inner, m: Int }\n\
-         #main(Outer o) -> List<Cell>\no.inner.cells",
-    ] {
-        let cl = AotEvaluator::from_source(src);
-        assert!(cl.is_err(), "cranelift must loudly reject `{src}`, got Ok");
-        let llvm = LlvmAotEvaluator::from_source(src);
-        assert!(llvm.is_err(), "llvm must loudly reject `{src}`, got Ok");
-    }
+    // Dict param — analyzer dead-end. The only return-side cap left.
+    let src = "#main(Dict<String, Int> d) -> Dict<String, Int>\nd";
+    let cl = AotEvaluator::from_source(src);
+    assert!(cl.is_err(), "cranelift must loudly reject `{src}`, got Ok");
+    let llvm = LlvmAotEvaluator::from_source(src);
+    assert!(llvm.is_err(), "llvm must loudly reject `{src}`, got Ok");
 }
 
 /// F5: a `List<List<String>>` param consumed through `.length()` now

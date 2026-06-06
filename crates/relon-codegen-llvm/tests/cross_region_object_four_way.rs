@@ -420,6 +420,47 @@ fn servers_many_with_cjk_empty_long() {
     );
 }
 
+// F7: a cross-region object field whose value is a `List<Team>` parameter
+// identity, where each Team carries a nested `members: List<Person>`
+// object-array field and a `tags: List<List<Int>>` nested-list field. The
+// object head sits in out_buf; the list root + its recursively-nested
+// element sub-records live in in_buf and are followed cross-region by the
+// multi-region verifier and decoded recursively by the in-place reader.
+const SRC_TEAMS_OBJ: &str = "#schema Person { name: String }\n\
+     #schema Team { name: String, members: List<Person>, tags: List<List<Int>> }\n\
+     #main(List<Team> teams) -> Dict\n{ teams: teams, n: 1 }";
+
+#[test]
+fn f7_object_field_teams_nested() {
+    let person = |n: &str| cfg("Person", vec![("name", s(n))]);
+    let team = |name: &str, members: Vec<Value>, rows: &[&[i64]]| {
+        let tags = list(rows.iter().map(|r| iints(r)).collect());
+        cfg(
+            "Team",
+            vec![
+                ("name", s(name)),
+                ("members", list(members)),
+                ("tags", tags),
+            ],
+        )
+    };
+    assert_four_way(
+        SRC_TEAMS_OBJ,
+        args1(
+            "teams",
+            list(vec![
+                team("empty", vec![], &[]),
+                team(
+                    &from_cps(&[0x4E2D, 0x6587]),
+                    vec![person("a"), person(&from_cps(&[0x1F980]))],
+                    &[&[1, 2, 3], &[], &[i64::MIN, i64::MAX]],
+                ),
+                team("solo", vec![person("")], &[&[0]]),
+            ]),
+        ),
+    );
+}
+
 const SRC_GRID: &str = "#main(List<List<Int>> grid) -> Dict\n{ g: grid, n: 1 }";
 
 #[test]

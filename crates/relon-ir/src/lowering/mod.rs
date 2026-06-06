@@ -2655,15 +2655,24 @@ fn branded_field_cross_region_param_list(
 }
 
 /// True when a `List<Schema>` return type's per-element sub-record carries
-/// only fields the S4 in-place sub-record reader can decode: the scalar
-/// leaves (`Int` / `Float` / `Bool` / `Null` / `String`), `List<scalar>`,
-/// and `List<String>`. A sub-record field that is itself a pointer-array
-/// *element* list (`List<Schema>` / `List<List<…>>`) is **out of S4 scope**
-/// — the in-place reader (`read_record_field`) caps it loudly — so the
-/// in-place return must NOT be taken; the caller keeps it a loud cap at
-/// lowering (S5 territory) rather than emit a sentinel the host can't
-/// decode. `ty` is the full `List<Schema{…}>` return type (the element
-/// schema is canonicalised inline, so the field set is available here).
+/// only fields the in-place sub-record reader can decode — **recursively,
+/// to any depth** (F7). The admission is type-driven: a field is in scope
+/// when its type is a scalar leaf (`Int` / `Float` / `Bool` / `Null` /
+/// `String`) or a `List<element>` whose element is itself in scope
+/// ([`cross_region_list_element_ok`]). The list arm reaches back into this
+/// predicate for a `List<Schema>` element, so a sub-record field that is
+/// itself an object array (`members: List<Person>`) or a nested list
+/// (`tags: List<List<Int>>`) — and whose own element schemas again carry
+/// such fields — is accepted to whatever depth the element schemas nest.
+///
+/// The verifier ([`crate::verifier`] in `relon-eval-api`) walks the same
+/// graph recursively with a `MAX_DEPTH` guard, and the in-place reader
+/// decodes it type-driven, so admitting these here is sound: the host
+/// verifies the whole reachable graph before any decode. A field type the
+/// layout pass cannot materialise (`Option` / `Result` / `Closure`, or a
+/// bare nested `Schema`) returns `false`, keeping that shape a loud cap.
+/// `ty` is the full `List<Schema{…}>` return type (the element schema is
+/// canonicalised inline, so the field set is available here).
 fn list_schema_subrecord_in_s4_scope(ty: &TypeRepr) -> bool {
     let TypeRepr::List { element } = ty else {
         return false;
@@ -2675,12 +2684,14 @@ fn list_schema_subrecord_in_s4_scope(ty: &TypeRepr) -> bool {
         TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool | TypeRepr::Null | TypeRepr::String => {
             true
         }
-        TypeRepr::List { element } => matches!(
-            element.as_ref(),
-            TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool | TypeRepr::String
-        ),
-        // Nested Schema field, Option / Result / Closure, or a deeper
-        // pointer-array element list — out of S4 scope.
+        // F7: a list field recurses through the shared element predicate,
+        // which re-enters this function for a `List<Schema>` element — so
+        // `List<Person>` / `List<List<Int>>` / deeper nest are admitted to
+        // the depth the element schemas materialise.
+        TypeRepr::List { element } => cross_region_list_element_ok(element.as_ref()),
+        // Bare nested Schema field, Option / Result / Closure — out of
+        // scope (the bare-Schema sub-field reader path is not on the
+        // return-side in-place surface yet).
         _ => false,
     })
 }
