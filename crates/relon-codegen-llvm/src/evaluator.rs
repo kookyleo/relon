@@ -35,7 +35,6 @@ use inkwell::targets::{
 };
 use inkwell::OptimizationLevel;
 
-use ordered_float::OrderedFloat;
 use relon_eval_api::inplace_return::ArenaRegions;
 use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
 use relon_parser::Node;
@@ -1466,43 +1465,26 @@ impl LlvmAotEvaluator {
             ));
         }
         let arena = &arena[..regions.arena_size.min(arena.len())];
-        // Object / fixed-area return path: under the F1 arena-absolute slot
-        // convention the object head sits at `out_ptr` and every pointer
-        // slot it carries is an arena-absolute offset, so the reader +
-        // verifier walk the **whole arena** anchored at `out_ptr` rather
-        // than a region-relative `out_buf` slice. The multi-region gate
-        // confines every followed span to one region (today all in `out`,
-        // cross-region object fields stay capped — F1b releases them) and
-        // closes the red-line gap where the object path previously decoded
-        // with no verifier at all.
-        let multi = regions.multi_region().map_err(|e| {
-            RuntimeError::IoError(format!("llvm-aot object return arena regions invalid: {e}"))
-        })?;
-        relon_eval_api::inplace_return::verify_object_return_multi(
+        // Object / fixed-area return path: the shared central entry gates
+        // the record through the multi-region bounds verifier BEFORE any
+        // decode (verify → decode is enforced inside, so no object-return
+        // caller can skip it), then walks the backend-shared object-field
+        // reader. Under the F1 arena-absolute slot convention the object
+        // head sits at `out_ptr` and every pointer slot it carries is an
+        // arena-absolute offset, so the reader + verifier walk the **whole
+        // arena** anchored at `out_ptr`. The gate confines every followed
+        // span to one region (today all in `out`; cross-region object
+        // fields stay capped — F1b releases them) and closes the red-line
+        // gap where the object path previously decoded with no verifier.
+        relon_eval_api::inplace_return::decode_object_return(
             "llvm-aot",
             arena,
             out_ptr,
-            multi,
+            regions,
             &schema.return_layout,
-            &schema.return_schema.fields,
-        )?;
-        let reader = relon_eval_api::buffer::BufferReader::new_at_base(
-            &schema.return_layout,
-            &schema.return_schema.fields,
-            arena,
-            out_ptr,
+            &schema.return_schema,
+            is_single_value_wrapper(&schema.return_schema),
         )
-        .map_err(buffer_to_runtime_error)?;
-        if is_single_value_wrapper(&schema.return_schema) {
-            let field = &schema.return_schema.fields[0];
-            read_value_from_reader(&reader, field)
-        } else {
-            let map = read_record_into_map(&reader, &schema.return_schema)?;
-            Ok(Value::branded_dict(
-                map,
-                Some(schema.return_schema.name.clone()),
-            ))
-        }
     }
 
     /// Plan a wasm buffer-protocol dispatch: pack the `#main` args into
@@ -1704,10 +1686,12 @@ impl Evaluator for LlvmAotEvaluator {
 // Buffer-protocol packing / unpacking helpers.
 //
 // These mirror what `relon-codegen-cranelift::evaluator` does for
-// `write_value_into_builder` / `read_value_from_reader` /
-// `read_record_into_map` / `is_single_value_wrapper` /
-// `buffer_to_runtime_error`. Kept inside this crate so the LLVM
-// backend has no compile-time dep on cranelift-native.
+// `write_value_into_builder` / `is_single_value_wrapper` /
+// `buffer_to_runtime_error`. The object-return *decode* side is no
+// longer mirrored per crate — it lives once in
+// `relon_eval_api::inplace_return::decode_object_return`. Kept inside
+// this crate so the LLVM backend has no compile-time dep on
+// cranelift-native.
 // ---------------------------------------------------------------------------
 
 fn buffer_to_runtime_error(e: relon_eval_api::buffer::BufferError) -> RuntimeError {
@@ -1744,9 +1728,10 @@ fn is_single_int_field_record(schema: &relon_eval_api::schema_canonical::Schema)
 /// carved out so each leaf type owns a private `marshal_<type>_in`
 /// helper rather than living inline in a single fat `match`. Adding a
 /// new leaf type means: (1) add an arm here delegating to a new
-/// `marshal_<type>_in`, (2) add the symmetric arm to
-/// [`read_value_from_reader`] / `marshal_<type>_out`, and (3) widen the
-/// build.rs-visible [`EmittedFieldType`] triple (see that enum's docs).
+/// `marshal_<type>_in`, (2) add the symmetric arm to the shared
+/// object-return decoder `relon_eval_api::inplace_return` (reached via
+/// `decode_object_return`), and (3) widen the build.rs-visible
+/// [`EmittedFieldType`] triple (see that enum's docs).
 ///
 /// Note: MCJIT already marshals `Float` / `Schema` here; the
 /// build.rs-visible [`EmittedFieldType`] surface is the *narrower* set
@@ -2048,260 +2033,11 @@ fn write_schema_into_builder(
     Ok(())
 }
 
-/// Decode a buffer slot back into a typed [`Value`] on the way *out* of
-/// the JIT body (arena → host).
-///
-/// Sibling of [`write_value_into_builder`]; same marshalling-seam
-/// contract — each leaf type owns a private `marshal_<type>_out`
-/// helper. Adding a leaf type adds an arm here delegating to a new
-/// `marshal_<type>_out`.
-fn read_value_from_reader(
-    reader: &relon_eval_api::buffer::BufferReader<'_>,
-    field: &relon_eval_api::schema_canonical::Field,
-) -> Result<Value, RuntimeError> {
-    use relon_eval_api::schema_canonical::TypeRepr;
-    match &field.ty {
-        TypeRepr::Int => marshal_int_out(reader, &field.name),
-        TypeRepr::Float => marshal_float_out(reader, &field.name),
-        TypeRepr::Bool => marshal_bool_out(reader, &field.name),
-        TypeRepr::Null => marshal_null_out(),
-        TypeRepr::String => marshal_string_out(reader, &field.name),
-        TypeRepr::Schema { schema } => marshal_schema_out(reader, &field.name, schema),
-        TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::Int) => {
-            marshal_list_int_out(reader, &field.name)
-        }
-        TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::Float) => {
-            marshal_list_float_out(reader, &field.name)
-        }
-        TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::Bool) => {
-            marshal_list_bool_out(reader, &field.name)
-        }
-        TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::String) => {
-            marshal_list_string_out(reader, &field.name)
-        }
-        // F2: cross-region object field `List<Schema>` — the field slot
-        // holds the parameter list root's arena-absolute offset into in_buf
-        // (no tail copy). `verify_object_return_multi` already classified +
-        // bounds-checked the whole reachable graph; the reader walks the
-        // pointer array (shared arena window, anchored at `out_ptr`) into one
-        // sub-reader per element, draining each into a branded dict. Mirrors
-        // the cranelift `read_value_from_reader` arm — same shared
-        // `relon-eval-api` `BufferReader`, just from the llvm/wasm host.
-        TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::Schema { .. }) => {
-            let TypeRepr::Schema { schema } = element.as_ref() else {
-                unreachable!("guarded by the match arm");
-            };
-            marshal_list_schema_out(reader, &field.name, schema)
-        }
-        // F2: cross-region object field `List<List<scalar>>` — the nested
-        // pointer-array decode, re-wrapping each inner row as a `Value::List`.
-        // F5: `List<List<String|Schema>>` routes through the recursive
-        // `read_list_value` so the inner pointer arrays are followed.
-        TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::List { .. }) => {
-            let TypeRepr::List { element: inner } = element.as_ref() else {
-                unreachable!("guarded by the match arm");
-            };
-            match inner.as_ref() {
-                TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool => reader
-                    .read_list_list(&field.name)
-                    .map(|rows| {
-                        Value::List(Arc::new(
-                            rows.into_iter().map(|r| Value::List(Arc::new(r))).collect(),
-                        ))
-                    })
-                    .map_err(buffer_to_runtime_error),
-                _ => reader
-                    .read_list_value(&field.name, element.as_ref())
-                    .map(|rows| Value::List(Arc::new(rows)))
-                    .map_err(buffer_to_runtime_error),
-            }
-        }
-        // ----- add new leaf marshalling arm above this line -----
-        other => Err(RuntimeError::Unsupported {
-            reason: format!(
-                "llvm-aot: return field `{}` type {other:?} not supported in Phase B",
-                field.name
-            ),
-        }),
-    }
-}
-
-// --- per-variant host-side output marshalling helpers (S1.A seam) ---
-
-fn marshal_int_out(
-    reader: &relon_eval_api::buffer::BufferReader<'_>,
-    name: &str,
-) -> Result<Value, RuntimeError> {
-    reader
-        .read_int(name)
-        .map(Value::Int)
-        .map_err(buffer_to_runtime_error)
-}
-
-/// AOT-1 scalar Float slice: the buffer stores the f64 as 8 LE bytes
-/// (write side: [`marshal_float_in`]); the reader decodes them back
-/// through `read_float`.
-fn marshal_float_out(
-    reader: &relon_eval_api::buffer::BufferReader<'_>,
-    name: &str,
-) -> Result<Value, RuntimeError> {
-    reader
-        .read_float(name)
-        .map(|f| Value::Float(OrderedFloat(f)))
-        .map_err(buffer_to_runtime_error)
-}
-
-fn marshal_bool_out(
-    reader: &relon_eval_api::buffer::BufferReader<'_>,
-    name: &str,
-) -> Result<Value, RuntimeError> {
-    reader
-        .read_bool(name)
-        .map(Value::Bool)
-        .map_err(buffer_to_runtime_error)
-}
-
-fn marshal_null_out() -> Result<Value, RuntimeError> {
-    Ok(Value::Null)
-}
-
-/// Phase E.1: String return-value decode. The pointer-indirect
-/// StoreField path wrote the `[len:u32][utf8]` record into the tail
-/// region of the output buffer and stamped its buffer-relative offset
-/// into the fixed-area slot. `BufferReader` walks the same protocol to
-/// materialise the borrowed `&str`, which we then copy into an owned
-/// `Value::String`.
-fn marshal_string_out(
-    reader: &relon_eval_api::buffer::BufferReader<'_>,
-    name: &str,
-) -> Result<Value, RuntimeError> {
-    reader
-        .read_string(name)
-        .map(|s| Value::String(s.into()))
-        .map_err(buffer_to_runtime_error)
-}
-
-/// S2.② `List<Int>` return-value decode — the gap 0b recorded. The
-/// JIT body's `StoreField` for a `List<Int>` return wrote the
-/// `[len: u32 LE][pad to 8][i64 LE …]` record into the output buffer's
-/// tail region (the ConstPool `add_list_int` blob is materialised there
-/// for a const-list return) and stamped its buffer-relative offset into
-/// the fixed-area pointer slot. `BufferReader::read_list_int` walks the
-/// same protocol the String decode uses (`[len][bytes]` → `[len][i64…]`),
-/// returning the owned `Vec<i64>` we wrap into a `Value::List` of
-/// `Value::Int`.
-fn marshal_list_int_out(
-    reader: &relon_eval_api::buffer::BufferReader<'_>,
-    name: &str,
-) -> Result<Value, RuntimeError> {
-    reader
-        .read_list_int(name)
-        .map(|v| Value::list(v.into_iter().map(Value::Int).collect()))
-        .map_err(buffer_to_runtime_error)
-}
-
-/// `List<Float>` return-value decode. Mirrors [`marshal_list_int_out`]
-/// over the `[len][pad to 8][f64 LE …]` record `read_list_float` walks.
-fn marshal_list_float_out(
-    reader: &relon_eval_api::buffer::BufferReader<'_>,
-    name: &str,
-) -> Result<Value, RuntimeError> {
-    reader
-        .read_list_float(name)
-        .map(|v| {
-            Value::list(
-                v.into_iter()
-                    .map(|f| Value::Float(OrderedFloat(f)))
-                    .collect(),
-            )
-        })
-        .map_err(buffer_to_runtime_error)
-}
-
-/// `List<Bool>` return-value decode. Mirrors [`marshal_list_int_out`]
-/// over the `[len][u8 …]` record `read_list_bool` walks.
-fn marshal_list_bool_out(
-    reader: &relon_eval_api::buffer::BufferReader<'_>,
-    name: &str,
-) -> Result<Value, RuntimeError> {
-    reader
-        .read_list_bool(name)
-        .map(|v| Value::list(v.into_iter().map(Value::Bool).collect()))
-        .map_err(buffer_to_runtime_error)
-}
-
-/// `List<String>` return-value decode. The `StoreField { ty: ListString }`
-/// path copied the whole pointer-array block — header
-/// `[len][off_0..off_{N-1}]` plus the per-entry `[slen][utf8]` String
-/// records — into the output buffer's tail and relocated every `off_i`
-/// into the buffer's coordinate system. `BufferReader::read_list_string`
-/// walks that protocol: it follows each buffer-relative entry offset to
-/// its String record and borrows the UTF-8 payload, which we copy into
-/// owned `Value::String`s.
-fn marshal_list_string_out(
-    reader: &relon_eval_api::buffer::BufferReader<'_>,
-    name: &str,
-) -> Result<Value, RuntimeError> {
-    reader
-        .read_list_string(name)
-        .map(|v| Value::list(v.into_iter().map(|s| Value::String(s.into())).collect()))
-        .map_err(buffer_to_runtime_error)
-}
-
-/// Phase 0b: nested-Schema return decode. The return record's pointer
-/// slot for a Schema-typed field holds a buffer-relative offset to the
-/// sub-record's fixed area; `BufferReader::sub_record` anchors a
-/// sub-reader there (sharing the parent's byte slice) so we recurse into
-/// its fields and materialise a branded `Value::Dict`.
-fn marshal_schema_out(
-    reader: &relon_eval_api::buffer::BufferReader<'_>,
-    name: &str,
-    schema: &relon_eval_api::schema_canonical::Schema,
-) -> Result<Value, RuntimeError> {
-    let sub_layout = relon_eval_api::layout::SchemaLayout::offsets_for(schema).map_err(|e| {
-        RuntimeError::Unsupported {
-            reason: format!("llvm-aot: return field `{name}` layout: {e}"),
-        }
-    })?;
-    let sub_reader = reader
-        .sub_record(name, &sub_layout, &schema.fields)
-        .map_err(buffer_to_runtime_error)?;
-    let map = read_record_into_map(&sub_reader, schema)?;
-    Ok(Value::branded_dict(map, Some(schema.name.clone())))
-}
-
-/// F2: `List<Schema>` object-field decode. The field slot holds the
-/// parameter list root's arena-absolute offset (a cross-region pointer into
-/// in_buf); `verify_object_return_multi` already bounds-checked the whole
-/// reachable graph, so the reader walks the pointer array into one
-/// sub-reader per element (sharing the parent's arena window) and drains
-/// each element's fields into a branded `Value::Dict`. Mirrors
-/// `marshal_schema_out` over the element schema and the cranelift backend's
-/// `List<Schema>` arm — the same shared `relon-eval-api` reader, just
-/// invoked from the llvm/wasm host.
-fn marshal_list_schema_out(
-    reader: &relon_eval_api::buffer::BufferReader<'_>,
-    name: &str,
-    schema: &relon_eval_api::schema_canonical::Schema,
-) -> Result<Value, RuntimeError> {
-    let elem_layout = relon_eval_api::layout::SchemaLayout::offsets_for(schema).map_err(|e| {
-        RuntimeError::Unsupported {
-            reason: format!(
-                "llvm-aot: List<Schema> element `{}` layout: {e}",
-                schema.name
-            ),
-        }
-    })?;
-    let sub_readers = reader
-        .read_list_record(name, &elem_layout, schema)
-        .map_err(buffer_to_runtime_error)?;
-    let mut items = Vec::with_capacity(sub_readers.len());
-    for sub in &sub_readers {
-        let map = read_record_into_map(sub, schema)?;
-        items.push(Value::branded_dict(map, Some(schema.name.clone())));
-    }
-    Ok(Value::List(Arc::new(items)))
-}
+// The object-return field decode (`read_value_from_reader` /
+// `read_record_into_map` and the per-type `marshal_*_out` seam) now
+// lives once in `relon_eval_api::inplace_return` and is reached through
+// `decode_object_return`; both AOT backends share that single copy, so a
+// new return field type is added in exactly one place.
 
 /// Phase E.1: does the return schema include any pointer-indirect
 /// type (`String` / `List*`)? Drives the output buffer's tail-cap
@@ -2314,18 +2050,6 @@ fn return_needs_tail_region(schema: &relon_eval_api::schema_canonical::Schema) -
             TypeRepr::String | TypeRepr::List { .. } | TypeRepr::Schema { .. }
         )
     })
-}
-
-fn read_record_into_map(
-    reader: &relon_eval_api::buffer::BufferReader<'_>,
-    schema: &relon_eval_api::schema_canonical::Schema,
-) -> Result<HashMap<String, Value>, RuntimeError> {
-    let mut out = HashMap::with_capacity(schema.fields.len());
-    for f in &schema.fields {
-        let v = read_value_from_reader(reader, f)?;
-        out.insert(f.name.clone(), v);
-    }
-    Ok(out)
 }
 
 /// Phase D.1 / D.2: discover whether `schema` qualifies for the typed

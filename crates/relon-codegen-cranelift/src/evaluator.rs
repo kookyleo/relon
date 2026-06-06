@@ -16,21 +16,19 @@
 //! paths, so callers never see a hard failure outside `run_main`.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use cranelift_jit::JITModule;
 
-use relon_eval_api::buffer::{BufferBuilder, BufferError, BufferReader};
+use relon_eval_api::buffer::{BufferBuilder, BufferError};
 use relon_eval_api::inplace_return::{
     decode_inplace_return, decode_inplace_sentinel, ArenaRegions,
 };
 use relon_eval_api::layout::{OffsetTable, SchemaLayout};
 use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
-use relon_eval_api::{
-    ClosureData, Evaluator, RelonFunction, RuntimeError, Scope, SmolStr, Thunk, Value,
-};
+use relon_eval_api::{ClosureData, Evaluator, RelonFunction, RuntimeError, Scope, Thunk, Value};
 use relon_ir::ir::NativeImport;
 use relon_parser::{Node, TokenRange};
 
@@ -1687,44 +1685,24 @@ impl AotEvaluator {
             arena_size,
         };
 
-        // Object / fixed-area return path: gate the record through the
-        // multi-region bounds verifier before decoding. Today every such
-        // return is self-contained in out_buf (cross-region object fields
-        // are still capped — F1b releases them), so every followed span
-        // lands in the `out` region, but the gate is already
+        // Object / fixed-area return path: the shared central entry gates
+        // the record through the multi-region bounds verifier BEFORE any
+        // decode (verify → decode is enforced inside, so no object-return
+        // caller can skip it), then walks the backend-shared object-field
+        // reader. Today every such return is self-contained in out_buf
+        // (cross-region object fields are still capped — F1b releases them),
+        // so every followed span lands in `out`, but the gate is already
         // cross-region-correct. This closes the red-line gap where the
         // object path previously decoded with no verifier at all.
-        let multi = regions.multi_region().map_err(|e| {
-            RuntimeError::IoError(format!(
-                "cranelift object return arena regions invalid: {e}"
-            ))
-        })?;
-        relon_eval_api::inplace_return::verify_object_return_multi(
+        relon_eval_api::inplace_return::decode_object_return(
             "cranelift",
             arena,
             out_ptr as usize,
-            multi,
+            regions,
             &bs.return_layout,
-            &bs.return_schema.fields,
-        )?;
-
-        let reader = BufferReader::new_at_base(
-            &bs.return_layout,
-            &bs.return_schema.fields,
-            arena,
-            out_ptr as usize,
+            &bs.return_schema,
+            is_single_value_wrapper(&bs.return_schema),
         )
-        .map_err(buffer_to_runtime_error)?;
-        if is_single_value_wrapper(&bs.return_schema) {
-            let field = &bs.return_schema.fields[0];
-            read_value_from_reader(&reader, field, &bs.return_schema)
-        } else {
-            let map = read_record_into_map(&reader, &bs.return_schema)?;
-            Ok(Value::branded_dict(
-                map,
-                Some(bs.return_schema.name.clone()),
-            ))
-        }
     }
 }
 
@@ -2124,149 +2102,10 @@ fn write_schema_fields_into_builder(
     Ok(())
 }
 
-/// Decode a single field via [`BufferReader`]. Stage 3 widens this to
-/// cover `String` / `List<Int>` / `List<Float>` / `List<Bool>` —
-/// pointer-indirect leaves whose payload lives in the out_buf tail
-/// area at the offset stored in the fixed-area slot. `List<String>` /
-/// `List<Schema>` still surface as `Unsupported` because the codegen
-/// can't yet emit them on the cranelift side.
-fn read_value_from_reader(
-    reader: &BufferReader<'_>,
-    field: &Field,
-    parent_schema: &Schema,
-) -> Result<Value, RuntimeError> {
-    match &field.ty {
-        TypeRepr::Int => reader
-            .read_int(&field.name)
-            .map(Value::Int)
-            .map_err(buffer_to_runtime_error),
-        TypeRepr::Float => reader
-            .read_float(&field.name)
-            .map(|f| Value::Float(ordered_float_wrap(f)))
-            .map_err(buffer_to_runtime_error),
-        TypeRepr::Bool => reader
-            .read_bool(&field.name)
-            .map(Value::Bool)
-            .map_err(buffer_to_runtime_error),
-        TypeRepr::Null => reader
-            .read_null(&field.name)
-            .map(|()| Value::Null)
-            .map_err(buffer_to_runtime_error),
-        TypeRepr::String => reader
-            .read_string(&field.name)
-            .map(|s| Value::String(s.into()))
-            .map_err(buffer_to_runtime_error),
-        TypeRepr::List { element } => match element.as_ref() {
-            TypeRepr::Int => reader
-                .read_list_int(&field.name)
-                .map(|v| Value::List(Arc::new(v.into_iter().map(Value::Int).collect())))
-                .map_err(buffer_to_runtime_error),
-            TypeRepr::Float => reader
-                .read_list_float(&field.name)
-                .map(|v| {
-                    Value::List(Arc::new(
-                        v.into_iter()
-                            .map(|f| Value::Float(ordered_float_wrap(f)))
-                            .collect(),
-                    ))
-                })
-                .map_err(buffer_to_runtime_error),
-            TypeRepr::Bool => reader
-                .read_list_bool(&field.name)
-                .map(|v| Value::List(Arc::new(v.into_iter().map(Value::Bool).collect())))
-                .map_err(buffer_to_runtime_error),
-            TypeRepr::String => reader
-                .read_list_string(&field.name)
-                .map(|v| {
-                    Value::List(Arc::new(
-                        v.into_iter().map(|s| Value::String(s.into())).collect(),
-                    ))
-                })
-                .map_err(buffer_to_runtime_error),
-            // `List<Schema>`: walk the pointer array into one sub-reader
-            // per entry (`read_list_record` shares the same buffer base),
-            // then drain each entry's fields into a branded dict via the
-            // same `read_record_into_map` the top-level record return
-            // uses. The recursion runs entirely in safe Rust against the
-            // single shared buffer window — no machine-code re-pack.
-            TypeRepr::Schema { schema } => {
-                let elem_layout = SchemaLayout::offsets_for(schema).map_err(|e| {
-                    RuntimeError::Unsupported {
-                        reason: format!(
-                            "cranelift-native: List<Schema> element `{}` layout: {e}",
-                            schema.name
-                        ),
-                    }
-                })?;
-                let sub_readers = reader
-                    .read_list_record(&field.name, &elem_layout, schema)
-                    .map_err(buffer_to_runtime_error)?;
-                let mut items = Vec::with_capacity(sub_readers.len());
-                for sub in &sub_readers {
-                    let map = read_record_into_map(sub, schema)?;
-                    items.push(Value::branded_dict(map, Some(schema.name.clone())));
-                }
-                Ok(Value::List(Arc::new(items)))
-            }
-            // `List<List<…>>`: decode the nested pointer-array. The inner
-            // inline-fixed scalar case keeps the dedicated `read_list_list`
-            // reader; `List<List<String|Schema>>` (F5) routes through the
-            // recursive `read_list_value` so the inner pointer arrays are
-            // followed one level deeper.
-            TypeRepr::List { element: inner } => match inner.as_ref() {
-                TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool => reader
-                    .read_list_list(&field.name)
-                    .map(|rows| {
-                        Value::List(Arc::new(
-                            rows.into_iter().map(|r| Value::List(Arc::new(r))).collect(),
-                        ))
-                    })
-                    .map_err(buffer_to_runtime_error),
-                _ => reader
-                    .read_list_value(&field.name, element.as_ref())
-                    .map(|rows| Value::List(Arc::new(rows)))
-                    .map_err(buffer_to_runtime_error),
-            },
-            other => Err(RuntimeError::Unsupported {
-                reason: format!(
-                    "cranelift-native: cannot decode list field `{field}` of element type `{ty:?}` in schema `{schema}`",
-                    field = field.name,
-                    ty = other,
-                    schema = parent_schema.name,
-                ),
-            }),
-        },
-        other => Err(RuntimeError::Unsupported {
-            reason: format!(
-                "cranelift-native: cannot decode field `{field}` of type `{ty:?}` in schema `{schema}`",
-                field = field.name,
-                ty = other,
-                schema = parent_schema.name,
-            ),
-        }),
-    }
-}
-
-/// Borrow `ordered_float::OrderedFloat` without the bound's crate
-/// dependency leaking out of the helper — keeps the eval-api surface
-/// of the cranelift backend narrow.
-fn ordered_float_wrap(f: f64) -> ordered_float::OrderedFloat<f64> {
-    ordered_float::OrderedFloat(f)
-}
-
-/// Drain every field of `schema` into a sorted `BTreeMap<SmolStr,
-/// Value>`. Mirrors `relon_codegen_wasm::read_record_into_map`.
-fn read_record_into_map(
-    reader: &BufferReader<'_>,
-    schema: &Schema,
-) -> Result<BTreeMap<SmolStr, Value>, RuntimeError> {
-    let mut map = BTreeMap::new();
-    for field in &schema.fields {
-        let value = read_value_from_reader(reader, field, schema)?;
-        map.insert(SmolStr::from(field.name.as_str()), value);
-    }
-    Ok(map)
-}
+// The object-return field decode (`read_value_from_reader` /
+// `read_record_into_map`) now lives once in
+// `relon_eval_api::inplace_return` and is reached through
+// `decode_object_return`; both AOT backends share that single copy.
 
 #[cfg(test)]
 mod tests {
