@@ -6101,3 +6101,200 @@ fn run_main_w7_recursive_closure_dict_field() {
         d.map
     );
 }
+
+// ---------------------------------------------------------------------------
+// Fused `list.sum(range(...))` — AST-level fusion shared with IR lowering.
+//
+// These pin the tree-walk interpreter's materialisation-free fast-path
+// (`try_eval_fused`, fed by `relon_parser::rewrite::recognize_fused`).
+// ---------------------------------------------------------------------------
+
+/// Evaluate a fused-pattern document under a caller-supplied `Context` so
+/// individual tests can dial capability knobs (`max_value_elements`,
+/// `max_steps`). Mirrors `eval_doc` but takes the context.
+fn eval_fused_with(ctx: Context, source: &str) -> Result<Value, RuntimeError> {
+    let node = parse_doc(source);
+    let ctx = ctx.with_root(node);
+    let ctx = std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    });
+    TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx))
+        .eval_root(&std::sync::Arc::new(Scope::default()))
+}
+
+#[test]
+fn fused_list_sum_range_matches_materialized_small() {
+    // The fused fold must equal the materialised `range(...).sum()` for the
+    // ordinary case: sum 0..100 = 4950.
+    let result = eval_doc("#import list from \"std/list\"\n{ s: list.sum(range(100)) }").unwrap();
+    let Value::Dict(d) = result else {
+        panic!("expected dict")
+    };
+    assert_eq!(d.map.get("s"), Some(&Value::Int(4950)));
+}
+
+#[test]
+fn fused_list_sum_range_start_end() {
+    // start..end form: sum 5..10 = 5+6+7+8+9 = 35.
+    let result = eval_doc("#import list from \"std/list\"\n{ s: list.sum(range(5, 10)) }").unwrap();
+    let Value::Dict(d) = result else {
+        panic!("expected dict")
+    };
+    assert_eq!(d.map.get("s"), Some(&Value::Int(35)));
+}
+
+#[test]
+fn fused_list_sum_range_boundaries() {
+    // n=0 (empty), n=1 (single element 0), inverted start>=end (empty).
+    for (src, want) in [
+        ("list.sum(range(0))", 0i64),
+        ("list.sum(range(1))", 0),
+        ("list.sum(range(2))", 1),
+        ("list.sum(range(10, 3))", 0),  // start >= end ⇒ empty ⇒ 0
+        ("list.sum(range(-3, 3))", -3), // -3-2-1+0+1+2 = -3
+    ] {
+        let doc = format!("#import list from \"std/list\"\n{{ s: {src} }}");
+        let result = eval_doc(&doc).unwrap();
+        let Value::Dict(d) = result else {
+            panic!("expected dict")
+        };
+        assert_eq!(d.map.get("s"), Some(&Value::Int(want)), "src=`{src}`");
+    }
+}
+
+#[test]
+fn fused_list_sum_range_traps_on_overflow_like_oracle() {
+    // Byte-exact overflow contract. The user-facing `list.sum` is the
+    // `std/list` wrapper `sum(l): l | _list_reduce(0, (acc, x) => acc + x)`,
+    // whose `+` is the interpreter's *checked* Int addition — it raises
+    // `NumericOverflow` on the first overflowing partial sum, NOT wrapping
+    // and NOT a closed-form. The fused fast-path MUST reproduce that trap.
+    //
+    // First confirm the oracle (un-fused, via a literal list that the fused
+    // recogniser never matches) traps, then confirm the fused range form
+    // traps identically.
+    let lo = i64::MAX - 2;
+    let hi = i64::MAX; // range = [MAX-2, MAX-1]; MAX-2 + MAX-1 overflows.
+    let fused_doc = format!("#import list from \"std/list\"\n{{ s: list.sum(range({lo}, {hi})) }}");
+    let fused = eval_fused_with(Context::new(), &fused_doc);
+    assert!(
+        matches!(fused, Err(RuntimeError::NumericOverflow(_))),
+        "fused list.sum(range) must trap on overflow like the checked `+` oracle, got {fused:?}"
+    );
+
+    // Oracle cross-check: the same two elements summed through the
+    // *materialised* `list.sum([..])` wrapper also trap with NumericOverflow.
+    let oracle_doc = format!(
+        "#import list from \"std/list\"\n{{ s: list.sum([{lo}, {}]) }}",
+        hi - 1
+    );
+    let oracle = eval_fused_with(Context::new(), &oracle_doc);
+    assert!(
+        matches!(oracle, Err(RuntimeError::NumericOverflow(_))),
+        "oracle list.sum([..]) must also trap, got {oracle:?}"
+    );
+}
+
+#[test]
+fn fused_list_sum_range_no_materialization_witness() {
+    // **Non-materialisation proof.** Sum a range so large that materialising
+    // the intermediate `Vec<Value>` (each `Value` is multiple words) would
+    // require tens of GB and OOM/abort the test. The fused fold streams the
+    // sum in i64 space, so it returns promptly. If this test ever starts
+    // OOM-ing or timing out, the interpreter has regressed to materialising
+    // the range list.
+    //
+    // No `max_value_elements` cap is set, so the materialised path would be
+    // *permitted* to allocate — only the fusion saves us. The expected value
+    // is the wrapping sum of 0..N.
+    // 1e8 elements × sizeof(Value) (multiple words each) ⇒ several GB, far
+    // beyond a test runner's headroom if materialised; the fused i64 fold
+    // streams it without allocating, completing even in an unoptimised debug
+    // build. If this ever OOMs/hangs, the interpreter regressed to
+    // materialising the range list.
+    let n: i64 = 100_000_000;
+    let doc = format!("#import list from \"std/list\"\n{{ s: list.sum(range({n})) }}");
+    let result = eval_fused_with(Context::new(), &doc).expect("fused fold must not allocate");
+    // Sum 0..2e8 ≈ 2e16, comfortably within i64 (no overflow), so the
+    // checked fold returns the value rather than trapping.
+    let mut acc: i64 = 0;
+    let mut i = 0i64;
+    while i < n {
+        acc = acc.checked_add(i).expect("witness sum fits in i64");
+        i += 1;
+    }
+    let Value::Dict(d) = result else {
+        panic!("expected dict")
+    };
+    assert_eq!(d.map.get("s"), Some(&Value::Int(acc)));
+}
+
+#[test]
+fn fused_list_sum_range_respects_max_value_elements() {
+    // Byte-exact error contract: the fused path mirrors `Range`'s
+    // `max_value_elements` pre-flight, so an oversized range still surfaces
+    // `ValueTooLarge` exactly as the materialised path would.
+    // Cap must exceed the std/list module's own entry count (so importing /
+    // identity-checking the module succeeds) yet be smaller than the range,
+    // isolating the range pre-flight as the trip.
+    let mut ctx = Context::new();
+    ctx.capabilities.max_value_elements = Some(50);
+    let result = eval_fused_with(
+        ctx,
+        "#import list from \"std/list\"\n{ s: list.sum(range(100)) }",
+    );
+    assert!(
+        matches!(
+            result,
+            Err(RuntimeError::ValueTooLarge {
+                limit: 50,
+                actual: 100,
+                ..
+            })
+        ),
+        "expected ValueTooLarge from fused range pre-flight, got {result:?}"
+    );
+}
+
+#[test]
+fn fused_list_sum_range_respects_max_steps() {
+    // The fused path mirrors `Range`'s length tick, so a large range under a
+    // tight step budget still trips `StepLimitExceeded`.
+    let mut ctx = Context::new();
+    ctx.capabilities.max_steps = Some(100);
+    ctx.capabilities.max_value_elements = None;
+    let result = eval_fused_with(
+        ctx,
+        "#import list from \"std/list\"\n{ s: list.sum(range(10000)) }",
+    );
+    assert!(
+        matches!(
+            result,
+            Err(RuntimeError::StepLimitExceeded {
+                limit: Some(100),
+                ..
+            })
+        ),
+        "expected StepLimitExceeded from fused tick, got {result:?}"
+    );
+}
+
+#[test]
+fn fused_list_sum_range_falls_through_when_list_shadowed() {
+    // Soundness guard: if a local binding shadows `list`, the fused path must
+    // NOT fire — the call resolves against the user's binding instead. Here a
+    // `where`-bound `list` shadows the stdlib module; `list.sum` then fails to
+    // resolve as a method on an Int, surfacing an error rather than silently
+    // computing a fused sum.
+    let result =
+        eval_doc("#import list from \"std/list\"\n{ s: list.sum(range(10)) where { list: 7 } }");
+    // The fused fast-path is bypassed (list is shadowed by the int 7); the
+    // generic dispatch then cannot find `list.sum` and errors. The key
+    // assertion is that we did NOT return Int(45) (the fused sum of 0..10).
+    assert!(
+        !matches!(&result, Ok(Value::Dict(d)) if d.map.get("s") == Some(&Value::Int(45))),
+        "fused path must not fire when `list` is shadowed, got {result:?}"
+    );
+}

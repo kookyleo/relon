@@ -56,6 +56,20 @@ pub(super) fn try_lower_list_sum_range(
     // recognized `.map((p) => <body>)` / `.filter((p) => <body>)`
     // invocations.  Returns the base range_args plus the per-stage
     // closure adaptor list; otherwise falls through.
+    //
+    // The *bare* `list.sum(range(...))` subset (no map/filter stages) is
+    // ALSO recognised by the shared AST recogniser
+    // `relon_parser::rewrite::recognize_fused`, which the tree-walk
+    // interpreter now consumes for its materialisation-free fast-path. This
+    // IR helper retains its own `match_range_chain` walk because it must
+    // additionally lower the map/filter chain forms (the chain handling is
+    // the other W-series peephole infrastructure). The two recognisers are
+    // kept structurally consistent for the bare-range subset; see the
+    // `recognizer_parity` tests at the bottom of this module for the parity
+    // guard. The IR helper stays the authority on the IR side (no double
+    // rewrite: the interpreter fast-path and IR lowering are mutually
+    // exclusive — one runs in the tree-walk backend, the other in the
+    // compiled backends).
     let Some(chain) = match_range_chain(&args[0].value.expr) else {
         return Ok(None);
     };
@@ -3811,4 +3825,84 @@ fn emit_range_pipeline_loop(
     });
     ctx.tstack.push(acc_ty);
     Ok(())
+}
+
+#[cfg(test)]
+mod recognizer_parity {
+    //! Parity guard: the shared AST recogniser
+    //! `relon_parser::rewrite::recognize_fused` (consumed by the tree-walk
+    //! interpreter's materialisation-free fast-path) must agree with this
+    //! module's IR-side `match_range_chain` on the *bare* `list.sum(range(...))`
+    //! subset (no map/filter stages). Keeps the two recognisers from drifting.
+
+    use super::*;
+    use relon_parser::parse_document;
+    use relon_parser::rewrite::{recognize_fused, FusedPattern};
+
+    fn list_sum_call(src: &str) -> Node {
+        let doc = parse_document(src).expect("parse");
+        fn find(node: &Node) -> Option<Node> {
+            if let Expr::FnCall { path, .. } = node.expr.as_ref() {
+                let is_list_sum = path.len() == 2
+                    && matches!(&path[0], TokenKey::String(s, _, _) if s == "list")
+                    && matches!(&path[1], TokenKey::String(s, _, _) if s == "sum");
+                if is_list_sum {
+                    return Some(node.clone());
+                }
+            }
+            for child in relon_parser::child_nodes(node) {
+                if let Some(found) = find(child) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        find(&doc).expect("list.sum call")
+    }
+
+    /// On the bare-range subset both recognisers fire and agree on the
+    /// presence/absence of an explicit `start` argument.
+    #[test]
+    fn bare_range_subset_agrees() {
+        for (src, has_start) in [
+            ("#main(Int n) -> Int\nlist.sum(range(n))", false),
+            ("#main(Int n) -> Int\nlist.sum(range(5, n))", true),
+        ] {
+            let call = list_sum_call(src);
+            let Expr::FnCall { args, .. } = call.expr.as_ref() else {
+                unreachable!()
+            };
+            // IR side.
+            let chain = match_range_chain(&args[0].value.expr).expect("ir match");
+            assert!(chain.stages.is_empty(), "bare range has no stages: {src}");
+            let ir_has_start = chain.range_args.len() == 2;
+            // Shared AST recogniser.
+            let pat = recognize_fused(call.expr.as_ref()).expect("ast match");
+            let FusedPattern::RangeSum { start, .. } = pat;
+            assert_eq!(start.is_some(), has_start, "ast start mismatch: {src}");
+            assert_eq!(
+                ir_has_start,
+                start.is_some(),
+                "ir/ast disagree on start arg: {src}"
+            );
+        }
+    }
+
+    /// The map/filter chain forms are owned by the IR peephole only; the
+    /// shared AST recogniser deliberately does NOT fire on them (so the
+    /// interpreter falls through to the stdlib path).
+    #[test]
+    fn chain_form_is_ir_only() {
+        let call = list_sum_call("#main(Int n) -> Int\nlist.sum(range(n).map((i) => i))");
+        let chain = match_range_chain(match call.expr.as_ref() {
+            Expr::FnCall { args, .. } => &args[0].value.expr,
+            _ => unreachable!(),
+        })
+        .expect("ir match");
+        assert_eq!(chain.stages.len(), 1, "one map stage");
+        assert!(
+            recognize_fused(call.expr.as_ref()).is_none(),
+            "shared recogniser must not claim chain forms"
+        );
+    }
 }
