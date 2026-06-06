@@ -1,0 +1,296 @@
+//! Capability-cap site registry for the lowering pass.
+//!
+//! Every place in `lowering` that constructs a [`LoweringError`] — a loud
+//! "this construct is not yet expressible in the IR" cap — is wrapped in
+//! the [`cap!`] macro with a stable, descriptive id. The wrapping is
+//! deliberately codegen-neutral:
+//!
+//! * In a normal (non-test) build `cap!(id, err)` is a **pure identity
+//!   passthrough**: it expands to `err` unchanged, the id is consumed
+//!   only as a compile-time `&'static str` constant, and no runtime code
+//!   is emitted. The IR / object bytes the backends hash therefore stay
+//!   byte-identical to a tree without the wrapping, so the codegen
+//!   `GENERATOR_VERSION` does not move.
+//! * Under `#[cfg(test)]` `cap!` additionally records that `id` fired
+//!   (see [`record`]) before returning `err` unchanged. A later wave's
+//!   no-fallback test reads [`fired_caps`] to learn which caps a corpus
+//!   probe actually hit. The recording is side-effect-free with respect
+//!   to the returned error value.
+//!
+//! [`LOWERING_CAP_IDS`] is the canonical list of every wrapped site's id.
+//! The macro asserts (in test builds) that it is only ever invoked with an
+//! id present in this slice, and the harness `ledger_completeness` test
+//! enforces a bijection between this slice and the test-harness ledger, so
+//! a future cap added without a registered id fails fast.
+
+/// Wrap a [`crate::error::LoweringError`] construction at a capped site.
+///
+/// `cap!(id, err_expr)` returns `err_expr` unchanged. `id` must be a
+/// `&'static str` literal that appears in [`LOWERING_CAP_IDS`].
+///
+/// The two arms below are value-identical; only the test arm adds the
+/// (value-preserving) recording side-channel.
+#[cfg(not(test))]
+macro_rules! cap {
+    ($id:expr, $err:expr $(,)?) => {{
+        // Consume the id as a compile-time constant so a typo is still a
+        // type error, without emitting any runtime instruction.
+        const _: &str = $id;
+        $err
+    }};
+}
+
+#[cfg(test)]
+macro_rules! cap {
+    ($id:expr, $err:expr $(,)?) => {{
+        const _: &str = $id;
+        $crate::lowering::cap::record($id);
+        $err
+    }};
+}
+
+/// Stable ids for every [`cap!`] site in the lowering pass. Append-only in
+/// spirit: a new cap site must add its id here (and a ledger entry), or the
+/// completeness test fails. Ids are `<fn>.<variant_snake>[.<n>]`, where the
+/// trailing index disambiguates multiple physical sites of the same variant
+/// inside one function.
+pub const LOWERING_CAP_IDS: &[&str] = &[
+    "lower_workspace.entry_module_not_found.1",
+    "lower_workspace.entry_module_not_found.2",
+    "lower_workspace.multiple_main_directives",
+    "detect_cross_file_schema_conflicts.duplicate_schema_across_files",
+    "lower_entry_with_resolver.missing_main",
+    "lower_entry_with_resolver.closure_across_boundary.1",
+    "lower_entry_with_resolver.closure_across_boundary.2",
+    "lower_entry_with_resolver.unsupported_expr.1",
+    "lower_entry_with_resolver.unsupported_expr.2",
+    "lower_entry_with_resolver.unsupported_type_in_main",
+    "lower_entry_with_resolver.unsupported_expr.3",
+    "build_main_params_schema.unsupported_type_in_main",
+    "build_main_return_schema.unsupported_type_in_main.1",
+    "build_main_return_schema.unsupported_type_in_main.2",
+    "anon_dict_return_plan.unsupported_expr",
+    "anon_dict_return_plan.closure_across_boundary",
+    "anon_dict_return_plan.unsupported_field_type",
+    "classify_anon_dict_scalar_field.unsupported_expr",
+    "classify_anon_dict_str_int_field.unsupported_expr.1",
+    "classify_anon_dict_str_int_field.unsupported_expr.2",
+    "classify_anon_dict_list_string_field.unsupported_expr",
+    "classify_anon_dict_list_field.unsupported_field_type.1",
+    "classify_anon_dict_list_field.unsupported_field_type.2",
+    "classify_anon_dict_list_field.unsupported_field_type.3",
+    "classify_anon_dict_scalar_field_irt.unsupported_expr.1",
+    "classify_anon_dict_scalar_field_irt.unsupported_expr.2",
+    "classify_anon_dict_scalar_field_irt.unsupported_expr.3",
+    "classify_anon_dict_scalar_field_irt.unsupported_expr.4",
+    "lower_anon_dict_body.unsupported_expr.1",
+    "lower_anon_dict_body.unsupported_expr.2",
+    "lower_anon_dict_body.unsupported_expr.3",
+    "lower_anon_dict_body.unsupported_field_type.1",
+    "lower_anon_dict_body.unsupported_expr.4",
+    "lower_anon_dict_body.unsupported_field_type.2",
+    "lower_anon_dict_body.unsupported_expr.5",
+    "lower_anon_dict_body.unsupported_expr.6",
+    "lower_anon_dict_body.unsupported_expr.7",
+    "lower_anon_dict_body.unsupported_field_type.3",
+    "lower_anon_dict_body.unsupported_expr.8",
+    "type_repr_to_ir_type.unsupported_type_in_main.1",
+    "type_repr_to_ir_type.unsupported_type_in_main.2",
+    "lower_expr.unsupported_expr.1",
+    "lower_expr.unsupported_expr.2",
+    "lower_expr.unsupported_expr.3",
+    "lower_expr.unsupported_expr.4",
+    "lower_expr.unsupported_expr.5",
+    "lower_expr.unsupported_expr.6",
+    "lower_expr.unsupported_expr.7",
+    "lower_expr.closure_across_boundary",
+    "lower_expr.unsupported_expr.8",
+    "try_lower_local_closure_call.unsupported_expr.1",
+    "try_lower_local_closure_call.unknown_stdlib_method",
+    "try_lower_local_closure_call.unsupported_expr.2",
+    "try_lower_local_closure_call.unsupported_expr.3",
+    "try_lower_local_closure_call.stdlib_arg_type_mismatch",
+    "try_lower_native_call.unsupported_expr.1",
+    "try_lower_native_call.unsupported_expr.2",
+    "try_lower_native_call.unsupported_expr.3",
+    "lower_fn_call.unsupported_expr.1",
+    "lower_fn_call.unsupported_expr.2",
+    "lower_fn_call.unknown_stdlib_method.1",
+    "lower_fn_call.unknown_stdlib_method.2",
+    "lower_fn_call.unknown_stdlib_method.3",
+    "lower_fn_call.unsupported_expr.3",
+    "lower_fn_call.unsupported_expr.4",
+    "lower_fn_call.unknown_stdlib_method.4",
+    "lower_fn_call.unknown_stdlib_method.5",
+    "lower_fn_call.unknown_stdlib_method.6",
+    "lower_fn_call.unsupported_expr.5",
+    "lower_fn_call.unsupported_expr.6",
+    "lower_list_index_typed.unsupported_expr",
+    "lower_list_string_index.unsupported_expr",
+    "lower_dict_string_index.unsupported_expr.1",
+    "lower_dict_string_index.unsupported_expr.2",
+    "lower_dict_string_index.unsupported_expr.3",
+    "expect_int_top.unsupported_expr.1",
+    "expect_int_top.unsupported_expr.2",
+    "lower_stdlib_arg.unknown_stdlib_method",
+    "lower_stdlib_arg.unsupported_expr.1",
+    "lower_stdlib_arg.unsupported_expr.2",
+    "lower_stdlib_arg.unsupported_expr.3",
+    "lower_method_receiver.unsupported_expr.1",
+    "lower_method_receiver.unsupported_expr.2",
+    "finish_schema_method_call.unknown_stdlib_method",
+    "finish_schema_method_call.unsupported_expr.1",
+    "finish_schema_method_call.stdlib_arg_type_mismatch.1",
+    "finish_schema_method_call.unsupported_expr.2",
+    "finish_schema_method_call.unsupported_expr.3",
+    "finish_schema_method_call.stdlib_arg_type_mismatch.2",
+    "check_stdlib_arg.unknown_stdlib_method",
+    "check_stdlib_arg.stdlib_arg_type_mismatch",
+    "lower_where.unsupported_expr.1",
+    "lower_where.unsupported_expr.2",
+    "lower_where.unsupported_expr.3",
+    "lower_where.unsupported_expr.4",
+    "lower_where.unsupported_expr.5",
+    "lower_where.unsupported_expr.6",
+    "lower_binary.unsupported_operator.1",
+    "lower_binary.unsupported_operator.2",
+    "lower_binary.unsupported_operator.3",
+    "lower_binary.unsupported_operator.4",
+    "lower_binary.unsupported_operator.5",
+    "lower_binary.unsupported_operator.6",
+    "lower_binary.unsupported_operator.7",
+    "lower_binary.unsupported_operator.8",
+    "lower_binary.unsupported_operator.9",
+    "lower_binary.unsupported_operator.10",
+    "lower_binary.unsupported_operator.11",
+    "lower_binary.unsupported_operator.12",
+    "lower_binary.unsupported_operator.13",
+    "lower_binary.unsupported_operator.14",
+    "lower_ternary.unsupported_expr",
+    "lower_ternary.if_condition_not_bool",
+    "lower_ternary.if_branch_type_mismatch",
+    "lower_branch.unsupported_expr",
+    "canonical_schema_from_def.unsupported_expr",
+    "canonical_schema_from_def.cyclic_field_dependency",
+    "canonical_schema_from_def.unsupported_field_type",
+    "canonical_type_repr.unsupported_field_type.1",
+    "canonical_type_repr.unsupported_field_type.2",
+    "canonical_type_repr.unsupported_field_type.3",
+    "topo_order_fields.missing_field_no_default",
+    "topo_order_fields.cyclic_field_dependency",
+    "check_field_default_refs_resolvable.unknown_field_reference_in_default",
+    "lower_dict_into_record.unknown_schema_brand",
+    "lower_dict_into_record.unsupported_expr.1",
+    "lower_dict_into_record.unsupported_field_type.1",
+    "lower_dict_into_record.unsupported_expr.2",
+    "lower_dict_into_record.unsupported_field_type.2",
+    "lower_dict_field_value.unsupported_expr.1",
+    "lower_dict_field_value.unsupported_field_type.1",
+    "lower_dict_field_value.unsupported_field_type.2",
+    "lower_dict_field_value.unsupported_expr.2",
+    "lower_dict_field_value.unsupported_field_type.3",
+    "lower_dict_default.missing_field_no_default",
+    "lower_variable.unsupported_expr.1",
+    "lower_variable.unsupported_expr.2",
+    "lower_variable.unresolved_variable.1",
+    "lower_variable.unresolved_variable.2",
+    "lower_variable.unsupported_expr.3",
+    "lower_variable.unsupported_expr.4",
+    "lower_variable.unsupported_expr.5",
+    "lower_variable.unsupported_expr.6",
+    "lower_variable.unsupported_expr.7",
+    "lower_variable.unsupported_expr.8",
+    "lower_variable.unsupported_field_type",
+    "lower_variable.unsupported_expr.9",
+    "lower_variable.unsupported_expr.10",
+    "method_signature_ir_types.unsupported_type_in_main.1",
+    "method_signature_ir_types.unsupported_type_in_main.2",
+    "method_signature_ir_types.unsupported_type_in_main.3",
+    "lower_one_method.unsupported_expr.1",
+    "lower_one_method.unsupported_expr.2",
+    "lower_one_method.unsupported_type_in_main",
+    "try_lower_materialized_list_reduce.unresolved_variable",
+    "try_lower_materialized_list_reduce.unsupported_expr.1",
+    "try_lower_materialized_list_reduce.unsupported_expr.2",
+    "try_lower_materialized_list_reduce.unsupported_expr.3",
+    "combine_operator_to_op.unsupported_expr",
+    "try_lower_list_filter.unknown_stdlib_method.1",
+    "try_lower_list_filter.unknown_stdlib_method.2",
+    "try_lower_list_filter.unsupported_expr",
+    "try_lower_list_sum_value.unknown_stdlib_method.1",
+    "try_lower_list_sum_value.unknown_stdlib_method.2",
+    "emit_list_float_literal_materialize.unsupported_expr.1",
+    "emit_list_float_literal_materialize.unsupported_expr.2",
+    "emit_list_float_literal_materialize.unsupported_expr.3",
+    "emit_list_float_literal_materialize.unsupported_expr.4",
+    "emit_list_int_literal_materialize.unsupported_expr.1",
+    "emit_list_int_literal_materialize.unsupported_expr.2",
+    "emit_list_int_literal_materialize.unsupported_expr.3",
+    "emit_list_int_literal_materialize.unsupported_expr.4",
+    "probe_expr_ir_ty.unsupported_expr",
+    "emit_list_value_materialize.unsupported_expr.1",
+    "emit_list_value_materialize.unsupported_expr.2",
+    "emit_list_value_materialize.unsupported_expr.3",
+    "emit_list_value_materialize.unsupported_expr.4",
+    "emit_range_pipeline_loop.unsupported_expr.1",
+    "emit_range_pipeline_loop.unsupported_expr.2",
+    "emit_range_pipeline_loop.unsupported_expr.3",
+    "emit_range_pipeline_loop.unsupported_expr.4",
+    "emit_range_pipeline_loop.unsupported_expr.5",
+    "emit_range_pipeline_loop.unsupported_expr.6",
+    "emit_range_pipeline_loop.unsupported_expr.7",
+    "emit_range_pipeline_loop.unsupported_expr.8",
+    "resolve_capture.unsupported_closure_capture",
+    "lower_closure_as_value.unsupported_expr.1",
+    "lower_closure_as_value.unsupported_expr.2",
+    "lower_closure_as_value.unsupported_expr.3",
+    "lower_closure_as_value.stdlib_arg_type_mismatch",
+];
+
+#[cfg(test)]
+thread_local! {
+    static FIRED: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Record that the cap `id` fired. Test-only; asserts `id` is registered.
+#[cfg(test)]
+pub(crate) fn record(id: &'static str) {
+    debug_assert!(
+        LOWERING_CAP_IDS.contains(&id),
+        "cap! fired with unregistered id `{id}` — add it to LOWERING_CAP_IDS"
+    );
+    FIRED.with(|f| f.borrow_mut().push(id));
+}
+
+/// Drain and return the ids that fired on this thread since the last call.
+/// Test-only; used by no-fallback coverage tests to assert which cap a
+/// probe hit.
+#[cfg(test)]
+pub(crate) fn fired_caps() -> Vec<&'static str> {
+    FIRED.with(|f| std::mem::take(&mut *f.borrow_mut()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for id in LOWERING_CAP_IDS {
+            assert!(
+                seen.insert(*id),
+                "duplicate cap id in LOWERING_CAP_IDS: {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_then_drain_roundtrips() {
+        let id = LOWERING_CAP_IDS[0];
+        let _ = fired_caps(); // clear any residue from earlier tests on this thread
+        record(id);
+        assert_eq!(fired_caps(), vec![id]);
+        assert!(fired_caps().is_empty(), "drain should empty the buffer");
+    }
+}

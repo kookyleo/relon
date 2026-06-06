@@ -44,6 +44,8 @@ use crate::stdlib::{
     stdlib_method_index,
 };
 
+#[macro_use]
+pub mod cap;
 mod closure;
 mod peephole;
 
@@ -511,18 +513,22 @@ pub fn lower_workspace(
     ws: &WorkspaceTree,
     entry_module: &str,
 ) -> Result<LoweredEntry, LoweringError> {
-    let entry_tree =
-        ws.modules
-            .get(entry_module)
-            .ok_or_else(|| LoweringError::EntryModuleNotFound {
+    let entry_tree = ws.modules.get(entry_module).ok_or_else(|| {
+        cap!(
+            "lower_workspace.entry_module_not_found.1",
+            LoweringError::EntryModuleNotFound {
                 module: entry_module.to_string(),
-            })?;
-    let entry_root =
-        ws.nodes
-            .get(entry_module)
-            .ok_or_else(|| LoweringError::EntryModuleNotFound {
+            }
+        )
+    })?;
+    let entry_root = ws.nodes.get(entry_module).ok_or_else(|| {
+        cap!(
+            "lower_workspace.entry_module_not_found.2",
+            LoweringError::EntryModuleNotFound {
                 module: entry_module.to_string(),
-            })?;
+            }
+        )
+    })?;
 
     // Reachable modules, BFS from the entry. Entry first so it wins
     // on a schema-name collision (the conflict detection below catches
@@ -553,10 +559,13 @@ pub fn lower_workspace(
             continue;
         }
         if tree.main_signature.is_some() {
-            return Err(LoweringError::MultipleMainDirectives {
-                entry_module: entry_module.to_string(),
-                other_module: (*id).to_string(),
-            });
+            return Err(cap!(
+                "lower_workspace.multiple_main_directives",
+                LoweringError::MultipleMainDirectives {
+                    entry_module: entry_module.to_string(),
+                    other_module: (*id).to_string(),
+                }
+            ));
         }
     }
 
@@ -658,11 +667,14 @@ fn detect_cross_file_schema_conflicts(
             let name = decl.name.clone();
             if let Some((other_id, other_schema)) = first_seen.get(&name) {
                 if schema_hashes_differ(other_schema, &canonical) {
-                    return Err(LoweringError::DuplicateSchemaAcrossFiles {
-                        name,
-                        first_module: other_id.clone(),
-                        second_module: (*id).to_string(),
-                    });
+                    return Err(cap!(
+                        "detect_cross_file_schema_conflicts.duplicate_schema_across_files",
+                        LoweringError::DuplicateSchemaAcrossFiles {
+                            name,
+                            first_module: other_id.clone(),
+                            second_module: (*id).to_string(),
+                        }
+                    ));
                 }
             } else {
                 first_seen.insert(name, ((*id).to_string(), canonical));
@@ -687,12 +699,14 @@ fn lower_entry_with_resolver<'a>(
     module_id: &str,
     resolver: SchemaResolver<'a>,
 ) -> Result<LoweredEntry, LoweringError> {
-    let sig = tree
-        .main_signature
-        .as_ref()
-        .ok_or_else(|| LoweringError::MissingMain {
-            module: module_id.to_string(),
-        })?;
+    let sig = tree.main_signature.as_ref().ok_or_else(|| {
+        cap!(
+            "lower_entry_with_resolver.missing_main",
+            LoweringError::MissingMain {
+                module: module_id.to_string(),
+            }
+        )
+    })?;
 
     // Phase 10-a: reject closure-typed `#main` params + return type
     // up front. Wasm-side closure values are scratch-heap pointers
@@ -702,18 +716,24 @@ fn lower_entry_with_resolver<'a>(
     // than at a downstream schema-build failure.
     for p in &sig.params {
         if type_node_names_closure(&p.type_node) {
-            return Err(LoweringError::ClosureAcrossBoundary {
-                context: format!("`#main` parameter `{}`", p.name),
-                range: p.type_node.range,
-            });
+            return Err(cap!(
+                "lower_entry_with_resolver.closure_across_boundary.1",
+                LoweringError::ClosureAcrossBoundary {
+                    context: format!("`#main` parameter `{}`", p.name),
+                    range: p.type_node.range,
+                }
+            ));
         }
     }
     if let Some(rt) = sig.return_type.as_ref() {
         if type_node_names_closure(rt) {
-            return Err(LoweringError::ClosureAcrossBoundary {
-                context: "`#main` return type".to_string(),
-                range: rt.range,
-            });
+            return Err(cap!(
+                "lower_entry_with_resolver.closure_across_boundary.2",
+                LoweringError::ClosureAcrossBoundary {
+                    context: "`#main` return type".to_string(),
+                    range: rt.range,
+                }
+            ));
         }
     }
 
@@ -815,13 +835,16 @@ fn lower_entry_with_resolver<'a>(
         let dict_pairs = match &*root.expr {
             Expr::Dict(pairs) => pairs.as_slice(),
             _ => {
-                return Err(LoweringError::UnsupportedExpr {
-                    kind: format!(
-                        "Body-of-branded-#main must be a dict literal, got `{}`",
-                        root.expr.kind()
-                    ),
-                    range: root.range,
-                });
+                return Err(cap!(
+                    "lower_entry_with_resolver.unsupported_expr.1",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "Body-of-branded-#main must be a dict literal, got `{}`",
+                            root.expr.kind()
+                        ),
+                        range: root.range,
+                    }
+                ));
             }
         };
         let record_local = ctx.alloc_record_local();
@@ -849,13 +872,16 @@ fn lower_entry_with_resolver<'a>(
         let dict_pairs = match &*root.expr {
             Expr::Dict(pairs) => pairs.as_slice(),
             _ => {
-                return Err(LoweringError::UnsupportedExpr {
-                    kind: format!(
-                        "Body-of-anon-Dict-#main must be a dict literal, got `{}`",
-                        root.expr.kind()
-                    ),
-                    range: root.range,
-                });
+                return Err(cap!(
+                    "lower_entry_with_resolver.unsupported_expr.2",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "Body-of-anon-Dict-#main must be a dict literal, got `{}`",
+                            root.expr.kind()
+                        ),
+                        range: root.range,
+                    }
+                ));
             }
         };
         let record_local = ctx.alloc_record_local();
@@ -932,15 +958,18 @@ fn lower_entry_with_resolver<'a>(
             && !pointer_array_list_source_is_const_pool(&root.expr)
             && !is_inplace_param_walk
         {
-            return Err(LoweringError::UnsupportedTypeInMain {
-                type_name: format!(
-                    "{:?} return sourced from `{}` — pointer-array list returns are only \
+            return Err(cap!(
+                "lower_entry_with_resolver.unsupported_type_in_main",
+                LoweringError::UnsupportedTypeInMain {
+                    type_name: format!(
+                        "{:?} return sourced from `{}` — pointer-array list returns are only \
                      marshalled from in-source list literals, not parameters / loads / calls",
-                    return_schema.fields[0].ty,
-                    root.expr.kind()
-                ),
-                range: sig.range,
-            });
+                        return_schema.fields[0].ty,
+                        root.expr.kind()
+                    ),
+                    range: sig.range,
+                }
+            ));
         }
         lower_expr(&root.expr, root.range, &mut ctx)?;
 
@@ -983,9 +1012,14 @@ fn lower_entry_with_resolver<'a>(
         .drain(..)
         .enumerate()
         .map(|(i, slot)| {
-            slot.ok_or_else(|| LoweringError::UnsupportedExpr {
-                kind: format!("closure-table slot {i} reserved but never filled"),
-                range: sig.range,
+            slot.ok_or_else(|| {
+                cap!(
+                    "lower_entry_with_resolver.unsupported_expr.3",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!("closure-table slot {i} reserved but never filled"),
+                        range: sig.range,
+                    }
+                )
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1063,10 +1097,13 @@ fn build_main_params_schema(
     let mut fields = Vec::with_capacity(sig.params.len());
     for p in &sig.params {
         let ty = type_node_to_canonical_with_schemas(&p.type_node, resolver).ok_or_else(|| {
-            LoweringError::UnsupportedTypeInMain {
-                type_name: type_head_for_display(&p.type_node),
-                range: p.type_node.range,
-            }
+            cap!(
+                "build_main_params_schema.unsupported_type_in_main",
+                LoweringError::UnsupportedTypeInMain {
+                    type_name: type_head_for_display(&p.type_node),
+                    range: p.type_node.range,
+                }
+            )
         })?;
         fields.push(Field {
             name: p.name.clone(),
@@ -1158,13 +1195,15 @@ fn build_main_return_schema(
     sig: &MainSignature,
     resolver: &SchemaResolver<'_>,
 ) -> Result<Schema, LoweringError> {
-    let rt = sig
-        .return_type
-        .as_ref()
-        .ok_or_else(|| LoweringError::UnsupportedTypeInMain {
-            type_name: "<missing>".to_string(),
-            range: sig.range,
-        })?;
+    let rt = sig.return_type.as_ref().ok_or_else(|| {
+        cap!(
+            "build_main_return_schema.unsupported_type_in_main.1",
+            LoweringError::UnsupportedTypeInMain {
+                type_name: "<missing>".to_string(),
+                range: sig.range,
+            }
+        )
+    })?;
     // S4: a `-> List<Schema>` return resolves through the schema-aware
     // canonicaliser (the narrow `type_node_to_canonical` has no resolver
     // and so can't name a user schema). F5: `List<List<String>>` /
@@ -1174,9 +1213,14 @@ fn build_main_return_schema(
     let ty = type_node_to_canonical(rt)
         .or_else(|| return_nested_list_canonical(rt, Some(resolver)))
         .or_else(|| return_list_schema_canonical(rt, resolver))
-        .ok_or_else(|| LoweringError::UnsupportedTypeInMain {
-            type_name: type_head_for_display(rt),
-            range: rt.range,
+        .ok_or_else(|| {
+            cap!(
+                "build_main_return_schema.unsupported_type_in_main.2",
+                LoweringError::UnsupportedTypeInMain {
+                    type_name: type_head_for_display(rt),
+                    range: rt.range,
+                }
+            )
         })?;
     Ok(Schema {
         name: MAIN_RETURN_SCHEMA_NAME.to_string(),
@@ -1320,10 +1364,13 @@ fn anon_dict_return_plan(
 
     for (key, value) in pairs {
         let TokenKey::String(name, _, _) = key else {
-            return Err(LoweringError::UnsupportedExpr {
-                kind: "Dict(non-string-key in anon-Dict-return body)".to_string(),
-                range: root.range,
-            });
+            return Err(cap!(
+                "anon_dict_return_plan.unsupported_expr",
+                LoweringError::UnsupportedExpr {
+                    kind: "Dict(non-string-key in anon-Dict-return body)".to_string(),
+                    range: root.range,
+                }
+            ));
         };
         // A field carrying a `#internal` pragma is hidden from the
         // host-visible return surface (the tree-walk oracle drops it
@@ -1342,12 +1389,15 @@ fn anon_dict_return_plan(
                 // silently dropped from the host output (the tree-walk
                 // oracle errors on returning a closure), so reject it.
                 if !is_internal {
-                    return Err(LoweringError::ClosureAcrossBoundary {
-                        context: format!(
-                            "anon-Dict-return field `{name}` is a closure but not `#internal`"
-                        ),
-                        range: value.range,
-                    });
+                    return Err(cap!(
+                        "anon_dict_return_plan.closure_across_boundary",
+                        LoweringError::ClosureAcrossBoundary {
+                            context: format!(
+                                "anon-Dict-return field `{name}` is a closure but not `#internal`"
+                            ),
+                            range: value.range,
+                        }
+                    ));
                 }
                 // Default each unannotated param to I64; honor a
                 // `(k: Bool) =>` style annotation when the user
@@ -1388,13 +1438,13 @@ fn anon_dict_return_plan(
                 // binding silently drops host-visible data. Reject it
                 // loudly instead.
                 if !is_internal {
-                    return Err(LoweringError::UnsupportedFieldType {
+                    return Err(cap!("anon_dict_return_plan.unsupported_field_type", LoweringError::UnsupportedFieldType {
                         schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
                         field: name.clone(),
                         ty: "Dict-valued anon-Dict-return field is only supported as `#internal`"
                             .to_string(),
                         range: value.range,
-                    });
+                    }));
                 }
                 let entries = classify_anon_dict_str_int_field(inner_pairs, value.range, name)?;
                 dict_field_names.insert(name.as_str());
@@ -1561,12 +1611,17 @@ fn classify_anon_dict_scalar_field(
         dict_field_names,
         field_name,
     )?;
-    ir_type_to_type_repr(irt).ok_or_else(|| LoweringError::UnsupportedExpr {
-        kind: format!(
-            "AnonDictReturn(field `{}`: non-scalar inferred IR type {:?})",
-            field_name, irt,
-        ),
-        range,
+    ir_type_to_type_repr(irt).ok_or_else(|| {
+        cap!(
+            "classify_anon_dict_scalar_field.unsupported_expr",
+            LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "AnonDictReturn(field `{}`: non-scalar inferred IR type {:?})",
+                    field_name, irt,
+                ),
+                range,
+            }
+        )
     })
 }
 
@@ -1584,16 +1639,19 @@ fn classify_anon_dict_str_int_field(
     let mut entries: Vec<(String, i64)> = Vec::with_capacity(pairs.len());
     for (key, value) in pairs {
         let TokenKey::String(key_name, _, _) = key else {
-            return Err(LoweringError::UnsupportedExpr {
-                kind: format!(
-                    "AnonDictReturn(dict field `{}`: non-string dict key)",
-                    field_name
-                ),
-                range,
-            });
+            return Err(cap!(
+                "classify_anon_dict_str_int_field.unsupported_expr.1",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "AnonDictReturn(dict field `{}`: non-string dict key)",
+                        field_name
+                    ),
+                    range,
+                }
+            ));
         };
         let Expr::Int(v) = &*value.expr else {
-            return Err(LoweringError::UnsupportedExpr {
+            return Err(cap!("classify_anon_dict_str_int_field.unsupported_expr.2", LoweringError::UnsupportedExpr {
                 kind: format!(
                     "AnonDictReturn(dict field `{}`: value for key `{}` is `{}`, only Int literals supported in P1)",
                     field_name,
@@ -1601,7 +1659,7 @@ fn classify_anon_dict_str_int_field(
                     value.expr.kind()
                 ),
                 range: value.range,
-            });
+            }));
         };
         entries.push((key_name.clone(), *v));
     }
@@ -1622,14 +1680,17 @@ fn classify_anon_dict_list_string_field(
     let mut elements: Vec<String> = Vec::with_capacity(items.len());
     for node in items {
         let Expr::String(s) = &*node.expr else {
-            return Err(LoweringError::UnsupportedExpr {
-                kind: format!(
+            return Err(cap!(
+                "classify_anon_dict_list_string_field.unsupported_expr",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
                     "AnonDictReturn(list field `{}`: element `{}`, only String literals supported)",
                     field_name,
                     node.expr.kind()
                 ),
-                range,
-            });
+                    range,
+                }
+            ));
         };
         elements.push(s.clone());
     }
@@ -1661,13 +1722,16 @@ fn classify_anon_dict_list_field(
     field_name: &str,
 ) -> Result<TypeRepr, LoweringError> {
     let Some(first) = items.first() else {
-        return Err(LoweringError::UnsupportedFieldType {
-            schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
-            field: field_name.to_string(),
-            ty: "empty list field — element type cannot be inferred for the return marshaller"
-                .to_string(),
-            range,
-        });
+        return Err(cap!(
+            "classify_anon_dict_list_field.unsupported_field_type.1",
+            LoweringError::UnsupportedFieldType {
+                schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+                field: field_name.to_string(),
+                ty: "empty list field — element type cannot be inferred for the return marshaller"
+                    .to_string(),
+                range,
+            }
+        ));
     };
     let element = match &*first.expr {
         Expr::Int(_) => TypeRepr::Int,
@@ -1675,16 +1739,19 @@ fn classify_anon_dict_list_field(
         Expr::Bool(_) => TypeRepr::Bool,
         Expr::String(_) => TypeRepr::String,
         other => {
-            return Err(LoweringError::UnsupportedFieldType {
-                schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
-                field: field_name.to_string(),
-                ty: format!(
+            return Err(cap!(
+                "classify_anon_dict_list_field.unsupported_field_type.2",
+                LoweringError::UnsupportedFieldType {
+                    schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+                    field: field_name.to_string(),
+                    ty: format!(
                     "list element `{}` — only homogeneous List<Int/Float/Bool/String> fields are \
                      marshalled in anon-Dict returns",
                     other.kind()
                 ),
-                range,
-            });
+                    range,
+                }
+            ));
         }
     };
     // Enforce homogeneity up front so a mixed list (which `lower_expr`
@@ -1699,15 +1766,18 @@ fn classify_anon_dict_list_field(
                 | (TypeRepr::String, Expr::String(_))
         );
         if !ok {
-            return Err(LoweringError::UnsupportedFieldType {
-                schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
-                field: field_name.to_string(),
-                ty: format!(
-                    "heterogeneous list field (expected all {element:?} elements, found `{}`)",
-                    node.expr.kind()
-                ),
-                range,
-            });
+            return Err(cap!(
+                "classify_anon_dict_list_field.unsupported_field_type.3",
+                LoweringError::UnsupportedFieldType {
+                    schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+                    field: field_name.to_string(),
+                    ty: format!(
+                        "heterogeneous list field (expected all {element:?} elements, found `{}`)",
+                        node.expr.kind()
+                    ),
+                    range,
+                }
+            ));
         }
     }
     Ok(TypeRepr::List {
@@ -1745,13 +1815,16 @@ fn classify_anon_dict_scalar_field_irt(
                     return Ok(IrType::I64);
                 }
             }
-            Err(LoweringError::UnsupportedExpr {
-                kind: format!(
-                    "AnonDictReturn(field `{}`: cannot classify Variable({:?}))",
-                    field_name, path
-                ),
-                range,
-            })
+            Err(cap!(
+                "classify_anon_dict_scalar_field_irt.unsupported_expr.1",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "AnonDictReturn(field `{}`: cannot classify Variable({:?}))",
+                        field_name, path
+                    ),
+                    range,
+                }
+            ))
         }
         Expr::FnCall { path, .. } => {
             if let [TokenKey::String(name, _, _)] = path.as_slice() {
@@ -1771,15 +1844,18 @@ fn classify_anon_dict_scalar_field_irt(
                     return Ok(IrType::I64);
                 }
             }
-            Err(LoweringError::UnsupportedExpr {
-                kind: format!(
-                    "AnonDictReturn(field `{}`: cannot classify FnCall({:?}) — \
+            Err(cap!(
+                "classify_anon_dict_scalar_field_irt.unsupported_expr.2",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "AnonDictReturn(field `{}`: cannot classify FnCall({:?}) — \
                      only calls into previously-classified closure fields are \
                      supported at this surface)",
-                    field_name, path
-                ),
-                range,
-            })
+                        field_name, path
+                    ),
+                    range,
+                }
+            ))
         }
         Expr::Binary(_, lhs, rhs) => {
             // Conservative arithmetic propagation: both sides must
@@ -1809,23 +1885,29 @@ fn classify_anon_dict_scalar_field_irt(
                 | (IrType::I64, IrType::F64) => Ok(IrType::F64),
                 (IrType::Bool, IrType::Bool) => Ok(IrType::Bool),
                 (IrType::String, IrType::String) => Ok(IrType::String),
-                _ => Err(LoweringError::UnsupportedExpr {
-                    kind: format!(
+                _ => Err(cap!(
+                    "classify_anon_dict_scalar_field_irt.unsupported_expr.3",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
                         "AnonDictReturn(field `{}`: binary with mixed scalar types {:?} / {:?})",
                         field_name, lt, rt
                     ),
-                    range,
-                }),
+                        range,
+                    }
+                )),
             }
         }
-        _ => Err(LoweringError::UnsupportedExpr {
-            kind: format!(
-                "AnonDictReturn(field `{}`: unsupported value shape `{}`)",
-                field_name,
-                expr.kind()
-            ),
-            range,
-        }),
+        _ => Err(cap!(
+            "classify_anon_dict_scalar_field_irt.unsupported_expr.4",
+            LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "AnonDictReturn(field `{}`: unsupported value shape `{}`)",
+                    field_name,
+                    expr.kind()
+                ),
+                range,
+            }
+        )),
     }
 }
 
@@ -1883,13 +1965,16 @@ fn lower_anon_dict_body(
                 ret_ty,
             } => {
                 let value = user_values.get(name.as_str()).copied().ok_or_else(|| {
-                    LoweringError::UnsupportedExpr {
-                        kind: format!(
-                            "AnonDictReturn(missing source value for closure field `{}`)",
-                            name
-                        ),
-                        range: TokenRange::default(),
-                    }
+                    cap!(
+                        "lower_anon_dict_body.unsupported_expr.1",
+                        LoweringError::UnsupportedExpr {
+                            kind: format!(
+                                "AnonDictReturn(missing source value for closure field `{}`)",
+                                name
+                            ),
+                            range: TokenRange::default(),
+                        }
+                    )
                 })?;
                 // Pre-allocate the let-idx the closure handle will
                 // land in. Registered before the body lowers so a
@@ -1912,13 +1997,18 @@ fn lower_anon_dict_body(
                 lower_closure_as_value(&value.expr, value.range, param_tys, *ret_ty, ctx)?;
 
                 // Stash the handle into the pre-allocated let-local.
-                let popped = ctx
-                    .tstack
-                    .pop()
-                    .ok_or_else(|| LoweringError::UnsupportedExpr {
-                        kind: format!("AnonDictReturn(closure field `{}` produced no value)", name),
-                        range: value.range,
-                    })?;
+                let popped = ctx.tstack.pop().ok_or_else(|| {
+                    cap!(
+                        "lower_anon_dict_body.unsupported_expr.2",
+                        LoweringError::UnsupportedExpr {
+                            kind: format!(
+                                "AnonDictReturn(closure field `{}` produced no value)",
+                                name
+                            ),
+                            range: value.range,
+                        }
+                    )
+                })?;
                 debug_assert_eq!(popped, IrType::Closure);
                 ctx.out.push(TaggedOp {
                     op: Op::LetSet {
@@ -1993,13 +2083,16 @@ fn lower_anon_dict_body(
             }
             AnonDictField::Scalar { name, ty } => {
                 let value = user_values.get(name.as_str()).copied().ok_or_else(|| {
-                    LoweringError::UnsupportedExpr {
-                        kind: format!(
-                            "AnonDictReturn(missing source value for scalar field `{}`)",
-                            name
-                        ),
-                        range: TokenRange::default(),
-                    }
+                    cap!(
+                        "lower_anon_dict_body.unsupported_expr.3",
+                        LoweringError::UnsupportedExpr {
+                            kind: format!(
+                                "AnonDictReturn(missing source value for scalar field `{}`)",
+                                name
+                            ),
+                            range: TokenRange::default(),
+                        }
+                    )
                 })?;
                 let expected_ir = type_repr_to_ir_type(ty)?;
                 // Same pointer-array-list provenance guard as the
@@ -2013,41 +2106,55 @@ fn lower_anon_dict_body(
                 if pointer_array_list_ir_type(expected_ir)
                     && !pointer_array_list_source_is_const_pool(&value.expr)
                 {
-                    return Err(LoweringError::UnsupportedFieldType {
-                        schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
-                        field: name.clone(),
-                        ty: format!(
+                    return Err(cap!(
+                        "lower_anon_dict_body.unsupported_field_type.1",
+                        LoweringError::UnsupportedFieldType {
+                            schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+                            field: name.clone(),
+                            ty: format!(
                             "{expected_ir:?} sourced from `{}` — pointer-array list fields are \
                              only marshalled from in-source list literals",
                             value.expr.kind()
                         ),
-                        range: value.range,
-                    });
+                            range: value.range,
+                        }
+                    ));
                 }
                 lower_expr(&value.expr, value.range, ctx)?;
-                let top = ctx
-                    .tstack
-                    .pop()
-                    .ok_or_else(|| LoweringError::UnsupportedExpr {
-                        kind: format!("AnonDictReturn(scalar field `{}` produced no value)", name),
-                        range: value.range,
-                    })?;
+                let top = ctx.tstack.pop().ok_or_else(|| {
+                    cap!(
+                        "lower_anon_dict_body.unsupported_expr.4",
+                        LoweringError::UnsupportedExpr {
+                            kind: format!(
+                                "AnonDictReturn(scalar field `{}` produced no value)",
+                                name
+                            ),
+                            range: value.range,
+                        }
+                    )
+                })?;
                 if top.wasm_slot() != expected_ir.wasm_slot() {
-                    return Err(LoweringError::UnsupportedFieldType {
-                        schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
-                        field: name.clone(),
-                        ty: format!("expected {:?}, got {:?}", expected_ir, top),
-                        range: value.range,
-                    });
+                    return Err(cap!(
+                        "lower_anon_dict_body.unsupported_field_type.2",
+                        LoweringError::UnsupportedFieldType {
+                            schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+                            field: name.clone(),
+                            ty: format!("expected {:?}, got {:?}", expected_ir, top),
+                            range: value.range,
+                        }
+                    ));
                 }
                 let layout_field = layout.fields.get(scalar_layout_idx).ok_or_else(|| {
-                    LoweringError::UnsupportedExpr {
-                        kind: format!(
-                            "AnonDictReturn(scalar field `{}`: layout index out of range)",
-                            name
-                        ),
-                        range: value.range,
-                    }
+                    cap!(
+                        "lower_anon_dict_body.unsupported_expr.5",
+                        LoweringError::UnsupportedExpr {
+                            kind: format!(
+                                "AnonDictReturn(scalar field `{}`: layout index out of range)",
+                                name
+                            ),
+                            range: value.range,
+                        }
+                    )
                 })?;
                 debug_assert_eq!(&layout_field.name, name);
                 // Pointer-indirect fields (String / List<scalar> /
@@ -2108,13 +2215,16 @@ fn lower_anon_dict_body(
                 // oracle. An offset that classifies to no region / runs off
                 // its region is a loud verifier error; the decode never runs.
                 let value = user_values.get(name.as_str()).copied().ok_or_else(|| {
-                    LoweringError::UnsupportedExpr {
-                        kind: format!(
-                            "AnonDictReturn(missing source value for cross-region field `{}`)",
-                            name
-                        ),
-                        range: TokenRange::default(),
-                    }
+                    cap!(
+                        "lower_anon_dict_body.unsupported_expr.6",
+                        LoweringError::UnsupportedExpr {
+                            kind: format!(
+                                "AnonDictReturn(missing source value for cross-region field `{}`)",
+                                name
+                            ),
+                            range: TokenRange::default(),
+                        }
+                    )
                 })?;
                 let expected_ir = type_repr_to_ir_type(ty)?;
                 // F1b admitted `ListSchema` / `ListList`; F3 widens to the
@@ -2133,35 +2243,43 @@ fn lower_anon_dict_body(
                         | IrType::ListBool
                 ));
                 lower_expr(&value.expr, value.range, ctx)?;
-                let top = ctx
-                    .tstack
-                    .pop()
-                    .ok_or_else(|| LoweringError::UnsupportedExpr {
-                        kind: format!(
-                            "AnonDictReturn(cross-region field `{}` produced no value)",
-                            name
-                        ),
-                        range: value.range,
-                    })?;
+                let top = ctx.tstack.pop().ok_or_else(|| {
+                    cap!(
+                        "lower_anon_dict_body.unsupported_expr.7",
+                        LoweringError::UnsupportedExpr {
+                            kind: format!(
+                                "AnonDictReturn(cross-region field `{}` produced no value)",
+                                name
+                            ),
+                            range: value.range,
+                        }
+                    )
+                })?;
                 if top != expected_ir {
-                    return Err(LoweringError::UnsupportedFieldType {
-                        schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
-                        field: name.clone(),
-                        ty: format!(
-                            "cross-region field expected {:?}, got {:?}",
-                            expected_ir, top
-                        ),
-                        range: value.range,
-                    });
+                    return Err(cap!(
+                        "lower_anon_dict_body.unsupported_field_type.3",
+                        LoweringError::UnsupportedFieldType {
+                            schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+                            field: name.clone(),
+                            ty: format!(
+                                "cross-region field expected {:?}, got {:?}",
+                                expected_ir, top
+                            ),
+                            range: value.range,
+                        }
+                    ));
                 }
                 let layout_field = layout.fields.get(scalar_layout_idx).ok_or_else(|| {
-                    LoweringError::UnsupportedExpr {
-                        kind: format!(
+                    cap!(
+                        "lower_anon_dict_body.unsupported_expr.8",
+                        LoweringError::UnsupportedExpr {
+                            kind: format!(
                             "AnonDictReturn(cross-region field `{}`: layout index out of range)",
                             name
                         ),
-                        range: value.range,
-                    }
+                            range: value.range,
+                        }
+                    )
                 })?;
                 debug_assert_eq!(&layout_field.name, name);
                 // Store the parameter list root's arena-absolute offset
@@ -2713,18 +2831,24 @@ fn type_repr_to_ir_type(t: &TypeRepr) -> Result<IrType, LoweringError> {
             TypeRepr::String => Ok(IrType::ListString),
             TypeRepr::Schema { .. } => Ok(IrType::ListSchema),
             TypeRepr::List { .. } => Ok(IrType::ListList),
-            _ => Err(LoweringError::UnsupportedTypeInMain {
-                type_name: format!("{t:?}"),
-                range: TokenRange::default(),
-            }),
+            _ => Err(cap!(
+                "type_repr_to_ir_type.unsupported_type_in_main.1",
+                LoweringError::UnsupportedTypeInMain {
+                    type_name: format!("{t:?}"),
+                    range: TokenRange::default(),
+                }
+            )),
         },
         // Composite / list-of-other types are rejected upstream
         // during schema build; this branch fires only for a directly
         // hand-crafted IR.
-        _ => Err(LoweringError::UnsupportedTypeInMain {
-            type_name: format!("{t:?}"),
-            range: TokenRange::default(),
-        }),
+        _ => Err(cap!(
+            "type_repr_to_ir_type.unsupported_type_in_main.2",
+            LoweringError::UnsupportedTypeInMain {
+                type_name: format!("{t:?}"),
+                range: TokenRange::default(),
+            }
+        )),
     }
 }
 
@@ -3002,10 +3126,13 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
             // lowering error so a hand-written program surfaces the
             // mistake clearly rather than crashing at codegen.
             if items.is_empty() {
-                return Err(LoweringError::UnsupportedExpr {
-                    kind: "List(empty literal)".to_string(),
-                    range,
-                });
+                return Err(cap!(
+                    "lower_expr.unsupported_expr.1",
+                    LoweringError::UnsupportedExpr {
+                        kind: "List(empty literal)".to_string(),
+                        range,
+                    }
+                ));
             }
             // #359 (W20): a list literal with at least one *computed*
             // element (the per-step `step(s)` body `[s[0] + s[4]*dt, ..]`)
@@ -3026,13 +3153,16 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
                     IrType::F64 => return emit_list_float_literal_materialize(items, range, ctx),
                     IrType::I64 => return emit_list_int_literal_materialize(items, range, ctx),
                     other => {
-                        return Err(LoweringError::UnsupportedExpr {
-                            kind: format!(
-                                "List(computed element of type {other:?} — only Float / Int \
+                        return Err(cap!(
+                            "lower_expr.unsupported_expr.2",
+                            LoweringError::UnsupportedExpr {
+                                kind: format!(
+                                    "List(computed element of type {other:?} — only Float / Int \
                                  computed list literals are materialised in the AOT envelope)"
-                            ),
-                            range,
-                        })
+                                ),
+                                range,
+                            }
+                        ))
                     }
                 }
             }
@@ -3043,10 +3173,13 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
                 Expr::Bool(_) => ConstListKind::Bool,
                 Expr::String(_) => ConstListKind::String,
                 other => {
-                    return Err(LoweringError::UnsupportedExpr {
-                        kind: format!("List(non-literal element `{}`)", other.kind()),
-                        range: items[0].range,
-                    });
+                    return Err(cap!(
+                        "lower_expr.unsupported_expr.3",
+                        LoweringError::UnsupportedExpr {
+                            kind: format!("List(non-literal element `{}`)", other.kind()),
+                            range: items[0].range,
+                        }
+                    ));
                 }
             };
             match kind {
@@ -3056,13 +3189,16 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
                         match &*node.expr {
                             Expr::Int(v) => elements.push(*v),
                             _ => {
-                                return Err(LoweringError::UnsupportedExpr {
-                                    kind: format!(
-                                        "List<Int>(non-Int element `{}`)",
-                                        node.expr.kind()
-                                    ),
-                                    range: node.range,
-                                });
+                                return Err(cap!(
+                                    "lower_expr.unsupported_expr.4",
+                                    LoweringError::UnsupportedExpr {
+                                        kind: format!(
+                                            "List<Int>(non-Int element `{}`)",
+                                            node.expr.kind()
+                                        ),
+                                        range: node.range,
+                                    }
+                                ));
                             }
                         }
                     }
@@ -3084,13 +3220,16 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
                             // decimal point.
                             Expr::Int(v) => elements.push((*v as f64).to_bits()),
                             _ => {
-                                return Err(LoweringError::UnsupportedExpr {
-                                    kind: format!(
-                                        "List<Float>(non-Float element `{}`)",
-                                        node.expr.kind()
-                                    ),
-                                    range: node.range,
-                                });
+                                return Err(cap!(
+                                    "lower_expr.unsupported_expr.5",
+                                    LoweringError::UnsupportedExpr {
+                                        kind: format!(
+                                            "List<Float>(non-Float element `{}`)",
+                                            node.expr.kind()
+                                        ),
+                                        range: node.range,
+                                    }
+                                ));
                             }
                         }
                     }
@@ -3107,13 +3246,16 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
                         match &*node.expr {
                             Expr::Bool(v) => elements.push(*v),
                             _ => {
-                                return Err(LoweringError::UnsupportedExpr {
-                                    kind: format!(
-                                        "List<Bool>(non-Bool element `{}`)",
-                                        node.expr.kind()
-                                    ),
-                                    range: node.range,
-                                });
+                                return Err(cap!(
+                                    "lower_expr.unsupported_expr.6",
+                                    LoweringError::UnsupportedExpr {
+                                        kind: format!(
+                                            "List<Bool>(non-Bool element `{}`)",
+                                            node.expr.kind()
+                                        ),
+                                        range: node.range,
+                                    }
+                                ));
                             }
                         }
                     }
@@ -3130,13 +3272,16 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
                         match &*node.expr {
                             Expr::String(v) => elements.push(v.clone()),
                             _ => {
-                                return Err(LoweringError::UnsupportedExpr {
-                                    kind: format!(
-                                        "List<String>(non-String element `{}`)",
-                                        node.expr.kind()
-                                    ),
-                                    range: node.range,
-                                });
+                                return Err(cap!(
+                                    "lower_expr.unsupported_expr.7",
+                                    LoweringError::UnsupportedExpr {
+                                        kind: format!(
+                                            "List<String>(non-String element `{}`)",
+                                            node.expr.kind()
+                                        ),
+                                        range: node.range,
+                                    }
+                                ));
                             }
                         }
                     }
@@ -3155,14 +3300,20 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
         Expr::Ternary { cond, then, els } => lower_ternary(cond, then, els, range, ctx),
         Expr::Where { expr, bindings } => lower_where(expr, bindings, range, ctx),
         Expr::FnCall { path, args } => lower_fn_call(path, args, range, ctx),
-        Expr::Closure { .. } => Err(LoweringError::ClosureAcrossBoundary {
-            context: "closure used in a non-higher-order position".to_string(),
-            range,
-        }),
-        _ => Err(LoweringError::UnsupportedExpr {
-            kind: expr.kind().to_string(),
-            range,
-        }),
+        Expr::Closure { .. } => Err(cap!(
+            "lower_expr.closure_across_boundary",
+            LoweringError::ClosureAcrossBoundary {
+                context: "closure used in a non-higher-order position".to_string(),
+                range,
+            }
+        )),
+        _ => Err(cap!(
+            "lower_expr.unsupported_expr.8",
+            LoweringError::UnsupportedExpr {
+                kind: expr.kind().to_string(),
+                range,
+            }
+        )),
     }
 }
 
@@ -3194,19 +3345,27 @@ fn try_lower_local_closure_call(
         .closure_let_signatures
         .get(&binding.idx)
         .cloned()
-        .ok_or_else(|| LoweringError::UnsupportedExpr {
-            kind: format!(
-                "FnCall(local-closure `{}`: signature side-table missing for let_idx {})",
-                name, binding.idx,
-            ),
-            range,
+        .ok_or_else(|| {
+            cap!(
+                "try_lower_local_closure_call.unsupported_expr.1",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "FnCall(local-closure `{}`: signature side-table missing for let_idx {})",
+                        name, binding.idx,
+                    ),
+                    range,
+                }
+            )
         })?;
     if args.len() != param_tys.len() {
-        return Err(LoweringError::UnknownStdlibMethod {
-            name: name.clone(),
-            arity: args.len() as u32,
-            range,
-        });
+        return Err(cap!(
+            "try_lower_local_closure_call.unknown_stdlib_method",
+            LoweringError::UnknownStdlibMethod {
+                name: name.clone(),
+                arity: args.len() as u32,
+                range,
+            }
+        ));
     }
     // Push the closure handle first; `Op::CallClosure` consumes
     // `[handle, arg0, arg1, ...]`.
@@ -3220,31 +3379,39 @@ fn try_lower_local_closure_call(
     ctx.tstack.push(IrType::Closure);
     for (i, call_arg) in args.iter().enumerate() {
         if call_arg.name.is_some() {
-            return Err(LoweringError::UnsupportedExpr {
-                kind: format!("FnCall(local-closure `{}`: named-arg unsupported)", name),
-                range,
-            });
+            return Err(cap!(
+                "try_lower_local_closure_call.unsupported_expr.2",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("FnCall(local-closure `{}`: named-arg unsupported)", name),
+                    range,
+                }
+            ));
         }
         lower_expr(&call_arg.value.expr, call_arg.value.range, ctx)?;
         let expected = param_tys[i];
-        let got = ctx
-            .tstack
-            .pop()
-            .ok_or_else(|| LoweringError::UnsupportedExpr {
-                kind: format!(
-                    "FnCall(local-closure `{}`: arg {} produced no value)",
-                    name, i
-                ),
-                range,
-            })?;
+        let got = ctx.tstack.pop().ok_or_else(|| {
+            cap!(
+                "try_lower_local_closure_call.unsupported_expr.3",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "FnCall(local-closure `{}`: arg {} produced no value)",
+                        name, i
+                    ),
+                    range,
+                }
+            )
+        })?;
         if got.wasm_slot() != expected.wasm_slot() {
-            return Err(LoweringError::StdlibArgTypeMismatch {
-                name: name.clone(),
-                arg_idx: i as u32,
-                got,
-                expected,
-                range,
-            });
+            return Err(cap!(
+                "try_lower_local_closure_call.stdlib_arg_type_mismatch",
+                LoweringError::StdlibArgTypeMismatch {
+                    name: name.clone(),
+                    arg_idx: i as u32,
+                    got,
+                    expected,
+                    range,
+                }
+            ));
         }
         ctx.tstack.push(got);
     }
@@ -3322,10 +3489,13 @@ fn try_lower_native_call(
     // call doesn't match the host signature.
     for call_arg in args {
         if call_arg.name.is_some() {
-            return Err(LoweringError::UnsupportedExpr {
-                kind: format!("FnCall(named-arg `{name}` for native fn)"),
-                range,
-            });
+            return Err(cap!(
+                "try_lower_native_call.unsupported_expr.1",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("FnCall(named-arg `{name}` for native fn)"),
+                    range,
+                }
+            ));
         }
     }
 
@@ -3342,21 +3512,23 @@ fn try_lower_native_call(
     //    with the IR type the import declares.
     for (i, call_arg) in args.iter().enumerate() {
         lower_expr(&call_arg.value.expr, call_arg.value.range, ctx)?;
-        let pushed = ctx
-            .tstack
-            .pop()
-            .ok_or_else(|| LoweringError::UnsupportedExpr {
-                kind: format!("FnCall(native arg{i}-stack-empty for `{name}`)"),
-                range,
-            })?;
+        let pushed = ctx.tstack.pop().ok_or_else(|| {
+            cap!(
+                "try_lower_native_call.unsupported_expr.2",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("FnCall(native arg{i}-stack-empty for `{name}`)"),
+                    range,
+                }
+            )
+        })?;
         let expected = entry.param_tys[i];
         if pushed != expected {
-            return Err(LoweringError::UnsupportedExpr {
+            return Err(cap!("try_lower_native_call.unsupported_expr.3", LoweringError::UnsupportedExpr {
                 kind: format!(
                     "FnCall(`{name}`) native arg {i} type mismatch: expected {expected:?}, got {pushed:?}"
                 ),
                 range,
-            });
+            }));
         }
     }
 
@@ -3383,10 +3555,13 @@ fn lower_fn_call(
     ctx: &mut LowerCtx<'_>,
 ) -> Result<(), LoweringError> {
     if path.is_empty() {
-        return Err(LoweringError::UnsupportedExpr {
-            kind: "FnCall(empty-path)".to_string(),
-            range,
-        });
+        return Err(cap!(
+            "lower_fn_call.unsupported_expr.1",
+            LoweringError::UnsupportedExpr {
+                kind: "FnCall(empty-path)".to_string(),
+                range,
+            }
+        ));
     }
     // Phase F.2 (W7 anon-Dict-return): a free-call whose head is a
     // single-segment identifier may resolve to a closure-typed
@@ -3515,10 +3690,13 @@ fn lower_fn_call(
     let method_name = match path.last().unwrap() {
         TokenKey::String(name, _, _) => name.as_str(),
         _ => {
-            return Err(LoweringError::UnsupportedExpr {
-                kind: "FnCall(non-string-tail-segment)".to_string(),
-                range,
-            });
+            return Err(cap!(
+                "lower_fn_call.unsupported_expr.2",
+                LoweringError::UnsupportedExpr {
+                    kind: "FnCall(non-string-tail-segment)".to_string(),
+                    range,
+                }
+            ));
         }
     };
     let receiver_segments = &path[..path.len() - 1];
@@ -3562,32 +3740,44 @@ fn lower_fn_call(
             if try_lower_native_call(method_name, args, arity, range, ctx)? {
                 return Ok(());
             }
-            return Err(LoweringError::UnknownStdlibMethod {
-                name: method_name.to_string(),
-                arity,
-                range,
-            });
+            return Err(cap!(
+                "lower_fn_call.unknown_stdlib_method.1",
+                LoweringError::UnknownStdlibMethod {
+                    name: method_name.to_string(),
+                    arity,
+                    range,
+                }
+            ));
         };
         let stdlib_meta = builtin_stdlib().get(fn_index as usize).ok_or_else(|| {
-            LoweringError::UnknownStdlibMethod {
-                name: method_name.to_string(),
-                arity,
-                range,
-            }
+            cap!(
+                "lower_fn_call.unknown_stdlib_method.2",
+                LoweringError::UnknownStdlibMethod {
+                    name: method_name.to_string(),
+                    arity,
+                    range,
+                }
+            )
         })?;
         if (stdlib_meta.params.len() as u32) != arity {
-            return Err(LoweringError::UnknownStdlibMethod {
-                name: method_name.to_string(),
-                arity,
-                range,
-            });
+            return Err(cap!(
+                "lower_fn_call.unknown_stdlib_method.3",
+                LoweringError::UnknownStdlibMethod {
+                    name: method_name.to_string(),
+                    arity,
+                    range,
+                }
+            ));
         }
         for (i, call_arg) in args.iter().enumerate() {
             if call_arg.name.is_some() {
-                return Err(LoweringError::UnsupportedExpr {
-                    kind: format!("FnCall(named-arg `{}` for stdlib)", method_name),
-                    range,
-                });
+                return Err(cap!(
+                    "lower_fn_call.unsupported_expr.3",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!("FnCall(named-arg `{}` for stdlib)", method_name),
+                        range,
+                    }
+                ));
             }
             lower_stdlib_arg(
                 stdlib_meta.name,
@@ -3619,10 +3809,13 @@ fn lower_fn_call(
     // dispatch (when the receiver carries a brand) or the stdlib
     // method table.
     let receiver_brand = lower_method_receiver(receiver_segments, range, ctx)?;
-    let receiver_ty = *ctx.tstack.last().ok_or(LoweringError::UnsupportedExpr {
-        kind: format!("FnCall(receiver-stack-empty for `{}`)", method_name),
-        range,
-    })?;
+    let receiver_ty = *ctx.tstack.last().ok_or(cap!(
+        "lower_fn_call.unsupported_expr.4",
+        LoweringError::UnsupportedExpr {
+            kind: format!("FnCall(receiver-stack-empty for `{}`)", method_name),
+            range,
+        }
+    ))?;
     // Schema-rooted dispatch beats the stdlib table when both could
     // resolve the call — Phase 5 keeps user methods first-class. The
     // stdlib path stays available for receivers without a brand
@@ -3647,42 +3840,57 @@ fn lower_fn_call(
         }
     }
     let Some(fn_index) = stdlib_method_index(receiver_ty, method_name) else {
-        return Err(LoweringError::UnknownStdlibMethod {
-            name: method_name.to_string(),
-            arity,
-            range,
-        });
+        return Err(cap!(
+            "lower_fn_call.unknown_stdlib_method.4",
+            LoweringError::UnknownStdlibMethod {
+                name: method_name.to_string(),
+                arity,
+                range,
+            }
+        ));
     };
     let stdlib_meta = builtin_stdlib().get(fn_index as usize).ok_or_else(|| {
-        LoweringError::UnknownStdlibMethod {
-            name: method_name.to_string(),
-            arity,
-            range,
-        }
+        cap!(
+            "lower_fn_call.unknown_stdlib_method.5",
+            LoweringError::UnknownStdlibMethod {
+                name: method_name.to_string(),
+                arity,
+                range,
+            }
+        )
     })?;
     if (stdlib_meta.params.len() as u32) != arity {
-        return Err(LoweringError::UnknownStdlibMethod {
-            name: method_name.to_string(),
-            arity,
-            range,
-        });
+        return Err(cap!(
+            "lower_fn_call.unknown_stdlib_method.6",
+            LoweringError::UnknownStdlibMethod {
+                name: method_name.to_string(),
+                arity,
+                range,
+            }
+        ));
     }
     // The receiver already sits on the vstack — re-check that its
     // slot matches the callee's declared param[0] so a future
     // dispatch entry that mistypes its receiver surfaces at lowering
     // rather than at codegen.
-    let pushed_receiver = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
-        kind: format!("FnCall(receiver-stack-empty for `{}`)", method_name),
-        range,
-    })?;
+    let pushed_receiver = ctx.tstack.pop().ok_or(cap!(
+        "lower_fn_call.unsupported_expr.5",
+        LoweringError::UnsupportedExpr {
+            kind: format!("FnCall(receiver-stack-empty for `{}`)", method_name),
+            range,
+        }
+    ))?;
     check_stdlib_arg(method_name, 0, pushed_receiver, &stdlib_meta.params, range)?;
     ctx.tstack.push(pushed_receiver);
     for (i, call_arg) in args.iter().enumerate() {
         if call_arg.name.is_some() {
-            return Err(LoweringError::UnsupportedExpr {
-                kind: format!("FnCall(named-arg `{}` for stdlib)", method_name),
-                range,
-            });
+            return Err(cap!(
+                "lower_fn_call.unsupported_expr.6",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("FnCall(named-arg `{}` for stdlib)", method_name),
+                    range,
+                }
+            ));
         }
         lower_stdlib_arg(
             stdlib_meta.name,
@@ -3765,10 +3973,13 @@ fn lower_list_index_typed(
     ctx.next_let_idx += 2;
 
     // Stash the receiver handle (already on the vstack as the list ty).
-    let top = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
-        kind: "Variable(list-index-empty-stack)".to_string(),
-        range,
-    })?;
+    let top = ctx.tstack.pop().ok_or(cap!(
+        "lower_list_index_typed.unsupported_expr",
+        LoweringError::UnsupportedExpr {
+            kind: "Variable(list-index-empty-stack)".to_string(),
+            range,
+        }
+    ))?;
     debug_assert_eq!(top, recv_ty);
     ctx.out.push(TaggedOp {
         op: Op::LetSet {
@@ -3903,10 +4114,13 @@ fn lower_list_string_index(
     ctx.next_let_idx += 2;
 
     // Stash the receiver handle (a `ListString` arena offset, i32).
-    let top = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
-        kind: "Variable(list-string-index-empty-stack)".to_string(),
-        range,
-    })?;
+    let top = ctx.tstack.pop().ok_or(cap!(
+        "lower_list_string_index.unsupported_expr",
+        LoweringError::UnsupportedExpr {
+            kind: "Variable(list-string-index-empty-stack)".to_string(),
+            range,
+        }
+    ))?;
     debug_assert_eq!(top, IrType::ListString);
     ctx.out.push(TaggedOp {
         op: Op::LetSet {
@@ -4044,10 +4258,13 @@ fn lower_dict_string_index(
     ctx: &mut LowerCtx<'_>,
 ) -> Result<(), LoweringError> {
     // Pop the `Dict` receiver handle into an i32 let-local.
-    let top = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
-        kind: "Variable(dict-index-empty-stack)".to_string(),
-        range,
-    })?;
+    let top = ctx.tstack.pop().ok_or(cap!(
+        "lower_dict_string_index.unsupported_expr.1",
+        LoweringError::UnsupportedExpr {
+            kind: "Variable(dict-index-empty-stack)".to_string(),
+            range,
+        }
+    ))?;
     debug_assert_eq!(top, IrType::Dict);
     let dict_base = ctx.next_let_idx;
     ctx.next_let_idx += 1;
@@ -4061,15 +4278,21 @@ fn lower_dict_string_index(
 
     // Lower the key expression; it must produce a `String` handle.
     lower_expr(&index_node.expr, index_node.range, ctx)?;
-    let key_ty = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
-        kind: "Variable(dict-index-key-empty-stack)".to_string(),
-        range,
-    })?;
-    if key_ty != IrType::String {
-        return Err(LoweringError::UnsupportedExpr {
-            kind: format!("Variable(dict-index key must be String, got {key_ty:?})"),
+    let key_ty = ctx.tstack.pop().ok_or(cap!(
+        "lower_dict_string_index.unsupported_expr.2",
+        LoweringError::UnsupportedExpr {
+            kind: "Variable(dict-index-key-empty-stack)".to_string(),
             range,
-        });
+        }
+    ))?;
+    if key_ty != IrType::String {
+        return Err(cap!(
+            "lower_dict_string_index.unsupported_expr.3",
+            LoweringError::UnsupportedExpr {
+                kind: format!("Variable(dict-index key must be String, got {key_ty:?})"),
+                range,
+            }
+        ));
     }
     let kh = ctx.next_let_idx;
     ctx.next_let_idx += 1;
@@ -4398,17 +4621,23 @@ fn lower_dict_string_index(
 fn expect_int_top(ctx: &mut LowerCtx<'_>, range: TokenRange) -> Result<(), LoweringError> {
     match ctx.tstack.last().copied() {
         Some(IrType::I64) => Ok(()),
-        Some(other) => Err(LoweringError::UnsupportedExpr {
-            kind: format!(
-                "list.sum(range(...)) desugar requires Int args, got {:?}",
-                other
-            ),
-            range,
-        }),
-        None => Err(LoweringError::UnsupportedExpr {
-            kind: "list.sum(range(...)) desugar saw empty vstack".to_string(),
-            range,
-        }),
+        Some(other) => Err(cap!(
+            "expect_int_top.unsupported_expr.1",
+            LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "list.sum(range(...)) desugar requires Int args, got {:?}",
+                    other
+                ),
+                range,
+            }
+        )),
+        None => Err(cap!(
+            "expect_int_top.unsupported_expr.2",
+            LoweringError::UnsupportedExpr {
+                kind: "list.sum(range(...)) desugar saw empty vstack".to_string(),
+                range,
+            }
+        )),
     }
 }
 
@@ -4425,14 +4654,16 @@ fn lower_stdlib_arg(
     ctx: &mut LowerCtx<'_>,
     call_range: TokenRange,
 ) -> Result<(), LoweringError> {
-    let expected =
-        *param_tys
-            .get(arg_idx as usize)
-            .ok_or_else(|| LoweringError::UnknownStdlibMethod {
+    let expected = *param_tys.get(arg_idx as usize).ok_or_else(|| {
+        cap!(
+            "lower_stdlib_arg.unknown_stdlib_method",
+            LoweringError::UnknownStdlibMethod {
                 name: name.to_string(),
                 arity: param_tys.len() as u32,
                 range: call_range,
-            })?;
+            }
+        )
+    })?;
     if expected == IrType::Closure {
         // Closure surface: the value expression must be a literal
         // lambda. Any other shape (a Variable referencing a closure,
@@ -4440,36 +4671,44 @@ fn lower_stdlib_arg(
         if let Expr::Closure { .. } = &*value.expr {
             let (param_tys_c, ret_ty_c) =
                 stdlib_closure_arg_signature(name, arg_idx).ok_or_else(|| {
-                    LoweringError::UnsupportedExpr {
-                        kind: format!(
-                            "FnCall(`{}`) arg {} is Closure but no signature side-table entry",
-                            name, arg_idx
-                        ),
-                        range: call_range,
-                    }
+                    cap!(
+                        "lower_stdlib_arg.unsupported_expr.1",
+                        LoweringError::UnsupportedExpr {
+                            kind: format!(
+                                "FnCall(`{}`) arg {} is Closure but no signature side-table entry",
+                                name, arg_idx
+                            ),
+                            range: call_range,
+                        }
+                    )
                 })?;
             lower_closure_as_value(&value.expr, value.range, &param_tys_c, ret_ty_c, ctx)?;
         } else {
-            return Err(LoweringError::UnsupportedExpr {
-                kind: format!(
-                    "FnCall(`{}`) arg {} expected Closure literal, got `{}`",
-                    name,
-                    arg_idx,
-                    value.expr.kind()
-                ),
-                range: value.range,
-            });
+            return Err(cap!(
+                "lower_stdlib_arg.unsupported_expr.2",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "FnCall(`{}`) arg {} expected Closure literal, got `{}`",
+                        name,
+                        arg_idx,
+                        value.expr.kind()
+                    ),
+                    range: value.range,
+                }
+            ));
         }
     } else {
         lower_expr(&value.expr, value.range, ctx)?;
     }
-    let pushed = ctx
-        .tstack
-        .pop()
-        .ok_or_else(|| LoweringError::UnsupportedExpr {
-            kind: format!("FnCall(arg{}-stack-empty for `{}`)", arg_idx, name),
-            range: call_range,
-        })?;
+    let pushed = ctx.tstack.pop().ok_or_else(|| {
+        cap!(
+            "lower_stdlib_arg.unsupported_expr.3",
+            LoweringError::UnsupportedExpr {
+                kind: format!("FnCall(arg{}-stack-empty for `{}`)", arg_idx, name),
+                range: call_range,
+            }
+        )
+    })?;
     check_stdlib_arg(name, arg_idx, pushed, param_tys, call_range)?;
     ctx.tstack.push(pushed);
     Ok(())
@@ -4504,10 +4743,13 @@ fn lower_method_receiver(
                 return Ok(None);
             }
             _ => {
-                return Err(LoweringError::UnsupportedExpr {
-                    kind: "FnCall(unsupported-receiver-key)".to_string(),
-                    range,
-                });
+                return Err(cap!(
+                    "lower_method_receiver.unsupported_expr.1",
+                    LoweringError::UnsupportedExpr {
+                        kind: "FnCall(unsupported-receiver-key)".to_string(),
+                        range,
+                    }
+                ));
             }
         }
     }
@@ -4525,13 +4767,16 @@ fn lower_method_receiver(
         lower_variable(receiver_segments, range, ctx)?;
         return Ok(brand);
     }
-    Err(LoweringError::UnsupportedExpr {
-        kind: format!(
-            "FnCall(multi-segment-receiver, segments={})",
-            receiver_segments.len()
-        ),
-        range,
-    })
+    Err(cap!(
+        "lower_method_receiver.unsupported_expr.2",
+        LoweringError::UnsupportedExpr {
+            kind: format!(
+                "FnCall(multi-segment-receiver, segments={})",
+                receiver_segments.len()
+            ),
+            range,
+        }
+    ))
 }
 
 /// Statically inspect the receiver path against the current lowering
@@ -4617,48 +4862,66 @@ fn finish_schema_method_call(
     let arity = param_tys.len() as u32;
     let expected_args = arity.saturating_sub(1) as usize;
     if args.len() != expected_args {
-        return Err(LoweringError::UnknownStdlibMethod {
-            name: method_name.to_string(),
-            arity,
-            range,
-        });
+        return Err(cap!(
+            "finish_schema_method_call.unknown_stdlib_method",
+            LoweringError::UnknownStdlibMethod {
+                name: method_name.to_string(),
+                arity,
+                range,
+            }
+        ));
     }
     // Validate the receiver slot against param[0].
-    let pushed_receiver = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
-        kind: format!("FnCall(receiver-stack-empty for `{}`)", method_name),
-        range,
-    })?;
-    if pushed_receiver.wasm_slot() != param_tys[0].wasm_slot() {
-        return Err(LoweringError::StdlibArgTypeMismatch {
-            name: method_name.to_string(),
-            arg_idx: 0,
-            got: pushed_receiver,
-            expected: param_tys[0],
+    let pushed_receiver = ctx.tstack.pop().ok_or(cap!(
+        "finish_schema_method_call.unsupported_expr.1",
+        LoweringError::UnsupportedExpr {
+            kind: format!("FnCall(receiver-stack-empty for `{}`)", method_name),
             range,
-        });
+        }
+    ))?;
+    if pushed_receiver.wasm_slot() != param_tys[0].wasm_slot() {
+        return Err(cap!(
+            "finish_schema_method_call.stdlib_arg_type_mismatch.1",
+            LoweringError::StdlibArgTypeMismatch {
+                name: method_name.to_string(),
+                arg_idx: 0,
+                got: pushed_receiver,
+                expected: param_tys[0],
+                range,
+            }
+        ));
     }
     ctx.tstack.push(pushed_receiver);
     for (i, call_arg) in args.iter().enumerate() {
         if call_arg.name.is_some() {
-            return Err(LoweringError::UnsupportedExpr {
-                kind: format!("FnCall(named-arg `{}` for schema method)", method_name),
-                range,
-            });
+            return Err(cap!(
+                "finish_schema_method_call.unsupported_expr.2",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("FnCall(named-arg `{}` for schema method)", method_name),
+                    range,
+                }
+            ));
         }
         lower_expr(&call_arg.value.expr, call_arg.value.range, ctx)?;
-        let pushed = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
-            kind: format!("FnCall(arg{}-stack-empty for `{}`)", i + 1, method_name),
-            range,
-        })?;
+        let pushed = ctx.tstack.pop().ok_or(cap!(
+            "finish_schema_method_call.unsupported_expr.3",
+            LoweringError::UnsupportedExpr {
+                kind: format!("FnCall(arg{}-stack-empty for `{}`)", i + 1, method_name),
+                range,
+            }
+        ))?;
         let expected = param_tys[i + 1];
         if pushed.wasm_slot() != expected.wasm_slot() {
-            return Err(LoweringError::StdlibArgTypeMismatch {
-                name: method_name.to_string(),
-                arg_idx: (i + 1) as u32,
-                got: pushed,
-                expected,
-                range,
-            });
+            return Err(cap!(
+                "finish_schema_method_call.stdlib_arg_type_mismatch.2",
+                LoweringError::StdlibArgTypeMismatch {
+                    name: method_name.to_string(),
+                    arg_idx: (i + 1) as u32,
+                    got: pushed,
+                    expected,
+                    range,
+                }
+            ));
         }
         ctx.tstack.push(pushed);
     }
@@ -4692,22 +4955,27 @@ fn check_stdlib_arg(
     param_tys: &[IrType],
     range: TokenRange,
 ) -> Result<(), LoweringError> {
-    let expected =
-        *param_tys
-            .get(arg_idx as usize)
-            .ok_or_else(|| LoweringError::UnknownStdlibMethod {
+    let expected = *param_tys.get(arg_idx as usize).ok_or_else(|| {
+        cap!(
+            "check_stdlib_arg.unknown_stdlib_method",
+            LoweringError::UnknownStdlibMethod {
                 name: name.to_string(),
                 arity: param_tys.len() as u32,
                 range,
-            })?;
+            }
+        )
+    })?;
     if got.wasm_slot() != expected.wasm_slot() {
-        return Err(LoweringError::StdlibArgTypeMismatch {
-            name: name.to_string(),
-            arg_idx,
-            got,
-            expected,
-            range,
-        });
+        return Err(cap!(
+            "check_stdlib_arg.stdlib_arg_type_mismatch",
+            LoweringError::StdlibArgTypeMismatch {
+                name: name.to_string(),
+                arg_idx,
+                got,
+                expected,
+                range,
+            }
+        ));
     }
     Ok(())
 }
@@ -5118,10 +5386,13 @@ fn lower_where(
     let pairs = match &*bindings.expr {
         Expr::Dict(pairs) => pairs,
         _ => {
-            return Err(LoweringError::UnsupportedExpr {
-                kind: format!("Where(bindings={})", bindings.expr.kind()),
-                range,
-            });
+            return Err(cap!(
+                "lower_where.unsupported_expr.1",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("Where(bindings={})", bindings.expr.kind()),
+                    range,
+                }
+            ));
         }
     };
     let saved_lets_len = ctx.lets.len();
@@ -5129,10 +5400,13 @@ fn lower_where(
         let name = match key {
             TokenKey::String(s, _, _) => s.clone(),
             _ => {
-                return Err(LoweringError::UnsupportedExpr {
-                    kind: "Where(non-string-binding-key)".to_string(),
-                    range,
-                });
+                return Err(cap!(
+                    "lower_where.unsupported_expr.2",
+                    LoweringError::UnsupportedExpr {
+                        kind: "Where(non-string-binding-key)".to_string(),
+                        range,
+                    }
+                ));
             }
         };
         // AOT-3: a where-binding whose value is a closure (the
@@ -5243,10 +5517,13 @@ fn lower_where(
             // Lower the closure body — pushes `IrType::Closure` and
             // appends the lambda Func to `ctx.lambda_funcs`.
             lower_closure_as_value(&value.expr, value.range, &param_irts, ret_ty, ctx)?;
-            let popped = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
-                kind: "Where(closure-binding-empty-stack)".to_string(),
-                range: value.range,
-            })?;
+            let popped = ctx.tstack.pop().ok_or(cap!(
+                "lower_where.unsupported_expr.3",
+                LoweringError::UnsupportedExpr {
+                    kind: "Where(closure-binding-empty-stack)".to_string(),
+                    range: value.range,
+                }
+            ))?;
             debug_assert_eq!(popped, IrType::Closure);
             ctx.out.push(TaggedOp {
                 op: Op::LetSet {
@@ -5275,10 +5552,13 @@ fn lower_where(
             || match_materializable_outer_map(&value.expr).is_some()
         {
             emit_list_value_materialize(&value.expr, value.range, ctx)?;
-            let value_ty = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
-                kind: "Where(range-materialize-empty-stack)".to_string(),
-                range: value.range,
-            })?;
+            let value_ty = ctx.tstack.pop().ok_or(cap!(
+                "lower_where.unsupported_expr.4",
+                LoweringError::UnsupportedExpr {
+                    kind: "Where(range-materialize-empty-stack)".to_string(),
+                    range: value.range,
+                }
+            ))?;
             debug_assert_eq!(value_ty, IrType::ListInt);
             let idx = ctx.next_let_idx;
             ctx.next_let_idx += 1;
@@ -5310,10 +5590,13 @@ fn lower_where(
         if let Expr::List(items) = &*value.expr {
             if !items.is_empty() && list_is_float_shaped(items) {
                 emit_list_float_literal_materialize(items, value.range, ctx)?;
-                let value_ty = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
-                    kind: "Where(float-list-materialize-empty-stack)".to_string(),
-                    range: value.range,
-                })?;
+                let value_ty = ctx.tstack.pop().ok_or(cap!(
+                    "lower_where.unsupported_expr.5",
+                    LoweringError::UnsupportedExpr {
+                        kind: "Where(float-list-materialize-empty-stack)".to_string(),
+                        range: value.range,
+                    }
+                ))?;
                 debug_assert_eq!(value_ty, IrType::ListFloat);
                 let idx = ctx.next_let_idx;
                 ctx.next_let_idx += 1;
@@ -5347,10 +5630,13 @@ fn lower_where(
             _ => None,
         };
         lower_expr(&value.expr, value.range, ctx)?;
-        let value_ty = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
-            kind: "Where(binding-empty-stack)".to_string(),
-            range: value.range,
-        })?;
+        let value_ty = ctx.tstack.pop().ok_or(cap!(
+            "lower_where.unsupported_expr.6",
+            LoweringError::UnsupportedExpr {
+                kind: "Where(binding-empty-stack)".to_string(),
+                range: value.range,
+            }
+        ))?;
         let idx = ctx.next_let_idx;
         ctx.next_let_idx += 1;
         ctx.out.push(TaggedOp {
@@ -5413,12 +5699,15 @@ fn lower_binary(
     // comparison paths below.
     if matches!(op, Operator::And | Operator::Or) {
         lower_expr(&lhs.expr, lhs.range, ctx)?;
-        let lhs_ty = ctx
-            .tstack
-            .pop()
-            .ok_or(LoweringError::UnsupportedOperator { op, range })?;
+        let lhs_ty = ctx.tstack.pop().ok_or(cap!(
+            "lower_binary.unsupported_operator.1",
+            LoweringError::UnsupportedOperator { op, range }
+        ))?;
         if lhs_ty != IrType::Bool {
-            return Err(LoweringError::UnsupportedOperator { op, range });
+            return Err(cap!(
+                "lower_binary.unsupported_operator.2",
+                LoweringError::UnsupportedOperator { op, range }
+            ));
         }
         let (then_body, then_ty) = if matches!(op, Operator::And) {
             // a && b: then-branch is `b`, else-branch is `false`.
@@ -5453,7 +5742,10 @@ fn lower_binary(
             lower_branch(rhs, range, ctx)?
         };
         if then_ty != IrType::Bool || else_ty != IrType::Bool {
-            return Err(LoweringError::UnsupportedOperator { op, range });
+            return Err(cap!(
+                "lower_binary.unsupported_operator.3",
+                LoweringError::UnsupportedOperator { op, range }
+            ));
         }
         ctx.out.push(TaggedOp {
             op: Op::If {
@@ -5473,21 +5765,22 @@ fn lower_binary(
         // `I64` one — the LHS sits buried under the RHS once both are
         // emitted, so we cannot append to it after the fact.
         lower_expr(&lhs.expr, lhs.range, ctx)?;
-        let lhs_ty = *ctx
-            .tstack
-            .last()
-            .ok_or(LoweringError::UnsupportedOperator { op, range })?;
+        let lhs_ty = *ctx.tstack.last().ok_or(cap!(
+            "lower_binary.unsupported_operator.4",
+            LoweringError::UnsupportedOperator { op, range }
+        ))?;
         let saved_out = std::mem::take(&mut ctx.out);
         lower_expr(&rhs.expr, rhs.range, ctx)?;
         let rhs_ops = std::mem::replace(&mut ctx.out, saved_out);
-        let rhs_ty = ctx
-            .tstack
-            .pop()
-            .ok_or(LoweringError::UnsupportedOperator { op, range })?;
+        let rhs_ty = ctx.tstack.pop().ok_or(cap!(
+            "lower_binary.unsupported_operator.5",
+            LoweringError::UnsupportedOperator { op, range }
+        ))?;
         // Pop the LHS too — the result type tag is recomputed below.
-        ctx.tstack
-            .pop()
-            .ok_or(LoweringError::UnsupportedOperator { op, range })?;
+        ctx.tstack.pop().ok_or(cap!(
+            "lower_binary.unsupported_operator.6",
+            LoweringError::UnsupportedOperator { op, range }
+        ))?;
         // Int↔Float promotion (#359 / #362): mirror the tree-walker's
         // `NumericValue::as_f64()` — when one operand is `Int` and the
         // other `Float`, the `Int` operand is widened to `f64` and the
@@ -5532,7 +5825,10 @@ fn lower_binary(
         // through to the same-type checks below.
         ctx.out.extend(rhs_ops);
         if lhs_ty != rhs_ty {
-            return Err(LoweringError::UnsupportedOperator { op, range });
+            return Err(cap!(
+                "lower_binary.unsupported_operator.7",
+                LoweringError::UnsupportedOperator { op, range }
+            ));
         }
         // F-D7-D: `String + String` lowers to `Op::Add(IrType::String)`.
         // The trace recorder short-circuits this onto `TraceOp::StrConcat`
@@ -5546,7 +5842,10 @@ fn lower_binary(
         // not both be `String` here for any non-Add arith op.
         if lhs_ty == IrType::String {
             if !matches!(op, Operator::Add) {
-                return Err(LoweringError::UnsupportedOperator { op, range });
+                return Err(cap!(
+                    "lower_binary.unsupported_operator.8",
+                    LoweringError::UnsupportedOperator { op, range }
+                ));
             }
             ctx.out.push(TaggedOp {
                 op: Op::Add(IrType::String),
@@ -5557,7 +5856,10 @@ fn lower_binary(
         }
         // Only Int / Float pairs support arithmetic.
         if !matches!(lhs_ty, IrType::I64 | IrType::F64) {
-            return Err(LoweringError::UnsupportedOperator { op, range });
+            return Err(cap!(
+                "lower_binary.unsupported_operator.9",
+                LoweringError::UnsupportedOperator { op, range }
+            ));
         }
         // #362: `F64 % F64` lowers to `Op::Mod(F64)` (and so does the
         // promoted-mixed `%` above) to match the tree-walker, which
@@ -5576,16 +5878,19 @@ fn lower_binary(
     if let Some(cmp_ctor) = comparison_op_ctor(op) {
         lower_expr(&lhs.expr, lhs.range, ctx)?;
         lower_expr(&rhs.expr, rhs.range, ctx)?;
-        let rhs_ty = ctx
-            .tstack
-            .pop()
-            .ok_or(LoweringError::UnsupportedOperator { op, range })?;
-        let lhs_ty = ctx
-            .tstack
-            .pop()
-            .ok_or(LoweringError::UnsupportedOperator { op, range })?;
+        let rhs_ty = ctx.tstack.pop().ok_or(cap!(
+            "lower_binary.unsupported_operator.10",
+            LoweringError::UnsupportedOperator { op, range }
+        ))?;
+        let lhs_ty = ctx.tstack.pop().ok_or(cap!(
+            "lower_binary.unsupported_operator.11",
+            LoweringError::UnsupportedOperator { op, range }
+        ))?;
         if lhs_ty != rhs_ty {
-            return Err(LoweringError::UnsupportedOperator { op, range });
+            return Err(cap!(
+                "lower_binary.unsupported_operator.12",
+                LoweringError::UnsupportedOperator { op, range }
+            ));
         }
         // Phase 2.c supports comparisons on Int / Float / Bool /
         // Null. Bool / Null only support `==` / `!=`; ordering
@@ -5596,7 +5901,12 @@ fn lower_binary(
             (IrType::I64 | IrType::F64, _) => {}
             (IrType::Bool, Operator::Eq | Operator::Ne) => {}
             (IrType::Null, Operator::Eq | Operator::Ne) => {}
-            _ => return Err(LoweringError::UnsupportedOperator { op, range }),
+            _ => {
+                return Err(cap!(
+                    "lower_binary.unsupported_operator.13",
+                    LoweringError::UnsupportedOperator { op, range }
+                ))
+            }
         }
         ctx.out.push(TaggedOp {
             op: cmp_ctor(lhs_ty),
@@ -5605,7 +5915,10 @@ fn lower_binary(
         ctx.tstack.push(IrType::Bool);
         return Ok(());
     }
-    Err(LoweringError::UnsupportedOperator { op, range })
+    Err(cap!(
+        "lower_binary.unsupported_operator.14",
+        LoweringError::UnsupportedOperator { op, range }
+    ))
 }
 
 /// #165 — fold a left-leaning `String + String + ... + String` chain
@@ -5712,15 +6025,21 @@ fn lower_ternary(
     // Lower the condition in the outer tstack so a body like
     // `(a > 0) ? ... : ...` accurately reports its Bool result.
     lower_expr(&cond.expr, cond.range, ctx)?;
-    let cond_ty = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
-        kind: "Ternary(cond)".to_string(),
-        range,
-    })?;
-    if cond_ty != IrType::Bool {
-        return Err(LoweringError::IfConditionNotBool {
-            got: cond_ty,
+    let cond_ty = ctx.tstack.pop().ok_or(cap!(
+        "lower_ternary.unsupported_expr",
+        LoweringError::UnsupportedExpr {
+            kind: "Ternary(cond)".to_string(),
             range,
-        });
+        }
+    ))?;
+    if cond_ty != IrType::Bool {
+        return Err(cap!(
+            "lower_ternary.if_condition_not_bool",
+            LoweringError::IfConditionNotBool {
+                got: cond_ty,
+                range,
+            }
+        ));
     }
     // Lower each branch into its own sub-stream + isolated tstack so
     // an inner expression spilling extra values onto the stack is
@@ -5738,11 +6057,14 @@ fn lower_ternary(
     let else_body = else_ops.0;
 
     if then_ty != else_ty {
-        return Err(LoweringError::IfBranchTypeMismatch {
-            then_ty,
-            else_ty,
-            range,
-        });
+        return Err(cap!(
+            "lower_ternary.if_branch_type_mismatch",
+            LoweringError::IfBranchTypeMismatch {
+                then_ty,
+                else_ty,
+                range,
+            }
+        ));
     }
     let result_ty = then_ty;
     ctx.out.push(TaggedOp {
@@ -5776,10 +6098,13 @@ fn lower_branch(
     let branch_ops = std::mem::replace(&mut parent.out, saved_out);
     let branch_stack = std::mem::replace(&mut parent.tstack, saved_stack);
     if branch_stack.len() != 1 {
-        return Err(LoweringError::UnsupportedExpr {
-            kind: format!("Ternary(branch-stack={})", branch_stack.len()),
-            range,
-        });
+        return Err(cap!(
+            "lower_branch.unsupported_expr",
+            LoweringError::UnsupportedExpr {
+                kind: format!("Ternary(branch-stack={})", branch_stack.len()),
+                range,
+            }
+        ));
     }
     Ok((branch_ops, branch_stack[0]))
 }
@@ -5860,34 +6185,41 @@ fn canonical_schema_from_def<'a>(
     stack: &mut Vec<&'a str>,
     range: TokenRange,
 ) -> Result<Schema, LoweringError> {
-    let name = def
-        .name
-        .as_deref()
-        .ok_or_else(|| LoweringError::UnsupportedExpr {
-            kind: "anonymous-nested-schema".to_string(),
-            range,
-        })?;
+    let name = def.name.as_deref().ok_or_else(|| {
+        cap!(
+            "canonical_schema_from_def.unsupported_expr",
+            LoweringError::UnsupportedExpr {
+                kind: "anonymous-nested-schema".to_string(),
+                range,
+            }
+        )
+    })?;
     if stack.contains(&name) {
         let mut cycle: Vec<String> = stack.iter().map(|s| s.to_string()).collect();
         cycle.push(name.to_string());
-        return Err(LoweringError::CyclicFieldDependency {
-            schema: name.to_string(),
-            cycle,
-            range,
-        });
+        return Err(cap!(
+            "canonical_schema_from_def.cyclic_field_dependency",
+            LoweringError::CyclicFieldDependency {
+                schema: name.to_string(),
+                cycle,
+                range,
+            }
+        ));
     }
     stack.push(name);
     let mut fields = Vec::with_capacity(def.fields.len());
     for f in &def.fields {
-        let ty_node = f
-            .type_hint
-            .as_ref()
-            .ok_or_else(|| LoweringError::UnsupportedFieldType {
-                schema: name.to_string(),
-                field: f.name.clone(),
-                ty: "<untyped>".to_string(),
-                range: f.value_range,
-            })?;
+        let ty_node = f.type_hint.as_ref().ok_or_else(|| {
+            cap!(
+                "canonical_schema_from_def.unsupported_field_type",
+                LoweringError::UnsupportedFieldType {
+                    schema: name.to_string(),
+                    field: f.name.clone(),
+                    ty: "<untyped>".to_string(),
+                    range: f.value_range,
+                }
+            )
+        })?;
         let ty = canonical_type_repr(ty_node, resolver, stack, f.value_range)?;
         fields.push(Field {
             name: f.name.clone(),
@@ -5915,12 +6247,15 @@ fn canonical_type_repr<'a>(
     range: TokenRange,
 ) -> Result<TypeRepr, LoweringError> {
     if ty.path.len() != 1 || ty.variant_fields.is_some() {
-        return Err(LoweringError::UnsupportedFieldType {
-            schema: stack.last().copied().unwrap_or("?").to_string(),
-            field: "?".to_string(),
-            ty: type_head_for_display(ty),
-            range,
-        });
+        return Err(cap!(
+            "canonical_type_repr.unsupported_field_type.1",
+            LoweringError::UnsupportedFieldType {
+                schema: stack.last().copied().unwrap_or("?").to_string(),
+                field: "?".to_string(),
+                ty: type_head_for_display(ty),
+                range,
+            }
+        ));
     }
     let head = ty.path[0].as_str();
     match (head, ty.generics.as_slice()) {
@@ -5956,23 +6291,29 @@ fn canonical_type_repr<'a>(
                     element: Box::new(inner),
                 })
             } else {
-                Err(LoweringError::UnsupportedFieldType {
-                    schema: stack.last().copied().unwrap_or("?").to_string(),
-                    field: "?".to_string(),
-                    ty: type_head_for_display(ty),
-                    range,
-                })
+                Err(cap!(
+                    "canonical_type_repr.unsupported_field_type.2",
+                    LoweringError::UnsupportedFieldType {
+                        schema: stack.last().copied().unwrap_or("?").to_string(),
+                        field: "?".to_string(),
+                        ty: type_head_for_display(ty),
+                        range,
+                    }
+                ))
             }
         }
         _ => {
             // Treat any single-segment head as a user-schema reference.
             let Some(def) = resolver.resolve(head) else {
-                return Err(LoweringError::UnsupportedFieldType {
-                    schema: stack.last().copied().unwrap_or("?").to_string(),
-                    field: "?".to_string(),
-                    ty: head.to_string(),
-                    range,
-                });
+                return Err(cap!(
+                    "canonical_type_repr.unsupported_field_type.3",
+                    LoweringError::UnsupportedFieldType {
+                        schema: stack.last().copied().unwrap_or("?").to_string(),
+                        field: "?".to_string(),
+                        ty: head.to_string(),
+                        range,
+                    }
+                ));
             };
             let sub = canonical_schema_from_def(def, resolver, stack, range)?;
             Ok(TypeRepr::Schema {
@@ -6018,11 +6359,14 @@ fn topo_order_fields(
         if field.is_wildcard {
             // `Int x: *` declares the field with no default value.
             // The dict literal must provide it.
-            return Err(LoweringError::MissingFieldNoDefault {
-                schema: schema_name.to_string(),
-                field: field.name.clone(),
-                range,
-            });
+            return Err(cap!(
+                "topo_order_fields.missing_field_no_default",
+                LoweringError::MissingFieldNoDefault {
+                    schema: schema_name.to_string(),
+                    field: field.name.clone(),
+                    range,
+                }
+            ));
         }
         collect_field_refs(&field.value_node.expr, &name_to_idx, &mut deps[i]);
         // Sanity: every reference must resolve to a sibling field.
@@ -6074,11 +6418,14 @@ fn topo_order_fields(
     if order.len() != n {
         // Find one cycle path for the error message via DFS.
         let cycle = find_cycle_path(&outgoing, def, &incoming);
-        return Err(LoweringError::CyclicFieldDependency {
-            schema: schema_name.to_string(),
-            cycle,
-            range,
-        });
+        return Err(cap!(
+            "topo_order_fields.cyclic_field_dependency",
+            LoweringError::CyclicFieldDependency {
+                schema: schema_name.to_string(),
+                cycle,
+                range,
+            }
+        ));
     }
     Ok(order)
 }
@@ -6211,12 +6558,12 @@ fn check_field_default_refs_resolvable(
             Expr::Variable(path) | Expr::Reference { path, .. } => {
                 if let Some(TokenKey::String(name, range, _)) = path.first() {
                     if !name_to_idx.contains_key(name.as_str()) {
-                        return Err(LoweringError::UnknownFieldReferenceInDefault {
+                        return Err(cap!("check_field_default_refs_resolvable.unknown_field_reference_in_default", LoweringError::UnknownFieldReferenceInDefault {
                             schema: schema.to_string(),
                             field: field.to_string(),
                             referenced: name.clone(),
                             range: *range,
-                        });
+                        }));
                     }
                 }
             }
@@ -6300,29 +6647,38 @@ fn lower_dict_into_record(
     // be lowered. The canonical Schema we have here only carries
     // field name + type — defaults live on the SchemaDef.
     let def = ctx.schema_resolver.resolve(&schema.name).ok_or_else(|| {
-        LoweringError::UnknownSchemaBrand {
-            name: schema.name.clone(),
-            range,
-        }
+        cap!(
+            "lower_dict_into_record.unknown_schema_brand",
+            LoweringError::UnknownSchemaBrand {
+                name: schema.name.clone(),
+                range,
+            }
+        )
     })?;
 
     // Build name → user-expr map. Reject duplicate keys.
     let mut user_values: HashMap<String, &Node> = HashMap::new();
     for (key, value) in dict_pairs {
         let TokenKey::String(name, _, _) = key else {
-            return Err(LoweringError::UnsupportedExpr {
-                kind: format!("Dict(non-string-key in branded dict for `{}`)", schema.name),
-                range,
-            });
+            return Err(cap!(
+                "lower_dict_into_record.unsupported_expr.1",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("Dict(non-string-key in branded dict for `{}`)", schema.name),
+                    range,
+                }
+            ));
         };
         // Schema must declare this field.
         if !schema.fields.iter().any(|f| &f.name == name) {
-            return Err(LoweringError::UnsupportedFieldType {
-                schema: schema.name.clone(),
-                field: name.clone(),
-                ty: format!("(unknown field, not declared on `{}`)", schema.name),
-                range,
-            });
+            return Err(cap!(
+                "lower_dict_into_record.unsupported_field_type.1",
+                LoweringError::UnsupportedFieldType {
+                    schema: schema.name.clone(),
+                    field: name.clone(),
+                    ty: format!("(unknown field, not declared on `{}`)", schema.name),
+                    range,
+                }
+            ));
         }
         user_values.insert(name.clone(), value);
     }
@@ -6370,23 +6726,28 @@ fn lower_dict_into_record(
             // Pointer-indirect fields all store as an i32 pointer.
             FieldKind::PointerIndirect { .. } => IrType::I32,
         };
-        let top = ctx
-            .tstack
-            .pop()
-            .ok_or_else(|| LoweringError::UnsupportedExpr {
-                kind: format!(
-                    "Dict field `{}` of `{}` produced no value",
-                    canonical_field.name, schema.name
-                ),
-                range,
-            })?;
+        let top = ctx.tstack.pop().ok_or_else(|| {
+            cap!(
+                "lower_dict_into_record.unsupported_expr.2",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "Dict field `{}` of `{}` produced no value",
+                        canonical_field.name, schema.name
+                    ),
+                    range,
+                }
+            )
+        })?;
         if top.wasm_slot() != store_ty.wasm_slot() {
-            return Err(LoweringError::UnsupportedFieldType {
-                schema: schema.name.clone(),
-                field: canonical_field.name.clone(),
-                ty: format!("got {:?}, expected {:?}", top, store_ty),
-                range,
-            });
+            return Err(cap!(
+                "lower_dict_into_record.unsupported_field_type.2",
+                LoweringError::UnsupportedFieldType {
+                    schema: schema.name.clone(),
+                    field: canonical_field.name.clone(),
+                    ty: format!("got {:?}, expected {:?}", top, store_ty),
+                    range,
+                }
+            ));
         }
         ctx.out.push(TaggedOp {
             op: Op::StoreFieldAtRecord {
@@ -6520,20 +6881,26 @@ fn lower_dict_field_value(
             if let TypeRepr::List { .. } = &canonical.ty {
                 if branded_field_cross_region_param_list(&canonical.ty, value, ctx) {
                     lower_expr(&value.expr, range, ctx)?;
-                    let popped = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
-                        kind: "Dict(cross-region-field-value-stack-empty)".to_string(),
-                        range,
-                    })?;
+                    let popped = ctx.tstack.pop().ok_or(cap!(
+                        "lower_dict_field_value.unsupported_expr.1",
+                        LoweringError::UnsupportedExpr {
+                            kind: "Dict(cross-region-field-value-stack-empty)".to_string(),
+                            range,
+                        }
+                    ))?;
                     let expected_ir = type_repr_to_ir_type_dict(&canonical.ty);
                     if popped != expected_ir {
-                        return Err(LoweringError::UnsupportedFieldType {
-                            schema: schema.name.clone(),
-                            field: canonical.name.clone(),
-                            ty: format!(
-                                "cross-region field expected {expected_ir:?}, got {popped:?}"
-                            ),
-                            range,
-                        });
+                        return Err(cap!(
+                            "lower_dict_field_value.unsupported_field_type.1",
+                            LoweringError::UnsupportedFieldType {
+                                schema: schema.name.clone(),
+                                field: canonical.name.clone(),
+                                ty: format!(
+                                    "cross-region field expected {expected_ir:?}, got {popped:?}"
+                                ),
+                                range,
+                            }
+                        ));
                     }
                     // The slot stores the arena-absolute offset directly.
                     // The caller's `StoreFieldAtRecord` writes an i32
@@ -6563,18 +6930,21 @@ fn lower_dict_field_value(
                 if pointer_array_list_ir_type(field_ir)
                     && !pointer_array_list_source_is_const_pool(&value.expr)
                 {
-                    return Err(LoweringError::UnsupportedFieldType {
-                        schema: schema.name.clone(),
-                        field: canonical.name.clone(),
-                        ty: format!(
-                            "{:?} sourced from `{}` — pointer-array list fields are only \
+                    return Err(cap!(
+                        "lower_dict_field_value.unsupported_field_type.2",
+                        LoweringError::UnsupportedFieldType {
+                            schema: schema.name.clone(),
+                            field: canonical.name.clone(),
+                            ty: format!(
+                                "{:?} sourced from `{}` — pointer-array list fields are only \
                              marshalled from in-source list literals, not parameters / loads / \
                              calls",
-                            canonical.ty,
-                            value.expr.kind()
-                        ),
-                        range,
-                    });
+                                canonical.ty,
+                                value.expr.kind()
+                            ),
+                            range,
+                        }
+                    ));
                 }
             }
             // Recursively lower the value to produce an absolute
@@ -6584,10 +6954,13 @@ fn lower_dict_field_value(
             lower_expr(&value.expr, range, ctx)?;
             // Top of stack is an absolute address. Emit the tail-
             // record memcpy.
-            let popped = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
-                kind: "Dict(field-value-stack-empty)".to_string(),
-                range,
-            })?;
+            let popped = ctx.tstack.pop().ok_or(cap!(
+                "lower_dict_field_value.unsupported_expr.2",
+                LoweringError::UnsupportedExpr {
+                    kind: "Dict(field-value-stack-empty)".to_string(),
+                    range,
+                }
+            ))?;
             // Cross-check the IR type against the declared field
             // type — saves a confusing codegen-time failure when the
             // dict field expects a String but the value lowered to
@@ -6605,12 +6978,15 @@ fn lower_dict_field_value(
                 _ => unreachable!(),
             };
             if popped != expected_ir {
-                return Err(LoweringError::UnsupportedFieldType {
-                    schema: schema.name.clone(),
-                    field: canonical.name.clone(),
-                    ty: format!("expected {expected_ir:?}, got {popped:?}"),
-                    range,
-                });
+                return Err(cap!(
+                    "lower_dict_field_value.unsupported_field_type.3",
+                    LoweringError::UnsupportedFieldType {
+                        schema: schema.name.clone(),
+                        field: canonical.name.clone(),
+                        ty: format!("expected {expected_ir:?}, got {popped:?}"),
+                        range,
+                    }
+                ));
             }
             ctx.out.push(TaggedOp {
                 op: Op::EmitTailRecordFromAbsoluteAddr { ty: expected_ir },
@@ -6640,11 +7016,14 @@ fn lower_dict_default(
 ) -> Result<(), LoweringError> {
     let field = &def.fields[field_idx];
     if field.is_wildcard {
-        return Err(LoweringError::MissingFieldNoDefault {
-            schema: schema_name.to_string(),
-            field: field.name.clone(),
-            range,
-        });
+        return Err(cap!(
+            "lower_dict_default.missing_field_no_default",
+            LoweringError::MissingFieldNoDefault {
+                schema: schema_name.to_string(),
+                field: field.name.clone(),
+                range,
+            }
+        ));
     }
     // Lower the default expression with the surrounding lets in
     // scope. The let-stack already carries `<prior-field-name> →
@@ -6674,18 +7053,24 @@ fn lower_variable(
     ctx: &mut LowerCtx<'_>,
 ) -> Result<(), LoweringError> {
     if path.is_empty() {
-        return Err(LoweringError::UnsupportedExpr {
-            kind: "Variable(empty-path)".to_string(),
-            range,
-        });
+        return Err(cap!(
+            "lower_variable.unsupported_expr.1",
+            LoweringError::UnsupportedExpr {
+                kind: "Variable(empty-path)".to_string(),
+                range,
+            }
+        ));
     }
     let head = match &path[0] {
         TokenKey::String(s, _, _) => s.as_str(),
         TokenKey::Index(_, _) | TokenKey::Dummy | TokenKey::Spread(_) | TokenKey::Dynamic(_, _) => {
-            return Err(LoweringError::UnsupportedExpr {
-                kind: "Variable(non-string-key)".to_string(),
-                range,
-            });
+            return Err(cap!(
+                "lower_variable.unsupported_expr.2",
+                LoweringError::UnsupportedExpr {
+                    kind: "Variable(non-string-key)".to_string(),
+                    range,
+                }
+            ));
         }
     };
     // #359 (W20 container perf): a bare reference to a where-bound
@@ -6754,10 +7139,13 @@ fn lower_variable(
             ctx.tstack.push(p.ty);
             current_schema = p.schema;
         } else {
-            return Err(LoweringError::UnresolvedVariable {
-                name: head.to_string(),
-                range,
-            });
+            return Err(cap!(
+                "lower_variable.unresolved_variable.1",
+                LoweringError::UnresolvedVariable {
+                    name: head.to_string(),
+                    range,
+                }
+            ));
         }
     } else if let Some(b) = ctx.lets.iter().rev().find(|b| b.name == head).cloned() {
         ctx.out.push(TaggedOp {
@@ -6782,9 +7170,14 @@ fn lower_variable(
             .iter()
             .find(|b| b.name == head)
             .cloned()
-            .ok_or_else(|| LoweringError::UnresolvedVariable {
-                name: head.to_string(),
-                range,
+            .ok_or_else(|| {
+                cap!(
+                    "lower_variable.unresolved_variable.2",
+                    LoweringError::UnresolvedVariable {
+                        name: head.to_string(),
+                        range,
+                    }
+                )
             })?;
         // Pointer-indirect leaves (`String` / `ListInt`) get their own
         // op tag so a later phase can hang String / List operations
@@ -6882,10 +7275,13 @@ fn lower_variable(
                 // Optional indexing (`xs[i]?`) would need a Null-or-value
                 // result the i64 element path can't represent; decline.
                 if *optional {
-                    return Err(LoweringError::UnsupportedExpr {
-                        kind: "Variable(optional-list-index unsupported)".to_string(),
-                        range,
-                    });
+                    return Err(cap!(
+                        "lower_variable.unsupported_expr.3",
+                        LoweringError::UnsupportedExpr {
+                            kind: "Variable(optional-list-index unsupported)".to_string(),
+                            range,
+                        }
+                    ));
                 }
                 // Pops the `ListInt` receiver, pushes the i64 element.
                 lower_list_int_index(index_node, range, ctx)?;
@@ -6925,10 +7321,13 @@ fn lower_variable(
                 unreachable!("guarded by the all-Dynamic check above");
             };
             if *optional {
-                return Err(LoweringError::UnsupportedExpr {
-                    kind: "Variable(optional-list-index unsupported)".to_string(),
-                    range,
-                });
+                return Err(cap!(
+                    "lower_variable.unsupported_expr.4",
+                    LoweringError::UnsupportedExpr {
+                        kind: "Variable(optional-list-index unsupported)".to_string(),
+                        range,
+                    }
+                ));
             }
             // Pops the `ListFloat` receiver, pushes the f64 element.
             lower_list_index_typed(index_node, IrType::ListFloat, range, ctx)?;
@@ -6951,10 +7350,13 @@ fn lower_variable(
                 unreachable!("guarded by the all-Dynamic check above");
             };
             if *optional {
-                return Err(LoweringError::UnsupportedExpr {
-                    kind: "Variable(optional-list-index unsupported)".to_string(),
-                    range,
-                });
+                return Err(cap!(
+                    "lower_variable.unsupported_expr.5",
+                    LoweringError::UnsupportedExpr {
+                        kind: "Variable(optional-list-index unsupported)".to_string(),
+                        range,
+                    }
+                ));
             }
             // Pops the `ListString` receiver, pushes the String handle.
             lower_list_string_index(index_node, range, ctx)?;
@@ -6974,10 +7376,13 @@ fn lower_variable(
                 unreachable!("guarded by the all-Dynamic check above");
             };
             if *optional {
-                return Err(LoweringError::UnsupportedExpr {
-                    kind: "Variable(optional-dict-index unsupported)".to_string(),
-                    range,
-                });
+                return Err(cap!(
+                    "lower_variable.unsupported_expr.6",
+                    LoweringError::UnsupportedExpr {
+                        kind: "Variable(optional-dict-index unsupported)".to_string(),
+                        range,
+                    }
+                ));
             }
             // Pops the `Dict` receiver, pushes the i64 value (Int).
             lower_dict_string_index(index_node, range, ctx)?;
@@ -6991,20 +7396,26 @@ fn lower_variable(
         let field_name = match seg {
             TokenKey::String(s, _, _) => s.as_str(),
             _ => {
-                return Err(LoweringError::UnsupportedExpr {
-                    kind: "Variable(non-string-segment)".to_string(),
-                    range,
-                });
+                return Err(cap!(
+                    "lower_variable.unsupported_expr.7",
+                    LoweringError::UnsupportedExpr {
+                        kind: "Variable(non-string-segment)".to_string(),
+                        range,
+                    }
+                ));
             }
         };
         let Some(schema) = current_schema.clone() else {
-            return Err(LoweringError::UnsupportedExpr {
-                kind: format!(
-                    "Variable(field-on-non-schema-base, segment=`{}`)",
-                    field_name
-                ),
-                range,
-            });
+            return Err(cap!(
+                "lower_variable.unsupported_expr.8",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "Variable(field-on-non-schema-base, segment=`{}`)",
+                        field_name
+                    ),
+                    range,
+                }
+            ));
         };
         // Recompute the layout for the current schema shape. Cached
         // canonical schemas are reused across calls so the resolver
@@ -7014,24 +7425,35 @@ fn lower_variable(
             .fields
             .iter()
             .position(|f| f.name == field_name)
-            .ok_or_else(|| LoweringError::UnsupportedFieldType {
-                schema: schema.name.clone(),
-                field: field_name.to_string(),
-                ty: "(unknown field)".to_string(),
-                range,
+            .ok_or_else(|| {
+                cap!(
+                    "lower_variable.unsupported_field_type",
+                    LoweringError::UnsupportedFieldType {
+                        schema: schema.name.clone(),
+                        field: field_name.to_string(),
+                        ty: "(unknown field)".to_string(),
+                        range,
+                    }
+                )
             })?;
         let field_meta = &schema.fields[field_idx];
         let layout_field = &layout.fields[field_idx];
         // Pop the base address.
-        let popped = ctx.tstack.pop().ok_or(LoweringError::UnsupportedExpr {
-            kind: "Variable(field-load-stack-empty)".to_string(),
-            range,
-        })?;
-        if popped.wasm_slot() != IrType::I32 {
-            return Err(LoweringError::UnsupportedExpr {
-                kind: format!("Variable(field-base-not-i32, got={:?})", popped),
+        let popped = ctx.tstack.pop().ok_or(cap!(
+            "lower_variable.unsupported_expr.9",
+            LoweringError::UnsupportedExpr {
+                kind: "Variable(field-load-stack-empty)".to_string(),
                 range,
-            });
+            }
+        ))?;
+        if popped.wasm_slot() != IrType::I32 {
+            return Err(cap!(
+                "lower_variable.unsupported_expr.10",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("Variable(field-base-not-i32, got={:?})", popped),
+                    range,
+                }
+            ));
         }
         let field_ir = type_repr_to_ir_type_dict(&field_meta.ty);
         ctx.out.push(TaggedOp {
@@ -7201,10 +7623,13 @@ fn method_signature_ir_types(
     for p in &info.params {
         let repr =
             type_node_to_canonical_with_schemas(&p.type_node, resolver).ok_or_else(|| {
-                LoweringError::UnsupportedTypeInMain {
-                    type_name: type_head_for_display(&p.type_node),
-                    range: p.type_node.range,
-                }
+                cap!(
+                    "method_signature_ir_types.unsupported_type_in_main.1",
+                    LoweringError::UnsupportedTypeInMain {
+                        type_name: type_head_for_display(&p.type_node),
+                        range: p.type_node.range,
+                    }
+                )
             })?;
         match repr {
             TypeRepr::Schema { schema } => {
@@ -7219,10 +7644,13 @@ fn method_signature_ir_types(
     }
     let ret_repr =
         type_node_to_canonical_with_schemas(&info.return_type, resolver).ok_or_else(|| {
-            LoweringError::UnsupportedTypeInMain {
-                type_name: type_head_for_display(&info.return_type),
-                range: info.return_type.range,
-            }
+            cap!(
+                "method_signature_ir_types.unsupported_type_in_main.2",
+                LoweringError::UnsupportedTypeInMain {
+                    type_name: type_head_for_display(&info.return_type),
+                    range: info.return_type.range,
+                }
+            )
         })?;
     // Phase 5 scope: only scalar / `Bool` / `Null` returns ride the
     // wasm function's single-value return slot. Variable-length
@@ -7234,10 +7662,13 @@ fn method_signature_ir_types(
         TypeRepr::Bool => IrType::Bool,
         TypeRepr::Null => IrType::Null,
         _ => {
-            return Err(LoweringError::UnsupportedTypeInMain {
-                type_name: type_head_for_display(&info.return_type),
-                range: info.return_type.range,
-            });
+            return Err(cap!(
+                "method_signature_ir_types.unsupported_type_in_main.3",
+                LoweringError::UnsupportedTypeInMain {
+                    type_name: type_head_for_display(&info.return_type),
+                    range: info.return_type.range,
+                }
+            ));
         }
     };
     Ok(MethodSig {
@@ -7266,14 +7697,15 @@ fn lower_one_method<'a>(
         param_schemas,
     } = sig;
     let ret_ty = *ret_ty;
-    let body_node = m
-        .info
-        .body_node
-        .as_ref()
-        .ok_or_else(|| LoweringError::UnsupportedExpr {
-            kind: format!("SchemaMethod(no-body for `{}`)", m.info.name),
-            range: m.info.range,
-        })?;
+    let body_node = m.info.body_node.as_ref().ok_or_else(|| {
+        cap!(
+            "lower_one_method.unsupported_expr.1",
+            LoweringError::UnsupportedExpr {
+                kind: format!("SchemaMethod(no-body for `{}`)", m.info.name),
+                range: m.info.range,
+            }
+        )
+    })?;
     // Build the per-param metadata, skipping the leading `self` slot
     // since the method ctx tracks it separately via `SelfBinding`.
     let mut method_params: Vec<MethodParam> = Vec::with_capacity(m.info.params.len());
@@ -7310,25 +7742,29 @@ fn lower_one_method<'a>(
     lower_expr(&body_node.expr, body_node.range, &mut ctx)?;
     // Validate the body left exactly one value of the declared
     // return type on the virtual stack.
-    let top = ctx
-        .tstack
-        .last()
-        .copied()
-        .ok_or_else(|| LoweringError::UnsupportedExpr {
-            kind: format!(
-                "SchemaMethod(`{}::{}`) body produced no value",
-                m.schema_name, m.info.name
-            ),
-            range: body_node.range,
-        })?;
+    let top = ctx.tstack.last().copied().ok_or_else(|| {
+        cap!(
+            "lower_one_method.unsupported_expr.2",
+            LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "SchemaMethod(`{}::{}`) body produced no value",
+                    m.schema_name, m.info.name
+                ),
+                range: body_node.range,
+            }
+        )
+    })?;
     if top.wasm_slot() != ret_ty.wasm_slot() {
-        return Err(LoweringError::UnsupportedTypeInMain {
-            type_name: format!(
-                "method `{}::{}` returns `{:?}` but body produced `{:?}`",
-                m.schema_name, m.info.name, ret_ty, top
-            ),
-            range: body_node.range,
-        });
+        return Err(cap!(
+            "lower_one_method.unsupported_type_in_main",
+            LoweringError::UnsupportedTypeInMain {
+                type_name: format!(
+                    "method `{}::{}` returns `{:?}` but body produced `{:?}`",
+                    m.schema_name, m.info.name, ret_ty, top
+                ),
+                range: body_node.range,
+            }
+        ));
     }
     ctx.out.push(TaggedOp {
         op: Op::Return,
