@@ -2254,8 +2254,8 @@ dependencies = [
  "relon-analyzer",
  "relon-eval-api",
  "relon-fmt",
- "relon-ir",
  "relon-parser",
+ "relon-unicode",
  "relon-util",
  "serde",
  "serde_json",
@@ -2282,6 +2282,7 @@ dependencies = [
  "relon-analyzer",
  "relon-eval-api",
  "relon-parser",
+ "relon-unicode",
  "thiserror 2.0.18",
 ]
 
@@ -2402,6 +2403,10 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
 ]
+
+[[package]]
+name = "relon-unicode"
+version = "0.1.0"
 
 [[package]]
 name = "relon-util"

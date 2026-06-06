@@ -44,7 +44,7 @@ pub fn register_to(ctx: &mut Context) {
     let string_lower_locale: Arc<dyn RelonFunction> = Arc::new(StringLowerLocale);
     let string_title_locale: Arc<dyn RelonFunction> = Arc::new(StringTitleLocale);
     // v3++ b-5: Unicode normalization (UAX #15). All four arcs delegate
-    // to `relon_ir::normalization`, the shared algorithm the wasm-AOT
+    // to `relon_unicode::normalization`, the shared algorithm the wasm-AOT
     // backend also embeds — so both executors stay byte-for-byte in
     // lock-step against UCD 14.0.0.
     let string_nfc: Arc<dyn RelonFunction> = Arc::new(StringNfc);
@@ -244,7 +244,7 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_method("String", "lower_locale", string_lower_locale);
     ctx.register_pure_method("String", "title_locale", string_title_locale);
     // v3++ b-5: Unicode normalization forms. Each method delegates to
-    // the shared `relon_ir::normalization` algorithm; the wasm-AOT body
+    // the shared `relon_unicode::normalization` algorithm; the wasm-AOT body
     // walks the same data tables so backend tests can compare results
     // byte-for-byte.
     ctx.register_pure_method("String", "nfc", string_nfc);
@@ -1054,9 +1054,9 @@ fn fold_string_with_ascii_hint(
     // == codepoint index, so the slow loop below resumes at
     // codepoint index `consumed` with no re-decoding.
     let fast_mode = match mode {
-        CaseFoldMode::Upper => Some(relon_ir::ascii_fold_simd::AsciiFoldMode::Upper),
-        CaseFoldMode::Lower => Some(relon_ir::ascii_fold_simd::AsciiFoldMode::Lower),
-        CaseFoldMode::Title => Some(relon_ir::ascii_fold_simd::AsciiFoldMode::Title),
+        CaseFoldMode::Upper => Some(relon_unicode::ascii_fold_simd::AsciiFoldMode::Upper),
+        CaseFoldMode::Lower => Some(relon_unicode::ascii_fold_simd::AsciiFoldMode::Lower),
+        CaseFoldMode::Title => Some(relon_unicode::ascii_fold_simd::AsciiFoldMode::Title),
     };
     let fast_consumed = if !locale_turkish {
         if let Some(fm) = fast_mode {
@@ -1064,7 +1064,7 @@ fn fold_string_with_ascii_hint(
                 AsciiHint::AllAscii => {
                     // Caller has guaranteed every byte is `< 0x80`.
                     // Skip the scan and consume the whole payload.
-                    let r = relon_ir::ascii_fold_simd::case_fold_ascii_fast_into_string(
+                    let r = relon_unicode::ascii_fold_simd::case_fold_ascii_fast_into_string(
                         s.as_bytes(),
                         fm,
                         at_word_start,
@@ -1081,7 +1081,7 @@ fn fold_string_with_ascii_hint(
                     0
                 }
                 AsciiHint::Unknown => {
-                    let r = relon_ir::ascii_fold_simd::fold_ascii_prefix_into_string(
+                    let r = relon_unicode::ascii_fold_simd::fold_ascii_prefix_into_string(
                         s.as_bytes(),
                         fm,
                         at_word_start,
@@ -1108,7 +1108,7 @@ fn fold_string_with_ascii_hint(
     // `fast_consumed`.
     let cps: Vec<u32> = s.chars().map(|c| c as u32).collect();
     for (i, &cp) in cps.iter().enumerate().skip(fast_consumed) {
-        let is_mark = relon_ir::combining_marks::is_combining_mark(cp);
+        let is_mark = relon_unicode::combining_marks::is_combining_mark(cp);
         if is_mark {
             // Combining marks: pass through unchanged. The word-boundary
             // flag stays as-is because marks belong to their base
@@ -1144,7 +1144,7 @@ fn fold_string_with_ascii_hint(
 
         // Final sigma context — only when lowering Σ (U+03A3).
         if effective_mode == CaseFoldMode::Lower && cp == 0x03A3 {
-            let final_form = relon_ir::full_case_folding::is_final_sigma_context(&cps, i);
+            let final_form = relon_unicode::full_case_folding::is_final_sigma_context(&cps, i);
             let mapped = if final_form { 0x03C2 } else { 0x03C3 };
             if let Some(c) = char::from_u32(mapped) {
                 out.push(c);
@@ -1155,8 +1155,8 @@ fn fold_string_with_ascii_hint(
         // Turkish locale overrides take precedence over default tables.
         if locale_turkish {
             let entry = match effective_mode {
-                CaseFoldMode::Upper => relon_ir::full_case_folding::turkish_upper_entry(cp),
-                CaseFoldMode::Lower => relon_ir::full_case_folding::turkish_lower_entry(cp),
+                CaseFoldMode::Upper => relon_unicode::full_case_folding::turkish_upper_entry(cp),
+                CaseFoldMode::Lower => relon_unicode::full_case_folding::turkish_lower_entry(cp),
                 CaseFoldMode::Title => unreachable!("normalised above"),
             };
             if let Some((len, slots)) = entry {
@@ -1171,8 +1171,8 @@ fn fold_string_with_ascii_hint(
 
         // FULL multi-codepoint mappings (e.g. ß -> SS, ﬁ -> FI).
         let full_entry = match effective_mode {
-            CaseFoldMode::Upper => relon_ir::full_case_folding::full_upper_entry(cp),
-            CaseFoldMode::Lower => relon_ir::full_case_folding::full_lower_entry(cp),
+            CaseFoldMode::Upper => relon_unicode::full_case_folding::full_upper_entry(cp),
+            CaseFoldMode::Lower => relon_unicode::full_case_folding::full_lower_entry(cp),
             CaseFoldMode::Title => unreachable!("normalised above"),
         };
         if let Some((len, slots)) = full_entry {
@@ -1274,35 +1274,35 @@ fn fold_string_to_smol_ascii_fast(
         }
     }
     let ir_mode = match mode {
-        CaseFoldMode::Upper => relon_ir::ascii_fold_simd::AsciiFoldMode::Upper,
-        CaseFoldMode::Lower => relon_ir::ascii_fold_simd::AsciiFoldMode::Lower,
-        CaseFoldMode::Title => relon_ir::ascii_fold_simd::AsciiFoldMode::Title,
+        CaseFoldMode::Upper => relon_unicode::ascii_fold_simd::AsciiFoldMode::Upper,
+        CaseFoldMode::Lower => relon_unicode::ascii_fold_simd::AsciiFoldMode::Lower,
+        CaseFoldMode::Title => relon_unicode::ascii_fold_simd::AsciiFoldMode::Title,
     };
     // Inline buffer write: the slice handed to the writer is exactly
     // `bytes.len()` bytes long, and the body below emits exactly that
     // many bytes (output length == input length for ASCII upper /
     // lower / title). The mask + xor body is the same one
-    // [`relon_ir::ascii_fold_simd::fold_ascii_prefix_upper_lower`]
+    // [`relon_unicode::ascii_fold_simd::fold_ascii_prefix_upper_lower`]
     // implements; we inline it here to write directly into the inline
     // slot — going through the IR helper would force a scratch
     // `Vec<u8>` allocation, defeating the alloc-skip the inline path
     // exists for.
     SmolStr::try_build_inline(bytes.len(), |out| match ir_mode {
-        relon_ir::ascii_fold_simd::AsciiFoldMode::Upper => {
+        relon_unicode::ascii_fold_simd::AsciiFoldMode::Upper => {
             // upper(b) = (b in 'a'..='z') ? b ^ 0x20 : b
             for (i, &b) in bytes.iter().enumerate() {
                 let in_range = b.wrapping_sub(b'a') < 26;
                 out[i] = b ^ if in_range { 0x20 } else { 0x00 };
             }
         }
-        relon_ir::ascii_fold_simd::AsciiFoldMode::Lower => {
+        relon_unicode::ascii_fold_simd::AsciiFoldMode::Lower => {
             // lower(b) = (b in 'A'..='Z') ? b ^ 0x20 : b
             for (i, &b) in bytes.iter().enumerate() {
                 let in_range = b.wrapping_sub(b'A') < 26;
                 out[i] = b ^ if in_range { 0x20 } else { 0x00 };
             }
         }
-        relon_ir::ascii_fold_simd::AsciiFoldMode::Title => {
+        relon_unicode::ascii_fold_simd::AsciiFoldMode::Title => {
             // title walks the prefix tracking word-boundary state:
             // ASCII whitespace resets `at_word_start = true`, the first
             // non-whitespace codepoint after that uppers, every later
@@ -1410,7 +1410,7 @@ impl RelonFunction for StringLower {
 
 /// v3++ b-6: locale-aware case folding. Surface names
 /// `upper_locale` / `lower_locale` / `title_locale`. The locale string
-/// is parsed via [`relon_ir::full_case_folding::is_turkish_locale`] —
+/// is parsed via [`relon_unicode::full_case_folding::is_turkish_locale`] —
 /// only `tr` / `az` (with optional `-XX` / `_XX` region) flips into
 /// the Turkish override branch; every other locale falls back to the
 /// default UAX #21 behaviour.
@@ -1425,7 +1425,7 @@ impl RelonFunction for StringUpperLocale {
         expect_arg_count(&args, 2, range)?;
         let smol = expect_smol_string(&args[0], range)?;
         let locale = expect_string(&args[1], range)?;
-        let tr = relon_ir::full_case_folding::is_turkish_locale(locale);
+        let tr = relon_unicode::full_case_folding::is_turkish_locale(locale);
         let hint = AsciiHint::from_smol(smol);
         Ok(Value::String(fold_string_to_smol_with_hint(
             smol.as_str(),
@@ -1447,7 +1447,7 @@ impl RelonFunction for StringLowerLocale {
         expect_arg_count(&args, 2, range)?;
         let smol = expect_smol_string(&args[0], range)?;
         let locale = expect_string(&args[1], range)?;
-        let tr = relon_ir::full_case_folding::is_turkish_locale(locale);
+        let tr = relon_unicode::full_case_folding::is_turkish_locale(locale);
         let hint = AsciiHint::from_smol(smol);
         Ok(Value::String(fold_string_to_smol_with_hint(
             smol.as_str(),
@@ -1469,7 +1469,7 @@ impl RelonFunction for StringTitleLocale {
         expect_arg_count(&args, 2, range)?;
         let smol = expect_smol_string(&args[0], range)?;
         let locale = expect_string(&args[1], range)?;
-        let tr = relon_ir::full_case_folding::is_turkish_locale(locale);
+        let tr = relon_unicode::full_case_folding::is_turkish_locale(locale);
         let hint = AsciiHint::from_smol(smol);
         Ok(Value::String(fold_string_to_smol_with_hint(
             smol.as_str(),
@@ -1519,7 +1519,7 @@ impl RelonFunction for StringTitle {
 
 /// v3++ b-5: Unicode normalization (UAX #15) — Canonical Composition.
 ///
-/// Calls into [`relon_ir::normalization::to_nfc`], which shares its
+/// Calls into [`relon_unicode::normalization::to_nfc`], which shares its
 /// data tables (`NFD_INDEX` / `NFD_POOL` / `CCC_TABLE` /
 /// `COMPOSITION_PAIRS`) with the wasm-AOT backend body in
 /// `crates/relon-ir/src/stdlib.rs`. Both executors therefore see the
@@ -1538,7 +1538,9 @@ impl RelonFunction for StringNfc {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
         let s = expect_string(&args[0], range)?;
-        Ok(Value::String(relon_ir::normalization::to_nfc(s).into()))
+        Ok(Value::String(
+            relon_unicode::normalization::to_nfc(s).into(),
+        ))
     }
 }
 
@@ -1554,7 +1556,9 @@ impl RelonFunction for StringNfd {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
         let s = expect_string(&args[0], range)?;
-        Ok(Value::String(relon_ir::normalization::to_nfd(s).into()))
+        Ok(Value::String(
+            relon_unicode::normalization::to_nfd(s).into(),
+        ))
     }
 }
 
@@ -1570,7 +1574,9 @@ impl RelonFunction for StringNfkc {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
         let s = expect_string(&args[0], range)?;
-        Ok(Value::String(relon_ir::normalization::to_nfkc(s).into()))
+        Ok(Value::String(
+            relon_unicode::normalization::to_nfkc(s).into(),
+        ))
     }
 }
 
@@ -1586,7 +1592,9 @@ impl RelonFunction for StringNfkd {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
         let s = expect_string(&args[0], range)?;
-        Ok(Value::String(relon_ir::normalization::to_nfkd(s).into()))
+        Ok(Value::String(
+            relon_unicode::normalization::to_nfkd(s).into(),
+        ))
     }
 }
 
@@ -1608,7 +1616,7 @@ impl RelonFunction for StringContains {
 /// 2026-05-21: Tier-2 LuaJIT-pattern-subset glob matcher
 /// (`glob_match(s, pattern) -> Bool`).
 ///
-/// Delegates to the shared algorithm in [`relon_ir::glob::glob_match`]
+/// Delegates to the shared algorithm in [`relon_unicode::glob::glob_match`]
 /// so the tree-walker and the cranelift host-helper backend stay
 /// byte-for-byte in lock-step. The matcher itself is anchored, case-
 /// sensitive, char-by-char Unicode, and runs in linear time over
@@ -1626,7 +1634,7 @@ impl RelonFunction for StringGlobMatch {
         expect_arg_count(&args, 2, range)?;
         let s = expect_string(&args[0], range)?;
         let pattern = expect_string(&args[1], range)?;
-        Ok(Value::Bool(relon_ir::glob::glob_match(s, pattern)))
+        Ok(Value::Bool(relon_unicode::glob::glob_match(s, pattern)))
     }
 }
 

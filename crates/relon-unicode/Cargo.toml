@@ -1,0 +1,19 @@
+[package]
+name = "relon-unicode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Leaf Unicode tables, case-folding / normalization algorithms, and the glob matcher shared across Relon crates."
+authors = ["kookyleo <kookyleo@gmail.com>"]
+keywords = ["relon", "unicode"]
+categories = ["compilers", "text-processing"]
+
+# Deliberately depends on **no other** `relon-*` crate so it sits at the
+# very bottom of the workspace dep graph — a true leaf (like relon-util
+# and relon-cap). Adding a relon-* dep here would risk a dependency cycle
+# the moment a consumer wires it back in; reviewers should reject any
+# such change.
+[dependencies]

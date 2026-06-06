@@ -28,11 +28,14 @@ remote-http = ["dep:ureq"]
 relon-parser = { workspace = true }
 relon-analyzer = { workspace = true }
 relon-eval-api = { workspace = true }
-# v3++ b-4: pulled in so the tree-walk `title()` body shares the
-# same Unicode combining-mark detection table as the wasm-AOT body.
-# Keeping the table in one place avoids the two backends drifting
-# apart on grapheme-cluster semantics.
-relon-ir = { workspace = true }
+# v3++ b-4: pulled in so the tree-walk `title()` / case-fold /
+# normalize / `glob_match` bodies share the same Unicode tables and
+# matcher as the wasm-AOT / native backends. Keeping them in one leaf
+# crate avoids the engines drifting apart on grapheme-cluster /
+# normalization / glob semantics. The evaluator is a tree-walk engine
+# and never touches the IR surface, so it depends on `relon-unicode`
+# directly rather than on `relon-ir`.
+relon-unicode = { workspace = true }
 relon-util = { workspace = true }
 ordered-float.workspace = true
 # `rc` enables `serde::Serialize`/`Deserialize` for `Arc<T>` so that

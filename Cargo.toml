@@ -114,6 +114,13 @@ relon-util = { path = "crates/relon-util", version = "0.1.0" }
 # bottom of the dep graph and breaks the eval-api <-> analyzer cycle that
 # forced the analyzer to mirror these types.
 relon-cap = { path = "crates/relon-cap", version = "0.1.0" }
+# Leaf crate holding the Unicode tables, case-folding / normalization
+# algorithms, the SIMD ASCII fast path, and the glob matcher. Consumed
+# by the tree-walk evaluator and the codegen backends. Depends on no
+# other relon-* crate so it stays at the bottom of the dep graph and
+# lets `relon-evaluator` drop its edge to `relon-ir` (the evaluator only
+# ever needed these shared tables, never the IR surface).
+relon-unicode = { path = "crates/relon-unicode", version = "0.1.0" }
 
 # Default release profile — throughput-tuned. Fat LTO + single
 # codegen unit so the optimizer sees the whole program; downstream
