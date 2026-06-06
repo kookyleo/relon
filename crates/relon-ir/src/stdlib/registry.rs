@@ -36,6 +36,7 @@ use super::normalization::{
 };
 use super::signatures::StdlibFunction;
 use super::string_ops::{ends_with_string, len_string_to_int, replace_string};
+use super::validators::is_uuid_string;
 
 /// Return the ordered list of builtin stdlib functions. The order is
 /// part of the wire format — new entries must be **appended** so the
@@ -279,6 +280,25 @@ pub fn builtin_stdlib() -> &'static [StdlibFunction] {
             len_string_to_int(),
             ends_with_string(),
             replace_string(),
+            // Wave R9: Bool-returning `is_*` validator stdlib. Appended at
+            // the tail (index 55) so every position-pinned index above
+            // stays put — existing-construct cranelift/llvm bytes are
+            // unchanged, so GENERATOR_VERSION does not move. The body is
+            // purely byte-level (record-header read, byte loads, integer
+            // compares, `BitAnd` / `Add` / `Sub` / `Mul`) — no UTF-8
+            // decode, no `Op::Trap`, no integer division/remainder — so it
+            // lowers four-way (tree-walk == cranelift == llvm-native ==
+            // llvm-wasm), byte-exact with the tree-walk `is_uuid_str`
+            // oracle.
+            //   * `55` — `is_uuid(String) -> Bool` (RFC 4122 canonical
+            //             text form, case-insensitive).
+            // Sibling validators stay capped: `is_email` / `is_uri` walk
+            // `s.chars()` (UTF-8 decode seam — LLVM/wasm segfault),
+            // `is_ipv4` / `is_ipv6` route through `core::net` parsers (no
+            // wasm-portable body), and `is_iso_date` needs integer
+            // division / remainder (leap-year `% 4 / % 100 / % 400`) for
+            // which the IR exposes no `DivS` / `RemS` op.
+            is_uuid_string(),
         ]
     })
 }

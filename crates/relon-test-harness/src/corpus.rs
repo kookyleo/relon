@@ -1060,6 +1060,49 @@ pub fn all_cases() -> Vec<CorpusCase> {
             tier: Tier::StdlibSimple,
             supported_by: TW_CR,
         },
+        // Wave R9: Bool-returning `is_uuid` validator lowered four-way.
+        // Tree-walk == cranelift here; the wasm + llvm-native legs live in
+        // `relon-codegen-llvm::aot_wasm_parity::r9_*`. Edges covered: valid
+        // canonical UUID (lower / upper hex), wrong length, dash-position
+        // failure, and a non-hex byte. Sibling validators stay capped:
+        // `is_email` / `is_uri` (UTF-8 decode seam), `is_ipv4` / `is_ipv6`
+        // (`core::net` parser, no wasm body), `is_iso_date` (needs integer
+        // div/rem for the leap-year test, no `DivS` / `RemS` IR op).
+        CorpusCase {
+            name: "r9_is_uuid_valid",
+            source: "#main() -> Bool\nis_uuid(\"12345678-1234-1234-1234-123456789012\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r9_is_uuid_upper_hex",
+            source: "#main() -> Bool\nis_uuid(\"ABCDEF01-ABCD-ABCD-ABCD-ABCDEF012345\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r9_is_uuid_too_short",
+            source: "#main() -> Bool\nis_uuid(\"12345678-1234-1234-1234-12345678901\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r9_is_uuid_bad_dash",
+            source: "#main() -> Bool\nis_uuid(\"12345678X1234-1234-1234-123456789012\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r9_is_uuid_nonhex",
+            source: "#main() -> Bool\nis_uuid(\"1234567g-1234-1234-1234-123456789012\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
         // ---- StdlibNormalize: most complex ----
         // Bytecode rejects `String`-typed return; trace const table
         // pre-computes both NFD / NFC payloads.
