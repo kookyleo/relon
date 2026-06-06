@@ -6120,7 +6120,10 @@ fn eval_fused_with(ctx: Context, source: &str) -> Result<Value, RuntimeError> {
         crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
         ctx
     });
+    // These tests exercise the fused fast-path itself, so opt the evaluator
+    // into high-level fusion (the default `new` is oracle-safe = unfused).
     TreeWalkEvaluator::new(std::sync::Arc::clone(&ctx))
+        .with_high_level_fusion(true)
         .eval_root(&std::sync::Arc::new(Scope::default()))
 }
 

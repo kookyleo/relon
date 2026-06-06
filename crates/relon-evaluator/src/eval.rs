@@ -29,6 +29,24 @@ pub struct TreeWalkEvaluator {
     /// Cached empty scope used as the parent of native-fn closure
     /// callbacks. Avoids one `Arc::new(Scope::default())` per element.
     empty_scope: std::sync::OnceLock<Arc<Scope>>,
+    /// Whether to apply AST-level high-level fusion fast-paths (e.g. the
+    /// materialisation-free `list.sum(range(...))` fold in
+    /// [`Self::try_eval_fused`]).
+    ///
+    /// **Default `false` — reference / oracle semantics.** The tree-walk
+    /// evaluator's primary role is the *gold oracle* for differential
+    /// testing: it must take the plain, obviously-correct path (materialise
+    /// the `range`, fold through the `std/list` wrapper) so it can
+    /// independently validate the compiled back-ends' own fusion. Turning
+    /// fusion on in the oracle would let a shared fusion bug hide from the
+    /// four-way diff.
+    ///
+    /// A production interpreter deployment (no compiler available) can opt
+    /// into the perf win with [`Self::with_high_level_fusion`]; the fused
+    /// path is byte-exact with the reference path (same additions, order,
+    /// checked-overflow, and capability pre-flight), so the only observable
+    /// difference is speed / not materialising the intermediate list.
+    high_level_fusion: bool,
 }
 
 impl TreeWalkEvaluator {
@@ -53,7 +71,20 @@ impl TreeWalkEvaluator {
             context,
             caps: std::sync::OnceLock::new(),
             empty_scope: std::sync::OnceLock::new(),
+            // Oracle-safe default: no high-level fusion. See the field doc.
+            high_level_fusion: false,
         }
+    }
+
+    /// Opt this evaluator into AST-level high-level fusion fast-paths
+    /// (see [`Self::try_eval_fused`]). Intended for a production
+    /// interpreter deployment that wants the materialisation-free perf and
+    /// is *not* acting as the differential oracle. The default
+    /// ([`Self::new`]) leaves fusion off so the oracle keeps reference
+    /// semantics.
+    pub fn with_high_level_fusion(mut self, enabled: bool) -> Self {
+        self.high_level_fusion = enabled;
+        self
     }
 
     /// Install the tree-walking backend's defaults into `ctx`
@@ -1607,6 +1638,13 @@ impl TreeWalkEvaluator {
         node: &Node,
         scope: &Arc<Scope>,
     ) -> Result<Option<Value>, RuntimeError> {
+        // Reference / oracle role: never fuse — take the plain materialised
+        // path so the oracle can independently validate the compiled
+        // back-ends' fusion. Only a production interpreter that opted in via
+        // `with_high_level_fusion(true)` reaches the fast-path below.
+        if !self.high_level_fusion {
+            return Ok(None);
+        }
         use relon_parser::rewrite::{recognize_fused, FusedPattern};
         let Some(pattern) = recognize_fused(node.expr.as_ref()) else {
             return Ok(None);
