@@ -205,6 +205,159 @@ fn many_records() {
     assert_inplace(SRC_NAME_PORT, cfg_list(items));
 }
 
+// ---- F7: element sub-record carries List<Schema> / List<List> fields --
+//
+// `List<Team>` where Team carries `members: List<Person>` (object array
+// element field), `tags: List<List<Int>>` (nested-list element field), or
+// a deeper Person that again carries a `List<X>`. The element sub-record
+// decode now recurses through the unified list reader, and the lowering
+// admission walks the element schema's field types recursively, so these
+// in-place returns lift to any depth. The verifier already recursed.
+
+/// `Team { name: String, members: List<Person> }` — an object array
+/// *inside* the element sub-record.
+const SRC_TEAM_MEMBERS: &str = "#schema Person { name: String }\n\
+     #schema Team { name: String, members: List<Person> }\n\
+     #main(List<Team> teams) -> List<Team>\nteams";
+
+fn assert_inplace_named(src: &str, arg: &str, value: Value) {
+    let mut m = HashMap::new();
+    m.insert(arg.to_string(), value);
+    let report = assert_all_backends_bit_equal(src, m);
+    assert!(
+        report.cranelift_compared,
+        "cranelift must compile `{src}`; skipped: {:?}",
+        report.cranelift_skip_reason
+    );
+    #[cfg(feature = "llvm-aot")]
+    assert!(
+        report.llvm_compared,
+        "llvm must compile `{src}`; skipped: {:?}",
+        report.llvm_skip_reason
+    );
+}
+
+fn person(name: &str) -> Value {
+    cfg("Person", vec![("name", s(name))])
+}
+
+fn team(name: &str, members: Vec<Value>) -> Value {
+    cfg(
+        "Team",
+        vec![("name", s(name)), ("members", cfg_list(members))],
+    )
+}
+
+#[test]
+fn f7_team_members_list_schema_field() {
+    assert_inplace_named(
+        SRC_TEAM_MEMBERS,
+        "teams",
+        cfg_list(vec![
+            team("empty", vec![]),
+            team("alpha", vec![person("a"), person("")]),
+            team(
+                &from_cps(&[0x4E2D, 0x6587]),
+                vec![person(&from_cps(&[0x1F980])), person("z")],
+            ),
+        ]),
+    );
+}
+
+/// `Team { name: String, tags: List<List<Int>> }` — a nested-list field
+/// inside the element sub-record.
+const SRC_TEAM_TAGS: &str = "#schema Team { name: String, tags: List<List<Int>> }\n\
+     #main(List<Team> teams) -> List<Team>\nteams";
+
+fn team_tags(name: &str, rows: &[&[i64]]) -> Value {
+    let tags = Value::List(Arc::new(rows.iter().map(|r| iints(r)).collect()));
+    cfg("Team", vec![("name", s(name)), ("tags", tags)])
+}
+
+#[test]
+fn f7_team_tags_list_list_int_field() {
+    assert_inplace_named(
+        SRC_TEAM_TAGS,
+        "teams",
+        cfg_list(vec![
+            team_tags("e", &[]),
+            team_tags("m", &[&[1, 2, 3], &[], &[i64::MIN, i64::MAX]]),
+            team_tags(&from_cps(&[0x4E2D]), &[&[0]]),
+        ]),
+    );
+}
+
+/// Three levels: Team -> members: List<Person>, Person -> roles:
+/// List<Role>, Role -> name: String. The element sub-record decode and
+/// the lowering admission recurse two element-schema layers deep.
+const SRC_THREE_LEVEL: &str = "#schema Role { name: String }\n\
+     #schema Person { name: String, roles: List<Role> }\n\
+     #schema Team { name: String, members: List<Person> }\n\
+     #main(List<Team> teams) -> List<Team>\nteams";
+
+fn role(name: &str) -> Value {
+    cfg("Role", vec![("name", s(name))])
+}
+
+fn person_roles(name: &str, roles: Vec<Value>) -> Value {
+    cfg(
+        "Person",
+        vec![("name", s(name)), ("roles", cfg_list(roles))],
+    )
+}
+
+#[test]
+fn f7_three_level_list_schema_nest() {
+    assert_inplace_named(
+        SRC_THREE_LEVEL,
+        "teams",
+        cfg_list(vec![
+            team("t0", vec![]),
+            team(
+                "t1",
+                vec![
+                    person_roles("p0", vec![]),
+                    person_roles(
+                        &from_cps(&[0x4E2D, 0x6587]),
+                        vec![role("admin"), role(""), role(&from_cps(&[0x1F980]))],
+                    ),
+                ],
+            ),
+        ]),
+    );
+}
+
+/// F7 as a parameter-FIELD return (`w.teams` where each Team carries a
+/// nested List<Person>): combines the F4 field walk with the F7 deep
+/// element decode.
+const SRC_W_TEAMS: &str = "#schema Person { name: String }\n\
+     #schema Team { name: String, members: List<Person> }\n\
+     #schema W { teams: List<Team>, n: Int }\n\
+     #main(W w) -> List<Team>\nw.teams";
+
+#[test]
+fn f7_param_field_teams_with_member_lists() {
+    let w = cfg(
+        "W",
+        vec![
+            (
+                "teams",
+                cfg_list(vec![
+                    team("a", vec![person("x"), person("")]),
+                    team(&from_cps(&[0x4E2D]), vec![]),
+                ]),
+            ),
+            ("n", Value::Int(3)),
+        ],
+    );
+    let mut m = HashMap::new();
+    m.insert("w".to_string(), w);
+    let report = assert_all_backends_bit_equal(SRC_W_TEAMS, m);
+    assert!(report.cranelift_compared, "cranelift must compile w.teams");
+    #[cfg(feature = "llvm-aot")]
+    assert!(report.llvm_compared, "llvm must compile w.teams");
+}
+
 // ---- F4: parameter-FIELD List<Schema> return (`w.items`) -------------
 //
 // `#main(W w) -> List<Cfg>\nw.items` — the returned list is `w`'s field,
@@ -318,27 +471,76 @@ proptest! {
         #[cfg(feature = "llvm-aot")]
         prop_assert!(report.llvm_compared, "llvm must compile the shape");
     }
+
+    // F7: random `List<Team>` where each Team carries a nested
+    // `members: List<Person>` object-array field and a `tags:
+    // List<List<Int>>` nested-list field — the recursive element decode
+    // and the recursive lowering admission, fuzzed.
+    #[test]
+    fn diff_list_team_nested(teams in list_team_strat()) {
+        let src = "#schema Person { name: String }\n\
+                   #schema Team { name: String, members: List<Person>, tags: List<List<Int>> }\n\
+                   #main(List<Team> teams) -> List<Team>\nteams";
+        let mut m = HashMap::new();
+        m.insert("teams".to_string(), teams);
+        let report = assert_all_backends_bit_equal(src, m);
+        prop_assert!(report.cranelift_compared, "cranelift must compile the nested shape");
+        #[cfg(feature = "llvm-aot")]
+        prop_assert!(report.llvm_compared, "llvm must compile the nested shape");
+    }
+}
+
+/// One Team value for the F7 proptest schema
+/// `{ name: String, members: List<Person{name:String}>, tags: List<List<Int>> }`.
+fn team_value_strat() -> impl Strategy<Value = Value> {
+    (
+        string_strat(),
+        prop::collection::vec(string_strat(), 0..4),
+        prop::collection::vec(prop::collection::vec(any::<i64>(), 0..3), 0..3),
+    )
+        .prop_map(|(name, members, rows)| {
+            let members = members
+                .into_iter()
+                .map(|n| cfg("Person", vec![("name", s(&n))]))
+                .collect::<Vec<_>>();
+            let tags = Value::List(Arc::new(
+                rows.into_iter()
+                    .map(|r| Value::List(Arc::new(r.into_iter().map(Value::Int).collect())))
+                    .collect(),
+            ));
+            cfg(
+                "Team",
+                vec![
+                    ("name", s(&name)),
+                    ("members", cfg_list(members)),
+                    ("tags", tags),
+                ],
+            )
+        })
+}
+
+fn list_team_strat() -> impl Strategy<Value = Value> {
+    prop::collection::vec(team_value_strat(), 0..6).prop_map(cfg_list)
 }
 
 // ---- loud-cap guards: unsupported shapes decline, never miscompile ---
 
-/// Shapes still beyond F5 must make **both** AOT backends decline the
-/// `#main` shape (a setup error). In production `Backend::Auto` falls back
-/// to the tree-walk oracle; here we assert the decline is loud.
+/// Shapes the in-place ABI still does NOT lift must make **both** AOT
+/// backends decline the `#main` shape (a setup error). In production
+/// `Backend::Auto` falls back to the tree-walk oracle; here we assert the
+/// decline is loud.
 ///
-/// F5 lifted the `List<List<Schema>>` double pointer array; what remains
-/// is a `List<Schema>` whose sub-record carries a nested `List<Schema>`
-/// field (out of the S4 sub-record decode scope) and the `Dict` param
-/// dead-end.
+/// F7 lifted the last return-side functional axis — an element sub-record
+/// carrying `List<Schema>` / `List<List>` fields now decodes recursively
+/// to any depth (see `f7_*` tests). The only remaining cap on the
+/// return side is the `Dict` param dead-end (an analyzer dead-end with no
+/// buffer-protocol input decode path), which is an *input*-side cap, not a
+/// return-side one.
 #[test]
 fn unsupported_return_shapes_fail_loudly_not_silently() {
     let cap_cases = [
-        // Sub-record carrying a nested List<Schema> field — out of S4
-        // scope (`list_schema_subrecord_in_s4_scope` rejects a sub-record
-        // whose field is itself a pointer-array-of-schema).
-        "#schema Inner { x: Int }\n#schema Cfg { kids: List<Inner> }\n\
-         #main(List<Cfg> items) -> List<Cfg>\nitems",
-        // Dict param — analyzer dead-end.
+        // Dict param — analyzer dead-end, no input decode path. This is
+        // the only shape that still declines on the return-side surface.
         "#main(Dict<String, Int> d) -> Int\n1",
     ];
     for src in cap_cases {

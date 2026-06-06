@@ -149,9 +149,13 @@ signature**; each parameter declares one host-pushed slot:
 >   recursion runs over linear memory). A parameter-*field*
 >   `List<Schema>` (`#main(W w) -> List<Cfg> = w.items`) is **also
 >   supported** on all three (F4) via the same arena-absolute field-load.
->   A sub-record that itself carries a nested `List<Schema>` /
->   `List<List<…>>` field stays out of scope (the in-place sub-record reader
->   caps it),
+>   An element sub-record that itself carries a nested `List<Schema>` /
+>   `List<List<…>>` field (e.g. `Team { name: String, members: List<Person>,
+>   tags: List<List<Int>> }`) is **also supported, recursively to any depth**
+>   (F7): the in-place sub-record reader recurses through the same unified
+>   list reader and the lowering admission walks the element schema's field
+>   types recursively, so nested object arrays and nested lists inside the
+>   element schema decode bit-equal at any nesting depth,
 > - **deep nested-schema field-walk returns** (`#main(Outer o) ->
 >   List<String> = o.inner.tags`, and deeper such as `o.a.b.tags`), on **the
 >   cranelift, llvm, and compiled-wasm backends** (F6). A `≥3`-segment chain
@@ -193,11 +197,11 @@ signature**; each parameter declares one host-pushed slot:
 > use the tree-walk evaluator for those shapes):
 >
 > - `Dict<_, _>` parameters (the analyzer cannot type `d["x"]` index
->   reads; use a `#schema` struct for structured config instead),
-> - a `List<Schema>` return whose sub-record carries a nested
->   `List<Schema>` / `List<List<…>>` field (the in-place sub-record reader
->   caps the deeper pointer array — this also caps a deep field-walk whose
->   leaf is such a `List<Schema>`).
+>   reads; use a `#schema` struct for structured config instead). This is
+>   the only shape on the return-side surface that still declines — every
+>   nested list / object-array / nested-schema return shape (identity,
+>   parameter field, deep field-walk, and object field) is now supported
+>   four-way at any depth (F7).
 >
 >   An **object field** sourced by a parameter — whether the object
 >   is an **anon-`Dict`** (`-> Dict { servers: servers, n: 1 }`) or a

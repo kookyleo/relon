@@ -332,12 +332,19 @@ fn read_record_into_branded_map(
 }
 
 /// Decode one sub-record field (`reader` is the per-element sub-record
-/// reader) into a [`Value`]. Covers the scalar leaves plus the
-/// pointer-indirect field shapes a `List<Schema>` element carries within
-/// S4 scope: `String`, `List<scalar>`, and `List<String>`. Deeper nested
-/// pointer-array element fields (`List<Schema>` / `List<List<…>>` *inside*
-/// a sub-record) are out of S4 scope and capped loudly at lowering, so a
-/// reach here is ABI drift surfaced rather than silently mis-decoded.
+/// reader) into a [`Value`]. Covers the scalar leaves plus every
+/// pointer-indirect list field a `List<Schema>` element can carry —
+/// **recursively, to any depth** (F7): `String`, `List<scalar>`,
+/// `List<String>`, and (new) `List<Schema>` / `List<List<…>>` element
+/// fields whose own element schemas again carry such fields. The list
+/// arms route through the buffer reader's unified recursive list reader
+/// ([`BufferReader::read_list_value`]), which follows the pointer array
+/// one level per element type — exactly the depth the multi-region
+/// verifier already certified before this decode runs. The produced
+/// values are bit-identical to the codegen evaluators' `read_list_value`
+/// path the tree-walk oracle's writer feeds. A bare nested `Schema`
+/// field, or any non-list non-scalar leaf, is capped at lowering, so a
+/// reach here is ABI drift surfaced loudly rather than mis-decoded.
 fn read_record_field(
     backend: &str,
     reader: &BufferReader<'_>,
@@ -364,38 +371,16 @@ fn read_record_field(
             .read_string(name)
             .map(|s| Value::String(s.into()))
             .map_err(map_err),
-        TypeRepr::List { element } => match element.as_ref() {
-            TypeRepr::Int => reader
-                .read_list_int(name)
-                .map(|v| Value::List(Arc::new(v.into_iter().map(Value::Int).collect())))
-                .map_err(map_err),
-            TypeRepr::Float => reader
-                .read_list_float(name)
-                .map(|v| {
-                    Value::List(Arc::new(
-                        v.into_iter()
-                            .map(|f| Value::Float(ordered_float::OrderedFloat(f)))
-                            .collect(),
-                    ))
-                })
-                .map_err(map_err),
-            TypeRepr::Bool => reader
-                .read_list_bool(name)
-                .map(|v| Value::List(Arc::new(v.into_iter().map(Value::Bool).collect())))
-                .map_err(map_err),
-            TypeRepr::String => reader
-                .read_list_string(name)
-                .map(|v| {
-                    Value::List(Arc::new(
-                        v.into_iter().map(|s| Value::String(s.into())).collect(),
-                    ))
-                })
-                .map_err(map_err),
-            other => Err(RuntimeError::IoError(format!(
-                "{backend} in-place List<Schema> sub-record field `{name}` has unsupported \
-                 list element {other:?} (S4 covers List<scalar> / List<String>)"
-            ))),
-        },
+        // Every list field — `List<scalar>` / `List<String>` /
+        // `List<Schema>` / `List<List<…>>` — decodes through the unified
+        // recursive list reader. It dispatches on `element` and recurses
+        // per pointer-array entry (into sub-records via `read_record_at`,
+        // into inner lists via itself), so nested object arrays and nested
+        // lists inside the element schema are decoded to any depth.
+        TypeRepr::List { element } => reader
+            .read_list_value(name, element.as_ref())
+            .map(|rows| Value::List(Arc::new(rows)))
+            .map_err(map_err),
         other => Err(RuntimeError::IoError(format!(
             "{backend} in-place List<Schema> sub-record field `{name}` has unsupported type \
              {other:?}"

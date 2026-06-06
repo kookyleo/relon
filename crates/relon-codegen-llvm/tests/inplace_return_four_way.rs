@@ -860,6 +860,221 @@ fn f6_three_level_tags() {
 }
 
 // ====================================================================
+// F7: element sub-record carries List<Schema> / List<List> fields.
+//
+// `List<Team>` where Team carries `members: List<Person>` (an object array
+// *inside* the element sub-record), `tags: List<List<Int>>` (a nested-list
+// element field), or a deeper Person that again carries a list. The
+// element sub-record decode recurses through the unified list reader, the
+// lowering admission walks the element schema's field types recursively,
+// and the verifier already recursed — so these in-place returns lift to
+// any depth. Same negative in-place sentinel + same shared host decode;
+// wasm rides the IR with no per-target change.
+// ====================================================================
+
+const SRC_TEAM_MEMBERS: &str = "#schema Person { name: String }\n\
+     #schema Team { name: String, members: List<Person> }\n\
+     #main(List<Team> teams) -> List<Team>\nteams";
+
+fn person(name: &str) -> Value {
+    let map = std::collections::BTreeMap::from([(
+        relon_eval_api::smol_str::SmolStr::from("name"),
+        Value::String(name.into()),
+    )]);
+    Value::branded_dict(map, Some("Person".into()))
+}
+
+fn team(name: &str, members: Vec<Value>) -> Value {
+    let map = std::collections::BTreeMap::from([
+        (
+            relon_eval_api::smol_str::SmolStr::from("name"),
+            Value::String(name.into()),
+        ),
+        (
+            relon_eval_api::smol_str::SmolStr::from("members"),
+            Value::List(Arc::new(members)),
+        ),
+    ]);
+    Value::branded_dict(map, Some("Team".into()))
+}
+
+#[test]
+fn f7_team_members_list_schema_field() {
+    assert_four_way(
+        SRC_TEAM_MEMBERS,
+        args1(
+            "teams",
+            Value::List(Arc::new(vec![
+                team("empty", vec![]),
+                team("alpha", vec![person("a"), person("")]),
+                team("\u{4E2D}\u{6587}", vec![person("\u{1F980}"), person("z")]),
+            ])),
+        ),
+    );
+}
+
+const SRC_TEAM_TAGS: &str = "#schema Team { name: String, tags: List<List<Int>> }\n\
+     #main(List<Team> teams) -> List<Team>\nteams";
+
+fn team_tags(name: &str, rows: &[&[i64]]) -> Value {
+    let map = std::collections::BTreeMap::from([
+        (
+            relon_eval_api::smol_str::SmolStr::from("name"),
+            Value::String(name.into()),
+        ),
+        (
+            relon_eval_api::smol_str::SmolStr::from("tags"),
+            int_rows(rows),
+        ),
+    ]);
+    Value::branded_dict(map, Some("Team".into()))
+}
+
+#[test]
+fn f7_team_tags_list_list_int_field() {
+    assert_four_way(
+        SRC_TEAM_TAGS,
+        args1(
+            "teams",
+            Value::List(Arc::new(vec![
+                team_tags("e", &[]),
+                team_tags("m", &[&[1, 2, 3], &[], &[i64::MIN, i64::MAX]]),
+                team_tags("\u{4E2D}", &[&[0]]),
+            ])),
+        ),
+    );
+}
+
+const SRC_THREE_LEVEL: &str = "#schema Role { name: String }\n\
+     #schema Person { name: String, roles: List<Role> }\n\
+     #schema Team { name: String, members: List<Person> }\n\
+     #main(List<Team> teams) -> List<Team>\nteams";
+
+fn role(name: &str) -> Value {
+    let map = std::collections::BTreeMap::from([(
+        relon_eval_api::smol_str::SmolStr::from("name"),
+        Value::String(name.into()),
+    )]);
+    Value::branded_dict(map, Some("Role".into()))
+}
+
+fn person_roles(name: &str, roles: Vec<Value>) -> Value {
+    let map = std::collections::BTreeMap::from([
+        (
+            relon_eval_api::smol_str::SmolStr::from("name"),
+            Value::String(name.into()),
+        ),
+        (
+            relon_eval_api::smol_str::SmolStr::from("roles"),
+            Value::List(Arc::new(roles)),
+        ),
+    ]);
+    Value::branded_dict(map, Some("Person".into()))
+}
+
+#[test]
+fn f7_three_level_list_schema_nest() {
+    assert_four_way(
+        SRC_THREE_LEVEL,
+        args1(
+            "teams",
+            Value::List(Arc::new(vec![
+                team("t0", vec![]),
+                team(
+                    "t1",
+                    vec![
+                        person_roles("p0", vec![]),
+                        person_roles(
+                            "\u{4E2D}\u{6587}",
+                            vec![role("admin"), role(""), role("\u{1F980}")],
+                        ),
+                    ],
+                ),
+            ])),
+        ),
+    );
+}
+
+// F7 deep chain whose leaf `List<Cell>` element sub-record carries a
+// nested-list field (`rows: List<List<Int>>`) — the exact shape capped
+// through F6, now four-way bit-equal.
+const SRC_DEEP_CELLS: &str = "#schema Cell { rows: List<List<Int>>, k: Int }\n\
+     #schema Inner { cells: List<Cell>, n: Int }\n\
+     #schema Outer { inner: Inner, m: Int }\n\
+     #main(Outer o) -> List<Cell>\no.inner.cells";
+
+#[test]
+fn f7_deep_chain_leaf_list_schema_nested_list_field() {
+    let cell = |rows: &[&[i64]], k: i64| {
+        let map = std::collections::BTreeMap::from([
+            (
+                relon_eval_api::smol_str::SmolStr::from("rows"),
+                int_rows(rows),
+            ),
+            (relon_eval_api::smol_str::SmolStr::from("k"), Value::Int(k)),
+        ]);
+        Value::branded_dict(map, Some("Cell".into()))
+    };
+    let inner = {
+        let map = std::collections::BTreeMap::from([
+            (
+                relon_eval_api::smol_str::SmolStr::from("cells"),
+                Value::List(Arc::new(vec![
+                    cell(&[], 0),
+                    cell(&[&[1, 2], &[], &[i64::MIN, i64::MAX]], 7),
+                ])),
+            ),
+            (relon_eval_api::smol_str::SmolStr::from("n"), Value::Int(2)),
+        ]);
+        Value::branded_dict(map, Some("Inner".into()))
+    };
+    let outer = {
+        let map = std::collections::BTreeMap::from([
+            (relon_eval_api::smol_str::SmolStr::from("inner"), inner),
+            (relon_eval_api::smol_str::SmolStr::from("m"), Value::Int(3)),
+        ]);
+        Value::branded_dict(map, Some("Outer".into()))
+    };
+    assert_four_way(SRC_DEEP_CELLS, args1("o", outer));
+}
+
+// F7 paste-alignment edge: `List<Cfg>` where Cfg has only u32-pointer
+// fields (`root_align == 4`) but a `List<Int>` tail field whose i64
+// payload needs 8-alignment. The list entry must paste at an 8-aligned
+// offset (deep paste alignment) so the reader's absolute alignment
+// recovery lands on the bytes the writer wrote — a latent S4 bug F7 fixed.
+const SRC_CFG_NUMS: &str = "#schema Cfg { name: String, nums: List<Int> }\n\
+     #main(List<Cfg> items) -> List<Cfg>\nitems";
+
+#[test]
+fn f7_list_schema_align4_element_with_int_list_tail() {
+    let cfg = |name: &str, nums: &[i64]| {
+        let map = std::collections::BTreeMap::from([
+            (
+                relon_eval_api::smol_str::SmolStr::from("name"),
+                Value::String(name.into()),
+            ),
+            (
+                relon_eval_api::smol_str::SmolStr::from("nums"),
+                Value::List(Arc::new(nums.iter().copied().map(Value::Int).collect())),
+            ),
+        ]);
+        Value::branded_dict(map, Some("Cfg".into()))
+    };
+    assert_four_way(
+        SRC_CFG_NUMS,
+        args1(
+            "items",
+            Value::List(Arc::new(vec![
+                cfg("a", &[123456789]),
+                cfg("", &[]),
+                cfg("\u{4E2D}", &[i64::MIN, 0, i64::MAX, -1]),
+            ])),
+        ),
+    );
+}
+
+// ====================================================================
 // proptest differential — the "shapes you didn't think of" net.
 // Smaller case count than the native three-way: each wasm case shells out
 // to wasm-ld + spins up a wasmtime instance.
@@ -1076,6 +1291,55 @@ proptest! {
             prop_assert_eq!(res.map_err(TestCaseError::fail)?, oracle);
         }
     }
+
+    // F7: random `List<Team>` where each Team carries a nested
+    // `members: List<Person>` object-array field AND a `tags:
+    // List<List<Int>>` nested-list field. Exercises the recursive element
+    // decode and the paste-alignment of an 8-aligned inner-scalar-list
+    // living in a list-record entry's tail (the latent S4 bug F7 fixed).
+    #[test]
+    fn diff_list_team_nested(teams in list_team_strat()) {
+        let oracle = run_tree_walk(SRC_TEAM_NESTED, args1("teams", teams.clone()));
+        if let Some(res) = run_wasm(SRC_TEAM_NESTED, &args1("teams", teams)) {
+            prop_assert_eq!(res.map_err(TestCaseError::fail)?, oracle);
+        }
+    }
+}
+
+const SRC_TEAM_NESTED: &str = "#schema Person { name: String }\n\
+     #schema Team { name: String, members: List<Person>, tags: List<List<Int>> }\n\
+     #main(List<Team> teams) -> List<Team>\nteams";
+
+fn team_value_strat() -> impl Strategy<Value = Value> {
+    (
+        string_strat(),
+        prop::collection::vec(string_strat(), 0..4),
+        prop::collection::vec(prop::collection::vec(int_strat(), 0..3), 0..3),
+    )
+        .prop_map(|(name, members, rows)| {
+            let members = members.into_iter().map(|n| person(&n)).collect::<Vec<_>>();
+            let tags = Value::List(Arc::new(
+                rows.into_iter()
+                    .map(|r| Value::List(Arc::new(r.into_iter().map(Value::Int).collect())))
+                    .collect(),
+            ));
+            let map = std::collections::BTreeMap::from([
+                (
+                    relon_eval_api::smol_str::SmolStr::from("name"),
+                    Value::String(name.into()),
+                ),
+                (
+                    relon_eval_api::smol_str::SmolStr::from("members"),
+                    Value::List(Arc::new(members)),
+                ),
+                (relon_eval_api::smol_str::SmolStr::from("tags"), tags),
+            ]);
+            Value::branded_dict(map, Some("Team".into()))
+        })
+}
+
+fn list_team_strat() -> impl Strategy<Value = Value> {
+    prop::collection::vec(team_value_strat(), 0..5).prop_map(|teams| Value::List(Arc::new(teams)))
 }
 
 // ====================================================================
@@ -1136,23 +1400,19 @@ fn verifier_rejects_out_of_region_root_loudly() {
 /// emit path shares the `relon-ir` lowering with the native backends, so
 /// the decline is symmetric — assert wasm32 emit returns `Err`.
 ///
-/// F5 lifts the doubly-nested pointer-array shapes (`List<List<String>>` /
-/// `List<List<Schema>>`) and F6 lifts the deep nested-schema field chain
-/// to a pointer-array leaf (`o.inner.tags`), so those are NO LONGER here.
-/// The remaining caps are a deep chain whose leaf is a `List<Schema>`
-/// whose element sub-record carries a nested-list field (past the
-/// in-place sub-record reader's S4 decode scope) and `Dict<_,_>` params
-/// (an analyzer dead-end with no buffer-protocol decode path).
+/// F5 lifted the doubly-nested pointer-array shapes, F6 the deep
+/// nested-schema field chain to a pointer-array leaf, and F7 the element
+/// sub-record carrying `List<Schema>` / `List<List>` fields (recursive to
+/// any depth) — so the previously-capped deep-chain-with-nested-list-field
+/// shape is NO LONGER here (it is now four-way bit-equal; see `f7_*`). The
+/// only shape that still declines is the `Dict<_,_>` param — an analyzer
+/// dead-end with no buffer-protocol *input* decode path, not a return-side
+/// cap.
 #[test]
 fn capped_shapes_decline_on_wasm_emit_not_silently() {
     let cap_cases = [
-        // Deep chain whose leaf `List<Cell>` element sub-record carries a
-        // `List<List<Int>>` field — out of the S4 sub-record decode scope.
-        "#schema Cell { rows: List<List<Int>>, k: Int }\n\
-         #schema Inner { cells: List<Cell>, n: Int }\n\
-         #schema Outer { inner: Inner, m: Int }\n\
-         #main(Outer o) -> List<Cell>\no.inner.cells",
-        // Dict param — analyzer dead-end, no input decode path.
+        // Dict param — analyzer dead-end, no input decode path. The only
+        // shape that still declines on the wasm32 emit path.
         "#main(Dict<String, Int> d) -> Int\n1",
     ];
     let dir = std::env::temp_dir();

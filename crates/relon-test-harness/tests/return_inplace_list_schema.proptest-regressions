@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b9258ca7c74b11eb38da2b8c5cfcca19349cf44f3e069da2eb4c5bce6986f373 # shrinks to teams = List([Dict(ValueDict { map: {"members": List([]), "name": String(""), "tags": List([List([Int(0)])])}, brand: Some("Team"), variant_of: None })])

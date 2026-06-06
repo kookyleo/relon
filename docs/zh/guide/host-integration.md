@@ -122,9 +122,12 @@ host-pushed slot：
 >   dict —— 逐字节等价于 tree-walk oracle（含每个子对象每个字段的内容），
 >   wasm 上亦然（同一递归在线性内存上跑）。入参 **字段**
 >   形式的 `List<Schema>`（`#main(W w) -> List<Cfg> = w.items`）在三个后端上
->   **同样支持**（F4，经同一 arena-绝对字段读取）；子记录自身再含
->   嵌套 `List<Schema>` / `List<List<…>>` 字段者仍 cap（超出范围 —— 就地子
->   记录读取器对其响亮 cap）；
+>   **同样支持**（F4，经同一 arena-绝对字段读取）；元素子记录自身再含
+>   嵌套 `List<Schema>` / `List<List<…>>` 字段者（如 `Team { name: String,
+>   members: List<Person>, tags: List<List<Int>> }`）**亦已支持，且递归到
+>   任意深度**（F7）：就地子记录读取器经同一统一 list reader 递归，lowering
+>   准入对元素 schema 的字段类型递归判定，故元素 schema 内的嵌套对象数组与
+>   嵌套列表在任意嵌套深度上都逐字节等价解码；
 > - **深层嵌套 schema 字段链返回**（`#main(Outer o) -> List<String> =
 >   o.inner.tags`，乃至更深的 `o.a.b.tags`），**cranelift、llvm 与已编译
 >   wasm 三个后端均已支持**（F6）。`≥3` 段链，中间各段为嵌套 schema 字段、
@@ -156,10 +159,9 @@ host-pushed slot：
 > 回退；这类形状请改用 tree-walk 解释器）：
 >
 > - `Dict<_, _>` 入参（analyzer 无法给 `d["x"]` 下标定类型；结构化
->   config 请改用 `#schema` 结构体）；
-> - 返回子记录自身再含嵌套 `List<Schema>` / `List<List<…>>` 字段的
->   `List<Schema>`（就地子记录读取器对其更深的指针数组响亮 cap；叶子为此类
->   `List<Schema>` 的深层字段链同样被此 cap 拦下）。
+>   config 请改用 `#schema` 结构体）。这是返回侧唯一仍 decline 的形状 ——
+>   所有嵌套列表 / 对象数组 / 嵌套 schema 返回形状（恒等、入参字段、深层
+>   字段链、对象字段）现已在任意深度上四方支持（F7）。
 >
 >   返回**含该类入参字段的对象** —— 无论对象是**匿名 `Dict`**
 >   （`-> Dict { servers: servers, n: 1 }`）还是**结构体 `#schema`**

@@ -121,6 +121,63 @@ fn ptr_array_elem_for(element: &TypeRepr) -> Option<PtrArrayElem> {
     }
 }
 
+/// The strongest byte alignment any value of declared type `ty` requires
+/// **anywhere in its serialised graph** — fixed area *and* tail records.
+///
+/// The tail-area scalar-list writers
+/// ([`BufferBuilder::append_tail_record_with_inner_alignment`]) place an
+/// `Int` / `Float` payload on an 8-byte boundary, computed in the
+/// authoring buffer's coordinates. When a sub-record / list entry is later
+/// pasted into a parent and its pointers are relocated by adding the paste
+/// base, the payload bytes are **not** moved — so the reader's absolute
+/// `(rec_start + 4).next_multiple_of(8)` recovery only lands on the bytes
+/// the writer wrote when the paste base is itself a multiple of 8. A
+/// record's fixed-area `root_align` does not capture this (the 8-aligned
+/// content lives in the tail), so paste sites must additionally honour the
+/// **deep tail alignment** computed here. Returns 1 when nothing inside
+/// `ty` needs more than byte alignment.
+fn type_graph_align(ty: &TypeRepr) -> usize {
+    match ty {
+        // Inline-fixed scalar / String tail (`[len][utf8]`) — 4 suffices;
+        // the record-prefix `pad_to(4)` already covers them.
+        TypeRepr::Null | TypeRepr::Bool | TypeRepr::Int | TypeRepr::Float | TypeRepr::String => 1,
+        TypeRepr::List { element } => match element.as_ref() {
+            // `List<Int>` / `List<Float>` tail payload sits on an 8-byte
+            // boundary; `List<Bool>` packs at 1.
+            TypeRepr::Int | TypeRepr::Float => 8,
+            TypeRepr::Bool => 1,
+            // String element pointer array — 4-aligned offsets only.
+            TypeRepr::String => 1,
+            // Recurse into the element graph (`List<List<Int>>`,
+            // `List<Schema>`, deeper nests).
+            other => type_graph_align(other),
+        },
+        TypeRepr::Schema { schema } => schema
+            .fields
+            .iter()
+            .map(|f| type_graph_align(&f.ty))
+            .max()
+            .unwrap_or(1),
+        // Composite leaves that never reach the buffer protocol.
+        TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Closure { .. } => 1,
+    }
+}
+
+/// The deepest paste alignment a schema's serialised graph requires:
+/// `max(root_align, deep tail alignment of every field)`. Used at every
+/// sub-record / list-entry paste so an 8-aligned `List<Int|Float>` (or a
+/// nested-list / nested-schema field that transitively carries one) in the
+/// tail lands at an absolute offset where the reader's alignment recovery
+/// is correct after relocation.
+fn schema_paste_align(layout: &OffsetTable, fields: &[Field]) -> usize {
+    let tail = fields
+        .iter()
+        .map(|f| type_graph_align(&f.ty))
+        .max()
+        .unwrap_or(1);
+    layout.root_align.max(tail).max(1)
+}
+
 /// Pre-computed relocation table for a [`BufferBuilder`]'s schema.
 ///
 /// `relocate_pointers` walks pointer-indirect slots when a child buffer
@@ -743,7 +800,11 @@ impl<'a> BufferBuilder<'a> {
             elem_layout,
             elem_schema,
             entry_offsets: Vec::new(),
-            elem_align: elem_layout.root_align.max(1),
+            // Paste each entry at the element schema's deep paste alignment
+            // (not just its fixed-area `root_align`) so an 8-aligned
+            // `List<Int|Float>` payload in the entry's tail lands where the
+            // reader's absolute alignment recovery expects it post-paste.
+            elem_align: schema_paste_align(elem_layout, &elem_schema.fields),
         })
     }
 
@@ -939,7 +1000,23 @@ impl<'a> BufferBuilder<'a> {
             });
         };
         let slot_offset = entry.offset;
-        let child_align = child.layout.root_align.max(tail_alignment).max(1);
+        // Paste at the child's deep paste alignment so an 8-aligned
+        // `List<Int|Float>` (or a nested field transitively carrying one)
+        // in the child's tail lands at an absolute offset where the
+        // reader's alignment recovery is correct after relocation — not
+        // just the child's fixed-area `root_align`.
+        let child_tail_align = child
+            .field_index
+            .iter()
+            .map(|fe| type_graph_align(&fe.ty))
+            .max()
+            .unwrap_or(1);
+        let child_align = child
+            .layout
+            .root_align
+            .max(tail_alignment)
+            .max(child_tail_align)
+            .max(1);
         let (child_bytes, child_reloc) = child.into_parts();
         let mut child_bytes = child_bytes;
         self.pad_to(child_align);
@@ -1204,7 +1281,11 @@ impl<'a> BufferBuilder<'a> {
                         reason: "inner List<Schema> element schema is not layoutable",
                     }
                 })?;
-                let elem_align = sub_layout.root_align.max(1);
+                // Paste each inner schema sub-record at its deep paste
+                // alignment (not just `root_align`) so an 8-aligned
+                // `List<Int|Float>` field in the sub-record's tail lands
+                // where the reader's absolute alignment recovery expects it.
+                let elem_align = schema_paste_align(&sub_layout, &schema.fields);
                 self.pad_to(4);
                 let header_offset = self.bytes.len();
                 self.bytes.extend_from_slice(&(count as u32).to_le_bytes());
