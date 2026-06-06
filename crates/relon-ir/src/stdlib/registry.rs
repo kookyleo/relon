@@ -22,12 +22,13 @@ use super::case_fold::{
     title_locale_string, title_string, upper_locale_string, upper_string,
 };
 use super::defs::{
-    abs_int, concat_string_string, contains_string, glob_match_string, is_empty_string,
-    length_string_to_int, list_bool_length, list_float_filter, list_float_fold, list_float_length,
-    list_float_map, list_float_map_to_int, list_float_map_to_string, list_int_filter,
-    list_int_fold, list_int_length_to_int, list_int_map, list_int_map_to_float,
-    list_int_map_to_string, list_int_max, list_int_sum, list_list_length, list_schema_length,
-    list_string_length, list_string_map, max_int, min_int, starts_with_string, substring_string,
+    abs_float, abs_int, ceil_float_to_int, concat_string_string, contains_string,
+    floor_float_to_int, glob_match_string, is_empty_string, length_string_to_int, list_bool_length,
+    list_float_filter, list_float_fold, list_float_length, list_float_map, list_float_map_to_int,
+    list_float_map_to_string, list_int_filter, list_int_fold, list_int_length_to_int, list_int_map,
+    list_int_map_to_float, list_int_map_to_string, list_int_max, list_int_sum, list_list_length,
+    list_schema_length, list_string_length, list_string_map, max_int, min_int, round_float_to_int,
+    sqrt_float, starts_with_string, substring_string,
 };
 use super::normalization::{
     ccc_lookup_helper, compose_lookup_helper, decomp_lookup_helper, nfc_string, nfd_string,
@@ -229,6 +230,26 @@ pub fn builtin_stdlib() -> &'static [StdlibFunction] {
             list_string_map(),
             list_int_map_to_string(),
             list_float_map_to_string(),
+            // Wave R7: scalar-returning Float math stdlib. Appended at the
+            // tail (indices 47+) so every position-pinned index above stays
+            // put — existing-construct cranelift/llvm bytes are unchanged,
+            // so GENERATOR_VERSION does not move. Each body is a tiny
+            // direct-op stream over the new `Op::F64Unary` / `Op::F64ToI64Sat`
+            // float intrinsics (NOT a libcall), four-way byte-equal with the
+            // tree-walk oracle.
+            //   * `47` — `abs_float(Float) -> Float`  (`f64::abs`).
+            //   * `48` — `floor(Float) -> Int`        (`f64::floor as i64`).
+            //   * `49` — `ceil(Float) -> Int`         (`f64::ceil as i64`).
+            //   * `50` — `round(Float) -> Int`        (`f64::round_ties_even as i64`).
+            //   * `51` — `sqrt(Float) -> Float`       (`f64::sqrt`; NaN on neg).
+            // `pow` stays capped: it needs a `pow` libcall, which has no
+            // native wasm instruction, so four-way byte-equality is not
+            // established here (see the cap note in the scalar-math peephole).
+            abs_float(),
+            floor_float_to_int(),
+            ceil_float_to_int(),
+            round_float_to_int(),
+            sqrt_float(),
         ]
     })
 }

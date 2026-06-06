@@ -915,6 +915,74 @@ pub fn all_cases() -> Vec<CorpusCase> {
             tier: Tier::StdlibList,
             supported_by: TW_CR,
         },
+        // ---- Wave R7: scalar-returning Float math stdlib. `abs` (Float
+        //      overload), `floor` / `ceil` / `round` (Float -> Int via
+        //      saturating `as i64`), `sqrt` (Float, NaN on negatives).
+        //      Each lowers to the new `Op::F64Unary` / `Op::F64ToI64Sat`
+        //      float intrinsics (NOT a libcall) — byte-equal with the
+        //      tree-walk oracle (`f64::abs` / `floor` / `ceil` /
+        //      `round_ties_even` / `sqrt`). These ride `TW_CR`: a scalar
+        //      Float/Int return is established four-way (incl. wasm) in
+        //      `aot_wasm_parity::r7_*`; the bytecode / trace tiers keep
+        //      their Float-scalar exclusion (mirrors the R3b float rows).
+        //      `pow` stays capped — it needs a `pow` libcall with no
+        //      native wasm instruction.
+        CorpusCase {
+            name: "r7_abs_float",
+            source: "#main() -> Float\nabs(0.0 - 5.5)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r7_floor",
+            source: "#main() -> Int\nfloor(3.7)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r7_floor_neg",
+            source: "#main() -> Int\nfloor(0.0 - 3.2)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r7_ceil",
+            source: "#main() -> Int\nceil(3.2)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r7_round_ties_even_down",
+            source: "#main() -> Int\nround(2.5)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r7_round_ties_even_up",
+            source: "#main() -> Int\nround(3.5)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r7_sqrt",
+            source: "#main() -> Float\nsqrt(9.0)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r7_sqrt_int_widen",
+            source: "#main() -> Float\nsqrt(16)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
         // ---- StdlibNormalize: most complex ----
         // Bytecode rejects `String`-typed return; trace const table
         // pre-computes both NFD / NFC payloads.

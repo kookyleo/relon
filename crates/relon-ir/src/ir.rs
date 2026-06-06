@@ -303,6 +303,34 @@ pub struct TaggedOp {
 /// lowering pass guarantees the tag matches the actual operand
 /// types on the virtual stack at emit time; mismatches are caller
 /// bugs and codegen surfaces them via `CodegenError::MixedNumericTypes`.
+/// Wave R7: which unary IEEE-754 float intrinsic [`Op::F64Unary`]
+/// applies. Each variant maps to a native float instruction on every
+/// backend, so the math stdlib bodies stay byte-exact with the
+/// tree-walk oracle (`f64::floor` / `ceil` / `round_ties_even` / `sqrt`
+/// / `abs`) without a libcall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum F64UnaryOp {
+    /// `f64::floor` — round toward negative infinity. cranelift `floor`,
+    /// wasm `f64.floor`, LLVM `llvm.floor.f64`.
+    Floor,
+    /// `f64::ceil` — round toward positive infinity. cranelift `ceil`,
+    /// wasm `f64.ceil`, LLVM `llvm.ceil.f64`.
+    Ceil,
+    /// `f64::round_ties_even` — round to nearest, ties to even (the
+    /// IEEE-754 default rounding the `round` oracle uses, NOT C `round`'s
+    /// ties-away). cranelift `nearest`, wasm `f64.nearest`, LLVM
+    /// `llvm.roundeven.f64`.
+    Nearest,
+    /// `f64::sqrt` — IEEE-754 square root; `NaN` for a negative operand,
+    /// matching the oracle. cranelift `sqrt`, wasm `f64.sqrt`, LLVM
+    /// `llvm.sqrt.f64`.
+    Sqrt,
+    /// `f64::abs` — clear the sign bit (so `abs(-0.0) == 0.0`, `abs(NaN)`
+    /// stays `NaN`). cranelift `fabs`, wasm `f64.abs`, LLVM
+    /// `llvm.fabs.f64`.
+    Abs,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
     /// Push a Bool literal. Stack: `[] -> [Bool]`. Codegen emits
@@ -675,6 +703,25 @@ pub enum Op {
     /// which have no native float remainder — gracefully reject `Op::Mod(F64)`
     /// at codegen.
     ConvertI64ToF64,
+    /// Wave R7: IEEE-754 float→signed-int conversion with saturation.
+    /// Pop one `F64`-typed value, push its `I64`-typed truncation. Stack:
+    /// `[F64] -> [I64]`.
+    ///
+    /// Matches Rust's `f64 as i64` cast (the tree-walk oracle's
+    /// `<f64> as i64`): saturating toward the nearest representable bound
+    /// on overflow, and `0` for `NaN`. Used by the `floor` / `ceil` /
+    /// `round` math bodies, which all return `Int`.
+    ///
+    /// Backend lowering: cranelift `fcvt_to_sint_sat`, wasm
+    /// `i64.trunc_sat_f64_s`, LLVM the `llvm.fptosi.sat.i64.f64`
+    /// saturating intrinsic (NOT the plain `fptosi`, whose out-of-range /
+    /// NaN result is poison).
+    F64ToI64Sat,
+    /// Wave R7: unary IEEE-754 float intrinsic. Pop one `F64`-typed
+    /// value, push the `F64`-typed result. Stack: `[F64] -> [F64]`.
+    /// See [`F64UnaryOp`] for the per-variant intrinsic + oracle
+    /// semantics.
+    F64Unary(F64UnaryOp),
     /// Pop two operands of the tagged type, push the boolean result.
     /// Stack: `[T, T] -> [Bool]`. Lowers to `i64.eq` / `f64.eq` /
     /// `i32.eq` depending on `T`'s wasm slot. `Null == Null` always
@@ -1695,6 +1742,8 @@ impl Op {
             | Op::Mod(_)
             | Op::BitAnd(_)
             | Op::ConvertI64ToF64
+            | Op::F64ToI64Sat
+            | Op::F64Unary(_)
             | Op::Eq(_)
             | Op::Ne(_)
             | Op::Lt(_)

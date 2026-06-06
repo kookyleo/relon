@@ -39,7 +39,7 @@
 
 use ordered_float::OrderedFloat;
 
-use crate::ir::{ClosureCapture, IrType, Op, TaggedOp, TrapKind};
+use crate::ir::{ClosureCapture, F64UnaryOp, IrType, Op, TaggedOp, TrapKind};
 
 /// Backend-dispatch visitor over [`Op`]. Each method matches exactly
 /// one [`Op`] variant; the trait carries no default bodies so adding
@@ -142,6 +142,13 @@ pub trait OpVisitor {
     /// Mirrors the tree-walker's `as_f64()` Int promotion so mixed
     /// `Int`/`Float` arithmetic compiles bit-identically.
     fn visit_convert_i64_to_f64(&mut self) -> Result<Self::Output, Self::Error>;
+    /// Wave R7: saturating float→signed-int conversion (`Op::F64ToI64Sat`).
+    /// Pop one `F64`-typed value, push its `I64`-typed truncation,
+    /// matching Rust's `f64 as i64` (saturating + NaN → 0).
+    fn visit_f64_to_i64_sat(&mut self) -> Result<Self::Output, Self::Error>;
+    /// Wave R7: unary IEEE-754 float intrinsic (`Op::F64Unary`). Pop one
+    /// `F64`-typed value, push the `F64`-typed result.
+    fn visit_f64_unary(&mut self, op: F64UnaryOp) -> Result<Self::Output, Self::Error>;
 
     // Comparison.
     fn visit_eq(&mut self, ty: IrType) -> Result<Self::Output, Self::Error>;
@@ -328,6 +335,8 @@ pub fn walk_op<V: OpVisitor>(op: &Op, visitor: &mut V) -> Result<V::Output, V::E
         Op::Mod(ty) => visitor.visit_mod_(*ty),
         Op::BitAnd(ty) => visitor.visit_bit_and(*ty),
         Op::ConvertI64ToF64 => visitor.visit_convert_i64_to_f64(),
+        Op::F64ToI64Sat => visitor.visit_f64_to_i64_sat(),
+        Op::F64Unary(op) => visitor.visit_f64_unary(*op),
         Op::Eq(ty) => visitor.visit_eq(*ty),
         Op::Ne(ty) => visitor.visit_ne(*ty),
         Op::Lt(ty) => visitor.visit_lt(*ty),
@@ -589,6 +598,16 @@ mod tests {
         fn visit_convert_i64_to_f64(&mut self) -> Result<(), ()> {
             self.calls += 1;
             self.last = "ConvertI64ToF64";
+            Ok(())
+        }
+        fn visit_f64_to_i64_sat(&mut self) -> Result<(), ()> {
+            self.calls += 1;
+            self.last = "F64ToI64Sat";
+            Ok(())
+        }
+        fn visit_f64_unary(&mut self, _: F64UnaryOp) -> Result<(), ()> {
+            self.calls += 1;
+            self.last = "F64Unary";
             Ok(())
         }
         fn visit_eq(&mut self, _: IrType) -> Result<(), ()> {
