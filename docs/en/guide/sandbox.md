@@ -151,7 +151,7 @@ language builtins: Relon has **no** effectful builtins (`clock()`,
 `random()`, `read_file()`, `read_dir()`, `stat()` do not exist). The
 language is a pure function — effectful values are taken by the host and
 fed in as inputs. See
-[the ADR](../../internal/adr-effectful-io-builtins-2026-06-04) and
+[the ADR](https://github.com/kookyleo/relon/blob/main/docs/internal/adr-effectful-io-builtins-2026-06-04.md) and
 [Standard library → No effectful language builtins](./stdlib).
 
 ### `max_steps: Option<u64>`

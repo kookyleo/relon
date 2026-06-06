@@ -136,7 +136,7 @@ change——宿主侧别用穷举式 struct literal 构造，统一通过
 **没有**任何 effectful builtin（`clock()`、`random()`、`read_file()`、
 `read_dir()`、`stat()` 都不存在）。语言是一个纯函数 —— effectful 的值
 由宿主取好、作为 input 喂进来。详见
-[ADR](../../internal/adr-effectful-io-builtins-2026-06-04) 与
+[ADR](https://github.com/kookyleo/relon/blob/main/docs/internal/adr-effectful-io-builtins-2026-06-04.md) 与
 [标准库 → 语言没有 effectful builtin](./stdlib.md)。
 
 ### `max_steps: Option<u64>`
