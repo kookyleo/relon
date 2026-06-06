@@ -461,6 +461,16 @@ const FAST: &[Fast] = &[
         src: "#import list from \"std/list\"\n#main(Int n) -> Int\nlist.sum(range(n))",
         args: &[1000],
     },
+    // Wave R2 — pipe operator. `range(n) | list.sum` is a pure static
+    // desugar of `w1_listsum_range`; the pipe lowering prepends the LHS
+    // as the call's first positional arg, folding into the same FastInt
+    // accumulator loop. Validates the desugar on the LLVM native + wasm
+    // legs against the native oracle.
+    Fast {
+        name: "r2_pipe_range_sum",
+        src: "#import list from \"std/list\"\n#main(Int n) -> Int\nrange(n) | list.sum",
+        args: &[1000],
+    },
     // w2 — map closure (i+1)*(i+2) sum.
     Fast {
         name: "w2_dot",
@@ -623,6 +633,55 @@ fn const_string_return_aligns_native_via_wasmtime() {
     match out.get("value") {
         Some(Decoded::Str(s)) => assert_eq!(*s, want, "const-string wasm != native"),
         other => panic!("const-string decoded {other:?}"),
+    }
+}
+
+/// Wave R2 — f-string with an Int interpolation (`f"n=${n}"`) → String.
+/// Exercises `Op::IntToStr` + `Op::StrConcatN` on the LLVM native and
+/// wasm32 legs, checked byte-exact against the native `run_main` oracle
+/// (itself bit-aligned to tree-walk + cranelift).
+#[test]
+fn fstring_int_interp_aligns_native_via_wasmtime() {
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping f-string int interp");
+        return;
+    }
+    let src = "#main(Int n) -> String\nf\"n=${n}\"";
+    let n = 42i64;
+    let want = match native_run(src, HashMap::from([("n".to_string(), Value::Int(n))])) {
+        Value::String(s) => s,
+        other => panic!("native expected String, got {other:?}"),
+    };
+    let (bytes, info) = build("fstring_int", src);
+    let in_record = pack_single_int(&info, n);
+    let out = run_buffer(&bytes, "relon_parity_fstring_int", &info, &in_record);
+    match out.get("value") {
+        Some(Decoded::Str(s)) => assert_eq!(*s, want, "f-string int wasm != native"),
+        other => panic!("f-string int decoded {other:?}"),
+    }
+}
+
+/// Wave R2 — f-string mixing literal parts and an Int interpolation
+/// (`f"a${n}b${n}c"`) → String. Two `Op::IntToStr` records feeding a
+/// 5-operand `Op::StrConcatN`; the record alignment fix matters here.
+#[test]
+fn fstring_mixed_parts_aligns_native_via_wasmtime() {
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping f-string mixed parts");
+        return;
+    }
+    let src = "#main(Int n) -> String\nf\"a${n}b${n}c\"";
+    let n = 7i64;
+    let want = match native_run(src, HashMap::from([("n".to_string(), Value::Int(n))])) {
+        Value::String(s) => s,
+        other => panic!("native expected String, got {other:?}"),
+    };
+    let (bytes, info) = build("fstring_mixed", src);
+    let in_record = pack_single_int(&info, n);
+    let out = run_buffer(&bytes, "relon_parity_fstring_mixed", &info, &in_record);
+    match out.get("value") {
+        Some(Decoded::Str(s)) => assert_eq!(*s, want, "f-string mixed wasm != native"),
+        other => panic!("f-string mixed decoded {other:?}"),
     }
 }
 

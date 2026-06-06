@@ -29,7 +29,9 @@ use relon_analyzer::tree::AnalyzedTree;
 use relon_analyzer::workspace::WorkspaceTree;
 use relon_eval_api::layout::{FieldKind, OffsetTable, SchemaLayout};
 use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
-use relon_parser::{ClosureParam, Expr, Node, Operator, TokenKey, TokenRange, TypeNode};
+use relon_parser::{
+    ClosureParam, Expr, FStringPart, Node, Operator, TokenKey, TokenRange, TypeNode,
+};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -3296,6 +3298,7 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
             Ok(())
         }
         Expr::Variable(path) => lower_variable(path, range, ctx),
+        Expr::FString(parts) => lower_fstring(parts, range, ctx),
         Expr::Binary(op, lhs, rhs) => lower_binary(*op, lhs, rhs, range, ctx),
         Expr::Ternary { cond, then, els } => lower_ternary(cond, then, els, range, ctx),
         Expr::Where { expr, bindings } => lower_where(expr, bindings, range, ctx),
@@ -5915,10 +5918,178 @@ fn lower_binary(
         ctx.tstack.push(IrType::Bool);
         return Ok(());
     }
+    // Wave R2 — `a | f(...)` pipe operator. A pure static desugar: the
+    // tree-walker (eval.rs `Expr::Binary(Operator::Pipe, ..)`) prepends
+    // the LHS value as the FIRST positional argument of the right-hand
+    // call and dispatches the call. We reproduce that here by building a
+    // synthetic argument list `[positional(lhs), ...rhs_args]` and
+    // routing it through `lower_fn_call`, so `xs | list.sum`
+    // (zero extra args) lowers identically to `list.sum(xs)`, and
+    // `xs | _list_reduce(0, f)` lowers identically to
+    // `_list_reduce(xs, 0, f)`. No new IR op is needed — the desugar is
+    // entirely at the call-shape level, and every downstream peephole
+    // (`list.sum(range(..))`, `_len(_list_filter(..))`, ...) fires
+    // exactly as it would for the spelled-out call. The tree-walker uses
+    // `right.range` for the dispatched call; we mirror that by using the
+    // RHS node's range.
+    if matches!(op, Operator::Pipe) {
+        match rhs.expr.as_ref() {
+            // `a | f(extra...)` ≡ `f(a, extra...)`.
+            Expr::FnCall { path, args } => {
+                let mut piped_args: Vec<relon_parser::CallArg> = Vec::with_capacity(args.len() + 1);
+                piped_args.push(relon_parser::CallArg {
+                    name: None,
+                    value: lhs.clone(),
+                });
+                piped_args.extend(args.iter().cloned());
+                return lower_fn_call(path, &piped_args, rhs.range, ctx);
+            }
+            // `a | path` (bare, no parens) — `path` parses as a
+            // `Variable` naming a function/stdlib entry. The tree-walker
+            // resolves it to a closure value and applies `a` as the sole
+            // argument, which is byte-equal to the zero-extra-arg call
+            // `path(a)`. Route it through the same call lowering.
+            Expr::Variable(path) => {
+                let piped_args = vec![relon_parser::CallArg {
+                    name: None,
+                    value: lhs.clone(),
+                }];
+                return lower_fn_call(path, &piped_args, rhs.range, ctx);
+            }
+            // `a | <closure-literal>` / `a | <other>` — the tree-walker
+            // applies a closure *value* on the RHS. Closures cannot
+            // cross the AOT boundary as first-class values (already
+            // capped as `lower_expr.closure_across_boundary`), so this
+            // residual pipe shape stays capped via the catch-all below.
+            _ => {}
+        }
+    }
     Err(cap!(
         "lower_binary.unsupported_operator.14",
         LoweringError::UnsupportedOperator { op, range }
     ))
+}
+
+/// Wave R2 — lower an f-string `f"...${e}..."` into a single `String`
+/// IR value. Pure static desugar of the tree-walker's `Expr::FString`
+/// arm (eval.rs): the parts are concatenated left-to-right, each
+/// interpolated value coerced to a `String` via the same rendering the
+/// tree-walker uses (`write!(result, "{}", val)`, i.e. `Display`):
+///
+///   * a `String`-typed interpolation is used verbatim,
+///   * an `Int`-typed interpolation is rendered as its base-10 decimal
+///     (`Op::IntToStr`, byte-exact with `i64` `Display`),
+///   * literal parts become `Op::ConstString`.
+///
+/// Each part is reduced to exactly one `String` operand; the operands
+/// are then joined with `Op::StrConcatN { operand_count: parts }` (which
+/// matches the chained `String + String` lowering byte-for-byte). The
+/// 0-part (`f""`) and 1-part degenerate shapes skip the concat. Float /
+/// Bool / other interpolation types are not yet byte-proven and stay
+/// capped via the catch-all `lower_expr.unsupported_expr.8`.
+fn lower_fstring(
+    parts: &[FStringPart],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    // `f""` → the empty string literal (interned like any other).
+    if parts.is_empty() {
+        let idx = ctx.const_intern.borrow_mut().strings.intern("");
+        ctx.out.push(TaggedOp {
+            op: Op::ConstString {
+                idx,
+                value: String::new(),
+            },
+            range,
+        });
+        ctx.tstack.push(IrType::String);
+        return Ok(());
+    }
+    // Emit one `String` operand per part, in source order.
+    for part in parts {
+        lower_fstring_part(part, range, ctx)?;
+    }
+    // Single part: the lone operand is already the result.
+    if parts.len() == 1 {
+        return Ok(());
+    }
+    // Join the N operands with a single concat allocation.
+    let operand_count = parts.len() as u32;
+    // The N String operands were just pushed; collapse their stack tags
+    // into the single String result.
+    for _ in 0..operand_count {
+        ctx.tstack.pop().ok_or(cap!(
+            "lower_expr.unsupported_expr.8",
+            LoweringError::UnsupportedExpr {
+                kind: "FString(operand stack underflow)".to_string(),
+                range,
+            }
+        ))?;
+    }
+    ctx.out.push(TaggedOp {
+        op: Op::StrConcatN { operand_count },
+        range,
+    });
+    ctx.tstack.push(IrType::String);
+    Ok(())
+}
+
+/// Lower one f-string part to exactly one `String` operand on the stack.
+fn lower_fstring_part(
+    part: &FStringPart,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    match part {
+        FStringPart::Literal(s) => {
+            let idx = ctx.const_intern.borrow_mut().strings.intern(s);
+            ctx.out.push(TaggedOp {
+                op: Op::ConstString {
+                    idx,
+                    value: s.clone(),
+                },
+                range,
+            });
+            ctx.tstack.push(IrType::String);
+            Ok(())
+        }
+        FStringPart::Interpolation(node) => {
+            lower_expr(&node.expr, node.range, ctx)?;
+            let ty = ctx.tstack.pop().ok_or(cap!(
+                "lower_expr.unsupported_expr.8",
+                LoweringError::UnsupportedExpr {
+                    kind: "FString(interpolation operand underflow)".to_string(),
+                    range: node.range,
+                }
+            ))?;
+            match ty {
+                IrType::String => {
+                    // Already a String — coercion is identity.
+                    ctx.tstack.push(IrType::String);
+                    Ok(())
+                }
+                IrType::I64 => {
+                    // Int → base-10 decimal, byte-exact with `Display`.
+                    ctx.out.push(TaggedOp {
+                        op: Op::IntToStr,
+                        range: node.range,
+                    });
+                    ctx.tstack.push(IrType::String);
+                    Ok(())
+                }
+                other => Err(cap!(
+                    "lower_expr.unsupported_expr.8",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "FString(interpolation of type {other:?} — only String / Int \
+                             interpolations have a byte-exact AOT coercion)"
+                        ),
+                        range: node.range,
+                    }
+                )),
+            }
+        }
+    }
 }
 
 /// #165 — fold a left-leaning `String + String + ... + String` chain

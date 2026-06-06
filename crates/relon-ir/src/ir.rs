@@ -577,6 +577,21 @@ pub enum Op {
         /// in all cases).
         operand_count: u32,
     },
+    /// Wave R2 (f-string lowering) — convert a signed `I64` value to its
+    /// base-10 decimal `String` record. Stack: `[I64] -> [String]`.
+    ///
+    /// Produced by the f-string desugar for an interpolated `Int`
+    /// (`f"n=${n}"`). The decimal rendering is byte-exact with the
+    /// tree-walker's `write!(result, "{}", Value::Int(i))` — i.e. Rust's
+    /// `i64` `Display`: a leading `-` for negatives, no leading zeros,
+    /// `0` for zero, and `i64::MIN` renders `-9223372036854775808`.
+    ///
+    /// Backends materialise a fresh `[len: u32 LE][utf8 digits]` record
+    /// in the scratch arena (cranelift / LLVM-native / LLVM-wasm share
+    /// the same arena string layout as [`Op::StrConcatN`]). The op is
+    /// self-contained: no external itoa libcall, so the wasm leg needs
+    /// no extra import.
+    IntToStr,
     /// Pop two operands of the tagged type, push their difference.
     Sub(IrType),
     /// Pop two operands of the tagged type, push their product.
@@ -1633,6 +1648,7 @@ impl Op {
             | Op::LetGet { .. }
             | Op::Add(_)
             | Op::StrConcatN { .. }
+            | Op::IntToStr
             | Op::Sub(_)
             | Op::Mul(_)
             | Op::Div(_)

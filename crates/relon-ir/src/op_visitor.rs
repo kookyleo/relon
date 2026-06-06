@@ -128,6 +128,10 @@ pub trait OpVisitor {
     /// fresh arena slot, and cranelift sums the lengths once before
     /// the alloc.
     fn visit_str_concat_n(&mut self, operand_count: u32) -> Result<Self::Output, Self::Error>;
+    /// Wave R2 (f-string lowering) — pop one `I64`, push its base-10
+    /// decimal `String` record. Byte-exact with the tree-walker's
+    /// `Display` rendering of `Value::Int`.
+    fn visit_int_to_str(&mut self) -> Result<Self::Output, Self::Error>;
     fn visit_sub(&mut self, ty: IrType) -> Result<Self::Output, Self::Error>;
     fn visit_mul(&mut self, ty: IrType) -> Result<Self::Output, Self::Error>;
     fn visit_div(&mut self, ty: IrType) -> Result<Self::Output, Self::Error>;
@@ -317,6 +321,7 @@ pub fn walk_op<V: OpVisitor>(op: &Op, visitor: &mut V) -> Result<V::Output, V::E
         Op::ListGetByIntIdx { element_ty } => visitor.visit_list_get_by_int_idx(*element_ty),
         Op::Add(ty) => visitor.visit_add(*ty),
         Op::StrConcatN { operand_count } => visitor.visit_str_concat_n(*operand_count),
+        Op::IntToStr => visitor.visit_int_to_str(),
         Op::Sub(ty) => visitor.visit_sub(*ty),
         Op::Mul(ty) => visitor.visit_mul(*ty),
         Op::Div(ty) => visitor.visit_div(*ty),
@@ -549,6 +554,11 @@ mod tests {
         fn visit_str_concat_n(&mut self, _: u32) -> Result<(), ()> {
             self.calls += 1;
             self.last = "StrConcatN";
+            Ok(())
+        }
+        fn visit_int_to_str(&mut self) -> Result<(), ()> {
+            self.calls += 1;
+            self.last = "IntToStr";
             Ok(())
         }
         fn visit_sub(&mut self, _: IrType) -> Result<(), ()> {
