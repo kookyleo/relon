@@ -154,6 +154,20 @@ fn two_ints(an: &str, av: i64, bn: &str, bv: i64) -> HashMap<String, Value> {
     m
 }
 
+fn args_n_5() -> HashMap<String, Value> {
+    one_int("n", 5)
+}
+
+fn args_n_42() -> HashMap<String, Value> {
+    one_int("n", 42)
+}
+
+fn args_s_world() -> HashMap<String, Value> {
+    let mut m = HashMap::new();
+    m.insert("s".to_string(), Value::String("world".into()));
+    m
+}
+
 // ---- ArithControl ----
 
 fn args_x_40_y_2() -> HashMap<String, Value> {
@@ -528,6 +542,41 @@ pub fn all_cases() -> Vec<CorpusCase> {
             tier: Tier::StdlibMemory,
             supported_by: TW_CR_TJ,
         },
+        // Wave R2 — f-string lowering. A pure static desugar: literal
+        // parts become `Op::ConstString`, interpolations are coerced to
+        // `String` (identity for a String, `Op::IntToStr` for an Int),
+        // and the parts join via `Op::StrConcatN`. These return `String`
+        // (bytecode rejects the shape) and are not in the trace recipe
+        // catalogue, so both claim `TW_CR`. Byte-exactness with the
+        // tree-walker's `Display` coercion is the differential guard.
+        CorpusCase {
+            name: "fstring_string_interp",
+            source: "#main(String s) -> String\nf\"hi ${s}!\"",
+            args_factory: args_s_world,
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "fstring_int_interp",
+            source: "#main(Int n) -> String\nf\"n=${n}\"",
+            args_factory: args_n_42,
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "fstring_int_interp_negative",
+            source: "#main(Int n) -> String\nf\"v=${n}.\"",
+            args_factory: || one_int("n", -7),
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "fstring_mixed_parts",
+            source: "#main(Int n) -> String\nf\"a${n}b${n}c\"",
+            args_factory: args_n_5,
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
         // ---- StdlibCaseFold ----
         // All case-fold entries return `String`, which the bytecode
         // M2-A scaffold rejects; cranelift + tree-walk + the trace
@@ -634,6 +683,19 @@ pub fn all_cases() -> Vec<CorpusCase> {
             name: "stdlib_list_sum_range_empty",
             source: "#import list from \"std/list\"\n#main(Int n) -> Int\nlist.sum(range(n))",
             args_factory: || one_int("n", 0),
+            tier: Tier::StdlibList,
+            supported_by: TW_CR_BC,
+        },
+        // Wave R2 — pipe operator. `range(n) | list.sum` is a pure
+        // static desugar of `list.sum(range(n))`: the lowering prepends
+        // the pipe LHS as the call's first positional arg, so it folds
+        // into the exact same `Op::Loop` accumulator the spelled-out
+        // call above emits. Differential agreement here is the
+        // regression guard for the pipe desugar.
+        CorpusCase {
+            name: "pipe_range_into_list_sum",
+            source: "#import list from \"std/list\"\n#main(Int n) -> Int\nrange(n) | list.sum",
+            args_factory: || one_int("n", 100),
             tier: Tier::StdlibList,
             supported_by: TW_CR_BC,
         },

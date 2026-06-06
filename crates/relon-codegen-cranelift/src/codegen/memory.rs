@@ -386,4 +386,172 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         self.push(base_off);
         Ok(())
     }
+
+    /// Lower `Op::IntToStr` — pop one `I64`, materialise its base-10
+    /// decimal `String` record in the scratch arena, push the record
+    /// offset. Byte-exact with the tree-walker's `i64` `Display`
+    /// rendering: a leading `-` for negatives, no leading zeros, `0`
+    /// for zero, and `i64::MIN` → `-9223372036854775808`.
+    ///
+    /// Strategy (no libc itoa, so the wasm leg needs no import): work on
+    /// the unsigned magnitude (`-i64::MIN` is computed via wrapping
+    /// negation reinterpreted as `u64`, which is the correct magnitude),
+    /// count the decimal digits in a first loop, then fill the record
+    /// payload back-to-front in a second loop and prepend `-` when
+    /// negative. The record is `[len: u32 LE][utf8 digits]`, the same
+    /// layout `Op::StrConcatN` / `Op::ConstString` produce, so the
+    /// result feeds straight into the f-string concat.
+    pub(super) fn emit_int_to_str(&mut self) -> Result<(), CraneliftError> {
+        let v = self.pop()?;
+        let zero64 = self.builder.ins().iconst(I64, 0);
+        let ten64 = self.builder.ins().iconst(I64, 10);
+        let one32 = self.builder.ins().iconst(I32, 1);
+
+        // is_neg = v < 0 (signed).
+        let is_neg = self.builder.ins().icmp(IntCC::SignedLessThan, v, zero64);
+        // mag = is_neg ? (0 - v) : v   — wrapping negate (correct for
+        // i64::MIN); reinterpreted as an unsigned magnitude for the
+        // unsigned div/rem below.
+        let neg_v = self.builder.ins().isub(zero64, v);
+        let mag = self.builder.ins().select(is_neg, neg_v, v);
+        // sign_len = is_neg ? 1 : 0.
+        let zero32 = self.builder.ins().iconst(I32, 0);
+        let sign_len = self.builder.ins().select(is_neg, one32, zero32);
+
+        // Pass 1: count decimal digits of `mag`.
+        //   cnt = 1; t = mag; while t >= 10 { t /= 10; cnt += 1 }
+        let count_hdr = self.builder.create_block();
+        let count_body = self.builder.create_block();
+        let count_done = self.builder.create_block();
+        self.builder.append_block_param(count_hdr, I64); // t
+        self.builder.append_block_param(count_hdr, I32); // cnt
+        self.builder.append_block_param(count_done, I32); // final cnt
+        self.builder
+            .ins()
+            .jump(count_hdr, &[mag.into(), one32.into()]);
+
+        self.builder.switch_to_block(count_hdr);
+        let t_val = self.builder.block_params(count_hdr)[0];
+        let cnt_val = self.builder.block_params(count_hdr)[1];
+        let cont = self
+            .builder
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, t_val, ten64);
+        self.builder
+            .ins()
+            .brif(cont, count_body, &[], count_done, &[cnt_val.into()]);
+
+        self.builder.switch_to_block(count_body);
+        let t_next = self.builder.ins().udiv(t_val, ten64);
+        let cnt_next = self.builder.ins().iadd(cnt_val, one32);
+        self.builder
+            .ins()
+            .jump(count_hdr, &[t_next.into(), cnt_next.into()]);
+        self.builder.seal_block(count_hdr);
+        self.builder.seal_block(count_body);
+
+        self.builder.switch_to_block(count_done);
+        self.builder.seal_block(count_done);
+        let digit_count = self.builder.block_params(count_done)[0];
+        // total_len = digit_count + sign_len   (utf8 byte count).
+        let total_len = self.builder.ins().iadd(digit_count, sign_len);
+        // record_size = total_len + 4 (header), rounded up to a 4-byte
+        // multiple. The scratch bump allocator hands out records back-
+        // to-back, and the buffer-protocol return path aligns a String
+        // payload up to 4 bytes when it copies the record into the out
+        // buffer (`align_up(base + 4, 4)`). If this record left the
+        // scratch cursor unaligned, the NEXT scratch record (e.g. the
+        // `Op::StrConcatN` that joins an f-string's parts) would start
+        // unaligned and the return-side alignment would skip its leading
+        // bytes. Padding the allocation — header still stores the exact
+        // `total_len` — keeps every record 4-aligned. The slack bytes
+        // are never read (the header length bounds every consumer).
+        let four = self.builder.ins().iconst(I32, 4);
+        let raw_size = self.builder.ins().iadd(total_len, four);
+        let three = self.builder.ins().iconst(I32, 3);
+        let neg_four = self.builder.ins().iconst(I32, -4);
+        let bumped = self.builder.ins().iadd(raw_size, three);
+        let record_size = self.builder.ins().band(bumped, neg_four);
+
+        // Allocate the record; pop its arena offset.
+        self.emit_alloc_scratch(record_size)?;
+        let base_off = self.pop()?;
+        // Header: store total_len at base.
+        let base_abs = self.arena_addr(base_off, 4)?;
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), total_len, base_abs, 0);
+
+        // Payload base offset = base_off + 4 + sign_len (digits start
+        // after the optional sign). Write digits back-to-front.
+        let payload_off = self.builder.ins().iadd(base_off, four);
+        let digits_off = self.builder.ins().iadd(payload_off, sign_len);
+        // cursor = digits_off + digit_count (one past the last digit).
+        let end_off = self.builder.ins().iadd(digits_off, digit_count);
+
+        // Pass 2: m = mag; cursor = end_off;
+        //   do { d = m % 10; cursor -= 1; store('0'+d) at cursor; m /= 10 }
+        //   while (m != 0)
+        let write_hdr = self.builder.create_block();
+        let write_done = self.builder.create_block();
+        self.builder.append_block_param(write_hdr, I64); // m
+        self.builder.append_block_param(write_hdr, I32); // cursor
+        self.builder
+            .ins()
+            .jump(write_hdr, &[mag.into(), end_off.into()]);
+
+        self.builder.switch_to_block(write_hdr);
+        let m_val = self.builder.block_params(write_hdr)[0];
+        let cur_val = self.builder.block_params(write_hdr)[1];
+        let rem = self.builder.ins().urem(m_val, ten64);
+        let rem32 = self.builder.ins().ireduce(I32, rem);
+        let ascii0 = self.builder.ins().iconst(I32, b'0' as i64);
+        let ch = self.builder.ins().iadd(rem32, ascii0);
+        let cur_next = self.builder.ins().isub(cur_val, one32);
+        let ch_abs = self.arena_addr(cur_next, 1)?;
+        let ch8 = self
+            .builder
+            .ins()
+            .ireduce(cranelift_codegen::ir::types::I8, ch);
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), ch8, ch_abs, 0);
+        let m_next = self.builder.ins().udiv(m_val, ten64);
+        let more = self.builder.ins().icmp(IntCC::NotEqual, m_next, zero64);
+        self.builder.ins().brif(
+            more,
+            write_hdr,
+            &[m_next.into(), cur_next.into()],
+            write_done,
+            &[],
+        );
+        self.builder.seal_block(write_hdr);
+
+        self.builder.switch_to_block(write_done);
+        self.builder.seal_block(write_done);
+        // Prepend '-' at payload_off when negative (digits_off ==
+        // payload_off + 1 in that case, so the byte slot is free).
+        let minus_done = self.builder.create_block();
+        let minus_body = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(is_neg, minus_body, &[], minus_done, &[]);
+        self.builder.switch_to_block(minus_body);
+        let minus_abs = self.arena_addr(payload_off, 1)?;
+        let minus_ch = self.builder.ins().iconst(I32, b'-' as i64);
+        let minus8 = self
+            .builder
+            .ins()
+            .ireduce(cranelift_codegen::ir::types::I8, minus_ch);
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), minus8, minus_abs, 0);
+        self.builder.ins().jump(minus_done, &[]);
+        self.builder.seal_block(minus_body);
+        self.builder.switch_to_block(minus_done);
+        self.builder.seal_block(minus_done);
+
+        self.push(base_off);
+        Ok(())
+    }
 }

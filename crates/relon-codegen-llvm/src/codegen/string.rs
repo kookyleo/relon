@@ -741,4 +741,238 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         self.module
             .add_function(sym, fn_ty, Some(Linkage::External))
     }
+
+    /// Lower `Op::IntToStr` — pop one `I64`, materialise its base-10
+    /// decimal `String` record in the scratch arena, push the i32
+    /// record offset. Byte-exact with the tree-walker's `i64`
+    /// `Display`: leading `-` for negatives, no leading zeros, `0` for
+    /// zero, `i64::MIN` → `-9223372036854775808`. Mirrors cranelift's
+    /// `emit_int_to_str` instruction-for-instruction (count digits,
+    /// alloc `[len][digits]`, fill back-to-front, prepend sign). No
+    /// libc itoa, so the wasm leg needs no extra import.
+    pub(crate) fn emit_int_to_str(&mut self, ip_hint: &str) -> Result<(), LlvmError> {
+        let i32_t = self.ctx.i32_type();
+        let i64_t = self.ctx.i64_type();
+        let i8_t = self.ctx.i8_type();
+        let v = self.pop_int(ip_hint)?;
+
+        let zero64 = i64_t.const_int(0, false);
+        let ten64 = i64_t.const_int(10, false);
+        let one32 = i32_t.const_int(1, false);
+        let zero32 = i32_t.const_int(0, false);
+        let four = i32_t.const_int(4, false);
+
+        let cg = |e: inkwell::builder::BuilderError, what: &str| {
+            LlvmError::Codegen(format!("IntToStr {what}: {e}"))
+        };
+
+        // is_neg = v < 0 (signed).
+        let is_neg = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, v, zero64, "i2s_isneg")
+            .map_err(|e| cg(e, "isneg"))?;
+        // mag = is_neg ? (0 - v) : v   (wrapping negate; correct for
+        // i64::MIN). Reinterpreted unsigned for udiv/urem.
+        let neg_v = self
+            .builder
+            .build_int_sub(zero64, v, "i2s_negv")
+            .map_err(|e| cg(e, "negv"))?;
+        let mag = self
+            .builder
+            .build_select(is_neg, neg_v, v, "i2s_mag")
+            .map_err(|e| cg(e, "mag"))?
+            .into_int_value();
+        let sign_len = self
+            .builder
+            .build_select(is_neg, one32, zero32, "i2s_signlen")
+            .map_err(|e| cg(e, "signlen"))?
+            .into_int_value();
+
+        // ---- Pass 1: count decimal digits of `mag` ----
+        // cnt = 1; t = mag; while t >= 10 { t /= 10; cnt += 1 }
+        let count_hdr = self.ctx.append_basic_block(self.func, "i2s_count_hdr");
+        let count_body = self.ctx.append_basic_block(self.func, "i2s_count_body");
+        let count_done = self.ctx.append_basic_block(self.func, "i2s_count_done");
+        let pre_bb = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| LlvmError::Codegen("IntToStr: no insert block".into()))?;
+        self.builder
+            .build_unconditional_branch(count_hdr)
+            .map_err(|e| cg(e, "to count_hdr"))?;
+
+        self.builder.position_at_end(count_hdr);
+        let t_phi = self
+            .builder
+            .build_phi(i64_t, "i2s_t")
+            .map_err(|e| cg(e, "t phi"))?;
+        let cnt_phi = self
+            .builder
+            .build_phi(i32_t, "i2s_cnt")
+            .map_err(|e| cg(e, "cnt phi"))?;
+        t_phi.add_incoming(&[(&mag, pre_bb)]);
+        cnt_phi.add_incoming(&[(&one32, pre_bb)]);
+        let t_val = t_phi.as_basic_value().into_int_value();
+        let cnt_val = cnt_phi.as_basic_value().into_int_value();
+        let cont = self
+            .builder
+            .build_int_compare(IntPredicate::UGE, t_val, ten64, "i2s_cont")
+            .map_err(|e| cg(e, "cont"))?;
+        self.builder
+            .build_conditional_branch(cont, count_body, count_done)
+            .map_err(|e| cg(e, "count br"))?;
+
+        self.builder.position_at_end(count_body);
+        let t_next = self
+            .builder
+            .build_int_unsigned_div(t_val, ten64, "i2s_tnext")
+            .map_err(|e| cg(e, "tnext"))?;
+        let cnt_next = self
+            .builder
+            .build_int_add(cnt_val, one32, "i2s_cntnext")
+            .map_err(|e| cg(e, "cntnext"))?;
+        t_phi.add_incoming(&[(&t_next, count_body)]);
+        cnt_phi.add_incoming(&[(&cnt_next, count_body)]);
+        self.builder
+            .build_unconditional_branch(count_hdr)
+            .map_err(|e| cg(e, "count loop back"))?;
+
+        self.builder.position_at_end(count_done);
+        let digit_count = cnt_val;
+        // total_len = digit_count + sign_len.
+        let total_len = self
+            .builder
+            .build_int_add(digit_count, sign_len, "i2s_totallen")
+            .map_err(|e| cg(e, "totallen"))?;
+        // record_size = (total_len + 4) rounded up to a 4-byte multiple
+        // so the scratch cursor stays 4-aligned for the next record
+        // (the return path aligns a String payload up to 4 bytes). See
+        // the cranelift `emit_int_to_str` for the full rationale. The
+        // header still stores the exact `total_len`.
+        let raw_size = self
+            .builder
+            .build_int_add(total_len, four, "i2s_rawsize")
+            .map_err(|e| cg(e, "rawsize"))?;
+        let three = i32_t.const_int(3, false);
+        let neg_four = i32_t.const_int((-4i64) as u64, false);
+        let bumped = self
+            .builder
+            .build_int_add(raw_size, three, "i2s_bumped")
+            .map_err(|e| cg(e, "bumped"))?;
+        let record_size = self
+            .builder
+            .build_and(bumped, neg_four, "i2s_recsize")
+            .map_err(|e| cg(e, "recsize"))?;
+
+        // Allocate the record; pop its arena offset.
+        self.emit_alloc_scratch_common(record_size)?;
+        let base_off = self.pop_int(ip_hint)?;
+        // Header: store total_len at base.
+        let base_abs = self.arena_addr_i32(base_off)?;
+        self.builder
+            .build_store(base_abs, total_len)
+            .map_err(|e| cg(e, "header store"))?;
+
+        // payload_off = base_off + 4; digits_off = payload_off + sign_len;
+        // end_off = digits_off + digit_count (one past last digit).
+        let payload_off = self
+            .builder
+            .build_int_add(base_off, four, "i2s_payoff")
+            .map_err(|e| cg(e, "payoff"))?;
+        let digits_off = self
+            .builder
+            .build_int_add(payload_off, sign_len, "i2s_digoff")
+            .map_err(|e| cg(e, "digoff"))?;
+        let end_off = self
+            .builder
+            .build_int_add(digits_off, digit_count, "i2s_endoff")
+            .map_err(|e| cg(e, "endoff"))?;
+
+        // ---- Pass 2: fill digits back-to-front ----
+        // m = mag; cursor = end_off;
+        // do { d = m % 10; cursor -= 1; store '0'+d at cursor; m /= 10 }
+        // while m != 0
+        let write_hdr = self.ctx.append_basic_block(self.func, "i2s_write_hdr");
+        let write_done = self.ctx.append_basic_block(self.func, "i2s_write_done");
+        let write_pre = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| LlvmError::Codegen("IntToStr: no write-pre block".into()))?;
+        self.builder
+            .build_unconditional_branch(write_hdr)
+            .map_err(|e| cg(e, "to write_hdr"))?;
+
+        self.builder.position_at_end(write_hdr);
+        let m_phi = self
+            .builder
+            .build_phi(i64_t, "i2s_m")
+            .map_err(|e| cg(e, "m phi"))?;
+        let cur_phi = self
+            .builder
+            .build_phi(i32_t, "i2s_cur")
+            .map_err(|e| cg(e, "cur phi"))?;
+        m_phi.add_incoming(&[(&mag, write_pre)]);
+        cur_phi.add_incoming(&[(&end_off, write_pre)]);
+        let m_val = m_phi.as_basic_value().into_int_value();
+        let cur_val = cur_phi.as_basic_value().into_int_value();
+        let rem = self
+            .builder
+            .build_int_unsigned_rem(m_val, ten64, "i2s_rem")
+            .map_err(|e| cg(e, "rem"))?;
+        let rem32 = self
+            .builder
+            .build_int_truncate(rem, i32_t, "i2s_rem32")
+            .map_err(|e| cg(e, "rem32"))?;
+        let ascii0 = i32_t.const_int(u64::from(b'0'), false);
+        let ch = self
+            .builder
+            .build_int_add(rem32, ascii0, "i2s_ch")
+            .map_err(|e| cg(e, "ch"))?;
+        let ch8 = self
+            .builder
+            .build_int_truncate(ch, i8_t, "i2s_ch8")
+            .map_err(|e| cg(e, "ch8"))?;
+        let cur_next = self
+            .builder
+            .build_int_sub(cur_val, one32, "i2s_curnext")
+            .map_err(|e| cg(e, "curnext"))?;
+        let ch_abs = self.arena_addr_i32(cur_next)?;
+        self.builder
+            .build_store(ch_abs, ch8)
+            .map_err(|e| cg(e, "digit store"))?;
+        let m_next = self
+            .builder
+            .build_int_unsigned_div(m_val, ten64, "i2s_mnext")
+            .map_err(|e| cg(e, "mnext"))?;
+        let more = self
+            .builder
+            .build_int_compare(IntPredicate::NE, m_next, zero64, "i2s_more")
+            .map_err(|e| cg(e, "more"))?;
+        m_phi.add_incoming(&[(&m_next, write_hdr)]);
+        cur_phi.add_incoming(&[(&cur_next, write_hdr)]);
+        self.builder
+            .build_conditional_branch(more, write_hdr, write_done)
+            .map_err(|e| cg(e, "write br"))?;
+
+        self.builder.position_at_end(write_done);
+        // Prepend '-' at payload_off when negative.
+        let minus_body = self.ctx.append_basic_block(self.func, "i2s_minus_body");
+        let minus_done = self.ctx.append_basic_block(self.func, "i2s_minus_done");
+        self.builder
+            .build_conditional_branch(is_neg, minus_body, minus_done)
+            .map_err(|e| cg(e, "minus br"))?;
+        self.builder.position_at_end(minus_body);
+        let minus_abs = self.arena_addr_i32(payload_off)?;
+        let minus8 = i8_t.const_int(u64::from(b'-'), false);
+        self.builder
+            .build_store(minus_abs, minus8)
+            .map_err(|e| cg(e, "minus store"))?;
+        self.builder
+            .build_unconditional_branch(minus_done)
+            .map_err(|e| cg(e, "minus to done"))?;
+        self.builder.position_at_end(minus_done);
+
+        self.push(base_off, IrType::String);
+        Ok(())
+    }
 }
