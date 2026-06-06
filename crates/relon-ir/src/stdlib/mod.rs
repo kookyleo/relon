@@ -311,15 +311,22 @@ mod glob_match_index_tests {
     }
 
     /// The bundled stdlib count. `glob_match` (37) and `contains` (36)
-    /// keep their pinned slots; `list_list_length` was appended at the
-    /// tail (index 38) so the nested-`List<List<…>>.length()` shape has
-    /// a body without shifting any position-pinned index. Pinning the
-    /// count catches accidental double-registrations.
+    /// keep their pinned slots; `list_list_length` was appended at index
+    /// 38. Wave R3b appended the typed `List<Float>` / cross-type HOF
+    /// bodies at indices 39..43, all at the tail so every position-pinned
+    /// index above stays put. Pinning the count catches accidental
+    /// double-registrations.
     #[test]
-    fn bundle_has_39_entries() {
-        assert_eq!(stdlib_function_count(), 39);
+    fn bundle_has_44_entries() {
+        assert_eq!(stdlib_function_count(), 44);
         assert_eq!(stdlib_function_index("glob_match"), Some(37));
         assert_eq!(stdlib_function_index("list_list_length"), Some(38));
+        // Wave R3b tail appends (order-pinned wire format).
+        assert_eq!(stdlib_function_index("list_float_map"), Some(39));
+        assert_eq!(stdlib_function_index("list_float_filter"), Some(40));
+        assert_eq!(stdlib_function_index("list_float_fold"), Some(41));
+        assert_eq!(stdlib_function_index("list_int_map_to_float"), Some(42));
+        assert_eq!(stdlib_function_index("list_float_map_to_int"), Some(43));
     }
 }
 

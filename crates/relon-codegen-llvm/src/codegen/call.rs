@@ -840,7 +840,13 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         // the caller-side load below pushes the value back on the
         // virtual stack.
         let ret_llvm_ty: inkwell::types::BasicTypeEnum<'ctx> = match ret_ty {
-            IrType::I64 => self.ctx.i64_type().into(),
+            // AOT-1: F64 rides as i64 bits on the operand stack, so its
+            // inline-frame ret slot is i64-wide (same as I64). The
+            // callee's `Op::Return` stores the raw bit pattern via
+            // `coerce_to_let_ty`; the caller-side load reads i64 bits and
+            // re-tags the pushed value `F64`. Used by the Wave R3b
+            // `list_float_fold` (`-> Float`) bundled body.
+            IrType::I64 | IrType::F64 => self.ctx.i64_type().into(),
             IrType::I32
             | IrType::Bool
             | IrType::Null
