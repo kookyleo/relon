@@ -712,6 +712,138 @@ fn const_list_int_return_aligns_native_via_wasmtime() {
     }
 }
 
+/// Wave R3 helper: build a `#main(Int n) -> List<Int>` source, take the
+/// native LLVM `run_main` as the oracle (itself bit-aligned to the
+/// tree-walk and cranelift backends), then assert the wasm32 leg decodes
+/// byte-equal. When
+/// `wasm-ld` is unavailable the wasm leg is a recorded skip, but the
+/// native LLVM compile + run still executes so the LLVM-native lowering
+/// of the construct is proven on every invocation.
+fn r3_list_parity(test_name: &str, entry: &str, src: &str, n: i64) {
+    let want = match native_run(src, HashMap::from([("n".to_string(), Value::Int(n))])) {
+        Value::List(items) => items
+            .iter()
+            .map(|v| match v {
+                Value::Int(i) => *i,
+                other => panic!("[{test_name}] non-int list element {other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        other => panic!("[{test_name}] native expected List, got {other:?}"),
+    };
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping {test_name} wasm leg");
+        return;
+    }
+    let (bytes, info) = build(test_name, src);
+    assert!(matches!(
+        info.shape,
+        relon_codegen_llvm::EmittedEntryShape::Buffer
+    ));
+    let in_record = pack_single_int(&info, n);
+    let out = run_buffer(&bytes, entry, &info, &in_record);
+    match out.get("value") {
+        Some(Decoded::ListInt(v)) => assert_eq!(*v, want, "[{test_name}] wasm List<Int> != native"),
+        other => panic!("[{test_name}] decoded {other:?}"),
+    }
+}
+
+/// Wave R3 — `range(n)` as a materialised `List<Int>` value.
+#[test]
+fn r3_range_value_aligns_native_via_wasmtime() {
+    r3_list_parity(
+        "r3_range_value",
+        "relon_parity_r3_range_value",
+        "#main(Int n) -> List<Int>\nrange(n)",
+        5,
+    );
+}
+
+/// Wave R3 — `range(n).map((x) => x*x)` (general map closure → List<Int>).
+#[test]
+fn r3_range_map_aligns_native_via_wasmtime() {
+    r3_list_parity(
+        "r3_range_map",
+        "relon_parity_r3_range_map",
+        "#main(Int n) -> List<Int>\nrange(n).map((Int x) => x * x)",
+        5,
+    );
+}
+
+/// Wave R3 — `range(n).filter((x) => x > 1)` (general filter predicate).
+#[test]
+fn r3_range_filter_aligns_native_via_wasmtime() {
+    r3_list_parity(
+        "r3_range_filter",
+        "relon_parity_r3_range_filter",
+        "#main(Int n) -> List<Int>\nrange(n).filter((Int x) => x > 1)",
+        5,
+    );
+}
+
+/// Wave R3 — `_list_map(range(n), f)` free-function intrinsic form.
+#[test]
+fn r3_list_map_free_aligns_native_via_wasmtime() {
+    r3_list_parity(
+        "r3_list_map_free",
+        "relon_parity_r3_list_map_free",
+        "#main(Int n) -> List<Int>\n_list_map(range(n), (Int x) => x + 100)",
+        4,
+    );
+}
+
+/// Wave R3 — comprehension `[x*2 for x in range(n)]` desugared onto map.
+#[test]
+fn r3_comprehension_aligns_native_via_wasmtime() {
+    r3_list_parity(
+        "r3_comprehension",
+        "relon_parity_r3_comprehension",
+        "#main(Int n) -> List<Int>\n[x * 2 for x in range(n)]",
+        4,
+    );
+}
+
+/// Wave R3 — comprehension with a guard `[x*10 for x in range(n) if x>1]`
+/// desugared onto filter-then-map.
+#[test]
+fn r3_comprehension_if_aligns_native_via_wasmtime() {
+    r3_list_parity(
+        "r3_comprehension_if",
+        "relon_parity_r3_comprehension_if",
+        "#main(Int n) -> List<Int>\n[x * 10 for x in range(n) if x > 1]",
+        5,
+    );
+}
+
+/// Wave R3 — `_list_reduce(range(n), 0, (a, x) => a + x)` (fold to Int).
+/// Returns a scalar `Int`, so the wasm leg decodes the fixed-area `value`
+/// field directly.
+#[test]
+fn r3_list_reduce_free_aligns_native_via_wasmtime() {
+    let src = "#import list from \"std/list\"\n#main(Int n) -> Int\n\
+               _list_reduce(range(n), 0, (Int a, Int x) => a + x)";
+    let n = 5i64;
+    let want = match native_run(src, HashMap::from([("n".to_string(), Value::Int(n))])) {
+        Value::Int(i) => i,
+        other => panic!("[r3_list_reduce_free] native expected Int, got {other:?}"),
+    };
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping r3_list_reduce_free wasm leg");
+        return;
+    }
+    let (bytes, info) = build("r3_list_reduce_free", src);
+    let in_record = pack_single_int(&info, n);
+    let out = run_buffer(
+        &bytes,
+        "relon_parity_r3_list_reduce_free",
+        &info,
+        &in_record,
+    );
+    match out.get("value") {
+        Some(Decoded::Int(v)) => assert_eq!(*v, want, "[r3_list_reduce_free] wasm Int != native"),
+        other => panic!("[r3_list_reduce_free] decoded {other:?}"),
+    }
+}
+
 /// z4_dict_return — multi-field Int Dict return through the fixed-area
 /// buffer protocol (`#main(Int a, Int b) -> Dict { x: a+b, y: a*b }`).
 #[test]

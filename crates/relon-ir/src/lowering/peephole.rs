@@ -1632,6 +1632,297 @@ pub(super) fn try_lower_list_filter(
     Ok(Some(()))
 }
 
+/// Wave R3 shared emitter for the single-closure list HOFs
+/// (`list_int_map` / `list_int_filter`): speculatively lower `args[0]`
+/// (the list source) into a scratch op stream, roll back on a non-list
+/// result so dispatch can fall through, then lower the closure arg
+/// (`args[1]`) against the matching stdlib signature and emit
+/// `Op::Call(<builtin>)`. Leaves the callee's `List<Int>` return handle
+/// on the vstack.
+///
+/// The roll-back discipline (out / tstack / next_let_idx / lambda_table
+/// truncation) is identical to [`try_lower_list_filter`]'s so a source
+/// that doesn't lower to a list leaves the ctx pristine for the regular
+/// dispatch path.
+fn emit_list_int_hof_call(
+    builtin: &'static str,
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    let saved_out = std::mem::take(&mut ctx.out);
+    let saved_stack = std::mem::take(&mut ctx.tstack);
+    let saved_next_let = ctx.next_let_idx;
+    let saved_lambda_len = ctx.lambda_table.borrow().len();
+    let lower_res = lower_expr(&args[0].value.expr, args[0].value.range, ctx);
+    let produced = ctx.tstack.last().copied();
+    if lower_res.is_err() || produced != Some(IrType::ListInt) {
+        ctx.out = saved_out;
+        ctx.tstack = saved_stack;
+        ctx.next_let_idx = saved_next_let;
+        ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+        return Ok(None);
+    }
+    let arg_stream = std::mem::replace(&mut ctx.out, saved_out);
+    ctx.out.extend(arg_stream);
+    let arg_stack = std::mem::replace(&mut ctx.tstack, saved_stack);
+    ctx.tstack.extend(arg_stack);
+
+    let fn_idx = stdlib_function_index(builtin).ok_or_else(|| {
+        cap!(
+            "emit_list_int_hof_call.unknown_stdlib_method.1",
+            LoweringError::UnknownStdlibMethod {
+                name: builtin.to_string(),
+                arity: 2,
+                range,
+            }
+        )
+    })?;
+    let meta = builtin_stdlib().get(fn_idx as usize).ok_or_else(|| {
+        cap!(
+            "emit_list_int_hof_call.unknown_stdlib_method.2",
+            LoweringError::UnknownStdlibMethod {
+                name: builtin.to_string(),
+                arity: 2,
+                range,
+            }
+        )
+    })?;
+    let params = meta.params.clone();
+    let ret = meta.ret;
+
+    let (param_tys_c, ret_ty_c) = stdlib_closure_arg_signature(builtin, 1).ok_or_else(|| {
+        cap!(
+            "emit_list_int_hof_call.unsupported_expr",
+            LoweringError::UnsupportedExpr {
+                kind: format!("{builtin} closure signature missing"),
+                range,
+            }
+        )
+    })?;
+    lower_closure_as_value(
+        &args[1].value.expr,
+        args[1].value.range,
+        &param_tys_c,
+        ret_ty_c,
+        ctx,
+    )?;
+    ctx.tstack.pop(); // closure
+    ctx.tstack.pop(); // source list handle
+    ctx.out.push(TaggedOp {
+        op: Op::Call {
+            fn_index: fn_idx,
+            arg_count: 2,
+            param_tys: params,
+            ret_ty: ret,
+        },
+        range,
+    });
+    ctx.tstack.push(ret);
+    Ok(Some(()))
+}
+
+/// Wave R3 emitter for `_list_reduce(xs, init, f)` /
+/// `xs.reduce(init, f)`: speculatively lower the list source (`args[0]`),
+/// roll back on a non-list result, lower the `Int` init (`args[1]`) and
+/// the `(I64, I64) -> I64` fold closure (`args[2]`), then emit
+/// `Op::Call(list_int_fold)` (return `Int`).
+fn emit_list_int_fold_call(
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    let saved_out = std::mem::take(&mut ctx.out);
+    let saved_stack = std::mem::take(&mut ctx.tstack);
+    let saved_next_let = ctx.next_let_idx;
+    let saved_lambda_len = ctx.lambda_table.borrow().len();
+    let lower_res = lower_expr(&args[0].value.expr, args[0].value.range, ctx);
+    let produced = ctx.tstack.last().copied();
+    if lower_res.is_err() || produced != Some(IrType::ListInt) {
+        ctx.out = saved_out;
+        ctx.tstack = saved_stack;
+        ctx.next_let_idx = saved_next_let;
+        ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+        return Ok(None);
+    }
+    let arg_stream = std::mem::replace(&mut ctx.out, saved_out);
+    ctx.out.extend(arg_stream);
+    let arg_stack = std::mem::replace(&mut ctx.tstack, saved_stack);
+    ctx.tstack.extend(arg_stack);
+
+    let fn_idx = stdlib_function_index("list_int_fold").ok_or_else(|| {
+        cap!(
+            "emit_list_int_fold_call.unknown_stdlib_method.1",
+            LoweringError::UnknownStdlibMethod {
+                name: "list_int_fold".to_string(),
+                arity: 3,
+                range,
+            }
+        )
+    })?;
+    let meta = builtin_stdlib().get(fn_idx as usize).ok_or_else(|| {
+        cap!(
+            "emit_list_int_fold_call.unknown_stdlib_method.2",
+            LoweringError::UnknownStdlibMethod {
+                name: "list_int_fold".to_string(),
+                arity: 3,
+                range,
+            }
+        )
+    })?;
+    let params = meta.params.clone();
+    let ret = meta.ret;
+
+    // init (arg 1) must be Int (I64).
+    lower_expr(&args[1].value.expr, args[1].value.range, ctx)?;
+    let init_ty = ctx.tstack.last().copied();
+    if init_ty != Some(IrType::I64) {
+        return Err(cap!(
+            "emit_list_int_fold_call.unsupported_expr.1",
+            LoweringError::UnsupportedExpr {
+                kind: format!("_list_reduce(init) must be Int, got {:?}", init_ty),
+                range: args[1].value.range,
+            }
+        ));
+    }
+
+    // fold closure (arg 2): (I64, I64) -> I64.
+    let (param_tys_c, ret_ty_c) =
+        stdlib_closure_arg_signature("list_int_fold", 2).ok_or_else(|| {
+            cap!(
+                "emit_list_int_fold_call.unsupported_expr.2",
+                LoweringError::UnsupportedExpr {
+                    kind: "list_int_fold closure signature missing".to_string(),
+                    range,
+                }
+            )
+        })?;
+    lower_closure_as_value(
+        &args[2].value.expr,
+        args[2].value.range,
+        &param_tys_c,
+        ret_ty_c,
+        ctx,
+    )?;
+    ctx.tstack.pop(); // closure
+    ctx.tstack.pop(); // init
+    ctx.tstack.pop(); // source list handle
+    ctx.out.push(TaggedOp {
+        op: Op::Call {
+            fn_index: fn_idx,
+            arg_count: 3,
+            param_tys: params,
+            ret_ty: ret,
+        },
+        range,
+    });
+    ctx.tstack.push(ret);
+    Ok(Some(()))
+}
+
+/// Wave R3: general `range(a, b)` / `range(b)` as a materialised
+/// `List<Int>` *value* (not folded inside an eliding `list.sum` /
+/// `_len` consumer). Fires only on a bare `range(...)` free-call — any
+/// trailing `.map(...)` / `.filter(...)` is owned by the chain
+/// consumers above (which run first) or, for the list-producing value
+/// forms, by `try_lower_list_map` / `try_lower_list_filter` whose
+/// speculative source lowering re-enters this peephole for the inner
+/// `range(...)`.
+///
+/// Reuses [`emit_range_materialize`] (the AOT-4 W18 slice's runtime
+/// range record builder): `[len: u32 LE][pad][i64 elements...]`,
+/// payload at `(base + 11) & -8`, with the `start >= end -> []` clamp
+/// the tree-walker `range` applies. The result is a real `List<Int>`
+/// handle so `range(n)` can be returned, indexed, summed, or piped into
+/// `.map` / `.filter` / `reduce`. Returns `Ok(Some(()))` on a match,
+/// `Ok(None)` otherwise.
+pub(super) fn try_lower_range_value(
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    // Bare `range(...)` head: single path segment `range`, 1 or 2
+    // positional args (start defaults to 0), no keyword form. Mirrors
+    // `match_bare_range` without constructing a temporary `Expr`.
+    if path.len() != 1 || !matches!(&path[0], TokenKey::String(s, _, _) if s == "range") {
+        return Ok(None);
+    }
+    if args.is_empty() || args.len() > 2 || args.iter().any(|a| a.name.is_some()) {
+        return Ok(None);
+    }
+    emit_range_materialize(args, range, ctx)?;
+    Ok(Some(()))
+}
+
+/// Wave R3: general `_list_map(xs, (x) => <body>)` over an arbitrary
+/// `List<Int>`-typed first argument. Mirror of [`try_lower_list_filter`]
+/// — speculatively lowers the list source (so a bare `range(...)`, a
+/// where-bound list, a `#main` `List<Int>` param, or a nested
+/// `_list_map` / `_list_filter` result all flow through), commits only
+/// when it produced an `IrType::ListInt` handle, then lowers the
+/// transform closure (`(I64) -> I64`) and emits
+/// `Op::Call(list_int_map)`, leaving a fresh `List<Int>` handle.
+///
+/// The bundled `list_int_map` body dispatches the closure per element
+/// via `Op::CallClosure` (the proven four-way closure substrate), so the
+/// emitted code applies the same per-element transform in source order —
+/// byte-identical to the tree-walk `ListMap` (`results.push(f(item))`).
+pub(super) fn try_lower_list_map(
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    if path.len() != 1 || args.len() != 2 || args.iter().any(|a| a.name.is_some()) {
+        return Ok(None);
+    }
+    if !matches!(&path[0], TokenKey::String(s, _, _) if s == "_list_map") {
+        return Ok(None);
+    }
+    let Expr::Closure { params, .. } = &*args[1].value.expr else {
+        return Ok(None);
+    };
+    if params.len() != 1 {
+        return Ok(None);
+    }
+    emit_list_int_hof_call("list_int_map", args, range, ctx)
+}
+
+/// Wave R3: general `_list_reduce(xs, <init>, (acc, x) => <body>)` over
+/// an arbitrary `List<Int>`-typed first argument, folding to an `Int`
+/// accumulator. Speculatively lowers the list source (same composition
+/// envelope as [`try_lower_list_map`] / [`try_lower_list_filter`]),
+/// commits only when it produced an `IrType::ListInt` handle, lowers the
+/// `Int` init expression and the `(I64, I64) -> I64` fold closure, then
+/// emits `Op::Call(list_int_fold)`.
+///
+/// `list_int_fold`'s body matches the tree-walk `ListReduce` exactly:
+/// `acc = init`, then `acc = f(acc, item)` per element in source order,
+/// returning `acc`. The fold body lowers normally, so a `+` inside it
+/// stays a CHECKED i64 add that traps `NumericOverflow` identically to
+/// the tree-walker.
+pub(super) fn try_lower_list_reduce(
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    if path.len() != 1 || args.len() != 3 || args.iter().any(|a| a.name.is_some()) {
+        return Ok(None);
+    }
+    if !matches!(&path[0], TokenKey::String(s, _, _) if s == "_list_reduce") {
+        return Ok(None);
+    }
+    let Expr::Closure { params, .. } = &*args[2].value.expr else {
+        return Ok(None);
+    };
+    if params.len() != 2 {
+        return Ok(None);
+    }
+    emit_list_int_fold_call(args, range, ctx)
+}
+
 /// AOT-4 (W16 slice): general `list.sum(xs)` over an arbitrary
 /// `List<Int>`-typed argument (vs the `list.sum(range(...))` eliding
 /// peephole, which folds a raw range without materialising). Lowers the

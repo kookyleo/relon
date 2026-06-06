@@ -699,6 +699,90 @@ pub fn all_cases() -> Vec<CorpusCase> {
             tier: Tier::StdlibList,
             supported_by: TW_CR_BC,
         },
+        // ---- Wave R3: general list-building higher-order ops ----
+        // `range(n)` as a materialised List<Int> value (not folded inside
+        // an eliding consumer), general `.map`/`.filter`/`reduce` and the
+        // `_list_map`/`_list_filter`/`_list_reduce` free-function forms,
+        // plus comprehension desugared onto the same machinery. The
+        // cranelift backend lowers these via `emit_range_materialize`
+        // (range value) and the bundled `list_int_map`/`filter`/`fold`
+        // bodies (closure dispatched through the proven `Op::CallClosure`
+        // substrate). Differential agreement vs the tree-walk oracle is
+        // the regression guard. List-returning shapes use `TW_CR` (the
+        // bytecode VM rejects List<Int> return entry shapes and these
+        // `range`-based shapes aren't in the trace recipe catalogue);
+        // `_list_reduce` returns Int and rides `TW_CR` for the same
+        // range-recipe reason.
+        CorpusCase {
+            name: "r3_range_value",
+            source: "#main(Int n) -> List<Int>\nrange(n)",
+            args_factory: || one_int("n", 5),
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r3_range_value_empty",
+            source: "#main(Int n) -> List<Int>\nrange(n)",
+            args_factory: || one_int("n", 0),
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r3_range_map",
+            source: "#main(Int n) -> List<Int>\nrange(n).map((Int x) => x * x)",
+            args_factory: || one_int("n", 5),
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r3_range_filter",
+            source: "#main(Int n) -> List<Int>\nrange(n).filter((Int x) => x > 1)",
+            args_factory: || one_int("n", 5),
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r3_range_filter_empty",
+            source: "#main(Int n) -> List<Int>\nrange(n).filter((Int x) => x > 100)",
+            args_factory: || one_int("n", 5),
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r3_list_map_free",
+            source: "#main(Int n) -> List<Int>\n_list_map(range(n), (Int x) => x + 100)",
+            args_factory: || one_int("n", 4),
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r3_list_filter_free",
+            source: "#main(Int n) -> List<Int>\n_list_filter(range(n), (Int x) => x % 2 == 0)",
+            args_factory: || one_int("n", 6),
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r3_list_reduce_free",
+            source: "#import list from \"std/list\"\n#main(Int n) -> Int\n_list_reduce(range(n), 0, (Int a, Int x) => a + x)",
+            args_factory: || one_int("n", 5),
+            tier: Tier::StdlibList,
+            supported_by: TW_CR_BC,
+        },
+        CorpusCase {
+            name: "r3_comprehension",
+            source: "#main(Int n) -> List<Int>\n[x * 2 for x in range(n)]",
+            args_factory: || one_int("n", 4),
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r3_comprehension_if",
+            source: "#main(Int n) -> List<Int>\n[x * 10 for x in range(n) if x > 1]",
+            args_factory: || one_int("n", 5),
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
         // ---- StdlibNormalize: most complex ----
         // Bytecode rejects `String`-typed return; trace const table
         // pre-computes both NFD / NFC payloads.
