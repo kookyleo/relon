@@ -2574,3 +2574,261 @@ pub(super) fn list_float_fold() -> StdlibFunction {
         || list_fold_body_typed(|o| Op::LoadF64AtAbsolute { offset: o }, IrType::F64),
     )
 }
+
+/// Wave R3c shared body for the String-result `map` family
+/// (`list_string_map`, `list_int_map_to_string`,
+/// `list_float_map_to_string`). The result is a `List<String>` value:
+/// a pointer-array record `[count: u32][off_0: u32]…[off_{n-1}: u32]`
+/// whose `off_i` are arena-relative offsets to per-element String
+/// records (`[len: u32][utf8]`). This matches the `write_list_string`
+/// layout the return ABI / verifier walk byte-for-byte (4-byte slots,
+/// 4-aligned header), so a result built here is decoded identically by
+/// `read_list_string_at`.
+///
+/// Why no relocation is needed: every per-element String handle the
+/// closure returns is **already** an arena-relative offset (a const-pool
+/// literal, a scratch-built `StrConcatN` / `IntToStr` result — all in the
+/// same flat arena), and the result header lives in scratch. The slots we
+/// store are therefore arena-absolute as-is — exactly the single global
+/// arena-relative pointer convention the verifier asserts. There is no
+/// child-buffer paste, so the "single-delta relocation" the host-side
+/// `BufferBuilder` performs at parameter-marshal time does not apply here.
+///
+/// `load_elem` reads one source element at `src_payload + i*src_stride`;
+/// `src_stride` is `8` for `List<Int>` / `List<Float>` sources (8-byte
+/// inline slots) and `4` for a `List<String>` source (pointer-array
+/// slots). `src_8aligned` selects the source payload-start formula:
+/// `(xs + 4 + 7) & -8` for the inline 8-byte sources, `xs + 4` for the
+/// 4-byte pointer-array String source.
+///
+/// Locals:
+///   * 0 — `n:           I32`
+///   * 1 — `i:           I32`
+///   * 2 — `src_payload: I32`
+///   * 3 — `dst_payload: I32`
+///   * 4 — `new_base:    I32` (4-aligned result-header offset)
+fn list_map_to_string_body(
+    load_elem: fn(u32) -> Op,
+    param_ty: IrType,
+    src_stride: i32,
+    src_8aligned: bool,
+) -> Vec<TaggedOp> {
+    const N: u32 = 0;
+    const I: u32 = 1;
+    const SRC_PAYLOAD: u32 = 2;
+    const DST_PAYLOAD: u32 = 3;
+    const NEW_BASE: u32 = 4;
+    // Source payload-start: 8-byte sources align to 8; the String
+    // pointer-array source starts its 4-byte slots right after the
+    // length prefix at `xs + 4`.
+    let src_payload_setup: Vec<TaggedOp> = if src_8aligned {
+        vec![
+            tt(Op::LocalGet(0)),
+            tt(Op::ConstI32(4 + 7)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::ConstI32(-8)),
+            tt(Op::BitAnd(IrType::I32)),
+            tt(Op::LetSet {
+                idx: SRC_PAYLOAD,
+                ty: IrType::I32,
+            }),
+        ]
+    } else {
+        vec![
+            tt(Op::LocalGet(0)),
+            tt(Op::ConstI32(4)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::LetSet {
+                idx: SRC_PAYLOAD,
+                ty: IrType::I32,
+            }),
+        ]
+    };
+    let mut body = vec![
+        // n = i32.load(xs, 0)
+        tt(Op::LocalGet(0)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        // record_size = 4 + 4*n + 4 (the trailing +4 is alignment slop so
+        // the 4-aligned header fits regardless of the raw scratch base).
+        tt(Op::ConstI32(8)),
+        tt(Op::LetGet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(4)),
+        tt(Op::Mul(IrType::I32)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::AllocScratchDyn),
+        // new_base = (raw_base + 3) & -4
+        tt(Op::ConstI32(3)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::ConstI32(-4)),
+        tt(Op::BitAnd(IrType::I32)),
+        tt(Op::LetSet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        // store header: i32.store(new_base, n)
+        tt(Op::LetGet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        tt(Op::StoreI32AtAbsolute { offset: 0 }),
+    ];
+    body.extend(src_payload_setup);
+    body.extend([
+        // dst_payload = new_base + 4 (entries start, 4-byte slots)
+        tt(Op::LetGet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(4)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::LetSet {
+            idx: DST_PAYLOAD,
+            ty: IrType::I32,
+        }),
+        // i = 0
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: I,
+            ty: IrType::I32,
+        }),
+        tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
+                result_ty: None,
+                body: vec![
+                    // exit when i >= n
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: N,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Ge(IrType::I32)),
+                    tt(Op::BrIf { label_depth: 1 }),
+                    // dst_addr = dst_payload + i * 4 (pushed first so the
+                    // i32.store sees [addr, handle] at the end)
+                    tt(Op::LetGet {
+                        idx: DST_PAYLOAD,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(4)),
+                    tt(Op::Mul(IrType::I32)),
+                    tt(Op::Add(IrType::I32)),
+                    // push closure handle (param 1)
+                    tt(Op::LocalGet(1)),
+                    // push the source element: load(src_payload + i*stride)
+                    tt(Op::LetGet {
+                        idx: SRC_PAYLOAD,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(src_stride)),
+                    tt(Op::Mul(IrType::I32)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(load_elem(0)),
+                    // closure(elem) -> String (i32 arena-relative handle)
+                    tt(Op::CallClosure {
+                        param_tys: vec![param_ty],
+                        ret_ty: IrType::String,
+                    }),
+                    // i32.store: stack is [dst_addr, string_handle]
+                    tt(Op::StoreI32AtAbsolute { offset: 0 }),
+                    // i = i + 1
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(1)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        // return new_base
+        tt(Op::LetGet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::Return),
+    ]);
+    body
+}
+
+/// `list_string_map(xs: List<String>, f: Closure<String -> String>) ->
+/// List<String>`.
+pub(super) fn list_string_map() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_string_map",
+        vec![IrType::ListString, IrType::Closure],
+        IrType::ListString,
+        || {
+            list_map_to_string_body(
+                |o| Op::LoadI32AtAbsolute { offset: o },
+                IrType::String,
+                4,
+                false,
+            )
+        },
+    )
+}
+
+/// `list_int_map_to_string(xs: List<Int>, f: Closure<Int -> String>) ->
+/// List<String>` — element-type-changing map whose closure return type
+/// makes the result list a `List<String>`.
+pub(super) fn list_int_map_to_string() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_int_map_to_string",
+        vec![IrType::ListInt, IrType::Closure],
+        IrType::ListString,
+        || {
+            list_map_to_string_body(
+                |o| Op::LoadI64AtAbsolute { offset: o },
+                IrType::I64,
+                8,
+                true,
+            )
+        },
+    )
+}
+
+/// `list_float_map_to_string(xs: List<Float>, f: Closure<Float -> String>)
+/// -> List<String>` — Float source, String closure result.
+pub(super) fn list_float_map_to_string() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_float_map_to_string",
+        vec![IrType::ListFloat, IrType::Closure],
+        IrType::ListString,
+        || {
+            list_map_to_string_body(
+                |o| Op::LoadF64AtAbsolute { offset: o },
+                IrType::F64,
+                8,
+                true,
+            )
+        },
+    )
+}
