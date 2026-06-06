@@ -311,6 +311,218 @@ pub fn verify_object_return_multi(
     })
 }
 
+/// Single central entry for the **object** (positive-`bytes_written`)
+/// return path, shared by both AOT backends. It enforces the one correct
+/// order — `verify_object_return_multi` **before** any decode — so no
+/// present or future object-return caller can reach a `BufferReader`
+/// without the multi-region bounds gate having run first. A verify
+/// failure aborts loudly; the decode never runs on an unverified arena.
+///
+/// `arena` must already be sliced to `regions.arena_size` by the caller
+/// (each backend owns the read-length bounds check against its own arena
+/// allocation). `record_base` is the object head (`out_ptr`).
+/// `single_value_wrapper` is the backend's `is_single_value_wrapper`
+/// decision (it depends on `relon-ir` schema-name constants this leaf
+/// crate intentionally does not pull in); when set, the single
+/// return-schema field is decoded directly, otherwise the whole record is
+/// drained into a branded dict.
+///
+/// The decode walks the shared [`read_object_field`] / [`BufferReader`]
+/// path for both backends, so the produced [`Value`] is byte-identical
+/// regardless of which AOT backend invoked it.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_object_return(
+    backend: &str,
+    arena: &[u8],
+    record_base: usize,
+    regions: ArenaRegions,
+    return_layout: &OffsetTable,
+    return_schema: &Schema,
+    single_value_wrapper: bool,
+) -> Result<Value, RuntimeError> {
+    let multi = regions.multi_region().map_err(|e| {
+        RuntimeError::IoError(format!(
+            "{backend} object return arena regions invalid: {e}"
+        ))
+    })?;
+    // Bounds gate FIRST — must precede every decode below.
+    verify_object_return_multi(
+        backend,
+        arena,
+        record_base,
+        multi,
+        return_layout,
+        &return_schema.fields,
+    )?;
+    let reader =
+        BufferReader::new_at_base(return_layout, &return_schema.fields, arena, record_base)
+            .map_err(|e| RuntimeError::IoError(format!("{backend} buffer: {e}")))?;
+    if single_value_wrapper {
+        let field = &return_schema.fields[0];
+        read_object_field(backend, &reader, field, return_schema)
+    } else {
+        let map = read_object_record_into_map(backend, &reader, return_schema)?;
+        Ok(Value::branded_dict(map, Some(return_schema.name.clone())))
+    }
+}
+
+/// Drain every field of `schema` from the object record `reader` into a
+/// sorted `BTreeMap<SmolStr, Value>`. Backend-shared body of the object /
+/// nested-record decode (replaces the two per-crate `read_record_into_map`
+/// copies the cranelift / llvm evaluators carried).
+fn read_object_record_into_map(
+    backend: &str,
+    reader: &BufferReader<'_>,
+    schema: &Schema,
+) -> Result<std::collections::BTreeMap<SmolStr, Value>, RuntimeError> {
+    let mut map = std::collections::BTreeMap::new();
+    for field in &schema.fields {
+        let value = read_object_field(backend, reader, field, schema)?;
+        map.insert(SmolStr::from(field.name.as_str()), value);
+    }
+    Ok(map)
+}
+
+/// Decode one object-return field via [`BufferReader`] into a [`Value`].
+/// This is the single backend-shared copy of the object-path
+/// `read_value_from_reader` the cranelift and llvm evaluators each carried
+/// (debt 1): adding a new field type now changes exactly this one arm set.
+///
+/// It covers the full object-field type space — scalars (`Int` / `Float` /
+/// `Bool` / `Null`), `String`, every `List<…>` shape, and a bare nested
+/// `Schema` (sub-record) — by mapping each leaf onto the matching
+/// [`BufferReader`] reader. The `List<List<scalar>>` arm keeps the
+/// dedicated `read_list_list` reader (inline-fixed inner rows); every
+/// pointer-array list (`List<Schema>` / `List<List<String|Schema>>`)
+/// routes through the unified recursive `read_list_value`, exactly as both
+/// backends did. `parent_schema` only feeds the unsupported-type
+/// diagnostic. The verifier in [`decode_object_return`] has already
+/// certified every pointer this reader follows.
+fn read_object_field(
+    backend: &str,
+    reader: &BufferReader<'_>,
+    field: &Field,
+    parent_schema: &Schema,
+) -> Result<Value, RuntimeError> {
+    let map_err =
+        |e: crate::buffer::BufferError| RuntimeError::IoError(format!("{backend} buffer: {e}"));
+    match &field.ty {
+        TypeRepr::Int => reader
+            .read_int(&field.name)
+            .map(Value::Int)
+            .map_err(map_err),
+        TypeRepr::Float => reader
+            .read_float(&field.name)
+            .map(|f| Value::Float(ordered_float::OrderedFloat(f)))
+            .map_err(map_err),
+        TypeRepr::Bool => reader
+            .read_bool(&field.name)
+            .map(Value::Bool)
+            .map_err(map_err),
+        TypeRepr::Null => reader
+            .read_null(&field.name)
+            .map(|()| Value::Null)
+            .map_err(map_err),
+        TypeRepr::String => reader
+            .read_string(&field.name)
+            .map(|s| Value::String(s.into()))
+            .map_err(map_err),
+        // Bare nested Schema: anchor a sub-reader at the slot's
+        // sub-record fixed area and recurse into a branded dict.
+        TypeRepr::Schema { schema } => {
+            let sub_layout = SchemaLayout::offsets_for(schema).map_err(|e| {
+                RuntimeError::IoError(format!(
+                    "{backend} object return field `{}` layout: {e}",
+                    field.name
+                ))
+            })?;
+            let sub_reader = reader
+                .sub_record(&field.name, &sub_layout, &schema.fields)
+                .map_err(map_err)?;
+            let map = read_object_record_into_map(backend, &sub_reader, schema)?;
+            Ok(Value::branded_dict(map, Some(schema.name.clone())))
+        }
+        TypeRepr::List { element } => match element.as_ref() {
+            TypeRepr::Int => reader
+                .read_list_int(&field.name)
+                .map(|v| Value::List(Arc::new(v.into_iter().map(Value::Int).collect())))
+                .map_err(map_err),
+            TypeRepr::Float => reader
+                .read_list_float(&field.name)
+                .map(|v| {
+                    Value::List(Arc::new(
+                        v.into_iter()
+                            .map(|f| Value::Float(ordered_float::OrderedFloat(f)))
+                            .collect(),
+                    ))
+                })
+                .map_err(map_err),
+            TypeRepr::Bool => reader
+                .read_list_bool(&field.name)
+                .map(|v| Value::List(Arc::new(v.into_iter().map(Value::Bool).collect())))
+                .map_err(map_err),
+            TypeRepr::String => reader
+                .read_list_string(&field.name)
+                .map(|v| {
+                    Value::List(Arc::new(
+                        v.into_iter().map(|s| Value::String(s.into())).collect(),
+                    ))
+                })
+                .map_err(map_err),
+            TypeRepr::Schema { schema } => {
+                let elem_layout = SchemaLayout::offsets_for(schema).map_err(|e| {
+                    RuntimeError::IoError(format!(
+                        "{backend} object return List<Schema> element `{}` layout: {e}",
+                        schema.name
+                    ))
+                })?;
+                let sub_readers = reader
+                    .read_list_record(&field.name, &elem_layout, schema)
+                    .map_err(map_err)?;
+                let mut items = Vec::with_capacity(sub_readers.len());
+                for sub in &sub_readers {
+                    let map = read_object_record_into_map(backend, sub, schema)?;
+                    items.push(Value::branded_dict(map, Some(schema.name.clone())));
+                }
+                Ok(Value::List(Arc::new(items)))
+            }
+            // `List<List<…>>`: the inner inline-fixed scalar case keeps the
+            // dedicated `read_list_list` reader; `List<List<String|Schema>>`
+            // routes through the recursive `read_list_value` one level
+            // deeper. Byte-identical to both backends' prior arms.
+            TypeRepr::List { element: inner } => match inner.as_ref() {
+                TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool => reader
+                    .read_list_list(&field.name)
+                    .map(|rows| {
+                        Value::List(Arc::new(
+                            rows.into_iter().map(|r| Value::List(Arc::new(r))).collect(),
+                        ))
+                    })
+                    .map_err(map_err),
+                _ => reader
+                    .read_list_value(&field.name, element.as_ref())
+                    .map(|rows| Value::List(Arc::new(rows)))
+                    .map_err(map_err),
+            },
+            other => Err(RuntimeError::IoError(format!(
+                "{backend} object return: cannot decode list field `{field}` of element type \
+                 `{ty:?}` in schema `{schema}`",
+                field = field.name,
+                ty = other,
+                schema = parent_schema.name,
+            ))),
+        },
+        // ----- add new object-return field type arm above this line -----
+        other => Err(RuntimeError::IoError(format!(
+            "{backend} object return: cannot decode field `{field}` of type `{ty:?}` in schema \
+             `{schema}`",
+            field = field.name,
+            ty = other,
+            schema = parent_schema.name,
+        ))),
+    }
+}
+
 /// Drain every field of `schema` from the sub-record `reader` into a
 /// sorted `BTreeMap<SmolStr, Value>` — the branded-dict body for one
 /// `List<Schema>` element. Mirrors the codegen evaluators'

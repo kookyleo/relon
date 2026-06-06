@@ -88,6 +88,28 @@ mod vtable;
 mod wasi_host;
 pub mod wasm_link;
 
+/// Generator stamp for the LLVM-AOT codegen, the mirror of
+/// `relon_codegen_cranelift::GENERATOR_VERSION`.
+///
+/// **Today this is a forward-looking placeholder, not yet wired into any
+/// cache key.** The LLVM backend ships no object / ELF cache — every
+/// dispatch JIT-compiles in-process via MCJIT — so there is presently no
+/// persisted byte stream that could go stale against newer codegen.
+///
+/// THE INVARIANT THIS PINS, for whoever adds an LLVM object / ELF /
+/// bitcode cache later: this version string **MUST** be folded into that
+/// cache's integrity key (the HMAC / hash that gates a cache hit), exactly
+/// as the cranelift backend folds its `GENERATOR_VERSION` into the object
+/// cache HMAC (`object_cache_integration::cache_signature`). Bump it on
+/// every codegen-incompatible change (op lowering, ABI / arena layout,
+/// marshalling-seam, entry-shape changes). If a future cache omits this
+/// key, stale machine code from an older generator will be silently
+/// loaded and executed against new host-side decode assumptions — a
+/// silent-wrong-result / memory-safety footgun. See
+/// `docs/internal/capability-and-trust-model.md` for the recorded
+/// rationale.
+pub const GENERATOR_VERSION: &str = "relon-codegen-llvm v0 (no object cache yet)";
+
 pub use codegen::WorldMode;
 pub use error::LlvmError;
 pub use evaluator::{
