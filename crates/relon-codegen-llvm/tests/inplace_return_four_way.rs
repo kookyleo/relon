@@ -743,6 +743,123 @@ fn f5_ll_schema_mixed() {
 }
 
 // ====================================================================
+// F6: DEEP nested-schema field chains to a pointer-array leaf
+// (`o.inner.tags` / `o.a.b.tags`). Combines the multi-segment
+// nested-schema field walk (which already worked for scalar leaves) with
+// the cross-region list-field return (F1b–F5, single-segment). Every
+// intermediate segment loads a nested sub-record's arena-absolute base
+// (post-F1 the marshaller bakes `in_ptr` into every pointer slot
+// recursively); the leaf list-field load reads the list root's
+// arena-absolute offset off that base — exactly the value the single-root
+// in-place sentinel + multi-region verifier + reader consume at any depth.
+// ====================================================================
+
+fn inner_dict(brand: &str, field: &str, val: Value, n: i64) -> Value {
+    let map = std::collections::BTreeMap::from([
+        (relon_eval_api::smol_str::SmolStr::from(field), val),
+        (relon_eval_api::smol_str::SmolStr::from("n"), Value::Int(n)),
+    ]);
+    Value::branded_dict(map, Some(brand.into()))
+}
+
+fn outer_wrap(brand: &str, child_field: &str, child: Value, m: i64) -> Value {
+    let map = std::collections::BTreeMap::from([
+        (relon_eval_api::smol_str::SmolStr::from(child_field), child),
+        (relon_eval_api::smol_str::SmolStr::from("m"), Value::Int(m)),
+    ]);
+    Value::branded_dict(map, Some(brand.into()))
+}
+
+const SRC_DEEP_TAGS: &str = "#schema Inner { tags: List<String>, n: Int }\n\
+                             #schema Outer { inner: Inner, m: Int }\n\
+                             #main(Outer o) -> List<String>\no.inner.tags";
+
+#[test]
+fn f6_deep_tags_empty() {
+    let inner = inner_dict("Inner", "tags", str_list(&[]), 0);
+    assert_four_way(
+        SRC_DEEP_TAGS,
+        args1("o", outer_wrap("Outer", "inner", inner, 1)),
+    );
+}
+
+#[test]
+fn f6_deep_tags_cjk_empty_long() {
+    let long = "q".repeat(4096);
+    let cjk = "\u{4E2D}\u{6587}".repeat(300);
+    let inner = inner_dict(
+        "Inner",
+        "tags",
+        str_list(&["", "\u{4E2D}\u{6587}", long.as_str(), cjk.as_str(), "z"]),
+        7,
+    );
+    assert_four_way(
+        SRC_DEEP_TAGS,
+        args1("o", outer_wrap("Outer", "inner", inner, 3)),
+    );
+}
+
+const SRC_DEEP_ITEMS: &str = "#schema Server { host: String, port: Int }\n\
+                              #schema Inner { items: List<Server>, n: Int }\n\
+                              #schema Outer { inner: Inner, m: Int }\n\
+                              #main(Outer o) -> List<Server>\no.inner.items";
+
+#[test]
+fn f6_deep_items_list_schema() {
+    let items = Value::List(Arc::new(vec![
+        server("", 0),
+        server("\u{6570}\u{636E}\u{5E93}", 5432),
+        server("h", i64::MAX),
+    ]));
+    let inner = inner_dict("Inner", "items", items, 9);
+    assert_four_way(
+        SRC_DEEP_ITEMS,
+        args1("o", outer_wrap("Outer", "inner", inner, 2)),
+    );
+}
+
+const SRC_DEEP_GRID: &str = "#schema Inner { grid: List<List<Int>>, n: Int }\n\
+                             #schema Outer { inner: Inner, m: Int }\n\
+                             #main(Outer o) -> List<List<Int>>\no.inner.grid";
+
+#[test]
+fn f6_deep_grid_list_list_int() {
+    let inner = inner_dict(
+        "Inner",
+        "grid",
+        int_rows(&[&[1, 2, 3], &[], &[i64::MIN, i64::MAX]]),
+        3,
+    );
+    assert_four_way(
+        SRC_DEEP_GRID,
+        args1("o", outer_wrap("Outer", "inner", inner, 5)),
+    );
+}
+
+// Three-segment chain (`o.a.b.tags`): proves the walk is depth-general,
+// not hardcoded to exactly two intermediate segments.
+const SRC_THREE_TAGS: &str = "#schema B { tags: List<String>, n: Int }\n\
+                              #schema A { b: B, k: Int }\n\
+                              #schema Outer { a: A, m: Int }\n\
+                              #main(Outer o) -> List<String>\no.a.b.tags";
+
+#[test]
+fn f6_three_level_tags() {
+    let b = inner_dict("B", "tags", str_list(&["", "\u{4E2D}\u{6587}", "z"]), 1);
+    // A { b: B, k: Int } — `outer_wrap` wraps a child under a field plus a
+    // trailing scalar named `m`; here A's trailing scalar is `k`, so build
+    // A explicitly to keep the field names matching the schema source.
+    let a = {
+        let map = std::collections::BTreeMap::from([
+            (relon_eval_api::smol_str::SmolStr::from("b"), b),
+            (relon_eval_api::smol_str::SmolStr::from("k"), Value::Int(2)),
+        ]);
+        Value::branded_dict(map, Some("A".into()))
+    };
+    assert_four_way(SRC_THREE_TAGS, args1("o", outer_wrap("Outer", "a", a, 9)));
+}
+
+// ====================================================================
 // proptest differential — the "shapes you didn't think of" net.
 // Smaller case count than the native three-way: each wasm case shells out
 // to wasm-ld + spins up a wasmtime instance.
@@ -935,6 +1052,30 @@ proptest! {
             prop_assert_eq!(res.map_err(TestCaseError::fail)?, oracle);
         }
     }
+
+    // F6 deep nested-schema field chains: wrap a generated list inside an
+    // `Inner` sub-record, wrap that inside `Outer`, and return `o.inner.X`.
+    // The leaf list root reached through the two-segment field-load chain
+    // must decode bit-equal to the tree-walk oracle.
+    #[test]
+    fn diff_deep_field_tags(val in list_string_strat()) {
+        let inner = inner_dict("Inner", "tags", val, 0);
+        let arg = outer_wrap("Outer", "inner", inner, 0);
+        let oracle = run_tree_walk(SRC_DEEP_TAGS, args1("o", arg.clone()));
+        if let Some(res) = run_wasm(SRC_DEEP_TAGS, &args1("o", arg)) {
+            prop_assert_eq!(res.map_err(TestCaseError::fail)?, oracle);
+        }
+    }
+
+    #[test]
+    fn diff_deep_field_grid(val in list_list_int_strat()) {
+        let inner = inner_dict("Inner", "grid", val, 0);
+        let arg = outer_wrap("Outer", "inner", inner, 0);
+        let oracle = run_tree_walk(SRC_DEEP_GRID, args1("o", arg.clone()));
+        if let Some(res) = run_wasm(SRC_DEEP_GRID, &args1("o", arg)) {
+            prop_assert_eq!(res.map_err(TestCaseError::fail)?, oracle);
+        }
+    }
 }
 
 // ====================================================================
@@ -996,16 +1137,21 @@ fn verifier_rejects_out_of_region_root_loudly() {
 /// the decline is symmetric — assert wasm32 emit returns `Err`.
 ///
 /// F5 lifts the doubly-nested pointer-array shapes (`List<List<String>>` /
-/// `List<List<Schema>>`), so those are NO LONGER here; the remaining caps
-/// are the `o.inner.tags` ≥3-segment nested-schema field chain (F4 only
-/// admits a single-segment field walk) and `Dict<_,_>` params (an
-/// analyzer dead-end with no buffer-protocol decode path).
+/// `List<List<Schema>>`) and F6 lifts the deep nested-schema field chain
+/// to a pointer-array leaf (`o.inner.tags`), so those are NO LONGER here.
+/// The remaining caps are a deep chain whose leaf is a `List<Schema>`
+/// whose element sub-record carries a nested-list field (past the
+/// in-place sub-record reader's S4 decode scope) and `Dict<_,_>` params
+/// (an analyzer dead-end with no buffer-protocol decode path).
 #[test]
 fn capped_shapes_decline_on_wasm_emit_not_silently() {
     let cap_cases = [
-        // ≥3-segment nested-schema field chain — out of scope.
-        "#schema Inner { tags: List<String> }\n#schema Outer { inner: Inner }\n\
-         #main(Outer o) -> List<String>\no.inner.tags",
+        // Deep chain whose leaf `List<Cell>` element sub-record carries a
+        // `List<List<Int>>` field — out of the S4 sub-record decode scope.
+        "#schema Cell { rows: List<List<Int>>, k: Int }\n\
+         #schema Inner { cells: List<Cell>, n: Int }\n\
+         #schema Outer { inner: Inner, m: Int }\n\
+         #main(Outer o) -> List<Cell>\no.inner.cells",
         // Dict param — analyzer dead-end, no input decode path.
         "#main(Dict<String, Int> d) -> Int\n1",
     ];

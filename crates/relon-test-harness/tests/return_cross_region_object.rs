@@ -586,16 +586,22 @@ fn f5_double_pointer_array_object_field_compiles() {
     assert_cross_region(src_field, args1("w", w));
 }
 
-/// Shapes still beyond F5 must cap on both native backends (loud decline):
-/// the `o.inner.tags` ≥3-segment nested-schema field chain (F4 admits only
-/// a single-segment field walk) and `Dict<_,_>` params (an analyzer
+/// Shapes still beyond F6 must cap on both native backends (loud decline).
+/// F6 lifted the deep nested-schema field chain to a pointer-array leaf
+/// (`o.inner.tags`, as a top-level return and as an object field). The
+/// remaining caps: a deep chain whose object-field leaf is a `List<Schema>`
+/// whose element sub-record carries a nested-list field (past the in-place
+/// sub-record reader's S4 decode scope) and `Dict<_,_>` params (an analyzer
 /// dead-end with no input decode path).
 #[test]
 fn beyond_f5_still_capped() {
     let cap_cases = [
-        // ≥3-segment nested-schema field chain.
-        "#schema Inner { tags: List<String> }\n#schema Outer { inner: Inner }\n\
-         #main(Outer o) -> Dict\n{ t: o.inner.tags, n: 1 }",
+        // Deep chain object field whose leaf `List<Cell>` element sub-record
+        // carries a `List<List<Int>>` field — out of the S4 decode scope.
+        "#schema Cell { rows: List<List<Int>>, k: Int }\n\
+         #schema Inner { cells: List<Cell>, n: Int }\n\
+         #schema Outer { inner: Inner, m: Int }\n\
+         #main(Outer o) -> Dict\n{ c: o.inner.cells, n: 1 }",
         // Dict param — analyzer dead-end.
         "#main(Dict<String, Int> d) -> Dict\n{ n: 1 }",
     ];

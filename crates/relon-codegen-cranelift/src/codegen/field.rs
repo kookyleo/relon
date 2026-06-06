@@ -704,9 +704,11 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
     /// list-index, the in-place return sentinel / cross-region object slot)
     /// expect. No re-encode happens here, which is why the F4 parameter-field
     /// list return (`o.tags` / `o.items` / `o.grid`) is bit-equal to
-    /// tree-walk. Multi-segment nested-schema walks (`o.inner.x`, the inner
-    /// segment ty `I32`) remain out of scope here — see the report's
-    /// honesty note.
+    /// tree-walk. F6 chains this: a multi-segment nested-schema walk
+    /// (`o.inner.tags`) loads each intermediate sub-record's arena-absolute
+    /// base through the `I32` scalar branch below, then the leaf list-field
+    /// load (this branch) reads the list root's arena-absolute offset off
+    /// that base — bit-equal at any depth.
     pub(super) fn emit_load_field_at_absolute(
         &mut self,
         offset: u32,
