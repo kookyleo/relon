@@ -759,15 +759,28 @@ impl TreeWalkEvaluator {
                     captured_env,
                 })))
             }
-            Expr::FnCall { path, args } => {
-                let mut evaluated_args = Vec::new();
-                for arg in args {
-                    evaluated_args.push(EvaluatedArg {
-                        name: arg.name.clone(),
-                        value: self.eval(&arg.value, &current_scope)?,
-                    });
+            Expr::FnCall { .. } => {
+                // High-level fusion fast-path (shared AST recogniser in
+                // `relon_parser::rewrite`). When the call matches a fused
+                // pattern AND the participating stdlib names are not
+                // shadowed, evaluate the fused form directly — no
+                // intermediate list materialisation. Falls through to the
+                // generic native/closure dispatch otherwise.
+                if let Some(value) = self.try_eval_fused(node, &current_scope)? {
+                    Ok(value)
+                } else {
+                    let Expr::FnCall { path, args } = node.expr.as_ref() else {
+                        unreachable!("matched Expr::FnCall above")
+                    };
+                    let mut evaluated_args = Vec::new();
+                    for arg in args {
+                        evaluated_args.push(EvaluatedArg {
+                            name: arg.name.clone(),
+                            value: self.eval(&arg.value, &current_scope)?,
+                        });
+                    }
+                    self.call_function(path, evaluated_args, &current_scope, node.range)
                 }
-                self.call_function(path, evaluated_args, &current_scope, node.range)
             }
             Expr::Binary(Operator::Pipe, left, right) => {
                 let left_val = self.eval(left, &current_scope)?;
@@ -1548,6 +1561,182 @@ impl TreeWalkEvaluator {
                 expected: "Closure".to_string(),
                 found: func.type_name().to_string(),
                 range,
+            }),
+        }
+    }
+
+    /// High-level fusion fast-path for the tree-walk interpreter.
+    ///
+    /// Consumes the shared AST recogniser in [`relon_parser::rewrite`] so the
+    /// interpreter gets the *same* materialisation-free fusion the compiled
+    /// back-ends have always had via the IR peephole layer. Today only
+    /// `list.sum(range(...))` is fused (the pilot); the recogniser is the
+    /// single extension point both halves share.
+    ///
+    /// Returns:
+    ///   * `Ok(Some(value))` — the fused form fired and produced the result;
+    ///   * `Ok(None)` — no fused pattern / the participating stdlib names are
+    ///     shadowed, so the caller falls through to the generic dispatch;
+    ///   * `Err(_)` — a sub-expression (e.g. `start` / `end`) failed to
+    ///     evaluate, or a capability gate tripped.
+    ///
+    /// ## Byte-exact contract
+    ///
+    /// The fused `list.sum(range(start, end))` computes
+    /// `acc = 0; for i in start..end { acc = acc.checked_add(i)? }` — exactly
+    /// the additions, order, and **checked-overflow** behaviour of the
+    /// materialised tree-walk path. The user-facing `list.sum` is the
+    /// `std/list` wrapper `sum(l): l | _list_reduce(0, (acc, x) => acc + x)`,
+    /// whose `+` is the interpreter's *checked* Int addition — it raises
+    /// `NumericOverflow` on the first overflowing partial sum, in ascending
+    /// element order, rather than wrapping. The fused fold reproduces that
+    /// trap-on-overflow exactly (it is a *fusion*, not a closed-form
+    /// substitution, and not the `wrapping_add` of the unrelated
+    /// `[..].sum()` method-form native).
+    ///
+    /// Value-affecting capability checks are mirrored from `Range`: the
+    /// requested length is `tick`ed and `max_value_elements` is enforced
+    /// up front, so an oversized range still surfaces the same
+    /// `ValueTooLarge` / `StepLimitExceeded` error it would on the
+    /// materialised path. (The per-AST-node step counter is *not* a
+    /// language-observable result — it already differs across back-ends — so
+    /// the small node-count difference of the fused walk is not part of the
+    /// byte-exact contract.)
+    fn try_eval_fused(
+        &self,
+        node: &Node,
+        scope: &Arc<Scope>,
+    ) -> Result<Option<Value>, RuntimeError> {
+        use relon_parser::rewrite::{recognize_fused, FusedPattern};
+        let Some(pattern) = recognize_fused(node.expr.as_ref()) else {
+            return Ok(None);
+        };
+        match pattern {
+            FusedPattern::RangeSum { start, end } => {
+                // Soundness guard. The fused fold is only byte-exact with the
+                // generic dispatch when:
+                //
+                //   * `range(...)` dispatches to the stdlib native `Range`
+                //     (not a user-shadowed `range`), and
+                //   * `list.sum(...)` dispatches to the canonical `std/list`
+                //     `sum` wrapper (`l | _list_reduce(0, (acc, x) => acc + x)`).
+                //
+                // `range`: the native lives in `context.functions["range"]`;
+                // it is shadowed iff the scope carries a local `range`
+                // binding/thunk (resolve_variable consults locals first).
+                //
+                // `list`: the import binds `list` as a scope-local module
+                // value. We verify it is the *built-in* `std/list` module —
+                // identity-checked against a fresh load of `"std/list"` — so a
+                // user who imports a different module under the name `list`
+                // (or shadows it with a non-module value, e.g. an Int) falls
+                // through to the generic path. The std module is cached, so
+                // the load is cheap; this check runs only after the structural
+                // recogniser already fired.
+                if self.is_shadowed("range", scope)
+                    || !self.context.functions.contains_key("range")
+                    || !self.is_canonical_std_list(scope, node.range)
+                {
+                    return Ok(None);
+                }
+                let range = node.range;
+                let start_val = match start {
+                    Some(n) => self.expect_int_value(n, scope)?,
+                    None => 0,
+                };
+                let end_val = self.expect_int_value(end, scope)?;
+
+                // Mirror `Range`'s value-affecting pre-flight: charge the
+                // requested length against the step budget and enforce
+                // `max_value_elements` before producing the (now never
+                // materialised) sum.
+                let requested_len = (end_val as i128 - start_val as i128).max(0) as u128;
+                let caps = self.caps();
+                if requested_len > 0 {
+                    let ticks = if requested_len > u64::MAX as u128 {
+                        u64::MAX
+                    } else {
+                        requested_len as u64
+                    };
+                    caps.tick(ticks, range)?;
+                }
+                if let Some(limit) = caps.max_value_elements() {
+                    if requested_len > limit as u128 {
+                        let actual = if requested_len > usize::MAX as u128 {
+                            usize::MAX
+                        } else {
+                            requested_len as usize
+                        };
+                        return Err(RuntimeError::ValueTooLarge {
+                            limit,
+                            actual,
+                            range,
+                        });
+                    }
+                }
+
+                // Fused fold — byte-identical to the `std/list` `sum`
+                // wrapper over the materialised `range`: empty when
+                // `start >= end`, *checked* i64 addition in ascending order
+                // (trap-on-overflow with `NumericOverflow`, matching the
+                // wrapper's `acc + x`).
+                let mut acc: i64 = 0;
+                let mut i = start_val;
+                while i < end_val {
+                    acc = acc
+                        .checked_add(i)
+                        .ok_or(RuntimeError::NumericOverflow(range))?;
+                    i += 1;
+                }
+                Ok(Some(Value::Int(acc)))
+            }
+        }
+    }
+
+    /// True when `name` is bound by a local value / thunk in `scope` (a
+    /// closure or `where`-binding shadowing a stdlib name). Mirrors the
+    /// head-resolution order of [`Self::resolve_variable`].
+    fn is_shadowed(&self, name: &str, scope: &Arc<Scope>) -> bool {
+        scope.get_local(name).is_some() || scope.get_thunk(name).is_some()
+    }
+
+    /// True when the in-scope binding `list` exposes the canonical `std/list`
+    /// `sum` wrapper (so the fused fold is byte-exact with the generic
+    /// dispatch).
+    ///
+    /// Identity is established by comparing the bound module's `sum` member
+    /// against the `sum` member of a fresh `load_module("std/list")`.
+    /// `Value::Closure` compares structurally (closure bodies compare by AST
+    /// shape), so a user module imported under the name `list` whose `sum`
+    /// differs — or a non-module shadow (e.g. an Int) — compares unequal and
+    /// the caller falls through to the generic dispatch. The std module load
+    /// is cached. Any resolution / load error (e.g. no `StdModuleResolver`
+    /// registered) conservatively returns `false`.
+    ///
+    /// Comparing just the `sum` member (rather than the whole module) keeps
+    /// the check cheap and scoped to exactly the surface the fold mirrors.
+    fn is_canonical_std_list(&self, scope: &Arc<Scope>, range: TokenRange) -> bool {
+        let Some(Value::Dict(bound)) = scope.get_local("list") else {
+            return false;
+        };
+        let Some(bound_sum) = bound.map.get("sum") else {
+            return false;
+        };
+        let Ok(Value::Dict(canonical)) = self.load_module("std/list", None, scope, range) else {
+            return false;
+        };
+        canonical.map.get("sum") == Some(bound_sum)
+    }
+
+    /// Evaluate `node` and require an `Int`, surfacing the same
+    /// `TypeMismatch` shape the stdlib `expect_int` helper would.
+    fn expect_int_value(&self, node: &Node, scope: &Arc<Scope>) -> Result<i64, RuntimeError> {
+        match self.eval(node, scope)? {
+            Value::Int(i) => Ok(i),
+            other => Err(RuntimeError::TypeMismatch {
+                expected: "Int".to_string(),
+                found: other.type_name().to_string(),
+                range: node.range,
             }),
         }
     }
