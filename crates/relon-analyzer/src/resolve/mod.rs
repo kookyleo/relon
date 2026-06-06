@@ -321,18 +321,34 @@ impl<'a> Walker<'a> {
             }
             Expr::Comprehension {
                 element,
+                id,
                 iterable,
                 condition,
-                ..
             } => {
                 // Comprehensions iterate over `iterable`; the element /
                 // condition expressions both see iteration context.
+                //
+                // R1: the comprehension binding (`[ … for x in xs ]`)
+                // introduces `x` into the element / condition scope. We
+                // open a frame whose `closure_params` carries `x` so the
+                // body's `Variable(x)` head resolves (lands in
+                // `references`) instead of falling through to
+                // `queue_cross_module`. The iterable itself is evaluated
+                // in the *outer* scope (the binding isn't visible to its
+                // own source), so we visit it before pushing the frame.
                 self.iteration_depth += 1;
-                self.visit(element);
                 self.visit(iterable);
+                let mut frame = ScopeFrame::default();
+                // The binding has no value-node of its own; use the
+                // element's id as the stable sentinel, matching the
+                // closure-param convention.
+                frame.closure_params.insert(id.clone(), element.id);
+                self.scope_stack.push(frame);
+                self.visit(element);
                 if let Some(c) = condition {
                     self.visit(c);
                 }
+                self.scope_stack.pop();
                 self.iteration_depth -= 1;
             }
             Expr::Closure { params, body, .. } => {

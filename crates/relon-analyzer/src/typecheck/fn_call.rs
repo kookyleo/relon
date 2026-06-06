@@ -29,7 +29,8 @@ use crate::diagnostic::{span_of, Diagnostic};
 use crate::generics::collect_bindings;
 use crate::infer::{self, infer_type, InferredType};
 use crate::sig::{instantiate, lookup_signature, FnSignature};
-use relon_parser::{Expr, Node, TokenKey, TokenRange};
+use relon_parser::{CallArg, Expr, Node, TokenKey, TokenRange};
+use std::collections::HashMap;
 
 impl<'a> Walker<'a> {
     /// Stage 2.7: when a function call's `callable` is a single-segment
@@ -511,5 +512,162 @@ impl<'a> Walker<'a> {
             return Some(name);
         }
         None
+    }
+
+    /// R1 (contextual closure typing): inspect a `FnCall` site and, for
+    /// every closure-literal argument whose param slot in the resolved
+    /// signature is a `Closure<…>`, derive the closure's parameter types
+    /// from the call context and stash them on
+    /// `self.closure_param_context` keyed by the closure node's id. The
+    /// `Expr::Closure` arm of `visit_internal` then reads them back so a
+    /// param whose type IS derivable no longer trips
+    /// `ClosureParamTypeMissing` under strict mode.
+    ///
+    /// Handles both call shapes that route to the same higher-order
+    /// signatures:
+    ///
+    /// * **Bare form** — `_list_map(xs, (x) => …)`: resolved straight
+    ///   through [`Self::resolve_call_signature`], args used as-is.
+    /// * **Method form** — `xs.map((x) => …)` / `range(n).map(…)`: the
+    ///   parser lowers this to a `FnCall` whose head is a
+    ///   `TokenKey::Dynamic(receiver)` segment followed by the method
+    ///   name. We map the list method name onto its `_list_*` intrinsic
+    ///   signature and synthesize an arg list with the receiver
+    ///   prepended as positional arg 0, so the exact same generic
+    ///   unification that the bare form uses applies.
+    pub(super) fn populate_closure_context(&mut self, path: &[TokenKey], args: &[CallArg]) {
+        // Resolve the signature + the effective positional arg list for
+        // unification. Two shapes feed the same machinery.
+        let Some((sig, eff_args)) = self.contextual_call_resolution(path, args) else {
+            return;
+        };
+        if sig.generics.is_empty() {
+            // A monomorphic signature still pins closure params directly
+            // from its declared `Closure<…>` slot (no unification
+            // needed), but the stdlib higher-order fns are all generic,
+            // so this is rare. We still handle it uniformly below by
+            // running `collect_bindings` (returns empty for no generics)
+            // and substituting (a no-op), so don't early-return.
+        }
+
+        // Run pass-1 generic unification off the non-closure args — this
+        // is exactly what `collect_bindings` does, and we reuse it so the
+        // `Closure<T, U>` slot's `T` resolves to the element type bound
+        // from the `List<T>` receiver / init arg.
+        let bindings = {
+            let scope = self.build_type_scope();
+            collect_bindings(&sig, &eff_args, &scope)
+        };
+
+        // For each closure-literal arg whose slot is `Closure<…>`,
+        // substitute the slot's leading (param) type vars under the
+        // bindings and record the concrete ones.
+        let mut to_record: Vec<(
+            relon_parser::NodeId,
+            HashMap<String, relon_parser::TypeNode>,
+        )> = Vec::new();
+        for (idx, arg) in eff_args.iter().enumerate() {
+            let Expr::Closure { params, .. } = &*arg.value.expr else {
+                continue;
+            };
+            let Some(param_ty) = (if idx < sig.params.len() {
+                Some(&sig.params[idx].ty)
+            } else {
+                sig.variadic_tail.as_ref()
+            }) else {
+                continue;
+            };
+            if param_ty.path.len() != 1 {
+                continue;
+            }
+            let head = param_ty.path[0].as_str();
+            if head != "Closure" && head != "Fn" {
+                continue;
+            }
+            if param_ty.generics.is_empty() {
+                continue;
+            }
+            // Slot layout: [param_tys.., return_ty]. Only the leading
+            // param slots feed closure-param typing.
+            let (slot_param_tys, _ret) = param_ty.generics.split_at(param_ty.generics.len() - 1);
+            let mut derived: HashMap<String, relon_parser::TypeNode> = HashMap::new();
+            for (p_idx, cp) in params.iter().enumerate() {
+                // An explicit annotation already owns this param — no
+                // contextual derivation needed (and the strict guard
+                // doesn't fire on it anyway).
+                if cp.type_hint.is_some() {
+                    continue;
+                }
+                let Some(slot) = slot_param_tys.get(p_idx) else {
+                    continue;
+                };
+                let mut sub = slot.clone();
+                crate::sig::substitute_in_type_node(&mut sub, &sig.generics, &bindings);
+                // Only pin params whose type resolved to something
+                // concrete. A residual `Any` (unbindable generic) is left
+                // unpinned so the strict guard still rejects the true
+                // leak.
+                if matches!(
+                    crate::infer::infer_from_type_node(&sub),
+                    crate::infer::InferredType::Any
+                ) {
+                    continue;
+                }
+                derived.insert(cp.name.clone(), sub);
+            }
+            if !derived.is_empty() {
+                to_record.push((arg.value.id, derived));
+            }
+        }
+        for (id, derived) in to_record {
+            self.closure_param_context.insert(id, derived);
+        }
+    }
+
+    /// Resolve a call site to `(signature, effective positional args)`
+    /// for R1 contextual closure typing. Covers the bare form and the
+    /// `TokenKey::Dynamic`-head list-method form. Returns `None` when no
+    /// higher-order signature applies (so contextual typing is a no-op
+    /// and the strict guard keeps owning the verdict).
+    fn contextual_call_resolution(
+        &self,
+        path: &[TokenKey],
+        args: &[CallArg],
+    ) -> Option<(FnSignature, Vec<CallArg>)> {
+        // Bare form: every segment is a String — `resolve_call_signature`
+        // already fans out across closure-index / host / stdlib / schema
+        // method tables.
+        if path.iter().all(|s| matches!(s, TokenKey::String(_, _, _))) {
+            let sig = self.resolve_call_signature(path)?;
+            return Some((sig, args.to_vec()));
+        }
+        // Method form: `<receiver>.method(args)` lowers to
+        // `[Dynamic(receiver), String(method)]`. Map the recognized list
+        // methods onto their `_list_*` intrinsic and prepend the receiver
+        // as positional arg 0.
+        if path.len() != 2 {
+            return None;
+        }
+        let TokenKey::Dynamic(receiver, _) = &path[0] else {
+            return None;
+        };
+        let TokenKey::String(method, _, _) = &path[1] else {
+            return None;
+        };
+        let intrinsic = match method.as_str() {
+            "map" => "_list_map",
+            "filter" => "_list_filter",
+            "reduce" => "_list_reduce",
+            "contains" => "_list_contains",
+            _ => return None,
+        };
+        let sig = lookup_signature(intrinsic, self.tree, &self.tree.host_fn_signatures)?;
+        let mut eff_args: Vec<CallArg> = Vec::with_capacity(args.len() + 1);
+        eff_args.push(CallArg {
+            name: None,
+            value: receiver.clone(),
+        });
+        eff_args.extend(args.iter().cloned());
+        Some((sig, eff_args))
     }
 }

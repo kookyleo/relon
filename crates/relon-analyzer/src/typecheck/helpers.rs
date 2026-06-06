@@ -17,7 +17,7 @@
 //!   free helpers rather than being duplicated in every domain file.
 
 use super::Walker;
-use crate::infer::{self, InferredType, TypeScope};
+use crate::infer::{InferredType, TypeScope};
 use crate::sig::{type_node_simple, FnParam, FnSignature};
 use crate::tree::AnalyzedTree;
 use relon_parser::{ClosureParam, Node, TypeNode};
@@ -285,33 +285,6 @@ impl<'a> Walker<'a> {
     pub(super) fn build_type_scope(&self) -> TypeScope<'_> {
         TypeScope {
             locals: HashMap::new(),
-            parent_locals: Vec::new(),
-            schemas: Some(&self.schema_index),
-            frames: self.scope_stack.iter().collect(),
-            tree: Some(self.tree),
-        }
-    }
-
-    /// v1.5 helper: build a type-scope with the supplied closure
-    /// parameters seeded into `locals`, so a strict-mode closure-body
-    /// inference walks the body in the same scope shape the runtime
-    /// would produce when calling the closure. Untyped params land as
-    /// `Any` (the strict-mode untyped-param check already pinned
-    /// the diagnostic on the closure node, so we don't need to fail
-    /// here as well).
-    pub(super) fn build_type_scope_with_closure(&self, params: &[ClosureParam]) -> TypeScope<'_> {
-        let mut locals = HashMap::new();
-        let imports = self.tree.workspace_import_index.as_ref();
-        for p in params {
-            let ty = p
-                .type_hint
-                .as_ref()
-                .map(|t| infer::infer_from_type_node_with_imports(t, imports))
-                .unwrap_or(InferredType::Any);
-            locals.insert(p.name.clone(), ty);
-        }
-        TypeScope {
-            locals,
             parent_locals: Vec::new(),
             schemas: Some(&self.schema_index),
             frames: self.scope_stack.iter().collect(),
