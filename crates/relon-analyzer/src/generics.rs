@@ -151,7 +151,11 @@ pub(crate) fn unify(
 /// inside generics, fn types) collapse to `Any`. The cases that
 /// matter for v1.1's stdlib pipeline (`Int`, `String`, `Bool`,
 /// `List<X>`, `Schema(name)`) all round-trip cleanly.
-fn type_node_for(t: &InferredType) -> TypeNode {
+///
+/// `pub(crate)` so the R1 comprehension-binding typing in the
+/// type-check walker can reuse the same lift when it pins the
+/// iteration variable's derived element type.
+pub(crate) fn type_node_for(t: &InferredType) -> TypeNode {
     use crate::sig::{type_node_generic, type_node_simple};
     match t {
         InferredType::Any => type_node_simple("Any"),

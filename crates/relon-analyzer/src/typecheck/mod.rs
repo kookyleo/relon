@@ -41,8 +41,7 @@
 //!   `closest_variant`, `same_outer_container`, `required_and_max`,
 //!   `extract_closure_signature`, `param_is_polymorphic`,
 //!   `stdlib_registered_names`, `stdlib_names`) + small Walker
-//!   scaffolding (`build_type_scope` /
-//!   `build_type_scope_with_closure` / `is_known_fn` /
+//!   scaffolding (`build_type_scope` / `is_known_fn` /
 //!   `lookup_field_node` / `dynamic_save`).
 //! - **`index`** — pre-walk side-table builders
 //!   (`build_schema_index` / `build_enum_index` /
@@ -133,6 +132,7 @@ pub fn typecheck(root: &Node, tree: &mut AnalyzedTree) {
         variant_field_index,
         base_index,
         pipe_target_calls,
+        closure_param_context: std::collections::HashMap::new(),
     };
     walker.visit(root);
 }
@@ -156,6 +156,21 @@ struct Walker<'a> {
     /// these ids before recursing so the FnCall arm can suppress the
     /// signature check on them.
     pipe_target_calls: HashSet<relon_parser::NodeId>,
+    /// R1 (contextual closure typing): when a closure literal appears as
+    /// an argument to a call/method whose resolved signature pins a
+    /// `Closure<…>` slot at that position, we derive the closure's
+    /// parameter types from the call context (unifying the signature's
+    /// generics off the *other* args / receiver) and record them here,
+    /// keyed by the closure node's id. The `Expr::Closure` arm consults
+    /// this table so an otherwise-untyped param whose type IS derivable
+    /// no longer trips `ClosureParamTypeMissing` under strict mode. Each
+    /// entry is `param_name → TypeNode`; only the params that context
+    /// could pin appear, so a genuinely unbindable param still falls
+    /// through to the strict guard.
+    closure_param_context: std::collections::HashMap<
+        relon_parser::NodeId,
+        std::collections::HashMap<String, relon_parser::TypeNode>,
+    >,
 }
 
 impl<'a> Walker<'a> {
@@ -280,10 +295,25 @@ impl<'a> Walker<'a> {
                 body,
                 return_type,
             } => {
+                // R1: contextual param types derived from the enclosing
+                // call site (if any), keyed by this closure node's id.
+                // An untyped param that context could pin reads its type
+                // from here; the strict guard then skips it.
+                let ctx_param_types = self.closure_param_context.get(&node.id).cloned();
                 let mut frame = ScopeFrame::default();
                 for param in params {
                     frame.closure_params.insert(param.name.clone(), body.id);
                     if let Some(t) = &param.type_hint {
+                        frame
+                            .closure_param_types
+                            .insert(param.name.clone(), t.clone());
+                    } else if let Some(t) =
+                        ctx_param_types.as_ref().and_then(|m| m.get(&param.name))
+                    {
+                        // R1: seed the contextually-derived type so the
+                        // body's inference scope resolves `Variable(x)`
+                        // heads to the pinned type — same slot the
+                        // explicit annotation would fill.
                         frame
                             .closure_param_types
                             .insert(param.name.clone(), t.clone());
@@ -294,16 +324,30 @@ impl<'a> Walker<'a> {
                 // which leaks an unclassified type into the body's
                 // inference scope. Pin the diagnostic on the closure's
                 // own range (the param spans aren't on `ClosureParam`).
+                //
+                // R1: a param whose type the enclosing call pins
+                // contextually is *not* an `Any` leak — its type is
+                // derivable, so suppress the diagnostic for it. Params
+                // that context could not pin still fire (the strict guard
+                // is narrowed, not removed).
                 if self.tree.strict_mode {
                     for param in params {
-                        if param.type_hint.is_none() {
-                            self.tree
-                                .diagnostics
-                                .push(Diagnostic::ClosureParamTypeMissing {
-                                    param_name: param.name.clone(),
-                                    range: span_of(node.range),
-                                });
+                        if param.type_hint.is_some() {
+                            continue;
                         }
+                        let pinned_by_context = ctx_param_types
+                            .as_ref()
+                            .map(|m| m.contains_key(&param.name))
+                            .unwrap_or(false);
+                        if pinned_by_context {
+                            continue;
+                        }
+                        self.tree
+                            .diagnostics
+                            .push(Diagnostic::ClosureParamTypeMissing {
+                                param_name: param.name.clone(),
+                                range: span_of(node.range),
+                            });
                     }
                 }
                 // v1.6: ban `Any` (recursively) in closure param types
@@ -349,7 +393,15 @@ impl<'a> Walker<'a> {
                     // succeed; if it lands on `Any` we can't
                     // distinguish a typed-`Any` slot from a real
                     // failure, so push a closure-body diagnostic.
-                    let scope = self.build_type_scope_with_closure(params);
+                    //
+                    // R1: `frame` (already pushed onto the scope stack)
+                    // carries both explicit and contextually-derived
+                    // closure-param types, so `build_type_scope` resolves
+                    // `Variable(x)` heads to the pinned types and the
+                    // body infers concretely — no false
+                    // `ClosureReturnTypeUnknown` when the type IS
+                    // derivable.
+                    let scope = self.build_type_scope();
                     let body_ty = infer_type(body, &scope).unwrap_or(InferredType::Any);
                     if matches!(body_ty, InferredType::Any) {
                         self.tree
@@ -452,6 +504,11 @@ impl<'a> Walker<'a> {
                 self.check_fn_call(node, path, args);
                 self.check_strict_fn_call(node, path);
                 self.check_method_dispatch(node, path);
+                // R1: derive contextual closure-param types from this
+                // call's resolved signature *before* recursing, so the
+                // `Expr::Closure` arm sees the pinned types when it
+                // decides whether to fire `ClosureParamTypeMissing`.
+                self.populate_closure_context(path, args);
                 for arg in args {
                     self.visit_internal(&arg.value, None);
                 }
@@ -473,6 +530,76 @@ impl<'a> Walker<'a> {
                 } else {
                     self.visit_internal(expr, None);
                 }
+            }
+            Expr::Comprehension {
+                element,
+                id,
+                iterable,
+                condition,
+            } => {
+                // R1: `[ body for x in <iterable> ]` binds `x` to the
+                // iterable's element type. We infer the iterable's type,
+                // peel its element type (`List<T>` → `T`, `range(...)` →
+                // `Int`, list literal `Tuple(..)` → join), and push a
+                // scope frame whose `closure_param_types` carries `x`.
+                // The element / condition bodies then infer `Variable(x)`
+                // concretely instead of tripping `UnknownReferenceType`.
+                //
+                // The iterable is checked in the *outer* scope (the
+                // binding isn't visible to its own source).
+                self.visit_internal(iterable, None);
+
+                let elem_ty = {
+                    let scope = self.build_type_scope();
+                    let iter_ty = infer_type(iterable, &scope).unwrap_or(InferredType::Any);
+                    match iter_ty {
+                        InferredType::List(t) => Some(*t),
+                        InferredType::Dict(v) => Some(*v),
+                        InferredType::Tuple(elems) if !elems.is_empty() => elems
+                            .into_iter()
+                            .reduce(|acc, t| InferredType::join(&acc, &t)),
+                        _ => None,
+                    }
+                };
+
+                let mut frame = ScopeFrame::default();
+                frame.closure_params.insert(id.clone(), element.id);
+                // Only pin the binding's type when it derived to
+                // something concrete.
+                let pinned = match &elem_ty {
+                    Some(t) if !matches!(t, InferredType::Any) => {
+                        let tn = crate::generics::type_node_for(t);
+                        frame.closure_param_types.insert(id.clone(), tn);
+                        true
+                    }
+                    _ => false,
+                };
+                // R1: keep rejecting true `Any` leaks. When the iterable's
+                // element type isn't derivable (e.g. iterating a scalar,
+                // or an opaque value), strict mode must not silently
+                // accept the comprehension — the binding `x` would leak
+                // `Any` into the body. The `closure_params` entry above
+                // would otherwise let `check_strict_path` dedup-suppress
+                // the body reference (it can't tell a comprehension
+                // binding from a closure param), so we surface the failure
+                // here on the iterable itself.
+                if !pinned && self.tree.strict_mode {
+                    self.tree
+                        .diagnostics
+                        .push(Diagnostic::ExpressionTypeUnknown {
+                            reason: format!(
+                                "comprehension binding `{id}` has no derivable element type \
+                                 (the iterable's element type is not statically known)"
+                            ),
+                            range: span_of(iterable.range),
+                        });
+                }
+                self.scope_stack.push(frame);
+                self.visit_internal(element, None);
+                if let Some(c) = condition {
+                    self.visit_internal(c, None);
+                }
+                self.scope_stack.pop();
             }
             _ => {
                 for child in child_nodes(node) {

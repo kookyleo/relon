@@ -3091,3 +3091,151 @@ fn phase9_b3_strict_where_binding_shadows_outer() {
         unresolved
     );
 }
+
+// ---- R1: contextual closure / comprehension typing -----------------
+
+/// R1 positive (bare form): `_list_map(xs, (x) => …)` derives `x: Int`
+/// from the `List<Int>` receiver, so the untyped param no longer trips
+/// `ClosureParamTypeMissing` / `ClosureReturnTypeUnknown` under strict.
+#[test]
+fn r1_bare_list_map_untyped_param_pinned() {
+    let tree = analyze_str(
+        r#"
+        #main(Int n) -> List<Int>
+        _list_map([1, 2, 3], (x) => x * 2)
+        "#,
+    );
+    let missing = count(&tree, |d| {
+        matches!(d, Diagnostic::ClosureParamTypeMissing { .. })
+    });
+    let ret = count(&tree, |d| {
+        matches!(d, Diagnostic::ClosureReturnTypeUnknown { .. })
+    });
+    assert_eq!(
+        missing, 0,
+        "param should be context-pinned: {:?}",
+        tree.diagnostics
+    );
+    assert_eq!(
+        ret, 0,
+        "return should infer concretely: {:?}",
+        tree.diagnostics
+    );
+}
+
+/// R1 positive (method form): `range(n).map((x) => …)` routes through
+/// the `_list_map` intrinsic with the receiver as arg 0, deriving
+/// `x: Int` and suppressing both closure diagnostics.
+#[test]
+fn r1_method_map_untyped_param_pinned() {
+    let tree = analyze_str(
+        r#"
+        #main(Int n) -> Int
+        range(n).map((x) => x * 2)
+        "#,
+    );
+    let missing = count(&tree, |d| {
+        matches!(d, Diagnostic::ClosureParamTypeMissing { .. })
+    });
+    let ret = count(&tree, |d| {
+        matches!(d, Diagnostic::ClosureReturnTypeUnknown { .. })
+    });
+    assert_eq!(
+        missing, 0,
+        "method-form param should be context-pinned: {:?}",
+        tree.diagnostics
+    );
+    assert_eq!(
+        ret, 0,
+        "method-form return should infer: {:?}",
+        tree.diagnostics
+    );
+}
+
+/// R1 positive (reduce, two closure params): `_list_reduce(xs, 0, (a, x)
+/// => a + x)` binds both the accumulator (`U` from `init`) and the
+/// element (`T` from `List<T>`), so neither param flags.
+#[test]
+fn r1_reduce_both_params_pinned() {
+    let tree = analyze_str(
+        r#"
+        #main(Int n) -> Int
+        _list_reduce(range(n), 0, (a, x) => a + x)
+        "#,
+    );
+    let missing = count(&tree, |d| {
+        matches!(d, Diagnostic::ClosureParamTypeMissing { .. })
+    });
+    assert_eq!(
+        missing, 0,
+        "both reduce params should be pinned: {:?}",
+        tree.diagnostics
+    );
+}
+
+/// R1 positive (comprehension): `[x * 2 for x in range(n)]` derives
+/// `x: Int` from the iterable so the body reference resolves instead
+/// of `UnknownReferenceType`.
+#[test]
+fn r1_comprehension_binding_typed_from_iterable() {
+    let tree = analyze_str(
+        r#"
+        #main(Int n) -> List<Int>
+        [x * 2 for x in range(n)]
+        "#,
+    );
+    let unknown = count(
+        &tree,
+        |d| matches!(d, Diagnostic::UnknownReferenceType { name, .. } if name == "x"),
+    );
+    assert_eq!(
+        unknown, 0,
+        "comprehension binding should be typed: {:?}",
+        tree.diagnostics
+    );
+}
+
+/// R1 negative: a closure with NO pinning call context still trips the
+/// strict guard. The narrowing must only accept *derivable* cases —
+/// true `Any` leaks stay rejected.
+#[test]
+fn r1_uncontextualized_closure_still_rejected() {
+    let tree = analyze_str(
+        r#"
+        #main(Int n) -> List<Int>
+        [(x) => x + 1, n]
+        "#,
+    );
+    let missing = count(
+        &tree,
+        |d| matches!(d, Diagnostic::ClosureParamTypeMissing { param_name, .. } if param_name == "x"),
+    );
+    assert!(
+        missing >= 1,
+        "uncontextualized closure must still flag: {:?}",
+        tree.diagnostics
+    );
+}
+
+/// R1 negative (comprehension): a non-derivable iterable element leaves
+/// the binding `Any`, so strict mode still rejects it. `n` is an `Int`
+/// (not iterable into a known element type), so the binding can't be
+/// pinned and the iterable surfaces `ExpressionTypeUnknown`.
+#[test]
+fn r1_comprehension_non_iterable_still_rejected() {
+    let tree = analyze_str(
+        r#"
+        #main(Int n) -> List<Int>
+        [y * 2 for y in n]
+        "#,
+    );
+    let unknown = count(
+        &tree,
+        |d| matches!(d, Diagnostic::ExpressionTypeUnknown { reason, .. } if reason.contains("`y`")),
+    );
+    assert!(
+        unknown >= 1,
+        "non-derivable comprehension binding must still flag: {:?}",
+        tree.diagnostics
+    );
+}
