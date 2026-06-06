@@ -784,6 +784,78 @@ pub fn all_cases() -> Vec<CorpusCase> {
             tier: Tier::StdlibList,
             supported_by: TW_CR,
         },
+        // ---- Wave R3b: typed list higher-order ops over List<Float> +
+        //      the element-type-changing numeric `map` shapes. The
+        //      `list_float_*` bundled bodies share the `List<Int>` record
+        //      layout (8-byte slots) and dispatch the closure per element
+        //      via `Op::CallClosure`, so cranelift / tree-walk agree
+        //      element-by-element. Float arithmetic inside the closure is
+        //      IEEE-754 (no overflow trap), matched to the tree-walker.
+        //      List-returning shapes ride `TW_CR` (the bytecode VM rejects
+        //      List return entry shapes and these aren't in the trace
+        //      recipe catalogue); the `Float`-returning reduce rides
+        //      `TW_CR` too (Float scalar return is out of the bytecode
+        //      entry envelope). The wasm / llvm-native legs are covered by
+        //      the dedicated `list_float_hof_four_way` test +
+        //      `aot_wasm_parity::r3b_float_reduce_*`.
+        CorpusCase {
+            name: "r3b_float_map",
+            source: "#main() -> List<Float>\n[1.0, 2.0, 3.0].map((Float x) => x * 2.0)",
+            args_factory: no_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r3b_float_filter",
+            source: "#main() -> List<Float>\n[0.5, 1.5, 2.5, 0.9].filter((Float x) => x > 1.0)",
+            args_factory: no_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r3b_float_reduce_sum",
+            source: "#main() -> Float\n\
+                      _list_reduce([1.0, 2.0, 3.0, 4.0], 0.0, (Float a, Float x) => a + x)",
+            args_factory: no_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r3b_float_reduce_max",
+            source: "#main() -> Float\n\
+                      _list_reduce([3.0, 1.0, 4.0, 1.5, 9.0, 2.0], 0.0, \
+                      (Float a, Float x) => x > a ? x : a)",
+            args_factory: no_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        // Element-type-changing numeric map: result list element type is
+        // taken from the closure's inferred return type.
+        CorpusCase {
+            name: "r3b_int_to_float_map",
+            source: "#main() -> List<Float>\n_list_map([1, 2, 3], (Int x) => x * 2.0)",
+            args_factory: no_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r3b_float_to_int_map",
+            source: "#main() -> List<Int>\n_list_map([1.5, 2.7, 3.2], (Float x) => x > 2.0 ? 1 : 0)",
+            args_factory: no_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        // Empty source through a non-literal (range filtered to nothing,
+        // re-mapped to Float) — the `[]` literal isn't lowerable, so the
+        // empty-list edge rides a range-derived source.
+        CorpusCase {
+            name: "r3b_float_map_empty",
+            source: "#main(Int n) -> List<Float>\n\
+                      _list_map(range(n).filter((Int x) => x > 100), (Int x) => x * 1.0)",
+            args_factory: || one_int("n", 5),
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
         // ---- StdlibNormalize: most complex ----
         // Bytecode rejects `String`-typed return; trace const table
         // pre-computes both NFD / NFC payloads.

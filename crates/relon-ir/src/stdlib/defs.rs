@@ -2042,3 +2042,535 @@ fn list_int_fold_body() -> Vec<TaggedOp> {
         tt(Op::Return),
     ]
 }
+
+// =====================================================================
+// Wave R3b: typed list higher-order ops over `List<Float>` and the
+// element-type-changing numeric `map` shapes (Int<->Float).
+//
+// Every list record these bodies touch shares the `List<Int>` layout
+// (`[len: u32 LE][pad: u32][8-byte elements...]`, payload at
+// `(base + 4 + 7) & -8`). `List<Float>` stores each element as the
+// raw 8-byte IEEE-754 bit pattern in the same slot, so the only
+// difference from the `list_int_*` bodies is which typed load/store
+// op moves the element (an `f64.load` / `f64.store` keeps the value in
+// an f-register so the per-element closure call sees a Float) and the
+// `Op::CallClosure` param / ret type tag. The structural op stream
+// (sizing, payload alignment, loop, header writeback) is identical;
+// the helpers below take the element-load / element-store / closure
+// signature as parameters and emit the shared shape.
+//
+// String list HOFs (`List<String>` map / filter / reduce, or any map
+// whose closure returns a `String`) stay capped: a `List<String>`
+// result requires a runtime pointer-array builder with the
+// arena-relative handle-slot convention, which is not yet a proven
+// four-way substrate. Those surfaces fall through the typed-HOF
+// peephole and cap loudly through the existing dispatch-miss path.
+
+/// Shared map body parameterised by the element representation.
+///
+/// `load_elem` reads element `i` from the source payload (an
+/// `Op::LoadI64AtAbsolute` for Int sources, `Op::LoadF64AtAbsolute`
+/// for Float sources). `store_elem` writes the closure result into the
+/// destination payload (`StoreI64AtAbsolute` for Int results,
+/// `StoreF64AtAbsolute` for Float results). `param_ty` / `ret_ty` tag
+/// the per-element `Op::CallClosure` so codegen routes the value
+/// through the right register class. Byte-identical in structure to
+/// [`list_int_map_body`].
+fn list_map_body_typed(
+    load_elem: fn(u32) -> Op,
+    store_elem: fn(u32) -> Op,
+    param_ty: IrType,
+    ret_ty: IrType,
+) -> Vec<TaggedOp> {
+    const N: u32 = 0;
+    const I: u32 = 1;
+    const SRC_PAYLOAD: u32 = 2;
+    const DST_PAYLOAD: u32 = 3;
+    const NEW_BASE: u32 = 4;
+    vec![
+        tt(Op::LocalGet(0)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        // record_size = 8 + 8*n + 8
+        tt(Op::ConstI32(16)),
+        tt(Op::LetGet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(8)),
+        tt(Op::Mul(IrType::I32)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::AllocScratchDyn),
+        tt(Op::LetSet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        // store header: i32.store(new_base, n)
+        tt(Op::LetGet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        tt(Op::StoreI32AtAbsolute { offset: 0 }),
+        // src_payload = (xs + 4 + 7) & -8
+        tt(Op::LocalGet(0)),
+        tt(Op::ConstI32(4 + 7)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::ConstI32(-8)),
+        tt(Op::BitAnd(IrType::I32)),
+        tt(Op::LetSet {
+            idx: SRC_PAYLOAD,
+            ty: IrType::I32,
+        }),
+        // dst_payload = (new_base + 4 + 7) & -8
+        tt(Op::LetGet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(4 + 7)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::ConstI32(-8)),
+        tt(Op::BitAnd(IrType::I32)),
+        tt(Op::LetSet {
+            idx: DST_PAYLOAD,
+            ty: IrType::I32,
+        }),
+        // i = 0
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: I,
+            ty: IrType::I32,
+        }),
+        tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
+                result_ty: None,
+                body: vec![
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: N,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Ge(IrType::I32)),
+                    tt(Op::BrIf { label_depth: 1 }),
+                    // dst_addr = dst_payload + i * 8
+                    tt(Op::LetGet {
+                        idx: DST_PAYLOAD,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(8)),
+                    tt(Op::Mul(IrType::I32)),
+                    tt(Op::Add(IrType::I32)),
+                    // push closure handle (param 1)
+                    tt(Op::LocalGet(1)),
+                    // push the source element: load(src_payload + i*8)
+                    tt(Op::LetGet {
+                        idx: SRC_PAYLOAD,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(8)),
+                    tt(Op::Mul(IrType::I32)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(load_elem(0)),
+                    tt(Op::CallClosure {
+                        param_tys: vec![param_ty],
+                        ret_ty,
+                    }),
+                    // store: stack is [dst_addr, result]
+                    tt(store_elem(0)),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(1)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        tt(Op::LetGet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::Return),
+    ]
+}
+
+/// Shared filter body parameterised by the element representation. The
+/// predicate closure always returns `Bool`; only the element load /
+/// store op and the closure param type vary. Byte-identical in
+/// structure to [`list_int_filter_body`].
+fn list_filter_body_typed(
+    load_elem: fn(u32) -> Op,
+    store_elem: fn(u32) -> Op,
+    param_ty: IrType,
+    cur_val_ty: IrType,
+) -> Vec<TaggedOp> {
+    const N: u32 = 0;
+    const I: u32 = 1;
+    const SRC_PAYLOAD: u32 = 2;
+    const DST_PAYLOAD: u32 = 3;
+    const NEW_BASE: u32 = 4;
+    const OUT_COUNT: u32 = 5;
+    const CUR_VAL: u32 = 6;
+    const SINK: u32 = 7;
+    vec![
+        tt(Op::LocalGet(0)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(16)),
+        tt(Op::LetGet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(8)),
+        tt(Op::Mul(IrType::I32)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::AllocScratchDyn),
+        tt(Op::LetSet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::LocalGet(0)),
+        tt(Op::ConstI32(4 + 7)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::ConstI32(-8)),
+        tt(Op::BitAnd(IrType::I32)),
+        tt(Op::LetSet {
+            idx: SRC_PAYLOAD,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(4 + 7)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::ConstI32(-8)),
+        tt(Op::BitAnd(IrType::I32)),
+        tt(Op::LetSet {
+            idx: DST_PAYLOAD,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: I,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: OUT_COUNT,
+            ty: IrType::I32,
+        }),
+        tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
+                result_ty: None,
+                body: vec![
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: N,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Ge(IrType::I32)),
+                    tt(Op::BrIf { label_depth: 1 }),
+                    // cur_val = load(src_payload + i*8)
+                    tt(Op::LetGet {
+                        idx: SRC_PAYLOAD,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(8)),
+                    tt(Op::Mul(IrType::I32)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(load_elem(0)),
+                    tt(Op::LetSet {
+                        idx: CUR_VAL,
+                        ty: cur_val_ty,
+                    }),
+                    // closure(cur_val) -> bool
+                    tt(Op::LocalGet(1)),
+                    tt(Op::LetGet {
+                        idx: CUR_VAL,
+                        ty: cur_val_ty,
+                    }),
+                    tt(Op::CallClosure {
+                        param_tys: vec![param_ty],
+                        ret_ty: IrType::Bool,
+                    }),
+                    tt(Op::If {
+                        result_ty: IrType::I32,
+                        then_body: vec![
+                            tt(Op::LetGet {
+                                idx: DST_PAYLOAD,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::LetGet {
+                                idx: OUT_COUNT,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(8)),
+                            tt(Op::Mul(IrType::I32)),
+                            tt(Op::Add(IrType::I32)),
+                            tt(Op::LetGet {
+                                idx: CUR_VAL,
+                                ty: cur_val_ty,
+                            }),
+                            tt(store_elem(0)),
+                            tt(Op::LetGet {
+                                idx: OUT_COUNT,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(1)),
+                            tt(Op::Add(IrType::I32)),
+                            tt(Op::LetSet {
+                                idx: OUT_COUNT,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(0)),
+                        ],
+                        else_body: vec![tt(Op::ConstI32(0))],
+                    }),
+                    tt(Op::LetSet {
+                        idx: SINK,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(1)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        tt(Op::LetGet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: OUT_COUNT,
+            ty: IrType::I32,
+        }),
+        tt(Op::StoreI32AtAbsolute { offset: 0 }),
+        tt(Op::LetGet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::Return),
+    ]
+}
+
+/// Shared fold body parameterised by the element / accumulator
+/// representation (Int -> `I64`, Float -> `F64`). The accumulator and
+/// each element share `acc_ty`; the closure is `(acc_ty, acc_ty) ->
+/// acc_ty`. Byte-identical in structure to [`list_int_fold_body`].
+fn list_fold_body_typed(load_elem: fn(u32) -> Op, acc_ty: IrType) -> Vec<TaggedOp> {
+    const N: u32 = 0;
+    const I: u32 = 1;
+    const SRC_PAYLOAD: u32 = 2;
+    const ACC: u32 = 3;
+    vec![
+        tt(Op::LocalGet(0)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        tt(Op::LocalGet(0)),
+        tt(Op::ConstI32(4 + 7)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::ConstI32(-8)),
+        tt(Op::BitAnd(IrType::I32)),
+        tt(Op::LetSet {
+            idx: SRC_PAYLOAD,
+            ty: IrType::I32,
+        }),
+        // acc = init
+        tt(Op::LocalGet(1)),
+        tt(Op::LetSet {
+            idx: ACC,
+            ty: acc_ty,
+        }),
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: I,
+            ty: IrType::I32,
+        }),
+        tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
+                result_ty: None,
+                body: vec![
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: N,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Ge(IrType::I32)),
+                    tt(Op::BrIf { label_depth: 1 }),
+                    tt(Op::LocalGet(2)),
+                    tt(Op::LetGet {
+                        idx: ACC,
+                        ty: acc_ty,
+                    }),
+                    tt(Op::LetGet {
+                        idx: SRC_PAYLOAD,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(8)),
+                    tt(Op::Mul(IrType::I32)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(load_elem(0)),
+                    tt(Op::CallClosure {
+                        param_tys: vec![acc_ty, acc_ty],
+                        ret_ty: acc_ty,
+                    }),
+                    tt(Op::LetSet {
+                        idx: ACC,
+                        ty: acc_ty,
+                    }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(1)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        tt(Op::LetGet {
+            idx: ACC,
+            ty: acc_ty,
+        }),
+        tt(Op::Return),
+    ]
+}
+
+/// `list_float_map(xs: List<Float>, f: Closure<F64 -> F64>) -> List<Float>`.
+pub(super) fn list_float_map() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_float_map",
+        vec![IrType::ListFloat, IrType::Closure],
+        IrType::ListFloat,
+        || {
+            list_map_body_typed(
+                |o| Op::LoadF64AtAbsolute { offset: o },
+                |o| Op::StoreF64AtAbsolute { offset: o },
+                IrType::F64,
+                IrType::F64,
+            )
+        },
+    )
+}
+
+/// `list_int_map_to_float(xs: List<Int>, f: Closure<I64 -> F64>) -> List<Float>`
+/// — element-type-changing map whose closure return type widens the
+/// result list to `List<Float>`.
+pub(super) fn list_int_map_to_float() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_int_map_to_float",
+        vec![IrType::ListInt, IrType::Closure],
+        IrType::ListFloat,
+        || {
+            list_map_body_typed(
+                |o| Op::LoadI64AtAbsolute { offset: o },
+                |o| Op::StoreF64AtAbsolute { offset: o },
+                IrType::I64,
+                IrType::F64,
+            )
+        },
+    )
+}
+
+/// `list_float_map_to_int(xs: List<Float>, f: Closure<F64 -> I64>) -> List<Int>`
+/// — element-type-changing map (Float source, Int closure result).
+pub(super) fn list_float_map_to_int() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_float_map_to_int",
+        vec![IrType::ListFloat, IrType::Closure],
+        IrType::ListInt,
+        || {
+            list_map_body_typed(
+                |o| Op::LoadF64AtAbsolute { offset: o },
+                |o| Op::StoreI64AtAbsolute { offset: o },
+                IrType::F64,
+                IrType::I64,
+            )
+        },
+    )
+}
+
+/// `list_float_filter(xs: List<Float>, f: Closure<F64 -> Bool>) -> List<Float>`.
+pub(super) fn list_float_filter() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_float_filter",
+        vec![IrType::ListFloat, IrType::Closure],
+        IrType::ListFloat,
+        || {
+            list_filter_body_typed(
+                |o| Op::LoadF64AtAbsolute { offset: o },
+                |o| Op::StoreF64AtAbsolute { offset: o },
+                IrType::F64,
+                IrType::F64,
+            )
+        },
+    )
+}
+
+/// `list_float_fold(xs: List<Float>, init: Float, f: Closure<(F64, F64) -> F64>) -> Float`.
+pub(super) fn list_float_fold() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_float_fold",
+        vec![IrType::ListFloat, IrType::F64, IrType::Closure],
+        IrType::F64,
+        || list_fold_body_typed(|o| Op::LoadF64AtAbsolute { offset: o }, IrType::F64),
+    )
+}

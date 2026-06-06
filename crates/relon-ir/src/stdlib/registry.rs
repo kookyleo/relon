@@ -23,8 +23,9 @@ use super::case_fold::{
 };
 use super::defs::{
     abs_int, concat_string_string, contains_string, glob_match_string, is_empty_string,
-    length_string_to_int, list_bool_length, list_float_length, list_int_filter, list_int_fold,
-    list_int_length_to_int, list_int_map, list_int_max, list_int_sum, list_list_length,
+    length_string_to_int, list_bool_length, list_float_filter, list_float_fold, list_float_length,
+    list_float_map, list_float_map_to_int, list_int_filter, list_int_fold, list_int_length_to_int,
+    list_int_map, list_int_map_to_float, list_int_max, list_int_sum, list_list_length,
     list_schema_length, list_string_length, max_int, min_int, starts_with_string, substring_string,
 };
 use super::normalization::{
@@ -187,6 +188,26 @@ pub fn builtin_stdlib() -> &'static [StdlibFunction] {
             // `list_<T>_length` shapes — only the `ListList` param tag
             // differs.
             list_list_length(),
+            // Wave R3b: typed list higher-order ops over `List<Float>`
+            // plus the element-type-changing numeric `map` shapes.
+            // Appended at the tail (indices 39+) so every position-pinned
+            // index above stays put — existing-construct cranelift bytes
+            // are unchanged, so GENERATOR_VERSION does not move.
+            //   * `39` — `list_float_map(List<Float>, Closure<F64 -> F64>)
+            //             -> List<Float>`.
+            //   * `40` — `list_float_filter(List<Float>,
+            //             Closure<F64 -> Bool>) -> List<Float>`.
+            //   * `41` — `list_float_fold(List<Float>, Float,
+            //             Closure<(F64, F64) -> F64>) -> Float`.
+            //   * `42` — `list_int_map_to_float(List<Int>,
+            //             Closure<I64 -> F64>) -> List<Float>`.
+            //   * `43` — `list_float_map_to_int(List<Float>,
+            //             Closure<F64 -> I64>) -> List<Int>`.
+            list_float_map(),
+            list_float_filter(),
+            list_float_fold(),
+            list_int_map_to_float(),
+            list_float_map_to_int(),
         ]
     })
 }

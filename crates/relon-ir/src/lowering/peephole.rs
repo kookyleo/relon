@@ -1561,6 +1561,17 @@ pub(super) fn try_lower_list_filter(
     let saved_lambda_len = ctx.lambda_table.borrow().len();
     let lower_res = lower_expr(&args[0].value.expr, args[0].value.range, ctx);
     let produced = ctx.tstack.last().copied();
+    // Wave R3b: a `List<Float>` source routes to the float filter body
+    // via the shared typed-HOF emitter. Roll back the speculative source
+    // lowering first (the typed emitter re-lowers it itself), keeping
+    // the `List<Int>` path below byte-identical.
+    if lower_res.is_ok() && produced == Some(IrType::ListFloat) {
+        ctx.out = saved_out;
+        ctx.tstack = saved_stack;
+        ctx.next_let_idx = saved_next_let;
+        ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+        return emit_list_hof_call(ListHofKind::Filter, args, range, ctx);
+    }
     if lower_res.is_err() || produced != Some(IrType::ListInt) {
         ctx.out = saved_out;
         ctx.tstack = saved_stack;
@@ -1632,42 +1643,218 @@ pub(super) fn try_lower_list_filter(
     Ok(Some(()))
 }
 
-/// Wave R3 shared emitter for the single-closure list HOFs
-/// (`list_int_map` / `list_int_filter`): speculatively lower `args[0]`
-/// (the list source) into a scratch op stream, roll back on a non-list
-/// result so dispatch can fall through, then lower the closure arg
-/// (`args[1]`) against the matching stdlib signature and emit
-/// `Op::Call(<builtin>)`. Leaves the callee's `List<Int>` return handle
-/// on the vstack.
+/// Speculatively lower the closure literal `node` with the given param
+/// types and a *candidate* return type, committing only when its body
+/// type-checks against that return slot. Returns `Ok(true)` and leaves
+/// the `MakeClosure` op + `Closure` tstack entry in place on success;
+/// on a body/return-type mismatch it rolls the ctx back fully (ops,
+/// tstack, let counter, reserved lambda slot) and returns `Ok(false)`
+/// so the caller can retry with an alternative return type. A genuine
+/// lowering error (not a return-type mismatch) propagates.
+fn try_lower_closure_with_ret(
+    node: &Node,
+    param_tys: &[IrType],
+    ret_ty: IrType,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<bool, LoweringError> {
+    let saved_out_len = ctx.out.len();
+    let saved_stack_len = ctx.tstack.len();
+    let saved_next_let = ctx.next_let_idx;
+    let saved_lambda_len = ctx.lambda_table.borrow().len();
+    match lower_closure_as_value(&node.expr, node.range, param_tys, ret_ty, ctx) {
+        Ok(()) => Ok(true),
+        Err(LoweringError::StdlibArgTypeMismatch { .. }) => {
+            // Body produced a different result slot than `ret_ty`. Roll
+            // back so the caller can try the other numeric width.
+            ctx.out.truncate(saved_out_len);
+            ctx.tstack.truncate(saved_stack_len);
+            ctx.next_let_idx = saved_next_let;
+            ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Single-closure list HOF kind dispatched by [`emit_list_hof_call`].
+#[derive(Clone, Copy)]
+enum ListHofKind {
+    Map,
+    Filter,
+}
+
+/// Wave R3 / R3b shared emitter for the single-closure list HOFs
+/// (`map` / `filter`) over `List<Int>` and `List<Float>` sources,
+/// including the element-type-changing numeric `map` (Int -> Float /
+/// Float -> Int): speculatively lower `args[0]` (the list source) into
+/// a scratch op stream, roll back on a non-list result so dispatch can
+/// fall through, then resolve the bundled body from the source element
+/// type (and, for `map`, the closure's inferred return type), lower
+/// the closure arg, and emit `Op::Call(<builtin>)`. Leaves the
+/// callee's result list handle on the vstack.
+///
+/// `List<String>` sources (and any map whose closure returns a String)
+/// are NOT handled here — they roll back and cap loudly through the
+/// regular dispatch-miss path, because a `List<String>` result needs a
+/// runtime pointer-array builder that is not yet a proven four-way
+/// substrate.
 ///
 /// The roll-back discipline (out / tstack / next_let_idx / lambda_table
 /// truncation) is identical to [`try_lower_list_filter`]'s so a source
-/// that doesn't lower to a list leaves the ctx pristine for the regular
-/// dispatch path.
-fn emit_list_int_hof_call(
-    builtin: &'static str,
+/// that doesn't lower to a supported list leaves the ctx pristine for
+/// the regular dispatch path.
+fn emit_list_hof_call(
+    kind: ListHofKind,
     args: &[relon_parser::CallArg],
     range: TokenRange,
     ctx: &mut LowerCtx<'_>,
 ) -> Result<Option<()>, LoweringError> {
+    // Speculatively lower the source list into a scratch op stream. The
+    // ctx's `out` / `tstack` are swapped out so a non-list (or
+    // unsupported element) source rolls back cleanly. The source ops
+    // are NOT committed until the whole HOF is decided — for `map` the
+    // closure's return-type probe runs first, so a String-returning map
+    // (which we cap) leaves the ctx pristine for the regular path.
     let saved_out = std::mem::take(&mut ctx.out);
     let saved_stack = std::mem::take(&mut ctx.tstack);
     let saved_next_let = ctx.next_let_idx;
     let saved_lambda_len = ctx.lambda_table.borrow().len();
-    let lower_res = lower_expr(&args[0].value.expr, args[0].value.range, ctx);
-    let produced = ctx.tstack.last().copied();
-    if lower_res.is_err() || produced != Some(IrType::ListInt) {
-        ctx.out = saved_out;
-        ctx.tstack = saved_stack;
+    let restore = |ctx: &mut LowerCtx<'_>, out: Vec<TaggedOp>, stack: Vec<IrType>| {
+        ctx.out = out;
+        ctx.tstack = stack;
         ctx.next_let_idx = saved_next_let;
         ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+    };
+    let lower_res = lower_expr(&args[0].value.expr, args[0].value.range, ctx);
+    let produced = ctx.tstack.last().copied();
+    // Only `List<Int>` / `List<Float>` sources are in the typed-HOF
+    // envelope (8-byte element slots). Everything else rolls back.
+    let src_elem = match produced {
+        Some(IrType::ListInt) => IrType::I64,
+        Some(IrType::ListFloat) => IrType::F64,
+        _ => {
+            restore(ctx, saved_out, saved_stack);
+            return Ok(None);
+        }
+    };
+    if lower_res.is_err() {
+        restore(ctx, saved_out, saved_stack);
         return Ok(None);
     }
-    let arg_stream = std::mem::replace(&mut ctx.out, saved_out);
-    ctx.out.extend(arg_stream);
-    let arg_stack = std::mem::replace(&mut ctx.tstack, saved_stack);
-    ctx.tstack.extend(arg_stack);
+    // Detach the committed source op-stream / type-stack; we splice it
+    // back (after the original outer stream) only once the closure half
+    // is decided. The closure half is lowered into a FRESH empty buffer
+    // so a failed map probe leaves nothing behind.
+    let src_stream = std::mem::take(&mut ctx.out);
+    let src_stack = std::mem::take(&mut ctx.tstack);
 
+    // Helper: commit the final stream as `saved_out ++ src ++ closure`
+    // (and the matching type stacks), then emit the call. `ctx.out` /
+    // `ctx.tstack` currently hold the closure-only stream.
+    fn commit(
+        ctx: &mut LowerCtx<'_>,
+        saved_out: Vec<TaggedOp>,
+        saved_stack: Vec<IrType>,
+        src_stream: Vec<TaggedOp>,
+        src_stack: Vec<IrType>,
+        builtin: &str,
+        range: TokenRange,
+    ) -> Result<Option<()>, LoweringError> {
+        let closure_stream = std::mem::take(&mut ctx.out);
+        let closure_stack = std::mem::take(&mut ctx.tstack);
+        ctx.out = saved_out;
+        ctx.out.extend(src_stream);
+        ctx.out.extend(closure_stream);
+        ctx.tstack = saved_stack;
+        ctx.tstack.extend(src_stack);
+        ctx.tstack.extend(closure_stack);
+        finish_list_hof(builtin, range, ctx)
+    }
+
+    match kind {
+        ListHofKind::Filter => {
+            let builtin = match src_elem {
+                IrType::I64 => "list_int_filter",
+                IrType::F64 => "list_float_filter",
+                _ => unreachable!("src_elem is I64 or F64"),
+            };
+            // Resolve the predicate closure signature (`(elem) -> Bool`)
+            // from the single side-table source of truth.
+            let (param_tys_c, ret_ty_c) =
+                stdlib_closure_arg_signature(builtin, 1).ok_or_else(|| {
+                    cap!(
+                        "emit_list_int_hof_call.unsupported_expr",
+                        LoweringError::UnsupportedExpr {
+                            kind: format!("{builtin} closure signature missing"),
+                            range,
+                        }
+                    )
+                })?;
+            lower_closure_as_value(
+                &args[1].value.expr,
+                args[1].value.range,
+                &param_tys_c,
+                ret_ty_c,
+                ctx,
+            )?;
+            commit(
+                ctx,
+                saved_out,
+                saved_stack,
+                src_stream,
+                src_stack,
+                builtin,
+                range,
+            )
+        }
+        ListHofKind::Map => {
+            // Probe the closure body: try homogeneous (src -> src) first,
+            // then the numeric cross-type width. The candidates are
+            // mutually exclusive (the body yields exactly one slot).
+            let (homo_builtin, cross_builtin, cross_ret) = match src_elem {
+                IrType::I64 => ("list_int_map", "list_int_map_to_float", IrType::F64),
+                IrType::F64 => ("list_float_map", "list_float_map_to_int", IrType::I64),
+                _ => unreachable!(),
+            };
+            if try_lower_closure_with_ret(&args[1].value, &[src_elem], src_elem, ctx)? {
+                return commit(
+                    ctx,
+                    saved_out,
+                    saved_stack,
+                    src_stream,
+                    src_stack,
+                    homo_builtin,
+                    range,
+                );
+            }
+            if try_lower_closure_with_ret(&args[1].value, &[src_elem], cross_ret, ctx)? {
+                return commit(
+                    ctx,
+                    saved_out,
+                    saved_stack,
+                    src_stream,
+                    src_stack,
+                    cross_builtin,
+                    range,
+                );
+            }
+            // Neither numeric return matched (e.g. a String-returning
+            // map). Nothing was committed; restore so the regular
+            // dispatch path caps it loudly.
+            restore(ctx, saved_out, saved_stack);
+            Ok(None)
+        }
+    }
+}
+
+/// Finish a single-closure list HOF: pop the closure + source handles,
+/// emit `Op::Call(<builtin>)` with the registry-declared param / ret
+/// types, and push the result handle.
+fn finish_list_hof(
+    builtin: &str,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
     let fn_idx = stdlib_function_index(builtin).ok_or_else(|| {
         cap!(
             "emit_list_int_hof_call.unknown_stdlib_method.1",
@@ -1690,23 +1877,6 @@ fn emit_list_int_hof_call(
     })?;
     let params = meta.params.clone();
     let ret = meta.ret;
-
-    let (param_tys_c, ret_ty_c) = stdlib_closure_arg_signature(builtin, 1).ok_or_else(|| {
-        cap!(
-            "emit_list_int_hof_call.unsupported_expr",
-            LoweringError::UnsupportedExpr {
-                kind: format!("{builtin} closure signature missing"),
-                range,
-            }
-        )
-    })?;
-    lower_closure_as_value(
-        &args[1].value.expr,
-        args[1].value.range,
-        &param_tys_c,
-        ret_ty_c,
-        ctx,
-    )?;
     ctx.tstack.pop(); // closure
     ctx.tstack.pop(); // source list handle
     ctx.out.push(TaggedOp {
@@ -1738,6 +1908,17 @@ fn emit_list_int_fold_call(
     let saved_lambda_len = ctx.lambda_table.borrow().len();
     let lower_res = lower_expr(&args[0].value.expr, args[0].value.range, ctx);
     let produced = ctx.tstack.last().copied();
+    // Wave R3b: a `List<Float>` source folds through `list_float_fold`
+    // with an F64 accumulator. Roll back the speculative source first
+    // (the float emitter re-lowers it), keeping the `List<Int>` path
+    // below byte-identical.
+    if lower_res.is_ok() && produced == Some(IrType::ListFloat) {
+        ctx.out = saved_out;
+        ctx.tstack = saved_stack;
+        ctx.next_let_idx = saved_next_let;
+        ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+        return emit_list_float_fold_call(args, range, ctx);
+    }
     if lower_res.is_err() || produced != Some(IrType::ListInt) {
         ctx.out = saved_out;
         ctx.tstack = saved_stack;
@@ -1793,6 +1974,116 @@ fn emit_list_int_fold_call(
                 "emit_list_int_fold_call.unsupported_expr.2",
                 LoweringError::UnsupportedExpr {
                     kind: "list_int_fold closure signature missing".to_string(),
+                    range,
+                }
+            )
+        })?;
+    lower_closure_as_value(
+        &args[2].value.expr,
+        args[2].value.range,
+        &param_tys_c,
+        ret_ty_c,
+        ctx,
+    )?;
+    ctx.tstack.pop(); // closure
+    ctx.tstack.pop(); // init
+    ctx.tstack.pop(); // source list handle
+    ctx.out.push(TaggedOp {
+        op: Op::Call {
+            fn_index: fn_idx,
+            arg_count: 3,
+            param_tys: params,
+            ret_ty: ret,
+        },
+        range,
+    });
+    ctx.tstack.push(ret);
+    Ok(Some(()))
+}
+
+/// Wave R3b emitter for `_list_reduce(xs, init, f)` / `xs.reduce(init,
+/// f)` over a `List<Float>` source: folds to an F64 accumulator through
+/// the bundled `list_float_fold` body. The source has already been
+/// rolled back by the caller, so this re-lowers it. The init expression
+/// lowers to F64 (an `Int` literal init like `0` is promoted to F64,
+/// mirroring the tree-walk's Int->Float coercion when folding floats);
+/// the fold closure is `(F64, F64) -> F64`. `+` inside the body is an
+/// IEEE add (no overflow trap) for Float, matching the tree-walker.
+fn emit_list_float_fold_call(
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    let saved_out = std::mem::take(&mut ctx.out);
+    let saved_stack = std::mem::take(&mut ctx.tstack);
+    let saved_next_let = ctx.next_let_idx;
+    let saved_lambda_len = ctx.lambda_table.borrow().len();
+    let lower_res = lower_expr(&args[0].value.expr, args[0].value.range, ctx);
+    let produced = ctx.tstack.last().copied();
+    if lower_res.is_err() || produced != Some(IrType::ListFloat) {
+        ctx.out = saved_out;
+        ctx.tstack = saved_stack;
+        ctx.next_let_idx = saved_next_let;
+        ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+        return Ok(None);
+    }
+    let arg_stream = std::mem::replace(&mut ctx.out, saved_out);
+    ctx.out.extend(arg_stream);
+    let arg_stack = std::mem::replace(&mut ctx.tstack, saved_stack);
+    ctx.tstack.extend(arg_stack);
+
+    let fn_idx = stdlib_function_index("list_float_fold").ok_or_else(|| {
+        cap!(
+            "emit_list_int_fold_call.unknown_stdlib_method.1",
+            LoweringError::UnknownStdlibMethod {
+                name: "list_float_fold".to_string(),
+                arity: 3,
+                range,
+            }
+        )
+    })?;
+    let meta = builtin_stdlib().get(fn_idx as usize).ok_or_else(|| {
+        cap!(
+            "emit_list_int_fold_call.unknown_stdlib_method.2",
+            LoweringError::UnknownStdlibMethod {
+                name: "list_float_fold".to_string(),
+                arity: 3,
+                range,
+            }
+        )
+    })?;
+    let params = meta.params.clone();
+    let ret = meta.ret;
+
+    // init (arg 1) must lower to F64. An Int literal init is promoted.
+    lower_expr(&args[1].value.expr, args[1].value.range, ctx)?;
+    match ctx.tstack.last().copied() {
+        Some(IrType::F64) => {}
+        Some(IrType::I64) => {
+            ctx.out.push(TaggedOp {
+                op: Op::ConvertI64ToF64,
+                range: args[1].value.range,
+            });
+            ctx.tstack.pop();
+            ctx.tstack.push(IrType::F64);
+        }
+        other => {
+            return Err(cap!(
+                "emit_list_int_fold_call.unsupported_expr.1",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("_list_reduce(init) must be Float, got {:?}", other),
+                    range: args[1].value.range,
+                }
+            ));
+        }
+    }
+
+    let (param_tys_c, ret_ty_c) =
+        stdlib_closure_arg_signature("list_float_fold", 2).ok_or_else(|| {
+            cap!(
+                "emit_list_int_fold_call.unsupported_expr.2",
+                LoweringError::UnsupportedExpr {
+                    kind: "list_float_fold closure signature missing".to_string(),
                     range,
                 }
             )
@@ -1989,7 +2280,7 @@ pub(super) fn try_lower_list_map(
     if params.len() != 1 {
         return Ok(None);
     }
-    emit_list_int_hof_call("list_int_map", args, range, ctx)
+    emit_list_hof_call(ListHofKind::Map, args, range, ctx)
 }
 
 /// Wave R3: general `_list_reduce(xs, <init>, (acc, x) => <body>)` over

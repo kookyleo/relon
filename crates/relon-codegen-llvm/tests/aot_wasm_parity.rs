@@ -971,6 +971,42 @@ fn r3_list_reduce_free_aligns_native_via_wasmtime() {
     }
 }
 
+/// Wave R3b — `List<Float>` fold to a scalar `Float`. The source is an
+/// element-type-changing `_list_map(range(n), (Int x) => x * 1.0)`
+/// (Int -> Float) reduced with an F64 accumulator through the bundled
+/// `list_float_fold` body. A scalar `Float` return rides the buffer
+/// protocol's fixed-area `value` slot, so the wasm leg decodes it
+/// directly (the List<Float> return shape is not yet wasm-marshallable).
+/// Native LLVM-AOT is the oracle.
+#[test]
+fn r3b_float_reduce_aligns_native_via_wasmtime() {
+    let src = "#import list from \"std/list\"\n#main(Int n) -> Float\n\
+               _list_reduce(_list_map(range(n), (Int x) => x * 1.0), 0.0, \
+               (Float a, Float x) => a + x)";
+    let n = 5i64;
+    let want = match native_run(src, HashMap::from([("n".to_string(), Value::Int(n))])) {
+        Value::Float(f) => f.0,
+        other => panic!("[r3b_float_reduce] native expected Float, got {other:?}"),
+    };
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping r3b_float_reduce wasm leg");
+        return;
+    }
+    let (bytes, info) = build("r3b_float_reduce", src);
+    let in_record = pack_single_int(&info, n);
+    let out = run_buffer(&bytes, "relon_parity_r3b_float_reduce", &info, &in_record);
+    match out.get("value") {
+        Some(Decoded::Float(v)) => {
+            assert_eq!(
+                v.to_bits(),
+                want.to_bits(),
+                "[r3b_float_reduce] wasm Float != native"
+            )
+        }
+        other => panic!("[r3b_float_reduce] decoded {other:?}"),
+    }
+}
+
 /// z4_dict_return — multi-field Int Dict return through the fixed-area
 /// buffer protocol (`#main(Int a, Int b) -> Dict { x: a+b, y: a*b }`).
 #[test]

@@ -114,6 +114,17 @@ pub fn stdlib_method_index(receiver_ty: IrType, name: &str) -> Option<u32> {
         // record (all list shapes share the same header), but routes
         // through a distinct stdlib slot so the IR-level param type
         // check stays honest.
+        // Wave R3b: homogeneous higher-order ops over `List<Float>`.
+        // `map` here is the SAME-element-type form (F64 -> F64); the
+        // element-type-changing `map` (Int -> Float / Float -> Int) is
+        // resolved by the speculative peephole, which infers the result
+        // element type from the closure's return type and dispatches to
+        // `list_int_map_to_float` / `list_float_map_to_int`. `reduce`
+        // aliases the fold body (mirrors the `ListInt` wiring above).
+        (IrType::ListFloat, "map") => stdlib_function_index("list_float_map"),
+        (IrType::ListFloat, "filter") => stdlib_function_index("list_float_filter"),
+        (IrType::ListFloat, "fold") => stdlib_function_index("list_float_fold"),
+        (IrType::ListFloat, "reduce") => stdlib_function_index("list_float_fold"),
         (IrType::ListFloat, "length") => stdlib_function_index("list_float_length"),
         (IrType::ListBool, "length") => stdlib_function_index("list_bool_length"),
         (IrType::ListString, "length") => stdlib_function_index("list_string_length"),
@@ -140,6 +151,20 @@ pub fn stdlib_closure_arg_signature(name: &str, arg_idx: u32) -> Option<(Vec<IrT
         ("list_int_filter", 1) => Some((vec![IrType::I64], IrType::Bool)),
         // `xs.fold(init, |acc, x| ...)` — closure param at arg index 2.
         ("list_int_fold", 2) => Some((vec![IrType::I64, IrType::I64], IrType::I64)),
+        // Wave R3b: homogeneous `List<Float>` higher-order closures.
+        // F64 element in / out for map, F64 in + Bool out for filter,
+        // (F64, F64) -> F64 for the fold accumulator.
+        ("list_float_map", 1) => Some((vec![IrType::F64], IrType::F64)),
+        ("list_float_filter", 1) => Some((vec![IrType::F64], IrType::Bool)),
+        ("list_float_fold", 2) => Some((vec![IrType::F64, IrType::F64], IrType::F64)),
+        // Wave R3b: element-type-changing numeric `map` closures.
+        // `list_int_map_to_float` takes `(Int) -> Float`;
+        // `list_float_map_to_int` takes `(Float) -> Int`. These are
+        // reached only through the speculative HOF peephole (which
+        // selects the body from the closure's inferred return type),
+        // but the side-table entry keeps the signature source single.
+        ("list_int_map_to_float", 1) => Some((vec![IrType::I64], IrType::F64)),
+        ("list_float_map_to_int", 1) => Some((vec![IrType::F64], IrType::I64)),
         _ => None,
     }
 }
