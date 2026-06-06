@@ -34,6 +34,19 @@
 
 ---
 
+## 0.2 语义双路径:tree-walk(AST)是 oracle,IR 是编译后端的腰(2026-06-06 架构 review 校准)
+
+防后人误解"relon-IR 是全系统唯一语义腰",在此钉死真实结构:
+
+- **relon-IR 是「编译后端」的唯一腰**:cranelift / llvm / wasm 三者都只 lower 它,语义在 IR 层定义一次、各后端只做 codegen(不重定义语义)。这条对编译后端**完全成立**。
+- **但 tree-walk 解释器直接走 AST**(`relon-evaluator` 接 `&Node`,核心求值**不消费 IR**;它依赖 `relon-ir` 仅为复用 Unicode 数据表,该耦合已于 2026-06-06 抽出 `relon-unicode` leaf crate 消除)。所以"IR 是全系统唯一语义腰"**字面不成立**:语义落在**两条代码路径**——tree-walk 的 AST 求值,与 IR-lowering→codegen。
+- **这是有意设计,不是裂缝**:**tree-walk = 语义基准 oracle**(最权威、最全那一份),编译后端是必须与它**逐字节一致**的性能实现。"解释器走 AST、编译器走 IR"是正常分层——IR 是给编译后端的腰,**不是**给解释器的。
+- **两条路靠差分测试对齐**(`relon-test-harness`,tree-walk 当 oracle,bit-equal 深比对),而非靠共享同一份表示。
+- **代价(留痕)**:同一语义要实现两遍、只靠测试对齐——**差分覆盖漏了某形状,两条路就可能悄悄分叉**。这是全系统唯一一处根本性结构二元性,被强差分 harness 缓解但未消除。**因此差分覆盖是这条二元性的唯一保险:扩语言面 / 新增 Op / 改求值语义时,必须同步扩差分用例,否则 oracle 名存实亡。**
+- peephole 等优化只在 IR-lowering(如 `list.sum(range())` 融合成单 Loop),tree-walk 无对应路径——这是**性能差异、非语义差异**,不影响正确性(差分比的是结果值)。
+
+---
+
 ## 1. 背景(退役前的 5-tier 历史快照)
 
 当前有 **5 条执行路径**(后端 / tier),都消费同一份 `relon-ir`:
