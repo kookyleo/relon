@@ -258,6 +258,64 @@ fn param_field_list_return_cjk_byte_equal_across_backends() {
     );
 }
 
+/// F6: a deep nested-schema field chain (`o.inner.tags`) returned from the
+/// CLI must produce byte-identical JSON on tree-walk and cranelift-AOT.
+/// The chain descends through an intermediate `Inner` sub-record to a
+/// `List<String>` leaf; the cross-region in-place return must reproduce
+/// the CJK / empty / multi-element list exactly.
+#[test]
+fn deep_chain_list_return_cjk_byte_equal_across_backends() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-deepchain-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(
+        &path,
+        "#schema Inner { tags: List<String>, n: Int }\n\
+         #schema Outer { inner: Inner, m: Int }\n\
+         #main(Outer o) -> List<String>\no.inner.tags\n",
+    )
+    .expect("write fixture");
+
+    let cjk: String = [0x4E2Du32, 0x6587u32]
+        .iter()
+        .map(|c| char::from_u32(*c).unwrap())
+        .collect();
+    let args_json = format!(r#"{{"o":{{"inner":{{"tags":["{cjk}","","edge"],"n":3}},"m":9}}}}"#);
+
+    let run = |backend: &str| -> String {
+        let out = Command::new(BINARY)
+            .arg("run")
+            .arg(&path)
+            .arg("--backend")
+            .arg(backend)
+            .arg("--args")
+            .arg(&args_json)
+            .output()
+            .expect("spawn relon CLI");
+        assert!(
+            out.status.success(),
+            "CLI exited non-zero for {backend}: stderr={}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        String::from_utf8(out.stdout).expect("utf-8 stdout")
+    };
+
+    let tw = run("tree-walk");
+    let aot = run("cranelift-aot");
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        tw.contains(&cjk) && tw.contains("edge"),
+        "tree-walk output must carry the deep-chain CJK + element: {tw:?}"
+    );
+    assert_eq!(
+        tw, aot,
+        "tree-walk vs cranelift-aot deep-chain list JSON differs:\n  tw  = {tw:?}\n  aot = {aot:?}"
+    );
+}
+
 /// `--trust` is honoured by tree-walk + bytecode but is a no-op on the
 /// cranelift-AOT backend (no host-fn registry to grant capabilities
 /// from). It must NOT be silently dropped: the CLI warns on stderr so

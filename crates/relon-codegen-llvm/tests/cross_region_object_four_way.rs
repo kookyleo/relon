@@ -738,6 +738,77 @@ fn branded_struct_field_from_param_field_items() {
     );
 }
 
+// ---- F6: DEEP nested-schema field chain as an object field -----------
+//
+// `-> Dict { t: o.inner.tags }` / `-> Wrapper { items: o.inner.items }`.
+// The cross-region object field's value is a ≥3-segment chain that
+// descends through nested-schema fields to a pointer-array leaf. The
+// deep-chain walker classifies it as a cross-region field (the leaf list
+// root's arena-absolute offset is stored in the object slot, no copy);
+// the host's multi-region verifier + reader follow it cross-region into
+// the input region, bit-equal to tree-walk at any depth.
+
+const SRC_OBJ_DEEP_TAGS: &str = "#schema Inner { tags: List<String>, n: Int }\n\
+     #schema Outer { inner: Inner, m: Int }\n\
+     #main(Outer o) -> Dict\n{ t: o.inner.tags, k: 1 }";
+
+#[test]
+fn anon_dict_field_from_deep_chain_tags() {
+    let inner = cfg(
+        "Inner",
+        vec![
+            (
+                "tags",
+                strings(&["", &from_cps(&[0x4E2D, 0x6587]), &"q".repeat(2500)]),
+            ),
+            ("n", Value::Int(3)),
+        ],
+    );
+    assert_four_way(
+        SRC_OBJ_DEEP_TAGS,
+        args1(
+            "o",
+            outer("Outer", vec![("inner", inner), ("m", Value::Int(9))]),
+        ),
+    );
+}
+
+const SRC_OBJ_DEEP_WRAP: &str = "#schema Server { name: String, port: Int }\n\
+     #schema Inner { items: List<Server>, n: Int }\n\
+     #schema Outer { inner: Inner, m: Int }\n\
+     #schema Wrapper { items: List<Server>, n: Int }\n\
+     #main(Outer o) -> Wrapper { items: o.inner.items, n: 7 }";
+
+#[test]
+fn branded_struct_field_from_deep_chain_items() {
+    let inner = cfg(
+        "Inner",
+        vec![
+            (
+                "items",
+                list(vec![
+                    cfg("Server", vec![("name", s("")), ("port", Value::Int(0))]),
+                    cfg(
+                        "Server",
+                        vec![
+                            ("name", s(&from_cps(&[0x1F980]))),
+                            ("port", Value::Int(i64::MAX)),
+                        ],
+                    ),
+                ]),
+            ),
+            ("n", Value::Int(2)),
+        ],
+    );
+    assert_four_way(
+        SRC_OBJ_DEEP_WRAP,
+        args1(
+            "o",
+            outer("Outer", vec![("inner", inner), ("m", Value::Int(4))]),
+        ),
+    );
+}
+
 // ---- proptest --------------------------------------------------------
 
 fn string_strat() -> impl Strategy<Value = String> {

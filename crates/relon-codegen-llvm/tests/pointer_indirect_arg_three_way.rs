@@ -467,10 +467,14 @@ fn unsupported_pointer_indirect_shapes_loudly_capped() {
     for src in [
         // Dict param — analyzer dead-end.
         "#main(Dict<String, Int> d) -> Dict<String, Int>\nd",
-        // ≥3-segment nested-schema field chain (`o.inner.tags`) — F4 admits
-        // only a single-segment field walk.
-        "#schema Inner { tags: List<String> }\n#schema Outer { inner: Inner }\n\
-         #main(Outer o) -> List<String>\no.inner.tags",
+        // Deep nested-schema field chain (F6) is now lifted for a
+        // pointer-array leaf; what stays capped is a chain whose leaf is a
+        // `List<Schema>` element sub-record carrying a nested-list field
+        // (past the in-place sub-record reader's S4 decode scope).
+        "#schema Cell { rows: List<List<Int>>, k: Int }\n\
+         #schema Inner { cells: List<Cell>, n: Int }\n\
+         #schema Outer { inner: Inner, m: Int }\n\
+         #main(Outer o) -> List<Cell>\no.inner.cells",
     ] {
         let cl = AotEvaluator::from_source(src);
         assert!(cl.is_err(), "cranelift must loudly reject `{src}`, got Ok");

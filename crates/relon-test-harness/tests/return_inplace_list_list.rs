@@ -357,15 +357,21 @@ fn f5_list_list_schema_mixed() {
 /// Shapes still beyond F5 must make **both** AOT backends **decline** the
 /// `#main` shape (a setup error). In production `Backend::Auto` falls back
 /// to the tree-walk oracle; here we assert the decline is loud (an `Err`),
-/// so a silent miscompile can never sneak in. The remaining caps are the
-/// `o.inner.tags` ≥3-segment nested-schema field chain (F4 admits only a
-/// single-segment field walk) and `Dict<_,_>` params (analyzer dead-end).
+/// so a silent miscompile can never sneak in. F6 lifted the deep
+/// nested-schema field chain to a pointer-array leaf (`o.inner.tags`).
+/// The remaining caps are a deep chain whose leaf is a `List<Schema>`
+/// whose element sub-record carries a nested-list field (past the
+/// in-place sub-record reader's S4 decode scope) and `Dict<_,_>` params
+/// (analyzer dead-end).
 #[test]
 fn unsupported_return_shapes_fail_loudly_not_silently() {
     let cap_cases = [
-        // ≥3-segment nested-schema field chain.
-        "#schema Inner { tags: List<String> }\n#schema Outer { inner: Inner }\n\
-         #main(Outer o) -> List<String>\no.inner.tags",
+        // Deep chain whose leaf `List<Cell>` element sub-record carries a
+        // `List<List<Int>>` field — out of the S4 sub-record decode scope.
+        "#schema Cell { rows: List<List<Int>>, k: Int }\n\
+         #schema Inner { cells: List<Cell>, n: Int }\n\
+         #schema Outer { inner: Inner, m: Int }\n\
+         #main(Outer o) -> List<Cell>\no.inner.cells",
         // Dict param — analyzer dead-end.
         "#main(Dict<String, Int> d) -> Int\n1",
     ];

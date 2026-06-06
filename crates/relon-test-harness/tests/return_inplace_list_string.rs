@@ -251,17 +251,23 @@ fn param_field_tags_empty() {
 /// to the tree-walk oracle; here we assert the decline is loud (an `Err`),
 /// so a silent miscompile can never sneak in on either backend.
 ///
-/// F5 lifted `List<List<String>>`; the remaining cap here is the
-/// `Dict<_,_>` param analyzer dead-end.
+/// F5 lifted `List<List<String>>`; F6 lifted the deep nested-schema
+/// field chain to a pointer-array leaf (`o.inner.tags`). The remaining
+/// caps here: the `Dict<_,_>` param analyzer dead-end, and a deep chain
+/// whose leaf is a `List<Schema>` whose element sub-record itself carries
+/// a nested-list field (out of the in-place reader's S4 decode scope).
 #[test]
 fn unsupported_return_shapes_fail_loudly_not_silently() {
     let cap_cases = [
         // Dict param — analyzer dead-end with no input decode path.
         "#main(Dict<String, Int> d) -> Int\n1",
-        // ≥3-segment nested-schema field chain — F4 admits only a
-        // single-segment field walk.
-        "#schema Inner { tags: List<String> }\n#schema Outer { inner: Inner }\n\
-         #main(Outer o) -> List<String>\no.inner.tags",
+        // Deep chain leaf is `List<Schema>` whose element sub-record has a
+        // `List<List<Int>>` field — past the S4 sub-record decode scope,
+        // so the deep-chain walk declines (the leaf envelope check fails).
+        "#schema Cell { rows: List<List<Int>>, k: Int }\n\
+         #schema Inner { cells: List<Cell>, n: Int }\n\
+         #schema Outer { inner: Inner, m: Int }\n\
+         #main(Outer o) -> List<Cell>\no.inner.cells",
     ];
     for src in cap_cases {
         match new_evaluator(src, Backend::CraneliftAot) {

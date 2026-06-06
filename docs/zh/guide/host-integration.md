@@ -125,6 +125,14 @@ host-pushed slot：
 >   **同样支持**（F4，经同一 arena-绝对字段读取）；子记录自身再含
 >   嵌套 `List<Schema>` / `List<List<…>>` 字段者仍 cap（超出范围 —— 就地子
 >   记录读取器对其响亮 cap）；
+> - **深层嵌套 schema 字段链返回**（`#main(Outer o) -> List<String> =
+>   o.inner.tags`，乃至更深的 `o.a.b.tags`），**cranelift、llvm 与已编译
+>   wasm 三个后端均已支持**（F6）。`≥3` 段链，中间各段为嵌套 schema 字段、
+>   叶子为指针数组 list（`List<String>` / `List<Int|Float|Bool>` /
+>   `List<Schema>` / `List<List<scalar>>`）：每个中间段读取对应子记录的
+>   arena-绝对基址，再从该基址读叶子 list 根的 arena-绝对偏移 —— 与单段走读
+>   共用同一单根哨兵 + 多区 verifier + reader，任意深度逐字节等价于 tree-walk
+>   oracle。支持作顶层返回与对象字段（匿名 `Dict` / 结构体）；
 > - **从 `#main` 入参返回 `List<List<String>>` / `List<List<Schema>>`**
 >   （`#main(List<List<String>> xss) -> List<List<String>> = xss`，及
 >   `List<List<Cfg>>` 形），**cranelift、llvm 与已编译 wasm 三个后端均已
@@ -150,9 +158,8 @@ host-pushed slot：
 > - `Dict<_, _>` 入参（analyzer 无法给 `d["x"]` 下标定类型；结构化
 >   config 请改用 `#schema` 结构体）；
 > - 返回子记录自身再含嵌套 `List<Schema>` / `List<List<…>>` 字段的
->   `List<Schema>`（就地子记录读取器对其更深的指针数组响亮 cap）；
-> - `≥3` 段嵌套 schema **字段链**走读返回（`o.inner.tags`）—— 就地返回
->   路径只接单段入参字段走读。
+>   `List<Schema>`（就地子记录读取器对其更深的指针数组响亮 cap；叶子为此类
+>   `List<Schema>` 的深层字段链同样被此 cap 拦下）。
 >
 >   返回**含该类入参字段的对象** —— 无论对象是**匿名 `Dict`**
 >   （`-> Dict { servers: servers, n: 1 }`）还是**结构体 `#schema`**

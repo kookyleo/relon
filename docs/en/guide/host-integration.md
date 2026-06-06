@@ -152,6 +152,17 @@ signature**; each parameter declares one host-pushed slot:
 >   A sub-record that itself carries a nested `List<Schema>` /
 >   `List<List<…>>` field stays out of scope (the in-place sub-record reader
 >   caps it),
+> - **deep nested-schema field-walk returns** (`#main(Outer o) ->
+>   List<String> = o.inner.tags`, and deeper such as `o.a.b.tags`), on **the
+>   cranelift, llvm, and compiled-wasm backends** (F6). A `≥3`-segment chain
+>   whose intermediate segments are nested-schema fields and whose leaf is a
+>   pointer-array list (`List<String>` / `List<Int|Float|Bool>` /
+>   `List<Schema>` / `List<List<scalar>>`) loads each intermediate
+>   sub-record's arena-absolute base, then reads the leaf list root's
+>   arena-absolute offset off that base — the same single-root sentinel +
+>   multi-region verifier + reader the single-segment walk uses, bit-equal to
+>   the tree-walk oracle at any depth. Supported as a top-level return and as
+>   an object field (anon-`Dict` / branded struct),
 > - **`List<List<String>>` / `List<List<Schema>>` returns from a `#main`
 >   parameter** (`#main(List<List<String>> xss) -> List<List<String>> = xss`,
 >   and the `List<List<Cfg>>` form), on **the cranelift, llvm, and
@@ -185,10 +196,8 @@ signature**; each parameter declares one host-pushed slot:
 >   reads; use a `#schema` struct for structured config instead),
 > - a `List<Schema>` return whose sub-record carries a nested
 >   `List<Schema>` / `List<List<…>>` field (the in-place sub-record reader
->   caps the deeper pointer array), and
-> - a `≥3`-segment nested-schema **field-walk** return (`o.inner.tags`) —
->   only a single-segment parameter-field walk is admitted on the in-place
->   return path.
+>   caps the deeper pointer array — this also caps a deep field-walk whose
+>   leaf is such a `List<Schema>`).
 >
 >   An **object field** sourced by a parameter — whether the object
 >   is an **anon-`Dict`** (`-> Dict { servers: servers, n: 1 }`) or a

@@ -1434,11 +1434,9 @@ fn anon_dict_return_plan(
             }
             Expr::Variable(path)
                 if !is_internal
-                    && matches!(
-                        path.as_slice(),
-                        [TokenKey::String(_, _, _)]
-                            | [TokenKey::String(_, _, _), TokenKey::String(_, _, _)]
-                    )
+                    && path
+                        .iter()
+                        .all(|seg| matches!(seg, TokenKey::String(_, _, _)))
                     && anon_dict_cross_region_param_list(path, &param_canonicals).is_some() =>
             {
                 // F1b: a host-visible field whose value is a parameter
@@ -2417,8 +2415,10 @@ fn pointer_array_param_identity_walk(expr: &Expr) -> bool {
 /// and `LoadFieldAtAbsolute` loads it verbatim. That offset IS the field
 /// list root the verifier classifies (into the input region) and the
 /// reader follows cross-region — proven byte-equal to the tree-walk
-/// oracle on cranelift / llvm / wasm. Only single-segment field access is
-/// admitted; a deeper chain (`o.inner.tags`) is not in scope.
+/// oracle on cranelift / llvm / wasm. F6 generalises this from a single
+/// field segment to an arbitrary-depth chain (`o.inner.tags`,
+/// `o.a.b.tags`) via [`cross_region_param_field_chain`]: every
+/// intermediate segment must be a nested-schema field.
 fn pointer_array_param_field_walk<'s>(
     expr: &Expr,
     main_schema: &'s Schema,
@@ -2426,15 +2426,61 @@ fn pointer_array_param_field_walk<'s>(
     let Expr::Variable(path) = expr else {
         return None;
     };
-    let [TokenKey::String(p, _, _), TokenKey::String(f, _, _)] = path.as_slice() else {
+    let [TokenKey::String(p, _, _), rest @ ..] = path.as_slice() else {
         return None;
     };
+    if rest.is_empty() {
+        return None;
+    }
     let param = main_schema.fields.iter().find(|fl| &fl.name == p)?;
-    let TypeRepr::Schema { schema } = &param.ty else {
-        return None;
-    };
-    let field = schema.fields.iter().find(|fl| &fl.name == f)?;
-    cross_region_list_envelope(&field.ty).then_some(&field.ty)
+    cross_region_param_field_chain(&param.ty, rest)
+}
+
+/// Resolve a `#main` parameter **field chain** (`o.inner.tags`,
+/// `o.a.b.tags`, or the single-segment `o.tags`) down to its leaf
+/// field's canonical [`TypeRepr`], returning it only when every
+/// intermediate segment is a nested-schema field and the leaf field is a
+/// pointer-array list inside the cross-region admission envelope
+/// ([`cross_region_list_envelope`]).
+///
+/// `base` is the canonical type the head identifier resolves to (the
+/// param's own type, with element schemas inlined); `segs` are the
+/// remaining `.field` segments after the head. Each non-leaf segment must
+/// name a `TypeRepr::Schema` field so the walk can descend into the
+/// sub-record's field set; the leaf segment's type must satisfy
+/// `cross_region_list_envelope`.
+///
+/// Why a deep chain is as safe as the single-segment F4 walk: the
+/// `lower_variable` walker already emits one `LoadFieldAtAbsolute` per
+/// segment, and post-F1 *every* pointer slot in the input region is
+/// arena-absolute. An intermediate nested-schema field load therefore
+/// pushes the sub-record's arena-absolute base, and the leaf list-field
+/// load reads the list root's arena-absolute offset off that base —
+/// exactly the single-root sentinel + multi-region verifier + reader
+/// value the F4 / identity walks consume. No re-encode happens at any
+/// link, so the host decode is unchanged and the result is byte-equal to
+/// the tree-walk oracle at any depth. A non-schema intermediate segment
+/// or an out-of-envelope leaf returns `None`, keeping it a loud cap.
+fn cross_region_param_field_chain<'s>(
+    base: &'s TypeRepr,
+    segs: &[TokenKey],
+) -> Option<&'s TypeRepr> {
+    let mut current = base;
+    let last = segs.len().checked_sub(1)?;
+    for (i, seg) in segs.iter().enumerate() {
+        let TokenKey::String(name, _, _) = seg else {
+            return None;
+        };
+        let TypeRepr::Schema { schema } = current else {
+            return None;
+        };
+        let field = schema.fields.iter().find(|fl| &fl.name == name)?;
+        if i == last {
+            return cross_region_list_envelope(&field.ty).then_some(&field.ty);
+        }
+        current = &field.ty;
+    }
+    None
 }
 
 /// The cross-region list-field admission envelope, shared by every
@@ -2521,14 +2567,12 @@ fn anon_dict_cross_region_param_list<'p>(
             let ty = param_canonicals.get(name.as_str())?;
             cross_region_list_envelope(ty).then_some(ty)
         }
-        // F4 field walk (`o.tags`): the param must be a schema and the
-        // named field a pointer-array list inside the envelope.
-        [TokenKey::String(p, _, _), TokenKey::String(f, _, _)] => {
-            let TypeRepr::Schema { schema } = param_canonicals.get(p.as_str())? else {
-                return None;
-            };
-            let field = schema.fields.iter().find(|fl| &fl.name == f)?;
-            cross_region_list_envelope(&field.ty).then_some(&field.ty)
+        // F4/F6 field walk (`o.tags`, `o.inner.tags`, `o.a.b.tags`): the
+        // head must be a schema param and the chain must descend through
+        // nested-schema fields to a pointer-array leaf inside the
+        // envelope. Resolved through the shared deep-chain walker.
+        [TokenKey::String(p, _, _), rest @ ..] if !rest.is_empty() => {
+            cross_region_param_field_chain(param_canonicals.get(p.as_str())?, rest)
         }
         _ => None,
     }
@@ -2585,24 +2629,26 @@ fn branded_field_cross_region_param_list(
             .params
             .iter()
             .any(|b| b.name == *name && b.ty == field_ir),
-        // F4 field walk (`w.items`): the param must be a schema and the
-        // named field a list whose IR type matches the struct field. The
-        // field-load pushes the field list root's arena-absolute offset
-        // post-F1, identical to the identity walk's slot value.
-        [TokenKey::String(p, _, _), TokenKey::String(f, _, _)] => {
+        // F4/F6 field walk (`w.items`, `w.inner.items`, `w.a.b.items`):
+        // the head must be a schema param and the chain must descend
+        // through nested-schema fields to a pointer-array leaf whose IR
+        // type matches the struct field. The field-load chain pushes the
+        // leaf list root's arena-absolute offset post-F1, identical to
+        // the identity walk's slot value.
+        [TokenKey::String(p, _, _), rest @ ..] if !rest.is_empty() => {
             let Some(binding) = ctx.params.iter().find(|b| b.name == *p) else {
                 return false;
             };
             let Some(schema) = binding.schema.as_ref() else {
                 return false;
             };
-            let Some(field) = schema.fields.iter().find(|fl| &fl.name == f) else {
-                return false;
+            let base = TypeRepr::Schema {
+                schema: Box::new(schema.clone()),
             };
-            cross_region_list_envelope(&field.ty)
-                && type_repr_to_ir_type(&field.ty)
-                    .map(|ir| ir == field_ir)
-                    .unwrap_or(false)
+            cross_region_param_field_chain(&base, rest)
+                .and_then(|leaf| type_repr_to_ir_type(leaf).ok())
+                .map(|ir| ir == field_ir)
+                .unwrap_or(false)
         }
         _ => false,
     }
