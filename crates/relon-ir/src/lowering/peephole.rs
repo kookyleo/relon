@@ -1678,7 +1678,7 @@ fn try_lower_closure_with_ret(
 
 /// Single-closure list HOF kind dispatched by [`emit_list_hof_call`].
 #[derive(Clone, Copy)]
-enum ListHofKind {
+pub(super) enum ListHofKind {
     Map,
     Filter,
 }
@@ -1693,11 +1693,14 @@ enum ListHofKind {
 /// the closure arg, and emit `Op::Call(<builtin>)`. Leaves the
 /// callee's result list handle on the vstack.
 ///
-/// `List<String>` sources (and any map whose closure returns a String)
-/// are NOT handled here — they roll back and cap loudly through the
-/// regular dispatch-miss path, because a `List<String>` result needs a
-/// runtime pointer-array builder that is not yet a proven four-way
-/// substrate.
+/// R3c extends this to `List<String>` sources and String-result `map`
+/// (any source whose closure returns a `String`): the result is a
+/// `List<String>` pointer-array record (`[count][off_i]…`, 4-byte slots)
+/// the bundled `list_*_map_to_string` / `list_string_map` /
+/// `list_string_filter` bodies build directly in scratch. Every stored
+/// `off_i` is an arena-relative String handle the closure already
+/// produced (no relocation needed), so the return ABI / verifier walk the
+/// result unchanged.
 ///
 /// The roll-back discipline (out / tstack / next_let_idx / lambda_table
 /// truncation) is identical to [`try_lower_list_filter`]'s so a source
@@ -1727,11 +1730,15 @@ fn emit_list_hof_call(
     };
     let lower_res = lower_expr(&args[0].value.expr, args[0].value.range, ctx);
     let produced = ctx.tstack.last().copied();
-    // Only `List<Int>` / `List<Float>` sources are in the typed-HOF
-    // envelope (8-byte element slots). Everything else rolls back.
+    // `List<Int>` / `List<Float>` sources are in the numeric typed-HOF
+    // envelope (8-byte element slots); `List<String>` (R3c) is a 4-byte
+    // pointer-array source whose closure param is a `String` handle.
+    // Everything else rolls back. `src_elem` is the closure's param type
+    // for the element.
     let src_elem = match produced {
         Some(IrType::ListInt) => IrType::I64,
         Some(IrType::ListFloat) => IrType::F64,
+        Some(IrType::ListString) => IrType::String,
         _ => {
             restore(ctx, saved_out, saved_stack);
             return Ok(None);
@@ -1776,7 +1783,18 @@ fn emit_list_hof_call(
             let builtin = match src_elem {
                 IrType::I64 => "list_int_filter",
                 IrType::F64 => "list_float_filter",
-                _ => unreachable!("src_elem is I64 or F64"),
+                // `List<String>` filter is kept CAPPED in R3c: although the
+                // `list_string_filter` body would build a correct result,
+                // no `String -> Bool` predicate currently lowers four-way
+                // (the analyzer cannot derive the return type of a String-
+                // receiver method predicate, and cranelift does not lower
+                // String `Eq`/`Ne`), so the shape is not provable byte-equal
+                // and rolls back to the loud cap rather than ship an
+                // unverified path.
+                _ => {
+                    restore(ctx, saved_out, saved_stack);
+                    return Ok(None);
+                }
             };
             // Resolve the predicate closure signature (`(elem) -> Bool`)
             // from the single side-table source of truth.
@@ -1808,41 +1826,145 @@ fn emit_list_hof_call(
             )
         }
         ListHofKind::Map => {
-            // Probe the closure body: try homogeneous (src -> src) first,
-            // then the numeric cross-type width. The candidates are
-            // mutually exclusive (the body yields exactly one slot).
-            let (homo_builtin, cross_builtin, cross_ret) = match src_elem {
-                IrType::I64 => ("list_int_map", "list_int_map_to_float", IrType::F64),
-                IrType::F64 => ("list_float_map", "list_float_map_to_int", IrType::I64),
-                _ => unreachable!(),
+            // Probe the closure body against each candidate result type
+            // for this source, in order: the homogeneous (src -> src)
+            // shape first, then the cross-type widths. Each candidate is
+            // `(closure_return_type, bundled_body_name)`. The candidates
+            // are mutually exclusive — the body yields exactly one result
+            // slot — so the first probe that accepts the closure wins, and
+            // the result element type comes from the matched return type
+            // (R3c extends the R3b "result-type-from-closure-return"
+            // selection to `String`).
+            //
+            // R3c adds `String` as a candidate return for every source
+            // (`list_int_map_to_string` / `list_float_map_to_string` /
+            // homogeneous `list_string_map`), so a String-returning map
+            // now lowers four-way instead of capping.
+            let candidates: &[(IrType, &str)] = match src_elem {
+                IrType::I64 => &[
+                    (IrType::I64, "list_int_map"),
+                    (IrType::F64, "list_int_map_to_float"),
+                    (IrType::String, "list_int_map_to_string"),
+                ],
+                IrType::F64 => &[
+                    (IrType::F64, "list_float_map"),
+                    (IrType::I64, "list_float_map_to_int"),
+                    (IrType::String, "list_float_map_to_string"),
+                ],
+                IrType::String => &[(IrType::String, "list_string_map")],
+                _ => unreachable!("src_elem is I64, F64, or String"),
             };
-            if try_lower_closure_with_ret(&args[1].value, &[src_elem], src_elem, ctx)? {
-                return commit(
-                    ctx,
-                    saved_out,
-                    saved_stack,
-                    src_stream,
-                    src_stack,
-                    homo_builtin,
-                    range,
-                );
+            for &(ret_ty, builtin) in candidates {
+                if try_lower_closure_with_ret(&args[1].value, &[src_elem], ret_ty, ctx)? {
+                    return commit(
+                        ctx,
+                        saved_out,
+                        saved_stack,
+                        src_stream,
+                        src_stack,
+                        builtin,
+                        range,
+                    );
+                }
             }
-            if try_lower_closure_with_ret(&args[1].value, &[src_elem], cross_ret, ctx)? {
-                return commit(
-                    ctx,
-                    saved_out,
-                    saved_stack,
-                    src_stream,
-                    src_stack,
-                    cross_builtin,
-                    range,
-                );
-            }
-            // Neither numeric return matched (e.g. a String-returning
-            // map). Nothing was committed; restore so the regular
-            // dispatch path caps it loudly.
+            // No candidate return matched. Nothing was committed; restore
+            // so the regular dispatch path caps it loudly.
             restore(ctx, saved_out, saved_stack);
             Ok(None)
+        }
+    }
+}
+
+/// Wave R3b/R3c method-form (`xs.map(f)` / `xs.filter(f)`) emitter:
+/// dispatch a single-closure list HOF when the **receiver is already
+/// lowered** onto the vstack (the generic method-dispatch path lowers the
+/// receiver before resolving the method). This is the method-form sibling
+/// of [`emit_list_hof_call`] (which lowers the source from `args[0]`): it
+/// selects the bundled body from the closure's inferred return type — the
+/// element-type-changing numeric maps (Int -> Float / Float -> Int) and
+/// the R3c String-result maps (`* -> String`) — instead of the single
+/// fixed `(elem -> elem)` signature the `stdlib_method_index` table pins.
+///
+/// `receiver_ty` is the source list's IR type (its handle is on top of the
+/// vstack); `closure` is the lone method argument. Returns `Ok(None)` when
+/// the receiver isn't a supported list type or no candidate return matches
+/// (the caller then falls through to the regular method dispatch, which
+/// caps it loudly). On success the receiver handle has been consumed and
+/// the result list handle is on the vstack.
+pub(super) fn emit_list_hof_method(
+    kind: ListHofKind,
+    receiver_ty: IrType,
+    closure: &Node,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    // Only literal single-param lambdas are a HOF surface.
+    let Expr::Closure { params, .. } = &*closure.expr else {
+        return Ok(None);
+    };
+    if params.len() != 1 {
+        return Ok(None);
+    }
+    let src_elem = match receiver_ty {
+        IrType::ListInt => IrType::I64,
+        IrType::ListFloat => IrType::F64,
+        IrType::ListString => IrType::String,
+        _ => return Ok(None),
+    };
+    // Candidate `(closure_return_type, bundled_body_name)` list, ordered
+    // homogeneous-first then cross-type — identical selection to the
+    // `emit_list_hof_call` map arm.
+    let map_candidates: &[(IrType, &str)] = match src_elem {
+        IrType::I64 => &[
+            (IrType::I64, "list_int_map"),
+            (IrType::F64, "list_int_map_to_float"),
+            (IrType::String, "list_int_map_to_string"),
+        ],
+        IrType::F64 => &[
+            (IrType::F64, "list_float_map"),
+            (IrType::I64, "list_float_map_to_int"),
+            (IrType::String, "list_float_map_to_string"),
+        ],
+        IrType::String => &[(IrType::String, "list_string_map")],
+        _ => unreachable!("src_elem is I64, F64, or String"),
+    };
+    match kind {
+        ListHofKind::Map => {
+            for &(ret_ty, builtin) in map_candidates {
+                if try_lower_closure_with_ret(closure, &[src_elem], ret_ty, ctx)? {
+                    // Receiver handle + closure handle are both on the
+                    // vstack now; `finish_list_hof` pops both and emits the
+                    // call.
+                    return finish_list_hof(builtin, range, ctx);
+                }
+            }
+            Ok(None)
+        }
+        ListHofKind::Filter => {
+            let builtin = match src_elem {
+                IrType::I64 => "list_int_filter",
+                IrType::F64 => "list_float_filter",
+                // `List<String>` filter stays capped in R3c — no provable
+                // four-way `String -> Bool` predicate (see the matching
+                // note in `emit_list_hof_call`). Fall through to the
+                // regular dispatch, which caps it loudly.
+                _ => return Ok(None),
+            };
+            let (param_tys_c, ret_ty_c) =
+                stdlib_closure_arg_signature(builtin, 1).ok_or_else(|| {
+                    cap!(
+                        "emit_list_int_hof_call.unsupported_expr",
+                        LoweringError::UnsupportedExpr {
+                            kind: format!("{builtin} closure signature missing"),
+                            range,
+                        }
+                    )
+                })?;
+            // The predicate signature is fixed (`elem -> Bool`); a body
+            // that doesn't match is a loud error, not a fall-through, so
+            // use the direct lowering (not the rollback probe).
+            lower_closure_as_value(&closure.expr, closure.range, &param_tys_c, ret_ty_c, ctx)?;
+            finish_list_hof(builtin, range, ctx)
         }
     }
 }

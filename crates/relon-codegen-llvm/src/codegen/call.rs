@@ -853,7 +853,11 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             | IrType::String
             | IrType::ListInt
             | IrType::ListFloat
-            | IrType::ListBool => self.ctx.i32_type().into(),
+            | IrType::ListBool
+            // Wave R3c: a stdlib body returning a pointer-array list
+            // (`list_string_map` / `list_*_map_to_string` -> `ListString`)
+            // hands back an i32 arena-relative handle, same as `ListInt`.
+            | IrType::ListString => self.ctx.i32_type().into(),
             other => {
                 return Err(LlvmError::Codegen(format!(
                     "Op::Call ret_ty {other:?} unsupported in inline frame"

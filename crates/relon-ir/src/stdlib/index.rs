@@ -128,6 +128,15 @@ pub fn stdlib_method_index(receiver_ty: IrType, name: &str) -> Option<u32> {
         (IrType::ListFloat, "length") => stdlib_function_index("list_float_length"),
         (IrType::ListBool, "length") => stdlib_function_index("list_bool_length"),
         (IrType::ListString, "length") => stdlib_function_index("list_string_length"),
+        // Wave R3c: homogeneous higher-order `map` over `List<String>`
+        // (String -> String). The element-type-changing String-result map
+        // from a numeric source (`List<Int>` / `List<Float>` ->
+        // `List<String>`) is resolved by the speculative HOF peephole,
+        // which infers the result element type from the closure's return
+        // type and dispatches to `list_int_map_to_string` /
+        // `list_float_map_to_string`. (`List<String>.filter` stays capped:
+        // no `String -> Bool` predicate lowers four-way yet.)
+        (IrType::ListString, "map") => stdlib_function_index("list_string_map"),
         (IrType::ListSchema, "length") => stdlib_function_index("list_schema_length"),
         (IrType::ListList, "length") => stdlib_function_index("list_list_length"),
         _ => None,
@@ -165,6 +174,16 @@ pub fn stdlib_closure_arg_signature(name: &str, arg_idx: u32) -> Option<(Vec<IrT
         // but the side-table entry keeps the signature source single.
         ("list_int_map_to_float", 1) => Some((vec![IrType::I64], IrType::F64)),
         ("list_float_map_to_int", 1) => Some((vec![IrType::F64], IrType::I64)),
+        // Wave R3c: String-result list higher-order closures.
+        // `list_string_map` takes `(String) -> String`. The numeric-source
+        // String-result maps take `(Int) -> String` / `(Float) -> String`;
+        // reached only through the speculative HOF peephole (which selects
+        // the body from the closure's inferred return type), but the
+        // side-table keeps the signature source single. (No
+        // `list_string_filter` entry — that shape stays capped.)
+        ("list_string_map", 1) => Some((vec![IrType::String], IrType::String)),
+        ("list_int_map_to_string", 1) => Some((vec![IrType::I64], IrType::String)),
+        ("list_float_map_to_string", 1) => Some((vec![IrType::F64], IrType::String)),
         _ => None,
     }
 }

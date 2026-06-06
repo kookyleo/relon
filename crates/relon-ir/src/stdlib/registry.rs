@@ -24,9 +24,10 @@ use super::case_fold::{
 use super::defs::{
     abs_int, concat_string_string, contains_string, glob_match_string, is_empty_string,
     length_string_to_int, list_bool_length, list_float_filter, list_float_fold, list_float_length,
-    list_float_map, list_float_map_to_int, list_int_filter, list_int_fold, list_int_length_to_int,
-    list_int_map, list_int_map_to_float, list_int_max, list_int_sum, list_list_length,
-    list_schema_length, list_string_length, max_int, min_int, starts_with_string, substring_string,
+    list_float_map, list_float_map_to_int, list_float_map_to_string, list_int_filter,
+    list_int_fold, list_int_length_to_int, list_int_map, list_int_map_to_float,
+    list_int_map_to_string, list_int_max, list_int_sum, list_list_length, list_schema_length,
+    list_string_length, list_string_map, max_int, min_int, starts_with_string, substring_string,
 };
 use super::normalization::{
     ccc_lookup_helper, compose_lookup_helper, decomp_lookup_helper, nfc_string, nfd_string,
@@ -208,6 +209,26 @@ pub fn builtin_stdlib() -> &'static [StdlibFunction] {
             list_float_fold(),
             list_int_map_to_float(),
             list_float_map_to_int(),
+            // Wave R3c: String-result list higher-order ops. Appended at
+            // the tail (indices 44+) so every position-pinned index above
+            // stays put — existing-construct cranelift bytes are
+            // unchanged, so GENERATOR_VERSION does not move. Each result
+            // is a `List<String>` pointer-array record (`[count][off_i]…`,
+            // 4-byte slots) byte-identical to `write_list_string`, so the
+            // return ABI / verifier walk it unchanged.
+            //   * `44` — `list_string_map(List<String>,
+            //             Closure<String -> String>) -> List<String>`.
+            //   * `45` — `list_int_map_to_string(List<Int>,
+            //             Closure<Int -> String>) -> List<String>`.
+            //   * `46` — `list_float_map_to_string(List<Float>,
+            //             Closure<Float -> String>) -> List<String>`.
+            // `list_string_filter` is intentionally NOT registered: no
+            // `String -> Bool` predicate currently lowers four-way, so the
+            // shape stays capped (the body would be unreachable / unverified
+            // — see the cap note in `lowering::peephole::emit_list_hof_call`).
+            list_string_map(),
+            list_int_map_to_string(),
+            list_float_map_to_string(),
         ]
     })
 }

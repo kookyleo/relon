@@ -856,6 +856,65 @@ pub fn all_cases() -> Vec<CorpusCase> {
             tier: Tier::StdlibList,
             supported_by: TW_CR,
         },
+        // ---- Wave R3c: String-result list `map` family. The bundled
+        //      `list_string_map` / `list_int_map_to_string` /
+        //      `list_float_map_to_string` bodies build the result as a
+        //      `List<String>` pointer-array record (`[count][off_i]…`,
+        //      4-byte slots) in scratch — every slot an arena-relative
+        //      String handle the closure produced — and the entry returns
+        //      it via the in-place region-walk ABI (no relocation,
+        //      byte-equal to the tree-walk `_list_map`). These ride
+        //      `TW_CR`: `List<String>` returns are three-way today
+        //      (tree-walk + cranelift + llvm-native, proven in
+        //      `list_string_hof_three_way`); the wasm leg is not yet
+        //      decodable for a `List<String>` return (see that test's
+        //      module doc). `List<String>` filter stays capped (no
+        //      provable `String -> Bool` predicate).
+        CorpusCase {
+            name: "r3c_string_map_concat",
+            source: "#main() -> List<String>\n[\"a\", \"b\", \"c\"].map((String s) => s + \"!\")",
+            args_factory: no_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r3c_string_map_free",
+            source: "#main() -> List<String>\n_list_map([\"x\", \"y\"], (String s) => s + s)",
+            args_factory: no_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        // The headline shape: a numeric source mapped to String via an
+        // f-string closure, result element type taken from the closure's
+        // inferred `String` return.
+        CorpusCase {
+            name: "r3c_range_map_fstring",
+            source: "#main(Int n) -> List<String>\nrange(n).map((Int x) => f\"v${x}\")",
+            args_factory: || one_int("n", 4),
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r3c_range_map_fstring_empty",
+            source: "#main(Int n) -> List<String>\nrange(n).map((Int x) => f\"v${x}\")",
+            args_factory: || one_int("n", 0),
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r3c_int_map_to_string_free",
+            source: "#main() -> List<String>\n_list_map([1, 2, 3], (Int x) => f\"#${x}\")",
+            args_factory: no_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r3c_float_map_to_string",
+            source: "#main() -> List<String>\n[1.5, 2.5].map((Float x) => \"f\")",
+            args_factory: no_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
         // ---- StdlibNormalize: most complex ----
         // Bytecode rejects `String`-typed return; trace const table
         // pre-computes both NFD / NFC payloads.

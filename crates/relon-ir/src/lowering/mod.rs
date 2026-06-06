@@ -958,6 +958,16 @@ fn lower_entry_with_resolver<'a>(
                 }
                 _ => false,
             };
+        // Wave R3c: a String-result list HOF (`map` / `filter`) building a
+        // self-contained scratch `List<String>` pointer-array also returns
+        // in place (same arena-absolute-slot invariant as a param walk —
+        // see [`string_result_list_hof_call`]). The numeric-result list
+        // HOFs (`List<Int>` / `List<Float>`) are inline-fixed, not
+        // pointer-array, so they keep the rigid-copy path and never reach
+        // this branch.
+        let is_inplace_string_hof =
+            ret_ir_ty == IrType::ListString && string_result_list_hof_call(&root.expr);
+        let is_inplace_param_walk = is_inplace_param_walk || is_inplace_string_hof;
         if pointer_array_list_ir_type(ret_ir_ty)
             && !pointer_array_list_source_is_const_pool(&root.expr)
             && !is_inplace_param_walk
@@ -2515,6 +2525,51 @@ fn pointer_array_list_source_is_const_pool(expr: &Expr) -> bool {
 /// param walk and keeps the existing const-pool / loud-cap paths.
 fn pointer_array_param_identity_walk(expr: &Expr) -> bool {
     matches!(expr, Expr::Variable(path) if path.len() == 1)
+}
+
+/// Wave R3c: true when `expr` is a list higher-order call (`map` /
+/// `filter`, in method form `xs.map(f)` or free form `_list_map(xs, f)` /
+/// `_list_filter(xs, f)` — the latter is also what a list comprehension
+/// desugars to) that, with a `List<String>` declared `#main` return,
+/// lowers to one of the R3c String-result bundled bodies
+/// (`list_string_map` / `list_int_map_to_string` /
+/// `list_float_map_to_string` / `list_string_filter`).
+///
+/// These bodies build the result `List<String>` pointer-array record in
+/// the **scratch** region, and every `off_i` slot they write is an
+/// arena-absolute String handle the closure already produced (a const-pool
+/// literal or a scratch-built `StrConcatN` / `IntToStr` record — all in the
+/// same flat arena). The record is therefore self-contained under the
+/// single global arena-relative pointer convention, exactly like a
+/// param-sourced pointer array, so it qualifies for the **in-place
+/// region-walk return** ABI: the backend reports the root header's
+/// arena-absolute offset via the negative sentinel and the host
+/// verifies + decodes it in place (over the scratch region) — no rigid
+/// block copy / relocation, which is what made the old `List<String>`
+/// computed-return path unsound.
+///
+/// Caller gates this on `ret_ir_ty == IrType::ListString`; we only need to
+/// confirm the source is one of the String-result HOF surfaces (the
+/// closure-return-type probe in `emit_list_hof_call` is what actually
+/// selects a String-result body, so a `map` returning a numeric list never
+/// reaches here with a `ListString` return type).
+fn string_result_list_hof_call(expr: &Expr) -> bool {
+    let Expr::FnCall { path, .. } = expr else {
+        return false;
+    };
+    // Free form / comprehension desugaring: `_list_map(...)` /
+    // `_list_filter(...)` — the leading segment names the builtin.
+    if let [TokenKey::String(name, _, _), ..] = path.as_slice() {
+        if name == "_list_map" || name == "_list_filter" {
+            return true;
+        }
+    }
+    // Method form: `xs.map(f)` / `xs.filter(f)` — the trailing segment
+    // names the method.
+    matches!(
+        path.last(),
+        Some(TokenKey::String(m, _, _)) if m == "map" || m == "filter"
+    )
 }
 
 /// F4: detect a two-segment `#main` parameter **field** walk (`o.tags`
@@ -4125,6 +4180,32 @@ fn lower_fn_call(
                 range,
                 ctx,
             );
+        }
+    }
+    // Wave R3b/R3c: route method-form `xs.map(f)` / `xs.filter(f)` over a
+    // list receiver through the closure-return-type candidate selector
+    // (the receiver is already lowered onto the vstack). This resolves the
+    // element-type-changing numeric maps and the R3c String-result maps
+    // that the fixed `stdlib_method_index` (`(elem -> elem)`) signature
+    // cannot. `Ok(None)` falls through to the regular dispatch below (e.g.
+    // a non-list receiver, or no candidate return matched), which caps it
+    // loudly.
+    if matches!(
+        receiver_ty,
+        IrType::ListInt | IrType::ListFloat | IrType::ListString
+    ) && (method_name == "map" || method_name == "filter")
+        && args.len() == 1
+        && args[0].name.is_none()
+    {
+        let kind = if method_name == "map" {
+            peephole::ListHofKind::Map
+        } else {
+            peephole::ListHofKind::Filter
+        };
+        if let Some(()) =
+            peephole::emit_list_hof_method(kind, receiver_ty, &args[0].value, range, ctx)?
+        {
+            return Ok(());
         }
     }
     let Some(fn_index) = stdlib_method_index(receiver_ty, method_name) else {
