@@ -1411,3 +1411,169 @@ fn r7_sqrt_negative_is_nan_aligns_native_via_wasmtime() {
 fn r7_abs_float_aligns_native_via_wasmtime() {
     r7_check_float("r7_abs_float", "#main(Float x) -> Float\nabs(x)", -5.5);
 }
+
+// ===========================================================
+// Wave R8 — byte-level string stdlib on wasm32.
+//
+// `len` (String -> Int), `ends_with` (String, String -> Bool), and
+// `replace` (String, String, String -> String). Each bundled body is
+// purely byte-level (loads / stores / `BitAnd` for the char-boundary
+// test, no UTF-8 decode or `Op::Trap`), exercised with constant String
+// operands inside an `Int n` param entry (the arg is consumed and
+// discarded by the literals). The String result rides the buffer
+// protocol's tail-area record exactly like the w3 / r4 String returns;
+// Bool / Int ride the fixed-area scalar slot. Native LLVM-AOT is the
+// oracle; the tree-walk == cranelift legs are proven in
+// `relon-test-harness` corpus `r8_*` + the per-fn probes.
+//
+// `trim` / `trim_start` / `trim_end` stay capped: a
+// `char::is_whitespace()`-exact trim needs the UTF-8 decoder +
+// `__is_whitespace` helper + `Op::Trap { InvalidUtf8 }` seam the
+// LLVM-native / wasm backends do not lower (same seam that keeps
+// `upper` / `title` / `nfd` tree-walk + cranelift only — see
+// `phase0b_unicode.rs`). `matches` (regex engine) and `split`
+// (List<String> result) stay capped — no wasm-portable body.
+// ===========================================================
+
+/// Shared driver: build `src` (single `Int n` param returning a String
+/// scalar), run the wasm32 leg, assert the decoded tail-record String
+/// matches the native oracle (itself bit-aligned to tree-walk +
+/// cranelift).
+fn r8_check_str(name: &str, src: &str) {
+    let want = match native_run(src, HashMap::from([("n".to_string(), Value::Int(1))])) {
+        Value::String(s) => s,
+        other => panic!("[{name}] native expected String, got {other:?}"),
+    };
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping {name}");
+        return;
+    }
+    let (bytes, info) = build(name, src);
+    let in_record = pack_single_int(&info, 1);
+    let out = run_buffer(&bytes, &format!("relon_parity_{name}"), &info, &in_record);
+    match out.get("value") {
+        Some(Decoded::Str(s)) => assert_eq!(*s, want, "[{name}] wasm String != native"),
+        other => panic!("[{name}] decoded {other:?}"),
+    }
+}
+
+/// Shared driver for an Int-scalar result (e.g. `len`).
+fn r8_check_int(name: &str, src: &str, want_dbg: i64) {
+    let want = match native_run(src, HashMap::from([("n".to_string(), Value::Int(1))])) {
+        Value::Int(v) => v,
+        other => panic!("[{name}] native expected Int, got {other:?}"),
+    };
+    assert_eq!(want, want_dbg, "[{name}] native Int oracle drifted");
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping {name}");
+        return;
+    }
+    let (bytes, info) = build(name, src);
+    let in_record = pack_single_int(&info, 1);
+    let out = run_buffer(&bytes, &format!("relon_parity_{name}"), &info, &in_record);
+    match out.get("value") {
+        Some(Decoded::Int(v)) => assert_eq!(*v, want, "[{name}] wasm Int != native"),
+        other => panic!("[{name}] decoded {other:?}"),
+    }
+}
+
+/// Shared driver for a Bool-scalar result (e.g. `ends_with`). Bool is
+/// decoded as `Decoded::Int(0/1)`.
+fn r8_check_bool(name: &str, src: &str, want_dbg: bool) {
+    let want = match native_run(src, HashMap::from([("n".to_string(), Value::Int(1))])) {
+        Value::Bool(b) => b,
+        other => panic!("[{name}] native expected Bool, got {other:?}"),
+    };
+    assert_eq!(want, want_dbg, "[{name}] native Bool oracle drifted");
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping {name}");
+        return;
+    }
+    let (bytes, info) = build(name, src);
+    let in_record = pack_single_int(&info, 1);
+    let out = run_buffer(&bytes, &format!("relon_parity_{name}"), &info, &in_record);
+    match out.get("value") {
+        Some(Decoded::Int(v)) => {
+            assert_eq!(*v != 0, want, "[{name}] wasm Bool != native")
+        }
+        other => panic!("[{name}] decoded {other:?}"),
+    }
+}
+
+#[test]
+fn r8_len_aligns_native_via_wasmtime() {
+    r8_check_int("r8_len", "#main(Int n) -> Int\nlen(\"hello\")", 5);
+}
+
+#[test]
+fn r8_len_unicode_aligns_native_via_wasmtime() {
+    // "café" — 5 UTF-8 bytes (len() is byte length, matching the oracle).
+    r8_check_int("r8_len_unicode", "#main(Int n) -> Int\nlen(\"café\")", 5);
+}
+
+#[test]
+fn r8_ends_with_true_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "r8_ends_with_t",
+        "#main(Int n) -> Bool\nends_with(\"hello\", \"lo\")",
+        true,
+    );
+}
+
+#[test]
+fn r8_ends_with_false_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "r8_ends_with_f",
+        "#main(Int n) -> Bool\nends_with(\"hello\", \"xo\")",
+        false,
+    );
+}
+
+#[test]
+fn r8_ends_with_empty_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "r8_ends_with_e",
+        "#main(Int n) -> Bool\nends_with(\"hello\", \"\")",
+        true,
+    );
+}
+
+#[test]
+fn r8_replace_all_aligns_native_via_wasmtime() {
+    r8_check_str(
+        "r8_replace_all",
+        "#main(Int n) -> String\n\"aXbXc\".replace(\"X\", \"-\")",
+    );
+}
+
+#[test]
+fn r8_replace_grow_aligns_native_via_wasmtime() {
+    r8_check_str(
+        "r8_replace_grow",
+        "#main(Int n) -> String\n\"a.b.c\".replace(\".\", \"__\")",
+    );
+}
+
+#[test]
+fn r8_replace_nomatch_aligns_native_via_wasmtime() {
+    r8_check_str(
+        "r8_replace_nomatch",
+        "#main(Int n) -> String\n\"abc\".replace(\"X\", \"-\")",
+    );
+}
+
+#[test]
+fn r8_replace_empty_from_aligns_native_via_wasmtime() {
+    r8_check_str(
+        "r8_replace_empty",
+        "#main(Int n) -> String\n\"ab\".replace(\"\", \"-\")",
+    );
+}
+
+#[test]
+fn r8_replace_empty_from_unicode_aligns_native_via_wasmtime() {
+    r8_check_str(
+        "r8_replace_empty_u",
+        "#main(Int n) -> String\n\"café\".replace(\"\", \"X\")",
+    );
+}

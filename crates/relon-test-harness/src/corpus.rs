@@ -983,6 +983,83 @@ pub fn all_cases() -> Vec<CorpusCase> {
             tier: Tier::StdlibSimple,
             supported_by: TW_CR,
         },
+        // Wave R8: byte-level string stdlib lowered four-way. Tree-walk ==
+        // cranelift here; the wasm + llvm-native legs live in
+        // `relon-codegen-llvm::aot_wasm_parity::r8_*`. Edges covered:
+        // empty string, no-match / overlap / empty-`from` / grow replace.
+        // `trim` / `trim_start` / `trim_end` stay capped (UTF-8 decode
+        // seam unsupported on LLVM-native / wasm — see the `string_ops`
+        // module docs); `matches` (regex) and `split` (List<String>) too.
+        CorpusCase {
+            name: "r8_len",
+            source: "#main() -> Int\nlen(\"hello\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r8_len_unicode",
+            source: "#main() -> Int\nlen(\"café\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r8_ends_with_true",
+            source: "#main() -> Bool\nends_with(\"hello\", \"lo\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r8_ends_with_false",
+            source: "#main() -> Bool\nends_with(\"hello\", \"xo\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r8_ends_with_empty",
+            source: "#main() -> Bool\nends_with(\"hello\", \"\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r8_replace_all",
+            source: "#main() -> String\n\"aXbXc\".replace(\"X\", \"-\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r8_replace_overlap",
+            source: "#main() -> String\n\"aaa\".replace(\"aa\", \"b\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r8_replace_nomatch",
+            source: "#main() -> String\n\"abc\".replace(\"X\", \"-\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r8_replace_empty_from",
+            source: "#main() -> String\n\"ab\".replace(\"\", \"-\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r8_replace_empty_from_unicode",
+            source: "#main() -> String\n\"café\".replace(\"\", \"X\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
         // ---- StdlibNormalize: most complex ----
         // Bytecode rejects `String`-typed return; trace const table
         // pre-computes both NFD / NFC payloads.

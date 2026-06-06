@@ -93,6 +93,7 @@ mod index;
 mod normalization;
 mod registry;
 mod signatures;
+mod string_ops;
 
 pub use index::{
     stdlib_closure_arg_signature, stdlib_function_count, stdlib_function_index, stdlib_method_index,
@@ -315,12 +316,13 @@ mod glob_match_index_tests {
     /// 38. Wave R3b appended the typed `List<Float>` / cross-type HOF
     /// bodies at indices 39..43; Wave R3c appended the String-result list
     /// `map` family at indices 44..46; Wave R7 appended the scalar Float
-    /// math bodies at indices 47..51 — all at the tail so every
-    /// position-pinned index above stays put. Pinning the count catches
-    /// accidental double-registrations.
+    /// math bodies at indices 47..51; Wave R8 appended the byte-level
+    /// string ops (`len` / `ends_with` / `replace`) at indices 52..54 —
+    /// all at the tail so every position-pinned index above stays put.
+    /// Pinning the count catches accidental double-registrations.
     #[test]
-    fn bundle_has_52_entries() {
-        assert_eq!(stdlib_function_count(), 52);
+    fn bundle_has_55_entries() {
+        assert_eq!(stdlib_function_count(), 55);
         assert_eq!(stdlib_function_index("glob_match"), Some(37));
         assert_eq!(stdlib_function_index("list_list_length"), Some(38));
         // Wave R3b tail appends (order-pinned wire format).
@@ -339,6 +341,10 @@ mod glob_match_index_tests {
         assert_eq!(stdlib_function_index("ceil"), Some(49));
         assert_eq!(stdlib_function_index("round"), Some(50));
         assert_eq!(stdlib_function_index("sqrt"), Some(51));
+        // Wave R8 tail appends (byte-level string ops).
+        assert_eq!(stdlib_function_index("len"), Some(52));
+        assert_eq!(stdlib_function_index("ends_with"), Some(53));
+        assert_eq!(stdlib_function_index("replace"), Some(54));
     }
 }
 

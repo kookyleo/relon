@@ -86,6 +86,16 @@ pub fn stdlib_method_index(receiver_ty: IrType, name: &str) -> Option<u32> {
         (IrType::String, "title_locale") => stdlib_function_index("title_locale"),
         (IrType::String, "substring") => stdlib_function_index("substring"),
         (IrType::String, "starts_with") => stdlib_function_index("starts_with"),
+        // Wave R8: `s.replace(a, b)` receiver-method dispatch. The
+        // free-call form `replace(s, a, b)` is method-only in the
+        // evaluator (no `register_pure_fn`), so it never reaches the
+        // free-call name lookup — only this method route fires.
+        // `ends_with` has NO tree-walk method form (only the free-call
+        // `ends_with(s, p)`), so it is intentionally absent here to keep
+        // the four-way surface in lock-step. `trim` / `trim_start` /
+        // `trim_end` stay capped (UTF-8 decode seam unsupported on
+        // LLVM-native / wasm — see `string_ops` module docs).
+        (IrType::String, "replace") => stdlib_function_index("replace"),
         // F-D7-D: `s.contains(needle)` and the free-call form
         // `contains(s, needle)` both resolve to the same body. The
         // trace recorder short-circuits the call onto
