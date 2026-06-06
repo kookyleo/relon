@@ -1,13 +1,29 @@
-//! Unicode-aware tables and helpers shared by the tree-walk
-//! evaluator and the wasm-AOT / native codegen backends.
+// Relaxed from `forbid` to `deny` so the v3++ item 4 SIMD ASCII fast
+// path (`ascii_fold_simd`) can use wasm32 `v128_load` / `v128_store`
+// intrinsics, both of which are `unsafe fn` in `core::arch::wasm32`.
+// The `unsafe` blocks are confined to that single module behind a
+// `#[allow(unsafe_code)]` and each has a SAFETY comment; the rest of
+// the crate stays unsafe-free.
+#![deny(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
+//! Unicode-aware tables, algorithms, and the glob matcher shared by
+//! the tree-walk evaluator and the wasm-AOT / native codegen
+//! backends.
 //!
-//! This submodule consolidates every Unicode dataset and the SIMD
-//! ASCII fast path that previously lived flat under `relon-ir/src/`.
-//! Moving them under a single `unicode/` parent keeps the IR crate
-//! root focused on the IR surface itself (`ir`, `lowering`,
-//! `op_visitor`, `stdlib*`, `shape_hash`, `error`) and gives Unicode
-//! contributors one place to land table regenerations + algorithm
-//! tweaks.
+//! This crate is a **leaf**: it depends on no other `relon-*` crate
+//! (matching `relon-util` / `relon-cap`), so it sits at the very
+//! bottom of the workspace dep graph. It consolidates every Unicode
+//! dataset, the SIMD ASCII fast path, and the linear-time glob
+//! matcher that previously lived under `relon-ir/src/unicode/` and
+//! `relon-ir/src/glob.rs`. Pulling them into a standalone crate lets
+//! `relon-evaluator` consume the shared tables without an edge to
+//! `relon-ir` (the evaluator is a tree-walk engine and never touches
+//! the IR surface), keeping the dep graph honest.
+//!
+//! `relon-ir` keeps same-named re-exports so the codegen backends
+//! that reach for `relon_ir::ascii_fold_simd` / `relon_ir::glob` /
+//! etc. compile unchanged.
 //!
 //! ### Module map
 //!
@@ -38,6 +54,8 @@
 //!   tree-walk `upper` / `lower` / `title` bodies. Only the wasm32
 //!   arm uses `unsafe` v128 intrinsics; other targets stay on the
 //!   chunked scalar fallback.
+//! * [`glob`] — linear-time Unicode-aware glob matcher backing the
+//!   `glob_match(s, pattern) -> Bool` stdlib function.
 //!
 //! UCD version: Unicode 14.0.0 across every regeneration script.
 //! When a future Unicode bump lands, regenerate the four data-bearing
@@ -48,6 +66,7 @@ pub mod ascii_fold_simd;
 pub mod case_folding;
 pub mod combining_marks;
 pub mod full_case_folding;
+pub mod glob;
 pub mod normalization;
 pub mod normalization_data;
 pub mod whitespace;

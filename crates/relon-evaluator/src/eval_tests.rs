@@ -294,7 +294,7 @@ fn test_string_stdlib() {
         // 2026-05-21: glob_match surface covers `string.glob_match(...)`,
         // the method form `s.glob_match(...)`, and the bare free-fn
         // `glob_match(...)`. All three must dispatch into the shared
-        // `relon_ir::glob::glob_match` impl.
+        // `relon_unicode::glob::glob_match` impl.
         assert_eq!(map.map.get("glob_prefix").unwrap(), &Value::Bool(true));
         assert_eq!(map.map.get("glob_extension").unwrap(), &Value::Bool(true));
         assert_eq!(map.map.get("glob_question").unwrap(), &Value::Bool(true));
@@ -6055,7 +6055,7 @@ fn unprepared_shared_arc_panics_loudly() {
 /// rather than silently in the bench harness.
 ///
 /// IR-driven tiers (bytecode VM, trace-JIT, cranelift / LLVM AOT) do
-/// **not** accept this source today — `relon_ir::lower_workspace_single`
+/// **not** accept this source today — relon-ir's `lower_workspace_single`
 /// bails on `-> Dict` + `Expr::Closure` at a non-higher-order site. The
 /// Phase F.2 design doc (local-only) captures the lifting work; this
 /// test is the tree-walker oracle the future Phase B lowering will be

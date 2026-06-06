@@ -9,8 +9,8 @@
 //! Regenerate with:
 //!
 //! ```sh
-//! python3 crates/relon-ir/tools/gen_normalization_tables.py \
-//!     > crates/relon-ir/src/unicode/normalization_data.rs
+//! python3 crates/relon-unicode/tools/gen_normalization_tables.py \
+//!     > crates/relon-unicode/src/normalization_data.rs
 //! ```
 //!
 //! Last regenerated: 2026-05-18 (UCD 14.0.0).

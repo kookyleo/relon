@@ -27,29 +27,28 @@
 pub mod effect;
 pub mod error;
 pub mod frontend;
-pub mod glob;
 pub mod intern;
 pub mod ir;
 pub mod lowering;
 pub mod op_visitor;
 pub mod shape_hash;
 pub mod stdlib;
-pub mod unicode;
 
-// Backwards-compatible re-exports: the eight Unicode-adjacent modules
-// previously lived flat under `relon-ir/src/`. They moved into
-// [`unicode`] (review-improvement P3, large-file / domain split,
-// 2026-05-21). Re-exporting them at the crate root keeps
-// `relon_ir::case_folding::...` / `relon_ir::normalization::...` /
-// etc. compiling for downstream crates so the move stays
-// non-breaking.
-pub use crate::unicode::ascii_fold_simd;
-pub use crate::unicode::case_folding;
-pub use crate::unicode::combining_marks;
-pub use crate::unicode::full_case_folding;
-pub use crate::unicode::normalization;
-pub use crate::unicode::normalization_data;
-pub use crate::unicode::whitespace;
+// Backwards-compatible re-exports: the Unicode tables / algorithms and
+// the glob matcher were extracted into the leaf `relon-unicode` crate
+// so the tree-walk evaluator can consume them without depending on
+// `relon-ir`. Re-exporting them at the crate root keeps the codegen
+// backends' `relon_ir::ascii_fold_simd::...` / `relon_ir::glob::...` /
+// `relon_ir::normalization::...` / etc. paths compiling unchanged, so
+// the move stays non-breaking for downstream crates.
+pub use relon_unicode::ascii_fold_simd;
+pub use relon_unicode::case_folding;
+pub use relon_unicode::combining_marks;
+pub use relon_unicode::full_case_folding;
+pub use relon_unicode::glob;
+pub use relon_unicode::normalization;
+pub use relon_unicode::normalization_data;
+pub use relon_unicode::whitespace;
 
 pub use error::LoweringError;
 pub use frontend::{compile, FrontendError};
