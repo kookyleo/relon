@@ -38,6 +38,7 @@
 
 use std::collections::HashMap;
 
+use ordered_float::OrderedFloat;
 use relon_eval_api::Value;
 
 use crate::BackendKind;
@@ -816,6 +817,66 @@ pub fn all_cases() -> Vec<CorpusCase> {
             source: "#schema Out { String name: *, Int n: * }\n#main() -> Out\n{ name: \"alice\", n: 42 }",
             args_factory: no_args,
             tier: Tier::DictReturn,
+            supported_by: TW_CR,
+        },
+        // ---- Wave R4: static const-fold of `type(v)` ----
+        // In strict mode the argument's IR type is statically known, so
+        // `type(v)` lowers to a constant canonical type-name String
+        // (`IrType::type_name`, asserted byte-equal to
+        // `Value::type_name`). The argument is still evaluated for trap
+        // parity, then discarded. `String` return ⇒ tree-walk +
+        // cranelift claim (bytecode rejects String return; the trace
+        // recipe catalogue has no `type` shape).
+        CorpusCase {
+            name: "r4_type_int",
+            source: "#main(Int n) -> String\ntype(n)",
+            args_factory: || one_int("n", 5),
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r4_type_float",
+            source: "#main(Float f) -> String\ntype(f)",
+            args_factory: || {
+                HashMap::from([("f".to_string(), Value::Float(OrderedFloat(1.5)))])
+            },
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r4_type_string",
+            source: "#main(String s) -> String\ntype(s)",
+            args_factory: || {
+                HashMap::from([("s".to_string(), Value::String("hi".into()))])
+            },
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r4_type_bool",
+            source: "#main(Bool b) -> String\ntype(b)",
+            args_factory: || HashMap::from([("b".to_string(), Value::Bool(true))]),
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        // Coarsening: a `List<Int>` argument → "List" (every concrete
+        // list element tag folds to the same name).
+        CorpusCase {
+            name: "r4_type_list_coarsen",
+            source: "#main(Int n) -> String\ntype(range(n))",
+            args_factory: || one_int("n", 3),
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        // Trap parity: the argument is evaluated before the type string
+        // is produced, so an overflowing sub-expression traps identically
+        // to the tree-walk `type` builtin (which reads
+        // `args[0].type_name()` only after evaluating `args[0]`).
+        CorpusCase {
+            name: "r4_type_arg_overflow_traps",
+            source: "#main(Int n) -> String\ntype(n * 9223372036854775807 + 9223372036854775807)",
+            args_factory: || one_int("n", 2),
+            tier: Tier::StdlibSimple,
             supported_by: TW_CR,
         },
     ]

@@ -150,6 +150,46 @@ impl IrType {
                 | IrType::ListList
         )
     }
+
+    /// Canonical surface type name for a statically-typed value of this
+    /// IR type — the exact string the tree-walk `type(v)` builtin would
+    /// return (`relon_eval_api::Value::type_name`). This is the SINGLE
+    /// source of truth for the Wave R4 static `type(v)` const-fold, and
+    /// it MUST agree byte-for-byte with `Value::type_name` (a unit test
+    /// in this crate cross-checks every variant against the oracle).
+    ///
+    /// The mapping COARSENS, exactly as the value model does: every
+    /// element-tagged list pointer (`ListInt` / `ListFloat` / ... /
+    /// `ListList`) folds to `"List"`, and `Dict` (plain or branded) folds
+    /// to `"Dict"`. A wrong string here is a silent wrong value, so the
+    /// coarsening is asserted, not assumed.
+    ///
+    /// Returns `None` for IR types that are NOT user-facing value shapes
+    /// (`I32` is a wasm-handshake-only slot). The caller keeps such a
+    /// `type(v)` capped rather than fabricating a name.
+    pub fn type_name(self) -> Option<&'static str> {
+        match self {
+            // `I32` is an internal wasm-handshake slot (in_ptr / out_cap /
+            // bytes_written), never a user-surfaced Relon value — refuse
+            // to name it so a stray `type(<i32-slot>)` stays capped.
+            IrType::I32 => None,
+            IrType::I64 => Some("Int"),
+            IrType::F64 => Some("Float"),
+            IrType::Bool => Some("Bool"),
+            IrType::Null => Some("Null"),
+            IrType::String => Some("String"),
+            // Coarsening: every concrete list element tag → "List".
+            IrType::ListInt
+            | IrType::ListFloat
+            | IrType::ListBool
+            | IrType::ListString
+            | IrType::ListSchema
+            | IrType::ListList => Some("List"),
+            IrType::Closure => Some("Closure"),
+            // Coarsening: plain and branded dict records → "Dict".
+            IrType::Dict => Some("Dict"),
+        }
+    }
 }
 
 /// One lowered module — a flat list of functions plus an optional
@@ -1756,6 +1796,83 @@ impl Op {
             // construction. Always ABORTs the trace.
             Op::CallNative { .. } => Unrecoverable,
         }
+    }
+}
+
+#[cfg(test)]
+mod type_name_oracle_tests {
+    use super::*;
+    use ordered_float::OrderedFloat;
+    use relon_eval_api::value::{Value, ValueDict};
+    use std::sync::Arc;
+
+    /// Wave R4: the IR-level `IrType::type_name` mapping is the single
+    /// source of truth for the static `type(v)` const-fold. It MUST
+    /// agree byte-for-byte with the tree-walk oracle
+    /// `Value::type_name`. This test pins each user-facing IrType to a
+    /// representative `Value` and asserts the two strings match — so a
+    /// drift in either mapping (e.g. losing the `List*` -> "List"
+    /// coarsening) fails loudly rather than emitting a silent wrong
+    /// type string in a compiled backend.
+    #[test]
+    fn ir_type_name_matches_value_oracle() {
+        // (representative value, IrType) pairs covering every
+        // user-facing IrType variant. `I32` is intentionally absent:
+        // it is a wasm-handshake-only slot with no `Value` counterpart
+        // and `IrType::type_name` returns `None` for it.
+        let cases: &[(Value, IrType)] = &[
+            (Value::Int(0), IrType::I64),
+            (Value::Float(OrderedFloat(0.0)), IrType::F64),
+            (Value::Bool(true), IrType::Bool),
+            (Value::Null, IrType::Null),
+            (Value::String("".into()), IrType::String),
+            // Every list element tag coarsens to the same "List" oracle.
+            (Value::list(vec![Value::Int(1)]), IrType::ListInt),
+            (
+                Value::list(vec![Value::Float(OrderedFloat(1.0))]),
+                IrType::ListFloat,
+            ),
+            (Value::list(vec![Value::Bool(true)]), IrType::ListBool),
+            (
+                Value::list(vec![Value::String("a".into())]),
+                IrType::ListString,
+            ),
+            (
+                Value::list(vec![Value::dict([("k", Value::Int(1))])]),
+                IrType::ListSchema,
+            ),
+            (
+                Value::list(vec![Value::list(vec![Value::Int(1)])]),
+                IrType::ListList,
+            ),
+            // Plain and branded dict both coarsen to "Dict".
+            (Value::dict([("k", Value::Int(1))]), IrType::Dict),
+        ];
+        for (value, ir_ty) in cases {
+            let ir_name = ir_ty
+                .type_name()
+                .expect("user-facing IrType must yield a name");
+            assert_eq!(
+                ir_name,
+                value.type_name(),
+                "IrType::{:?} name `{}` disagrees with Value::type_name `{}`",
+                ir_ty,
+                ir_name,
+                value.type_name(),
+            );
+        }
+
+        // Branded dict ALSO coarsens to "Dict" (the oracle never widens
+        // the brand into the type name).
+        let branded = Value::Dict(Arc::new(ValueDict::with_brand(
+            [("k", Value::Int(1))],
+            Some("User".to_string()),
+        )));
+        assert_eq!(branded.type_name(), "Dict");
+        assert_eq!(IrType::Dict.type_name(), Some("Dict"));
+
+        // `I32` is not user-facing: refuse to name it.
+        assert_eq!(IrType::I32.type_name(), None);
     }
 }
 

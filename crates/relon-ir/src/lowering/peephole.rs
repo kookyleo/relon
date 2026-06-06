@@ -1855,6 +1855,109 @@ pub(super) fn try_lower_range_value(
     Ok(Some(()))
 }
 
+/// Wave R4: static const-fold of the `type(v)` builtin.
+///
+/// In strict mode the argument's type is statically known after
+/// lowering it, so `type(v)` reduces to a constant type-name String —
+/// pure static, no runtime value model. The lowered shape is:
+///
+/// 1. Lower `<arg>` normally, so its value lands on the vstack **and
+///    any traps inside it fire** (the tree-walk `type` builtin
+///    evaluates its argument before reading `Value::type_name`, so an
+///    overflowing sub-expression must trap identically — we never skip
+///    evaluating `v`).
+/// 2. Map the produced IR type to the canonical type-name string via
+///    the single source of truth [`IrType::type_name`] (asserted equal
+///    to `Value::type_name` in a `relon-ir` unit test). This COARSENS:
+///    every `List*` -> "List", `Dict` (plain or branded) -> "Dict".
+/// 3. Discard the evaluated value by storing it into a fresh, never-read
+///    let-local (`Op::LetSet`), then push `Op::ConstString(<name>)`.
+///
+/// Returns `Ok(Some(()))` when the fold fired (leaves a single
+/// `IrType::String` on the vstack), `Ok(None)` when the shape does not
+/// match or the argument's type is not statically nameable (a wasm
+/// handshake `I32` slot) — in the latter case the speculative arg
+/// lowering is rolled back and dispatch falls through to the existing
+/// `unknown_stdlib_method` cap. `Err` only on an argument that fails to
+/// lower.
+///
+/// Out of scope (kept capped, Wave R6): `type()` over a `#relaxed` /
+/// boxed value whose type is not statically determinable — those never
+/// reach a concrete `IrType` here and surface through the normal cap.
+pub(super) fn try_lower_type_const(
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    // Bare `type(<arg>)`: single path segment `type`, exactly one
+    // positional argument, no keyword form.
+    if path.len() != 1 || !matches!(&path[0], TokenKey::String(s, _, _) if s == "type") {
+        return Ok(None);
+    }
+    if args.len() != 1 || args[0].name.is_some() {
+        return Ok(None);
+    }
+
+    // Snapshot so an unnameable argument type rolls the speculative arg
+    // lowering back cleanly and dispatch falls through to the cap path.
+    let saved_out = std::mem::take(&mut ctx.out);
+    let saved_stack = std::mem::take(&mut ctx.tstack);
+    let saved_next_let = ctx.next_let_idx;
+    let saved_lambda_len = ctx.lambda_table.borrow().len();
+
+    let lower_res = lower_expr(&args[0].value.expr, args[0].value.range, ctx);
+    let produced = ctx.tstack.last().copied();
+    let type_name = produced.and_then(IrType::type_name);
+
+    let (Ok(()), Some(arg_ty), Some(name)) = (lower_res, produced, type_name) else {
+        // Either the argument failed to lower, produced nothing, or
+        // produced a non-user-facing slot we refuse to name. Roll back
+        // and let the default dispatch raise the existing cap.
+        ctx.out = saved_out;
+        ctx.tstack = saved_stack;
+        ctx.next_let_idx = saved_next_let;
+        ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+        return Ok(None);
+    };
+
+    // Re-attach the argument's op stream / vstack (the arg evaluation
+    // is KEPT for trap + side-effect-ordering parity).
+    let arg_stream = std::mem::replace(&mut ctx.out, saved_out);
+    ctx.out.extend(arg_stream);
+    let arg_stack = std::mem::replace(&mut ctx.tstack, saved_stack);
+    ctx.tstack.extend(arg_stack);
+
+    // Discard the evaluated value: store it into a fresh let-local that
+    // is never read. This pops the vstack and keeps the evaluation in
+    // the op stream (its traps already fired). The let-local is internal
+    // — not registered in `ctx.lets` — so no source name can read it;
+    // both backends lazily declare the slot on first `LetSet`.
+    let discard_idx = ctx.next_let_idx;
+    ctx.next_let_idx += 1;
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: discard_idx,
+            ty: arg_ty,
+        },
+        range,
+    });
+    ctx.tstack.pop(); // the discarded argument value
+
+    // Push the constant type name (interned through the module-wide
+    // const-string table, same path as a source `Expr::String`).
+    let str_idx = ctx.const_intern.borrow_mut().strings.intern(name);
+    ctx.out.push(TaggedOp {
+        op: Op::ConstString {
+            idx: str_idx,
+            value: name.to_string(),
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::String);
+    Ok(Some(()))
+}
+
 /// Wave R3: general `_list_map(xs, (x) => <body>)` over an arbitrary
 /// `List<Int>`-typed first argument. Mirror of [`try_lower_list_filter`]
 /// — speculatively lowers the list source (so a bare `range(...)`, a

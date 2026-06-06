@@ -636,6 +636,60 @@ fn const_string_return_aligns_native_via_wasmtime() {
     }
 }
 
+/// Wave R4 — static const-fold of `type(n)` over an `Int` param →
+/// the constant `"Int"` String. Proves the const-string the lowering
+/// pushes (after evaluating + discarding the argument) round-trips
+/// byte-equal on the wasm32 leg against the native LLVM oracle (itself
+/// bit-aligned to tree-walk + cranelift).
+#[test]
+fn r4_type_int_aligns_native_via_wasmtime() {
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping r4 type(int)");
+        return;
+    }
+    let src = "#main(Int n) -> String\ntype(n)";
+    let n = 7i64;
+    let want = match native_run(src, HashMap::from([("n".to_string(), Value::Int(n))])) {
+        Value::String(s) => s,
+        other => panic!("native expected String, got {other:?}"),
+    };
+    assert_eq!(want, "Int", "native type(int) oracle drifted");
+    let (bytes, info) = build("r4_type_int", src);
+    let in_record = pack_single_int(&info, n);
+    let out = run_buffer(&bytes, "relon_parity_r4_type_int", &info, &in_record);
+    match out.get("value") {
+        Some(Decoded::Str(s)) => assert_eq!(*s, want, "r4 type(int) wasm != native"),
+        other => panic!("r4 type(int) decoded {other:?}"),
+    }
+}
+
+/// Wave R4 — coarsening: `type(range(n))` over a `List<Int>` argument
+/// folds to the constant `"List"` (every concrete list element tag maps
+/// to the same name). The `range(n)` is still materialised + discarded
+/// for trap/ordering parity; only the constant name survives. Verified
+/// byte-equal on the wasm32 leg against native LLVM.
+#[test]
+fn r4_type_list_coarsen_aligns_native_via_wasmtime() {
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping r4 type(list)");
+        return;
+    }
+    let src = "#main(Int n) -> String\ntype(range(n))";
+    let n = 3i64;
+    let want = match native_run(src, HashMap::from([("n".to_string(), Value::Int(n))])) {
+        Value::String(s) => s,
+        other => panic!("native expected String, got {other:?}"),
+    };
+    assert_eq!(want, "List", "native type(list) coarsen oracle drifted");
+    let (bytes, info) = build("r4_type_list", src);
+    let in_record = pack_single_int(&info, n);
+    let out = run_buffer(&bytes, "relon_parity_r4_type_list", &info, &in_record);
+    match out.get("value") {
+        Some(Decoded::Str(s)) => assert_eq!(*s, want, "r4 type(list) wasm != native"),
+        other => panic!("r4 type(list) decoded {other:?}"),
+    }
+}
+
 /// Wave R2 — f-string with an Int interpolation (`f"n=${n}"`) → String.
 /// Exercises `Op::IntToStr` + `Op::StrConcatN` on the LLVM native and
 /// wasm32 legs, checked byte-exact against the native `run_main` oracle

@@ -59,7 +59,7 @@ use peephole::{
     try_lower_list_filter, try_lower_list_len, try_lower_list_map, try_lower_list_reduce,
     try_lower_list_sum_range, try_lower_list_sum_value, try_lower_materialized_list_reduce,
     try_lower_nested_range_map_reduce, try_lower_range_chain_len, try_lower_range_chain_reduce,
-    try_lower_range_value,
+    try_lower_range_value, try_lower_type_const,
 };
 
 /// Per-function lowering state shared across the recursive walk.
@@ -3720,6 +3720,15 @@ fn lower_fn_call(
     // result is actually used as a list (returned, indexed, `.map`/
     // `.filter`/`reduce`'d) reaches here and gets a real record.
     if let Some(()) = try_lower_range_value(path, args, range, ctx)? {
+        return Ok(());
+    }
+    // Wave R4: static const-fold of `type(v)`. In strict mode the
+    // argument's type is statically known, so this lowers the argument
+    // (for trap parity), discards the value, and pushes the constant
+    // canonical type-name String via the shared `IrType::type_name`
+    // mapping. Falls through to the cap path when the argument type is
+    // not statically nameable (Wave R6 dynamic / boxed `type()`).
+    if let Some(()) = try_lower_type_const(path, args, range, ctx)? {
         return Ok(());
     }
     // Final path segment is the method / function name. Earlier
