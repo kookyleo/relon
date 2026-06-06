@@ -10,9 +10,43 @@
 //! The `ledger_completeness` integration test enforces a bijection
 //! between [`LEDGER`] and `LOWERING_CAP_IDS` — no orphan ledger row, no
 //! unregistered cap — so a future cap added without a ledger entry fails
-//! the build. As constructs gain real coverage in later value-model
-//! waves, their entries flip from [`Status::Capped`] to
-//! [`Status::Covered`] and gain a `corpus` probe name.
+//! the build.
+//!
+//! ## Two layers: cap-site registry vs supported-surface coverage
+//!
+//! There are two distinct things to track, and conflating them would be
+//! dishonest, so they live in two tables:
+//!
+//! * [`LEDGER`] — one row per **cap site**. A cap site is a place in the
+//!   lowering pass that *rejects* a shape (`cap!(id, LoweringError…)`).
+//!   By construction a cap site only ever fires on a shape it cannot
+//!   lower, so **every cap-site row is genuinely [`Status::Capped`]**:
+//!   "Covered" is not a meaningful state for a rejection point. The
+//!   `status` / `corpus` / `reason` fields record *why* a site rejects
+//!   and (for the few caps a test deliberately drives) which probe
+//!   exercises it. This is the machine-auditable "no silent new cap"
+//!   registry — Wave R6 finalises its reasons but does **not** flip any
+//!   site to Covered, because none of them are.
+//!
+//! * [`SUPPORTED_SURFACE`] — one row per **declared-supported construct**
+//!   (Waves R1–R9: contextual-typed closures / comprehension, pipe,
+//!   f-string, range / map / filter / reduce, `type()` const-fold,
+//!   strict-`match` arm-fold, scalar math, scalar string ops, `is_uuid`,
+//!   …). These rows ARE [`Status::Covered`]: each names a real corpus
+//!   case that lowers cleanly (the lowering pass fires **no** cap on it)
+//!   and runs the compiled backend in the differential. The Wave R6
+//!   `no_fallback_over_supported_surface` proof iterates this table and
+//!   asserts `auto` reaches the compiled backend for every row — never
+//!   the silent tree-walk capability fallback.
+//!
+//! The honest summary, then: the cap-site ledger is the partition of
+//! *rejection points* (all Capped, with truthful reasons); the
+//! supported-surface table is the partition of *constructs that lower*
+//! (all Covered, each backed by a passing differential case). A
+//! construct being Covered does not retire any cap site — the same cap
+//! site still guards the *unsupported* corners of that construct family
+//! (e.g. f-strings lower, but an f-string interpolating an unlowerable
+//! sub-expression still hits an `unsupported_expr` cap).
 
 /// One row per lowering cap id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1700,7 +1734,8 @@ pub const LEDGER: &[LedgerEntry] = &[
         status: Status::Capped,
         corpus: "",
         reason: "match arm not statically decidable (coarsening/generic/branded-builtin \
-                 pattern); dynamic brand dispatch deferred to R6",
+                 pattern); runtime brand-dispatch is the dynamic residue — honest cap \
+                 as a non-default escape hatch under the static-first decision",
     },
     LedgerEntry {
         id: "lower_match.unsupported_expr.2",
@@ -1708,8 +1743,9 @@ pub const LEDGER: &[LedgerEntry] = &[
         category: Category::ExprShape,
         status: Status::Capped,
         corpus: "",
-        reason: "match with no statically-matching arm would trap TypeMismatch; no \
-                 cross-backend trap code surfaces that RuntimeError yet",
+        reason: "no-match `match` would trap TypeMismatch; the sandbox trap table has no \
+                 TypeMismatch code, so no cranelift/llvm/wasm trap surfaces that RuntimeError \
+                 — capped (R6: not forced, would risk a wrong trap shape)",
     },
     LedgerEntry {
         id: "lower_match.unsupported_expr.3",
@@ -1718,5 +1754,273 @@ pub const LEDGER: &[LedgerEntry] = &[
         status: Status::Capped,
         corpus: "",
         reason: "match scrutinee produced no IR value during real lowering; defensive cap",
+    },
+];
+
+/// One row per declared-supported construct family. Unlike [`LEDGER`]
+/// (which is keyed by cap *site* and is therefore all-Capped), this table
+/// is keyed by *construct* and is all-[`Status::Covered`]: every row names
+/// a real corpus case that lowers cleanly (no `cap!` fires) and runs the
+/// compiled backend in the differential.
+///
+/// The Wave R6 `no_fallback_over_supported_surface` proof iterates this
+/// table, looks each `corpus` name up in [`crate::corpus::all_cases`],
+/// runs it through `Backend::Auto`, and asserts the compiled backend
+/// handled it — i.e. `auto` did NOT take the unsupported-shape capability
+/// fallback to the tree-walk interpreter. See that test for the
+/// trivial-scalar-`#main` perf-route carve-out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfaceEntry {
+    /// Construct family / sub-shape this row attests is supported.
+    pub construct: &'static str,
+    /// Wave that landed the lowering (R1–R9, or "base" for the
+    /// arith/cmp/control-flow envelope that predates the R series).
+    pub wave: &'static str,
+    /// CorpusCase name in [`crate::corpus::all_cases`] that exercises
+    /// the construct and lowers four-way (or `TW_CR` with the wasm /
+    /// llvm-native legs proven in a dedicated codegen test — noted in
+    /// `proof`). The no-fallback proof drives this exact case.
+    pub corpus: &'static str,
+    /// Always [`Status::Covered`] — the table is the supported surface.
+    pub status: Status,
+    /// How the construct is proven across backends. Honest about which
+    /// legs run inline vs in a dedicated test.
+    pub proof: &'static str,
+}
+
+/// The declared-supported surface. Every row is `Covered`; the
+/// no-fallback proof gates `auto` against this list.
+pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
+    // ---- base envelope (pre-R): arith / cmp / control flow / where ----
+    SurfaceEntry {
+        construct: "Int arithmetic (+ - * / %)",
+        wave: "base",
+        corpus: "arith_chain",
+        status: Status::Covered,
+        proof: "four-way (tree-walk + cranelift + trace-JIT + bytecode), FULL_SUPPORT",
+    },
+    SurfaceEntry {
+        construct: "Int comparison (== != < > <= >=)",
+        wave: "base",
+        corpus: "cmp_lt",
+        status: Status::Covered,
+        proof: "four-way, FULL_SUPPORT",
+    },
+    SurfaceEntry {
+        construct: "ternary control flow (cond ? a : b), nested",
+        wave: "base",
+        corpus: "if_nested",
+        status: Status::Covered,
+        proof: "four-way, FULL_SUPPORT",
+    },
+    SurfaceEntry {
+        construct: "where-binding (postfix let)",
+        wave: "base",
+        corpus: "let_then_add",
+        status: Status::Covered,
+        proof: "four-way, FULL_SUPPORT",
+    },
+    SurfaceEntry {
+        construct: "arithmetic trap parity (div-by-zero / overflow)",
+        wave: "base",
+        corpus: "arith_div_by_zero_traps",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift + bytecode agree on the trap (trace synth wraps)",
+    },
+    // ---- simple stdlib (scalar) ----
+    SurfaceEntry {
+        construct: "scalar stdlib (abs/min/max/length/is_empty)",
+        wave: "base",
+        corpus: "stdlib_abs_neg",
+        status: Status::Covered,
+        proof: "four-way, FULL_SUPPORT",
+    },
+    // ---- Wave R1: contextual-typed closures via list HOFs ----
+    SurfaceEntry {
+        construct: "contextual-typed closure as HOF arg (range.map)",
+        wave: "R1/R3",
+        corpus: "r3_range_map",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift inline; closure dispatched via Op::CallClosure",
+    },
+    SurfaceEntry {
+        construct: "comprehension desugar onto list HOFs",
+        wave: "R1/R3",
+        corpus: "r3_comprehension_if",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift inline (desugars to map/filter)",
+    },
+    // ---- Wave R2: pipe + f-string ----
+    SurfaceEntry {
+        construct: "pipe operator (range(n) | list.sum)",
+        wave: "R2",
+        corpus: "pipe_range_into_list_sum",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift + bytecode (pure desugar to the spelled-out call)",
+    },
+    SurfaceEntry {
+        construct: "f-string interpolation (String + Int parts)",
+        wave: "R2",
+        corpus: "fstring_mixed_parts",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (String return; bytecode/trace exclude String entry)",
+    },
+    // ---- Wave R3: range / map / filter / reduce / comprehension (Int) ----
+    SurfaceEntry {
+        construct: "range(n) as materialised List<Int>",
+        wave: "R3",
+        corpus: "r3_range_value",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (List<Int> return; wasm/llvm in codegen tests)",
+    },
+    SurfaceEntry {
+        construct: "list filter (range.filter)",
+        wave: "R3",
+        corpus: "r3_range_filter",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift inline",
+    },
+    SurfaceEntry {
+        construct: "list reduce (_list_reduce, Int)",
+        wave: "R3",
+        corpus: "r3_list_reduce_free",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift + bytecode (Int return)",
+    },
+    // ---- Wave R3b: List<Float> HOFs + cross-type numeric map ----
+    SurfaceEntry {
+        construct: "List<Float> map / filter / reduce",
+        wave: "R3b",
+        corpus: "r3b_float_reduce_sum",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift; wasm/llvm-native in list_float_hof_four_way",
+    },
+    SurfaceEntry {
+        construct: "cross-type numeric map (Int->Float)",
+        wave: "R3b",
+        corpus: "r3b_int_to_float_map",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (result element type from closure return)",
+    },
+    // ---- Wave R3c: String-result map family ----
+    SurfaceEntry {
+        construct: "String-result list map (range.map -> f-string)",
+        wave: "R3c",
+        corpus: "r3c_range_map_fstring",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift + llvm-native (three-way in list_string_hof_three_way; \
+                wasm List<String> decode pending — capped, not claimed here)",
+    },
+    // ---- Wave R4: type() static const-fold ----
+    SurfaceEntry {
+        construct: "type(v) static const-fold (scalar)",
+        wave: "R4",
+        corpus: "r4_type_int",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (folds to constant type-name String)",
+    },
+    SurfaceEntry {
+        construct: "type(v) coarsening (List -> \"List\")",
+        wave: "R4",
+        corpus: "r4_type_list_coarsen",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift",
+    },
+    SurfaceEntry {
+        construct: "type(v) arg-eval trap parity",
+        wave: "R4",
+        corpus: "r4_type_arg_overflow_traps",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift agree on the overflow trap before the type string",
+    },
+    // ---- Wave R5: strict-match static arm selection ----
+    SurfaceEntry {
+        construct: "strict match static arm-fold (builtin scalar arm)",
+        wave: "R5",
+        corpus: "r5_match_int_arm",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (first statically-matching arm wins)",
+    },
+    SurfaceEntry {
+        construct: "strict match selected-arm general body codegen",
+        wave: "R5",
+        corpus: "r5_match_int_body_arith",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift + bytecode (Int return; body is real IR, not a const)",
+    },
+    SurfaceEntry {
+        construct: "strict match source-order tie-break + mismatch->wildcard",
+        wave: "R5",
+        corpus: "r5_match_scalar_mismatch_falls_to_wildcard",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (provably-never arm skipped, wildcard wins)",
+    },
+    // ---- Wave R7: scalar Float math ----
+    SurfaceEntry {
+        construct: "scalar Float math (abs/floor/ceil/round/sqrt)",
+        wave: "R7",
+        corpus: "r7_round_ties_even_up",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift; wasm/llvm-native in aot_wasm_parity::r7_*",
+    },
+    SurfaceEntry {
+        construct: "Float math Int-widen (sqrt(Int))",
+        wave: "R7",
+        corpus: "r7_sqrt_int_widen",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift",
+    },
+    // ---- Wave R8: byte-level scalar string ops ----
+    SurfaceEntry {
+        construct: "scalar string len (byte / unicode)",
+        wave: "R8",
+        corpus: "r8_len_unicode",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift; wasm/llvm-native in aot_wasm_parity::r8_*",
+    },
+    SurfaceEntry {
+        construct: "scalar string ends_with",
+        wave: "R8",
+        corpus: "r8_ends_with_true",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift",
+    },
+    SurfaceEntry {
+        construct: "scalar string replace (grow / overlap / empty-from)",
+        wave: "R8",
+        corpus: "r8_replace_overlap",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift",
+    },
+    // ---- Wave R9: is_uuid validator ----
+    SurfaceEntry {
+        construct: "is_uuid validator (valid / invalid edges)",
+        wave: "R9",
+        corpus: "r9_is_uuid_valid",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift; wasm/llvm-native in aot_wasm_parity::r9_*",
+    },
+    SurfaceEntry {
+        construct: "is_uuid rejects bad dash / non-hex / short",
+        wave: "R9",
+        corpus: "r9_is_uuid_nonhex",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift",
+    },
+    // ---- str concat fold (Op::StrConcatN) ----
+    SurfaceEntry {
+        construct: "String concat-chain fold (StrConcatN)",
+        wave: "base",
+        corpus: "str_concat_chain_four_way",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (4-leaf chain folds to one StrConcatN)",
+    },
+    // ---- schema-rooted dict return (the supported dict shape) ----
+    SurfaceEntry {
+        construct: "schema-rooted dict return (Int field)",
+        wave: "base",
+        corpus: "dict_simple_return",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift + bytecode (schema-rooted, NOT a Dict param/literal)",
     },
 ];

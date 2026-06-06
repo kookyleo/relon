@@ -43,7 +43,9 @@ use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub use auto_evaluator::{is_trivial_scalar_main, is_trivial_scalar_main_node, AutoEvaluator};
+pub use auto_evaluator::{
+    is_trivial_scalar_main, is_trivial_scalar_main_node, AutoEvaluator, DispatchRoute,
+};
 pub use builder::{EvaluatorBuilder, TrustLevel};
 pub use projector::{JsonProjector, Projector};
 // Dart-style canonical AOT entry, re-exported through the facade so
