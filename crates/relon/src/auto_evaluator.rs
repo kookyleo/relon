@@ -31,6 +31,7 @@
 //! so wasm-AOT was dead weight.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
@@ -38,6 +39,50 @@ use relon_evaluator::TreeWalkEvaluator;
 use relon_parser::{Expr, Node, Operator};
 
 use crate::BackendError;
+
+/// Which dispatch route the most recent [`AutoEvaluator::run_main`] took.
+///
+/// This is an *observability* signal, not a control input — production
+/// dispatch never reads it. The Wave R6 `no_fallback_over_supported_surface`
+/// proof reads it after running a known-supported corpus case to assert
+/// `auto` reached the compiled backend ([`DispatchRoute::Aot`]) and did
+/// **not** silently drop to the tree-walk interpreter via the
+/// capability-fallback arm ([`DispatchRoute::UnsupportedFallback`]). The
+/// trivial-scalar-`#main` perf route ([`DispatchRoute::TrivialMain`]) is a
+/// deliberate performance short-circuit, NOT a capability fallback, and the
+/// proof carves it out explicitly (asserting value-equality instead).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DispatchRoute {
+    /// No `run_main` has been dispatched on this evaluator yet.
+    None = 0,
+    /// Trivial-scalar-`#main` perf short-circuit straight to tree-walk
+    /// (skips building the AOT pipeline). A performance route, not a
+    /// capability fallback.
+    TrivialMain = 1,
+    /// The compiled cranelift-AOT backend handled the call.
+    Aot = 2,
+    /// The compiled backend declined the `#main` shape (capability
+    /// boundary) and `auto` fell back to the tree-walk interpreter.
+    /// For a construct on the *declared supported surface* this is the
+    /// regression Wave R6 forbids.
+    UnsupportedFallback = 3,
+    /// A genuine source / host / infrastructure error surfaced from
+    /// `run_main` (not a fallback — the error is returned to the caller).
+    HostError = 4,
+}
+
+impl DispatchRoute {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => DispatchRoute::TrivialMain,
+            2 => DispatchRoute::Aot,
+            3 => DispatchRoute::UnsupportedFallback,
+            4 => DispatchRoute::HostError,
+            _ => DispatchRoute::None,
+        }
+    }
+}
 
 /// Wrapper [`Evaluator`] that routes the four AST-aware methods
 /// through a tree-walker and lazily spins up the cranelift-AOT
@@ -81,6 +126,12 @@ pub struct AutoEvaluator {
     /// cost only on the first call (and the cache fast-restore
     /// covers subsequent ones).
     is_trivial_main: bool,
+    /// Observability: the route the most recent `run_main` dispatch
+    /// took. Written on every `run_main` (a single relaxed store, no
+    /// branch-perf impact); read by the Wave R6 no-fallback proof to
+    /// detect a silent capability fallback over the supported surface.
+    /// Encoded as a [`DispatchRoute`] discriminant.
+    last_route: AtomicU8,
 }
 
 /// Cached outcome of a failed AOT pipeline build.
@@ -122,7 +173,27 @@ impl AutoEvaluator {
             aot: OnceLock::new(),
             aot_init_err: OnceLock::new(),
             is_trivial_main,
+            last_route: AtomicU8::new(DispatchRoute::None as u8),
         })
+    }
+
+    /// Observability hook: the route the most recent [`Self::run_main`]
+    /// dispatch took, or [`DispatchRoute::None`] before the first call.
+    ///
+    /// Used by the Wave R6 `no_fallback_over_supported_surface` proof to
+    /// assert that a known-supported source reached the compiled backend
+    /// ([`DispatchRoute::Aot`]) and did not silently fall back to the
+    /// tree-walk interpreter ([`DispatchRoute::UnsupportedFallback`]). The
+    /// trivial-scalar-`#main` perf route is reported distinctly
+    /// ([`DispatchRoute::TrivialMain`]) so the proof can carve it out.
+    pub fn last_dispatch_route(&self) -> DispatchRoute {
+        DispatchRoute::from_u8(self.last_route.load(Ordering::Relaxed))
+    }
+
+    /// Record the route this dispatch took. A single relaxed store; the
+    /// production hot path is otherwise untouched.
+    fn mark_route(&self, route: DispatchRoute) {
+        self.last_route.store(route as u8, Ordering::Relaxed);
     }
 
     /// Test / observability hook: returns `true` when [`Self::new`]
@@ -281,6 +352,7 @@ impl Evaluator for AutoEvaluator {
         // (~4-5 ms cold) is pure overhead. See [`Self::new`] for
         // the conservative classifier.
         if self.is_trivial_main {
+            self.mark_route(DispatchRoute::TrivialMain);
             tracing::debug!(
                 target: "relon::auto_evaluator",
                 "trivial scalar #main; routing run_main through tree-walker (skipping cranelift-AOT init)"
@@ -295,7 +367,10 @@ impl Evaluator for AutoEvaluator {
             return Evaluator::run_main(self.tree_walk.as_ref(), args);
         }
         match self.aot() {
-            Ok(aot) => aot.run_main(args),
+            Ok(aot) => {
+                self.mark_route(DispatchRoute::Aot);
+                aot.run_main(args)
+            }
             // The compiled backend can't express this `#main` shape
             // (e.g. a `-> List<P>` return). That's a capability
             // boundary, not a program error — adapt by running the
@@ -303,6 +378,28 @@ impl Evaluator for AutoEvaluator {
             // produces the authoritative result. The trade-off is the
             // loss of AOT acceleration for this run, so we log it.
             Err(err) if err.unsupported_shape => {
+                self.mark_route(DispatchRoute::UnsupportedFallback);
+                // Wave R6 hardening: a capability fallback over the
+                // *declared supported surface* is a coverage regression,
+                // not an expected decline. The supported surface is
+                // genuinely Capped-free, so any shape on it must reach the
+                // compiled backend. We cannot consult the test-harness
+                // ledger from this production crate (it depends on
+                // `relon`), so the loud surface lives in the
+                // `no_fallback_over_supported_surface` proof, which reads
+                // [`Self::last_dispatch_route`]. As a belt-and-braces
+                // local guard for ad-hoc debugging, honour
+                // `RELON_AUTO_FALLBACK_PANIC=1`: when set, a fallback
+                // panics instead of running the slow tree-walk, so a
+                // regression surfaces immediately under that flag without
+                // changing default production behaviour.
+                if std::env::var_os("RELON_AUTO_FALLBACK_PANIC").is_some_and(|v| v == "1") {
+                    panic!(
+                        "auto backend took the cranelift-AOT capability fallback \
+                         (RELON_AUTO_FALLBACK_PANIC=1); shape declined: {}",
+                        err.message
+                    );
+                }
                 tracing::info!(
                     target: "relon::auto_evaluator",
                     reason = %err.message,
@@ -315,9 +412,12 @@ impl Evaluator for AutoEvaluator {
             // infrastructure fault (JIT setup, module define, cache
             // I/O). Surfacing it keeps real problems visible rather
             // than masking them behind a silent tree-walk run.
-            Err(err) => Err(RuntimeError::Unsupported {
-                reason: format!("auto backend: cranelift-AOT setup failed: {}", err.message),
-            }),
+            Err(err) => {
+                self.mark_route(DispatchRoute::HostError);
+                Err(RuntimeError::Unsupported {
+                    reason: format!("auto backend: cranelift-AOT setup failed: {}", err.message),
+                })
+            }
         }
     }
 
