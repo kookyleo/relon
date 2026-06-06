@@ -256,6 +256,9 @@ pub const LOWERING_CAP_IDS: &[&str] = &[
     "lower_closure_as_value.unsupported_expr.2",
     "lower_closure_as_value.unsupported_expr.3",
     "lower_closure_as_value.stdlib_arg_type_mismatch",
+    "lower_match.unsupported_expr.1",
+    "lower_match.unsupported_expr.2",
+    "lower_match.unsupported_expr.3",
 ];
 
 #[cfg(test)]

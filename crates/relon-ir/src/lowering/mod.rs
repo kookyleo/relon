@@ -30,7 +30,8 @@ use relon_analyzer::workspace::WorkspaceTree;
 use relon_eval_api::layout::{FieldKind, OffsetTable, SchemaLayout};
 use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
 use relon_parser::{
-    ClosureParam, Expr, FStringPart, Node, Operator, TokenKey, TokenRange, TypeNode,
+    is_builtin_type_name, ClosureParam, Expr, FStringPart, Node, Operator, TokenKey, TokenRange,
+    TypeNode,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -3299,6 +3300,10 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
             Ok(())
         }
         Expr::Variable(path) => lower_variable(path, range, ctx),
+        Expr::Match {
+            expr: scrutinee,
+            arms,
+        } => lower_match(scrutinee, arms, range, ctx),
         Expr::FString(parts) => lower_fstring(parts, range, ctx),
         Expr::Binary(op, lhs, rhs) => lower_binary(*op, lhs, rhs, range, ctx),
         Expr::Ternary { cond, then, els } => lower_ternary(cond, then, els, range, ctx),
@@ -3325,6 +3330,242 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
             }
         )),
     }
+}
+
+/// Static result of testing one match arm's pattern against the
+/// scrutinee's statically-known shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaticArmDecision {
+    /// The scrutinee's static type provably satisfies this arm's
+    /// pattern — `check_type` / brand-equality would return `Ok` for
+    /// EVERY runtime value of this static type. Select this arm.
+    Matches,
+    /// The pattern provably never matches a value of this static type —
+    /// `check_type` would always fail (or the eval brand-shortcut would
+    /// `continue`). Skip this arm.
+    Never,
+    /// The static type does NOT pin the arm decision (a coarsening
+    /// builtin like `Number` / `List` / `Dict`, a generic pattern, a
+    /// dotted/optional pattern, or a builtin pattern against a branded
+    /// dict). Keep the whole `match` capped and defer — never force.
+    Undecidable,
+}
+
+/// Decide, purely statically, whether a value whose IR type is `ty`
+/// (carrying optional schema `brand`) satisfies the arm `pattern`.
+///
+/// This MUST agree with the tree-walk `Expr::Match` arm semantics in
+/// `relon-evaluator`'s `eval.rs` (the `check_type` / brand-equality
+/// path) for the static type in question:
+///
+/// * `Wildcard` always matches.
+/// * `Type(tn)` with a single-segment, non-generic, non-optional path:
+///   - branded scrutinee (`brand == Some(b)`, i.e. a branded `Dict`):
+///     `name == b` ⇒ match; a non-builtin `name != b` ⇒ the eval
+///     brand-shortcut `continue`s (never matches); a builtin `name`
+///     falls through to `check_type` against a branded dict, which the
+///     static layer does not model ⇒ `Undecidable`.
+///   - unbranded scrutinee: a builtin `name` matches iff it is the
+///     EXACT scalar tag for `ty` (no coarsening / multi-type builtin);
+///     a non-builtin (schema) `name` against a definite scalar value
+///     can never satisfy `apply_schema` (which requires a `Dict`) ⇒
+///     `Never`.
+///   - any optional / dotted / generic pattern ⇒ `Undecidable`.
+fn static_arm_decision(ty: IrType, brand: Option<&str>, pattern: &Expr) -> StaticArmDecision {
+    match pattern {
+        Expr::Wildcard => StaticArmDecision::Matches,
+        Expr::Type(tn) => static_type_pattern_decision(ty, brand, tn),
+        // Any other pattern shape (literal patterns, etc.) is not part of
+        // the strict-mode static surface — defer.
+        _ => StaticArmDecision::Undecidable,
+    }
+}
+
+fn static_type_pattern_decision(
+    ty: IrType,
+    brand: Option<&str>,
+    tn: &TypeNode,
+) -> StaticArmDecision {
+    // Optional (`W?`), dotted (`geo.Location`), or generic (`List<Int>`)
+    // patterns engage check_type branches the static layer does not
+    // model — defer rather than guess.
+    if tn.is_optional || tn.path.len() != 1 || !tn.generics.is_empty() {
+        return StaticArmDecision::Undecidable;
+    }
+    let name = tn.path[0].as_str();
+
+    if let Some(b) = brand {
+        // Branded scrutinee (a branded `Dict`). Mirror the eval
+        // brand-shortcut block exactly.
+        if name == b {
+            // `type_node.path.len() == 1 && path[0] == brand` ⇒ match.
+            return StaticArmDecision::Matches;
+        }
+        if !is_builtin_type_name(name) {
+            // Non-builtin brand mismatch ⇒ eval `continue`s (never).
+            return StaticArmDecision::Never;
+        }
+        // Builtin pattern against a branded dict falls through to
+        // check_type (e.g. `Dict` / `Any` matching a branded dict).
+        // Not modelled statically — defer.
+        return StaticArmDecision::Undecidable;
+    }
+
+    // Unbranded scrutinee.
+    if is_builtin_type_name(name) {
+        // Only the EXACT scalar tags are decided here. Coarsening /
+        // multi-type builtins (`Any`, `Number`, `List`, `Dict`,
+        // `Closure`, `Fn`, `Enum`, `Tuple`) are deferred.
+        match (name, ty) {
+            ("Int", IrType::I64) => StaticArmDecision::Matches,
+            ("Float", IrType::F64) => StaticArmDecision::Matches,
+            ("Bool", IrType::Bool) => StaticArmDecision::Matches,
+            ("String", IrType::String) => StaticArmDecision::Matches,
+            ("Null", IrType::Null) => StaticArmDecision::Matches,
+            // A scalar builtin pattern naming a DIFFERENT scalar than the
+            // (definite-scalar) static type can never match.
+            ("Int" | "Float" | "Bool" | "String" | "Null", t) if is_definite_scalar(t) => {
+                StaticArmDecision::Never
+            }
+            _ => StaticArmDecision::Undecidable,
+        }
+    } else {
+        // Non-builtin pattern (a schema/brand name) against an unbranded
+        // value. The eval path runs `check_type`, whose `apply_schema`
+        // requires a `Dict`; a definite scalar can never satisfy it, so
+        // the arm provably never matches. For non-scalar shapes (lists /
+        // plain dicts) defer to stay honest.
+        if is_definite_scalar(ty) {
+            StaticArmDecision::Never
+        } else {
+            StaticArmDecision::Undecidable
+        }
+    }
+}
+
+/// `true` when the IR type pins the runtime value to a single concrete
+/// scalar Relon shape (`Int` / `Float` / `Bool` / `String` / `Null`).
+/// These are the only types for which a scalar / schema pattern decision
+/// can be made with certainty.
+fn is_definite_scalar(ty: IrType) -> bool {
+    matches!(
+        ty,
+        IrType::I64 | IrType::F64 | IrType::Bool | IrType::String | IrType::Null
+    )
+}
+
+/// Wave R5 — static lowering of a strict-mode `match` whose scrutinee's
+/// type is statically known, so the winning arm is selected at compile
+/// time (no runtime brand dispatch).
+///
+/// Semantics matched byte-for-byte against the tree-walk `Expr::Match`
+/// arm (see `relon-evaluator`'s `eval.rs`):
+///
+/// 1. The scrutinee is evaluated exactly once (and any trap fires).
+/// 2. Arms are tried in SOURCE ORDER; the first arm whose pattern the
+///    scrutinee's static type satisfies wins.
+/// 3. The winning arm's body is the result.
+///
+/// The static decision per arm is made by [`static_arm_decision`], which
+/// is proven to agree with the runtime `check_type` / brand-equality for
+/// the scrutinee's static type. If ANY arm before the winner is
+/// undecidable, or no arm statically matches (the eval would trap with
+/// `TypeMismatch { expected: "a matching arm" }`, a cross-backend trap
+/// shape the static layer cannot yet surface), the whole construct is
+/// kept `cap!`'d and deferred (R6 — the `#relaxed` / dynamic
+/// brand-dispatch form lives there too).
+fn lower_match(
+    scrutinee: &Node,
+    arms: &[(Node, Node)],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    // 1. Determine the scrutinee's static IR type by speculatively
+    //    lowering it (rolled back — the real evaluation is re-emitted
+    //    below for trap / side-effect parity).
+    let ty = probe_expr_ir_ty(scrutinee, ctx)?;
+
+    // 2. Determine the scrutinee's static schema brand, if it is a plain
+    //    variable path rooted at a schema-typed binding. Any other
+    //    scrutinee shape carries no brand (brand == None).
+    let brand: Option<String> = match &*scrutinee.expr {
+        Expr::Variable(path) => resolve_receiver_schema_brand(path, ctx),
+        _ => None,
+    };
+
+    // 3. Walk arms in source order. Select the first arm that statically
+    //    matches. Bail (cap) the moment an earlier arm is undecidable —
+    //    its runtime match could pre-empt our chosen arm.
+    let mut selected: Option<usize> = None;
+    for (idx, (pattern, _body)) in arms.iter().enumerate() {
+        match static_arm_decision(ty, brand.as_deref(), &pattern.expr) {
+            StaticArmDecision::Matches => {
+                selected = Some(idx);
+                break;
+            }
+            StaticArmDecision::Never => continue,
+            StaticArmDecision::Undecidable => {
+                return Err(cap!(
+                    "lower_match.unsupported_expr.1",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "Match(arm pattern not statically decidable for scrutinee type \
+                             {ty:?} brand {brand:?} — deferred to dynamic brand-dispatch)"
+                        ),
+                        range: pattern.range,
+                    }
+                ));
+            }
+        }
+    }
+
+    let Some(selected) = selected else {
+        // No arm statically matches: the oracle traps with
+        // `TypeMismatch { expected: "a matching arm" }`. There is no IR
+        // trap kind that surfaces as `RuntimeError::TypeMismatch` across
+        // cranelift / llvm / wasm today (the sandbox trap table has no
+        // TypeMismatch code), so emitting a guaranteed-trap here would
+        // surface a DIFFERENT RuntimeError than the oracle. Keep it
+        // capped rather than miscompile the trap shape.
+        return Err(cap!(
+            "lower_match.unsupported_expr.2",
+            LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "Match(no arm statically matches scrutinee type {ty:?} brand {brand:?} — \
+                     no-match TypeMismatch trap not expressible cross-backend)"
+                ),
+                range,
+            }
+        ));
+    };
+
+    // 4. Evaluate the scrutinee for value / trap / side-effect-ordering
+    //    parity, then discard its value into a fresh internal let-local
+    //    that is never read (the R4 `type(v)` discard pattern). The
+    //    scrutinee's traps already fired in its op stream.
+    lower_expr(&scrutinee.expr, scrutinee.range, ctx)?;
+    let scrut_ty = ctx.tstack.pop().ok_or_else(|| {
+        cap!(
+            "lower_match.unsupported_expr.3",
+            LoweringError::UnsupportedExpr {
+                kind: "Match(scrutinee produced no value)".to_string(),
+                range: scrutinee.range,
+            }
+        )
+    })?;
+    let discard_idx = ctx.next_let_idx;
+    ctx.next_let_idx += 1;
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: discard_idx,
+            ty: scrut_ty,
+        },
+        range: scrutinee.range,
+    });
+
+    // 5. Lower the selected arm's body as the result of the whole match.
+    let body = &arms[selected].1;
+    lower_expr(&body.expr, body.range, ctx)
 }
 
 /// Phase F.2 (W7 anon-Dict-return): when a free-call's head names a
