@@ -1063,6 +1063,59 @@ fn multi_field_dict_return_aligns_native_via_wasmtime() {
     assert_eq!(out.get("y"), Some(&Decoded::Int(want_y)), "dict field y");
 }
 
+/// Wave R10 — backward static `&sibling` / `&root` field references in an
+/// anon-Dict-return body run on wasm32. Later fields read earlier ones
+/// via `&sibling.x` / `&root.x` (the entry dict IS the document root, so
+/// both bases resolve to the same field); the reference lowers to the
+/// same `Op::LetGet` over the source-ordered field-let graph that a bare
+/// let read uses. Verified byte-equal on the wasm32 leg against the LLVM
+/// native oracle (itself bit-aligned to tree-walk + cranelift via the
+/// `r10_*` corpus). The reference-in-dict-field surface is `#relaxed`
+/// (matching `examples/pricing.relon`).
+#[test]
+fn r10_sibling_root_backward_aligns_native_via_wasmtime() {
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping r10 sibling/root refs");
+        return;
+    }
+    let src = "#relaxed\n#main(Int a, Int b) -> Dict\n\
+               { x: a + b, y: &sibling.x * 2, z: &root.x + &sibling.y }";
+    let (a, b) = (17i64, 5i64);
+    let dict = match native_run(
+        src,
+        HashMap::from([
+            ("a".to_string(), Value::Int(a)),
+            ("b".to_string(), Value::Int(b)),
+        ]),
+    ) {
+        Value::Dict(d) => d,
+        other => panic!("native expected Dict, got {other:?}"),
+    };
+    let want = |k: &str| match dict.map.get(k) {
+        Some(Value::Int(v)) => *v,
+        other => panic!("{k} not Int: {other:?}"),
+    };
+    let (want_x, want_y, want_z) = (want("x"), want("y"), want("z"));
+    // Oracle sanity: x = a+b = 22, y = x*2 = 44, z = x + y = 66.
+    assert_eq!((want_x, want_y, want_z), (22, 44, 66), "r10 oracle drifted");
+
+    let (bytes, info) = build("r10_sibling_root", src);
+    let mut in_record = vec![0u8; info.main_root_size as usize];
+    for f in &info.main_fields {
+        let off = f.offset as usize;
+        let v = match f.name.as_str() {
+            "a" => a,
+            "b" => b,
+            other => panic!("unexpected main field {other}"),
+        };
+        in_record[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    let out = run_buffer(&bytes, "relon_parity_r10_sibling_root", &info, &in_record);
+    assert_eq!(out.get("x"), Some(&Decoded::Int(want_x)), "r10 field x");
+    assert_eq!(out.get("y"), Some(&Decoded::Int(want_y)), "r10 field y");
+    assert_eq!(out.get("z"), Some(&Decoded::Int(want_z)), "r10 field z");
+}
+
 /// W5-P3 — `d[k]` dict-get probe runs on wasm32. A `#main` dict body
 /// binds `#internal d` (an `Op::ConstDict` arena record) and the
 /// `result` Int field probes it with a `ConstString` key. This proves

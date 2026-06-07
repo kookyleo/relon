@@ -30,8 +30,8 @@ use relon_analyzer::workspace::WorkspaceTree;
 use relon_eval_api::layout::{FieldKind, OffsetTable, SchemaLayout};
 use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
 use relon_parser::{
-    is_builtin_type_name, ClosureParam, Expr, FStringPart, Node, Operator, TokenKey, TokenRange,
-    TypeNode,
+    is_builtin_type_name, ClosureParam, Expr, FStringPart, Node, Operator, RefBase, TokenKey,
+    TokenRange, TypeNode,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -1375,6 +1375,13 @@ fn anon_dict_return_plan(
     // sibling field's `d[k]` index classifies to the dict's `Int`
     // value type. Source order makes `d` visible before `result`.
     let mut dict_field_names: HashSet<&str> = HashSet::new();
+    // R10: host-visible scalar fields classified so far, name -> IR
+    // type, in source declaration order. A backward `&sibling.<name>`
+    // (or entry-level `&root.<name>`, which is the same — the entry
+    // dict IS the root) classifies to the earlier field's scalar type.
+    // Source order is what makes "backward" well-defined; a forward
+    // reference simply isn't in the map yet and caps cleanly.
+    let mut scalar_field_irts: HashMap<&str, IrType> = HashMap::new();
 
     for (key, value) in pairs {
         let TokenKey::String(name, _, _) = key else {
@@ -1544,8 +1551,12 @@ fn anon_dict_return_plan(
                     &param_tys,
                     &closure_field_sigs,
                     &dict_field_names,
+                    &scalar_field_irts,
                     name,
                 )?;
+                if let Ok(irt) = type_repr_to_ir_type(&ty) {
+                    scalar_field_irts.insert(name.as_str(), irt);
+                }
                 fields.push(AnonDictField::Scalar {
                     name: name.clone(),
                     ty,
@@ -1615,6 +1626,7 @@ fn classify_anon_dict_scalar_field(
     main_param_tys: &HashMap<&str, IrType>,
     closure_field_sigs: &HashMap<&str, (Vec<IrType>, IrType)>,
     dict_field_names: &HashSet<&str>,
+    scalar_field_irts: &HashMap<&str, IrType>,
     field_name: &str,
 ) -> Result<TypeRepr, LoweringError> {
     let irt = classify_anon_dict_scalar_field_irt(
@@ -1623,6 +1635,7 @@ fn classify_anon_dict_scalar_field(
         main_param_tys,
         closure_field_sigs,
         dict_field_names,
+        scalar_field_irts,
         field_name,
     )?;
     ir_type_to_type_repr(irt).ok_or_else(|| {
@@ -1805,6 +1818,7 @@ fn classify_anon_dict_scalar_field_irt(
     main_param_tys: &HashMap<&str, IrType>,
     closure_field_sigs: &HashMap<&str, (Vec<IrType>, IrType)>,
     dict_field_names: &HashSet<&str>,
+    scalar_field_irts: &HashMap<&str, IrType>,
     field_name: &str,
 ) -> Result<IrType, LoweringError> {
     match expr {
@@ -1812,6 +1826,35 @@ fn classify_anon_dict_scalar_field_irt(
         Expr::Float(_) => Ok(IrType::F64),
         Expr::Bool(_) => Ok(IrType::Bool),
         Expr::String(_) => Ok(IrType::String),
+        // R10: a backward static sibling/root reference to an earlier
+        // scalar field. At the entry-level dict (which IS the document
+        // root) `&sibling.<name>` and `&root.<name>` resolve to the
+        // same field, so both bases classify here. Only a single static
+        // `String` trailing segment naming an already-classified
+        // host-visible scalar field is accepted; positional bases
+        // (Uncle/Prev/Next/Index/This), forward names, dynamic keys and
+        // multi-segment paths fall through to the loud cap below.
+        Expr::Reference {
+            base: RefBase::Sibling | RefBase::Root,
+            path,
+        } => {
+            if let [TokenKey::String(name, _, _)] = path.as_slice() {
+                if let Some(t) = scalar_field_irts.get(name.as_str()) {
+                    return Ok(*t);
+                }
+            }
+            Err(cap!(
+                "classify_anon_dict_scalar_field_irt.reference_unresolved",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "AnonDictReturn(field `{}`: backward sibling/root reference {:?} \
+                         does not name an earlier host-visible scalar field)",
+                        field_name, path
+                    ),
+                    range,
+                }
+            ))
+        }
         Expr::Variable(path) => {
             if let [TokenKey::String(name, _, _)] = path.as_slice() {
                 if let Some(t) = main_param_tys.get(name.as_str()) {
@@ -1882,6 +1925,7 @@ fn classify_anon_dict_scalar_field_irt(
                 main_param_tys,
                 closure_field_sigs,
                 dict_field_names,
+                scalar_field_irts,
                 field_name,
             )?;
             let rt = classify_anon_dict_scalar_field_irt(
@@ -1890,6 +1934,7 @@ fn classify_anon_dict_scalar_field_irt(
                 main_param_tys,
                 closure_field_sigs,
                 dict_field_names,
+                scalar_field_irts,
                 field_name,
             )?;
             match (lt, rt) {
@@ -2158,6 +2203,42 @@ fn lower_anon_dict_body(
                         }
                     ));
                 }
+                // R10: stash this scalar field's value in an internal
+                // let-local so a *later* sibling field can read it back
+                // with `&sibling.<name>` / `&root.<name>` (the entry dict
+                // IS the document root, so both bases resolve to the same
+                // field). The let holds the field's natural scalar value
+                // (the same value `lower_variable` would `LetGet`); the
+                // pointer-indirect tail-emit, if any, happens below on the
+                // value we re-load — so the reference and the stored field
+                // observe a bit-identical value. Source order makes the
+                // binding visible only to fields declared after it, which
+                // is exactly the backward-only contract the reference arm
+                // in `lower_expr` enforces. Registered for every
+                // host-visible scalar field (including String); a forward
+                // or positional reference simply never finds it and caps.
+                let field_let_idx = ctx.next_let_idx;
+                ctx.next_let_idx += 1;
+                ctx.lets.push(LetBinding {
+                    name: name.clone(),
+                    idx: field_let_idx,
+                    ty: expected_ir,
+                    schema_brand: None,
+                });
+                ctx.out.push(TaggedOp {
+                    op: Op::LetSet {
+                        idx: field_let_idx,
+                        ty: expected_ir,
+                    },
+                    range: value.range,
+                });
+                ctx.out.push(TaggedOp {
+                    op: Op::LetGet {
+                        idx: field_let_idx,
+                        ty: expected_ir,
+                    },
+                    range: value.range,
+                });
                 let layout_field = layout.fields.get(scalar_layout_idx).ok_or_else(|| {
                     cap!(
                         "lower_anon_dict_body.unsupported_expr.5",
@@ -3355,6 +3436,7 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
             Ok(())
         }
         Expr::Variable(path) => lower_variable(path, range, ctx),
+        Expr::Reference { base, path } => lower_reference(*base, path, range, ctx),
         Expr::Match {
             expr: scrutinee,
             arms,
@@ -7704,6 +7786,103 @@ fn lower_dict_default(
     let value_node = &field.value_node;
     lower_expr(&value_node.expr, value_node.range, ctx)?;
     Ok(())
+}
+
+/// R10: lower a *backward static* `&sibling.<name>` / `&root.<name>`
+/// reference on the compiled path.
+///
+/// At the entry-level dict (the `#main -> Dict` anon-Dict-return body)
+/// the entry dict IS the document root, so `&sibling.<name>` and
+/// `&root.<name>` resolve to the very same field — both bases are
+/// handled here. The runtime contract for a `&sibling`/`&root` whose
+/// single trailing segment names an earlier field in the *same* dict is
+/// identical to a bare let reference, so this reuses the source-ordered
+/// field-let graph: each host-visible scalar field is registered as a
+/// `LetBinding` (see [`lower_anon_dict_body`]) before later fields
+/// lower, exactly as `lower_where` / the closure / dict / list-string
+/// fields already do. We resolve `<name>` to that let-idx and emit the
+/// same `LetGet` (or scalar-const inline) `lower_variable` would.
+///
+/// Everything outside that narrow shape is a loud cap, NOT a silent
+/// fallback:
+///
+/// * Positional / runtime / grandparent bases — `&uncle` / `&prev` /
+///   `&next` / `&index` / `&this` — need loop-carried or cross-dict
+///   state the compiled entry body does not model, so they cap.
+/// * A forward reference (the name is not yet bound — declared later in
+///   source order) is not in `ctx.lets` and caps via the unresolved
+///   path; the backward-only contract is what keeps the value
+///   well-defined at lowering time.
+/// * Dynamic-key segments and multi-segment paths (`&sibling.x.y`) cap;
+///   only a single static `String` segment is lowered. `#internal`
+///   sibling fields are dropped from the compiled plan entirely, so a
+///   reference to one never resolves and caps — this also sidesteps the
+///   `&sibling.<priv>`-allowed vs `&root.<priv>`-blocked privacy split,
+///   since neither form can reach a private field here.
+fn lower_reference(
+    base: RefBase,
+    path: &[TokenKey],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    // Only the entry-level-equivalent bases. Positional/runtime bases
+    // are honestly out of the compiled path's reach.
+    if !matches!(base, RefBase::Sibling | RefBase::Root) {
+        return Err(cap!(
+            "lower_reference.positional_base",
+            LoweringError::UnsupportedExpr {
+                kind: format!("Reference(positional base {base:?} not supported on compiled path)"),
+                range,
+            }
+        ));
+    }
+    // Exactly one static String segment — no dynamic keys, no chaining.
+    let name = match path {
+        [TokenKey::String(name, _, _)] => name.as_str(),
+        _ => {
+            return Err(cap!(
+                "lower_reference.unsupported_path_shape",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "Reference(only a single static field segment is supported, got {path:?})"
+                    ),
+                    range,
+                }
+            ));
+        }
+    };
+    // Backward-only: the named field must already be bound as a let
+    // (declared earlier in source order). Inline a scalar-const let to
+    // the literal exactly as `lower_variable` does so all backends fold
+    // an identical compile-time value; otherwise emit the `LetGet`.
+    if let Some(b) = ctx.lets.iter().rev().find(|b| b.name == name).cloned() {
+        if let Some(sc) = ctx.const_let_values.get(&b.idx).copied() {
+            let (op, ty) = match sc {
+                ScalarConst::I64(i) => (Op::ConstI64(i), IrType::I64),
+                ScalarConst::F64(f) => (Op::ConstF64(OrderedFloat::from(f)), IrType::F64),
+                ScalarConst::Bool(b) => (Op::ConstBool(b), IrType::Bool),
+            };
+            ctx.out.push(TaggedOp { op, range });
+            ctx.tstack.push(ty);
+            return Ok(());
+        }
+        ctx.out.push(TaggedOp {
+            op: Op::LetGet {
+                idx: b.idx,
+                ty: b.ty,
+            },
+            range,
+        });
+        ctx.tstack.push(b.ty);
+        return Ok(());
+    }
+    Err(cap!(
+        "lower_reference.unresolved_backward_field",
+        LoweringError::UnresolvedVariable {
+            name: name.to_string(),
+            range,
+        }
+    ))
 }
 
 /// Lower a bare-identifier reference. Phase 3.a checks the user-let

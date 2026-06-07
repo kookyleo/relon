@@ -1138,6 +1138,40 @@ pub fn all_cases() -> Vec<CorpusCase> {
             tier: Tier::DictReturn,
             supported_by: TW_CR,
         },
+        // ---- Wave R10: backward static `&sibling` / `&root` field refs ----
+        // A later anon-Dict-return field reads an EARLIER field's value
+        // through `&sibling.<name>` (or `&root.<name>` — at the entry
+        // dict, which IS the document root, both resolve to the same
+        // field). The reference reuses the source-ordered field-let graph:
+        // each host-visible scalar field is registered as an internal let
+        // before later fields lower, and the reference lowers to the same
+        // `Op::LetGet` a bare let read would. Reference-in-dict-field is a
+        // `#relaxed`-mode feature (strict-mode static type derivation of a
+        // reference is a separate analyzer concern; the production
+        // `examples/pricing.relon` surface is `#relaxed`), so these carry
+        // the directive. `Int` Dict return ⇒ `TW_CR` (the bytecode VM and
+        // trace recipe catalogue don't model anon-Dict construction).
+        CorpusCase {
+            name: "r10_sibling_backward",
+            source: "#relaxed\n#main(Int a, Int b) -> Dict\n{ x: a + b, y: &sibling.x * 2 }",
+            args_factory: args_x_40_y_2,
+            tier: Tier::DictReturn,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r10_root_backward_entry_level",
+            source: "#relaxed\n#main(Int a, Int b) -> Dict\n{ x: a + b, y: &root.x * 2 }",
+            args_factory: args_x_40_y_2,
+            tier: Tier::DictReturn,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r10_sibling_chain",
+            source: "#relaxed\n#main(Int a, Int b) -> Dict\n{ x: a + b, y: &sibling.x * 2, z: &root.x + &sibling.y }",
+            args_factory: args_x_17_y_5,
+            tier: Tier::DictReturn,
+            supported_by: TW_CR,
+        },
         // ---- Wave R4: static const-fold of `type(v)` ----
         // In strict mode the argument's IR type is statically known, so
         // `type(v)` lowers to a constant canonical type-name String

@@ -328,6 +328,15 @@ pub const LEDGER: &[LedgerEntry] = &[
         reason: "expression shape has no IR/codegen lowering path yet",
     },
     LedgerEntry {
+        id: "classify_anon_dict_scalar_field_irt.reference_unresolved",
+        site: "lowering/mod.rs::classify_anon_dict_scalar_field_irt",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "R10: backward `&sibling`/`&root` scalar field refs lower (corpus \
+                 `r10_*`); a forward / non-scalar / non-host-visible sibling name caps here",
+    },
+    LedgerEntry {
         id: "lower_anon_dict_body.unsupported_expr.1",
         site: "lowering/mod.rs::lower_anon_dict_body",
         category: Category::ExprShape,
@@ -1184,6 +1193,34 @@ pub const LEDGER: &[LedgerEntry] = &[
         reason: "branded dict omits a field that has no schema-side default",
     },
     LedgerEntry {
+        id: "lower_reference.positional_base",
+        site: "lowering/mod.rs::lower_reference",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "positional/runtime/grandparent ref bases (&uncle/&prev/&next/&index/&this) \
+                 need loop-carried or cross-dict state the compiled entry body lacks",
+    },
+    LedgerEntry {
+        id: "lower_reference.unsupported_path_shape",
+        site: "lowering/mod.rs::lower_reference",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "only a single static String segment lowers; dynamic-key or multi-segment \
+                 (&sibling.x.y) reference paths cap",
+    },
+    LedgerEntry {
+        id: "lower_reference.unresolved_backward_field",
+        site: "lowering/mod.rs::lower_reference",
+        category: Category::ExprShape,
+        status: Status::Covered,
+        corpus: "r10_sibling_backward",
+        reason: "R10: backward `&sibling`/`&root` scalar refs lower to LetGet/const-inline \
+                 over the source-ordered field-let graph; a forward / #internal sibling name \
+                 caps here (not yet bound)",
+    },
+    LedgerEntry {
         id: "lower_variable.unsupported_expr.1",
         site: "lowering/mod.rs::lower_variable",
         category: Category::ExprShape,
@@ -2022,5 +2059,14 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         corpus: "dict_simple_return",
         status: Status::Covered,
         proof: "tree-walk + cranelift + bytecode (schema-rooted, NOT a Dict param/literal)",
+    },
+    // ---- backward static sibling/root field reference ----
+    SurfaceEntry {
+        construct: "backward `&sibling`/`&root` scalar field reference (anon-Dict return)",
+        wave: "R10",
+        corpus: "r10_sibling_backward",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (TW_CR; wasm + llvm-native legs proven in \
+                relon-codegen-llvm::aot_wasm_parity::r10_sibling_root_backward)",
     },
 ];
