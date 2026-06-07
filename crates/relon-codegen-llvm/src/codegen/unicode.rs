@@ -4,48 +4,38 @@
 //! `WhitespaceRangesAddr`, `DecompTableAddr`, `CccTableAddr`,
 //! `CompositionTableAddr`, `FullCaseFoldTableAddr`, `CasedRangesAddr`,
 //! `CaseIgnorableRangesAddr`, `TurkishCaseFoldTableAddr`) are routed to
-//! the Phase 0b seam below from `super::lower_op`.
+//! the lowering below from `super::lower_op`.
 //!
-//! # Lowering model
+//! # Lowering model (Wave R14)
 //!
-//! On the cranelift side each `*TableAddr` op resolves to an
-//! arena-relative `i32` offset: `ConstPool` lays the encoded table
-//! bytes into the per-module const-data blob (which the host copies to
-//! the arena prefix before every dispatch) and the op pushes the byte
-//! offset of that record. Downstream the `__casefold_lookup` /
-//! `__is_combining_mark` / ... helpers add the arena base and read the
-//! table through the same `Load*AtAbsolute` path every other arena
-//! reference uses.
+//! Each `*TableAddr` op resolves to an arena-relative `i32` offset into
+//! the const-data prefix — the **exact same** mechanism cranelift uses.
+//! [`super::ConstPool::collect_op`] walks every body (incl. inlined
+//! bundled-stdlib helpers), encodes each referenced table once with the
+//! byte-for-byte-identical `relon_ir::{case_folding, combining_marks,
+//! whitespace, normalization, full_case_folding}` encoders (the same
+//! functions cranelift's `ConstPool` calls), and lays the bytes into the
+//! per-module const-data blob. The host copies that blob to the arena
+//! prefix before every dispatch, so the recorded offset is the
+//! arena-relative address the `__casefold_lookup` / `__is_combining_mark`
+//! / ... helpers read through the same `Load*AtAbsolute` path every other
+//! arena reference uses. The op lowering is therefore a pure
+//! compile-time-constant offset push — no global, no runtime copy.
 //!
-//! The LLVM `ConstPool` (see `super::ConstPool`) only collects
-//! `Op::ConstString` records — it does not carry the Unicode tables,
-//! and Phase 0b is not allowed to widen it (it lives in the shared
-//! `mod.rs`). To keep the *exact same* arena-relative-offset contract
-//! without touching the const pool, each `*TableAddr` op here:
+//! ## Why this replaced the Phase-0b per-call scratch copy
 //!
-//!   1. Encodes the table with the byte-for-byte-identical encoders in
-//!      `relon_ir::{case_folding, combining_marks, whitespace,
-//!      normalization, full_case_folding}` (the same functions
-//!      `relon-codegen-cranelift`'s `ConstPool` calls), so the bytes a
-//!      lookup helper sees are identical across both backends.
-//!   2. Materialises those bytes as a private, `module`-deduplicated
-//!      `[N x i8]` LLVM global constant.
-//!   3. At runtime bump-allocates `N` bytes of arena scratch
-//!      (`emit_alloc_scratch_static`, identical mechanism to
-//!      `Op::AllocScratch`), `memcpy`s the global into it, and pushes
-//!      the resulting arena-relative `i32` offset.
-//!
-//! The pushed value therefore has the same type, the same units
-//! (arena-relative bytes) and the same downstream usage as the
-//! cranelift offset — only the placement differs (per-call scratch vs
-//! const-data prefix). The table contents are read-only and the global
-//! is shared per module, so the per-call copy is the only divergence
-//! and it is invisible to every consumer.
+//! Phase 0b materialised each table by bump-allocating arena scratch and
+//! `memcpy`ing a module global into it *at the op site*. Because these
+//! ops live inside the case-fold / normalization helper bodies that are
+//! inlined into the per-codepoint decode loop, that re-copied every table
+//! (e.g. the 2404-byte combining-marks table) into fresh scratch on every
+//! loop iteration; the scratch cursor overran the arena within a few
+//! codepoints, so even `"hello".upper()` stored/loaded out of bounds —
+//! SIGSEGV on native, OOB on wasm. Laying the bytes into the const prefix
+//! once removes the per-iteration cost entirely and matches cranelift, so
+//! the result is byte-identical four-way (see `tests/unicode_four_way.rs`).
 
-use inkwell::module::Linkage;
-use inkwell::values::BasicValue;
-
-use relon_ir::ir::Op;
+use relon_ir::ir::{IrType, Op};
 
 use crate::error::LlvmError;
 
@@ -54,8 +44,8 @@ use super::*;
 /// Identifies which encoded Unicode table a `*TableAddr` op refers to.
 /// Drives both the deterministic global symbol name (so repeated uses
 /// in one module share a single global) and the byte encoder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UnicodeTable {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum UnicodeTable {
     CaseFold { upper: bool },
     FullCaseFold { upper: bool },
     Turkish { upper: bool },
@@ -95,11 +85,33 @@ impl UnicodeTable {
         }
     }
 
+    /// Map a `*TableAddr` op to the table it references, or `None` when
+    /// `op` is not a Unicode table-address op. Shared by the const-pool
+    /// collector (which lays the bytes once) and the lowering site
+    /// (which pushes the resulting offset).
+    pub(crate) fn from_op(op: &Op) -> Option<UnicodeTable> {
+        Some(match op {
+            Op::CaseFoldTableAddr { upper } => UnicodeTable::CaseFold { upper: *upper },
+            Op::FullCaseFoldTableAddr { upper } => UnicodeTable::FullCaseFold { upper: *upper },
+            Op::TurkishCaseFoldTableAddr { upper } => UnicodeTable::Turkish { upper: *upper },
+            Op::CombiningMarkRangesAddr => UnicodeTable::CombiningMarks,
+            Op::WhitespaceRangesAddr => UnicodeTable::Whitespace,
+            Op::CasedRangesAddr => UnicodeTable::Cased,
+            Op::CaseIgnorableRangesAddr => UnicodeTable::CaseIgnorable,
+            Op::DecompTableAddr { compatibility } => UnicodeTable::Decomp {
+                compatibility: *compatibility,
+            },
+            Op::CccTableAddr => UnicodeTable::Ccc,
+            Op::CompositionTableAddr => UnicodeTable::Composition,
+            _ => return None,
+        })
+    }
+
     /// Encode the table into the exact byte layout the lookup helpers
     /// expect. Each arm calls the same `relon_ir` encoder
     /// `relon-codegen-cranelift`'s `ConstPool` uses, so the bytes are
     /// identical across backends.
-    fn encode_bytes(self) -> Vec<u8> {
+    pub(crate) fn encode_bytes(self) -> Vec<u8> {
         match self {
             UnicodeTable::CaseFold { upper } => {
                 let table = if upper {
@@ -166,114 +178,57 @@ impl UnicodeTable {
 }
 
 impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
-    /// Phase 0b seam: Unicode `*TableAddr` long tail. Dispatched from
+    /// Wave R14: Unicode `*TableAddr` long tail. Dispatched from
     /// `super::lower_op`.
+    ///
+    /// Resolves the op to the const-data-prefix offset its encoded table
+    /// bytes were laid into by [`super::ConstPool::collect_op`] and
+    /// pushes that arena-relative `i32` offset — exactly the contract
+    /// `Op::ConstString` uses, and byte-for-byte identical to cranelift's
+    /// `ConstPool` (same `relon_ir` encoders, same const-data prefix the
+    /// host copies into the arena before every dispatch).
+    ///
+    /// # Why not per-call scratch (the pre-R14 approach)
+    ///
+    /// The Phase-0b lowering materialised each table by bump-allocating
+    /// arena scratch and `memcpy`ing a module global into it **at the op
+    /// site**. Because these ops live inside the bundled case-fold /
+    /// normalization helper bodies (`__casefold_lookup`,
+    /// `__is_combining_mark`, ...) which are *inlined into the
+    /// per-codepoint decode loop*, that copied every table (e.g. the
+    /// 2404-byte combining-marks range table) into fresh scratch on
+    /// **every loop iteration**. The scratch cursor ran off the end of
+    /// the arena within a few codepoints, so even `"hello".upper()`
+    /// stored/loaded out of bounds — SIGSEGV on native, OOB on wasm
+    /// (the R8 failure mode). Laying the bytes into the const prefix once
+    /// makes the op a pure compile-time-constant offset push with zero
+    /// runtime cost, which is also what cranelift does.
     pub(crate) fn lower_unicode_rest(
         &mut self,
         ip: usize,
         _ip_hint: &str,
         op: &Op,
     ) -> Result<(), LlvmError> {
-        let table = match op {
-            Op::CaseFoldTableAddr { upper } => UnicodeTable::CaseFold { upper: *upper },
-            Op::FullCaseFoldTableAddr { upper } => UnicodeTable::FullCaseFold { upper: *upper },
-            Op::TurkishCaseFoldTableAddr { upper } => UnicodeTable::Turkish { upper: *upper },
-            Op::CombiningMarkRangesAddr => UnicodeTable::CombiningMarks,
-            Op::WhitespaceRangesAddr => UnicodeTable::Whitespace,
-            Op::CasedRangesAddr => UnicodeTable::Cased,
-            Op::CaseIgnorableRangesAddr => UnicodeTable::CaseIgnorable,
-            Op::DecompTableAddr { compatibility } => UnicodeTable::Decomp {
-                compatibility: *compatibility,
-            },
-            Op::CccTableAddr => UnicodeTable::Ccc,
-            Op::CompositionTableAddr => UnicodeTable::Composition,
-            other => {
-                return Err(LlvmError::Codegen(format!(
-                    "lower_unicode_rest: non-unicode op routed here: {other:?} at ip={ip}"
-                )));
-            }
-        };
-        self.emit_unicode_table_addr(table)
-    }
-
-    /// Materialise `table` into the arena and push its arena-relative
-    /// `i32` offset. See the module-level doc for why this copies into
-    /// per-call scratch rather than the const-data prefix.
-    fn emit_unicode_table_addr(&mut self, table: UnicodeTable) -> Result<(), LlvmError> {
-        let bytes = table.encode_bytes();
-        let len = u32::try_from(bytes.len()).map_err(|_| {
+        let table = UnicodeTable::from_op(op).ok_or_else(|| {
             LlvmError::Codegen(format!(
-                "unicode table `{}` exceeds u32 byte range",
-                table.global_symbol()
+                "lower_unicode_rest: non-unicode op routed here: {op:?} at ip={ip}"
             ))
         })?;
-
-        // 1. Source global: a private, module-deduplicated `[N x i8]`
-        //    constant holding the encoded table bytes.
-        let global = self.unicode_table_global(table, &bytes)?;
-        let src_ptr = global.as_pointer_value();
-
-        // 2. Reserve `len` bytes of arena scratch; pushes the
-        //    arena-relative offset onto the virtual stack.
-        self.emit_alloc_scratch_static(len)?;
-        // Peek (don't pop) the freshly-pushed offset so we can compute
-        // the destination pointer; the offset stays on the stack as the
-        // op's result.
         let off = self
-            .stack
-            .last()
+            .const_pool
+            .unicode_table_offsets
+            .get(&table)
+            .copied()
             .ok_or_else(|| {
-                LlvmError::Codegen("unicode table addr: scratch offset missing from stack".into())
-            })?
-            .val;
-        let dst_ptr = self.arena_addr_i32(off)?;
-
-        // 3. memcpy the global into the arena slot. The table is
-        //    read-only so a single copy per dispatch is correct; the
-        //    bytes are byte-identical to cranelift's const-data record.
-        let i64_t = self.ctx.i64_type();
-        let len64 = i64_t.const_int(u64::from(len), false);
-        self.builder
-            .build_memcpy(dst_ptr, 1, src_ptr, 1, len64)
-            .map_err(|e| {
                 LlvmError::Codegen(format!(
-                    "unicode table `{}` memcpy: {e}",
+                    "Unicode table `{}` missing from const pool — \
+                     `ConstPool::collect_op` must have laid it out",
                     table.global_symbol()
                 ))
             })?;
-
+        let c = self.ctx.i32_type().const_int(u64::from(off), false);
+        self.push(c, IrType::I32);
         Ok(())
-    }
-
-    /// Return the private `[N x i8]` global holding `bytes`, creating
-    /// it on first reference and reusing it on subsequent ones (keyed
-    /// by the table's stable symbol name).
-    fn unicode_table_global(
-        &self,
-        table: UnicodeTable,
-        bytes: &[u8],
-    ) -> Result<inkwell::values::GlobalValue<'ctx>, LlvmError> {
-        let sym = table.global_symbol();
-        if let Some(existing) = self.module.get_global(sym) {
-            return Ok(existing);
-        }
-        let i8_t = self.ctx.i8_type();
-        let arr_t = i8_t.array_type(u32::try_from(bytes.len()).map_err(|_| {
-            LlvmError::Codegen(format!("unicode table `{sym}` exceeds u32 byte range"))
-        })?);
-        let global = self.module.add_global(arr_t, None, sym);
-        let init: Vec<_> = bytes
-            .iter()
-            .map(|&b| i8_t.const_int(u64::from(b), false))
-            .collect();
-        let init_arr = i8_t.const_array(&init);
-        global.set_initializer(&init_arr.as_basic_value_enum());
-        global.set_constant(true);
-        // Internal linkage: the table never escapes the module; the
-        // MCJIT engine resolves the pointer locally with no host-side
-        // `add_global_mapping`.
-        global.set_linkage(Linkage::Internal);
-        Ok(global)
     }
 }
 
@@ -281,106 +236,27 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
 mod tests {
     //! Byte-alignment differential for the `*TableAddr` long tail.
     //!
-    //! An end-to-end `from_source` three-way comparison is NOT possible
-    //! at this phase: the Unicode stdlib bodies that carry these ops
-    //! (`upper` / `lower` / `nfd` / ...) also reference ops neither
-    //! Phase-0b backend lowers yet (`Op::LoadStringPtr` on cranelift,
-    //! `Op::Trap { InvalidUtf8 }` etc. on LLVM), so `from_source` of a
-    //! `s.upper()` workload fails to *build* on both sides — long before
-    //! any value could be observed (see `tests/phase0b_unicode.rs`).
+    //! Wave R14 moved the Unicode tables off the per-call scratch copy
+    //! and into the const-data prefix (the exact mechanism cranelift's
+    //! `ConstPool` uses), so the alignment we pin is now twofold:
     //!
-    //! The meaningful alignment we CAN pin now is the table data itself:
-    //! cranelift's `ConstPool` materialises each table by calling the
-    //! shared `relon_ir::{case_folding, full_case_folding,
-    //! combining_marks, whitespace, normalization}` encoders, then a
-    //! `*TableAddr` op pushes the arena-relative offset of those bytes.
-    //! This LLVM backend emits a global initialised from the *same*
-    //! encoders and pushes an arena-relative offset to a per-call copy.
-    //! These tests build a real LLVM module, lower every `*TableAddr`
-    //! op, and assert the emitted global's bytes are byte-for-byte
-    //! identical to the encoder output cranelift consumes — so the bytes
-    //! a downstream lookup helper reads are guaranteed identical across
-    //! both backends.
+    //!   * `encode_bytes_match_shared_encoders` — each table's encoded
+    //!     bytes are byte-for-byte identical to the shared `relon_ir`
+    //!     encoder output cranelift's `ConstPool` consumes.
+    //!   * `const_pool_lays_tables_at_aligned_offsets` /
+    //!     `lower_pushes_const_pool_offset` — `ConstPool::collect_op`
+    //!     lays each referenced table once at a 4-aligned offset holding
+    //!     exactly those bytes, and `lower_unicode_rest` pushes that
+    //!     offset as a single i32 (no scratch alloc, no per-call copy).
+    //!
+    //! End-to-end value differentials across all four legs live in
+    //! `tests/unicode_four_way.rs`.
 
     use super::*;
     use crate::codegen::{ConstPool, EntryShape};
     use inkwell::context::Context;
     use inkwell::AddressSpace;
     use relon_ir::ir::IrType;
-
-    /// Run `op` through `lower_unicode_rest` inside a freshly-built
-    /// buffer-shaped LLVM function and return `(emitted global array
-    /// length, stack depth after lowering)`. The function takes a single
-    /// `ptr` param used as the arena-state pointer (its `[base]` word is
-    /// the arena base) — enough to satisfy `emit_alloc_scratch_static` +
-    /// `arena_addr_i32` + the memcpy. We never execute the function; we
-    /// only inspect the module the emit pass produced.
-    ///
-    /// Note we read back the *length* of the emitted `[N x i8]` global,
-    /// not its bytes: inkwell 0.9 has no per-element constant reader and
-    /// `get_string_constant` truncates at the embedded NULs every table
-    /// header carries. The byte-for-byte identity is pinned separately
-    /// by `encode_bytes_match_shared_encoders`, which checks the exact
-    /// `Vec<u8>` this function feeds into `set_initializer`.
-    fn lower_and_global_len(op: &Op, sym: &str) -> (usize, usize) {
-        let ctx = Context::create();
-        let module = ctx.create_module("unicode_test");
-        let ptr_t = ctx.ptr_type(AddressSpace::default());
-        let void_t = ctx.void_type();
-        let fn_ty = void_t.fn_type(&[ptr_t.into()], false);
-        let func = module.add_function("t", fn_ty, None);
-        let entry_bb = ctx.append_basic_block(func, "entry");
-        let builder = ctx.create_builder();
-        builder.position_at_end(entry_bb);
-
-        let state_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
-        // arena_base = *(state + ARENA_STATE_OFFSET_BASE) as ptr.
-        let i8_t = ctx.i8_type();
-        let i32_t = ctx.i32_type();
-        let i64_t = ctx.i64_type();
-        let base_gep = unsafe {
-            builder
-                .build_in_bounds_gep(
-                    i8_t,
-                    state_ptr,
-                    &[i32_t.const_int(crate::state::ARENA_STATE_OFFSET_BASE as u64, false)],
-                    "base_gep",
-                )
-                .unwrap()
-        };
-        let base_int = builder
-            .build_load(i64_t, base_gep, "base")
-            .unwrap()
-            .into_int_value();
-        let arena_base_ptr = builder
-            .build_int_to_ptr(base_int, ptr_t, "arena_base_ptr")
-            .unwrap();
-
-        let const_pool = ConstPool::default();
-        let mut emit = Emit::new(
-            &ctx,
-            &builder,
-            &module,
-            func,
-            EntryShape::Buffer,
-            Some(arena_base_ptr),
-            Some(state_ptr),
-            /*buffer_return_size=*/ 0,
-            &const_pool,
-        );
-        emit.lower_unicode_rest(0, "test", op).expect("lower op");
-        let depth = emit.stack.len();
-        // The lowered op leaves an i32 (the arena offset) on the stack.
-        if let Some(top) = emit.stack.last() {
-            assert_eq!(top.ty, IrType::I32, "table addr result must be i32");
-        }
-
-        let global = module.get_global(sym).expect("global emitted");
-        let init = global.get_initializer().expect("initializer set");
-        let arr = init.into_array_value();
-        let n = arr.get_type().len() as usize;
-        (n, depth)
-    }
 
     /// Build the full `(op, global symbol, expected encoder bytes)`
     /// matrix once — the expected bytes come from the *same* `relon_ir`
@@ -532,35 +408,50 @@ mod tests {
         }
     }
 
-    /// Wiring check: lowering each `*TableAddr` op emits a module global
-    /// whose `[N x i8]` length equals the encoder byte length and
-    /// pushes exactly one arena-offset value. Confirms the lowering
-    /// feeds the verified `encode_bytes` vector straight into the
-    /// global with no truncation / re-shaping.
+    /// Lay every `*TableAddr` op into a fresh `ConstPool` via
+    /// `collect_op` and check that each table lands at a 4-aligned
+    /// offset holding exactly its shared-encoder bytes. This is the
+    /// data half of the cranelift contract: the host copies
+    /// `ConstPool::bytes` to the arena prefix, so the recorded offset is
+    /// the arena-relative address a lookup helper reads from.
     #[test]
-    fn table_addr_emits_global_of_encoder_length() {
-        for (op, sym, expected) in table_cases() {
-            let (global_len, depth) = lower_and_global_len(&op, sym);
+    fn const_pool_lays_tables_at_aligned_offsets() {
+        let mut pool = ConstPool::default();
+        for (op, _sym, _expected) in table_cases() {
+            pool.collect_op(&op).expect("collect_op");
+        }
+        for (op, _sym, expected) in table_cases() {
+            let table = UnicodeTable::from_op(&op).expect("from_op");
+            let off = *pool
+                .unicode_table_offsets
+                .get(&table)
+                .unwrap_or_else(|| panic!("{op:?}: missing const-pool offset"));
+            assert_eq!(off % 4, 0, "{op:?}: table offset must be 4-aligned");
+            let slice = &pool.bytes[off as usize..off as usize + expected.len()];
             assert_eq!(
-                depth, 1,
-                "{op:?} must push exactly one (arena-offset) value, got depth {depth}"
-            );
-            assert_eq!(
-                global_len,
-                expected.len(),
-                "{op:?}: emitted global length differs from shared encoder length"
+                slice,
+                expected.as_slice(),
+                "{op:?}: const-pool bytes diverge from the shared encoder cranelift consumes"
             );
         }
     }
 
-    /// Repeated references to the same table inside one module must
-    /// share a single global (dedup by symbol) rather than re-emitting
-    /// the bytes per use — mirrors cranelift's "lay out once, reuse the
-    /// offset" const-pool contract.
+    /// `lower_unicode_rest` pushes exactly one i32 equal to the
+    /// const-pool offset for the table — no scratch alloc, no per-call
+    /// memcpy, no backing global. Repeated references resolve to the
+    /// SAME offset (dedup happens in `collect_op`).
     #[test]
-    fn repeated_table_addr_dedups_global() {
+    fn lower_pushes_const_pool_offset() {
+        let mut pool = ConstPool::default();
+        let op = Op::CccTableAddr;
+        pool.collect_op(&op).expect("collect");
+        let want_off = *pool
+            .unicode_table_offsets
+            .get(&UnicodeTable::Ccc)
+            .expect("ccc offset");
+
         let ctx = Context::create();
-        let module = ctx.create_module("dedup_test");
+        let module = ctx.create_module("offset_test");
         let ptr_t = ctx.ptr_type(AddressSpace::default());
         let void_t = ctx.void_type();
         let fn_ty = void_t.fn_type(&[ptr_t.into()], false);
@@ -569,52 +460,37 @@ mod tests {
         let builder = ctx.create_builder();
         builder.position_at_end(entry_bb);
         let state_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
-        let i8_t = ctx.i8_type();
-        let i32_t = ctx.i32_type();
-        let i64_t = ctx.i64_type();
-        let base_gep = unsafe {
-            builder
-                .build_in_bounds_gep(
-                    i8_t,
-                    state_ptr,
-                    &[i32_t.const_int(crate::state::ARENA_STATE_OFFSET_BASE as u64, false)],
-                    "base_gep",
-                )
-                .unwrap()
-        };
-        let base_int = builder
-            .build_load(i64_t, base_gep, "base")
-            .unwrap()
-            .into_int_value();
-        let arena_base_ptr = builder
-            .build_int_to_ptr(base_int, ptr_t, "arena_base_ptr")
-            .unwrap();
-        let const_pool = ConstPool::default();
+
         let mut emit = Emit::new(
             &ctx,
             &builder,
             &module,
             func,
             EntryShape::Buffer,
-            Some(arena_base_ptr),
+            None,
             Some(state_ptr),
             0,
-            &const_pool,
+            &pool,
         );
-        let op = Op::CccTableAddr;
         emit.lower_unicode_rest(0, "a", &op).unwrap();
         emit.lower_unicode_rest(1, "b", &op).unwrap();
-        // Two ops → two arena offsets on the stack, but only ONE backing
-        // global.
+        // Two ops → two identical offset constants on the stack, both i32.
         assert_eq!(emit.stack.len(), 2);
-        let mut count = 0;
-        let mut g = module.get_first_global();
-        while let Some(global) = g {
-            if global.get_name().to_string_lossy() == "relon_uni_ccc" {
-                count += 1;
-            }
-            g = global.get_next_global();
+        for tv in &emit.stack {
+            assert_eq!(tv.ty, IrType::I32, "table addr result must be i32");
+            let c = tv.val;
+            assert!(c.is_const(), "table addr must be a compile-time constant");
+            assert_eq!(
+                c.get_zero_extended_constant(),
+                Some(u64::from(want_off)),
+                "lowered offset must equal the const-pool offset"
+            );
         }
-        assert_eq!(count, 1, "repeated CccTableAddr must reuse one global");
+        // No table global is emitted any more (the bytes live in the
+        // const-data prefix, not a module global).
+        assert!(
+            module.get_global("relon_uni_ccc").is_none(),
+            "R14 must not emit a per-table module global"
+        );
     }
 }
