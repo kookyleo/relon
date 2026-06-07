@@ -8,19 +8,26 @@
 //! which compares the returned `Value` deep / bit-for-bit (every string
 //! byte, every element).
 //!
-//! Coverage is THREE-WAY (tree-walk + cranelift-native + llvm-native), not
-//! four-way. The wasm leg is honestly NOT established for a `List<String>`
-//! return: the LLVM→wasm32 emitter is target-agnostic and produces the
-//! same in-place return sentinel, but the `aot_wasm_parity` harness decoder
-//! only handles out_buf copy-returns of scalars / String / `List<Int>` —
-//! it has no `List<String>` decoder and rejects the negative in-place
-//! sentinel (`bytes_written < 0`) a scratch-region pointer-array root
-//! reports. This is the same gap that keeps the pre-existing const-pool
-//! `List<String>` return (`list_string_return_three_way`) at three-way;
-//! a wasm-side verifier + reader over scratch is future work, tracked
-//! separately. (Sibling numeric-list HOF coverage IS four-way:
-//! `list_float_hof_four_way` — those return inline-fixed `List<Int|Float>`
-//! the wasm harness already decodes.)
+//! Coverage here is THREE-WAY (tree-walk, cranelift-native, llvm-native).
+//! The wasm (fourth) leg for these EXACT scratch-built `List<String>` map
+//! results is now established separately, in
+//! `relon-codegen-llvm/tests/inplace_return_four_way.rs` (the `r13_*` cases
+//! plus the `diff_scratch_list_string_fstring` proptest): Wave R13 routed
+//! the wasm decode through the shared, verifier-gated
+//! `relon_eval_api::inplace_return` decoder over a linear-memory slice
+//! (`wasm_buffer_decode`), which handles `List<String>` and the negative
+//! in-place sentinel a scratch-region pointer-array root reports — so the
+//! headline `range(n).map(x => f"v${x}")`, the `String -> String` suffix
+//! map, and the const/empty/free-form bodies all run four-way bit-equal,
+//! through a real LLVM→wasm32 → wasm-ld → wasmtime pipeline, with NO
+//! codegen change (the sentinel was already emitted).
+//!
+//! This three-way file is retained as the harness-level oracle differential
+//! (it compares the full `Value` deep / bit-for-bit across the native
+//! backends); the wasm bit-equality lives in the four-way file above so the
+//! coverage is not duplicated. (Sibling numeric-list HOF coverage is also
+//! four-way: `list_float_hof_four_way` — those return inline-fixed
+//! `List<Int|Float>` the wasm harness already decodes.)
 //!
 //! The bundled `list_string_map` / `list_int_map_to_string` /
 //! `list_float_map_to_string` bodies build the result as a `List<String>`

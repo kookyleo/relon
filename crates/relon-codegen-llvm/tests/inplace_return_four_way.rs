@@ -434,6 +434,120 @@ fn ls_very_long() {
 }
 
 // ====================================================================
+// Wave R13: SCRATCH-BUILT List<String> results (the R3c String-result
+// `map` family).
+//
+// Unlike Shape 2 above (a parameter pass-through whose root lands in the
+// `in` region), these programs CONSTRUCT a fresh `List<String>` pointer-
+// array record in the SCRATCH region: a `map` closure produces a String
+// per element (const-pool literal, or a scratch-built `IntToStr` /
+// `StrConcatN` record) and collects the handles into a `[count][off..]`
+// pointer array. The entry returns it via the SAME negative in-place
+// sentinel `-(root_abs + 1)`, but the root now lives in scratch.
+//
+// R3c proved these THREE-WAY (tree-walk == cranelift-native ==
+// llvm-native) and recorded the wasm leg as honestly unestablished: the
+// old `aot_wasm_parity` hand-rolled decoder had no `List<String>` decode
+// and rejected the negative in-place sentinel. The shared
+// `relon_eval_api::inplace_return` decoder DOES handle `List<String>`
+// (region-select → verifier → `read_list_string_at`), and the wasm host
+// here routes through it via `wasm_buffer_decode` over a linear-memory
+// slice — exactly as Shape 2 does — so the scratch-root case lifts to
+// four-way with NO codegen change (the sentinel is already emitted; the
+// only per-target half is which sentinel the body reports, and that is
+// target-independent IR). The verifier runs over the scratch region of
+// the linear-memory slice before any decode, so an out-of-region or
+// over-reading root is a loud `Err`, never a wild read.
+// ====================================================================
+
+// Homogeneous `String -> String` map: `s + "!"` builds a fresh String per
+// element in scratch (const-pool literal `"!"` + `StrConcatN`), collected
+// into the scratch pointer array.
+const SRC_R13_MAP_SUFFIX: &str =
+    "#main() -> List<String>\n[\"a\", \"b\", \"c\"].map((String s) => s + \"!\")";
+
+#[test]
+fn r13_string_map_concat_suffix() {
+    assert_four_way(SRC_R13_MAP_SUFFIX, HashMap::new());
+}
+
+// Empty-string elements: each per-element String record is a bare `[0]`
+// length prefix with no payload; the identity-ish map must preserve every
+// empty entry byte-for-byte through the scratch decode.
+const SRC_R13_MAP_EMPTY_STR: &str =
+    "#main() -> List<String>\n[\"\", \"ab\", \"\"].map((String s) => s + \"\")";
+
+#[test]
+fn r13_string_map_empty_strings() {
+    assert_four_way(SRC_R13_MAP_EMPTY_STR, HashMap::new());
+}
+
+// The headline R3c shape: `range(n).map((Int x) => f"v${x}")`. The closure
+// builds a fresh String per element (`IntToStr` + concat in scratch); the
+// map collects the handles into the scratch result pointer array. n=4 ⇒
+// ["v0","v1","v2","v3"].
+const SRC_R13_FSTRING: &str = "#main(Int n) -> List<String>\nrange(n).map((Int x) => f\"v${x}\")";
+
+#[test]
+fn r13_int_to_string_fstring_headline() {
+    assert_four_way(SRC_R13_FSTRING, args1("n", Value::Int(4)));
+}
+
+#[test]
+fn r13_int_to_string_fstring_empty_source() {
+    // Empty source → `[]`: the body allocates the count-0 header and the
+    // loop never runs, so the scratch root is an empty `List<String>`.
+    assert_four_way(SRC_R13_FSTRING, args1("n", Value::Int(0)));
+}
+
+#[test]
+fn r13_int_to_string_fstring_single() {
+    // n=1 ⇒ ["v0"]: a single scratch-built String handle.
+    assert_four_way(SRC_R13_FSTRING, args1("n", Value::Int(1)));
+}
+
+// Const-body Int-source map (`range(n).map((Int x) => "v")`): every entry
+// is the SAME const-pool String handle — the scratch pointer array holds
+// repeated arena-absolute offsets into the const region (a cross-region
+// link from scratch → const the multi-region verifier classifies).
+const SRC_R13_CONST_BODY: &str = "#main(Int n) -> List<String>\nrange(n).map((Int x) => \"v\")";
+
+#[test]
+fn r13_int_to_string_const_body() {
+    assert_four_way(SRC_R13_CONST_BODY, args1("n", Value::Int(3)));
+}
+
+// Free-form `_list_map` Int source with an f-string body — the scratch
+// pointer array collects `#0`/`#1`/`#2` (literal `#` + IntToStr concat).
+const SRC_R13_FREE_FORM: &str =
+    "#main() -> List<String>\n_list_map([1, 2, 3], (Int x) => f\"#${x}\")";
+
+#[test]
+fn r13_int_to_string_free_form() {
+    assert_four_way(SRC_R13_FREE_FORM, HashMap::new());
+}
+
+// Float-source const-body map (`[1.5, 2.5].map((Float x) => "f")`): the
+// numeric source is consumed, the scratch result is a `List<String>` of
+// const-pool handles.
+const SRC_R13_FLOAT_CONST: &str = "#main() -> List<String>\n[1.5, 2.5].map((Float x) => \"f\")";
+
+#[test]
+fn r13_float_to_string_const_body() {
+    assert_four_way(SRC_R13_FLOAT_CONST, HashMap::new());
+}
+
+// Longer scratch run with CJK + empty + long elements, to stress the
+// scratch bump cursor across many per-element String records.
+const SRC_R13_FSTRING_PREFIX: &str =
+    "#main(Int n) -> List<String>\nrange(n).map((Int x) => f\"item-${x}\")";
+
+#[test]
+fn r13_int_to_string_fstring_longer() {
+    assert_four_way(SRC_R13_FSTRING_PREFIX, args1("n", Value::Int(10)));
+}
+
+// ====================================================================
 // Shape 3: List<Schema> parameter-identity
 // ====================================================================
 
@@ -1301,6 +1415,20 @@ proptest! {
     fn diff_list_team_nested(teams in list_team_strat()) {
         let oracle = run_tree_walk(SRC_TEAM_NESTED, args1("teams", teams.clone()));
         if let Some(res) = run_wasm(SRC_TEAM_NESTED, &args1("teams", teams)) {
+            prop_assert_eq!(res.map_err(TestCaseError::fail)?, oracle);
+        }
+    }
+
+    // R13: SCRATCH-BUILT `List<String>` results. `range(n).map(x => f"v${x}")`
+    // over a random length builds a fresh scratch pointer array whose entries
+    // are scratch-built `IntToStr` + concat records. The scratch root decodes
+    // bit-equal to the tree-walk oracle on the wasm leg — the "lengths you
+    // didn't think of" net for the scratch bump cursor + the in-place
+    // `read_list_string_at` decode over the scratch region.
+    #[test]
+    fn diff_scratch_list_string_fstring(n in 0i64..40) {
+        let oracle = run_tree_walk(SRC_R13_FSTRING, args1("n", Value::Int(n)));
+        if let Some(res) = run_wasm(SRC_R13_FSTRING, &args1("n", Value::Int(n))) {
             prop_assert_eq!(res.map_err(TestCaseError::fail)?, oracle);
         }
     }
