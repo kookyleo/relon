@@ -127,6 +127,7 @@ pub const LOWERING_CAP_IDS: &[&str] = &[
     "lower_fn_call.unknown_stdlib_method.4",
     "lower_fn_call.unknown_stdlib_method.5",
     "lower_fn_call.unknown_stdlib_method.6",
+    "lower_fn_call.split_empty_separator",
     "lower_fn_call.unsupported_expr.5",
     "lower_fn_call.unsupported_expr.6",
     "lower_list_index_typed.unsupported_expr",

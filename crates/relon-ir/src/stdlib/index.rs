@@ -96,6 +96,15 @@ pub fn stdlib_method_index(receiver_ty: IrType, name: &str) -> Option<u32> {
         // `trim_end` stay capped (UTF-8 decode seam unsupported on
         // LLVM-native / wasm — see `string_ops` module docs).
         (IrType::String, "replace") => stdlib_function_index("replace"),
+        // Wave R15: `s.split(sep)` receiver-method dispatch. The tree-walk
+        // surface defines `split(s, sep)` as a thin wrapper over the
+        // `_string_split` free call (see `std_relon/string.relon`), and the
+        // analyzer rewrites it back to the `split` method on a String
+        // receiver, so this method route is the one lowering sees. Result is
+        // a `List<String>` built four-way by the `split` bundled body.
+        // (Empty separator stays capped: the tree-walk oracle errors on it
+        // rather than producing a value — see `string_ops::split_string`.)
+        (IrType::String, "split") => stdlib_function_index("split"),
         // F-D7-D: `s.contains(needle)` and the free-call form
         // `contains(s, needle)` both resolve to the same body. The
         // trace recorder short-circuits the call onto

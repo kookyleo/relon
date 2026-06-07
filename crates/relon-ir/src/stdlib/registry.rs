@@ -35,7 +35,7 @@ use super::normalization::{
     nfkc_string, nfkd_string,
 };
 use super::signatures::StdlibFunction;
-use super::string_ops::{ends_with_string, len_string_to_int, replace_string};
+use super::string_ops::{ends_with_string, len_string_to_int, replace_string, split_string};
 use super::validators::is_uuid_string;
 
 /// Return the ordered list of builtin stdlib functions. The order is
@@ -275,12 +275,11 @@ pub fn builtin_stdlib() -> &'static [StdlibFunction] {
             // keeps `upper` / `title` / `nfd` at tree-walk + cranelift —
             // see `relon-codegen-llvm/tests/phase0b_unicode.rs`).
             // `matches` stays capped (needs the full `regex` engine, no
-            // wasm-portable body); `split` stays capped (it has no lowered
-            // byte-scan body on any compiled backend — tree-walk only). Its
-            // `List<String>` result is no longer the blocker: Wave R13 wired
-            // the wasm in-place `List<String>` decode (scratch-built results
-            // included), so once a `split` body lowers it can ship four-way
-            // through the same shared `inplace_return` decoder.
+            // wasm-portable body). `split` is lowered four-way as of Wave
+            // R15 (index 56 below) for a non-empty string-literal separator;
+            // an empty separator stays capped (the tree-walk oracle errors on
+            // it rather than producing a value — see `string_ops::split_string`
+            // and the `lower_fn_call.split_empty_separator` cap).
             len_string_to_int(),
             ends_with_string(),
             replace_string(),
@@ -303,6 +302,29 @@ pub fn builtin_stdlib() -> &'static [StdlibFunction] {
             // division / remainder (leap-year `% 4 / % 100 / % 400`) for
             // which the IR exposes no `DivS` / `RemS` op.
             is_uuid_string(),
+            // Wave R15: `split(String, String) -> List<String>`. Appended at
+            // the tail (index 56) so every position-pinned index above stays
+            // put — existing-construct cranelift/llvm bytes are unchanged, so
+            // GENERATOR_VERSION does not move (the body is a brand-new bundled
+            // entry, not a re-emit of an existing construct). The body is
+            // purely byte-level (record-header read, byte loads/stores,
+            // `Memcpy`, integer compares / `BitAnd`) — no UTF-8 decode, no
+            // `Op::Trap` — building a self-contained scratch `List<String>`
+            // pointer-array record byte-identical to `write_list_string`, so
+            // it lowers four-way (tree-walk == cranelift == llvm-native ==
+            // llvm-wasm) and returns in place through the shared
+            // `inplace_return` decoder (Wave R13 wired the wasm in-place
+            // `List<String>` decode for scratch-built results).
+            //   * `56` — `split(String, sep: String) -> List<String>`
+            //             (non-empty substring separator; N+1 segments,
+            //             data-dependent count — leading / trailing /
+            //             consecutive cuts each yield an empty segment,
+            //             empty input yields `[""]`, no-match yields the whole
+            //             string). The empty-separator case stays capped: the
+            //             tree-walk oracle rejects it with a loud
+            //             `UnsupportedOperator` rather than producing a value,
+            //             so there is no value to be byte-equal to.
+            split_string(),
         ]
     })
 }

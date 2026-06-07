@@ -1066,3 +1066,419 @@ fn nonempty_scan_write(
         tt(Op::ConstI32(0)),
     ]
 }
+
+// ---------------------------------------------------------------------
+// Wave R15: `split(s: String, sep: String) -> List<String>`.
+// ---------------------------------------------------------------------
+
+/// `split(s: String, sep: String) -> List<String>`.
+///
+/// Byte-exact with the tree-walk oracle (`str::split(&str)` over a
+/// **non-empty** substring separator): splits `s` at every
+/// non-overlapping left-to-right occurrence of `sep` and returns the
+/// `N+1` segments between cuts (where `N` is the match count). Leading,
+/// trailing, and consecutive-delimiter cuts each yield an empty segment,
+/// and an empty input yields the single empty segment `[""]`; a no-match
+/// input returns the whole string as one element. The empty-separator
+/// case is rejected by the tree-walk oracle (it returns a loud
+/// `UnsupportedOperator` error rather than a value), so it never reaches
+/// a lowered body — the lowering keeps it capped (it cannot be proven
+/// byte-equal to a *value* the oracle never produces). See the cap note
+/// in `super::registry::builtin_stdlib`.
+///
+/// The result is a `List<String>` pointer-array record
+/// `[count: u32][off_0: u32]…[off_{N}: u32]` whose `off_i` are
+/// arena-relative offsets to per-segment String records `[len: u32][utf8]`.
+/// This matches the `write_list_string` layout the return ABI / verifier
+/// walk byte-for-byte (same shape Wave R3c's `list_map_to_string_body`
+/// produces, but with a **data-dependent** element count). Every segment
+/// record is independently arena-allocated and self-contained under the
+/// single global arena-relative pointer convention, so the result returns
+/// in place through the shared `inplace_return` decoder (no rigid-block
+/// copy / relocation — same invariant as the R3c String-result HOF
+/// results and a param-sourced pointer array).
+///
+/// Two passes over the input. Pass 1 counts the segment count `N` (match
+/// count + 1) so the header size is known; pass 2 re-scans, and at every
+/// cut emits one segment String record + writes its offset into the next
+/// header slot. The body is purely byte-level (record-header read, byte
+/// loads/stores, `Memcpy`, integer compares / `BitAnd`) — no UTF-8 decode
+/// or `Op::Trap` — so it lowers four-way (tree-walk == cranelift ==
+/// llvm-native == llvm-wasm).
+pub(super) fn split_string() -> StdlibFunction {
+    StdlibFunction::new(
+        "split",
+        vec![IrType::String, IrType::String],
+        IrType::ListString,
+        split_string_body,
+    )
+}
+
+#[allow(clippy::vec_init_then_push)]
+fn split_string_body() -> Vec<TaggedOp> {
+    const S_LEN: u32 = 0;
+    const F_LEN: u32 = 1;
+    const N: u32 = 2; // segment count (= match count + 1)
+    const NEW_BASE: u32 = 3; // result header base (4-aligned)
+    const SLOT: u32 = 4; // next header slot offset (NEW_BASE + 4 + 4*p)
+    const SEG_START: u32 = 5; // current segment start in s payload
+    const I: u32 = 6; // outer scan cursor into s payload
+    const MATCH: u32 = 7; // 1 if `sep` matches at i
+    const J: u32 = 8; // inner compare cursor (match_from_at_i scratch)
+    const SINK: u32 = 9; // value sink for stack-balancing If/helpers
+    const SB: u32 = 10; // scratch byte (s side)
+    const BYTE: u32 = 11; // scratch byte (sep side)
+
+    let mut body: Vec<TaggedOp> = Vec::new();
+
+    // s_len = i32.load(s, 0); f_len = i32.load(sep, 0).
+    body.push(tt(Op::LocalGet(0)));
+    body.push(tt(Op::LoadI32AtAbsolute { offset: 0 }));
+    body.push(tt(Op::LetSet {
+        idx: S_LEN,
+        ty: IrType::I32,
+    }));
+    body.push(tt(Op::LocalGet(1)));
+    body.push(tt(Op::LoadI32AtAbsolute { offset: 0 }));
+    body.push(tt(Op::LetSet {
+        idx: F_LEN,
+        ty: IrType::I32,
+    }));
+
+    // ===== Pass 1: N = match_count + 1 =====
+    body.push(tt(Op::ConstI32(1)));
+    body.push(tt(Op::LetSet {
+        idx: N,
+        ty: IrType::I32,
+    }));
+    body.push(tt(Op::ConstI32(0)));
+    body.push(tt(Op::LetSet {
+        idx: I,
+        ty: IrType::I32,
+    }));
+    body.push(tt(Op::Block {
+        result_ty: None,
+        body: vec![tt(Op::Loop {
+            result_ty: None,
+            body: {
+                let mut l = Vec::new();
+                // exit when i >= s_len (so the tail where i+f_len > s_len
+                // can never false-match — match_from_at_i returns 0 there).
+                l.push(tt(Op::LetGet {
+                    idx: I,
+                    ty: IrType::I32,
+                }));
+                l.push(tt(Op::LetGet {
+                    idx: S_LEN,
+                    ty: IrType::I32,
+                }));
+                l.push(tt(Op::Ge(IrType::I32)));
+                l.push(tt(Op::BrIf { label_depth: 1 }));
+                l.extend(match_from_at_i(S_LEN, F_LEN, I, MATCH, J, SINK, SB, BYTE));
+                // if match { N += 1; i += f_len } else { i += 1 }
+                l.push(tt(Op::LetGet {
+                    idx: MATCH,
+                    ty: IrType::I32,
+                }));
+                l.push(tt(Op::If {
+                    result_ty: IrType::I32,
+                    then_body: vec![
+                        tt(Op::LetGet {
+                            idx: N,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(1)),
+                        tt(Op::Add(IrType::I32)),
+                        tt(Op::LetSet {
+                            idx: N,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::LetGet {
+                            idx: F_LEN,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::Add(IrType::I32)),
+                        tt(Op::LetSet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(0)),
+                    ],
+                    else_body: vec![
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(1)),
+                        tt(Op::Add(IrType::I32)),
+                        tt(Op::LetSet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(0)),
+                    ],
+                }));
+                l.push(tt(Op::LetSet {
+                    idx: SINK,
+                    ty: IrType::I32,
+                }));
+                l.push(tt(Op::Br { label_depth: 0 }));
+                l
+            },
+        })],
+    }));
+
+    // ===== Allocate result header [count][off_0]…[off_{N-1}] =====
+    // record_size = 4 + 4*N + 4 (trailing +4 is align slop so the
+    // 4-aligned header fits regardless of the raw scratch base — mirrors
+    // `list_map_to_string_body`).
+    body.push(tt(Op::ConstI32(8)));
+    body.push(tt(Op::LetGet {
+        idx: N,
+        ty: IrType::I32,
+    }));
+    body.push(tt(Op::ConstI32(4)));
+    body.push(tt(Op::Mul(IrType::I32)));
+    body.push(tt(Op::Add(IrType::I32)));
+    body.push(tt(Op::AllocScratchDyn));
+    // new_base = (raw_base + 3) & -4
+    body.push(tt(Op::ConstI32(3)));
+    body.push(tt(Op::Add(IrType::I32)));
+    body.push(tt(Op::ConstI32(-4)));
+    body.push(tt(Op::BitAnd(IrType::I32)));
+    body.push(tt(Op::LetSet {
+        idx: NEW_BASE,
+        ty: IrType::I32,
+    }));
+    // store header count: i32.store(new_base, N)
+    body.push(tt(Op::LetGet {
+        idx: NEW_BASE,
+        ty: IrType::I32,
+    }));
+    body.push(tt(Op::LetGet {
+        idx: N,
+        ty: IrType::I32,
+    }));
+    body.push(tt(Op::StoreI32AtAbsolute { offset: 0 }));
+
+    // slot = new_base + 4 (first off_i slot); seg_start = 0; i = 0.
+    body.push(tt(Op::LetGet {
+        idx: NEW_BASE,
+        ty: IrType::I32,
+    }));
+    body.push(tt(Op::ConstI32(4)));
+    body.push(tt(Op::Add(IrType::I32)));
+    body.push(tt(Op::LetSet {
+        idx: SLOT,
+        ty: IrType::I32,
+    }));
+    body.push(tt(Op::ConstI32(0)));
+    body.push(tt(Op::LetSet {
+        idx: SEG_START,
+        ty: IrType::I32,
+    }));
+    body.push(tt(Op::ConstI32(0)));
+    body.push(tt(Op::LetSet {
+        idx: I,
+        ty: IrType::I32,
+    }));
+
+    // ===== Pass 2: emit a segment record at every cut =====
+    body.push(tt(Op::Block {
+        result_ty: None,
+        body: vec![tt(Op::Loop {
+            result_ty: None,
+            body: {
+                let mut l = Vec::new();
+                l.push(tt(Op::LetGet {
+                    idx: I,
+                    ty: IrType::I32,
+                }));
+                l.push(tt(Op::LetGet {
+                    idx: S_LEN,
+                    ty: IrType::I32,
+                }));
+                l.push(tt(Op::Ge(IrType::I32)));
+                l.push(tt(Op::BrIf { label_depth: 1 }));
+                l.extend(match_from_at_i(S_LEN, F_LEN, I, MATCH, J, SINK, SB, BYTE));
+                l.push(tt(Op::LetGet {
+                    idx: MATCH,
+                    ty: IrType::I32,
+                }));
+                l.push(tt(Op::If {
+                    result_ty: IrType::I32,
+                    then_body: {
+                        // emit segment s[seg_start .. i] -> slot; advance.
+                        let mut t = emit_segment_record(SEG_START, I, SLOT, SB, J, SINK);
+                        // seg_start = i + f_len; i += f_len.
+                        t.push(tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }));
+                        t.push(tt(Op::LetGet {
+                            idx: F_LEN,
+                            ty: IrType::I32,
+                        }));
+                        t.push(tt(Op::Add(IrType::I32)));
+                        t.push(tt(Op::LetSet {
+                            idx: SEG_START,
+                            ty: IrType::I32,
+                        }));
+                        t.push(tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }));
+                        t.push(tt(Op::LetGet {
+                            idx: F_LEN,
+                            ty: IrType::I32,
+                        }));
+                        t.push(tt(Op::Add(IrType::I32)));
+                        t.push(tt(Op::LetSet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }));
+                        t.push(tt(Op::ConstI32(0)));
+                        t
+                    },
+                    else_body: vec![
+                        tt(Op::LetGet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(1)),
+                        tt(Op::Add(IrType::I32)),
+                        tt(Op::LetSet {
+                            idx: I,
+                            ty: IrType::I32,
+                        }),
+                        tt(Op::ConstI32(0)),
+                    ],
+                }));
+                l.push(tt(Op::LetSet {
+                    idx: SINK,
+                    ty: IrType::I32,
+                }));
+                l.push(tt(Op::Br { label_depth: 0 }));
+                l
+            },
+        })],
+    }));
+    // Final (or only) segment: s[seg_start .. s_len] -> last slot.
+    body.extend(emit_segment_record(SEG_START, S_LEN, SLOT, SB, J, SINK));
+
+    // return new_base
+    body.push(tt(Op::LetGet {
+        idx: NEW_BASE,
+        ty: IrType::I32,
+    }));
+    body.push(tt(Op::Return));
+    body
+}
+
+/// Emit a String record for `s[seg_start .. seg_end]` (param 0 is `s`),
+/// store its arena offset into the header slot at local `slot`, and
+/// advance `slot` by 4. Stack-neutral. Uses `len`/`rec`/`sink` scratch
+/// locals (the caller passes `sb`/`j`/`sink`, all dead across this call
+/// site, reused here as `len`/`rec`/`sink`).
+fn emit_segment_record(
+    seg_start: u32,
+    seg_end: u32,
+    slot: u32,
+    len: u32,
+    rec: u32,
+    sink: u32,
+) -> Vec<TaggedOp> {
+    vec![
+        // len = seg_end - seg_start
+        tt(Op::LetGet {
+            idx: seg_end,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: seg_start,
+            ty: IrType::I32,
+        }),
+        tt(Op::Sub(IrType::I32)),
+        tt(Op::LetSet {
+            idx: len,
+            ty: IrType::I32,
+        }),
+        // rec = AllocScratchDyn(4 + len); store len header.
+        tt(Op::ConstI32(4)),
+        tt(Op::LetGet {
+            idx: len,
+            ty: IrType::I32,
+        }),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::AllocScratchDyn),
+        tt(Op::LetSet {
+            idx: rec,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: rec,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: len,
+            ty: IrType::I32,
+        }),
+        tt(Op::StoreI32AtAbsolute { offset: 0 }),
+        // memcpy(rec + 4, s + 4 + seg_start, len)
+        tt(Op::LetGet {
+            idx: rec,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(4)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::LocalGet(0)),
+        tt(Op::ConstI32(4)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::LetGet {
+            idx: seg_start,
+            ty: IrType::I32,
+        }),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::LetGet {
+            idx: len,
+            ty: IrType::I32,
+        }),
+        tt(Op::MemcpyAtAbsolute),
+        // i32.store(slot, rec) — header slot holds the segment's offset.
+        tt(Op::LetGet {
+            idx: slot,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: rec,
+            ty: IrType::I32,
+        }),
+        tt(Op::StoreI32AtAbsolute { offset: 0 }),
+        // slot += 4
+        tt(Op::LetGet {
+            idx: slot,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(4)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::LetSet {
+            idx: slot,
+            ty: IrType::I32,
+        }),
+        // The caller treats this helper as stack-neutral; every op above
+        // is a statement, so we leave the stack untouched (sink unused —
+        // kept in the signature to mirror the other pass-2 helpers).
+        tt(Op::LetGet {
+            idx: sink,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetSet {
+            idx: sink,
+            ty: IrType::I32,
+        }),
+    ]
+}
