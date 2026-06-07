@@ -1324,5 +1324,54 @@ pub fn all_cases() -> Vec<CorpusCase> {
             tier: Tier::StdlibSimple,
             supported_by: TW_CR,
         },
+        // ---- Wave R12: spread (`...x`) — capped, by-design boundaries ----
+        //
+        // Both spread forms are rejected before they reach the cranelift
+        // lowering pass, for two orthogonal reasons. They are registered
+        // `TW_ONLY` (the tree-walker is the only backend that runs them):
+        // the corpus ratchet then asserts cranelift *gracefully* caps
+        // rather than silently miscompiling.
+        //
+        // LIST spread `[...a, b, ...c]`: the analyzer infers a list
+        // literal as a tuple (`infer/mod.rs` `Expr::List` ->
+        // `InferredType::Tuple`), and a spread element keeps the source's
+        // own type (`Expr::Spread(inner) -> infer_type(inner)`). So
+        // `[...[1,2,3], 4, ...[5,6]]` infers as
+        // `Tuple(Tuple(Int,Int,Int), Int, Tuple(Int,Int))`, never a
+        // `List<Int>`. The tuple-folds-into-`List<T>` subsumption
+        // (`infer/mod.rs` "List" arm) requires *every* tuple element to
+        // satisfy the slot's `T`; a `List`/`Tuple` element never satisfies
+        // a scalar `T`, so any `-> List<scalar>` return slot rejects with
+        // a return-type mismatch. With no declared return the entry type
+        // is `<missing>`, which the compiled backend's marshaller also
+        // rejects. Spread flattening only happens at runtime in the
+        // tree-walker (`eval.rs` `Expr::List` spread branch). Lifting this
+        // would change list/spread *type inference* (fold a spread
+        // source's element type into the surrounding tuple), not add a
+        // codegen lowering — out of scope for an IR-coverage wave.
+        CorpusCase {
+            name: "r12_list_spread_capped",
+            source: "#main()\n[...[1, 2, 3], 4, ...[5, 6]]",
+            args_factory: no_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_ONLY,
+        },
+        // DICT spread `{ ...base, k: v }`: blocked at the Dict-by-design
+        // gap (Wave R9: "unsupported expression Dict in lowering"). The
+        // compiled backends route objects through schema records and
+        // cannot construct or return a free `Dict` value at all, so the
+        // entry return type is `<missing>` and lowering caps before the
+        // spread is ever considered. Spread *override*
+        // (`{ ...{a:1}, a:2 }`) is a hard analyzer error
+        // (`duplicate field produced by spread`) in every backend — the
+        // language does not silently let later keys win. The no-override
+        // merge below runs on the tree-walker and caps on cranelift.
+        CorpusCase {
+            name: "r12_dict_spread_capped",
+            source: "#main()\n{ ...{ a: 1, b: 2 }, c: 3 }",
+            args_factory: no_args,
+            tier: Tier::DictReturn,
+            supported_by: TW_ONLY,
+        },
     ]
 }
