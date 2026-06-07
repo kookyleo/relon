@@ -1172,6 +1172,50 @@ pub fn all_cases() -> Vec<CorpusCase> {
             tier: Tier::DictReturn,
             supported_by: TW_CR,
         },
+        // ---- Wave R11: field decorators on the anon-Dict-return path ----
+        // A decorated field `@deco(args) k: v` desugars to the call
+        // `deco(v, args)` — the decorated value is the FIRST positional
+        // arg, the decorator's own args follow (matching the tree-walk
+        // `fallback_decorator`, which prepends `value` before the
+        // evaluated decorator args). The decorator resolves to an
+        // `#internal` field-form function (lifted to a closure let), so
+        // the desugared call lowers through `try_lower_local_closure_call`.
+        // `Int` Dict return ⇒ `TW_CR` (bytecode / trace don't model
+        // anon-Dict construction). Verified byte-equal four-way for the
+        // scalar-Int shape (wasm + llvm-native legs in
+        // `relon-codegen-llvm::aot_wasm_parity`).
+        CorpusCase {
+            name: "r11_int_decorator",
+            source: "#relaxed\n#main(Int p) -> Dict\n\
+                     { #internal\n add(v, n): v + n,\n @add(100)\n x: p }",
+            args_factory: || one_int("p", 5),
+            tier: Tier::DictReturn,
+            supported_by: TW_CR,
+        },
+        // Stacked decorators apply bottom-up (`@a @b v ≡ a(b(v))`): the
+        // decorator nearest the value (`@mul`) wraps first, the outermost
+        // (`@add`) wraps last. `@add(1) @mul(10) x: 5` ⇒ add(mul(5,10),1)
+        // = 51.
+        CorpusCase {
+            name: "r11_stacked_decorators",
+            source: "#relaxed\n#main(Int p) -> Dict\n\
+                     { #internal\n add(v, n): v + n,\n #internal\n mul(v, n): v * n,\n \
+                     @add(1) @mul(10)\n x: p }",
+            args_factory: || one_int("p", 5),
+            tier: Tier::DictReturn,
+            supported_by: TW_CR,
+        },
+        // A builtin `@`-decorator (`@value`) has no compiled call form;
+        // it caps loudly in `desugar_field_decorators` and `auto` falls
+        // back to the tree-walk interpreter. Tree-walk only — the
+        // compiled backend rejects it on purpose.
+        CorpusCase {
+            name: "r11_capped_builtin_value_decorator",
+            source: "#relaxed\n#main(Int p) -> Dict\n{ @value(999)\n x: p }",
+            args_factory: || one_int("p", 7),
+            tier: Tier::DictReturn,
+            supported_by: TW_ONLY,
+        },
         // ---- Wave R4: static const-fold of `type(v)` ----
         // In strict mode the argument's IR type is statically known, so
         // `type(v)` lowers to a constant canonical type-name String

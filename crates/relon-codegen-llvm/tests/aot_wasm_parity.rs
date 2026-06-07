@@ -1116,6 +1116,47 @@ fn r10_sibling_root_backward_aligns_native_via_wasmtime() {
     assert_eq!(out.get("z"), Some(&Decoded::Int(want_z)), "r10 field z");
 }
 
+/// Wave R11 — field decorators on the anon-Dict-return path run on
+/// wasm32. A decorated field `@deco(args) k: v` desugars to the call
+/// `deco(v, args)` (value-first), and stacked decorators apply bottom-up
+/// (`@a @b v ≡ a(b(v))`). The decorator resolves to an `#internal`
+/// field-form function lifted to a closure let, so the desugared call
+/// lowers through `Op::CallClosure`. Verified byte-equal on the wasm32
+/// leg against the LLVM native oracle (itself bit-aligned to tree-walk +
+/// cranelift via the `r11_*` corpus).
+#[test]
+fn r11_field_decorator_aligns_native_via_wasmtime() {
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping r11 field decorator");
+        return;
+    }
+    // Stacked: @add(1) @mul(10) x: p ⇒ add(mul(p,10),1).
+    let src = "#relaxed\n#main(Int p) -> Dict\n\
+               { #internal\n add(v, n): v + n,\n #internal\n mul(v, n): v * n,\n \
+               @add(1) @mul(10)\n x: p }";
+    let p = 5i64;
+    let dict = match native_run(src, HashMap::from([("p".to_string(), Value::Int(p))])) {
+        Value::Dict(d) => d,
+        other => panic!("native expected Dict, got {other:?}"),
+    };
+    let want_x = match dict.map.get("x") {
+        Some(Value::Int(v)) => *v,
+        other => panic!("x not Int: {other:?}"),
+    };
+    // Oracle sanity: add(mul(5,10),1) = 51.
+    assert_eq!(want_x, 51, "r11 oracle drifted");
+
+    let (bytes, info) = build("r11_field_decorator", src);
+    let in_record = pack_single_int(&info, p);
+    let out = run_buffer(
+        &bytes,
+        "relon_parity_r11_field_decorator",
+        &info,
+        &in_record,
+    );
+    assert_eq!(out.get("x"), Some(&Decoded::Int(want_x)), "r11 field x");
+}
+
 /// W5-P3 — `d[k]` dict-get probe runs on wasm32. A `#main` dict body
 /// binds `#internal d` (an `Op::ConstDict` arena record) and the
 /// `result` Int field probes it with a `ConstString` key. This proves
