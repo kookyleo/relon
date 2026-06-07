@@ -85,7 +85,7 @@ use crate::sandbox::SandboxConfig;
 /// `Linkage::Import` references). Cache files from stage 1 are
 /// emitted against the stub `relon_main_entry` and would deadlock
 /// the dlopen-exec path; the version bump self-invalidates them.
-pub const GENERATOR_VERSION: &str = "relon-codegen-cranelift v5-gamma 13";
+pub const GENERATOR_VERSION: &str = "relon-codegen-cranelift v5-gamma 14";
 
 /// Filename suffix for the legacy IR cache (paired with the
 /// relon-object-cache `<hash>.relon-native-v1` blob).
