@@ -415,6 +415,16 @@ impl<'a> Walker<'a> {
                 self.visit_internal(body, None);
                 self.scope_stack.pop();
             }
+            Expr::Tuple(items) => {
+                // A tuple is heterogeneous by design — its elements are
+                // NOT subject to the homogeneity / derivable-element
+                // gate the list arm enforces. We only recurse so each
+                // element expression is itself typechecked (nested
+                // tuples, calls, references, ...).
+                for item in items {
+                    self.visit_internal(item, None);
+                }
+            }
             Expr::List(items) => {
                 // v1.5: under strict mode, every list element must
                 // produce a derivable type. We collect diagnostics

@@ -90,6 +90,13 @@ ast_node!(
 ast_node!(Dict, DICT);
 ast_node!(DictField, DICT_FIELD);
 ast_node!(List, LIST);
+ast_node!(
+    /// `(e1, e2, ...)` tuple value literal. `()` is the unit tuple
+    /// (no children); `(e,)` the trailing-comma 1-tuple. A bare
+    /// grouping `(e)` is NOT a tuple and never produces this node.
+    Tuple,
+    TUPLE
+);
 ast_node!(Comprehension, COMPREHENSION);
 ast_node!(Closure, CLOSURE);
 ast_node!(ClosureParam, CLOSURE_PARAM);
@@ -154,6 +161,7 @@ pub enum Expr {
     Reference(ReferenceExpr),
     Dict(Dict),
     List(List),
+    Tuple(Tuple),
     Spread(SpreadExpr),
     Comprehension(Comprehension),
     Binary(BinaryExpr),
@@ -185,6 +193,7 @@ impl Expr {
             SyntaxKind::REFERENCE_EXPR => Self::Reference(ReferenceExpr(node)),
             SyntaxKind::DICT => Self::Dict(Dict(node)),
             SyntaxKind::LIST => Self::List(List(node)),
+            SyntaxKind::TUPLE => Self::Tuple(Tuple(node)),
             SyntaxKind::SPREAD_EXPR => Self::Spread(SpreadExpr(node)),
             SyntaxKind::COMPREHENSION => Self::Comprehension(Comprehension(node)),
             SyntaxKind::BINARY_EXPR => Self::Binary(BinaryExpr(node)),
@@ -211,6 +220,7 @@ impl Expr {
             Self::Reference(n) => n.syntax(),
             Self::Dict(n) => n.syntax(),
             Self::List(n) => n.syntax(),
+            Self::Tuple(n) => n.syntax(),
             Self::Spread(n) => n.syntax(),
             Self::Comprehension(n) => n.syntax(),
             Self::Binary(n) => n.syntax(),
@@ -328,6 +338,13 @@ impl DictField {
 }
 
 impl List {
+    pub fn items(&self) -> impl Iterator<Item = Expr> + '_ {
+        self.0.children().filter_map(Expr::cast)
+    }
+}
+
+impl Tuple {
+    /// Element expressions in source order. Empty for the unit tuple `()`.
     pub fn items(&self) -> impl Iterator<Item = Expr> + '_ {
         self.0.children().filter_map(Expr::cast)
     }

@@ -1125,21 +1125,21 @@ impl<'a> Parser<'a> {
             Some(SyntaxKind::L_BRACE) => self.parse_dict(),
             Some(SyntaxKind::L_BRACK) => self.parse_list(),
             Some(SyntaxKind::L_PAREN) => {
-                // Two shapes share the leading `(`:
+                // Three shapes share the leading `(`:
                 //   1. `(p1, p2) [-> RetType] => body` — a closure.
                 //   2. `(expr)`                       — a parenthesised
-                //      group (or, theoretically, a tuple, but the v1
-                //      grammar treats tuples only as TYPE expressions).
-                // We use lookahead to commit to the closure shape only
-                // when we can see the trailing `=>` (after the optional
-                // return type) — anything else stays as a group so the
-                // round-trip never regresses on edge cases.
+                //      group (precedence override, NOT a tuple).
+                //   3. `()` / `(e,)` / `(e1, e2, ...)` — a tuple value.
+                //      The unit `()` and the trailing-comma 1-tuple
+                //      `(e,)` are the disambiguators that keep `(e)`
+                //      pure grouping.
+                // Closure lookahead runs first (it can see the trailing
+                // `=>`); the tuple-vs-group decision is made by scanning
+                // the parenthesised body for a top-level comma.
                 if self.try_parse_paren_closure() {
                     return;
                 }
-                self.bump();
-                self.parse_expr();
-                self.expect(SyntaxKind::R_PAREN);
+                self.parse_paren_or_tuple();
             }
             Some(SyntaxKind::STAR) => {
                 self.open(SyntaxKind::WILDCARD);
@@ -1720,6 +1720,53 @@ impl<'a> Parser<'a> {
         }
         self.close();
         true
+    }
+
+    /// Parse a `(`-led atom that is NOT a closure: either a
+    /// parenthesised group `(expr)` or a tuple value literal.
+    ///
+    /// Disambiguation (locked design):
+    ///   * `()`              → unit / zero-tuple (TUPLE node, no children).
+    ///   * `(e)`             → grouping (the inner expression, no wrapper).
+    ///   * `(e,)`            → 1-tuple (trailing comma forces it).
+    ///   * `(e1, e2, ...)`   → n-tuple.
+    ///
+    /// The opening `(` and closing `)` land inside the TUPLE node for the
+    /// tuple shapes so the round-trip-by-bytes invariant holds; for the
+    /// grouping shape the parens are bumped as bare leaves around the
+    /// inner expression (matching the pre-tuple behaviour).
+    fn parse_paren_or_tuple(&mut self) {
+        debug_assert!(self.at(SyntaxKind::L_PAREN));
+        let ck = self.checkpoint();
+        self.bump(); // (
+                     // Empty parens — the unit tuple `()`.
+        if self.at(SyntaxKind::R_PAREN) {
+            self.open_at(ck, SyntaxKind::TUPLE);
+            self.bump(); // )
+            self.close();
+            return;
+        }
+        // Parse the first element / grouped expression.
+        self.parse_expr();
+        if self.at(SyntaxKind::COMMA) {
+            // At least one comma → a tuple. Wrap everything (including
+            // the already-parsed first element) in a TUPLE node.
+            self.open_at(ck, SyntaxKind::TUPLE);
+            while self.eat(SyntaxKind::COMMA) {
+                // Trailing comma before `)` is allowed (and is what
+                // makes `(e,)` a 1-tuple).
+                if self.at(SyntaxKind::R_PAREN) || self.at_end() {
+                    break;
+                }
+                self.parse_expr();
+            }
+            self.expect(SyntaxKind::R_PAREN);
+            self.close();
+            return;
+        }
+        // No comma — plain grouping `(expr)`. No TUPLE wrapper; the
+        // inner expression stands on its own (precedence override only).
+        self.expect(SyntaxKind::R_PAREN);
     }
 
     /// One closure parameter — either `name` or `Type name`. P2

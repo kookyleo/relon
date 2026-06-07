@@ -1403,6 +1403,78 @@ fn count(tree: &AnalyzedTree, pred: impl Fn(&Diagnostic) -> bool) -> usize {
     tree.diagnostics.iter().filter(|d| pred(d)).count()
 }
 
+// ---------------------------------------------------------------------
+// Wave T1: tuple value typing. A `(...)` tuple value is a first-class
+// tuple — heterogeneous elements are allowed (unlike a list literal),
+// it is typed `Tuple<...>` position-by-position, `.N` access yields the
+// Nth element type, out-of-range `.N` is statically rejected, and a
+// tuple value type-checks against a `Tuple<...>` slot / `#main` return.
+// ---------------------------------------------------------------------
+
+/// A heterogeneous tuple value is accepted — no StaticTypeMismatch /
+/// type-unknown diagnostics (it is NOT subject to the homogeneous-list
+/// rejection).
+#[test]
+fn t1_heterogeneous_tuple_value_is_accepted() {
+    let tree = analyze_str(r#"{ pair: (1, "a", true) }"#);
+    let n = count(&tree, |d| {
+        matches!(
+            d,
+            Diagnostic::StaticTypeMismatch { .. } | Diagnostic::ExpressionTypeUnknown { .. }
+        )
+    });
+    assert_eq!(n, 0, "{:?}", tree.diagnostics);
+}
+
+/// A tuple value flowing into a `Tuple<Int, String>` slot type-checks
+/// position-by-position; a matching tuple produces no diagnostic.
+#[test]
+fn t1_tuple_value_into_tuple_slot_ok() {
+    let tree = analyze_str(r#"{ Tuple<Int, String> pair: (1, "x") }"#);
+    let n = count(&tree, |d| {
+        matches!(d, Diagnostic::StaticTypeMismatch { .. })
+    });
+    assert_eq!(n, 0, "{:?}", tree.diagnostics);
+}
+
+/// A tuple value whose Nth element mismatches the slot's Nth position
+/// is rejected. The analyzer may report it either as a whole-tuple
+/// mismatch (subsumption catches `(Int, Int)` vs `Tuple<Int, String>`)
+/// or as a precise positional `pair[1]` mismatch — either is a clean
+/// rejection.
+#[test]
+fn t1_tuple_value_position_mismatch_flagged() {
+    let tree = analyze_str(r#"{ Tuple<Int, String> pair: (1, 2) }"#);
+    let n = count(
+        &tree,
+        |d| matches!(d, Diagnostic::StaticTypeMismatch { field, .. } if field == "pair" || field == "pair[1]"),
+    );
+    assert!(n >= 1, "{:?}", tree.diagnostics);
+}
+
+/// Tuple arity mismatch against a `Tuple<...>` slot is rejected.
+#[test]
+fn t1_tuple_value_arity_mismatch_flagged() {
+    let tree = analyze_str(r#"{ Tuple<Int, String> pair: (1, "x", 9) }"#);
+    let n = count(
+        &tree,
+        |d| matches!(d, Diagnostic::StaticTypeMismatch { field, .. } if field == "pair"),
+    );
+    assert!(n >= 1, "{:?}", tree.diagnostics);
+}
+
+/// Out-of-range positional access on a tuple binding is statically
+/// rejected (strict mode is the default — the index walks past the
+/// tuple's arity, so the reference type can't be determined).
+#[test]
+fn t1_tuple_out_of_range_index_rejected() {
+    let tree = analyze_str(r#"{ t: (10, 20), bad: &sibling.t.5 }"#);
+    assert!(
+        !tree.diagnostics.is_empty(),
+        "expected a diagnostic for out-of-range tuple index, got none"
+    );
+}
+
 /// v1.3 forward: in strict mode, an untyped non-dict spread
 /// (`...e` where `e` isn't a dict literal) reports
 /// `SpreadSourceTypeUnknown`.

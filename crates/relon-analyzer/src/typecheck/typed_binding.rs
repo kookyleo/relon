@@ -194,6 +194,37 @@ impl<'a> Walker<'a> {
                     }
                 }
             }
+            // A `(...)` tuple value landing in a typed slot. The common
+            // case is a `Tuple<T1, T2, ...>` slot: check arity, then
+            // recurse position-by-position. A tuple is also accepted in
+            // a `List<T>` slot when every element subsumes `T` (mirrors
+            // the list-literal-into-List path above).
+            Expr::Tuple(items) => {
+                if expected.path == vec!["Tuple"] {
+                    if items.len() != expected.generics.len() {
+                        self.tree.diagnostics.push(Diagnostic::StaticTypeMismatch {
+                            field: field_name.to_string(),
+                            expected: format_type(expected),
+                            found: format!("tuple of {} element(s)", items.len()),
+                            range: span_of(value.range),
+                        });
+                        return;
+                    }
+                    for (i, (item, slot)) in items.iter().zip(expected.generics.iter()).enumerate()
+                    {
+                        self.check_typed_binding(slot, item, &format!("{}[{}]", field_name, i));
+                    }
+                } else if expected.path == vec!["List"] && expected.generics.len() == 1 {
+                    let inner_expected = &expected.generics[0];
+                    for (i, item) in items.iter().enumerate() {
+                        self.check_typed_binding(
+                            inner_expected,
+                            item,
+                            &format!("{}[{}]", field_name, i),
+                        );
+                    }
+                }
+            }
             // Only the common `Dict<String, V>` shape is descended into;
             // other key types are deferred to the runtime checker.
             Expr::Dict(pairs)

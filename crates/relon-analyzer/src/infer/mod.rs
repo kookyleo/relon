@@ -892,6 +892,17 @@ pub(crate) fn infer_type(node: &Node, scope: &TypeScope) -> Option<InferredType>
                 .collect();
             Some(InferredType::Tuple(elems))
         }
+        // v(T1): a `(...)` tuple value literal is a first-class tuple.
+        // Unlike a list literal it is NEVER folded to `List<T>` and
+        // NEVER rejected for heterogeneity — each element keeps its own
+        // type position-by-position. `()` is the unit tuple `Tuple()`.
+        Expr::Tuple(items) => {
+            let elems: Vec<InferredType> = items
+                .iter()
+                .map(|item| infer_type(item, scope).unwrap_or(InferredType::Any))
+                .collect();
+            Some(InferredType::Tuple(elems))
+        }
         Expr::Dict(pairs) => {
             // Same idea, joining values into the dict's value type.
             if pairs.is_empty() {

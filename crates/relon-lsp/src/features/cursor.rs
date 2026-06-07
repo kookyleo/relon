@@ -69,7 +69,7 @@ fn children(node: &Node) -> Vec<&Node> {
                 out.push(value);
             }
         }
-        Expr::List(items) => out.extend(items.iter()),
+        Expr::List(items) | Expr::Tuple(items) => out.extend(items.iter()),
         Expr::Spread(inner) => out.push(inner),
         Expr::Comprehension {
             element,

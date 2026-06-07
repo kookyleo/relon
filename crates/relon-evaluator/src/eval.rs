@@ -585,6 +585,27 @@ impl TreeWalkEvaluator {
                 Ok(result)
             }
 
+            // A `(...)` tuple value. Fixed-arity and positional — no
+            // spread, no list-context / sibling-reference semantics
+            // (those belong to list literals). Each element is evaluated
+            // in order; the runtime representation is a positional
+            // `Value::List`, so JSON output is a positional array,
+            // `.N` access reuses list indexing, and equality / Display
+            // all flow through the existing list machinery. The
+            // list-vs-tuple distinction (heterogeneity) is enforced
+            // entirely in the analyzer at the literal level. `()` is the
+            // empty list.
+            Expr::Tuple(elements) => {
+                let mut values = Vec::with_capacity(elements.len());
+                for (i, el) in elements.iter().enumerate() {
+                    let item_scope = current_scope.with_path(i.to_string());
+                    values.push(self.eval(el, &item_scope)?);
+                }
+                let result = Value::list(values);
+                self.check_value_size(&result, node.range)?;
+                Ok(result)
+            }
+
             Expr::Dict(pairs) => {
                 let is_root = current_scope
                     .root_ref
