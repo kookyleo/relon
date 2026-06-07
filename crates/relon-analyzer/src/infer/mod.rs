@@ -28,7 +28,7 @@ mod tests;
 use walk::infer_path_inferred;
 pub(crate) use walk::{path_segments, walk_path, PathTailOutcome};
 
-use relon_parser::{Expr, Node, Operator, TokenKey, TypeNode};
+use relon_parser::{Expr, Node, Operator, RefBase, TokenKey, TypeNode};
 use std::collections::HashMap;
 
 use crate::resolve::ScopeFrame;
@@ -623,6 +623,14 @@ pub(crate) struct TypeScope<'a> {
     /// Snapshot index from the analyzer tree, for translating frame
     /// field NodeIds back into their values' static types.
     pub(crate) tree: Option<&'a AnalyzedTree>,
+    /// R10b cycle guard. Names of sibling/root dict fields currently
+    /// being re-inferred by [`TypeScope::lookup`]. When a field's value
+    /// is re-inferred to derive a `&sibling.<name>` / `&root.<name>`
+    /// reference type, its own name is pushed here so a self- or
+    /// mutually-recursive field reference (`x: &sibling.x`,
+    /// `x: &sibling.y, y: &sibling.x`) breaks the cycle (returns `None`
+    /// → `Any` → strict still rejects) instead of recursing forever.
+    pub(crate) resolving: Vec<String>,
 }
 
 impl<'a> TypeScope<'a> {
@@ -633,6 +641,7 @@ impl<'a> TypeScope<'a> {
             schemas: Some(schemas),
             frames: Vec::new(),
             tree: Some(tree),
+            resolving: Vec::new(),
         }
     }
 
@@ -655,6 +664,7 @@ impl<'a> TypeScope<'a> {
             schemas: self.schemas,
             frames: self.frames.clone(),
             tree: self.tree,
+            resolving: self.resolving.clone(),
         }
     }
 
@@ -709,12 +719,25 @@ impl<'a> TypeScope<'a> {
                     // Reset locals + parent chain — we're inferring a
                     // sibling field's value type, not continuing the
                     // current closure body.
+                    //
+                    // Note: this deliberately drops the dict frames too,
+                    // so a sibling field whose own value depends on the
+                    // enclosing scope (a `#main` param or an earlier
+                    // sibling) infers to `Any` *through this generic
+                    // path*. The R10b strict `&sibling` / `&root`
+                    // derivation does NOT route through here — it uses
+                    // `infer_reference`, which re-infers the target
+                    // field with the frames preserved and a cycle guard.
+                    // Keeping this path frame-less preserves the
+                    // pre-R10b behavior for every other consumer
+                    // (`Variable`, `&uncle`, `&this`, multi-segment).
                     let scope = TypeScope {
                         locals: HashMap::new(),
                         parent_locals: Vec::new(),
                         schemas: self.schemas,
                         frames: Vec::new(),
                         tree: self.tree,
+                        resolving: self.resolving.clone(),
                     };
                     return infer_type(target, &scope);
                 }
@@ -727,6 +750,112 @@ impl<'a> TypeScope<'a> {
         }
         None
     }
+}
+
+/// R10b: derive the static type of an `&sibling.<name>` / entry-level
+/// `&root.<name>` reference from the *target sibling/root field's* own
+/// static type. This is the strict-mode analogue of wave R10's
+/// backward static field-dependency lowering — the analyzer should
+/// accept exactly the references the compiled path already lowers, and
+/// keep rejecting (return `None` → `Any` → strict diagnostic) the rest.
+///
+/// Guards (kept consistent with R10's lowering so analyzer ⟂ lowering):
+///
+/// * `base ∈ {Sibling, Root}` only. `&uncle` / `&this` / `&prev` /
+///   `&next` / `&index` stay un-derived — list-context refs depend on
+///   iteration state and uncle crosses dict boundaries.
+/// * Single static `TokenKey::String` segment only. Multi-segment
+///   (`&sibling.a.b`) and dynamic-key paths stay un-derived; the
+///   runtime walks inside those values, which R10 doesn't lower.
+/// * Backward only: the target field must appear *earlier* in source
+///   than the reference site (compared by source offset). A forward
+///   (`y: &sibling.x, x: …` with `x` after `y`) or self-reference does
+///   not derive — R10's lowering caps forward refs ("does not name an
+///   earlier host-visible scalar field"), so deriving one would let a
+///   strict program pass analysis yet fail to compile four-way.
+///
+/// Privacy: a single-segment same-dict `&sibling` / entry-level
+/// `&root` may legitimately see an `#internal` sibling (the runtime
+/// keeps `#internal` values in the owning dict's locals precisely so
+/// same-dict siblings can read them — see `relon-evaluator`'s
+/// `reference.rs`), so no extra privacy gate is needed for this narrow
+/// shape.
+///
+/// Returns `None` for any reference outside these guards so the caller
+/// falls back to its existing "uninferrable" behavior (strict mode
+/// keeps emitting `UnknownReferenceType`; non-strict keeps the silent
+/// `Any` fallback).
+fn infer_reference(
+    base: &RefBase,
+    path: &[TokenKey],
+    node: &Node,
+    scope: &TypeScope,
+) -> Option<InferredType> {
+    // Guard 1: only sibling / root bases.
+    match base {
+        RefBase::Sibling | RefBase::Root => {}
+        _ => return None,
+    }
+    // Guard 2: exactly one static String segment.
+    let name = match path {
+        [TokenKey::String(s, _, _)] => s.as_str(),
+        _ => return None,
+    };
+    // Resolve the target field's value node in the appropriate frame:
+    // Sibling reads the innermost dict frame, entry-level Root reads
+    // the outermost. (At the entry dict — which *is* the document root
+    // — both frames coincide; the distinction matters only for nested
+    // dicts, where Root deliberately jumps to the document root.)
+    let tree = scope.tree?;
+    let frame = match base {
+        // Skip the synthetic `#main(...)` param-only frame so `&root`
+        // lands on the document-root dict (mirrors the resolver's
+        // `RefBase::Root` skip in `resolve/scope.rs`).
+        RefBase::Root => *scope.frames.iter().find(|f| !f.is_main_param_frame())?,
+        // Sibling (and the fallthrough is unreachable given guard 1).
+        _ => *scope.frames.last()?,
+    };
+    let target_id = frame.fields.get(name).copied()?;
+    let target = tree.node_index.get(&target_id)?;
+    // Guard 3: backward only. The target field must start earlier in
+    // source than the reference site. This mirrors R10's "earlier
+    // host-visible scalar field" lowering guard and rejects forward /
+    // self references (which the compiled path caps).
+    if target.range.start.offset >= node.range.start.offset {
+        return None;
+    }
+    // Cycle guard: refuse to re-enter a field already on the resolution
+    // stack (`x: &sibling.x`, or a mutually-recursive pair). Returns
+    // `None` → `Any` → strict still rejects.
+    if scope.resolving.iter().any(|n| n == name) {
+        return None;
+    }
+    // Derive the reference's type from the target field's static type.
+    // Prefer an explicit `Type field:` hint (the author's declared
+    // intent); otherwise re-infer the field's value expression.
+    //
+    // Unlike the generic `TypeScope::lookup` sibling path (which drops
+    // all frames to break cycles bluntly), we keep the enclosing dict
+    // frames + `#main` param frame visible so the target's own value
+    // can resolve its dependencies (`x: a + b` → `Int`). The
+    // `resolving` set seeded with `name` is what keeps this safe.
+    if let Some(hint) = &target.type_hint {
+        return Some(infer_from_type_node_with_imports(
+            hint,
+            tree.workspace_import_index.as_ref(),
+        ));
+    }
+    let mut resolving = scope.resolving.clone();
+    resolving.push(name.to_string());
+    let child = TypeScope {
+        locals: HashMap::new(),
+        parent_locals: Vec::new(),
+        schemas: scope.schemas,
+        frames: scope.frames.clone(),
+        tree: scope.tree,
+        resolving,
+    };
+    infer_type(target, &child)
 }
 
 /// Infer the static type of `node` under `scope`. Returns `None` for
@@ -827,7 +956,7 @@ pub(crate) fn infer_type(node: &Node, scope: &TypeScope) -> Option<InferredType>
             Some(joined)
         }
         Expr::Variable(path) => infer_path_inferred(path, scope),
-        Expr::Reference { path, .. } => infer_path_inferred(path, scope),
+        Expr::Reference { base, path } => infer_reference(base, path, node, scope),
         Expr::Closure {
             params,
             return_type,

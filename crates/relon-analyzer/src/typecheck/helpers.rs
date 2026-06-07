@@ -289,6 +289,7 @@ impl<'a> Walker<'a> {
             schemas: Some(&self.schema_index),
             frames: self.scope_stack.iter().collect(),
             tree: Some(self.tree),
+            resolving: Vec::new(),
         }
     }
 

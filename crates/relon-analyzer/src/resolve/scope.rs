@@ -30,7 +30,15 @@ impl<'a> Walker<'a> {
     ) -> Option<ResolvedRef> {
         let head = path_head(path)?;
         let frame = match base {
-            RefBase::Root => self.scope_stack.first()?,
+            // `&root` targets the document-root dict. When the entry
+            // declares `#main(...)` params, a synthetic param-only frame
+            // (empty `fields`, populated `closure_params`) sits *below*
+            // the root dict on the stack — `first()` would land on it
+            // and miss the root dict's fields. Skip leading param-only
+            // frames so `&root.x` resolves to the actual root field even
+            // in an entry program. (Without params the first frame IS
+            // the root dict, so this is a no-op for library files.)
+            RefBase::Root => self.scope_stack.iter().find(|f| !f.is_main_param_frame())?,
             RefBase::Sibling => self.scope_stack.last()?,
             RefBase::Uncle => {
                 // `path.len() >= 2` lets `&uncle.X` skip both the current
