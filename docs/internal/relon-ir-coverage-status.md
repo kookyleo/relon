@@ -14,7 +14,10 @@
 ## 进展更新(2026-06-07,loop 驱动)
 - ✅ **R10 `a57bb7e2`**:类别 A 的 **references `&sibling.<name>` + 入口级 `&root.<name>`(向后静态字段依赖)** 已编译四方(reuse 源序 field-let 图 → `LetGet`)。仍 cap:forward ref、dynamic key、multi-segment、`&uncle/&prev/&next/&this/&index`、`#internal` 隐私歧义。注:目前 references-in-dict-field 是 `#relaxed`(严格模式 analyzer 不推 reference 类型,`diagnostic.rs:462`,需类似 R1 的 analyzer 扩展=潜在后续 R10b)。GENERATOR_VERSION→14(scalar 字段改走 LetSet/LetGet,动了既有 anon-dict-return 字节)。
 - ✅ **R11 `e9f2d7c3`**:类别 A 的 **field decorator**(`@deco(v, args)` 值优先,实测自 evaluator 非文档注释;stacked 自底向上)已编译四方(scalar-Int)。**顺带修了一个静默 miscompile**(decorated 字段原先 lower 时无视 decorator → cranelift 返原值)。仍 cap:builtin `@`-decorator、named arg、multi-segment、String 结果(closure-field 参数类型信封)。
-- 类别 A 剩余:**spread**、**VariantCtor**(+ 上述 references 的 cap 子集、decorator 的 cap 子集、R10b 严格 ref analyzer)。
+- ✅ **R10b `465b0065`**:严格模式 references 类型推断(analyzer 从目标字段静态类型推 `&sibling.x`/`&root.x`,backward/单段守卫;`#relaxed` 不再是前提)。`&sibling.x` 现严格模式四方编译。GENERATOR_VERSION 不变(analyzer-only)。
+- **R12 spread `ddf4ee8f`**:全 cap(诚实)——list spread 被 analyzer 的 list=Tuple 推断挡在 lowering 之前(`infer/mod.rs:745/942`,`[...[1,2,3],4]` 推成嵌套 Tuple、不满足 List<scalar> 包容);dict spread 撞 Dict-by-design。要编 = 改 list 类型推断(类型系统决策)或建 Dict 支持,均越界。记 TW_ONLY,非 lowering cap site(故不进 LOWERING_CAP_IDS,双射不破)。
+- **类别 A 实质收尾**:references(R10/R10b)✓ · decorator(R11)✓ · spread = analyzer/类型系统挡(需决策)· VariantCtor = 大概率 Dict-by-design 挡(变体值=branded Dict)。
+- **剩余皆需决策或大改(已到 surface 点)**:① spread 要不要改 list=Tuple 推断 ② Unicode-seam string ops(upper/title/trim/nfd)移植 LLVM/wasm UTF-8 解码 seam(大、后端活)③ List<String> 返回的 wasm in-place 解码器(补 R3c/str.split 到四方,design-free 中等活)④ Dict 支持(当前 by-design cap,要不要改)⑤ #relaxed 真动态 / &prev/&next / regex / net-parse(静态优先下倾向诚实 cap)。
 
 ## 未展开工作(诚实记录,分三类)
 
