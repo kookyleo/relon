@@ -225,6 +225,12 @@ pub enum SyntaxKind {
     /// `CLOSURE_PARAM` list, a TYPE_NODE return type, and an
     /// expression body (omitted when `#native` is set).
     SCHEMA_METHOD,
+    /// `(e1, e2, ...)` tuple value literal. Distinct from a
+    /// parenthesised group `(e)` (which carries no comma) and from the
+    /// `(p, q) => body` closure form. The 1-tuple uses a trailing-comma
+    /// `(e,)` disambiguator; `()` is the zero-tuple (unit). Children are
+    /// the element expressions in source order.
+    TUPLE,
 
     // Append new kinds above this line.
     /// Sentinel to keep `(SyntaxKind as u16) < (__LAST as u16)`
@@ -368,6 +374,7 @@ impl SyntaxKind {
             x if x == Self::TUPLE_TYPE as u16 => Self::TUPLE_TYPE,
             x if x == Self::SCHEMA_WITH as u16 => Self::SCHEMA_WITH,
             x if x == Self::SCHEMA_METHOD as u16 => Self::SCHEMA_METHOD,
+            x if x == Self::TUPLE as u16 => Self::TUPLE,
             _ => return None,
         };
         Some(kind)

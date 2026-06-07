@@ -6301,3 +6301,98 @@ fn fused_list_sum_range_falls_through_when_list_shadowed() {
         "fused path must not fire when `list` is shadowed, got {result:?}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Wave T1: tuple oracle (tree-walk) semantics. The tree-walk evaluator
+// is the gold oracle that the four-way compiled backends (T2) will
+// match. A tuple constructs to a positional `Value::List` so JSON
+// output is a positional array byte-identical to the equivalent list,
+// `.N` access reuses list indexing, and equality flows through the
+// existing list machinery.
+// ---------------------------------------------------------------------
+
+#[test]
+fn tuple_constructs_positional_list_value() {
+    // `(1, 2, 3)` evaluates to a positional list value.
+    let v = eval_doc("(1, 2, 3)").expect("eval");
+    assert_eq!(
+        v,
+        Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+    );
+}
+
+#[test]
+fn tuple_is_heterogeneous() {
+    // Unlike a list literal, a tuple allows mixed element types.
+    let v = eval_doc(r#"(1, "a", true)"#).expect("eval");
+    assert_eq!(
+        v,
+        Value::list(vec![
+            Value::Int(1),
+            Value::String("a".into()),
+            Value::Bool(true),
+        ])
+    );
+}
+
+#[test]
+fn tuple_nested() {
+    // `((1, 2), 3)` — first element is itself a tuple value.
+    let v = eval_doc("((1, 2), 3)").expect("eval");
+    assert_eq!(
+        v,
+        Value::list(vec![
+            Value::list(vec![Value::Int(1), Value::Int(2)]),
+            Value::Int(3),
+        ])
+    );
+}
+
+#[test]
+fn tuple_one_element_trailing_comma() {
+    // `(42,)` is a 1-tuple, not a grouped `42`.
+    let v = eval_doc("(42,)").expect("eval");
+    assert_eq!(v, Value::list(vec![Value::Int(42)]));
+}
+
+#[test]
+fn unit_tuple_is_empty_list() {
+    // `()` — the zero-tuple evaluates to an empty positional list.
+    let v = eval_doc("()").expect("eval");
+    assert_eq!(v, Value::list(vec![]));
+}
+
+#[test]
+fn paren_grouping_is_not_a_tuple() {
+    // `(1 + 2)` is precedence grouping — the inner value, never a tuple.
+    let v = eval_doc("(1 + 2)").expect("eval");
+    assert_eq!(v, Value::Int(3));
+}
+
+#[test]
+fn tuple_index_access_on_binding() {
+    // `t.0` / `t.1` positional access on a tuple binding.
+    let v = eval_doc(r#"t.1 where { t: (10, "hello", true) }"#).expect("eval");
+    assert_eq!(v, Value::String("hello".into()));
+}
+
+#[test]
+fn tuple_json_output_is_array() {
+    // The locked output rule: a tuple serializes to a JSON array,
+    // byte-identical to the equivalent list literal.
+    let tuple_v = eval_doc(r#"(1, "a", true)"#).expect("eval tuple");
+    let list_v = eval_doc(r#"[1, "a", true]"#);
+    // The list literal is heterogeneous so the analyzer would reject it
+    // in strict mode, but `eval_doc` runs the bare evaluator; the point
+    // is the JSON projection of the tuple value matches a positional
+    // array.
+    let tuple_json = serde_json::to_string(&tuple_v).expect("json");
+    assert_eq!(tuple_json, r#"[1,"a",true]"#);
+    if let Ok(list_v) = list_v {
+        assert_eq!(
+            serde_json::to_string(&list_v).expect("json"),
+            tuple_json,
+            "tuple and equivalent list must JSON-serialize identically"
+        );
+    }
+}

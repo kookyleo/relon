@@ -333,6 +333,7 @@ pub fn child_nodes(node: &Node) -> Vec<&Node> {
             }
         }
         Expr::List(items) => out.extend(items.iter()),
+        Expr::Tuple(items) => out.extend(items.iter()),
         Expr::Spread(inner) => out.push(inner),
         Expr::Comprehension {
             element,
@@ -491,6 +492,69 @@ mod tests {
         .unwrap();
         assert_eq!(node.decorators.len(), 1);
         assert_eq!(node.decorators[0].path[0].to_string_key(), "foo");
+    }
+
+    #[test]
+    fn test_tuple_two_element() {
+        // `(a, b)` is a 2-tuple, distinct from a list.
+        let node = parse_document("(1, \"a\")").unwrap();
+        match &*node.expr {
+            Expr::Tuple(items) => {
+                assert_eq!(items.len(), 2);
+                assert!(matches!(*items[0].expr, Expr::Int(1)));
+                assert!(matches!(*items[1].expr, Expr::String(_)));
+            }
+            other => panic!("expected Tuple, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_tuple_one_element_trailing_comma() {
+        // `(a,)` — the trailing comma makes a 1-tuple.
+        let node = parse_document("(42,)").unwrap();
+        match &*node.expr {
+            Expr::Tuple(items) => {
+                assert_eq!(items.len(), 1);
+                assert!(matches!(*items[0].expr, Expr::Int(42)));
+            }
+            other => panic!("expected 1-tuple, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unit_tuple() {
+        // `()` — the zero-tuple / unit.
+        let node = parse_document("()").unwrap();
+        match &*node.expr {
+            Expr::Tuple(items) => assert!(items.is_empty()),
+            other => panic!("expected unit tuple, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_paren_grouping_is_not_tuple() {
+        // `(a)` stays a grouping — it lowers to the inner expression,
+        // never a Tuple.
+        let node = parse_document("(1 + 2)").unwrap();
+        assert!(
+            matches!(&*node.expr, Expr::Binary(Operator::Add, _, _)),
+            "grouping must not produce a Tuple: {:?}",
+            node.expr
+        );
+    }
+
+    #[test]
+    fn test_nested_tuple() {
+        // `((1, 2), 3)` — nested tuples.
+        let node = parse_document("((1, 2), 3)").unwrap();
+        match &*node.expr {
+            Expr::Tuple(items) => {
+                assert_eq!(items.len(), 2);
+                assert!(matches!(*items[0].expr, Expr::Tuple(_)));
+                assert!(matches!(*items[1].expr, Expr::Int(3)));
+            }
+            other => panic!("expected nested tuple, got {other:?}"),
+        }
     }
 
     #[test]

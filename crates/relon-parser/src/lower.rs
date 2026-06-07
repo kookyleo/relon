@@ -2616,6 +2616,37 @@ fn lower_list_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
     ))
 }
 
+/// Lower a `TUPLE` CST node into `Expr::Tuple`. Children in source order
+/// are the element expressions; `()` yields `Expr::Tuple(vec![])`. Unlike
+/// a list, a tuple never carries spreads or decorators on its elements,
+/// so the walk is a straight expression collect (with the recovering-mode
+/// Null-placeholder substitution that keeps ordinal positions stable).
+fn lower_tuple_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
+    let r = node.text_range();
+    let start: usize = r.start().into();
+    let end: usize = r.end().into();
+    let mut items: Vec<Node> = Vec::new();
+    for child in node.children() {
+        if let Some(e) = ast::Expr::cast(child.clone()) {
+            let item = match lower_expr_v2(&e, source) {
+                Some(n) => n,
+                None if is_recovering() => {
+                    let cr = child.text_range();
+                    let start_o: usize = cr.start().into();
+                    let end_o: usize = cr.end().into();
+                    Node::new(Expr::Null, range_from_offsets(source, start_o, end_o))
+                }
+                None => return None,
+            };
+            items.push(item);
+        }
+    }
+    Some(Node::new(
+        Expr::Tuple(items),
+        range_from_offsets(source, start, end),
+    ))
+}
+
 /// Lower a `COMPREHENSION` CST node into `Expr::Comprehension`.
 /// Children in source order: element Expr, then `for` IDENT bind, then
 /// iterable Expr, optional `if` cond Expr.
@@ -3152,6 +3183,7 @@ pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
         // dict / list / spread machinery here.
         ast::Expr::Dict(d) => lower_dict_v2(d.syntax(), source),
         ast::Expr::List(l) => lower_list_v2(l.syntax(), source),
+        ast::Expr::Tuple(t) => lower_tuple_v2(t.syntax(), source),
         ast::Expr::Spread(s) => lower_spread_expr_v2(s.syntax(), source),
         ast::Expr::Comprehension(c) => lower_comprehension_v2(c.syntax(), source),
         // Slice 3: operators + calls. The legacy `parse_expr` already
@@ -3443,7 +3475,7 @@ mod tests {
                     strip_node_ids(value);
                 }
             }
-            Expr::List(items) => {
+            Expr::List(items) | Expr::Tuple(items) => {
                 for item in items {
                     strip_node_ids(item);
                 }

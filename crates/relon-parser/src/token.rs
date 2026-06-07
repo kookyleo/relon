@@ -458,6 +458,13 @@ pub enum Expr {
     String(String),
 
     List(Vec<Node>),
+    /// Fixed-arity, heterogeneous, positional tuple value `(e1, e2, ...)`.
+    /// Distinct from `List` so the analyzer can type it position-by-position
+    /// (heterogeneous elements allowed, unlike a list literal) while it
+    /// still evaluates to a positional `Value::List` at runtime (so JSON
+    /// output is a positional array and `.N` access reuses list indexing).
+    /// `Tuple(vec![])` is the unit / zero-tuple `()`.
+    Tuple(Vec<Node>),
     Dict(Vec<(TokenKey, Node)>),
 
     Spread(Node),
@@ -569,6 +576,7 @@ impl Expr {
             Expr::Float(_) => "Float",
             Expr::String(_) => "String",
             Expr::List(_) => "List",
+            Expr::Tuple(_) => "Tuple",
             Expr::Dict(_) => "Dict",
             Expr::Spread(_) => "Spread",
             Expr::Comprehension { .. } => "Comprehension",
