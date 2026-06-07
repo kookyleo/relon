@@ -275,8 +275,12 @@ pub fn builtin_stdlib() -> &'static [StdlibFunction] {
             // keeps `upper` / `title` / `nfd` at tree-walk + cranelift —
             // see `relon-codegen-llvm/tests/phase0b_unicode.rs`).
             // `matches` stays capped (needs the full `regex` engine, no
-            // wasm-portable body); `split` stays capped (List<String>
-            // result — wasm has no in-place List<String> decoder yet).
+            // wasm-portable body); `split` stays capped (it has no lowered
+            // byte-scan body on any compiled backend — tree-walk only). Its
+            // `List<String>` result is no longer the blocker: Wave R13 wired
+            // the wasm in-place `List<String>` decode (scratch-built results
+            // included), so once a `split` body lowers it can ship four-way
+            // through the same shared `inplace_return` decoder.
             len_string_to_int(),
             ends_with_string(),
             replace_string(),
