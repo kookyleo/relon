@@ -216,6 +216,30 @@ pub const LEDGER: &[LedgerEntry] = &[
         reason: "#main param/return type outside the buffer-protocol decode envelope",
     },
     LedgerEntry {
+        id: "desugar_field_decorators.unsupported_expr.1",
+        site: "lowering/mod.rs::desugar_field_decorators",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "field decorator path is multi-segment / dynamic — no plain callable to desugar to",
+    },
+    LedgerEntry {
+        id: "desugar_field_decorators.unsupported_expr.2",
+        site: "lowering/mod.rs::desugar_field_decorators",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "r11_capped_builtin_value_decorator",
+        reason: "builtin @-decorator (@value/@expect/…) has no compiled call form",
+    },
+    LedgerEntry {
+        id: "desugar_field_decorators.unsupported_expr.3",
+        site: "lowering/mod.rs::desugar_field_decorators",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "field decorator with a named argument; positional-only call lowering can't thread it",
+    },
+    LedgerEntry {
         id: "anon_dict_return_plan.unsupported_expr",
         site: "lowering/mod.rs::anon_dict_return_plan",
         category: Category::ExprShape,
@@ -1145,6 +1169,14 @@ pub const LEDGER: &[LedgerEntry] = &[
         reason: "schema/dict field type has no canonical layout in this position",
     },
     LedgerEntry {
+        id: "lower_dict_into_record.unsupported_field_type.3",
+        site: "lowering/mod.rs::lower_dict_into_record",
+        category: Category::FieldType,
+        status: Status::Capped,
+        corpus: "",
+        reason: "field decorator on a branded `-> Schema` field not yet desugared (anon-Dict only)",
+    },
+    LedgerEntry {
         id: "lower_dict_field_value.unsupported_expr.1",
         site: "lowering/mod.rs::lower_dict_field_value",
         category: Category::ExprShape,
@@ -2068,5 +2100,14 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         status: Status::Covered,
         proof: "tree-walk + cranelift (TW_CR; wasm + llvm-native legs proven in \
                 relon-codegen-llvm::aot_wasm_parity::r10_sibling_root_backward)",
+    },
+    // ---- field decorators on the anon-Dict-return path ----
+    SurfaceEntry {
+        construct: "field decorator desugar (@deco(args) k: v -> deco(v, args)), stacked",
+        wave: "R11",
+        corpus: "r11_int_decorator",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (TW_CR; wasm + llvm-native legs proven in \
+                relon-codegen-llvm::aot_wasm_parity::r11_field_decorator)",
     },
 ];

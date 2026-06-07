@@ -762,8 +762,21 @@ fn lower_entry_with_resolver<'a>(
     // schema — `SchemaLayout` rejects them by Phase B's guard), so
     // the synthesised schema only carries the scalar fields that
     // survive the boundary.
+    // Wave R11: desugar field decorators in the anon-Dict-return body
+    // (`@deco(args) k: v` → `deco(v, args)`) so both the per-field plan
+    // and the body lowering see the decorator-call in place of the raw
+    // value. `None` ⇒ no field carried a decorator, so the byte-exact
+    // original `root` is used unchanged. Only the anon-Dict path is
+    // rewritten here; a branded `-> Schema` return rejects field
+    // decorators in `lower_dict_field_value` (loud cap, not silent).
+    let desugared_root: Option<Node> = if user_return_schema.is_none() {
+        desugar_anon_dict_decorators(root)?
+    } else {
+        None
+    };
+    let anon_dict_root: &Node = desugared_root.as_ref().unwrap_or(root);
     let anon_dict_plan = if user_return_schema.is_none() {
-        anon_dict_return_plan(sig, root, &resolver)?
+        anon_dict_return_plan(sig, anon_dict_root, &resolver)?
     } else {
         None
     };
@@ -873,7 +886,7 @@ fn lower_entry_with_resolver<'a>(
         // `closure_let_signatures` so a recursive self-call inside
         // the closure body resolves through `Op::CallClosure`); the
         // surviving scalar fields are stored into the root record.
-        let dict_pairs = match &*root.expr {
+        let dict_pairs = match &*anon_dict_root.expr {
             Expr::Dict(pairs) => pairs.as_slice(),
             _ => {
                 return Err(cap!(
@@ -881,9 +894,9 @@ fn lower_entry_with_resolver<'a>(
                     LoweringError::UnsupportedExpr {
                         kind: format!(
                             "Body-of-anon-Dict-#main must be a dict literal, got `{}`",
-                            root.expr.kind()
+                            anon_dict_root.expr.kind()
                         ),
-                        range: root.range,
+                        range: anon_dict_root.range,
                     }
                 ));
             }
@@ -1333,6 +1346,144 @@ enum AnonDictField {
 /// inference work stays Phase D scope. The shape is deliberately
 /// minimal so the W7 cmp_lua workload passes the IR pass without
 /// dragging analyzer-side per-field Dict inference into the picture.
+/// Builtin `@`-decorator names. These resolve to host-registered
+/// [`DecoratorPlugin`] semantics, not a user callable, so they have no
+/// "desugar to `deco(value, args)`" form on the compiled path. `@value`
+/// substitutes its first arg; `@expect`/`@msg`/`@error`/`@default` are
+/// schema-field-meta hooks that are identity on ordinary values. A
+/// future wave can lower the ones with a compiled-meaningful form; until
+/// then they cap loudly rather than silently dropping the transform.
+const BUILTIN_DECORATOR_NAMES: &[&str] = &["value", "expect", "msg", "error", "default"];
+
+/// Wave R11: desugar field decorators in a `#main(...) -> Dict { ... }`
+/// body before the anon-Dict-return plan / body lowering run.
+///
+/// A decorated field `@deco(a, b) k: v` desugars to the call
+/// `deco(v, a, b)` — the decorated value is the **first** positional
+/// argument, the decorator's own args follow. This matches the
+/// tree-walk contract exactly: `TreeWalkEvaluator::fallback_decorator`
+/// prepends `value` ahead of the evaluated decorator args (closure call
+/// `[value, ..args]`; native call `positional.insert(0, value)`). The
+/// `examples/pricing.relon` doc-comment that reads "value appended last"
+/// describes a `currency(symbol, val)` whose parameter order happens to
+/// place `val` last; the evaluator's actual convention — confirmed by
+/// running `@currency("USD") x: 12.3` → `"12.3 USD"` — is value-first.
+///
+/// Stacked decorators apply bottom-up (`@a @b v ≡ a(b(v))`): the
+/// decorator nearest the value wraps first, the outermost wraps last.
+/// The tree-walk iterates `node.decorators.iter().rev()`; this builds
+/// the nested call in the same order (innermost `Vec::last` first).
+///
+/// Returns `Ok(None)` when no field carries a decorator (the rewritten
+/// AST is then byte-identical to the original, so the existing lowering
+/// path — and the codegen bytes it produces — are untouched). Returns
+/// `Ok(Some(rewritten_root))` when at least one field was desugared.
+/// Caps loudly (never silently wrong) on a decorator shape that cannot
+/// become a plain `deco(value, args)` call: a builtin `@`-decorator
+/// (no compiled callable), a multi-segment / dynamic decorator path, or
+/// a named decorator argument (the local-closure / native call lowering
+/// admits positional args only).
+fn desugar_anon_dict_decorators(root: &Node) -> Result<Option<Node>, LoweringError> {
+    let Expr::Dict(pairs) = &*root.expr else {
+        return Ok(None);
+    };
+    if pairs.iter().all(|(_, v)| v.decorators.is_empty()) {
+        return Ok(None);
+    }
+    let mut new_pairs: Vec<(TokenKey, Node)> = Vec::with_capacity(pairs.len());
+    for (key, value) in pairs {
+        if value.decorators.is_empty() {
+            new_pairs.push((key.clone(), value.clone()));
+            continue;
+        }
+        new_pairs.push((key.clone(), desugar_field_decorators(value)?));
+    }
+    let mut new_root = root.clone();
+    new_root.expr = std::sync::Arc::new(Expr::Dict(new_pairs));
+    Ok(Some(new_root))
+}
+
+/// Desugar one decorated field value into a nested decorator-call node.
+/// See [`desugar_anon_dict_decorators`] for the arg-order / stack-order
+/// contract. The returned node carries the original field's directives
+/// (so a `#internal` decorated field stays internal) and `type_hint`,
+/// but has its decorators stripped — the transform is now expressed as
+/// the call chain in `expr`.
+fn desugar_field_decorators(value: &Node) -> Result<Node, LoweringError> {
+    // Start from the bare value with decorators removed; fold each
+    // decorator (innermost first) into a call wrapping the running node.
+    let mut inner = value.clone();
+    let decorators = std::mem::take(&mut inner.decorators);
+    // Strip directives off the running call node — directives belong to
+    // the field, not to the synthetic intermediate calls. They are
+    // re-attached to the outermost node at the end.
+    let directives = std::mem::take(&mut inner.directives);
+    let type_hint = inner.type_hint.take();
+
+    let mut current = inner;
+    // Bottom-up: the decorator nearest the value (`Vec::last` — source
+    // order stacks outermost-first into the vec) wraps first.
+    for dec in decorators.iter().rev() {
+        // Decorator path must be a single plain identifier resolving to
+        // a user callable; multi-segment / dynamic paths have no
+        // compiled-call form here.
+        let path_ok =
+            dec.path.len() == 1 && matches!(dec.path.first(), Some(TokenKey::String(_, _, _)));
+        if !path_ok {
+            return Err(cap!(
+                "desugar_field_decorators.unsupported_expr.1",
+                LoweringError::UnsupportedExpr {
+                    kind: "field decorator with multi-segment / dynamic path".to_string(),
+                    range: dec.range,
+                }
+            ));
+        }
+        let TokenKey::String(name, _, _) = &dec.path[0] else {
+            unreachable!("guarded by path_ok");
+        };
+        if BUILTIN_DECORATOR_NAMES.contains(&name.as_str()) {
+            return Err(cap!(
+                "desugar_field_decorators.unsupported_expr.2",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("builtin `@{name}` decorator has no compiled call form"),
+                    range: dec.range,
+                }
+            ));
+        }
+        // Named decorator args can't be threaded through the positional-
+        // only local-closure / native call lowering; cap loudly.
+        if dec.args.iter().any(|a| a.name.is_some()) {
+            return Err(cap!(
+                "desugar_field_decorators.unsupported_expr.3",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("field decorator `@{name}` with a named argument"),
+                    range: dec.range,
+                }
+            ));
+        }
+        // Build `deco(current, ..dec.args)` — value first, then the
+        // decorator's own positional args.
+        let mut call_args: Vec<relon_parser::CallArg> = Vec::with_capacity(dec.args.len() + 1);
+        call_args.push(relon_parser::CallArg {
+            name: None,
+            value: current,
+        });
+        call_args.extend(dec.args.iter().cloned());
+        current = Node::new(
+            Expr::FnCall {
+                path: dec.path.clone(),
+                args: call_args,
+            },
+            dec.range,
+        );
+    }
+
+    // Re-attach the field's directives + type hint to the outermost call.
+    current.directives = directives;
+    current.type_hint = type_hint;
+    Ok(current)
+}
+
 fn anon_dict_return_plan(
     sig: &MainSignature,
     root: &Node,
@@ -7451,6 +7602,24 @@ fn lower_dict_into_record(
         let field_range = def.fields[idx].value_range;
         // Lower the value expression (user-supplied or schema default).
         if let Some(user_value) = user_values.get(canonical_field.name.as_str()) {
+            // Wave R11: a field decorator on a branded `-> Schema` return
+            // field is not yet desugared on the compiled path (only the
+            // anon-Dict-return surface is). Cap loudly rather than lower
+            // the raw value and silently drop the decorator transform —
+            // that would diverge from the tree-walk oracle.
+            if !user_value.decorators.is_empty() {
+                return Err(cap!(
+                    "lower_dict_into_record.unsupported_field_type.3",
+                    LoweringError::UnsupportedFieldType {
+                        schema: schema.name.clone(),
+                        field: canonical_field.name.clone(),
+                        ty: "field decorator on a branded `-> Schema` return field is not yet \
+                             lowered (only anon-Dict-return field decorators desugar today)"
+                            .to_string(),
+                        range: user_value.range,
+                    }
+                ));
+            }
             lower_dict_field_value(schema, idx, user_value, user_value.range, ctx)?;
         } else {
             // Schema default. Re-bind `#main` params; let-scope is
