@@ -360,10 +360,34 @@ pub fn decode_object_return(
     if single_value_wrapper {
         let field = &return_schema.fields[0];
         read_object_field(backend, &reader, field, return_schema)
+    } else if return_schema.is_tuple {
+        // Wave T2: a tuple schema is laid out and verified exactly like any
+        // other record, but it decodes **positionally** to a `Value::List`
+        // (declaration-order slots, no field names) so the JSON projection
+        // is an array — byte-identical to the tree-walk oracle's
+        // `Value::List`, not a branded object.
+        read_tuple_record_into_list(backend, &reader, return_schema)
     } else {
         let map = read_object_record_into_map(backend, &reader, return_schema)?;
         Ok(Value::branded_dict(map, Some(return_schema.name.clone())))
     }
+}
+
+/// Wave T2: drain a tuple schema's fields in declaration order into a
+/// positional `Value::List`. The slot readers are the same
+/// [`read_object_field`] arms a branded record uses; only the container
+/// shape differs (ordered list vs named map), which is exactly the
+/// tuple-vs-record decode fork.
+fn read_tuple_record_into_list(
+    backend: &str,
+    reader: &BufferReader<'_>,
+    schema: &Schema,
+) -> Result<Value, RuntimeError> {
+    let mut items = Vec::with_capacity(schema.fields.len());
+    for field in &schema.fields {
+        items.push(read_object_field(backend, reader, field, schema)?);
+    }
+    Ok(Value::List(Arc::new(items)))
 }
 
 /// Drain every field of `schema` from the object record `reader` into a

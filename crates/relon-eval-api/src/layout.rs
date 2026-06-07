@@ -531,6 +531,7 @@ mod tests {
         let schema = Schema {
             name: "Trio".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![
                 field("a", TypeRepr::Int),
                 field("b", TypeRepr::Int),
@@ -552,6 +553,7 @@ mod tests {
         let schema = Schema {
             name: "Pair".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![field("score", TypeRepr::Int), field("flag", TypeRepr::Bool)],
         };
         let table = SchemaLayout::offsets_for(&schema).expect("layout");
@@ -569,6 +571,7 @@ mod tests {
         let schema = Schema {
             name: "Pair".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![field("flag", TypeRepr::Bool), field("score", TypeRepr::Int)],
         };
         let table = SchemaLayout::offsets_for(&schema).expect("layout");
@@ -585,6 +588,7 @@ mod tests {
         let schema = Schema {
             name: "Flags".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![
                 field("a", TypeRepr::Bool),
                 field("b", TypeRepr::Bool),
@@ -604,6 +608,7 @@ mod tests {
         let schema = Schema {
             name: "Unit".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![],
         };
         let table = SchemaLayout::offsets_for(&schema).expect("layout");
@@ -620,6 +625,7 @@ mod tests {
         let schema = Schema {
             name: "Greet".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![field("name", TypeRepr::String)],
         };
         let table = SchemaLayout::offsets_for(&schema).expect("layout");
@@ -643,6 +649,7 @@ mod tests {
         let schema = Schema {
             name: "Nums".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![field(
                 "nums",
                 TypeRepr::List {
@@ -669,6 +676,7 @@ mod tests {
         let schema = Schema {
             name: "Names".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![field(
                 "names",
                 TypeRepr::List {
@@ -695,6 +703,7 @@ mod tests {
         let schema = Schema {
             name: "Speeds".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![field(
                 "xs",
                 TypeRepr::List {
@@ -721,6 +730,7 @@ mod tests {
         let schema = Schema {
             name: "Flags".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![field(
                 "xs",
                 TypeRepr::List {
@@ -750,6 +760,7 @@ mod tests {
         let schema = Schema {
             name: "Nested".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![field(
                 "xs",
                 TypeRepr::List {
@@ -774,6 +785,7 @@ mod tests {
         let schema = Schema {
             name: "Nested".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![field(
                 "xs",
                 TypeRepr::List {
@@ -799,6 +811,7 @@ mod tests {
         let schema = Schema {
             name: "Nested".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![field(
                 "xs",
                 TypeRepr::List {
@@ -825,11 +838,13 @@ mod tests {
         let inner = Schema {
             name: "Inner".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![field("v", TypeRepr::Int)],
         };
         let schema = Schema {
             name: "Outer".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![field(
                 "xs",
                 TypeRepr::List {
@@ -853,6 +868,7 @@ mod tests {
         let schema = Schema {
             name: "Mixed".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![field("name", TypeRepr::String), field("age", TypeRepr::Int)],
         };
         let table = SchemaLayout::offsets_for(&schema).expect("layout");
@@ -870,6 +886,7 @@ mod tests {
         let schema = Schema {
             name: "Sentinel".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![field("nil", TypeRepr::Null)],
         };
         let table = SchemaLayout::offsets_for(&schema).expect("layout");
@@ -885,6 +902,7 @@ mod tests {
         let schema = Schema {
             name: "Phys".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![
                 field("flag", TypeRepr::Bool),
                 field("mass", TypeRepr::Float),

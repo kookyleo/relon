@@ -216,6 +216,32 @@ pub const LEDGER: &[LedgerEntry] = &[
         reason: "#main param/return type outside the buffer-protocol decode envelope",
     },
     LedgerEntry {
+        id: "return_tuple_canonical.unsupported_type_in_main",
+        site: "lowering/mod.rs::return_tuple_canonical",
+        category: Category::MainSignatureType,
+        status: Status::Capped,
+        corpus: "",
+        reason: "Tuple<...> return element outside the T2 first cut (nested tuple / List<...> \
+                 element / Null) — capped pending the cross-region tuple-element work",
+    },
+    LedgerEntry {
+        id: "lower_tuple_return.unsupported_expr",
+        site: "lowering/mod.rs::lower_tuple_return / lower_tuple_into_record",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "tuple-return body is not a tuple literal, or a tuple element lowered to a \
+                 type the positional slot cannot store",
+    },
+    LedgerEntry {
+        id: "lower_tuple_return.arity_mismatch",
+        site: "lowering/mod.rs::lower_tuple_return",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "tuple literal arity differs from the declared Tuple<...> return arity",
+    },
+    LedgerEntry {
         id: "desugar_field_decorators.unsupported_expr.1",
         site: "lowering/mod.rs::desugar_field_decorators",
         category: Category::ExprShape,
@@ -2121,6 +2147,23 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         corpus: "dict_simple_return",
         status: Status::Covered,
         proof: "tree-walk + cranelift + bytecode (schema-rooted, NOT a Dict param/literal)",
+    },
+    // ---- Wave T2: tuple return (anonymous positional record) ----
+    SurfaceEntry {
+        construct: "tuple return of scalars (Tuple<Int, String, Bool>) → JSON array",
+        wave: "T2",
+        corpus: "tuple_scalar_return",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (TW_CR; wasm + llvm-native legs proven four-way in \
+                relon-codegen-llvm::tuple_return_four_way)",
+    },
+    SurfaceEntry {
+        construct: "tuple return all-inline scalars (Tuple<Int, Int>) → JSON array",
+        wave: "T2",
+        corpus: "tuple_int_pair_return",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (TW_CR; wasm + llvm-native legs proven four-way in \
+                relon-codegen-llvm::tuple_return_four_way)",
     },
     // ---- backward static sibling/root field reference ----
     SurfaceEntry {

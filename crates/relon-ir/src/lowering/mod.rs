@@ -755,6 +755,21 @@ fn lower_entry_with_resolver<'a>(
     // resolver before delegating.
     let user_return_schema = resolve_return_user_schema(sig.return_type.as_ref(), &resolver)?;
 
+    // Wave T2: a `#main(...) -> Tuple<...>` return synthesises an
+    // anonymous positional-record schema. It reuses the whole record /
+    // return ABI (alloc root record + per-element `StoreFieldAtRecord`,
+    // host object-return decode + verifier) — the only fork is that the
+    // host decodes it positionally to a JSON array (`is_tuple`). An
+    // out-of-surface element type is a loud cap here, not a silent
+    // mis-encode.
+    let tuple_return_schema: Option<Schema> = match sig.return_type.as_ref() {
+        Some(rt) => match return_tuple_canonical(rt) {
+            Some(res) => Some(res?),
+            None => None,
+        },
+        None => None,
+    };
+
     // Phase F.2 (W7 anon-Dict-return): `#main(...) -> Dict { ... }`
     // synthesises an anonymous return schema by per-field inference
     // over the dict literal. Closure-typed fields are lifted to
@@ -769,13 +784,14 @@ fn lower_entry_with_resolver<'a>(
     // original `root` is used unchanged. Only the anon-Dict path is
     // rewritten here; a branded `-> Schema` return rejects field
     // decorators in `lower_dict_field_value` (loud cap, not silent).
-    let desugared_root: Option<Node> = if user_return_schema.is_none() {
-        desugar_anon_dict_decorators(root)?
-    } else {
-        None
-    };
+    let desugared_root: Option<Node> =
+        if user_return_schema.is_none() && tuple_return_schema.is_none() {
+            desugar_anon_dict_decorators(root)?
+        } else {
+            None
+        };
     let anon_dict_root: &Node = desugared_root.as_ref().unwrap_or(root);
-    let anon_dict_plan = if user_return_schema.is_none() {
+    let anon_dict_plan = if user_return_schema.is_none() && tuple_return_schema.is_none() {
         anon_dict_return_plan(sig, anon_dict_root, &resolver)?
     } else {
         None
@@ -791,6 +807,11 @@ fn lower_entry_with_resolver<'a>(
         // `BufferReader::new(...)` it would use for a hand-built dict
         // input. No `value` wrapping.
         user_schema.clone()
+    } else if let Some(ref tuple_schema) = tuple_return_schema {
+        // Wave T2: the tuple return lays the positional record directly
+        // into the fixed area (no `value` wrapping), exactly like a
+        // branded-dict return — only the host decode forks to an array.
+        tuple_schema.clone()
     } else if let Some(ref plan) = anon_dict_plan {
         plan.schema.clone()
     } else {
@@ -876,6 +897,55 @@ fn lower_entry_with_resolver<'a>(
             &return_layout,
             dict_pairs,
             root.range,
+            record_local,
+            &mut ctx,
+        )?;
+    } else if let Some(ref tuple_schema) = tuple_return_schema {
+        // Wave T2: tuple-return path. The body must be a tuple literal
+        // (`Expr::Tuple`) whose arity matches the declared `Tuple<...>`.
+        // Allocate the root record, then lower + store each element into
+        // its positional slot per the element's canonical type — the same
+        // `AllocRootRecord` + `StoreFieldAtRecord` shape the branded-dict
+        // return uses, so the backends and verifier are reused unchanged.
+        let elements = match &*root.expr {
+            Expr::Tuple(elems) => elems.as_slice(),
+            _ => {
+                return Err(cap!(
+                    "lower_tuple_return.unsupported_expr",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "Body-of-tuple-#main must be a tuple literal `(...)`, got `{}`",
+                            root.expr.kind()
+                        ),
+                        range: root.range,
+                    }
+                ));
+            }
+        };
+        if elements.len() != tuple_schema.fields.len() {
+            return Err(cap!(
+                "lower_tuple_return.arity_mismatch",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "tuple body has {} elements but `Tuple<...>` return declares {}",
+                        elements.len(),
+                        tuple_schema.fields.len()
+                    ),
+                    range: root.range,
+                }
+            ));
+        }
+        let record_local = ctx.alloc_record_local();
+        ctx.out.push(TaggedOp {
+            op: Op::AllocRootRecord {
+                record_local_idx: record_local,
+            },
+            range: root.range,
+        });
+        lower_tuple_into_record(
+            tuple_schema,
+            &return_layout,
+            elements,
             record_local,
             &mut ctx,
         )?;
@@ -1149,6 +1219,7 @@ fn build_main_params_schema(
         name: MAIN_PARAMS_SCHEMA_NAME.to_string(),
         generics: vec![],
         fields,
+        is_tuple: false,
     })
 }
 
@@ -1259,6 +1330,7 @@ fn build_main_return_schema(
     Ok(Schema {
         name: MAIN_RETURN_SCHEMA_NAME.to_string(),
         generics: vec![],
+        is_tuple: false,
         fields: vec![Field {
             name: RETURN_VALUE_FIELD_NAME.to_string(),
             ty,
@@ -1750,6 +1822,7 @@ fn anon_dict_return_plan(
         name: MAIN_RETURN_SCHEMA_NAME.to_string(),
         generics: vec![],
         fields: schema_fields,
+        is_tuple: false,
     };
     Ok(Some(AnonDictPlan { schema, fields }))
 }
@@ -2552,6 +2625,55 @@ fn lower_anon_dict_body(
     }
 
     Ok(())
+}
+
+/// Wave T2: name reserved for the synthesised anonymous positional-record
+/// schema a `Tuple<...>` lowers to. Distinct from `MainParams` / `Ret` so
+/// the backends and the host decode never confuse a tuple record with a
+/// scalar-wrapper or branded return.
+pub const TUPLE_RETURN_SCHEMA_NAME: &str = "Tuple";
+
+/// Wave T2: canonicalise a `Tuple<T0, T1, ...>` return type node to a
+/// tuple [`Schema`] (an anonymous positional record). First cut: every
+/// element must be a scalar (`Int` / `Float` / `Bool` / `String`) so the
+/// whole record/return ABI + verifier is reused and the four-way decode
+/// is byte-provable. Heterogeneous elements are allowed (that is the
+/// point of a tuple). Nested tuples and pointer-array list elements
+/// (`List<...>`) are deferred — they stay a loud `UnsupportedTypeInMain`
+/// cap at the call site so no shape silently mis-encodes.
+///
+/// Returns `None` when the head is not `Tuple` (so the caller falls
+/// through to the other return canonicalisers), and `Some(Err(..))` when
+/// the head IS `Tuple` but an element type is out of the first-cut
+/// surface (a loud cap rather than a silent miscompile).
+#[allow(clippy::type_complexity)]
+fn return_tuple_canonical(t: &TypeNode) -> Option<Result<Schema, LoweringError>> {
+    if t.path.len() != 1 || t.path[0].as_str() != "Tuple" || t.variant_fields.is_some() {
+        return None;
+    }
+    let mut elements = Vec::with_capacity(t.generics.len());
+    for g in &t.generics {
+        let elem = match type_node_to_canonical(g) {
+            Some(e @ (TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool | TypeRepr::String)) => e,
+            // Out of first-cut surface: nested tuple, List<...>, Null,
+            // Option/Result, or an unresolved head. Cap loudly.
+            _ => {
+                return Some(Err(cap!(
+                    "return_tuple_canonical.unsupported_type_in_main",
+                    LoweringError::UnsupportedTypeInMain {
+                        type_name: format!(
+                            "Tuple element `{}` — T2 lowers tuples of scalars \
+                             (Int/Float/Bool/String); nested tuples / list elements are capped",
+                            type_head_for_display(g)
+                        ),
+                        range: g.range,
+                    }
+                )));
+            }
+        };
+        elements.push(elem);
+    }
+    Some(Ok(Schema::tuple(TUPLE_RETURN_SCHEMA_NAME, elements)))
 }
 
 /// Map a parser [`TypeNode`] to a canonical [`TypeRepr`].
@@ -7196,6 +7318,7 @@ fn canonical_schema_from_def<'a>(
         name: name.to_string(),
         generics: def.generics.clone(),
         fields,
+        is_tuple: false,
     })
 }
 
@@ -7803,6 +7926,101 @@ fn lower_dict_into_record(
     let new_len = ctx.lets.len().saturating_sub(drop_count);
     ctx.lets.truncate(new_len);
 
+    Ok(())
+}
+
+/// Wave T2: lower the elements of a tuple literal into a positional
+/// record. `tuple_schema` is the synthesised anonymous positional-record
+/// schema (`is_tuple == true`); `layout` is its offset table; `elements`
+/// are the source-level element expressions in declaration order (arity
+/// already validated by the caller).
+///
+/// Each element is lowered like a branded-dict field of the matching
+/// canonical type: scalars (`Int` / `Float` / `Bool`) land inline; a
+/// `String` element is materialised to an absolute address then copied
+/// into the tail area via `EmitTailRecordFromAbsoluteAddr`, leaving an
+/// i32 buffer-relative pointer for the slot store — byte-identical to the
+/// branded-record path, so the host object-return decode + verifier read
+/// it back unchanged (only the final container shape forks to an array).
+fn lower_tuple_into_record(
+    tuple_schema: &Schema,
+    layout: &OffsetTable,
+    elements: &[Node],
+    record_local: u32,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    for (idx, element) in elements.iter().enumerate() {
+        let canonical_field = &tuple_schema.fields[idx];
+        let layout_field = &layout.fields[idx];
+        debug_assert_eq!(layout_field.name, canonical_field.name);
+
+        // Lower the element value. For a `String` element materialise the
+        // tail record (absolute addr -> tail copy -> i32 buffer offset);
+        // scalars lower directly to their inline value.
+        match &canonical_field.ty {
+            TypeRepr::String => {
+                lower_expr(&element.expr, element.range, ctx)?;
+                let popped = ctx.tstack.pop().ok_or_else(|| {
+                    cap!(
+                        "lower_tuple_return.unsupported_expr",
+                        LoweringError::UnsupportedExpr {
+                            kind: format!("tuple element {idx} produced no value"),
+                            range: element.range,
+                        }
+                    )
+                })?;
+                if popped != IrType::String {
+                    return Err(cap!(
+                        "lower_tuple_return.unsupported_expr",
+                        LoweringError::UnsupportedExpr {
+                            kind: format!("tuple element {idx} expected String, got {popped:?}"),
+                            range: element.range,
+                        }
+                    ));
+                }
+                ctx.out.push(TaggedOp {
+                    op: Op::EmitTailRecordFromAbsoluteAddr { ty: IrType::String },
+                    range: element.range,
+                });
+                ctx.tstack.push(IrType::I32);
+            }
+            _ => {
+                lower_expr(&element.expr, element.range, ctx)?;
+            }
+        }
+
+        let ir_ty = type_repr_to_ir_type_dict(&canonical_field.ty);
+        let store_ty = match layout_field.kind {
+            FieldKind::Inline { .. } => ir_ty,
+            FieldKind::PointerIndirect { .. } => IrType::I32,
+        };
+        let top = ctx.tstack.pop().ok_or_else(|| {
+            cap!(
+                "lower_tuple_return.unsupported_expr",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("tuple element {idx} produced no value"),
+                    range: element.range,
+                }
+            )
+        })?;
+        if top.wasm_slot() != store_ty.wasm_slot() {
+            return Err(cap!(
+                "lower_tuple_return.unsupported_expr",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("tuple element {idx}: got {top:?}, expected {store_ty:?}"),
+                    range: element.range,
+                }
+            ));
+        }
+        ctx.out.push(TaggedOp {
+            op: Op::StoreFieldAtRecord {
+                record_local_idx: record_local,
+                offset: layout_field.offset as u32,
+                ty: store_ty,
+            },
+            range: element.range,
+        });
+    }
     Ok(())
 }
 
@@ -10093,6 +10311,7 @@ mod w7_closure_boundary_tests {
         let wrap = |ty: TypeRepr| Schema {
             name: "Probe".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![Field {
                 name: "f".into(),
                 ty,
@@ -10135,6 +10354,7 @@ mod w7_closure_boundary_tests {
         let schema = Schema {
             name: "ProbeWithClosure".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![Field {
                 name: "fib".into(),
                 ty: TypeRepr::Closure {

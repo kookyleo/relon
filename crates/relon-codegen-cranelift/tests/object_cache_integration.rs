@@ -354,6 +354,7 @@ fn schema_sidecar_bound_to_object_hash() {
         main_schema: Schema {
             name: "M".into(),
             generics: Vec::new(),
+            is_tuple: false,
             fields: vec![Field {
                 name: "x".into(),
                 ty: TypeRepr::Int,
@@ -363,6 +364,7 @@ fn schema_sidecar_bound_to_object_hash() {
         return_schema: Schema {
             name: "R".into(),
             generics: Vec::new(),
+            is_tuple: false,
             fields: vec![Field {
                 name: "v".into(),
                 ty: TypeRepr::Int,

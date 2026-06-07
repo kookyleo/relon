@@ -78,6 +78,7 @@ pub fn lower_schema_def(def: &SchemaDef, fallback_name: &str) -> Result<Schema, 
             .unwrap_or_else(|| fallback_name.to_string()),
         generics: def.generics.clone(),
         fields,
+        is_tuple: false,
     })
 }
 

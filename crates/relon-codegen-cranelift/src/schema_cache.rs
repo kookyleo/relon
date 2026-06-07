@@ -303,6 +303,7 @@ mod tests {
 
     fn sample_entry() -> SchemaCacheEntry {
         let main = Schema {
+            is_tuple: false,
             name: "MainArgs".into(),
             generics: Vec::new(),
             fields: vec![Field {
@@ -312,6 +313,7 @@ mod tests {
             }],
         };
         let ret = Schema {
+            is_tuple: false,
             name: "MainReturn".into(),
             generics: Vec::new(),
             fields: vec![Field {
