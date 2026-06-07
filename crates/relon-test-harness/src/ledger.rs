@@ -681,6 +681,16 @@ pub const LEDGER: &[LedgerEntry] = &[
         reason: "method/function name + arity matches no stdlib signature",
     },
     LedgerEntry {
+        id: "lower_fn_call.split_empty_separator",
+        site: "lowering/mod.rs::lower_fn_call",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "String.split separator is not a provably non-empty string literal; \
+                 the tree-walk oracle errors on an empty separator (never a value), so \
+                 only a non-empty literal separator lowers byte-equal four-way (Wave R15)",
+    },
+    LedgerEntry {
         id: "lower_fn_call.unsupported_expr.5",
         site: "lowering/mod.rs::lower_fn_call",
         category: Category::ExprShape,
@@ -2075,6 +2085,26 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         corpus: "r9_is_uuid_nonhex",
         status: Status::Covered,
         proof: "tree-walk + cranelift",
+    },
+    // ---- Wave R15: `split(String, sep) -> List<String>` ----
+    SurfaceEntry {
+        construct: "String split on non-empty literal separator (List<String>, \
+                    data-dependent count)",
+        wave: "R15",
+        corpus: "r15_split_basic",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift; wasm/llvm-native four-way in \
+                relon-codegen-llvm::inplace_return_four_way::r15_split_*",
+    },
+    SurfaceEntry {
+        construct: "String split edges (empty input / leading / trailing / \
+                    consecutive / no-match / multi-char / utf-8)",
+        wave: "R15",
+        corpus: "r15_split_consecutive_empty",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift; wasm/llvm-native four-way in \
+                relon-codegen-llvm::inplace_return_four_way::r15_split_*. \
+                Empty separator stays capped (oracle errors, no value to match).",
     },
     // ---- str concat fold (Op::StrConcatN) ----
     SurfaceEntry {

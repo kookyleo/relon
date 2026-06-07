@@ -989,7 +989,9 @@ pub fn all_cases() -> Vec<CorpusCase> {
         // empty string, no-match / overlap / empty-`from` / grow replace.
         // `trim` / `trim_start` / `trim_end` stay capped (UTF-8 decode
         // seam unsupported on LLVM-native / wasm — see the `string_ops`
-        // module docs); `matches` (regex) and `split` (List<String>) too.
+        // module docs); `matches` (regex) stays capped too. `split`
+        // (List<String>) is lowered four-way as of Wave R15 (see the
+        // `r15_split_*` cases below) for a non-empty literal separator.
         CorpusCase {
             name: "r8_len",
             source: "#main() -> Int\nlen(\"hello\")",
@@ -1101,6 +1103,46 @@ pub fn all_cases() -> Vec<CorpusCase> {
             source: "#main() -> Bool\nis_uuid(\"1234567g-1234-1234-1234-123456789012\")",
             args_factory: no_args,
             tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        // ---- Wave R15: `split(String, sep) -> List<String>`. The bundled
+        //      `split` body scans the input twice (count segments, then
+        //      emit) and builds the result as a `List<String>` pointer-array
+        //      record (`[count][off_i]…`, 4-byte slots) in scratch — every
+        //      slot an arena-relative handle to an independently allocated
+        //      segment String record `[len][utf8]` — returned via the
+        //      in-place region-walk ABI (no relocation, byte-equal to the
+        //      tree-walk `_string_split`). The full four-way (incl. wasm)
+        //      proof lives in `relon-codegen-llvm::inplace_return_four_way::
+        //      r15_split_*`; these corpus rows ride `TW_CR`. The empty
+        //      separator stays capped: the tree-walk oracle errors on it
+        //      rather than producing a value (see `string_ops::split_string`).
+        CorpusCase {
+            name: "r15_split_basic",
+            source: "#main() -> List<String>\n\"a,b,c\".split(\",\")",
+            args_factory: no_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r15_split_consecutive_empty",
+            source: "#main() -> List<String>\n\"a,,b\".split(\",\")",
+            args_factory: no_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r15_split_no_match",
+            source: "#main() -> List<String>\n\"abc\".split(\",\")",
+            args_factory: no_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r15_split_multichar",
+            source: "#main() -> List<String>\n\"a--b--c\".split(\"--\")",
+            args_factory: no_args,
+            tier: Tier::StdlibList,
             supported_by: TW_CR,
         },
         // ---- StdlibNormalize: most complex ----

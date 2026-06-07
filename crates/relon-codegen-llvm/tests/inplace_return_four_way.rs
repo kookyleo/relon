@@ -548,6 +548,100 @@ fn r13_int_to_string_fstring_longer() {
 }
 
 // ====================================================================
+// Wave R15: `s.split(sep)` -> List<String> (data-dependent count).
+//
+// The body scans the input twice (count segments, then emit), building a
+// fresh scratch `List<String>` pointer-array whose every slot points at an
+// independently arena-allocated segment String record `[len][utf8]` — the
+// same self-contained single-arena invariant the R13 scratch results
+// satisfy, so it returns in place through the `relon_eval_api::inplace_return`
+// decoder. The receiver is a `#main` String param (runtime-sourced), the
+// separator a non-empty string literal (the only shape that lowers — an
+// empty separator stays capped because the tree-walk oracle errors on it).
+// Edges: empty input (`[""]`), no-match (whole string), leading / trailing
+// / consecutive cuts (empty segments), multi-char and UTF-8.
+// ====================================================================
+
+const SRC_R15_SPLIT_COMMA: &str = "#main(String s) -> List<String>\ns.split(\",\")";
+
+#[test]
+fn r15_split_basic() {
+    assert_four_way(
+        SRC_R15_SPLIT_COMMA,
+        args1("s", Value::String("a,b,c".into())),
+    );
+}
+
+#[test]
+fn r15_split_empty_input() {
+    // `"".split(",")` ⇒ `[""]`: one empty segment record `[0]`.
+    assert_four_way(SRC_R15_SPLIT_COMMA, args1("s", Value::String("".into())));
+}
+
+#[test]
+fn r15_split_no_match() {
+    // No delimiter present ⇒ the whole string as a single element.
+    assert_four_way(SRC_R15_SPLIT_COMMA, args1("s", Value::String("abc".into())));
+}
+
+#[test]
+fn r15_split_trailing_delim() {
+    // `"a,"` ⇒ `["a", ""]`: a trailing empty segment.
+    assert_four_way(SRC_R15_SPLIT_COMMA, args1("s", Value::String("a,".into())));
+}
+
+#[test]
+fn r15_split_leading_delim() {
+    // `",a"` ⇒ `["", "a"]`: a leading empty segment.
+    assert_four_way(SRC_R15_SPLIT_COMMA, args1("s", Value::String(",a".into())));
+}
+
+#[test]
+fn r15_split_consecutive_delims() {
+    // `"a,,b"` ⇒ `["a", "", "b"]`: a middle empty segment.
+    assert_four_way(
+        SRC_R15_SPLIT_COMMA,
+        args1("s", Value::String("a,,b".into())),
+    );
+}
+
+#[test]
+fn r15_split_only_delims() {
+    // `",,"` ⇒ `["", "", ""]`: three empty segments.
+    assert_four_way(SRC_R15_SPLIT_COMMA, args1("s", Value::String(",,".into())));
+}
+
+#[test]
+fn r15_split_utf8() {
+    // Multi-byte segments survive byte-for-byte through the scratch copy.
+    assert_four_way(
+        SRC_R15_SPLIT_COMMA,
+        args1("s", Value::String("café,déjà".into())),
+    );
+}
+
+// Multi-char (multi-byte at the match site) separator: every cut skips
+// `sep.len()` bytes, not one.
+const SRC_R15_SPLIT_MULTICHAR: &str = "#main(String s) -> List<String>\ns.split(\"--\")";
+
+#[test]
+fn r15_split_multichar_delim() {
+    assert_four_way(
+        SRC_R15_SPLIT_MULTICHAR,
+        args1("s", Value::String("a--b--c".into())),
+    );
+}
+
+#[test]
+fn r15_split_multichar_partial_no_split() {
+    // A lone `-` is not the `--` separator, so it stays inside a segment.
+    assert_four_way(
+        SRC_R15_SPLIT_MULTICHAR,
+        args1("s", Value::String("a-b--c-".into())),
+    );
+}
+
+// ====================================================================
 // Shape 3: List<Schema> parameter-identity
 // ====================================================================
 

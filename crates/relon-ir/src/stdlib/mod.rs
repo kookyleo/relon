@@ -319,12 +319,13 @@ mod glob_match_index_tests {
     /// `map` family at indices 44..46; Wave R7 appended the scalar Float
     /// math bodies at indices 47..51; Wave R8 appended the byte-level
     /// string ops (`len` / `ends_with` / `replace`) at indices 52..54;
-    /// Wave R9 appended the Bool `is_uuid` validator at index 55 — all at
-    /// the tail so every position-pinned index above stays put.
+    /// Wave R9 appended the Bool `is_uuid` validator at index 55; Wave R15
+    /// appended `split` -> List<String> at index 56 — all at the tail so
+    /// every position-pinned index above stays put.
     /// Pinning the count catches accidental double-registrations.
     #[test]
-    fn bundle_has_56_entries() {
-        assert_eq!(stdlib_function_count(), 56);
+    fn bundle_has_57_entries() {
+        assert_eq!(stdlib_function_count(), 57);
         assert_eq!(stdlib_function_index("glob_match"), Some(37));
         assert_eq!(stdlib_function_index("list_list_length"), Some(38));
         // Wave R3b tail appends (order-pinned wire format).
@@ -349,6 +350,8 @@ mod glob_match_index_tests {
         assert_eq!(stdlib_function_index("replace"), Some(54));
         // Wave R9 tail append (Bool validator).
         assert_eq!(stdlib_function_index("is_uuid"), Some(55));
+        // Wave R15 tail append (`split` -> List<String>).
+        assert_eq!(stdlib_function_index("split"), Some(56));
     }
 }
 

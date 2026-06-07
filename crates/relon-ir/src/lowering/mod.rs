@@ -981,6 +981,13 @@ fn lower_entry_with_resolver<'a>(
         let is_inplace_string_hof =
             ret_ir_ty == IrType::ListString && string_result_list_hof_call(&root.expr);
         let is_inplace_param_walk = is_inplace_param_walk || is_inplace_string_hof;
+        // Wave R15: `s.split(sep)` builds a self-contained scratch
+        // `List<String>` pointer-array (per-segment String records, each
+        // independently arena-allocated — same single-arena invariant as the
+        // R3c String-result HOF results), so it returns in place through the
+        // same `inplace_return` decoder rather than the rigid-block copy.
+        let is_inplace_split = ret_ir_ty == IrType::ListString && string_split_call(&root.expr);
+        let is_inplace_param_walk = is_inplace_param_walk || is_inplace_split;
         if pointer_array_list_ir_type(ret_ir_ty)
             && !pointer_array_list_source_is_const_pool(&root.expr)
             && !is_inplace_param_walk
@@ -2804,6 +2811,30 @@ fn string_result_list_hof_call(expr: &Expr) -> bool {
     )
 }
 
+/// Wave R15: true when `expr` is a `split` call on a String receiver
+/// (`s.split(sep)`) that, with a `List<String>` declared `#main` return,
+/// lowers to the `split` bundled body. That body builds the result
+/// `List<String>` pointer-array record (header + per-segment String
+/// records) entirely in the **scratch** region; every `off_i` slot is an
+/// arena-absolute handle to a self-contained segment record, so the
+/// result qualifies for the in-place region-walk return ABI exactly like
+/// the R3c String-result HOF results (see [`string_result_list_hof_call`]).
+///
+/// The free-call wrapper `_string_split(s, sep)` is a tree-walk-only
+/// surface (it routes through the evaluator's `std/string` module, not a
+/// lowered free-call body), so only the method form reaches here. Caller
+/// gates this on `ret_ir_ty == IrType::ListString`, which a `String`
+/// receiver's `split` always produces.
+fn string_split_call(expr: &Expr) -> bool {
+    let Expr::FnCall { path, .. } = expr else {
+        return false;
+    };
+    matches!(
+        path.last(),
+        Some(TokenKey::String(m, _, _)) if m == "split"
+    )
+}
+
 /// F4: detect a two-segment `#main` parameter **field** walk (`o.tags`
 /// where `o: Outer` is a schema-typed param and `tags: List<…>` is a
 /// pointer-array list field), returning the field's canonical `TypeRepr`
@@ -4478,6 +4509,34 @@ fn lower_fn_call(
             LoweringError::UnknownStdlibMethod {
                 name: method_name.to_string(),
                 arity,
+                range,
+            }
+        ));
+    }
+    // Wave R15: `s.split(sep)` is only sound to lower when the separator
+    // is a provably non-empty String literal. The tree-walk oracle
+    // *errors* on an empty separator (`UnsupportedOperator`, never a
+    // value), and the byte-level `split` body cannot portably reproduce
+    // that error (an empty separator would match at every byte position,
+    // diverging from the oracle). Rather than emit a non-portable
+    // `Op::Trap`, cap every case we cannot prove non-empty at lowering: a
+    // non-literal separator (parameter / load / call) and the empty
+    // literal both stay capped. The dominant `","` / `"--"` literal form
+    // lowers four-way.
+    if method_name == "split"
+        && receiver_ty == IrType::String
+        && !matches!(
+            args.first().map(|a| &*a.value.expr),
+            Some(Expr::String(s)) if !s.is_empty()
+        )
+    {
+        return Err(cap!(
+            "lower_fn_call.split_empty_separator",
+            LoweringError::UnsupportedExpr {
+                kind: "String.split with a separator that is not a non-empty string literal — the \
+                     tree-walk oracle errors on an empty separator, so only a provably non-empty \
+                     literal separator lowers byte-equal four-way"
+                    .to_string(),
                 range,
             }
         ));
