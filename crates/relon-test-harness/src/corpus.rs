@@ -1172,6 +1172,24 @@ pub fn all_cases() -> Vec<CorpusCase> {
             tier: Tier::DictReturn,
             supported_by: TW_CR,
         },
+        // ---- Wave R10b: STRICT-mode `&sibling` / `&root` derivation ----
+        // Same backward `&sibling.x` / `&root.x` chain as `r10_sibling_chain`
+        // but WITHOUT the `#relaxed` directive. R10b taught the strict-mode
+        // analyzer to derive a single-segment, backward `&sibling.<name>` /
+        // entry-level `&root.<name>` reference's type from the target
+        // sibling/root field's static type (`relon-analyzer`'s
+        // `infer::infer_reference`), so the same program now passes strict
+        // analysis. The lowering is unchanged (R10 already handles the
+        // backward field-let graph), so this proves the strict path runs
+        // byte-equal four-way. `Int` Dict return ⇒ `TW_CR` (bytecode VM and
+        // trace recipes don't model anon-Dict construction).
+        CorpusCase {
+            name: "r10b_strict_sibling_chain",
+            source: "#main(Int a, Int b) -> Dict\n{ x: a + b, y: &sibling.x * 2, z: &root.x + &sibling.y }",
+            args_factory: args_x_17_y_5,
+            tier: Tier::DictReturn,
+            supported_by: TW_CR,
+        },
         // ---- Wave R11: field decorators on the anon-Dict-return path ----
         // A decorated field `@deco(args) k: v` desugars to the call
         // `deco(v, args)` — the decorated value is the FIRST positional

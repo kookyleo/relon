@@ -276,6 +276,15 @@ impl ScopeFrame {
     pub(crate) fn might_dynamically_bind(&self, name: &str) -> bool {
         self.has_dynamic_spread || self.closure_params.contains_key(name)
     }
+
+    /// True for the synthetic `#main(...)` parameter frame: it carries
+    /// no real dict `fields`, only `closure_params` (the params, whose
+    /// types live on `closure_param_types`). `&root` resolution skips
+    /// such a frame so it lands on the document-root dict rather than
+    /// the param frame that sits below it on the stack.
+    pub(crate) fn is_main_param_frame(&self) -> bool {
+        self.fields.is_empty() && !self.closure_params.is_empty()
+    }
 }
 
 struct Walker<'a> {

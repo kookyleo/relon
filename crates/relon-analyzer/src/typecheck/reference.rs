@@ -30,6 +30,42 @@ use relon_parser::{Expr, Node, RefBase, TokenKey};
 impl<'a> Walker<'a> {
     pub(super) fn check_unresolved_ref(&mut self, node: &Node, base: &RefBase, path: &[TokenKey]) {
         if self.tree.references.contains_key(&node.id) {
+            // R10b: a single-segment, *backward* `&sibling.<name>` /
+            // entry-level `&root.<name>` derives its type from the target
+            // sibling/root field's static type (`infer::infer_reference`,
+            // which carries the base / single-segment / backward / cycle
+            // guards). When that derivation produces a concrete type, the
+            // reference is statically known — accept it and skip the
+            // base-blind strict-path walk that would otherwise refuse a
+            // context-dependent target value (`x: a + b`).
+            //
+            // When `infer_reference` declines (forward / self ref,
+            // multi-segment, `&uncle` / `&this`, or a target whose value
+            // genuinely can't be derived), we deliberately DON'T hard-
+            // reject here — we fall through to the unchanged
+            // `check_strict_path`, preserving the pre-R10b behavior:
+            // forward refs to a self-contained (e.g. literal) target stay
+            // accepted (they run fine on tree-walk), while a forward ref
+            // whose target value needs the enclosing scope still surfaces
+            // `UnknownReferenceType` through the frame-reset lookup. So
+            // R10b strictly *adds* derivable cases; it removes none.
+            if self.tree.strict_mode
+                && matches!(base, RefBase::Sibling | RefBase::Root)
+                && matches!(path, [TokenKey::String(_, _, _)])
+            {
+                let derived = {
+                    let scope = self.build_type_scope();
+                    infer::infer_type(node, &scope)
+                };
+                if matches!(&derived, Some(t) if !matches!(t, InferredType::Any)) {
+                    // Concrete backward derivation — accept. The tail walk
+                    // is a no-op for a single segment but keeps shape
+                    // parity with the general path.
+                    self.check_path_tail(node, path);
+                    return;
+                }
+                // else: fall through to the unchanged path below.
+            }
             // Head resolved — but multi-segment paths still need a tail
             // walk (Stage 2.6) to catch `obj.b` where `obj` exists but
             // `b` doesn't.

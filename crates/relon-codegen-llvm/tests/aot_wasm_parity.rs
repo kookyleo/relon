@@ -1116,6 +1116,67 @@ fn r10_sibling_root_backward_aligns_native_via_wasmtime() {
     assert_eq!(out.get("z"), Some(&Decoded::Int(want_z)), "r10 field z");
 }
 
+/// Wave R10b — the SAME backward `&sibling` / `&root` field-reference
+/// program as `r10_sibling_root_backward_aligns_native_via_wasmtime`,
+/// but in STRICT mode (no `#relaxed`). R10b taught the strict-mode
+/// analyzer to derive a single-segment, backward `&sibling.<name>` /
+/// entry-level `&root.<name>` reference's type from the target field's
+/// static type, so the program now passes strict analysis. Lowering is
+/// unchanged, so the wasm32 leg stays byte-equal to the LLVM native
+/// oracle — proving the strict reference path runs four-way.
+#[test]
+fn r10b_strict_sibling_root_backward_aligns_native_via_wasmtime() {
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping r10b strict sibling/root refs");
+        return;
+    }
+    let src = "#main(Int a, Int b) -> Dict\n\
+               { x: a + b, y: &sibling.x * 2, z: &root.x + &sibling.y }";
+    let (a, b) = (17i64, 5i64);
+    let dict = match native_run(
+        src,
+        HashMap::from([
+            ("a".to_string(), Value::Int(a)),
+            ("b".to_string(), Value::Int(b)),
+        ]),
+    ) {
+        Value::Dict(d) => d,
+        other => panic!("native expected Dict, got {other:?}"),
+    };
+    let want = |k: &str| match dict.map.get(k) {
+        Some(Value::Int(v)) => *v,
+        other => panic!("{k} not Int: {other:?}"),
+    };
+    let (want_x, want_y, want_z) = (want("x"), want("y"), want("z"));
+    // Oracle sanity: x = a+b = 22, y = x*2 = 44, z = x + y = 66.
+    assert_eq!(
+        (want_x, want_y, want_z),
+        (22, 44, 66),
+        "r10b oracle drifted"
+    );
+
+    let (bytes, info) = build("r10b_strict_sibling_root", src);
+    let mut in_record = vec![0u8; info.main_root_size as usize];
+    for f in &info.main_fields {
+        let off = f.offset as usize;
+        let v = match f.name.as_str() {
+            "a" => a,
+            "b" => b,
+            other => panic!("unexpected main field {other}"),
+        };
+        in_record[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    let out = run_buffer(
+        &bytes,
+        "relon_parity_r10b_strict_sibling_root",
+        &info,
+        &in_record,
+    );
+    assert_eq!(out.get("x"), Some(&Decoded::Int(want_x)), "r10b field x");
+    assert_eq!(out.get("y"), Some(&Decoded::Int(want_y)), "r10b field y");
+    assert_eq!(out.get("z"), Some(&Decoded::Int(want_z)), "r10b field z");
+}
+
 /// Wave R11 — field decorators on the anon-Dict-return path run on
 /// wasm32. A decorated field `@deco(args) k: v` desugars to the call
 /// `deco(v, args)` (value-first), and stacked decorators apply bottom-up

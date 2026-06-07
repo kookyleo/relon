@@ -3239,3 +3239,167 @@ fn r1_comprehension_non_iterable_still_rejected() {
         tree.diagnostics
     );
 }
+
+// ============= Wave R10b: strict `&sibling` / `&root` derivation =====
+//
+// Strict mode derives the type of a single-segment, backward
+// `&sibling.<name>` / entry-level `&root.<name>` reference from the
+// target sibling/root field's static type, so the reference type-checks
+// without `#relaxed`. Everything R10's lowering caps (forward / self
+// refs, multi-segment paths, `&uncle`) stays rejected.
+
+/// R10b headline: a backward `&sibling.x` inside an arithmetic field
+/// (`y: &sibling.x * 2`) derives `Int` and leaves no diagnostic under
+/// strict mode.
+#[test]
+fn r10b_strict_backward_sibling_in_arith_derives() {
+    let tree = analyze_str(
+        r#"
+        #main(Int a, Int b) -> Dict
+        { x: a + b, y: &sibling.x * 2 }
+        "#,
+    );
+    let leaks = count(&tree, |d| {
+        matches!(d, Diagnostic::UnknownReferenceType { .. })
+            || matches!(d, Diagnostic::ExpressionTypeUnknown { .. })
+    });
+    assert_eq!(
+        leaks, 0,
+        "backward `&sibling.x` should derive under strict: {:?}",
+        tree.diagnostics
+    );
+}
+
+/// R10b: a bare backward `&sibling.x` field value (no enclosing
+/// expression) also derives and is accepted.
+#[test]
+fn r10b_strict_backward_sibling_bare_field_derives() {
+    let tree = analyze_str(
+        r#"
+        #main(Int a, Int b) -> Dict
+        { x: a + b, y: &sibling.x }
+        "#,
+    );
+    let leaks = count(&tree, |d| {
+        matches!(d, Diagnostic::UnknownReferenceType { .. })
+            || matches!(d, Diagnostic::ExpressionTypeUnknown { .. })
+    });
+    assert_eq!(
+        leaks, 0,
+        "bare `&sibling.x` should derive: {:?}",
+        tree.diagnostics
+    );
+}
+
+/// R10b: entry-level `&root.x` (the entry dict IS the document root)
+/// derives the same way `&sibling.x` does — even with `#main` params
+/// present (the synthetic param frame is skipped).
+#[test]
+fn r10b_strict_backward_root_entry_level_derives() {
+    let tree = analyze_str(
+        r#"
+        #main(Int a, Int b) -> Dict
+        { x: a + b, y: &root.x * 2, z: &root.x + &sibling.y }
+        "#,
+    );
+    let leaks = count(&tree, |d| {
+        matches!(d, Diagnostic::UnknownReferenceType { .. })
+            || matches!(d, Diagnostic::ExpressionTypeUnknown { .. })
+    });
+    assert_eq!(
+        leaks, 0,
+        "backward `&root.x` should derive under strict: {:?}",
+        tree.diagnostics
+    );
+}
+
+/// R10b negative: a FORWARD `&sibling.x` (target defined *after* the
+/// reference) is what R10's lowering caps, so strict mode must keep
+/// rejecting it — `UnknownReferenceType`, not a silent `Any`.
+#[test]
+fn r10b_strict_forward_sibling_still_rejected() {
+    let tree = analyze_str(
+        r#"
+        #main(Int a, Int b) -> Dict
+        { y: &sibling.x * 2, x: a + b }
+        "#,
+    );
+    // Rejection surfaces as either `UnknownReferenceType` on the
+    // reference or `ExpressionTypeUnknown` on the enclosing field — both
+    // are clean diagnostics, the point is the program does NOT silently
+    // pass with an `Any` leak.
+    let rejected = count(&tree, |d| {
+        matches!(d, Diagnostic::UnknownReferenceType { .. })
+            || matches!(d, Diagnostic::ExpressionTypeUnknown { .. })
+    });
+    assert!(
+        rejected >= 1,
+        "forward `&sibling.x` must stay rejected under strict: {:?}",
+        tree.diagnostics
+    );
+}
+
+/// R10b negative: a self-reference (`x: &sibling.x + 1`) is forward by
+/// definition and must stay rejected (the cycle guard + backward guard
+/// both refuse it).
+#[test]
+fn r10b_strict_self_sibling_still_rejected() {
+    let tree = analyze_str(
+        r#"
+        #main(Int a) -> Dict
+        { x: &sibling.x + 1 }
+        "#,
+    );
+    let rejected = count(&tree, |d| {
+        matches!(d, Diagnostic::UnknownReferenceType { .. })
+            || matches!(d, Diagnostic::ExpressionTypeUnknown { .. })
+    });
+    assert!(
+        rejected >= 1,
+        "self `&sibling.x` must stay rejected under strict: {:?}",
+        tree.diagnostics
+    );
+}
+
+/// R10b negative: a multi-segment `&sibling.obj.x` is not a shape R10
+/// lowers (the runtime walks inside the value), so it stays rejected
+/// even when the inner field would resolve.
+#[test]
+fn r10b_strict_multisegment_sibling_still_rejected() {
+    let tree = analyze_str(
+        r#"
+        #main(Int a) -> Dict
+        { obj: { x: a }, y: &sibling.obj.x * 2 }
+        "#,
+    );
+    let leaks = count(&tree, |d| {
+        matches!(d, Diagnostic::UnknownReferenceType { .. })
+            || matches!(d, Diagnostic::ExpressionTypeUnknown { .. })
+    });
+    assert!(
+        leaks >= 1,
+        "multi-segment `&sibling.obj.x` must stay rejected: {:?}",
+        tree.diagnostics
+    );
+}
+
+/// R10b negative: a missing sibling field is still flagged — the
+/// derivation only fires for a field that actually exists earlier.
+#[test]
+fn r10b_strict_missing_sibling_still_rejected() {
+    let tree = analyze_str(
+        r#"
+        #main(Int a) -> Dict
+        { x: a, y: &sibling.nope * 2 }
+        "#,
+    );
+    let rejected = count(&tree, |d| {
+        matches!(d, Diagnostic::UnknownReferenceType { .. })
+            || matches!(d, Diagnostic::UnresolvedReference { name, .. } if name == "nope")
+    });
+    assert!(
+        rejected >= 1,
+        "missing `&sibling.nope` must stay rejected: {:?}",
+        tree.diagnostics
+    );
+}

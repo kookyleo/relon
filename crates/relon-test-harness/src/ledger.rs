@@ -2101,6 +2101,18 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         proof: "tree-walk + cranelift (TW_CR; wasm + llvm-native legs proven in \
                 relon-codegen-llvm::aot_wasm_parity::r10_sibling_root_backward)",
     },
+    // ---- STRICT-mode static type derivation of the above reference ----
+    SurfaceEntry {
+        construct:
+            "strict-mode `&sibling`/`&root` scalar field reference (derived type, no #relaxed)",
+        wave: "R10b",
+        corpus: "r10b_strict_sibling_chain",
+        status: Status::Covered,
+        proof: "analyzer-only: relon-analyzer derives the reference type from the backward \
+                sibling/root field (infer::infer_reference); lowering unchanged. tree-walk + \
+                cranelift (TW_CR; wasm + llvm-native legs proven in \
+                relon-codegen-llvm::aot_wasm_parity::r10b_strict_sibling_root_backward)",
+    },
     // ---- field decorators on the anon-Dict-return path ----
     SurfaceEntry {
         construct: "field decorator desugar (@deco(args) k: v -> deco(v, args)), stacked",
