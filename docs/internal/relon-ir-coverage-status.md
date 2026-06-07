@@ -24,6 +24,14 @@
 - **用户明确 greenlight 的两项工程已完成**(List<String> wasm 解码器 + Unicode-seam 移植)。
 - **剩余仍需决策/受设计边界限**:str.split(String→List<String>,变长 List<String> 构造,R13 后返回侧已通,缺 lowered body=可做的下一个 design-free 件)· dict.keys(撞 Dict-by-design)· VariantCtor(变体值=branded Dict,大概率 Dict-by-design 挡)· spread(改 list=Tuple 推断=类型系统决策)· Dict 支持(by-design)· #relaxed 真动态/&prev/&next/regex/net-parse(静态优先诚实 cap)。
 
+- ✅ **R15 `79fa4e62`**:`str.split` → 变长 `List<String>` 四方(两遍:数段→发子串记录+偏移槽,复用 R8 子串匹配器,无新 Op,就地返回)。匹配 Rust `str::split`。cap:空分隔符(oracle 报错非值)+ 不可证非空的运行期分隔符。无 GENERATOR_VERSION bump。
+- **design-free 工程件已基本做尽**。**剩余=两个真决策 + 设计边界内的诚实 cap**(下方"决策点")。
+
+## 决策点(需用户拍板,loop 已停在此)
+1. **spread**:要编译需改 analyzer 的 `list 字面量/spread = Tuple` 推断 → `List<T>`(类型系统改动,影响面广)。要不要动?
+2. **Dict 编译值支持**:VariantCtor(变体值=branded Dict)、dict.keys/values/merge、dict 字面量——全部 gated 在"Dict 作编译值"上,而这当前是**by-design cap**(analyzer 走 schema 不走 Dict)。要不要逆转这条边界、建 Dict 编译支持(大工程)?还是维持 schema-only、Dict 永久 cap?
+3. 或:**宣告静态覆盖收尾**——no-fallback 门已绿,剩余皆设计边界内诚实 cap(#relaxed 真动态 / &prev/&next / regex / net-parse / Dict-by-design / spread-as-Tuple)。
+
 ## 未展开工作(诚实记录,分三类)
 
 ### 类别 A:解释器有、relon-IR 编译路未 lower(= 真"尚未在 relon-ir 实现",auto 回退解释器)
