@@ -19,6 +19,11 @@
 - **类别 A 实质收尾**:references(R10/R10b)✓ · decorator(R11)✓ · spread = analyzer/类型系统挡(需决策)· VariantCtor = 大概率 Dict-by-design 挡(变体值=branded Dict)。
 - **剩余皆需决策或大改(已到 surface 点)**:① spread 要不要改 list=Tuple 推断 ② Unicode-seam string ops(upper/title/trim/nfd)移植 LLVM/wasm UTF-8 解码 seam(大、后端活)③ List<String> 返回的 wasm in-place 解码器(补 R3c/str.split 到四方,design-free 中等活)④ Dict 支持(当前 by-design cap,要不要改)⑤ #relaxed 真动态 / &prev/&next / regex / net-parse(静态优先下倾向诚实 cap)。
 
+- ✅ **R13 `371fa947`**:List<String> 就地返回的 **wasm 腿四方证实**(发现生产路 `wasm_buffer_decode` 本就走共享 verifier+reader,原"gap"只是测试 harness 窄;补了真四方 parity)。R3c 的 String-结果 map 现真四方。GENERATOR_VERSION 不变。
+- ✅ **R14 `5574b1bc`**:**Unicode-seam 移植 LLVM/wasm**——upper/lower/title/nfd 从两方升到**四方**。根因:`*TableAddr` 在每个 codepoint 循环里把整张表 memcpy 进 scratch→arena 溢出 SEGV/overflow;改成像 cranelift ConstPool 那样把表放 const-data 前缀一次性(`*TableAddr`=固定偏移);并修 `emit_if` 缺 label frame 的 Br 深度 bug。共用 `relon-unicode` 表,逐字节四方。(大输入 cranelift 因既存 cross-region 返回 scratch 窗口限制排除在 large 探针外=三方,small 全四方;trim 非注册 stdlib 方法、不在范围。)GENERATOR_VERSION 不变(只动 llvm 后端)。
+- **用户明确 greenlight 的两项工程已完成**(List<String> wasm 解码器 + Unicode-seam 移植)。
+- **剩余仍需决策/受设计边界限**:str.split(String→List<String>,变长 List<String> 构造,R13 后返回侧已通,缺 lowered body=可做的下一个 design-free 件)· dict.keys(撞 Dict-by-design)· VariantCtor(变体值=branded Dict,大概率 Dict-by-design 挡)· spread(改 list=Tuple 推断=类型系统决策)· Dict 支持(by-design)· #relaxed 真动态/&prev/&next/regex/net-parse(静态优先诚实 cap)。
+
 ## 未展开工作(诚实记录,分三类)
 
 ### 类别 A:解释器有、relon-IR 编译路未 lower(= 真"尚未在 relon-ir 实现",auto 回退解释器)
