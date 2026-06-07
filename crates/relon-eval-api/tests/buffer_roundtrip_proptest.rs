@@ -126,6 +126,7 @@ fn roundtrip_one(field: Field, value: Value) {
     let schema = Schema {
         name: "Root".into(),
         generics: vec![],
+        is_tuple: false,
         fields: vec![field.clone()],
     };
     let layout = SchemaLayout::offsets_for(&schema).expect("layout");
@@ -327,6 +328,7 @@ fn elem_schema() -> Schema {
     Schema {
         name: "Elem".into(),
         generics: vec![],
+        is_tuple: false,
         fields: vec![
             field("i", TypeRepr::Int),
             field("f", TypeRepr::Float),
@@ -510,6 +512,7 @@ fn xr_cfg_schema() -> Schema {
     Schema {
         name: "Cfg".into(),
         generics: vec![],
+        is_tuple: false,
         fields: vec![
             field("name", TypeRepr::String),
             field("port", TypeRepr::Int),
@@ -522,6 +525,7 @@ fn xr_outer_schema() -> Schema {
     Schema {
         name: "Out".into(),
         generics: vec![],
+        is_tuple: false,
         fields: vec![
             field(
                 "servers",

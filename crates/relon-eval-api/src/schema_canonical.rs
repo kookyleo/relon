@@ -149,6 +149,19 @@ pub struct Schema {
     /// identical, because the binary layout's field offsets are
     /// declaration-order dependent.
     pub fields: Vec<Field>,
+    /// Wave T2: marks an **anonymous positional record** synthesised for
+    /// a `Tuple<...>`. The binary layout, buffer builder, verifier and
+    /// codegen treat such a schema exactly like any other record (its
+    /// fields carry the synthetic positional names `"0"`, `"1"`, ...),
+    /// so the whole record/return ABI is reused unchanged. The only
+    /// behavioural fork is the **host decode**: a tuple schema decodes
+    /// to a positional JSON array (`Value::List`), byte-identical to the
+    /// tree-walk oracle's `Value::List`, rather than to a branded object.
+    ///
+    /// Serialised only when `true`, so every pre-T2 (non-tuple) schema's
+    /// canonical bytes — and therefore its ABI hash — stay unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_tuple: bool,
 }
 
 impl Schema {
@@ -159,6 +172,30 @@ impl Schema {
             name: name.into(),
             generics: Vec::new(),
             fields: Vec::new(),
+            is_tuple: false,
+        }
+    }
+
+    /// Wave T2: build an anonymous positional-record schema for a
+    /// `Tuple<...>` from its element types in order. Field names are the
+    /// synthetic decimal indices `"0"`, `"1"`, ... so the existing
+    /// declaration-order layout pass assigns one slot per element; the
+    /// `is_tuple` flag drives the array-shaped host decode.
+    pub fn tuple(name: impl Into<String>, elements: Vec<TypeRepr>) -> Self {
+        let fields = elements
+            .into_iter()
+            .enumerate()
+            .map(|(i, ty)| Field {
+                name: i.to_string(),
+                ty,
+                default: None,
+            })
+            .collect();
+        Self {
+            name: name.into(),
+            generics: Vec::new(),
+            fields,
+            is_tuple: true,
         }
     }
 }
@@ -223,6 +260,7 @@ mod tests {
         Schema {
             name: "User".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![
                 Field {
                     name: "id".into(),
@@ -304,6 +342,7 @@ mod tests {
         let outer_with_named = Schema {
             name: "Wrapper".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![Field {
                 name: "user".into(),
                 ty: TypeRepr::Schema {
@@ -318,6 +357,7 @@ mod tests {
         let outer_with_alias = Schema {
             name: "Wrapper".into(),
             generics: vec![],
+            is_tuple: false,
             fields: vec![Field {
                 name: "user".into(),
                 ty: TypeRepr::Schema {
@@ -337,6 +377,7 @@ mod tests {
                         name: inner.name.clone(),
                         generics: inner.generics.clone(),
                         fields: inner.fields.clone(),
+                        is_tuple: false,
                     }),
                 },
                 default: None,

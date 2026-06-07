@@ -192,6 +192,9 @@ fn args_x_neg42() -> HashMap<String, Value> {
 fn args_x_42() -> HashMap<String, Value> {
     one_int("x", 42)
 }
+fn args_n_7() -> HashMap<String, Value> {
+    one_int("n", 7)
+}
 fn args_x_max() -> HashMap<String, Value> {
     one_int("x", i64::MAX)
 }
@@ -1177,6 +1180,28 @@ pub fn all_cases() -> Vec<CorpusCase> {
             name: "dict_with_string_return",
             source: "#schema Out { String name: *, Int n: * }\n#main() -> Out\n{ name: \"alice\", n: 42 }",
             args_factory: no_args,
+            tier: Tier::DictReturn,
+            supported_by: TW_CR,
+        },
+        // ---- Wave T2: tuple return (anonymous positional record) ----
+        // A `#main(...) -> Tuple<...>` lowers to a positional record that
+        // reuses the whole branded-record/return ABI; the only fork is the
+        // host decode (positional `Value::List` → JSON array). Shares the
+        // DictReturn tier (schema-rooted output buffer) and rides `TW_CR`:
+        // the bytecode / trace recipe catalogues don't model anon-record
+        // construction, and the wasm + llvm-native legs are proven in the
+        // dedicated `relon-codegen-llvm::tuple_return_four_way` test.
+        CorpusCase {
+            name: "tuple_scalar_return",
+            source: "#main(Int n) -> Tuple<Int, String, Bool>\n(n, \"x\", true)",
+            args_factory: args_n_7,
+            tier: Tier::DictReturn,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "tuple_int_pair_return",
+            source: "#main(Int n) -> Tuple<Int, Int>\n(n, n + 1)",
+            args_factory: args_n_7,
             tier: Tier::DictReturn,
             supported_by: TW_CR,
         },

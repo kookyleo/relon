@@ -620,6 +620,7 @@ fn synthesise_schema(fields: &[EmittedField], name: &str) -> Schema {
                 default: None,
             })
             .collect(),
+        is_tuple: false,
     }
 }
 

@@ -1716,7 +1716,12 @@ fn is_single_value_wrapper(schema: &relon_eval_api::schema_canonical::Schema) ->
 /// as `Value::Dict` for the host, not be unwrapped to a bare scalar.
 fn is_single_int_field_record(schema: &relon_eval_api::schema_canonical::Schema) -> bool {
     use relon_eval_api::schema_canonical::TypeRepr;
-    schema.fields.len() == 1 && matches!(schema.fields[0].ty, TypeRepr::Int)
+    // Wave T2: a tuple schema (`is_tuple`) decodes positionally to a
+    // `Value::List`, never to a scalar / branded dict — so a 1-tuple
+    // `Tuple<Int>` must NOT take the typed-i64 fast path (which would
+    // return the wrong container shape). Force it onto the buffer path so
+    // the shared `decode_object_return` tuple fork runs.
+    !schema.is_tuple && schema.fields.len() == 1 && matches!(schema.fields[0].ty, TypeRepr::Int)
 }
 
 /// Marshal a typed [`Value`] into the buffer slot for `field` on the
