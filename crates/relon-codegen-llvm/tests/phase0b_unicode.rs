@@ -4,35 +4,28 @@
 //! `WhitespaceRangesAddr`, `CasedRangesAddr`, `CaseIgnorableRangesAddr`,
 //! `DecompTableAddr`, `CccTableAddr`, `CompositionTableAddr`).
 //!
-//! # Why this file does not run a three-way value differential
+//! # Scope of this file
 //!
 //! These ops never appear in user IR directly — they are emitted only
 //! inside the bundled Unicode stdlib bodies (`upper` / `lower` /
-//! `title` / `nfd` / `nfc` / `nfkd` / `nfkc` / `*_locale`). Those bodies
-//! also reference ops that NEITHER Phase-0b backend lowers yet:
+//! `title` / `nfd` / `nfc` / `nfkd` / `nfkc` / `*_locale`). This file
+//! pins the narrow build-time property that the Phase-0b `*TableAddr`
+//! seam is filled: lowering a Unicode workload no longer returns the
+//! Phase-0b stub error.
 //!
-//!   * cranelift rejects `Op::LoadStringPtr`
-//!     (`unsupported op in v5-beta-2 stage 3: LoadStringPtr`);
-//!   * the LLVM backend rejects the `Op::Trap { InvalidUtf8 }` / string
-//!     decode ops these bodies open with (Phase-0b `call.rs` seam).
-//!
-//! So `from_source` of a `s.upper()` workload fails to *build* on both
-//! sides — there is no compiled entry to invoke, hence no observable
-//! value to compare. A runtime three-way differential is therefore
-//! deferred until the surrounding string ops land; the byte-for-byte
-//! alignment with cranelift's gold-standard table data is pinned now by
-//! the in-crate unit tests in `src/codegen/unicode.rs`
+//! The byte-for-byte alignment with cranelift's gold-standard table data
+//! is pinned by the in-crate unit tests in `src/codegen/unicode.rs`
 //! (`encode_bytes_match_shared_encoders` checks the emitted table bytes
 //! against the exact `relon_ir` encoders cranelift's `ConstPool`
-//! consumes; `table_addr_emits_global_of_encoder_length` checks the
-//! lowering wires those bytes into the module global unchanged).
+//! consumes; `const_pool_lays_tables_at_aligned_offsets` /
+//! `lower_pushes_const_pool_offset` check the lowering lays those bytes
+//! into the const-data prefix and resolves the op to that offset).
 //!
-//! This integration test pins the one end-to-end property reachable
-//! through the public API today: lowering a Unicode workload no longer
-//! trips the Unicode `*TableAddr` seam — the `*TableAddr` ops compile,
-//! and any remaining build failure is attributable to a *different*,
-//! not-yet-implemented op family. If a future change re-stubs the
-//! Unicode seam, this fails loudly.
+//! Wave R14 took this seam all the way to a four-way value differential:
+//! `upper` / `lower` / `title` / `nfd` now run byte-identically across
+//! tree-walk == cranelift == llvm-native == llvm-wasm (see
+//! `tests/unicode_four_way.rs`). If a future change re-stubs the Unicode
+//! seam, this file still fails loudly on the build-time property.
 
 use relon_codegen_llvm::LlvmAotEvaluator;
 

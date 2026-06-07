@@ -230,6 +230,13 @@ pub struct ConstPool {
     /// payload (`key_off` record-relative). The W5-P3 dict-get probe
     /// binary-/linear-searches this table at runtime.
     pub dict_offsets: std::collections::HashMap<u32, u32>,
+    /// Wave R14: Unicode `*TableAddr` pool. Each distinct
+    /// [`unicode::UnicodeTable`] referenced anywhere in the module (incl.
+    /// inlined bundled-stdlib helper bodies) is encoded once via the
+    /// shared `relon_ir` encoders and laid into [`Self::bytes`]; the
+    /// `*TableAddr` op resolves to the recorded arena-relative offset.
+    /// Byte-identical to cranelift's per-table `ConstPool` slots.
+    pub(crate) unicode_table_offsets: std::collections::HashMap<unicode::UnicodeTable, u32>,
     /// Materialised bytes in record order. The host trampoline copies
     /// these verbatim to `arena[..bytes.len()]` before every dispatch.
     pub bytes: Vec<u8>,
@@ -282,8 +289,36 @@ impl ConstPool {
                 }
                 Ok(())
             }
-            _ => Ok(()),
+            // Wave R14: Unicode `*TableAddr` ops. Lay each referenced
+            // table into the const prefix once (deduped by table identity)
+            // so the lowering resolves to a fixed offset instead of
+            // copying the table into scratch per op-execution.
+            other => {
+                if let Some(table) = unicode::UnicodeTable::from_op(other) {
+                    self.add_unicode_table(table)?;
+                }
+                Ok(())
+            }
         }
+    }
+
+    /// Lay `table`'s encoded bytes into the pool on first reference and
+    /// record the arena-relative offset. The byte encoder is the exact
+    /// shared `relon_ir` function cranelift's `ConstPool` calls, so the
+    /// data a lookup helper reads is byte-identical across backends.
+    /// Aligned to 4 to match every `*TableAddr` slot on the cranelift
+    /// side (the table headers are read with 4-byte-aligned i32 loads).
+    fn add_unicode_table(&mut self, table: unicode::UnicodeTable) -> Result<(), LlvmError> {
+        if self.unicode_table_offsets.contains_key(&table) {
+            return Ok(());
+        }
+        self.align_to(4);
+        let off = u32::try_from(self.bytes.len())
+            .map_err(|_| LlvmError::Codegen("llvm const pool exceeds u32 range".into()))?;
+        let bytes = table.encode_bytes();
+        self.bytes.extend_from_slice(&bytes);
+        self.unicode_table_offsets.insert(table, off);
+        Ok(())
     }
 
     fn add_string(&mut self, idx: u32, value: &str) -> Result<(), LlvmError> {
@@ -2306,7 +2341,7 @@ pub(crate) enum LabelKind {
     Loop,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub(crate) struct LabelFrame<'ctx> {
     /// Header basic block. For Block this is unused for branching
     /// (we never branch backward to the start of a block); for Loop

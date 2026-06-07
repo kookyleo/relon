@@ -587,11 +587,32 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         // correct). Straight-line shapes like W18 are unaffected.
         let known_closure_snapshot = self.known_closure_let_slots.clone();
 
+        // Wave R14: wasm structured-control-flow treats `If` as a
+        // labeled block whose break target is the matching `End`. The IR
+        // depth model (and the cranelift backend's `emit_if`) therefore
+        // count the `If` as one label level: a `Br { depth }` inside an
+        // arm resolves with `depth 0 = If, 1 = enclosing Loop, 2 =
+        // enclosing Block, ...`. Push a `Block`-kind frame whose break
+        // target is `merge_bb` so those depths line up exactly. Without
+        // this the bundled Unicode case-fold / normalization helpers
+        // (which break out of their search loop via `Br 2` from inside an
+        // `If`) resolve one level too shallow and jump into the *caller's*
+        // per-codepoint loop — an infinite loop (the bug that surfaced
+        // once R14 removed the per-op scratch-table copy that previously
+        // overran the arena first).
+        let if_frame = LabelFrame {
+            header_bb: merge_bb,
+            tail_bb: merge_bb,
+            kind: LabelKind::Block,
+        };
+
         // Then arm.
         self.builder.position_at_end(then_bb);
+        self.label_stack.push(if_frame);
         for (ip, tagged) in then_body.iter().enumerate() {
             self.lower_op(ip, tagged)?;
         }
+        self.label_stack.pop();
         let then_result = self.pop(ip_hint).ok();
         let then_known_closures = std::mem::replace(
             &mut self.known_closure_let_slots,
@@ -607,9 +628,11 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
 
         // Else arm (starts from the pre-If snapshot, restored above).
         self.builder.position_at_end(else_bb);
+        self.label_stack.push(if_frame);
         for (ip, tagged) in else_body.iter().enumerate() {
             self.lower_op(ip, tagged)?;
         }
+        self.label_stack.pop();
         let else_result = self.pop(ip_hint).ok();
         let else_known_closures =
             std::mem::replace(&mut self.known_closure_let_slots, known_closure_snapshot);
