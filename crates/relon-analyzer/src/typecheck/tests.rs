@@ -1520,6 +1520,15 @@ fn v1_3_strict_typed_spread_silent() {
     assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }
 
+#[test]
+fn list_spread_contributes_inner_element_type() {
+    let tree = analyze_str(r#"{ List<Int> xs: [...[1, 2], 3] }"#);
+    let stm = count(&tree, |d| {
+        matches!(d, Diagnostic::StaticTypeMismatch { .. })
+    });
+    assert_eq!(stm, 0, "{:?}", tree.diagnostics);
+}
+
 /// v1.3 forward: dynamic key without typehint flagged in strict
 /// mode.
 #[test]
@@ -2881,11 +2890,11 @@ fn v1_6_ban_schema_nested_any() {
 
 // ============= v1.7: Tuple types =============
 
-/// v1.7 forward: tuple-typed binding accepts a list literal of
+/// Tuple-typed binding accepts a tuple literal of
 /// matching arity / element types.
 #[test]
 fn v1_7_tuple_typed_binding_silent() {
-    let tree = analyze_str(r#"{ (Int, String) row: [42, "Alice"] }"#);
+    let tree = analyze_str(r#"{ (Int, String) row: (42, "Alice") }"#);
     let n = count(&tree, |d| {
         matches!(d, Diagnostic::StaticTypeMismatch { .. })
     });
@@ -2895,7 +2904,7 @@ fn v1_7_tuple_typed_binding_silent() {
 /// v1.7 forward: tuple slot rejects element-type mismatch.
 #[test]
 fn v1_7_tuple_element_type_mismatch() {
-    let tree = analyze_str(r#"{ (Int, String) row: [42, 99] }"#);
+    let tree = analyze_str(r#"{ (Int, String) row: (42, 99) }"#);
     let n = count(&tree, |d| {
         matches!(d, Diagnostic::StaticTypeMismatch { .. })
     });
@@ -2905,7 +2914,7 @@ fn v1_7_tuple_element_type_mismatch() {
 /// v1.7 forward: tuple slot rejects arity mismatch.
 #[test]
 fn v1_7_tuple_arity_mismatch() {
-    let tree = analyze_str(r#"{ (Int, String) row: [42, "x", true] }"#);
+    let tree = analyze_str(r#"{ (Int, String) row: (42, "x", true) }"#);
     let n = count(&tree, |d| {
         matches!(d, Diagnostic::StaticTypeMismatch { .. })
     });
@@ -2915,17 +2924,17 @@ fn v1_7_tuple_arity_mismatch() {
 /// v1.7 forward: 1-tuple syntax `(T,)` works.
 #[test]
 fn v1_7_one_tuple_silent() {
-    let tree = analyze_str(r#"{ (Int,) singleton: [42] }"#);
+    let tree = analyze_str(r#"{ (Int,) singleton: (42,) }"#);
     let n = count(&tree, |d| {
         matches!(d, Diagnostic::StaticTypeMismatch { .. })
     });
     assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }
 
-/// v1.7 forward: unit tuple `()` accepts only an empty list.
+/// Unit tuple `()` accepts only an empty tuple literal.
 #[test]
 fn v1_7_unit_tuple_silent() {
-    let tree = analyze_str(r#"{ () unit: [] }"#);
+    let tree = analyze_str(r#"{ () unit: () }"#);
     let n = count(&tree, |d| {
         matches!(d, Diagnostic::StaticTypeMismatch { .. })
     });
@@ -2950,7 +2959,7 @@ fn v1_7_heterogeneous_list_under_int_slot_per_element_diagnostics() {
 /// row is a fixed-shape tuple.
 #[test]
 fn v1_7_list_of_tuples_silent() {
-    let tree = analyze_str(r#"{ List<(String, Int)> entries: [["Alice", 1], ["Bob", 2]] }"#);
+    let tree = analyze_str(r#"{ List<(String, Int)> entries: [("Alice", 1), ("Bob", 2)] }"#);
     let n = count(&tree, |d| {
         matches!(d, Diagnostic::StaticTypeMismatch { .. })
     });
@@ -2961,7 +2970,7 @@ fn v1_7_list_of_tuples_silent() {
 /// the precise element index.
 #[test]
 fn v1_7_list_of_tuples_inner_mismatch() {
-    let tree = analyze_str(r#"{ List<(String, Int)> entries: [["Alice", 1], ["Bob", "two"]] }"#);
+    let tree = analyze_str(r#"{ List<(String, Int)> entries: [("Alice", 1), ("Bob", "two")] }"#);
     let n = count(&tree, |d| {
         matches!(d, Diagnostic::StaticTypeMismatch { .. })
     });

@@ -5,7 +5,8 @@
 //! their target representation (JSON, YAML, BSON, a typed builder, …) and
 //! plug it into [`crate::project_with`] / [`crate::project_from_str`].
 //!
-//! Implementors recurse through [`Value::List`] / [`Value::Dict`]
+//! Implementors recurse through [`Value::List`] / [`Value::Tuple`] /
+//! [`Value::Dict`]
 //! themselves; the trait deliberately doesn't bake in a visitor walk so
 //! exotic projectors (streaming serializers, custom error policies, …) keep
 //! full control over traversal order and short-circuiting.
@@ -47,7 +48,7 @@ impl Projector for JsonProjector {
                     .ok_or(crate::Error::NonFiniteFloat(raw))
             }
             Value::String(s) => Ok(serde_json::Value::String(s.as_str().to_owned())),
-            Value::List(items) => {
+            Value::List(items) | Value::Tuple(items) => {
                 let mut out = Vec::with_capacity(items.len());
                 for item in items.iter() {
                     out.push(self.project(item)?);

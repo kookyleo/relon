@@ -3,4 +3,4 @@
 // inner element rather than reporting only an outer container
 // mismatch.
 // EXPECTED: ≥ 1 × StaticTypeMismatch.
-{ List<(Int, String)> rows: [[1, "a"], [2, 99]] }
+{ List<(Int, String)> rows: [(1, "a"), (2, 99)] }

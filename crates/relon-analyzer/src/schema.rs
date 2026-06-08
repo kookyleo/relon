@@ -44,6 +44,10 @@ pub struct SchemaDef {
     pub generics: Vec<String>,
     /// Field declarations in source order.
     pub fields: Vec<SchemaFieldDef>,
+    /// Positional element declarations for tuple schemas
+    /// (`#schema Pair (Int, String)`). `None` means this is not a tuple
+    /// schema; `Some(vec![])` is the unit tuple schema.
+    pub tuple_elements: Option<Vec<TypeNode>>,
     /// Base schemas this one extends (left operands of `Base + { ... }`).
     /// Each entry carries both the human-readable name (for diagnostics
     /// and LSP hover) and an `Arc<Node>` pointing back to the original
@@ -224,6 +228,17 @@ pub fn check_schema_field_types(tree: &mut AnalyzedTree) {
         for g in &def.generics {
             local_known.insert(g.clone());
         }
+        for element in def.tuple_elements.iter().flatten() {
+            crate::ban_unsafe_types::scan_typenode_for_any(
+                element,
+                &format!(
+                    "schema tuple element `{}`",
+                    def.name.as_deref().unwrap_or("<anonymous>")
+                ),
+                &mut diagnostics,
+            );
+            check_schema_type_name(element, &local_known, &mut diagnostics);
+        }
         for field in &def.fields {
             let Some(t) = &field.type_hint else { continue };
             // v1.6: ban `Any` (anywhere in the type tree).
@@ -232,34 +247,77 @@ pub fn check_schema_field_types(tree: &mut AnalyzedTree) {
                 &format!("schema field `{}`", field.name),
                 &mut diagnostics,
             );
-            if t.path.len() == 1 {
-                let head = &t.path[0];
-                if relon_parser::is_builtin_type_name(head) {
-                    continue;
-                }
-                if matches!(head.as_str(), "Result" | "Option") {
-                    continue;
-                }
-                if local_known.contains(head) {
-                    continue;
-                }
-                diagnostics.push(Diagnostic::UnknownTypeName {
-                    name: head.clone(),
-                    range: span_of(t.range),
-                });
-            } else if t.path.len() == 2 {
-                // v1.8+: tentative `pkg.Tail` diagnostic; cleared by
-                // `re_check_unknown_types` iff the entry's import index
-                // resolves `head` to an alias whose exports include
-                // `tail`. Otherwise the user sees the diagnostic.
-                diagnostics.push(Diagnostic::UnknownTypeName {
-                    name: format!("{}.{}", t.path[0], t.path[1]),
-                    range: span_of(t.range),
-                });
-            }
+            check_schema_type_name(t, &local_known, &mut diagnostics);
         }
     }
     tree.diagnostics.extend(diagnostics);
+}
+
+fn check_schema_type_name(
+    t: &TypeNode,
+    local_known: &std::collections::HashSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if t.path.len() == 1 {
+        let head = &t.path[0];
+        if relon_parser::is_builtin_type_name(head) {
+            return;
+        }
+        if matches!(head.as_str(), "Result" | "Option") {
+            return;
+        }
+        if local_known.contains(head) {
+            return;
+        }
+        diagnostics.push(Diagnostic::UnknownTypeName {
+            name: head.clone(),
+            range: span_of(t.range),
+        });
+    } else if t.path.len() == 2 {
+        // v1.8+: tentative `pkg.Tail` diagnostic; cleared by
+        // `re_check_unknown_types` iff the entry's import index
+        // resolves `head` to an alias whose exports include
+        // `tail`. Otherwise the user sees the diagnostic.
+        diagnostics.push(Diagnostic::UnknownTypeName {
+            name: format!("{}.{}", t.path[0], t.path[1]),
+            range: span_of(t.range),
+        });
+    }
+}
+
+pub(crate) fn tuple_elements_for_schema_type(
+    tree: &AnalyzedTree,
+    expected: &TypeNode,
+) -> Option<(String, Vec<TypeNode>)> {
+    let schema_name = match expected.path.as_slice() {
+        [name] => name.clone(),
+        [alias, name] => {
+            let idx = tree.workspace_import_index.as_ref()?;
+            if idx
+                .aliased
+                .get(alias)
+                .is_some_and(|exports| exports.contains(name))
+            {
+                format!("{alias}.{name}")
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    for def in tree.schemas.values() {
+        if def.name.as_deref() == Some(schema_name.as_str()) {
+            return def
+                .tuple_elements
+                .as_ref()
+                .map(|elements| (schema_name.clone(), elements.clone()));
+        }
+    }
+    tree.workspace_import_index
+        .as_ref()
+        .and_then(|idx| idx.imported_tuple_schemas.get(&schema_name))
+        .cloned()
+        .map(|elements| (schema_name, elements))
 }
 
 /// Walk `root` and populate `tree.schemas` with every statically-classifiable
@@ -357,6 +415,7 @@ pub fn lower_schema_pure_with(
         name,
         generics,
         fields: Vec::new(),
+        tuple_elements: None,
         bases: Vec::new(),
         range: value.range,
         variants: Vec::new(),
@@ -432,6 +491,10 @@ fn walk_schema_body(node: &Node, def: &mut SchemaDef, tree: &mut AnalyzedTree) -
         // tagged-enum form (alternatives carrying `variant_fields`) here so
         // the analyzer can expose `def.variants` to downstream passes.
         Expr::Type(t) if t.path.len() == 1 && t.path[0] == "Enum" => lower_enum_body(t, def, tree),
+        // Tuple schema body: `#schema IPv4 (Int, Int, Int, Int)`.
+        // This is fixed-arity positional data, distinct from both
+        // struct schemas (`{ ... }`) and homogeneous list values (`[...]`).
+        Expr::Tuple(items) => collect_tuple_elements(items, def, tree),
         Expr::Dict(pairs) => {
             collect_fields(pairs, def, tree);
             true
@@ -464,6 +527,49 @@ fn walk_schema_body(node: &Node, def: &mut SchemaDef, tree: &mut AnalyzedTree) -
             });
             false
         }
+    }
+}
+
+fn collect_tuple_elements(items: &[Node], def: &mut SchemaDef, tree: &mut AnalyzedTree) -> bool {
+    if !def.fields.is_empty() || !def.variants.is_empty() || !def.bases.is_empty() {
+        tree.diagnostics.push(Diagnostic::SchemaBodyNotDict {
+            found: "Tuple composition".to_string(),
+            range: span_of(def.range),
+        });
+        return false;
+    }
+    let mut elements = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        let Some(t) = type_node_from_tuple_schema_item(item) else {
+            tree.diagnostics.push(Diagnostic::SchemaFieldUntyped {
+                field: i.to_string(),
+                range: span_of(item.range),
+            });
+            return false;
+        };
+        elements.push(t);
+    }
+    def.tuple_elements = Some(elements);
+    true
+}
+
+fn type_node_from_tuple_schema_item(item: &Node) -> Option<TypeNode> {
+    match &*item.expr {
+        Expr::Type(t) => Some(t.clone()),
+        Expr::Variable(path) => {
+            let [TokenKey::String(name, _, false)] = path.as_slice() else {
+                return None;
+            };
+            Some(TypeNode {
+                path: vec![name.clone()],
+                generics: Vec::new(),
+                is_optional: false,
+                range: item.range,
+                variant_fields: None,
+                doc_comment: item.doc_comment.clone(),
+            })
+        }
+        _ => None,
     }
 }
 

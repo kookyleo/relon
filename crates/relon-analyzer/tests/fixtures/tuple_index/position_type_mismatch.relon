@@ -2,6 +2,6 @@
 // expects `String`. The walker pinpoints the mismatch.
 // EXPECTED: ≥ 1 × StaticTypeMismatch on the `wrong` field.
 {
-  (Int, String) pair: [42, "hello"],
+  (Int, String) pair: (42, "hello"),
   String wrong: pair.0
 }

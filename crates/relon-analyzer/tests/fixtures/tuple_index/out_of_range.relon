@@ -3,6 +3,6 @@
 // as `UnknownReferenceType`.
 // EXPECTED: ≥ 1 × UnknownReferenceType on the `bad` reference.
 {
-  (Int, String) pair: [42, "hello"],
+  (Int, String) pair: (42, "hello"),
   Int bad: pair.5
 }

@@ -283,7 +283,8 @@ available unconditionally:
   (`Int`).
 * `range(end)` / `range(start, end)` — half-open `Int` list.
 * `type(value)` — the value's type name (`"Int"`, `"Float"`,
-  `"String"`, `"Bool"`, `"List"`, `"Dict"`, `"Closure"`, `"Null"`).
+  `"String"`, `"Bool"`, `"List"`, `"Tuple"`, `"Dict"`, `"Closure"`,
+  `"Null"`).
 
 ### 6.2 std module catalog
 
@@ -319,7 +320,7 @@ will diverge.
 
 A `.relon` file evaluates to **one JSON value** — Object, Array,
 String, Number, Bool, or Null. The root **may be any expression**:
-dict / list literal, atomic literal, binary / ternary / pipe
+dict / list / tuple literal, atomic literal, binary / ternary / pipe
 expression, function call, variant constructor, reference,
 where / match — provided the final value falls in the JSON type
 set.
@@ -328,6 +329,7 @@ set.
 // Legal root forms
 { id: 1, total: 99 }              // dict literal
 [1, 2, 3]                          // list literal
+(1, "x")                            // tuple literal, projects to JSON array
 n + 1                              // binary expression (in a #main entry)
 "hello"                            // string literal
 42                                 // integer
@@ -390,8 +392,8 @@ Multiple parameters are listed side-by-side:
 }
 ```
 
-The optional `-> ReturnType` clause declares the **Json shape** the
-body produces — an atom, dict, or list schema/type. Omitting it
+The optional `-> ReturnType` clause declares the **JSON shape** the
+body produces — an atom, dict, list, or tuple schema/type. Omitting it
 leaves the return value unchecked.
 
 **Don't write `ReturnType` as `Result<T, E>`.** The success-vs-
@@ -528,8 +530,8 @@ with multiple segments):
   (strict raises `ClosureParamTypeMissing` and never reaches the
   walker). Propagate `Any` so non-strict callers defer to runtime.
 * `Tuple<T1, T2, ...>` head (v1.7) → tuples are positional, not named;
-  descending by name always yields `UnknownStep`. (Positional indexing
-  syntax like `pair.0` / `pair.1` would plumb through this branch.)
+  `pair.0` / `pair.1` yield the corresponding element type, while
+  descending by name yields `UnknownStep`.
 * `Int` / `String` / `Bool` / `List<...>` and other leaves → cannot
   descend; `UnknownReferenceType` (cross-mode).
 
@@ -635,33 +637,30 @@ examples — `Any` is gone from the user-facing surface.
 
 **v1.7: Tuple types + bare-generic ban**
 
-Through v1.6, list literals carried two roles: homogeneous arrays and
-heterogeneous tuples. With `List<Any>` retired, `[1, "x"]` no longer
-had a legal annotation. v1.7 introduces a proper `Tuple` type for
-fixed-length, mixed-element data:
+Through v1.6, square-bracket literals carried two roles: homogeneous
+arrays and heterogeneous tuples. With `List<Any>` retired,
+`[1, "x"]` no longer has a legal meaning as a list. v1.7 introduces a
+proper `Tuple` type and parenthesized tuple literals for fixed-length,
+mixed-element data:
 
 ```relon
-// Trailing-comma form disambiguates a 1-tuple from a parenthesized type
-() unit: []
-(Int,) one: [1]
-(Int, String) pair: [42, "hello"]
+// Trailing-comma form disambiguates a 1-tuple from grouping.
+() unit: ()
+(Int,) one: (1,)
+(Int, String) pair: (42, "hello")
 List<(String, Int, Bool)> rows: [
-  ["alice", 3, true],
-  ["bob", 1, false]
+  ("alice", 3, true),
+  ("bob", 1, false)
 ]
 ```
 
 Semantics:
 
-* List-literal inference now produces `Tuple<T1, T2, ...>` (instead of
-  `List<join(...)>`), preserving each element's precise type.
-  `[1, 2, 3]` infers as `Tuple<Int, Int, Int>`; `[1, "x"]` infers as
-  `Tuple<Int, String>`.
-* **Tuple → List collapse**: a homogeneous tuple still subsumes
-  `List<T>` (every element subsumes `T`), so all pre-v1.7 homogeneous-
-  list usage keeps working. `Tuple` lives **only** in the analyzer's
-  type lattice — there is no `Value::Tuple` runtime variant; at
-  runtime a tuple is a `Value::List` (see §6.7).
+* Square-bracket literals produce `List<T>` and must be homogeneous.
+  `[1, 2, 3]` is `List<Int>`; `[1, "x"]` is rejected. Use
+  `(1, "x")` for fixed heterogeneous data.
+* Parenthesized tuple literals produce `Tuple<T1, T2, ...>` and carry
+  a dedicated runtime representation (`Value::Tuple`).
 * **Tuple → Tuple**: arity check first, then per-position recursion.
   Any mismatch raises `StaticTypeMismatch` pinpointed to the position.
 * Nesting is fine: `List<(Int, String)>`, `(List<Int>, String)`,
@@ -730,18 +729,12 @@ all three:
   non-matching schema slot also got tightened: a clearly
   non-schema value shape (primitive, list, fn, tuple) is now a
   hard mismatch instead of silently accepted.
-* **Tuple-position access (`pair.0` / `pair.1`)**: pre-v1.8 the
-  walker stack dropped every non-`String` segment via
-  `path_segments`, so `pair.0` walked just `pair` and the static
-  type stayed `Tuple<...>`. v1.8 introduces `WalkSeg::Name |
-  Index` and a new `walk_segments` builder; `walk_path` gains
-  `Tuple, Index(i)` → element at position `i`,
-  `Tuple, Name(_)` → hard `UnknownStep`,
-  `List<T>, Index(_)` → `T`. Out-of-range tuple indices surface
-  `UnknownStep` (strict mode lifts to `UnknownReferenceType`);
-  list bounds checks stay runtime's job. Runtime behaviour is
-  unchanged — tuples are still `Value::List` at runtime, so
-  positional access goes through the existing list-index lookup.
+* **Tuple-position access (`pair.0` / `pair.1`)**: `WalkSeg::Name |
+  Index` preserves numeric path segments. `Tuple, Index(i)` yields
+  the element at position `i`; `Tuple, Name(_)` is a hard
+  `UnknownStep`; `List<T>, Index(_)` yields `T`. Out-of-range tuple
+  indices surface `UnknownStep` (strict mode lifts to
+  `UnknownReferenceType`); list bounds checks stay runtime's job.
 
 **v1.3 typed-spread / typed-dynkey syntax** (used by strict mode,
 also accepted in non-strict mode for opt-in static checking):
@@ -780,7 +773,7 @@ implemented in which evaluation tier so authors do not write against
 a function or syntax that silently exists in only one backend.
 
 **Tier-2 (tree-walker) only stdlib.** The tree-walker's free-fn
-registry holds ~77 `register_pure_fn` names
+registry holds ~76 `register_pure_fn` names
 (`crates/relon-evaluator/src/stdlib.rs`); within that surface a wave
 of JSON-Schema-parity helpers is registered **only in the
 tree-walker**. They have **no analyzer signatures** and are **absent
@@ -797,8 +790,7 @@ behave like the tree-walker. The set is:
   `ends_with`
 * list: `unique`, `count`, `every`, `some`
 * dict: `select_keys`, `omit_keys`
-* json / date: `to_json`, `from_json`, `parse_iso_date`,
-  `size_in_range`
+* json / date: `to_json`, `parse_iso_date`, `size_in_range`
 
 These are **tier-2 / tree-walker-only**. Treat them as
 reference-evaluator conveniences, not portable language surface,
@@ -810,14 +802,16 @@ is the file-level `#relaxed` directive, with `#unstrict` as an exact
 synonym (`crates/relon-parser/src/directive.rs`). No `#strict`
 keyword is parsed or recognized.
 
-**`Tuple` is a static-only type; there is no `Value::Tuple` runtime
-variant.** A tuple exists only in the analyzer's type lattice: list
-literals infer as `Tuple<T1, T2, ...>`, and `Tuple` slots are
-arity- and position-checked statically. At runtime a tuple **is** a
-`Value::List` — there is no dedicated tuple value
-(`crates/relon-evaluator/src/stdlib.rs`,
-`crates/relon-evaluator/src/schema.rs`). Positional access (`pair.0`)
-resolves through ordinary list indexing.
+**`List` and `Tuple` are distinct Relon values.** Square brackets
+construct homogeneous `List<T>` values; parentheses construct
+fixed-length `Tuple<T1, T2, ...>` values. Tuples carry their own
+runtime variant (`Value::Tuple`), are arity- and position-checked, and
+support positional access (`pair.0`, `pair.1`, ...). Both `List` and
+`Tuple` project to JSON arrays at the output boundary.
+
+Named tuple schemas use the same positional shape with a schema name:
+`#schema IPv4 (Int, Int, Int, Int)` declares a four-slot tuple schema,
+and `IPv4 ip` supports `ip.0` through `ip.3`.
 
 **Known doc-only gaps (not yet implemented end-to-end).** The
 following appear in design discussion but are **not** working

@@ -1,5 +1,5 @@
-// v1.7: tuples nest. The outer slot is `List<(Int, String)>` and
-// each element is itself a tuple — per-position checking flows
-// recursively into each pair.
+// Tuples nest. The outer slot is `List<(Int, String)>` and each
+// element is itself a tuple — per-position checking flows recursively
+// into each pair.
 // EXPECTED: 0 × StaticTypeMismatch.
-{ List<(Int, String)> rows: [[1, "a"], [2, "b"]] }
+{ List<(Int, String)> rows: [(1, "a"), (2, "b")] }

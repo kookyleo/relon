@@ -1,0 +1,5 @@
+// A tuple literal can satisfy a named tuple schema return type.
+// EXPECTED: 0 x MainReturnTypeMismatch.
+#schema IPv4 (Int, Int, Int, Int)
+#main(Int n) -> IPv4
+(n, 0, 0, 1)

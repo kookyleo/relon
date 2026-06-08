@@ -7,8 +7,7 @@
 //! the multi-region bounds verifier — so the native + wasm legs take exactly
 //! the same path a branded-dict return does. The only behavioural fork is the
 //! host decode: a tuple schema drains its slots **positionally** into a
-//! `Value::List`, byte-identical to the tree-walk oracle's tuple `Value::List`
-//! (whose JSON projection is a positional array).
+//! `Value::Tuple` whose JSON projection is a positional array.
 //!
 //! This file proves tree-walk == native-llvm == wasm for tuples of scalars
 //! (`Int` / `Float` / `Bool` / `String`, heterogeneous), including a String
@@ -256,22 +255,43 @@ fn run_wasm(src: &str, args: &HashMap<String, Value>) -> Option<Result<Value, St
     )
 }
 
-/// A tuple decodes to a positional `Value::List`. Normalise to the element
+/// A tuple decodes to a positional `Value::Tuple`. Normalise to the element
 /// vector so the four-way compare is element-by-element (a tuple has no field
 /// names — order is the identity).
 fn elems_of(v: &Value) -> Vec<Value> {
     match v {
-        Value::List(items) => items.as_ref().clone(),
-        other => panic!("expected List (tuple) return, got {other:?}"),
+        Value::Tuple(items) => items.as_ref().clone(),
+        other => panic!("expected Tuple return, got {other:?}"),
     }
 }
 
 /// Four-way bit-equal: tree-walk == native-llvm == wasm. The wasm leg is
 /// asserted when `wasm-ld` is present, otherwise a recorded skip (the
 /// three-way still runs).
+fn assert_value_four_way(src: &str, args: HashMap<String, Value>) {
+    let oracle = run_tree_walk(src, args.clone());
+
+    let ev = LlvmAotEvaluator::from_source_with_options(src, &opts()).expect("native from_source");
+    let native = ev.run_main(args.clone()).expect("native run_main");
+    assert_eq!(
+        native, oracle,
+        "native llvm != tree-walk oracle for `{src}`"
+    );
+
+    match run_wasm(src, &args) {
+        Some(Ok(wasm)) => assert_eq!(
+            wasm, oracle,
+            "wasm != tree-walk oracle for `{src}` (four-way bit-equal failed)"
+        ),
+        Some(Err(e)) => panic!("wasm decode failed for `{src}`: {e}"),
+        None => eprintln!("tuple_return_four_way: wasm-ld unavailable; wasm leg skipped"),
+    }
+}
+
+/// Tuple-return specialised wrapper that also asserts the oracle's
+/// container shape is positional.
 fn assert_four_way(src: &str, args: HashMap<String, Value>) {
     let oracle = run_tree_walk(src, args.clone());
-    // The oracle itself must be a tuple (positional list).
     let oracle_elems = elems_of(&oracle);
 
     let ev = LlvmAotEvaluator::from_source_with_options(src, &opts()).expect("native from_source");
@@ -297,6 +317,10 @@ fn assert_four_way(src: &str, args: HashMap<String, Value>) {
 
 fn args1(name: &str, v: Value) -> HashMap<String, Value> {
     HashMap::from([(name.to_string(), v)])
+}
+
+fn args_tuple(name: &str, items: Vec<Value>) -> HashMap<String, Value> {
+    HashMap::from([(name.to_string(), Value::Tuple(Arc::new(items)))])
 }
 
 // ---- hand-written cases ----------------------------------------------
@@ -357,5 +381,82 @@ fn tuple_int_long_string() {
     assert_four_way(
         &format!("#main(Int n) -> Tuple<Int, String>\n(n, \"{long}\")"),
         args1("n", Value::Int(-3)),
+    );
+}
+
+/// T3: tuple input + compiled `.N` access, with an arithmetic scalar return.
+#[test]
+fn tuple_param_index_arith_return() {
+    assert_value_four_way(
+        "#main(Tuple<Int, Int> pair) -> Int\npair.0 * 10 + pair.1",
+        args_tuple("pair", vec![Value::Int(4), Value::Int(2)]),
+    );
+}
+
+/// T3: tuple input + `.N` access to a pointer-indirect String field.
+#[test]
+fn tuple_param_string_index_return() {
+    assert_value_four_way(
+        "#main(Tuple<Int, String> pair) -> String\npair.1",
+        args_tuple(
+            "pair",
+            vec![Value::Int(1), Value::String("from-input".into())],
+        ),
+    );
+}
+
+/// T3: tuple input projected back into a tuple return, proving positional
+/// input marshalling, compiled `.N`, and tuple-return array decode together.
+#[test]
+fn tuple_param_project_tuple_return() {
+    assert_four_way(
+        "#main(Tuple<Int, String, Bool> pair) -> Tuple<Int, String, Bool>\n(pair.0, pair.1, pair.2)",
+        args_tuple(
+            "pair",
+            vec![
+                Value::Int(7),
+                Value::String("x".into()),
+                Value::Bool(true),
+            ],
+        ),
+    );
+}
+
+#[test]
+fn tuple_param_rejects_list_payload() {
+    let src = "#main(Tuple<Int, String> pair) -> String\npair.1";
+    let ev = LlvmAotEvaluator::from_source_with_options(src, &opts()).expect("native from_source");
+    let err = ev
+        .run_main(HashMap::from([(
+            "pair".to_string(),
+            Value::list(vec![Value::Int(7), Value::String("x".into())]),
+        )]))
+        .expect_err("Value::List must not satisfy Tuple<...> host input");
+    let rendered = format!("{err:?}");
+    assert!(
+        rendered.contains("got List"),
+        "expected tuple arg rejection to report List payload, got {rendered}"
+    );
+}
+
+/// Named tuple schema parameters use the same positional ABI as
+/// `Tuple<...>` parameters while preserving the user-facing schema name.
+#[test]
+fn named_tuple_schema_param_index_return() {
+    assert_value_four_way(
+        "#schema IPv4 (Int, Int, Int, Int)\n#main(IPv4 ip) -> Int\nip.0 * 1000000 + ip.1 * 10000 + ip.2 * 100 + ip.3",
+        args_tuple(
+            "ip",
+            vec![Value::Int(127), Value::Int(0), Value::Int(0), Value::Int(1)],
+        ),
+    );
+}
+
+/// Named tuple schema returns decode as JSON arrays, not branded objects.
+#[test]
+fn named_tuple_schema_return() {
+    assert_four_way(
+        "#schema Packet (Int, String, Bool)\n#main(Int n) -> Packet\n(n, \"ok\", true)",
+        args1("n", Value::Int(5)),
     );
 }

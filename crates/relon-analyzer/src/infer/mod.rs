@@ -91,8 +91,8 @@ pub(crate) enum InferredType {
     /// (`Int + Float` → `Number`) and by `Number`-typed slots.
     Number,
     String,
-    /// Homogeneous list. `List(Box::new(Any))` for empty / heterogeneous
-    /// list literals.
+    /// Homogeneous list. `List(Box::new(Any))` for empty literals or
+    /// for literals whose precise element type is not derivable.
     List(Box<InferredType>),
     /// Dict with String keys and the given value type. We only model the
     /// String-keyed case because the language doesn't admit non-String
@@ -108,11 +108,9 @@ pub(crate) enum InferredType {
     /// Closure / function with the given parameter types and return.
     /// Param types are `Any` when the user didn't annotate them.
     Fn(Vec<InferredType>, Box<InferredType>),
-    /// v1.7: tuple type. Element types in declaration order. Empty
-    /// vec is the unit tuple `()`. List literals (`[1, "x", true]`)
-    /// infer to `Tuple` so each element's type is preserved; the
-    /// subsumption logic folds a `Tuple` back to `List<T>` (or
-    /// rejects mismatch) when the slot's expected type is a List.
+    /// Tuple type. Element types in declaration order. Empty vec is
+    /// the unit tuple `()`. Only `(...)` literals and `Tuple<...>` type
+    /// nodes produce this shape; `[...]` remains a homogeneous List.
     Tuple(Vec<InferredType>),
 }
 
@@ -231,22 +229,6 @@ impl InferredType {
                     Some(slot) => elem.subsumes_with(slot, bases),
                     None => true,
                 },
-                // v1.7: a tuple subsumes `List<T>` iff every element
-                // type satisfies T. This is the "fold a tuple into a
-                // homogeneous list" path — what makes `[1, 2, 3]`
-                // (inferred as `Tuple(Int, Int, Int)`) acceptable in
-                // a `List<Int>` slot. Heterogeneous tuples like
-                // `Tuple(Int, String)` correctly fail against
-                // `List<Int>` because `String.subsumes(Int)` is
-                // false.
-                InferredType::Tuple(elems) => match expected.generics.first() {
-                    Some(slot) => elems.iter().all(|e| e.subsumes_with(slot, bases)),
-                    // Bare `List` — v1.7 forbids this, but we keep
-                    // permissive accept here so the diagnostic for
-                    // bare-generic fires once (at the type-position
-                    // walker) instead of cascading into mismatches.
-                    None => true,
-                },
                 _ => false,
             },
             "Dict" => match self {
@@ -278,16 +260,8 @@ impl InferredType {
                     .iter()
                     .any(|alt| enum_alt_matches(self, alt, bases))
             }
-            // v1.7: tuple-typed slot. Two cases:
-            //   - self is a Tuple: arity must match, then check
-            //     element-by-element against the slot's positional
-            //     generic args.
-            //   - self is a List<T>: every element of T must satisfy
-            //     each slot type (rare but well-defined: `List<Int>`
-            //     fits into `(Int, Int, Int)` only when arity is 3
-            //     and T is Int — but at the analyzer level we don't
-            //     know the runtime length of a List, so we fall
-            //     back to true and let runtime own the verdict).
+            // Tuple-typed slot. Only `(...)` tuple values can satisfy
+            // it; `[...]` is a List and stays a List.
             "Tuple" => match self {
                 InferredType::Tuple(elems) => {
                     let slot_count = expected.generics.len();
@@ -299,12 +273,6 @@ impl InferredType {
                         .zip(expected.generics.iter())
                         .all(|(e, slot)| e.subsumes_with(slot, bases))
                 }
-                // A `List<T>` against a fixed-arity tuple slot: the
-                // arity isn't statically known, so we accept and
-                // defer to runtime. Heterogeneous tuples never end
-                // up here because list literals infer as Tuple
-                // directly.
-                InferredType::List(_) => true,
                 _ => false,
             },
             // Custom schema name: we'd need the schema_index to know
@@ -377,18 +345,6 @@ impl InferredType {
                         .map(|(x, y)| Self::join(x, y))
                         .collect(),
                 )
-            }
-            // Tuple ∪ List: collapse the tuple to its element-join
-            // and join with the list's element type. Used by match-arm
-            // joins where one arm builds a tuple-shaped literal and
-            // another returns a List-typed value.
-            (InferredType::Tuple(elems), InferredType::List(l))
-            | (InferredType::List(l), InferredType::Tuple(elems)) => {
-                let mut acc = (**l).clone();
-                for e in elems {
-                    acc = Self::join(&acc, e);
-                }
-                InferredType::List(Box::new(acc))
             }
             (InferredType::Dict(va), InferredType::Dict(vb)) => {
                 InferredType::Dict(Box::new(Self::join(va, vb)))
@@ -872,25 +828,23 @@ pub(crate) fn infer_type(node: &Node, scope: &TypeScope) -> Option<InferredType>
         Expr::String(_) => Some(InferredType::String),
         Expr::FString(_) => Some(InferredType::String),
         Expr::List(items) => {
-            // v1.7: list literals are inferred as a tuple
-            // (`Tuple(t1, t2, ..., tn)`), preserving each element's
-            // type. Subsumption against a `List<T>` slot folds the
-            // tuple element-by-element; subsumption against a tuple
-            // slot checks position-by-position. Empty list literals
-            // become the unit tuple `Tuple()` — they still subsume
-            // every `List<T>` slot trivially because the
-            // "all elements satisfy T" predicate vacuously holds.
-            //
-            // Pre-v1.7 list literals collapsed to `List<join(...)>`.
-            // The collapse happened too early and lost information
-            // (e.g. `[1, "x"]` → `List<Any>`); the tuple-first
-            // strategy keeps the per-position type until subsumption
-            // forces a decision.
-            let elems: Vec<InferredType> = items
-                .iter()
-                .map(|item| infer_type(item, scope).unwrap_or(InferredType::Any))
-                .collect();
-            Some(InferredType::Tuple(elems))
+            // Lists are homogeneous. Preserve the list shape and join
+            // element types into a single element type; tuple-shaped,
+            // position-preserving typing belongs to `Expr::Tuple`.
+            if items.is_empty() {
+                return Some(InferredType::List(Box::new(InferredType::Any)));
+            }
+            let mut acc: Option<InferredType> = None;
+            for item in items {
+                let t = infer_list_item_type(item, scope).unwrap_or(InferredType::Any);
+                acc = Some(match acc {
+                    None => t,
+                    Some(prev) => InferredType::join(&prev, &t),
+                });
+            }
+            Some(InferredType::List(Box::new(
+                acc.unwrap_or(InferredType::Any),
+            )))
         }
         // v(T1): a `(...)` tuple value literal is a first-class tuple.
         // Unlike a list literal it is NEVER folded to `List<T>` and
@@ -1097,24 +1051,6 @@ pub(crate) fn infer_type(node: &Node, scope: &TypeScope) -> Option<InferredType>
             let item_ty = match iter_ty {
                 InferredType::List(t) => *t,
                 InferredType::Dict(v) => *v,
-                // v1.8+ fix: list literals now infer as `Tuple(...)`
-                // (v1.7 change), but a comprehension iterating over a
-                // list literal still wants the per-element type. Fold
-                // the tuple element types via `join` so
-                // `[x*x for x in [1,2,3]]` derives `x: Int` instead of
-                // `x: Any` (which used to leak past strict checks and
-                // return-type inference). Empty tuple → `Any` (caller
-                // will error on iterating an empty literal anyway).
-                InferredType::Tuple(elems) => {
-                    if elems.is_empty() {
-                        InferredType::Any
-                    } else {
-                        elems
-                            .into_iter()
-                            .reduce(|acc, t| InferredType::join(&acc, &t))
-                            .unwrap_or(InferredType::Any)
-                    }
-                }
                 // The runtime's comprehension demands a `List` iter
                 // (and the static walker will surface a mismatch
                 // separately). For inference, we keep the binding
@@ -1163,6 +1099,22 @@ pub(crate) fn infer_type(node: &Node, scope: &TypeScope) -> Option<InferredType>
             infer_type(expr, &child)
         }
         _ => None,
+    }
+}
+
+/// Infer the element contribution of one source item inside a list literal.
+/// A spread item contributes the element type of the spread source
+/// (`...[1, 2]` contributes `Int`, not `List<Int>`); non-list spread
+/// sources are left as `Any` because the spread checker owns the
+/// `NonSpreadableSource` diagnostic.
+pub(crate) fn infer_list_item_type(node: &Node, scope: &TypeScope) -> Option<InferredType> {
+    match &*node.expr {
+        Expr::Spread(inner) => match infer_type(inner, scope) {
+            Some(InferredType::List(elem)) => Some(*elem),
+            Some(_) => Some(InferredType::Any),
+            None => None,
+        },
+        _ => infer_type(node, scope),
     }
 }
 

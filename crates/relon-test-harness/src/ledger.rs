@@ -2165,6 +2165,23 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         proof: "tree-walk + cranelift (TW_CR; wasm + llvm-native legs proven four-way in \
                 relon-codegen-llvm::tuple_return_four_way)",
     },
+    // ---- Wave T3: tuple input + compiled positional access ----
+    SurfaceEntry {
+        construct: "tuple parameter positional access (`pair.0`) returning a scalar",
+        wave: "T3",
+        corpus: "tuple_param_index_arith_return",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (TW_CR; wasm + llvm-native legs proven four-way in \
+                relon-codegen-llvm::tuple_return_four_way)",
+    },
+    SurfaceEntry {
+        construct: "tuple parameter projected through `.N` into a tuple return",
+        wave: "T3",
+        corpus: "tuple_param_project_tuple_return",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (TW_CR; wasm + llvm-native legs proven four-way in \
+                relon-codegen-llvm::tuple_return_four_way)",
+    },
     // ---- backward static sibling/root field reference ----
     SurfaceEntry {
         construct: "backward `&sibling`/`&root` scalar field reference (anon-Dict return)",

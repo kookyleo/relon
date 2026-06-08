@@ -127,6 +127,7 @@ pub struct ClosureData {
 pub struct SchemaData {
     pub generics: Vec<String>,
     pub fields: std::collections::HashMap<String, SchemaField>,
+    pub tuple_elements: Option<Vec<relon_parser::TypeNode>>,
 }
 
 /// Inline payload for `Value::EnumSchema`, refcounted for the same
@@ -143,8 +144,9 @@ pub struct EnumSchemaData {
 
 /// Aggregate value type produced by the evaluator.
 ///
-/// `List` and `Dict` payloads are reference-counted: cloning a `Value::List`
-/// or `Value::Dict` only bumps an `Arc` and does not copy the underlying
+/// `List`, `Tuple`, and `Dict` payloads are reference-counted: cloning a
+/// `Value::List`, `Value::Tuple`, or `Value::Dict` only bumps an `Arc` and
+/// does not copy the underlying
 /// collection. Mutations go through `Arc::make_mut` (see [`Value::list_mut`]
 /// and [`Value::dict_mut`]), which clones the inner value lazily on first
 /// write — so existing aliases keep their snapshot semantics. This matters
@@ -172,6 +174,7 @@ pub enum Value {
     /// `Arc<str>` so clones stay O(1). See [`SmolStr`].
     String(SmolStr),
     List(Arc<Vec<Value>>),
+    Tuple(Arc<Vec<Value>>),
     Dict(Arc<ValueDict>),
     /// A unified closure (can be used as a function or a decorator).
     /// Payload is boxed; see [`ClosureData`].
@@ -205,6 +208,7 @@ impl PartialEq for Value {
             (Self::Float(l), Self::Float(r)) => l == r,
             (Self::String(l), Self::String(r)) => l == r,
             (Self::List(l), Self::List(r)) => l == r,
+            (Self::Tuple(l), Self::Tuple(r)) => l == r,
             (Self::Dict(l), Self::Dict(r)) => l == r,
             (Self::Schema(_), Self::Schema(_)) => false,
             (Self::EnumSchema(_), Self::EnumSchema(_)) => false,
@@ -225,6 +229,12 @@ impl Value {
     /// in `Arc` so subsequent clones are O(1).
     pub fn list(items: Vec<Value>) -> Self {
         Self::List(Arc::new(items))
+    }
+
+    /// Build a `Value::Tuple` from a `Vec`, taking ownership and wrapping it
+    /// in `Arc` so subsequent clones are O(1).
+    pub fn tuple(items: Vec<Value>) -> Self {
+        Self::Tuple(Arc::new(items))
     }
 
     /// Build a `Value::Dict` from any iterable of key/value pairs. The
@@ -300,7 +310,7 @@ impl Value {
             Value::Int(i) => *i != 0,
             Value::Float(f) => f.into_inner() != 0.0,
             Value::String(s) => !s.is_empty(),
-            Value::List(l) => !l.is_empty(),
+            Value::List(l) | Value::Tuple(l) => !l.is_empty(),
             Value::Dict(d) => !d.map.is_empty(),
             Value::Closure(_) => true,
             Value::Schema(_) => true,
@@ -318,6 +328,7 @@ impl Value {
             Value::Float(_) => "Float",
             Value::String(_) => "String",
             Value::List(_) => "List",
+            Value::Tuple(_) => "Tuple",
             Value::Dict(_) => "Dict",
             Value::Closure(_) => "Closure",
             Value::Schema(_) => "Schema",
@@ -394,6 +405,19 @@ impl std::fmt::Display for Value {
             Value::Float(fl) => write!(f, "{}", fl),
             Value::String(s) => write!(f, "{}", s),
             Value::List(l) => write!(f, "{:?}", l),
+            Value::Tuple(l) => {
+                write!(f, "(")?;
+                for (i, item) in l.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{item}")?;
+                }
+                if l.len() == 1 {
+                    write!(f, ",")?;
+                }
+                write!(f, ")")
+            }
             Value::Dict(d) => write!(f, "{:?}", d.map),
             Value::Closure(_) => write!(f, "<closure>"),
             Value::Schema(_) => write!(f, "<schema>"),

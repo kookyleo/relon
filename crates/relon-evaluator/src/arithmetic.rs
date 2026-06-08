@@ -114,6 +114,7 @@ impl TreeWalkEvaluator {
             return Ok(Value::Schema(Arc::new(crate::value::SchemaData {
                 generics: Vec::new(),
                 fields: merged_fields,
+                tuple_elements: None,
             })));
         }
 

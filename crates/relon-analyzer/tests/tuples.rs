@@ -145,3 +145,53 @@ fn fixture_tuple_index_list_index_silent() {
     });
     assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }
+
+// ====== tuple_schema (named positional schema) ======
+
+#[test]
+fn fixture_tuple_schema_named_ipv4_index_silent() {
+    let tree = analyze_fixture("tuple_schema/named_ipv4_index_silent.relon");
+    let n = count(&tree.diagnostics, |d| {
+        matches!(
+            d,
+            Diagnostic::StaticTypeMismatch { .. } | Diagnostic::UnknownReferenceType { .. }
+        )
+    });
+    assert_eq!(n, 0, "{:?}", tree.diagnostics);
+}
+
+#[test]
+fn fixture_tuple_schema_named_ipv4_return_silent() {
+    let tree = analyze_fixture("tuple_schema/named_ipv4_return_silent.relon");
+    let n = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::MainReturnTypeMismatch { .. })
+    });
+    assert_eq!(n, 0, "{:?}", tree.diagnostics);
+}
+
+#[test]
+fn fixture_tuple_schema_literal_into_named_schema_silent() {
+    let tree = analyze_fixture("tuple_schema/tuple_literal_into_named_schema_silent.relon");
+    let n = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::StaticTypeMismatch { .. })
+    });
+    assert_eq!(n, 0, "{:?}", tree.diagnostics);
+}
+
+#[test]
+fn fixture_tuple_schema_list_not_tuple_schema() {
+    let tree = analyze_fixture("tuple_schema/list_not_tuple_schema.relon");
+    let n = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::StaticTypeMismatch { .. })
+    });
+    assert!(n >= 1, "{:?}", tree.diagnostics);
+}
+
+#[test]
+fn fixture_tuple_schema_position_mismatch() {
+    let tree = analyze_fixture("tuple_schema/tuple_schema_position_mismatch.relon");
+    let n = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::StaticTypeMismatch { .. })
+    });
+    assert!(n >= 1, "{:?}", tree.diagnostics);
+}

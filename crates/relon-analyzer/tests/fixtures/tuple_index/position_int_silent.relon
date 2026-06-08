@@ -3,6 +3,6 @@
 // `Int first` slot.
 // EXPECTED: 0 × StaticTypeMismatch.
 {
-  (Int, String) pair: [42, "hello"],
+  (Int, String) pair: (42, "hello"),
   Int first: pair.0
 }

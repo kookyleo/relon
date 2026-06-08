@@ -174,7 +174,7 @@ impl TreeWalkEvaluator {
     }
 
     /// Enforce `Capabilities::max_value_elements`. We count elements in
-    /// `List` / `Dict` and skip primitive values entirely (their size is
+    /// `List` / `Tuple` / `Dict` and skip primitive values entirely (their size is
     /// bounded by the source).
     pub(crate) fn check_value_size(
         &self,
@@ -185,7 +185,7 @@ impl TreeWalkEvaluator {
             return Ok(());
         };
         let actual = match value {
-            Value::List(l) => l.len(),
+            Value::List(l) | Value::Tuple(l) => l.len(),
             Value::Dict(d) => d.map.len(),
             _ => return Ok(()),
         };
@@ -247,6 +247,11 @@ impl TreeWalkEvaluator {
     /// parameter must appear with a value of the declared type), bind
     /// every parameter into the root scope's locals, then evaluate the
     /// body.
+    ///
+    /// Tuple parameters must be supplied as `Value::Tuple` (or
+    /// `Value::tuple(...)`). Targetless JSON decoding such as
+    /// `serde_json::from_value::<Value>` maps JSON arrays to `Value::List`,
+    /// which intentionally does not satisfy `Tuple<...>` parameters.
     ///
     /// Errors:
     /// * [`RuntimeError::NoMainSignature`] — the file lacks a
@@ -419,6 +424,7 @@ impl TreeWalkEvaluator {
                     // shape during predicate building.
                     generics: decl.generics.clone(),
                     fields: HashMap::new(),
+                    tuple_elements: None,
                 })),
             );
             let (lowered, _diags) = relon_analyzer::lower_schema_pure(
@@ -441,15 +447,7 @@ impl TreeWalkEvaluator {
                     range: decl.directive_range,
                 });
             };
-            let value = if !def.variants.is_empty() {
-                self.build_root_enum_schema(&def)
-            } else {
-                let fields = self.build_schema_from_def(&def, scope)?;
-                Value::Schema(Arc::new(crate::value::SchemaData {
-                    generics: def.generics.clone(),
-                    fields,
-                }))
-            };
+            let value = self.build_schema_value_from_def(&def, scope)?;
             scope
                 .locals_for_write()
                 .insert(Arc::from(decl.name.as_str()), value);
@@ -492,6 +490,26 @@ impl TreeWalkEvaluator {
             generics: def.generics.clone(),
             variants,
         }))
+    }
+
+    fn build_schema_value_from_def(
+        &self,
+        def: &relon_analyzer::SchemaDef,
+        scope: &Arc<Scope>,
+    ) -> Result<Value, RuntimeError> {
+        if !def.variants.is_empty() {
+            return Ok(self.build_root_enum_schema(def));
+        }
+        let fields = if def.tuple_elements.is_some() {
+            HashMap::new()
+        } else {
+            self.build_schema_from_def(def, scope)?
+        };
+        Ok(Value::Schema(Arc::new(crate::value::SchemaData {
+            generics: def.generics.clone(),
+            fields,
+            tuple_elements: def.tuple_elements.clone(),
+        })))
     }
 
     pub(crate) fn eval_internal(
@@ -587,21 +605,17 @@ impl TreeWalkEvaluator {
 
             // A `(...)` tuple value. Fixed-arity and positional — no
             // spread, no list-context / sibling-reference semantics
-            // (those belong to list literals). Each element is evaluated
-            // in order; the runtime representation is a positional
-            // `Value::List`, so JSON output is a positional array,
-            // `.N` access reuses list indexing, and equality / Display
-            // all flow through the existing list machinery. The
-            // list-vs-tuple distinction (heterogeneity) is enforced
-            // entirely in the analyzer at the literal level. `()` is the
-            // empty list.
+            // (those belong to list literals). JSON projection still
+            // lowers to an array, but the runtime container stays
+            // distinct from `Value::List` so host APIs can mirror the
+            // surface syntax.
             Expr::Tuple(elements) => {
                 let mut values = Vec::with_capacity(elements.len());
                 for (i, el) in elements.iter().enumerate() {
                     let item_scope = current_scope.with_path(i.to_string());
                     values.push(self.eval(el, &item_scope)?);
                 }
-                let result = Value::list(values);
+                let result = Value::tuple(values);
                 self.check_value_size(&result, node.range)?;
                 Ok(result)
             }
@@ -1062,6 +1076,7 @@ impl TreeWalkEvaluator {
                 return Ok(Value::Schema(Arc::new(crate::value::SchemaData {
                     generics: def.generics.clone(),
                     fields,
+                    tuple_elements: def.tuple_elements.clone(),
                 })));
             }
         }
@@ -1081,6 +1096,7 @@ impl TreeWalkEvaluator {
         Ok(Value::Schema(Arc::new(crate::value::SchemaData {
             generics: def.generics.clone(),
             fields,
+            tuple_elements: def.tuple_elements.clone(),
         })))
     }
 
@@ -1151,6 +1167,7 @@ impl TreeWalkEvaluator {
                             return Ok(Some(Value::Schema(Arc::new(crate::value::SchemaData {
                                 generics: def.generics.clone(),
                                 fields,
+                                tuple_elements: def.tuple_elements.clone(),
                             }))));
                         }
                     }
@@ -1164,6 +1181,7 @@ impl TreeWalkEvaluator {
                         return Ok(Some(Value::Schema(Arc::new(crate::value::SchemaData {
                             generics: def.generics.clone(),
                             fields,
+                            tuple_elements: def.tuple_elements.clone(),
                         }))));
                     }
                 }
@@ -1466,15 +1484,7 @@ impl TreeWalkEvaluator {
                                 decl.schema_node.as_ref(),
                             );
                             let Some(def) = lowered else { continue };
-                            let value = if !def.variants.is_empty() {
-                                self.build_root_enum_schema(&def)
-                            } else {
-                                let fields = self.build_schema_from_def(&def, &module_scope)?;
-                                Value::Schema(Arc::new(crate::value::SchemaData {
-                                    generics: def.generics.clone(),
-                                    fields,
-                                }))
-                            };
+                            let value = self.build_schema_value_from_def(&def, &module_scope)?;
                             d_mut.map.insert(SmolStr::from(decl.name.as_str()), value);
                         }
                     }
@@ -1822,7 +1832,7 @@ impl TreeWalkEvaluator {
                     .func
                     .call(NativeArgs::from_evaluated(args, self.caps()), range)?;
                 // Catch-all enforcement of `max_value_elements` for
-                // every `List` / `Dict` produced by a native fn —
+                // every `List` / `Tuple` / `Dict` produced by a native fn —
                 // covers `range`, `string.split`, `dict.merge` (free
                 // form), `_list_map` / `_list_filter`, the `iter()`
                 // family, host-registered native fns, etc., without
@@ -2163,8 +2173,7 @@ impl TreeWalkEvaluator {
     ///       - `"string"` → one-codepoint-per-step over the wrapped
     ///         string (each element a fresh single-char `String`).
     ///       - `"dict_entries"` → key-sorted `(K, V)` pairs encoded
-    ///         as 2-element `Value::list([k, v])` (the runtime has no
-    ///         dedicated tuple variant).
+    ///         as 2-element `Value::Tuple`.
     ///
     /// Any other shape — including raw `String` / `Dict` not first
     /// turned into an iterator — surfaces a `TypeMismatch` whose
@@ -2270,7 +2279,7 @@ impl TreeWalkEvaluator {
                                 .map
                                 .iter()
                                 .map(|(k, v)| {
-                                    Value::list(vec![Value::String(k.as_str().into()), v.clone()])
+                                    Value::tuple(vec![Value::String(k.as_str().into()), v.clone()])
                                 })
                                 .collect(),
                         ))
@@ -2526,6 +2535,7 @@ impl TreeWalkEvaluator {
                         Value::Schema(Arc::new(crate::value::SchemaData {
                             generics: generics.clone(),
                             fields: HashMap::new(),
+                            tuple_elements: None,
                         })),
                     );
                     seeded.insert(name);
@@ -2603,6 +2613,7 @@ impl TreeWalkEvaluator {
                             Value::Schema(Arc::new(crate::value::SchemaData {
                                 generics,
                                 fields: HashMap::new(),
+                                tuple_elements: None,
                             })),
                         );
                     }
@@ -2916,6 +2927,7 @@ fn value_schema_tag(v: &Value) -> Option<String> {
         Value::Float(_) => Some("Float".to_string()),
         Value::String(_) => Some("String".to_string()),
         Value::List(_) => Some("List".to_string()),
+        Value::Tuple(_) => Some("Tuple".to_string()),
         Value::Null => Some("Null".to_string()),
         Value::Closure(_) | Value::Schema(_) | Value::EnumSchema(_) => None,
         Value::Type(_) | Value::Wildcard => None,

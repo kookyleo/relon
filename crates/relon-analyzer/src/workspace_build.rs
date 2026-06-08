@@ -853,6 +853,12 @@ pub struct WorkspaceImportIndex {
     /// `u.name` for cross-module schema parameters too. Last-write-wins
     /// on name collisions (same permissive policy as `spread_closures`).
     pub imported_schemas: HashMap<String, HashMap<String, TypeNode>>,
+    /// v1.8 tuple schema: positional element info for imported tuple
+    /// schemas, keyed like `imported_schemas` (`alias.Name` for alias
+    /// imports, flattened local names for spread/destructure). This lets
+    /// the path walker type `pkg.IPv4` parameters through `.0` / `.1`
+    /// without pretending tuple slots are named fields.
+    pub imported_tuple_schemas: HashMap<String, Vec<TypeNode>>,
     /// Schema-rooted §J follow-up: type hints for every root-level value
     /// field exposed by an aliased import. Keyed by `alias → field →
     /// TypeNode` so a 3-segment path `pkg.value.field` can resolve the
@@ -938,6 +944,17 @@ pub(crate) fn build_import_index(ws: &WorkspaceTree, importer_id: &str) -> Works
                 Some((name, fields))
             })
             .collect();
+        let exported_tuple_schemas: HashMap<String, Vec<TypeNode>> = target_tree
+            .schemas
+            .values()
+            .filter_map(|def| {
+                let name = def.name.clone()?;
+                if !exported_names.contains(&name) {
+                    return None;
+                }
+                Some((name, def.tuple_elements.clone()?))
+            })
+            .collect();
         // Schema-rooted §J follow-up (generics): pair `exported_schema_fields`
         // with each schema's declared generic-parameter names (e.g.
         // `Container<T>` → `["T"]`). The path-tail walker uses these
@@ -1015,6 +1032,12 @@ pub(crate) fn build_import_index(ws: &WorkspaceTree, importer_id: &str) -> Works
                 let qualified = format!("{alias}.{name}");
                 index.imported_schemas.insert(qualified, fields.clone());
             }
+            for (name, elements) in &exported_tuple_schemas {
+                let qualified = format!("{alias}.{name}");
+                index
+                    .imported_tuple_schemas
+                    .insert(qualified, elements.clone());
+            }
             // Schema-rooted §J follow-up (generics): mirror the
             // qualified-key layout for generic-parameter names.
             for (name, generics) in &exported_schema_generics {
@@ -1038,6 +1061,11 @@ pub(crate) fn build_import_index(ws: &WorkspaceTree, importer_id: &str) -> Works
             // importer's namespace.
             for (name, fields) in &exported_schema_fields {
                 index.imported_schemas.insert(name.clone(), fields.clone());
+            }
+            for (name, elements) in &exported_tuple_schemas {
+                index
+                    .imported_tuple_schemas
+                    .insert(name.clone(), elements.clone());
             }
             for (name, generics) in &exported_schema_generics {
                 index
@@ -1064,6 +1092,11 @@ pub(crate) fn build_import_index(ws: &WorkspaceTree, importer_id: &str) -> Works
                 // references like `MyUser` (alias of `User`) resolve.
                 if let Some(fields) = exported_schema_fields.get(upstream) {
                     index.imported_schemas.insert(local.clone(), fields.clone());
+                }
+                if let Some(elements) = exported_tuple_schemas.get(upstream) {
+                    index
+                        .imported_tuple_schemas
+                        .insert(local.clone(), elements.clone());
                 }
                 if let Some(generics) = exported_schema_generics.get(upstream) {
                     index

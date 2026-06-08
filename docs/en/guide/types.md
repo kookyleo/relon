@@ -26,11 +26,12 @@ during evaluation; a check failure raises a specific runtime error.
 }
 ```
 
-Built-in primitive types include: `Int`, `Float`, `Number` (covers
-both Int and Float), `String`, `Bool`, `Null`, `List`, `Dict`,
-`Closure`. (Note: `Any` was retired from the user-facing surface in
-v1.6; bare `List` / `Dict` / `Closure` without generic arguments are
-rejected by v1.7's `BareGenericContainer` diagnostic — see spec §6.6.)
+Built-in type names include: `Int`, `Float`, `Number` (covers both
+Int and Float), `String`, `Bool`, `Null`, `List<T>`,
+`Tuple<T1, T2, ...>`, `Dict<K, V>`, and `Closure<...>`. (Note:
+`Any` was retired from the user-facing surface in v1.6; bare `List` /
+`Dict` / `Closure` without generic arguments are rejected by v1.7's
+`BareGenericContainer` diagnostic — see spec §6.6.)
 
 ## Union types / untagged enums
 

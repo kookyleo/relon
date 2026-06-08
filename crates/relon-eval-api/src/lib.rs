@@ -95,6 +95,12 @@ pub trait Evaluator: Send + Sync {
 
     /// Evaluate the document as an entry program: check `args` against the
     /// file's `#main(...)` signature, bind them, then walk the body.
+    ///
+    /// Tuple parameters must be supplied as `Value::Tuple` (or
+    /// `Value::tuple(...)`). Targetless JSON decoding such as
+    /// `serde_json::from_value::<Value>` maps JSON arrays to `Value::List`,
+    /// which intentionally does not satisfy `Tuple<...>` parameters.
+    ///
     /// Returns `NoMainSignature` if the file lacks `#main(...)`.
     fn run_main(&self, args: HashMap<String, Value>) -> Result<Value, RuntimeError>;
 

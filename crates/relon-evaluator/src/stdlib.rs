@@ -135,7 +135,6 @@ pub fn register_to(ctx: &mut Context) {
     let is_ipv6: Arc<dyn RelonFunction> = Arc::new(IsIpv6);
     let multiple_of: Arc<dyn RelonFunction> = Arc::new(MultipleOf);
     let to_json: Arc<dyn RelonFunction> = Arc::new(ToJson);
-    let from_json: Arc<dyn RelonFunction> = Arc::new(FromJson);
     ctx.register_pure_fn("matches", Arc::clone(&string_matches));
     ctx.register_pure_fn("starts_with", Arc::clone(&string_starts_with));
     ctx.register_pure_fn("ends_with", Arc::clone(&string_ends_with));
@@ -147,7 +146,6 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_fn("is_ipv6", Arc::clone(&is_ipv6));
     ctx.register_pure_fn("multiple_of", Arc::clone(&multiple_of));
     ctx.register_pure_fn("to_json", Arc::clone(&to_json));
-    ctx.register_pure_fn("from_json", Arc::clone(&from_json));
 
     // Stdlib JSON Schema parity wave — batch 2: numeric helpers.
     let in_range: Arc<dyn RelonFunction> = Arc::new(InRange);
@@ -1790,8 +1788,7 @@ impl RelonFunction for IterFromString {
 
 /// Iter-builder for `Dict<K, V>.iter()`. Entries iterate in sorted key
 /// order (matches `Dict.keys()`). Element shape per step is a 2-tuple
-/// `(K, V)` encoded as `Value::list([k, v])` since the runtime does
-/// not have a dedicated Tuple value variant.
+/// `(K, V)` encoded as `Value::Tuple([k, v])`.
 struct IterFromDict;
 impl RelonFunction for IterFromDict {
     fn call(
@@ -1959,7 +1956,7 @@ impl RelonFunction for IterNext {
                         .nth(idx)
                         .map(|(k, v)| (k.as_str(), v.clone()))
                         .unwrap_or(("", Value::Null));
-                    Value::list(vec![Value::String(key.into()), v])
+                    Value::tuple(vec![Value::String(key.into()), v])
                 })
             }
             other => {
@@ -2727,26 +2724,6 @@ impl RelonFunction for ToJson {
     }
 }
 
-/// `from_json(s) -> Value` — parse a JSON string into Relon's Value.
-/// Numbers parse to Int when they round-trip exactly, otherwise
-/// Float; objects parse to Dict (no brand); arrays to List.
-struct FromJson;
-impl RelonFunction for FromJson {
-    fn call(
-        &self,
-        args: NativeArgs,
-        range: relon_parser::TokenRange,
-    ) -> Result<Value, RuntimeError> {
-        let args = args.into_positional();
-        expect_arg_count(&args, 1, range)?;
-        let s = expect_string(&args[0], range)?;
-        let json: serde_json::Value = serde_json::from_str(s).map_err(|e| {
-            RuntimeError::ValidationError(format!("from_json parse failed: {e}"), range)
-        })?;
-        Ok(json_to_value(json))
-    }
-}
-
 /// Minimal `Value` → `serde_json::Value` for stdlib `to_json`. Schema /
 /// EnumSchema / Closure / Wildcard / Brand-only / Native types fall to
 /// `null` because they have no JSON representation; user code that
@@ -2761,7 +2738,9 @@ fn value_to_json(value: &Value) -> serde_json::Value {
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
         Value::String(s) => serde_json::Value::String(s.as_str().to_owned()),
-        Value::List(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
+        Value::List(items) | Value::Tuple(items) => {
+            serde_json::Value::Array(items.iter().map(value_to_json).collect())
+        }
         Value::Dict(dict) => {
             let map = dict
                 .map
@@ -2771,27 +2750,6 @@ fn value_to_json(value: &Value) -> serde_json::Value {
             serde_json::Value::Object(map)
         }
         _ => serde_json::Value::Null,
-    }
-}
-
-fn json_to_value(json: serde_json::Value) -> Value {
-    match json {
-        serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(b) => Value::Bool(b),
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Value::Int(i)
-            } else if let Some(f) = n.as_f64() {
-                Value::Float(f.into())
-            } else {
-                Value::Null
-            }
-        }
-        serde_json::Value::String(s) => Value::String(s.into()),
-        serde_json::Value::Array(a) => Value::list(a.into_iter().map(json_to_value).collect()),
-        serde_json::Value::Object(o) => {
-            Value::dict(o.into_iter().map(|(k, v)| (k, json_to_value(v))))
-        }
     }
 }
 

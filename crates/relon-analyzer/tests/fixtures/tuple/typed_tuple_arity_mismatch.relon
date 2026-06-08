@@ -1,4 +1,4 @@
 // v1.7: a 3-element literal can't subsume a 2-tuple slot — the
 // arity check fires before per-position recursion.
 // EXPECTED: ≥ 1 × StaticTypeMismatch on the `pair` field.
-{ (Int, String) pair: [1, "two", 3] }
+{ (Int, String) pair: (1, "two", 3) }

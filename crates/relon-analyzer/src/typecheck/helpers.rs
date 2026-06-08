@@ -144,14 +144,6 @@ pub(super) fn same_outer_container(inferred: &InferredType, expected: &TypeNode)
         (inferred, expected.path[0].as_str()),
         (InferredType::List(_), "List")
             | (InferredType::Dict(_), "Dict")
-            // v1.7: list literals infer as Tuple, but they are
-            // structurally lists from the surface syntax. When the
-            // declared slot is `List<T>`, route the value through
-            // the per-element walker so each `xs[i]: ...` mismatch
-            // shows up with its precise position rather than the
-            // coarser `(Int, String, Int) vs List<Int>` outer
-            // diagnostic. Same idea for tuple-typed slots.
-            | (InferredType::Tuple(_), "List")
             | (InferredType::Tuple(_), "Tuple")
     )
 }

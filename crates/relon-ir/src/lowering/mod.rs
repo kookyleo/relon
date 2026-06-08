@@ -753,7 +753,8 @@ fn lower_entry_with_resolver<'a>(
     // `lower_workspace` cross-file aggregate is consulted here; for
     // single-file builds the helper still constructs a one-tree
     // resolver before delegating.
-    let user_return_schema = resolve_return_user_schema(sig.return_type.as_ref(), &resolver)?;
+    let resolved_user_return_schema =
+        resolve_return_user_schema(sig.return_type.as_ref(), &resolver)?;
 
     // Wave T2: a `#main(...) -> Tuple<...>` return synthesises an
     // anonymous positional-record schema. It reuses the whole record /
@@ -762,13 +763,17 @@ fn lower_entry_with_resolver<'a>(
     // host decodes it positionally to a JSON array (`is_tuple`). An
     // out-of-surface element type is a loud cap here, not a silent
     // mis-encode.
-    let tuple_return_schema: Option<Schema> = match sig.return_type.as_ref() {
-        Some(rt) => match return_tuple_canonical(rt) {
-            Some(res) => Some(res?),
+    let tuple_return_schema: Option<Schema> = match resolved_user_return_schema.as_ref() {
+        Some(schema) if schema.is_tuple => Some(schema.clone()),
+        _ => match sig.return_type.as_ref() {
+            Some(rt) => match return_tuple_canonical(rt) {
+                Some(res) => Some(res?),
+                None => None,
+            },
             None => None,
         },
-        None => None,
     };
+    let user_return_schema = resolved_user_return_schema.filter(|schema| !schema.is_tuple);
 
     // Phase F.2 (W7 anon-Dict-return): `#main(...) -> Dict { ... }`
     // synthesises an anonymous return schema by per-field inference
@@ -1236,6 +1241,16 @@ fn type_node_to_canonical_with_schemas(
 ) -> Option<TypeRepr> {
     if let Some(scalar) = type_node_to_canonical(t) {
         return Some(scalar);
+    }
+    // Wave T3: `Tuple<...>` parameters ride the existing schema-pointer
+    // input ABI as anonymous positional records, symmetric with T2 tuple
+    // returns. The first compiled surface keeps the T2 scalar element
+    // boundary; nested tuples / lists fall through to the caller's loud
+    // unsupported-type cap.
+    if let Some(schema) = tuple_type_node_to_schema(t) {
+        return Some(TypeRepr::Schema {
+            schema: Box::new(schema),
+        });
     }
     // Phase 10-c: `List<User>` — the head is `List` with a single
     // generic naming a user schema. Recurse into the generic via
@@ -2633,6 +2648,30 @@ fn lower_anon_dict_body(
 /// scalar-wrapper or branded return.
 pub const TUPLE_RETURN_SCHEMA_NAME: &str = "Tuple";
 
+/// Wave T3: canonicalise a `Tuple<T0, T1, ...>` type node into the
+/// anonymous positional-record schema used by the compiled boundary.
+///
+/// This helper is intentionally positive-only: it returns `None` both
+/// when `t` is not a tuple and when a tuple element is outside the T2/T3
+/// scalar surface. Callers that need a precise "tuple element unsupported"
+/// diagnostic (currently tuple returns) own that cap at their call site;
+/// parameter/method signature builders can keep using their existing
+/// broad unsupported-type caps.
+fn tuple_type_node_to_schema(t: &TypeNode) -> Option<Schema> {
+    if t.path.len() != 1 || t.path[0].as_str() != "Tuple" || t.variant_fields.is_some() {
+        return None;
+    }
+    let mut elements = Vec::with_capacity(t.generics.len());
+    for g in &t.generics {
+        let elem = match type_node_to_canonical(g) {
+            Some(e @ (TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool | TypeRepr::String)) => e,
+            _ => return None,
+        };
+        elements.push(elem);
+    }
+    Some(Schema::tuple(TUPLE_RETURN_SCHEMA_NAME, elements))
+}
+
 /// Wave T2: canonicalise a `Tuple<T0, T1, ...>` return type node to a
 /// tuple [`Schema`] (an anonymous positional record). First cut: every
 /// element must be a scalar (`Int` / `Float` / `Bool` / `String`) so the
@@ -3507,6 +3546,34 @@ fn type_head_for_display(t: &TypeNode) -> String {
         s.push('>');
     }
     s
+}
+
+fn token_key_display(key: &TokenKey) -> String {
+    match key {
+        TokenKey::Dummy => "_".to_string(),
+        TokenKey::Index(i, optional) => {
+            if *optional {
+                format!("{i}?")
+            } else {
+                i.to_string()
+            }
+        }
+        TokenKey::String(s, _, optional) => {
+            if *optional {
+                format!("{s}?")
+            } else {
+                s.clone()
+            }
+        }
+        TokenKey::Dynamic(_, optional) => {
+            if *optional {
+                "<dynamic>?".to_string()
+            } else {
+                "<dynamic>".to_string()
+            }
+        }
+        TokenKey::Spread(_) => "...".to_string(),
+    }
 }
 
 /// Recursive expression lowering. Appends ops to `ctx.out` in postfix /
@@ -7293,6 +7360,27 @@ fn canonical_schema_from_def<'a>(
         ));
     }
     stack.push(name);
+    if let Some(elements) = &def.tuple_elements {
+        let mut tys = Vec::with_capacity(elements.len());
+        for (idx, ty_node) in elements.iter().enumerate() {
+            let ty = canonical_type_repr(ty_node, resolver, stack, range).map_err(|_| {
+                cap!(
+                    "canonical_schema_from_def.unsupported_tuple_element_type",
+                    LoweringError::UnsupportedFieldType {
+                        schema: name.to_string(),
+                        field: idx.to_string(),
+                        ty: type_head_for_display(ty_node),
+                        range: ty_node.range,
+                    }
+                )
+            })?;
+            tys.push(ty);
+        }
+        stack.pop();
+        let mut schema = Schema::tuple(name.to_string(), tys);
+        schema.generics = def.generics.clone();
+        return Ok(schema);
+    }
     let mut fields = Vec::with_capacity(def.fields.len());
     for f in &def.fields {
         let ty_node = f.type_hint.as_ref().ok_or_else(|| {
@@ -8690,8 +8778,32 @@ fn lower_variable(
         // diagnostic below so the rejection message stays precise.
     }
     for seg in &path[1..] {
-        let field_name = match seg {
-            TokenKey::String(s, _, _) => s.as_str(),
+        let Some(schema) = current_schema.clone() else {
+            return Err(cap!(
+                "lower_variable.unsupported_expr.8",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "Variable(field-on-non-schema-base, segment=`{}`)",
+                        token_key_display(seg)
+                    ),
+                    range,
+                }
+            ));
+        };
+        let field_name: std::borrow::Cow<'_, str> = match seg {
+            TokenKey::String(s, _, _) => std::borrow::Cow::Borrowed(s.as_str()),
+            TokenKey::Index(i, optional) if schema.is_tuple && !*optional => {
+                std::borrow::Cow::Owned(i.to_string())
+            }
+            TokenKey::Index(_, true) if schema.is_tuple => {
+                return Err(cap!(
+                    "lower_variable.unsupported_expr.7",
+                    LoweringError::UnsupportedExpr {
+                        kind: "Variable(optional-tuple-index unsupported)".to_string(),
+                        range,
+                    }
+                ));
+            }
             _ => {
                 return Err(cap!(
                     "lower_variable.unsupported_expr.7",
@@ -8702,18 +8814,6 @@ fn lower_variable(
                 ));
             }
         };
-        let Some(schema) = current_schema.clone() else {
-            return Err(cap!(
-                "lower_variable.unsupported_expr.8",
-                LoweringError::UnsupportedExpr {
-                    kind: format!(
-                        "Variable(field-on-non-schema-base, segment=`{}`)",
-                        field_name
-                    ),
-                    range,
-                }
-            ));
-        };
         // Recompute the layout for the current schema shape. Cached
         // canonical schemas are reused across calls so the resolver
         // doesn't repeatedly re-walk the analyzer tree.
@@ -8721,7 +8821,7 @@ fn lower_variable(
         let field_idx = schema
             .fields
             .iter()
-            .position(|f| f.name == field_name)
+            .position(|f| f.name == field_name.as_ref())
             .ok_or_else(|| {
                 cap!(
                     "lower_variable.unsupported_field_type",

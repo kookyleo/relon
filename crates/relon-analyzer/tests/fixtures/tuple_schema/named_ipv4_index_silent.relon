@@ -1,0 +1,6 @@
+// Named tuple schema: `IPv4` is a fixed positional schema, and `.0`
+// resolves to its first Int slot.
+// EXPECTED: 0 x StaticTypeMismatch / UnknownReferenceType.
+#schema IPv4 (Int, Int, Int, Int)
+#main(IPv4 ip) -> Int
+ip.0

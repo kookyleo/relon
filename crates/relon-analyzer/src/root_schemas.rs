@@ -41,9 +41,10 @@ pub struct RootSchemaDecl {
     /// substitute `T → Int` and the analyzer reported field types
     /// like `T` as `UnknownTypeName`.
     pub generics: Vec<String>,
-    /// AST node of the schema body — a `Dict` literal or an `Enum<...>`
-    /// type expression. The evaluator builds a `Value::Schema` from this
-    /// node the same way it does for dict-field `#schema X : {...}`.
+    /// AST node of the schema body — a `Dict` literal, a tuple body
+    /// (`(...)`), or an `Enum<...>` type expression. The evaluator builds
+    /// a `Value::Schema` from this node the same way it does for
+    /// dict-field `#schema X : {...}`.
     pub schema_node: Arc<Node>,
     /// Source range of the entire directive (for diagnostics).
     pub directive_range: TokenRange,
@@ -77,11 +78,12 @@ pub fn collect_root_schemas(root: &Node, tree: &mut AnalyzedTree) {
         // produce a schema at runtime, so reject it eagerly.
         // Accepted body shapes:
         //   * `Dict { ... }` literal — a struct schema body.
+        //   * `Tuple (...)` literal — a positional tuple schema body.
         //   * `Enum<...>` type expression — a sum-type schema body.
         //   * `Base + { ... }` (or chained) — base-schema composition.
         //   * Plain reference / variable — an alias for an existing
         //     schema (validated at runtime by `lower_schema_pure`).
-        let valid = matches!(body.expr.as_ref(), Expr::Dict(_))
+        let valid = matches!(body.expr.as_ref(), Expr::Dict(_) | Expr::Tuple(_))
             || matches!(body.expr.as_ref(),
                 Expr::Type(t) if t.path.len() == 1 && t.path[0] == "Enum")
             || matches!(body.expr.as_ref(), Expr::Binary(Operator::Add, _, _))

@@ -460,9 +460,9 @@ pub enum Expr {
     List(Vec<Node>),
     /// Fixed-arity, heterogeneous, positional tuple value `(e1, e2, ...)`.
     /// Distinct from `List` so the analyzer can type it position-by-position
-    /// (heterogeneous elements allowed, unlike a list literal) while it
-    /// still evaluates to a positional `Value::List` at runtime (so JSON
-    /// output is a positional array and `.N` access reuses list indexing).
+    /// (heterogeneous elements allowed, unlike a list literal) and the
+    /// evaluator can preserve that distinction as `Value::Tuple`. JSON
+    /// output still projects it as a positional array.
     /// `Tuple(vec![])` is the unit / zero-tuple `()`.
     Tuple(Vec<Node>),
     Dict(Vec<(TokenKey, Node)>),

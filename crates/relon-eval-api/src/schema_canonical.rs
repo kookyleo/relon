@@ -40,9 +40,10 @@ use sha2::{Digest, Sha256};
 /// canonical form is a structural snapshot that strips presentation
 /// metadata and inlines nested schemas.
 ///
-/// Variants mirror the v1 binary layout's leaf-type table; extending
-/// the layout in a later phase (e.g. `Bytes`, `Tuple<...>`) requires
-/// adding the variant here so the hash distinguishes the new shape.
+/// Variants mirror the v1 binary layout's leaf-type table. Tuple
+/// shapes are represented as tuple schemas (`Schema::is_tuple = true`);
+/// future leaf/container layout shapes such as `Bytes` would need a new
+/// variant here so the hash distinguishes the new shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum TypeRepr {
@@ -155,8 +156,8 @@ pub struct Schema {
     /// fields carry the synthetic positional names `"0"`, `"1"`, ...),
     /// so the whole record/return ABI is reused unchanged. The only
     /// behavioural fork is the **host decode**: a tuple schema decodes
-    /// to a positional JSON array (`Value::List`), byte-identical to the
-    /// tree-walk oracle's `Value::List`, rather than to a branded object.
+    /// to a positional `Value::Tuple`, which JSON projection later emits
+    /// as an array, rather than to a branded object.
     ///
     /// Serialised only when `true`, so every pre-T2 (non-tuple) schema's
     /// canonical bytes — and therefore its ABI hash — stay unchanged.
@@ -180,7 +181,7 @@ impl Schema {
     /// `Tuple<...>` from its element types in order. Field names are the
     /// synthetic decimal indices `"0"`, `"1"`, ... so the existing
     /// declaration-order layout pass assigns one slot per element; the
-    /// `is_tuple` flag drives the array-shaped host decode.
+    /// `is_tuple` flag drives positional `Value::Tuple` host decode.
     pub fn tuple(name: impl Into<String>, elements: Vec<TypeRepr>) -> Self {
         let fields = elements
             .into_iter()

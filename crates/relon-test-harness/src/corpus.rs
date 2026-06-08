@@ -37,6 +37,7 @@
 //! coverage so a later refactor can't quietly un-widen.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use ordered_float::OrderedFloat;
 use relon_eval_api::Value;
@@ -194,6 +195,26 @@ fn args_x_42() -> HashMap<String, Value> {
 }
 fn args_n_7() -> HashMap<String, Value> {
     one_int("n", 7)
+}
+fn args_tuple_pair_ints() -> HashMap<String, Value> {
+    let mut m = HashMap::new();
+    m.insert(
+        "pair".to_string(),
+        Value::Tuple(Arc::new(vec![Value::Int(4), Value::Int(2)])),
+    );
+    m
+}
+fn args_tuple_int_string_bool() -> HashMap<String, Value> {
+    let mut m = HashMap::new();
+    m.insert(
+        "pair".to_string(),
+        Value::Tuple(Arc::new(vec![
+            Value::Int(7),
+            Value::String("x".into()),
+            Value::Bool(true),
+        ])),
+    );
+    m
 }
 fn args_x_max() -> HashMap<String, Value> {
     one_int("x", i64::MAX)
@@ -1186,7 +1207,7 @@ pub fn all_cases() -> Vec<CorpusCase> {
         // ---- Wave T2: tuple return (anonymous positional record) ----
         // A `#main(...) -> Tuple<...>` lowers to a positional record that
         // reuses the whole branded-record/return ABI; the only fork is the
-        // host decode (positional `Value::List` → JSON array). Shares the
+        // host decode (positional `Value::Tuple` → JSON array). Shares the
         // DictReturn tier (schema-rooted output buffer) and rides `TW_CR`:
         // the bytecode / trace recipe catalogues don't model anon-record
         // construction, and the wasm + llvm-native legs are proven in the
@@ -1202,6 +1223,24 @@ pub fn all_cases() -> Vec<CorpusCase> {
             name: "tuple_int_pair_return",
             source: "#main(Int n) -> Tuple<Int, Int>\n(n, n + 1)",
             args_factory: args_n_7,
+            tier: Tier::DictReturn,
+            supported_by: TW_CR,
+        },
+        // ---- Wave T3: tuple input + compiled positional access ----
+        // Tuple params use the same anonymous positional-record ABI as
+        // tuple returns. `pair.0` / `pair.1` lower as field loads from
+        // synthetic slots `"0"` / `"1"`.
+        CorpusCase {
+            name: "tuple_param_index_arith_return",
+            source: "#main(Tuple<Int, Int> pair) -> Int\npair.0 * 10 + pair.1",
+            args_factory: args_tuple_pair_ints,
+            tier: Tier::DictReturn,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "tuple_param_project_tuple_return",
+            source: "#main(Tuple<Int, String, Bool> pair) -> Tuple<Int, String, Bool>\n(pair.0, pair.1, pair.2)",
+            args_factory: args_tuple_int_string_bool,
             tier: Tier::DictReturn,
             supported_by: TW_CR,
         },
@@ -1417,23 +1456,14 @@ pub fn all_cases() -> Vec<CorpusCase> {
         // the corpus ratchet then asserts cranelift *gracefully* caps
         // rather than silently miscompiling.
         //
-        // LIST spread `[...a, b, ...c]`: the analyzer infers a list
-        // literal as a tuple (`infer/mod.rs` `Expr::List` ->
-        // `InferredType::Tuple`), and a spread element keeps the source's
-        // own type (`Expr::Spread(inner) -> infer_type(inner)`). So
-        // `[...[1,2,3], 4, ...[5,6]]` infers as
-        // `Tuple(Tuple(Int,Int,Int), Int, Tuple(Int,Int))`, never a
-        // `List<Int>`. The tuple-folds-into-`List<T>` subsumption
-        // (`infer/mod.rs` "List" arm) requires *every* tuple element to
-        // satisfy the slot's `T`; a `List`/`Tuple` element never satisfies
-        // a scalar `T`, so any `-> List<scalar>` return slot rejects with
-        // a return-type mismatch. With no declared return the entry type
-        // is `<missing>`, which the compiled backend's marshaller also
-        // rejects. Spread flattening only happens at runtime in the
-        // tree-walker (`eval.rs` `Expr::List` spread branch). Lifting this
-        // would change list/spread *type inference* (fold a spread
-        // source's element type into the surrounding tuple), not add a
-        // codegen lowering — out of scope for an IR-coverage wave.
+        // LIST spread `[...a, b, ...c]`: spread flattening only happens
+        // at runtime in the tree-walker (`eval.rs` `Expr::List` spread
+        // branch). Statically, spread elements keep the source's own list
+        // type, so a mixed spread/scalar literal is not a homogeneous
+        // `List<Int>`. With no declared return the entry type is
+        // `<missing>`, which the compiled backend's marshaller also
+        // rejects. Lifting this would change list/spread inference, not
+        // add a codegen lowering — out of scope for an IR-coverage wave.
         CorpusCase {
             name: "r12_list_spread_capped",
             source: "#main()\n[...[1, 2, 3], 4, ...[5, 6]]",

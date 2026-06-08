@@ -1,0 +1,4 @@
+// `[]` is a List, not a tuple. It must not satisfy a tuple schema.
+// EXPECTED: >= 1 x StaticTypeMismatch.
+#schema IPv4 (Int, Int, Int, Int)
+{ IPv4 ip: [127, 0, 0, 1] }

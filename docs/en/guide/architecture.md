@@ -101,9 +101,9 @@ Diagnostics have two levels: `Severity::Error` blocks evaluation;
   drops runtime-only Values (closures, schemas, EnumSchemas, types,
   wildcards) inside a Dict; `#internal` fields go one step further —
   they never enter `Value::Dict::map`, so the projector can't see
-  them. But in a **List** or at the document **root**, encountering
+  them. But in a **List**, **Tuple**, or at the document **root**, encountering
   a closure raises `UnsupportedClosure` instead of being silent: a
-  list is a "data sequence", and silently dropping an element would
+  list/tuple is a data sequence, and silently dropping an element would
   make indices and length lie. `#internal` / closure filtering /
   `UnsupportedClosure` are three layered defenses: the first two
   hide "things that shouldn't appear" position-by-position; the
@@ -135,8 +135,8 @@ See [Host integration](./host-integration).
   granted by the host in `Capabilities` for the sandbox to allow
   the call. That's the only authorization path — no by-name
   allowlist, no global short-circuit.
-- **Budgets**: `max_steps` (exceeded → `StepLimitExceeded`),
-  `max_value_elements` (list/dict construction checkpoints).
+- **Budgets**: `max_steps` (exceeded -> `StepLimitExceeded`),
+  `max_value_elements` (list/tuple/dict construction checkpoints).
 
 The filesystem's real enforcement point is the resolver:
 `FilesystemModuleResolver` denies by default; `with_root_dir`

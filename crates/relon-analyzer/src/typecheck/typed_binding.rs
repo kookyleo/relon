@@ -45,6 +45,9 @@ impl<'a> Walker<'a> {
         // the legacy name-string path for the diagnostic shape.
         let scope = self.build_type_scope();
         let inferred = infer_type(value, &scope);
+        if self.check_tuple_schema_literal(expected, value, field_name) {
+            return;
+        }
         if let Some(t) = &inferred {
             if t.subsumes_with_imports(
                 expected,
@@ -165,40 +168,35 @@ impl<'a> Walker<'a> {
             Expr::List(items) => {
                 if expected.path == vec!["List"] && expected.generics.len() == 1 {
                     let inner_expected = &expected.generics[0];
+                    let spread_expected = TypeNode {
+                        path: vec!["List".to_string()],
+                        generics: vec![inner_expected.clone()],
+                        is_optional: false,
+                        range: expected.range,
+                        variant_fields: None,
+                        doc_comment: None,
+                    };
                     for (i, item) in items.iter().enumerate() {
-                        self.check_typed_binding(
-                            inner_expected,
-                            item,
-                            &format!("{}[{}]", field_name, i),
-                        );
-                    }
-                }
-                // v1.7: list literal landing in a tuple-typed slot.
-                // Validate arity first; on mismatch emit a single
-                // top-level diagnostic with an arity-flavored message.
-                // On arity match, recurse into each position with the
-                // declared positional type.
-                if expected.path == vec!["Tuple"] {
-                    if items.len() != expected.generics.len() {
-                        self.tree.diagnostics.push(Diagnostic::StaticTypeMismatch {
-                            field: field_name.to_string(),
-                            expected: format_type(expected),
-                            found: format!("tuple of {} element(s)", items.len()),
-                            range: span_of(value.range),
-                        });
-                        return;
-                    }
-                    for (i, (item, slot)) in items.iter().zip(expected.generics.iter()).enumerate()
-                    {
-                        self.check_typed_binding(slot, item, &format!("{}[{}]", field_name, i));
+                        if let Expr::Spread(inner) = &*item.expr {
+                            self.check_typed_binding(
+                                &spread_expected,
+                                inner,
+                                &format!("{}[{}]", field_name, i),
+                            );
+                        } else {
+                            self.check_typed_binding(
+                                inner_expected,
+                                item,
+                                &format!("{}[{}]", field_name, i),
+                            );
+                        }
                     }
                 }
             }
             // A `(...)` tuple value landing in a typed slot. The common
             // case is a `Tuple<T1, T2, ...>` slot: check arity, then
-            // recurse position-by-position. A tuple is also accepted in
-            // a `List<T>` slot when every element subsumes `T` (mirrors
-            // the list-literal-into-List path above).
+            // recurse position-by-position. It is not a List: tuple
+            // values only satisfy tuple-typed slots.
             Expr::Tuple(items) => {
                 if expected.path == vec!["Tuple"] {
                     if items.len() != expected.generics.len() {
@@ -213,15 +211,6 @@ impl<'a> Walker<'a> {
                     for (i, (item, slot)) in items.iter().zip(expected.generics.iter()).enumerate()
                     {
                         self.check_typed_binding(slot, item, &format!("{}[{}]", field_name, i));
-                    }
-                } else if expected.path == vec!["List"] && expected.generics.len() == 1 {
-                    let inner_expected = &expected.generics[0];
-                    for (i, item) in items.iter().enumerate() {
-                        self.check_typed_binding(
-                            inner_expected,
-                            item,
-                            &format!("{}[{}]", field_name, i),
-                        );
                     }
                 }
             }
@@ -293,6 +282,41 @@ impl<'a> Walker<'a> {
         }
     }
 
+    fn check_tuple_schema_literal(
+        &mut self,
+        expected: &TypeNode,
+        value: &Node,
+        field_name: &str,
+    ) -> bool {
+        let Some((schema_name, elements)) =
+            crate::schema::tuple_elements_for_schema_type(self.tree, expected)
+        else {
+            return false;
+        };
+        let Expr::Tuple(items) = &*value.expr else {
+            return false;
+        };
+        if items.len() != elements.len() {
+            self.tree.diagnostics.push(Diagnostic::StaticTypeMismatch {
+                field: field_name.to_string(),
+                expected: format_type(expected),
+                found: format!("tuple of {} element(s)", items.len()),
+                range: span_of(value.range),
+            });
+            return true;
+        }
+        let subst_map = self.build_generic_subst(&schema_name, expected);
+        for (i, (item, slot)) in items.iter().zip(elements.iter()).enumerate() {
+            let resolved = if subst_map.is_empty() {
+                slot.clone()
+            } else {
+                substitute_generics_in_typenode(slot, &subst_map)
+            };
+            self.check_typed_binding(&resolved, item, &format!("{}[{}]", field_name, i));
+        }
+        true
+    }
+
     /// v1.8+ fix (issue 4): collect the `param_name → arg_TypeNode`
     /// substitution implied by `expected` (e.g. `Box<Int>` against
     /// `#schema Box<T> { ... }` produces `{T → Int}`). Returns an
@@ -322,6 +346,12 @@ impl<'a> Walker<'a> {
                     .iter()
                     .find(|d| d.name == schema_name)
                     .map(|d| d.generics.clone())
+            })
+            .or_else(|| {
+                self.tree
+                    .workspace_import_index
+                    .as_ref()
+                    .and_then(|idx| idx.imported_schema_generics.get(schema_name).cloned())
             })
             .unwrap_or_default();
         for (i, p) in params.iter().enumerate() {

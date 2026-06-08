@@ -12,7 +12,8 @@ use crate::diagnostic::{span_of, Diagnostic};
 use crate::infer::{infer_from_type_node_with_imports, infer_type, InferredType, TypeScope};
 use crate::tree::AnalyzedTree;
 use crate::typecheck::format_type;
-use relon_parser::Node;
+use relon_parser::{Node, TypeNode};
+use std::collections::HashMap;
 
 /// Walk the entry root's body under the inferred-types lens and push a
 /// [`Diagnostic::MainReturnTypeMismatch`] if the body's static type
@@ -48,6 +49,9 @@ pub(crate) fn check_main_return(root: &Node, tree: &mut AnalyzedTree) {
     let Some(body_ty) = infer_type(root, &scope) else {
         return;
     };
+    if tuple_schema_return_matches(tree, return_type, &body_ty, &bases) {
+        return;
+    }
     if body_ty.subsumes_with_imports(
         return_type,
         Some(&bases),
@@ -66,6 +70,67 @@ pub(crate) fn check_main_return(root: &Node, tree: &mut AnalyzedTree) {
         found: body_ty.name(),
         range: span_of(signature.range),
     });
+}
+
+fn tuple_schema_return_matches(
+    tree: &AnalyzedTree,
+    return_type: &TypeNode,
+    body_ty: &InferredType,
+    bases: &crate::infer::SchemaBaseIndex,
+) -> bool {
+    let Some((schema_name, mut elements)) =
+        crate::schema::tuple_elements_for_schema_type(tree, return_type)
+    else {
+        return false;
+    };
+    let InferredType::Tuple(items) = body_ty else {
+        return false;
+    };
+    if items.len() != elements.len() {
+        return false;
+    }
+    let subst = tuple_schema_generic_subst(tree, &schema_name, return_type);
+    if !subst.is_empty() {
+        elements = elements
+            .iter()
+            .map(|t| crate::typecheck::substitute_generics_in_typenode(t, &subst))
+            .collect();
+    }
+    items.iter().zip(elements.iter()).all(|(item, slot)| {
+        item.subsumes_with_imports(slot, Some(bases), tree.workspace_import_index.as_ref())
+    })
+}
+
+fn tuple_schema_generic_subst(
+    tree: &AnalyzedTree,
+    schema_name: &str,
+    expected: &TypeNode,
+) -> HashMap<String, TypeNode> {
+    if expected.generics.is_empty() {
+        return HashMap::new();
+    }
+    let params = tree
+        .schemas
+        .values()
+        .find(|def| def.name.as_deref() == Some(schema_name))
+        .map(|def| def.generics.clone())
+        .or_else(|| {
+            tree.root_schemas
+                .iter()
+                .find(|d| d.name == schema_name)
+                .map(|d| d.generics.clone())
+        })
+        .or_else(|| {
+            tree.workspace_import_index
+                .as_ref()
+                .and_then(|idx| idx.imported_schema_generics.get(schema_name).cloned())
+        })
+        .unwrap_or_default();
+    params
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| expected.generics.get(i).map(|arg| (p.clone(), arg.clone())))
+        .collect()
 }
 
 #[cfg(test)]

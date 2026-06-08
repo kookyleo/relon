@@ -24,10 +24,10 @@ pub enum Severity {
 
 #[derive(Debug, Clone, Error, MietteDiagnostic)]
 pub enum Diagnostic {
-    #[error("#schema body must be a Dict (or Schema composition), got {found}")]
+    #[error("#schema body must be a Dict, Tuple, Enum, or Schema composition; got {found}")]
     #[diagnostic(
         code(relon::analyze::schema_body_not_dict),
-        help("#schema expects `#schema Name {{ ... }}` or `#schema Name Base + {{ ... }}`.")
+        help("#schema expects `#schema Name {{ ... }}`, `#schema Name (...)`, `#schema Name Enum<...>`, or `#schema Name Base + {{ ... }}`.")
     )]
     SchemaBodyNotDict {
         found: String,

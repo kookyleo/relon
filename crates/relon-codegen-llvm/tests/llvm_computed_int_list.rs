@@ -13,15 +13,13 @@
 //!
 //! KERNEL SHAPE: the computed list is where-bound (`xs: [n, n+1, ..]`)
 //! and passed to a where-bound closure that indexes / lengths it. The
-//! closure-parameter shape is deliberate: the analyzer infers a bare
-//! list literal as a positional `Tuple`, and indexing-then-adding the
-//! literal directly (`xs[0] + xs[1]`) trips a tuple-`Add` static
-//! mismatch in the inference pass; routing the list through a closure
-//! param keeps the analyzer happy while the AOT lowering still sees the
-//! where-bound `Expr::List` and materialises it. This isolates THIS
+//! closure-parameter shape is deliberate: routing the list through a
+//! closure param keeps the analyzer and AOT lowering on the `List<Int>`
+//! path while the where-bound `Expr::List` still has to be materialised.
+//! This isolates THIS
 //! lane's change (the Int materialiser) from the unrelated analyzer
-//! tuple-index inference and exercises the exact materialise + 1D index
-//! / `_len` paths the work item asks for. (The AOT `list.sum(handle)`
+//! indexing inference and exercises the exact materialise + 1D index /
+//! `_len` paths the work item asks for. (The AOT `list.sum(handle)`
 //! peephole only matches a `range(..)`-rooted or filter-handle receiver,
 //! not a closure-param variable, so the full-element-sum coverage is
 //! spelled with explicit indexed adds instead of `list.sum`.)

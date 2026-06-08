@@ -80,19 +80,19 @@ pub(crate) enum ListIndexErrorKind {
     VariableNotFound,
 }
 
-/// P1-16 step_into_value dedup: shared Dict / List structural-lookup
+/// P1-16 step_into_value dedup: shared Dict / List / Tuple structural-lookup
 /// step. Four near-identical match blocks in `resolve_variable` /
 /// `lookup_value_path` (the path-cache flavour) lower to this
 /// helper, parameterised by `list_index_err` so each diagnostic
 /// shape stays exactly as the unduplicated code emitted. Behaviour
 /// guarantees (each leg is covered by existing tests):
 ///
-/// * Dict miss / List out-of-bounds: `OptionalNull` when `is_optional`,
+/// * Dict miss / List/Tuple out-of-bounds: `OptionalNull` when `is_optional`,
 ///   else `VariableNotFound(display_name, range)`.
 /// * Null receiver: `OptionalNull` when `is_optional`, else
-///   `TypeMismatch { expected: "Dict/List", found: "Null" }`.
+///   `TypeMismatch { expected: "Dict/List/Tuple", found: "Null" }`.
 /// * Non-collection receiver: same — `OptionalNull` when optional,
-///   else `TypeMismatch { expected: "Dict/List" }`.
+///   else `TypeMismatch { expected: "Dict/List/Tuple" }`.
 /// * List index parse failure: shape depends on `list_index_err`
 ///   (see [`ListIndexErrorKind`]).
 pub(crate) fn step_into_value(
@@ -138,13 +138,35 @@ pub(crate) fn step_into_value(
                 ))
             }
         }
+        Value::Tuple(items) => {
+            let idx = key.parse::<usize>().map_err(|_| match list_index_err {
+                ListIndexErrorKind::TypeMismatchIndex => RuntimeError::TypeMismatch {
+                    expected: "Index".to_string(),
+                    found: "String".to_string(),
+                    range,
+                },
+                ListIndexErrorKind::VariableNotFound => {
+                    RuntimeError::VariableNotFound(display_name.to_string(), range)
+                }
+            })?;
+            if let Some(val) = items.get(idx) {
+                Ok(ValueStep::Found(val.clone()))
+            } else if is_optional {
+                Ok(ValueStep::OptionalNull)
+            } else {
+                Err(RuntimeError::VariableNotFound(
+                    display_name.to_string(),
+                    range,
+                ))
+            }
+        }
         Value::Null if is_optional => Ok(ValueStep::OptionalNull),
         _ => {
             if is_optional {
                 Ok(ValueStep::OptionalNull)
             } else {
                 Err(RuntimeError::TypeMismatch {
-                    expected: "Dict/List".to_string(),
+                    expected: "Dict/List/Tuple".to_string(),
                     found: current_val.type_name().to_string(),
                     range,
                 })

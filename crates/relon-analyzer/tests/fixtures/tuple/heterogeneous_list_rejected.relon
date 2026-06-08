@@ -1,4 +1,4 @@
-// A heterogeneous list literal infers as `Tuple<Int, String>` and
-// fails the `List<Int>` slot check.
+// A heterogeneous list literal is rejected as a List; use `(1, "two")`
+// for a tuple.
 // EXPECTED: >= 1 x StaticTypeMismatch on the `mixed` field.
 { List<Int> mixed: [1, "two"] }

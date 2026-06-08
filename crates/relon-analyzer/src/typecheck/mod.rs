@@ -92,7 +92,7 @@ use index::{
 };
 
 use crate::diagnostic::{span_of, Diagnostic};
-use crate::infer::{infer_type, InferredType, SchemaBaseIndex};
+use crate::infer::{infer_list_item_type, infer_type, InferredType, SchemaBaseIndex};
 use crate::resolve::{build_frame, ScopeFrame};
 use crate::tree::AnalyzedTree;
 use relon_parser::{child_nodes, Expr, Node, TokenKey};
@@ -426,6 +426,7 @@ impl<'a> Walker<'a> {
                 }
             }
             Expr::List(items) => {
+                self.check_list_homogeneous(items, field_name, node.range);
                 // v1.5: under strict mode, every list element must
                 // produce a derivable type. We collect diagnostics
                 // into a local vec so the inference scope's read-only
@@ -440,11 +441,11 @@ impl<'a> Walker<'a> {
                             if item.type_hint.is_some() {
                                 continue;
                             }
-                            let t = infer_type(item, &scope).unwrap_or(InferredType::Any);
+                            let t = infer_list_item_type(item, &scope).unwrap_or(InferredType::Any);
                             if matches!(t, InferredType::Any)
                                 && !matches!(
                                     &*item.expr,
-                                    Expr::Variable(_) | Expr::Reference { .. }
+                                    Expr::Variable(_) | Expr::Reference { .. } | Expr::Spread(_)
                                 )
                             {
                                 to_emit.push(Diagnostic::ExpressionTypeUnknown {
@@ -550,9 +551,9 @@ impl<'a> Walker<'a> {
                 // R1: `[ body for x in <iterable> ]` binds `x` to the
                 // iterable's element type. We infer the iterable's type,
                 // peel its element type (`List<T>` → `T`, `range(...)` →
-                // `Int`, list literal `Tuple(..)` → join), and push a
-                // scope frame whose `closure_param_types` carries `x`.
-                // The element / condition bodies then infer `Variable(x)`
+                // `Int`), and push a scope frame whose
+                // `closure_param_types` carries `x`. The element /
+                // condition bodies then infer `Variable(x)`
                 // concretely instead of tripping `UnknownReferenceType`.
                 //
                 // The iterable is checked in the *outer* scope (the
@@ -617,6 +618,62 @@ impl<'a> Walker<'a> {
                 }
             }
         }
+    }
+}
+
+impl<'a> Walker<'a> {
+    fn check_list_homogeneous(
+        &mut self,
+        items: &[Node],
+        field_name: Option<&str>,
+        range: relon_parser::TokenRange,
+    ) {
+        if items.len() < 2 {
+            return;
+        }
+        let mut mismatch: Option<(InferredType, InferredType)> = None;
+        {
+            let scope = self.build_type_scope();
+            let mut acc: Option<InferredType> = None;
+            for item in items {
+                let t = infer_list_item_type(item, &scope).unwrap_or(InferredType::Any);
+                if let Some(prev) = acc {
+                    let joined = InferredType::join(&prev, &t);
+                    if !type_contains_any(&prev)
+                        && !type_contains_any(&t)
+                        && type_contains_any(&joined)
+                    {
+                        mismatch = Some((prev, t));
+                        break;
+                    }
+                    acc = Some(joined);
+                } else {
+                    acc = Some(t);
+                }
+            }
+        }
+        if let Some((left, right)) = mismatch {
+            self.tree.diagnostics.push(Diagnostic::StaticTypeMismatch {
+                field: field_name.unwrap_or("list").to_string(),
+                expected: "homogeneous List<T>".to_string(),
+                found: format!("List<{}, {}>", left.name(), right.name()),
+                range: span_of(range),
+            });
+        }
+    }
+}
+
+fn type_contains_any(t: &InferredType) -> bool {
+    match t {
+        InferredType::Any => true,
+        InferredType::List(inner) | InferredType::Dict(inner) | InferredType::Optional(inner) => {
+            type_contains_any(inner)
+        }
+        InferredType::Fn(params, ret) => {
+            params.iter().any(type_contains_any) || type_contains_any(ret)
+        }
+        InferredType::Tuple(elems) => elems.iter().any(type_contains_any),
+        _ => false,
     }
 }
 

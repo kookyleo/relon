@@ -52,6 +52,19 @@ pub enum SchemaLowerError {
 /// schema name when the analyzer-side `SchemaDef::name` is `None`
 /// (anonymous `#schema` annotations on data).
 pub fn lower_schema_def(def: &SchemaDef, fallback_name: &str) -> Result<Schema, SchemaLowerError> {
+    let name = def
+        .name
+        .clone()
+        .unwrap_or_else(|| fallback_name.to_string());
+    if let Some(elements) = &def.tuple_elements {
+        let mut tys = Vec::with_capacity(elements.len());
+        for (idx, ty_node) in elements.iter().enumerate() {
+            tys.push(lower_type_node(&idx.to_string(), ty_node)?);
+        }
+        let mut schema = Schema::tuple(name, tys);
+        schema.generics = def.generics.clone();
+        return Ok(schema);
+    }
     let mut fields = Vec::with_capacity(def.fields.len());
     for f in &def.fields {
         let ty_node = f
@@ -72,10 +85,7 @@ pub fn lower_schema_def(def: &SchemaDef, fallback_name: &str) -> Result<Schema, 
         });
     }
     Ok(Schema {
-        name: def
-            .name
-            .clone()
-            .unwrap_or_else(|| fallback_name.to_string()),
+        name,
         generics: def.generics.clone(),
         fields,
         is_tuple: false,
@@ -173,6 +183,7 @@ mod tests {
             name: Some(name.to_string()),
             generics: vec![],
             fields,
+            tuple_elements: None,
             bases: vec![],
             range: dummy_range(),
             variants: vec![],

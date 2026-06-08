@@ -51,10 +51,10 @@ pub trait NativeFnCaps: Send + Sync {
     /// so collection-building intrinsics (`range`, future bulk
     /// constructors) can pre-flight oversized requests before
     /// allocating. Returning `None` means the host imposes no cap on
-    /// `List` / `Dict` element counts.
+    /// `List` / `Tuple` / `Dict` element counts.
     ///
     /// The evaluator still runs a post-call `check_value_size` on
-    /// every `List` / `Dict` produced by a native fn (catch-all in
+    /// every `List` / `Tuple` / `Dict` produced by a native fn (catch-all in
     /// `call_function` / `try_call_native_method`), so an intrinsic
     /// that ignores this hint is still bounded — but allocating
     /// `Vec::with_capacity(end - start)` first would OOM the host

@@ -1,5 +1,5 @@
 // v1.7: a 1-tuple uses the trailing-comma form `(T,)` to
-// disambiguate from a parenthesized type. The literal `[1]` is a
+// disambiguate from a parenthesized type. The literal `(1,)` is a
 // 1-element tuple and matches the declared slot.
 // EXPECTED: 0 × StaticTypeMismatch.
-{ (Int,) one: [1] }
+{ (Int,) one: (1,) }

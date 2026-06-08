@@ -1878,8 +1878,11 @@ fn write_value_into_builder(
         // `marshal_schema_in`. Nested schema fields recurse through this
         // same arm; `finish_sub_record` relocates the child's pointer
         // slots into the parent's coordinate system.
-        (TypeRepr::Schema { schema }, Value::Dict(dict)) => {
+        (TypeRepr::Schema { schema }, Value::Dict(dict)) if !schema.is_tuple => {
             write_schema_arg_into_builder(builder, &field.name, schema, dict)
+        }
+        (TypeRepr::Schema { schema }, Value::Tuple(items)) if schema.is_tuple => {
+            write_tuple_arg_into_builder(builder, &field.name, schema, items.as_ref())
         }
         _ => Err(RuntimeError::MainArgTypeMismatch {
             name: field.name.clone(),
@@ -1931,6 +1934,27 @@ fn write_schema_arg_into_builder(
         .sub_record(name, &sub_layout, &schema.fields)
         .map_err(buffer_to_runtime_error)?;
     write_schema_fields_into_builder(&mut child, schema, dict, name)?;
+    builder
+        .finish_sub_record(name, child)
+        .map_err(buffer_to_runtime_error)
+}
+
+/// Marshal a tuple-typed `#main` arg. Tuples reuse the schema sub-record
+/// ABI (`schema.is_tuple`) but take a positional `Value::Tuple` from the
+/// host API.
+fn write_tuple_arg_into_builder(
+    builder: &mut BufferBuilder<'_>,
+    name: &str,
+    schema: &Schema,
+    items: &[Value],
+) -> Result<(), RuntimeError> {
+    let sub_layout = SchemaLayout::offsets_for(schema).map_err(|e| RuntimeError::Unsupported {
+        reason: format!("cranelift-native: tuple arg `{name}` layout: {e}"),
+    })?;
+    let mut child = builder
+        .sub_record(name, &sub_layout, &schema.fields)
+        .map_err(buffer_to_runtime_error)?;
+    write_tuple_fields_into_builder(&mut child, schema, items, name)?;
     builder
         .finish_sub_record(name, child)
         .map_err(buffer_to_runtime_error)
@@ -2055,17 +2079,29 @@ fn write_list_schema_arg_into_builder(
         .list_record_writer(name, &elem_layout, schema)
         .map_err(buffer_to_runtime_error)?;
     for (i, it) in items.iter().enumerate() {
-        let Value::Dict(dict) = it else {
-            return Err(RuntimeError::Unsupported {
-                reason: format!(
-                    "cranelift-native: List<Schema> arg `{name}` element #{i} got {} but expects \
-                     a branded record",
-                    it.type_name()
-                ),
-            });
-        };
         let mut child = writer.start_entry();
-        write_schema_fields_into_builder(&mut child, schema, dict, name)?;
+        match it {
+            Value::Dict(dict) if !schema.is_tuple => {
+                write_schema_fields_into_builder(&mut child, schema, dict, name)?;
+            }
+            Value::Tuple(tuple_items) if schema.is_tuple => {
+                write_tuple_fields_into_builder(&mut child, schema, tuple_items.as_ref(), name)?;
+            }
+            other => {
+                return Err(RuntimeError::Unsupported {
+                    reason: format!(
+                        "cranelift-native: List<Schema> arg `{name}` element #{i} got {} but \
+                         expects {}",
+                        other.type_name(),
+                        if schema.is_tuple {
+                            "a tuple"
+                        } else {
+                            "a branded record"
+                        }
+                    ),
+                });
+            }
+        }
         writer
             .finish_entry(builder, child)
             .map_err(buffer_to_runtime_error)?;
@@ -2097,6 +2133,28 @@ fn write_schema_fields_into_builder(
                         sub_field.name
                     ),
                 })?;
+        write_value_into_builder(child, sub_field, sub_value, &schema.name)?;
+    }
+    Ok(())
+}
+
+/// Fill a detached tuple sub-record from positional values.
+fn write_tuple_fields_into_builder(
+    child: &mut BufferBuilder<'_>,
+    schema: &Schema,
+    items: &[Value],
+    parent_field: &str,
+) -> Result<(), RuntimeError> {
+    if items.len() != schema.fields.len() {
+        return Err(RuntimeError::Unsupported {
+            reason: format!(
+                "cranelift-native: tuple arg `{parent_field}` has arity {} but schema expects {}",
+                items.len(),
+                schema.fields.len()
+            ),
+        });
+    }
+    for (sub_field, sub_value) in schema.fields.iter().zip(items.iter()) {
         write_value_into_builder(child, sub_field, sub_value, &schema.name)?;
     }
     Ok(())

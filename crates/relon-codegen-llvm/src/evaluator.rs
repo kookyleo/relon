@@ -1716,8 +1716,8 @@ fn is_single_value_wrapper(schema: &relon_eval_api::schema_canonical::Schema) ->
 /// as `Value::Dict` for the host, not be unwrapped to a bare scalar.
 fn is_single_int_field_record(schema: &relon_eval_api::schema_canonical::Schema) -> bool {
     use relon_eval_api::schema_canonical::TypeRepr;
-    // Wave T2: a tuple schema (`is_tuple`) decodes positionally to a
-    // `Value::List`, never to a scalar / branded dict — so a 1-tuple
+    // A tuple schema (`is_tuple`) decodes positionally to a `Value::Tuple`,
+    // never to a scalar / branded dict — so a 1-tuple
     // `Tuple<Int>` must NOT take the typed-i64 fast path (which would
     // return the wrong container shape). Force it onto the buffer path so
     // the shared `decode_object_return` tuple fork runs.
@@ -1758,8 +1758,11 @@ fn write_value_into_builder(
         (TypeRepr::Bool, Value::Bool(v)) => marshal_bool_in(builder, &field.name, *v),
         (TypeRepr::Null, Value::Null) => marshal_null_in(builder, &field.name),
         (TypeRepr::String, Value::String(s)) => marshal_string_in(builder, &field.name, s),
-        (TypeRepr::Schema { schema }, Value::Dict(dict)) => {
+        (TypeRepr::Schema { schema }, Value::Dict(dict)) if !schema.is_tuple => {
             marshal_schema_in(builder, &field.name, schema, dict)
+        }
+        (TypeRepr::Schema { schema }, Value::Tuple(items)) if schema.is_tuple => {
+            marshal_tuple_in(builder, &field.name, schema, items.as_ref())
         }
         (TypeRepr::List { element }, Value::List(items)) => {
             marshal_list_in(builder, &field.name, element, items)
@@ -1934,17 +1937,28 @@ fn marshal_list_schema_in(
         .list_record_writer(name, &elem_layout, schema)
         .map_err(buffer_to_runtime_error)?;
     for (i, it) in items.iter().enumerate() {
-        let Value::Dict(dict) = it else {
-            return Err(RuntimeError::Unsupported {
-                reason: format!(
-                    "llvm-aot: List<Schema> arg `{name}` element #{i} got {} but expects a \
-                     branded record",
-                    it.type_name()
-                ),
-            });
-        };
         let mut child = writer.start_entry();
-        write_schema_into_builder(&mut child, schema, dict, name)?;
+        match it {
+            Value::Dict(dict) if !schema.is_tuple => {
+                write_schema_into_builder(&mut child, schema, dict, name)?;
+            }
+            Value::Tuple(tuple_items) if schema.is_tuple => {
+                write_tuple_into_builder(&mut child, schema, tuple_items.as_ref(), name)?;
+            }
+            other => {
+                return Err(RuntimeError::Unsupported {
+                    reason: format!(
+                        "llvm-aot: List<Schema> arg `{name}` element #{i} got {} but expects {}",
+                        other.type_name(),
+                        if schema.is_tuple {
+                            "a tuple"
+                        } else {
+                            "a branded record"
+                        }
+                    ),
+                });
+            }
+        }
         writer
             .finish_entry(builder, child)
             .map_err(buffer_to_runtime_error)?;
@@ -2009,6 +2023,29 @@ fn marshal_schema_in(
         .map_err(buffer_to_runtime_error)
 }
 
+/// Tuple-typed `#main` arg marshalling. A tuple is a positional record
+/// (`schema.is_tuple`) at the binary layer, with a `Value::Tuple` host
+/// shape at the API layer.
+fn marshal_tuple_in(
+    builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
+    name: &str,
+    schema: &relon_eval_api::schema_canonical::Schema,
+    items: &[Value],
+) -> Result<(), RuntimeError> {
+    let sub_layout = relon_eval_api::layout::SchemaLayout::offsets_for(schema).map_err(|e| {
+        RuntimeError::Unsupported {
+            reason: format!("llvm-aot: tuple arg `{name}` layout: {e}"),
+        }
+    })?;
+    let mut child = builder
+        .sub_record(name, &sub_layout, &schema.fields)
+        .map_err(buffer_to_runtime_error)?;
+    write_tuple_into_builder(&mut child, schema, items, name)?;
+    builder
+        .finish_sub_record(name, child)
+        .map_err(buffer_to_runtime_error)
+}
+
 /// Recursively fill `child` (a detached sub-record builder) with the
 /// fields of `schema`, pulling each value out of the branded `dict`.
 /// Nested `Schema`-typed fields recurse through
@@ -2033,6 +2070,29 @@ fn write_schema_into_builder(
                         sub_field.name
                     ),
                 })?;
+        write_value_into_builder(child, sub_field, sub_value)?;
+    }
+    Ok(())
+}
+
+/// Recursively fill `child` from a tuple value, pairing positional items
+/// with the tuple schema's synthetic `"0"`, `"1"`, ... fields.
+fn write_tuple_into_builder(
+    child: &mut relon_eval_api::buffer::BufferBuilder<'_>,
+    schema: &relon_eval_api::schema_canonical::Schema,
+    items: &[Value],
+    parent_field: &str,
+) -> Result<(), RuntimeError> {
+    if items.len() != schema.fields.len() {
+        return Err(RuntimeError::Unsupported {
+            reason: format!(
+                "llvm-aot: tuple arg `{parent_field}` has arity {} but schema expects {}",
+                items.len(),
+                schema.fields.len()
+            ),
+        });
+    }
+    for (sub_field, sub_value) in schema.fields.iter().zip(items.iter()) {
         write_value_into_builder(child, sub_field, sub_value)?;
     }
     Ok(())

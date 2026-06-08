@@ -7,6 +7,7 @@
 use super::*;
 use relon_parser::parse_document;
 use relon_parser::Expr;
+use std::collections::HashMap;
 
 fn parse_doc(source: &str) -> relon_parser::Node {
     parse_document(source).expect("Parser failed")
@@ -1580,6 +1581,7 @@ fn test_brand_decorator_at_document_root() {
             );
             fields
         },
+        tuple_elements: None,
     }));
     let outer_scope = std::sync::Arc::new(Scope::default());
     outer_scope
@@ -4153,19 +4155,17 @@ fn v13_main_param_resolves_in_dict_root() {
 // ====== v1.7: tuple types end-to-end ======
 
 #[test]
-fn v17_tuple_typed_field_evaluates_as_list() {
-    // v1.7 e2e: a `(Int, String)`-typed field in a dict accepts a
-    // `[1, "x"]` literal. At runtime tuple is just a list (heterogeneous
-    // by intent), so the evaluator returns a `Value::List` of two
-    // entries.
-    let source = r#"{ (Int, String) pair: [42, "hello"] }"#;
+fn v17_tuple_typed_field_evaluates_as_tuple() {
+    // A `(Int, String)`-typed field in a dict accepts a `(1, "x")`
+    // literal and evaluates to a runtime `Value::Tuple`.
+    let source = r#"{ (Int, String) pair: (42, "hello") }"#;
     let result = eval_doc(source).expect("eval");
     let Value::Dict(map) = result else {
         panic!("expected Dict");
     };
     let pair = map.map.get("pair").expect("pair field");
-    let Value::List(items) = pair else {
-        panic!("expected List for tuple field, got {pair:?}");
+    let Value::Tuple(items) = pair else {
+        panic!("expected Tuple for tuple field, got {pair:?}");
     };
     assert_eq!(items.len(), 2);
     assert_eq!(items[0], Value::Int(42));
@@ -4177,7 +4177,7 @@ fn v17_tuple_nested_in_list() {
     // v1.7 e2e: `List<(String, Int)>` of records, exercising both
     // outer list iteration and inner tuple positions at runtime.
     let source = r#"{
-  List<(String, Int)> rows: [["alice", 3], ["bob", 1]]
+  List<(String, Int)> rows: [("alice", 3), ("bob", 1)]
 }"#;
     let result = eval_doc(source).expect("eval");
     let Value::Dict(map) = result else {
@@ -4192,9 +4192,8 @@ fn v17_tuple_nested_in_list() {
 
 #[test]
 fn v17_tuple_static_check_passes_for_homogeneous_list_slot() {
-    // Tuple → List collapse: `[1, 2, 3]` infers as
-    // `Tuple<Int, Int, Int>` and still subsumes `List<Int>`. The
-    // analyzer should issue zero `StaticTypeMismatch`.
+    // Homogeneous `[...]` is a regular `List<Int>` and should issue
+    // zero `StaticTypeMismatch`.
     let source = r#"{ List<Int> xs: [1, 2, 3] }"#;
     let node = parse_doc(source);
     let analyzed = relon_analyzer::analyze(&node);
@@ -4209,10 +4208,10 @@ fn v17_tuple_static_check_passes_for_homogeneous_list_slot() {
 #[test]
 fn v17_tuple_runtime_arity_mismatch() {
     // v1.7 e2e: runtime tuple check enforces arity. A 3-element
-    // literal in a `(Int, String)` slot raises a `TypeMismatch` at
+    // tuple literal in a `(Int, String)` slot raises a `TypeMismatch` at
     // eval time (the analyzer also flags it statically — this test
     // exercises the runtime path independently).
-    let source = r#"{ (Int, String) pair: [1, "two", 3] }"#;
+    let source = r#"{ (Int, String) pair: (1, "two", 3) }"#;
     let result = eval_doc(source);
     assert!(
         matches!(
@@ -4229,7 +4228,7 @@ fn v17_tuple_runtime_position_mismatch() {
     // v1.7 e2e: position 1 carries the wrong type. Runtime descends
     // into the tuple, hits the `String` slot, and reports the inner
     // mismatch.
-    let source = r#"{ (Int, String) pair: [1, 2] }"#;
+    let source = r#"{ (Int, String) pair: (1, 2) }"#;
     let result = eval_doc(source);
     assert!(
         matches!(result, Err(RuntimeError::TypeMismatch { .. })),
@@ -4239,12 +4238,10 @@ fn v17_tuple_runtime_position_mismatch() {
 
 #[test]
 fn v18_tuple_position_access_runtime() {
-    // v1.8 e2e: `pair.0` and `pair.1` retrieve the typed elements
-    // of a `(Int, String)` tuple at runtime. Tuples reuse
-    // `Value::List`, so positional access goes through the
-    // existing list-index lookup.
+    // `pair.0` and `pair.1` retrieve the typed elements of a runtime
+    // tuple value.
     let source = r#"{
-  (Int, String) pair: [42, "hello"],
+  (Int, String) pair: (42, "hello"),
   Int first: pair.0,
   String second: pair.1
 }"#;
@@ -4260,13 +4257,69 @@ fn v18_tuple_position_access_runtime() {
 }
 
 #[test]
+fn tuple_main_arg_rejects_list_payload() {
+    let source = "#main(Tuple<Int, String> pair) -> Int\npair.0";
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert(
+        "pair".to_string(),
+        Value::list(vec![Value::Int(42), Value::String("hello".into())]),
+    );
+
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args);
+
+    assert!(
+        matches!(
+            result,
+            Err(RuntimeError::MainArgTypeMismatch { ref name, ref expected, ref found, .. })
+                if name == "pair" && expected.starts_with("Tuple") && found == "List"
+        ),
+        "expected tuple arg to reject Value::List payload, got {result:?}"
+    );
+}
+
+#[test]
+fn tuple_main_arg_accepts_tuple_payload() {
+    let source = "#main(Tuple<Int, String> pair) -> String\npair.1";
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut args: HashMap<String, Value> = HashMap::new();
+    args.insert(
+        "pair".to_string(),
+        Value::tuple(vec![Value::Int(42), Value::String("hello".into())]),
+    );
+
+    let ctx = Context::new()
+        .with_root(node.clone())
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .expect("tuple payload should type-check");
+
+    assert_eq!(result, Value::String("hello".into()));
+}
+
+#[test]
 fn v18_tuple_position_static_mismatch() {
     // v1.8 static: `pair.0` is statically `Int`, so binding it to
     // a `String wrong` slot raises `StaticTypeMismatch` at the
     // analyzer level — pre-v1.8 the walker dropped the index
     // segment and `pair` typed as `Tuple`, masking the mismatch.
     let source = r#"{
-  (Int, String) pair: [42, "hello"],
+  (Int, String) pair: (42, "hello"),
   String wrong: pair.0
 }"#;
     let node = parse_doc(source);
@@ -5571,7 +5624,7 @@ fn comprehension_over_string_iter() {
 
 #[test]
 fn comprehension_over_dict_iter_yields_entries() {
-    // `d.iter()` yields `(K, V)` 2-element lists, key-sorted.
+    // `d.iter()` yields `(K, V)` 2-element tuples, key-sorted.
     use std::collections::{BTreeMap, HashMap};
     // The Indexable `a[i]` syntax isn't ready, so the assertion
     // below walks `d.iter()` and checks the count rather than the
@@ -5792,7 +5845,7 @@ fn iter_next_on_string_advances_per_codepoint() {
     assert_none("fourth");
 }
 
-/// `Dict.iter()` yields key-sorted `(K, V)` pairs as 2-element lists.
+/// `Dict.iter()` yields key-sorted `(K, V)` pairs as 2-element tuples.
 /// `next()` should produce them in the same order
 /// `materialize_iterable` would walk so user-driven and comprehension
 /// iteration over the same dict agree on order.
@@ -5838,8 +5891,8 @@ fn iter_next_on_dict_yields_key_sorted_entries() {
             panic!("{key} not a dict");
         };
         assert_eq!(opt.brand.as_deref(), Some("Some"), "{key} should be Some");
-        let Value::List(items) = opt.map.get("value").expect("payload missing") else {
-            panic!("{key} payload not List");
+        let Value::Tuple(items) = opt.map.get("value").expect("payload missing") else {
+            panic!("{key} payload not Tuple");
         };
         assert_eq!(items.len(), 2, "{key} payload should be 2-tuple");
         let k = match &items[0] {
@@ -6305,19 +6358,17 @@ fn fused_list_sum_range_falls_through_when_list_shadowed() {
 // ---------------------------------------------------------------------
 // Wave T1: tuple oracle (tree-walk) semantics. The tree-walk evaluator
 // is the gold oracle that the four-way compiled backends (T2) will
-// match. A tuple constructs to a positional `Value::List` so JSON
-// output is a positional array byte-identical to the equivalent list,
-// `.N` access reuses list indexing, and equality flows through the
-// existing list machinery.
+// match. A tuple constructs to a positional `Value::Tuple`; JSON output
+// is still a positional array byte-identical to the equivalent list.
 // ---------------------------------------------------------------------
 
 #[test]
-fn tuple_constructs_positional_list_value() {
-    // `(1, 2, 3)` evaluates to a positional list value.
+fn tuple_constructs_positional_tuple_value() {
+    // `(1, 2, 3)` evaluates to a positional tuple value.
     let v = eval_doc("(1, 2, 3)").expect("eval");
     assert_eq!(
         v,
-        Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+        Value::tuple(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
     );
 }
 
@@ -6327,7 +6378,7 @@ fn tuple_is_heterogeneous() {
     let v = eval_doc(r#"(1, "a", true)"#).expect("eval");
     assert_eq!(
         v,
-        Value::list(vec![
+        Value::tuple(vec![
             Value::Int(1),
             Value::String("a".into()),
             Value::Bool(true),
@@ -6341,8 +6392,8 @@ fn tuple_nested() {
     let v = eval_doc("((1, 2), 3)").expect("eval");
     assert_eq!(
         v,
-        Value::list(vec![
-            Value::list(vec![Value::Int(1), Value::Int(2)]),
+        Value::tuple(vec![
+            Value::tuple(vec![Value::Int(1), Value::Int(2)]),
             Value::Int(3),
         ])
     );
@@ -6352,14 +6403,14 @@ fn tuple_nested() {
 fn tuple_one_element_trailing_comma() {
     // `(42,)` is a 1-tuple, not a grouped `42`.
     let v = eval_doc("(42,)").expect("eval");
-    assert_eq!(v, Value::list(vec![Value::Int(42)]));
+    assert_eq!(v, Value::tuple(vec![Value::Int(42)]));
 }
 
 #[test]
-fn unit_tuple_is_empty_list() {
-    // `()` — the zero-tuple evaluates to an empty positional list.
+fn unit_tuple_is_empty_tuple() {
+    // `()` — the zero-tuple evaluates to an empty positional tuple.
     let v = eval_doc("()").expect("eval");
-    assert_eq!(v, Value::list(vec![]));
+    assert_eq!(v, Value::tuple(vec![]));
 }
 
 #[test]

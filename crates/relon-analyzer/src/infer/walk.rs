@@ -28,10 +28,10 @@ use std::collections::HashMap;
 pub(crate) fn path_segments(path: &[TokenKey]) -> Vec<String> {
     let mut out = Vec::with_capacity(path.len());
     for seg in path {
-        if let TokenKey::String(s, _, _) = seg {
-            out.push(s.clone());
-        } else {
-            break;
+        match seg {
+            TokenKey::String(s, _, _) => out.push(s.clone()),
+            TokenKey::Index(i, _) => out.push(i.to_string()),
+            _ => break,
         }
     }
     out
@@ -89,6 +89,21 @@ fn schema_generic_params(scope: &TypeScope, schema_name: &str) -> Vec<String> {
         }
     }
     Vec::new()
+}
+
+fn schema_tuple_elements(scope: &TypeScope, schema_name: &str) -> Option<Vec<TypeNode>> {
+    let tree = scope.tree?;
+    for def in tree.schemas.values() {
+        if def.name.as_deref() == Some(schema_name) {
+            return def.tuple_elements.clone();
+        }
+    }
+    if let Some(idx) = tree.workspace_import_index.as_ref() {
+        if let Some(elements) = idx.imported_tuple_schemas.get(schema_name) {
+            return Some(elements.clone());
+        }
+    }
+    None
 }
 
 /// Schema-rooted §J follow-up: rewrite a single-segment user-schema
@@ -372,6 +387,37 @@ pub(crate) fn walk_path(path: &[TokenKey], scope: &TypeScope) -> PathTailOutcome
                 } else {
                     current_namespace = None;
                 }
+            }
+            (InferredType::Schema(schema_name), WalkSeg::Index(i)) => {
+                let Some(elements) = schema_tuple_elements(scope, &schema_name) else {
+                    return PathTailOutcome::UnknownStep {
+                        at_segment,
+                        running_name: schema_name,
+                    };
+                };
+                let arity = elements.len();
+                let Some(element_ty) = elements.get(*i) else {
+                    return PathTailOutcome::UnknownStep {
+                        at_segment,
+                        running_name: format!("{schema_name} tuple of arity {arity}"),
+                    };
+                };
+                let substituted = if current_subst.is_empty() {
+                    element_ty.clone()
+                } else {
+                    crate::typecheck::substitute_generics_in_typenode(element_ty, &current_subst)
+                };
+                let renamespaced = if let Some(ns) = current_namespace.as_deref() {
+                    qualify_type_node_for_alias(&substituted, ns)
+                } else {
+                    substituted
+                };
+                current = infer_from_type_node_with_imports(
+                    &renamespaced,
+                    scope.tree.and_then(|t| t.workspace_import_index.as_ref()),
+                );
+                current_subst.clear();
+                current_namespace = None;
             }
             (InferredType::Dict(value_ty), WalkSeg::Name(_)) => {
                 current = *value_ty;

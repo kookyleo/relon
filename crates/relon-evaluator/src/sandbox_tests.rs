@@ -1070,6 +1070,7 @@ fn test_brand_registry() {
             );
             fields
         },
+        tuple_elements: None,
     }));
     ctx.register_schema("Email", email_schema);
 

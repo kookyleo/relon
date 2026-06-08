@@ -2978,7 +2978,7 @@ mod tests {
     #[test]
     fn tuple_type_in_dict_field_round_trips() {
         // v1.7 tuple types in the type-hint slot of a dict field.
-        let parsed = parse_round_trip("{ (Int, String) pair: [42, \"hello\"] }");
+        let parsed = parse_round_trip("{ (Int, String) pair: (42, \"hello\") }");
         assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
         let tts: Vec<_> = parsed
             .syntax()
@@ -2990,7 +2990,7 @@ mod tests {
 
     #[test]
     fn tuple_type_inside_generic() {
-        let parsed = parse_round_trip("{ List<(Int, String)> rows: [[1, \"a\"]] }");
+        let parsed = parse_round_trip("{ List<(Int, String)> rows: [(1, \"a\")] }");
         assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
         let tts: Vec<_> = parsed
             .syntax()

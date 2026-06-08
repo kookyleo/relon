@@ -102,23 +102,6 @@ pub(crate) fn unify(
                 unify(inner, elem, generics, bindings);
             }
         }
-        // v1.8+ fix: list literals now infer as `Tuple(...)` (v1.7
-        // change), so a `List<T>` slot needs to bind T from the
-        // tuple's element-type join. Pre-fix `_list_map([1,2,3], (n)
-        // => n + 1)` left T unbound (then defaulted to `Any`), which
-        // silently accepted any return type at the call site —
-        // analyzer missed the mismatch and runtime caught it.
-        ("List", InferredType::Tuple(elems)) => {
-            if let Some(inner) = param_ty.generics.first() {
-                if let Some(joined) = elems
-                    .iter()
-                    .cloned()
-                    .reduce(|acc, t| InferredType::join(&acc, &t))
-                {
-                    unify(inner, &joined, generics, bindings);
-                }
-            }
-        }
         ("Dict", InferredType::Dict(val)) => {
             // Dict<K, V>: keys are always String in the language, so
             // only the value slot can carry a placeholder we'd want

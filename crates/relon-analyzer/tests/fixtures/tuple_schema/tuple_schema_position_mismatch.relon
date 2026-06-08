@@ -1,0 +1,4 @@
+// Tuple schema slots are checked position-by-position.
+// EXPECTED: >= 1 x StaticTypeMismatch.
+#schema IPv4 (Int, Int, Int, Int)
+{ IPv4 ip: (127, 0, "bad", 1) }

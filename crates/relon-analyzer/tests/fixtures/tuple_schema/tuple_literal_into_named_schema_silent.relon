@@ -1,0 +1,4 @@
+// A tuple literal can satisfy a named tuple schema typed binding.
+// EXPECTED: 0 x StaticTypeMismatch.
+#schema IPv4 (Int, Int, Int, Int)
+{ IPv4 ip: (127, 0, 0, 1) }

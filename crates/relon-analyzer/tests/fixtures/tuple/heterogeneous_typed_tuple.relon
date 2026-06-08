@@ -4,7 +4,7 @@
 // EXPECTED: 0 × StaticTypeMismatch.
 {
   List<(String, Int, Bool)> rows: [
-    ["alice", 3, true],
-    ["bob", 1, false]
+    ("alice", 3, true),
+    ("bob", 1, false)
   ]
 }

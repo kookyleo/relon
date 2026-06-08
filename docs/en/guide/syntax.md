@@ -30,15 +30,28 @@ Collections are the core of data modeling in Relon.
 
 ### List
 
-A list (array) may contain elements of any type.
+A list is a homogeneous JSON-array-shaped collection. All elements
+must have a compatible element type; use a tuple for fixed-position
+heterogeneous data.
 
 ```relon
 [
     1,
-    "two",
-    { a: 3 }
+    2,
+    3
 ]
 ```
+
+### Tuple
+
+A tuple is a fixed-length, position-typed value. It uses parentheses
+in Relon source and projects to a JSON array at output.
+
+```relon
+(1, "two", true)
+```
+
+One-element tuples require a trailing comma: `(1,)`.
 
 #### List comprehensions
 
@@ -121,7 +134,7 @@ Bare `Dict` (without generics) is rejected by v1.7's
 
 Each `.relon` file evaluates to a single JSON value — Object, Array,
 String, Number, Bool, or Null. **The root may be any expression**:
-dict / list literal, atomic literal, binary / ternary / pipe
+dict / list / tuple literal, atomic literal, binary / ternary / pipe
 expression, function call, variant constructor, reference,
 where / match, … as long as the final value lands in the JSON type
 set. Directives, decorators, comments, and whitespace may precede it.
@@ -132,6 +145,9 @@ set. Directives, decorators, comments, and whitespace may precede it.
 
 // Legal: list root
 [1, 2, 3]
+
+// Legal: tuple root, projected as a JSON array
+(1, "x")
 
 // Legal: atomic literals are JSON values
 42

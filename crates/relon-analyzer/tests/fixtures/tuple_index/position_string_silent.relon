@@ -2,6 +2,6 @@
 // pair returns the second element as `String`.
 // EXPECTED: 0 × StaticTypeMismatch.
 {
-  (Int, String) pair: [42, "hello"],
+  (Int, String) pair: (42, "hello"),
   String second: pair.1
 }

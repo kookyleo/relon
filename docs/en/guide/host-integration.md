@@ -44,6 +44,11 @@ let result = Evaluator::new(Arc::new(ctx))
     .run_main(&Arc::new(Scope::default()), args)?;
 ```
 
+`serde_json::from_value::<Value>` is targetless: JSON arrays decode as
+`Value::List`. For a `#main` tuple parameter, construct
+`Value::tuple(...)` directly, or decode with the `#main` signature so
+the array-shaped payload can become `Value::Tuple`.
+
 Pair it with a `#main(...)` signature on the script side, describing
 the shape the host must push:
 
@@ -76,6 +81,9 @@ signature**; each parameter declares one host-pushed slot:
 > - scalar leaves (`Int` / `Float` / `Bool` / `Null`),
 > - **`String`** parameters (e.g. file contents the host read and pushes
 >   in),
+> - **tuple schema** parameters such as
+>   `#schema IPv4 (Int, Int, Int, Int)`, supplied by the host as
+>   `Value::Tuple` and decoded positionally,
 > - **`List<scalar>`**, **`List<String>`**, **`List<Schema>`**, nested
 >   **`List<List<scalar>>`**, and the doubly-nested pointer-array
 >   **`List<List<String>>`** / **`List<List<Schema>>`** parameters
@@ -101,6 +109,8 @@ signature**; each parameter declares one host-pushed slot:
 > - scalar leaves, `String`, and `List<scalar>` (`List<Int/Float/Bool>`)
 >   returns — including identity-returning a scalar-list `#main`
 >   parameter, whose tail record is a single inline-fixed block,
+> - **tuple schema returns** (`#main() -> IPv4 = (127, 0, 0, 1)`) decode
+>   to `Value::Tuple` and project to JSON arrays,
 > - `List<String>` returns **sourced from an in-source list literal**
 >   (`["a", "b", …]`) — a const-pool block whose inner string pointers
 >   are contiguous and single-base, so the rigid tail copy relocates them
@@ -184,8 +194,8 @@ signature**; each parameter declares one host-pushed slot:
 >   (`#main(W w) -> List<List<String>> = w.rows`), and as an object field
 >   (anon-`Dict` / branded struct),
 > - **`#schema`-branded struct returns** (`#main() -> Cfg { ... }`) whose
->   fields are any of the above (including literal `String` / `List`
->   fields),
+>   fields are supported struct-field shapes from the list above
+>   (including literal `String` / `List` fields),
 > - **anonymous `-> Dict { ... }` returns** — each non-`#internal` field
 >   is marshalled into the return record, including `String`,
 >   `List<scalar>`, and literal `List<String>` fields. (`#internal` fields
@@ -197,11 +207,15 @@ signature**; each parameter declares one host-pushed slot:
 > use the tree-walk evaluator for those shapes):
 >
 > - `Dict<_, _>` parameters (the analyzer cannot type `d["x"]` index
->   reads; use a `#schema` struct for structured config instead). This is
->   the only shape on the return-side surface that still declines — every
->   nested list / object-array / nested-schema return shape (identity,
->   parameter field, deep field-walk, and object field) is now supported
->   four-way at any depth (F7).
+>   reads; use a `#schema` struct for structured config instead).
+>   Nested list / object-array / nested-schema return shapes (identity,
+>   parameter field, deep field-walk, and object field) are supported
+>   four-way at any depth (F7); tuple-return caps are listed separately
+>   below.
+> - tuple returns outside the scalar/literal envelope: nested tuple
+>   elements, `List<...>` / `Null` tuple elements, or a tuple return body
+>   that is not a tuple literal. These stay loud caps until the positional
+>   tuple-element work is proven four-way.
 >
 >   An **object field** sourced by a parameter — whether the object
 >   is an **anon-`Dict`** (`-> Dict { servers: servers, n: 1 }`) or a
@@ -238,9 +252,9 @@ signature**; each parameter declares one host-pushed slot:
 >   `read_list_list_at` for `List<List<scalar>>`, `read_list_string_at`
 >   for an in-place `List<String>`). The in-place return wiring covers
 >   the *per-element pointer-array* `List<String>` and `List<Schema>`
->   shapes from both a parameter **identity** and (F4) a parameter
->   **field** walk (above); still missing only for deeper-nested element
->   lists, which stay a loud compile-time cap.
+>   shapes from a parameter **identity**, a parameter **field** walk
+>   (above), and object fields; doubly-nested `List<List<String>>` /
+>   `List<List<Schema>>` are covered by the same verifier-gated path.
 > - **returning a pointer-array list sourced from a `#main` parameter call
 >   / arbitrary expression** (rather than a parameter identity, a parameter
 >   field walk, or an in-source literal) — such a value is not proven
@@ -251,7 +265,7 @@ signature**; each parameter declares one host-pushed slot:
 > through the tree-walk evaluator.
 
 > [!NOTE]
-> **Why the output store is the hard half (and the planned fix).** The
+> **Why the output store is the hard half.** The
 > arena is one contiguous block: `[const_data | in_buf @ in_ptr | out_buf
 > @ out_ptr | scratch]`. Inside the running machine code every pointer is
 > *arena-base-relative* (`arena_base + ptr` dereferences it), so a param
@@ -308,20 +322,20 @@ signature**; each parameter declares one host-pushed slot:
 ### Boundary Result vs Relon value-level Result
 
 The host's `run_main` call returns a Rust-side
-`Result<Value, RuntimeError>`: on success `Ok(json_value)`; on failure
+`Result<Value, RuntimeError>`: on success `Ok(value)`; on failure
 `Err(...)` (schema validation, runtime overflow, capability denial,
 …). This **boundary Result is the Rust side's responsibility** — the
 script author doesn't perceive it.
 
-The `ReturnType` in `#main(...) -> ReturnType` describes the **Json
-shape the body produces** (an atomic value, dict, or list), not a
+The `ReturnType` in `#main(...) -> ReturnType` describes the **JSON
+shape the body produces** (an atomic value, dict, list, or tuple), not a
 Result wrapper. Relon's built-in `Result<T, E>` / `Option<T>` are
 **value-level** concepts (modelling "this field may be missing / may
 have failed" inside data); they don't belong in the entry signature's
 return position.
 
 ```relon
-// Good: ReturnType describes the body's Json output
+// Good: ReturnType describes the body's JSON output
 #main(Order order) -> Order
 { id: order.id, total: order.total * 1.1 }
 
@@ -561,7 +575,8 @@ Key points:
 - `NativeArgs` splits positional and named arguments: `args.get(0)`
   gets a positional arg; `args.get_named("name")` gets a named arg.
 - The function returns `Value` — Relon's in-memory value type. To
-  build a dict / list use `Value::Dict` / `Value::List`.
+  build a dict / list / tuple use `Value::Dict` / `Value::List` /
+  `Value::tuple(...)`.
 
 ## Capability-gated registration
 
@@ -694,6 +709,7 @@ with these specifics:
 - The same shapes at the top level **raise an error** (no JSON
   representation).
 - Non-finite floats (`Infinity` / `NaN`) raise an error.
+- `List` and `Tuple` both project to JSON arrays.
 - Sum-type variants output in **externally tagged** form:
   `{ "Email": { ... } }`.
 - Regular branded dicts stay **flat** — a `#schema User`-branded dict
@@ -719,7 +735,7 @@ impl Projector for InternallyTaggedJson {
 
     fn project(&self, value: &Value) -> Result<Self::Output, Self::Error> {
         // Walk it yourself, inspect brand/variant_of on Value::Dict, rewrite shape...
-        todo!()
+        Err(ProjErr("custom traversal omitted from the guide".into()))
     }
 }
 

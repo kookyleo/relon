@@ -29,7 +29,7 @@
 //!      tree-walker against a golden fixture so they get *some* execution
 //!      coverage.
 
-use crate::{Context, Scope, TreeWalkEvaluator, Value};
+use crate::{Context, RuntimeError, Scope, TreeWalkEvaluator, Value};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -94,7 +94,6 @@ const TIER2_TREEWALK_ONLY_DRIFT: &[&str] = &[
     "size_in_range",
     "parse_iso_date",
     "to_json",
-    "from_json",
 ];
 
 /// Scan `stdlib.rs` for every `register_pure_fn("<name>", ...)` call and
@@ -187,13 +186,15 @@ fn reverse_stdlib_drift_is_pinned() {
 /// bypassing the analyzer's strict static-type gate. This is the only
 /// execution path the tier-2 tree-walker-only stdlib fns can take.
 fn tree_walk(source: &str) -> Value {
+    tree_walk_result(source).expect("fixture must evaluate")
+}
+
+fn tree_walk_result(source: &str) -> Result<Value, RuntimeError> {
     let node = relon_parser::parse_document(source).expect("fixture must parse");
     let mut ctx = Context::new().with_root(node);
     TreeWalkEvaluator::prepare_in_place(&mut ctx);
     let ctx = Arc::new(ctx);
-    TreeWalkEvaluator::new(Arc::clone(&ctx))
-        .eval_root(&Arc::new(Scope::default()))
-        .expect("fixture must evaluate")
+    TreeWalkEvaluator::new(Arc::clone(&ctx)).eval_root(&Arc::new(Scope::default()))
 }
 
 fn workspace_root() -> PathBuf {
@@ -230,5 +231,15 @@ fn tier2_treewalk_only_fixture_executes() {
         expected,
         "tier-2 tree-walker-only golden mismatch.\n  actual: {}",
         serde_json::to_string_pretty(&actual).unwrap()
+    );
+}
+
+#[test]
+fn from_json_is_not_registered() {
+    let err = tree_walk_result(r#"from_json("[1,2]")"#)
+        .expect_err("from_json must not be available as a stdlib function");
+    assert!(
+        matches!(&err, RuntimeError::FunctionNotFound(name, _) if name == "from_json"),
+        "expected FunctionNotFound(from_json), got {err:?}"
     );
 }

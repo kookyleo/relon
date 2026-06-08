@@ -1293,15 +1293,26 @@ impl<'a> BufferBuilder<'a> {
                 self.bytes.resize(entries_start + count * 4, 0);
                 let mut offsets: Vec<u32> = Vec::with_capacity(count);
                 for (i, it) in items.iter().enumerate() {
-                    let Value::Dict(dict) = it else {
-                        return Err(BufferError::TypeMismatch {
-                            name: format!("<nested list>[{i}]"),
-                            declared: "List<Schema>",
-                            requested: it.type_name(),
-                        });
-                    };
                     let mut child = BufferBuilder::new(&sub_layout, &schema.fields);
-                    write_schema_record_into_builder(&mut child, schema, dict)?;
+                    match it {
+                        Value::Dict(dict) if !schema.is_tuple => {
+                            write_schema_record_into_builder(&mut child, schema, dict)?;
+                        }
+                        Value::Tuple(tuple_items) if schema.is_tuple => {
+                            write_tuple_record_into_builder(&mut child, schema, tuple_items)?;
+                        }
+                        other => {
+                            return Err(BufferError::TypeMismatch {
+                                name: format!("<nested list>[{i}]"),
+                                declared: if schema.is_tuple {
+                                    "List<Tuple>"
+                                } else {
+                                    "List<Schema>"
+                                },
+                                requested: other.type_name(),
+                            });
+                        }
+                    }
                     let (mut child_bytes, child_reloc) = child.into_parts();
                     self.pad_to(elem_align);
                     let entry_offset = self.bytes.len();
@@ -1761,6 +1772,26 @@ fn write_schema_record_into_builder(
     Ok(())
 }
 
+/// Write every field of a tuple schema from a positional `Value::Tuple`.
+/// The schema is still a record at the binary layer; only the source
+/// container shape is positional.
+fn write_tuple_record_into_builder(
+    child: &mut BufferBuilder<'_>,
+    schema: &Schema,
+    items: &[crate::value::Value],
+) -> Result<(), BufferError> {
+    if items.len() != schema.fields.len() {
+        return Err(BufferError::MalformedPayload {
+            name: schema.name.clone(),
+            reason: "tuple arity does not match schema",
+        });
+    }
+    for (field, value) in schema.fields.iter().zip(items.iter()) {
+        write_schema_field_into_builder(child, field, value)?;
+    }
+    Ok(())
+}
+
 /// Write one schema field (`field`) carrying `value` into `child`.
 fn write_schema_field_into_builder(
     child: &mut BufferBuilder<'_>,
@@ -1795,7 +1826,7 @@ fn write_schema_field_into_builder(
             child.bytes[slot_offset..slot_offset + 4].copy_from_slice(&ptr.to_le_bytes());
             Ok(())
         }
-        (TypeRepr::Schema { schema }, Value::Dict(sub)) => {
+        (TypeRepr::Schema { schema }, Value::Dict(sub)) if !schema.is_tuple => {
             let sub_layout =
                 SchemaLayout::offsets_for(schema).map_err(|_| BufferError::MalformedPayload {
                     name: name.to_string(),
@@ -1803,6 +1834,16 @@ fn write_schema_field_into_builder(
                 })?;
             let mut grandchild = child.sub_record(name, &sub_layout, &schema.fields)?;
             write_schema_record_into_builder(&mut grandchild, schema, sub)?;
+            child.finish_sub_record(name, grandchild)
+        }
+        (TypeRepr::Schema { schema }, Value::Tuple(items)) if schema.is_tuple => {
+            let sub_layout =
+                SchemaLayout::offsets_for(schema).map_err(|_| BufferError::MalformedPayload {
+                    name: name.to_string(),
+                    reason: "nested tuple field is not layoutable",
+                })?;
+            let mut grandchild = child.sub_record(name, &sub_layout, &schema.fields)?;
+            write_tuple_record_into_builder(&mut grandchild, schema, items)?;
             child.finish_sub_record(name, grandchild)
         }
         (_, other) => Err(BufferError::TypeMismatch {
@@ -2729,6 +2770,27 @@ impl<'a> BufferReader<'a> {
     ) -> Result<crate::value::Value, BufferError> {
         use crate::smol_str::SmolStr;
         use crate::value::Value;
+        if schema.is_tuple {
+            let mut items = Vec::with_capacity(schema.fields.len());
+            for field in &schema.fields {
+                let fo = layout
+                    .fields
+                    .iter()
+                    .find(|fo| fo.name == field.name)
+                    .ok_or_else(|| BufferError::MalformedPayload {
+                        name: field.name.clone(),
+                        reason: "tuple field missing from layout",
+                    })?;
+                let slot_abs = record_base.checked_add(fo.offset).ok_or_else(|| {
+                    BufferError::MalformedPayload {
+                        name: field.name.clone(),
+                        reason: "tuple field slot offset overflows usize",
+                    }
+                })?;
+                items.push(self.read_field_at(slot_abs, &field.ty)?);
+            }
+            return Ok(Value::Tuple(std::sync::Arc::new(items)));
+        }
         let mut map = std::collections::BTreeMap::new();
         for field in &schema.fields {
             let fo = layout

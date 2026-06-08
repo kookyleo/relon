@@ -30,6 +30,7 @@
 //!   distinct.
 //! * `Value::String(_)` byte-equal.
 //! * `Value::List(_)` element-wise recursive.
+//! * `Value::Tuple(_)` element-wise recursive.
 //! * `Value::Dict(_)` field-set + per-field recursive (insertion
 //!   order ignored on the assumption that the schema-rooted lowering
 //!   preserves declaration order; differences in key ordering would
@@ -523,7 +524,9 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Int(i) => J::Number((*i).into()),
         Value::Float(f) => J::String(format!("f64:{:#018x}", f.into_inner().to_bits())),
         Value::String(s) => J::String(s.to_string()),
-        Value::List(items) => J::Array(items.iter().map(value_to_json).collect()),
+        Value::List(items) | Value::Tuple(items) => {
+            J::Array(items.iter().map(value_to_json).collect())
+        }
         Value::Dict(d) => {
             let mut map = serde_json::Map::new();
             for (k, val) in &d.map {
@@ -551,6 +554,9 @@ pub fn value_bit_eq(a: &Value, b: &Value) -> bool {
         (Float(x), Float(y)) => x.into_inner().to_bits() == y.into_inner().to_bits(),
         (String(x), String(y)) => x == y,
         (List(x), List(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(xi, yi)| value_bit_eq(xi, yi))
+        }
+        (Tuple(x), Tuple(y)) => {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(xi, yi)| value_bit_eq(xi, yi))
         }
         (Dict(x), Dict(y)) => {

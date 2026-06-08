@@ -272,8 +272,12 @@ pub fn decode_inplace_return(
                 .map_err(|e| RuntimeError::IoError(format!("{backend} buffer: {e}")))?;
             let mut items = Vec::with_capacity(sub_readers.len());
             for sub in &sub_readers {
-                let map = read_record_into_branded_map(backend, sub, schema)?;
-                items.push(Value::branded_dict(map, Some(schema.name.clone())));
+                if schema.is_tuple {
+                    items.push(read_tuple_record_into_tuple(backend, sub, schema)?);
+                } else {
+                    let map = read_record_into_branded_map(backend, sub, schema)?;
+                    items.push(Value::branded_dict(map, Some(schema.name.clone())));
+                }
             }
             Ok(Value::List(Arc::new(items)))
         }
@@ -361,24 +365,23 @@ pub fn decode_object_return(
         let field = &return_schema.fields[0];
         read_object_field(backend, &reader, field, return_schema)
     } else if return_schema.is_tuple {
-        // Wave T2: a tuple schema is laid out and verified exactly like any
-        // other record, but it decodes **positionally** to a `Value::List`
-        // (declaration-order slots, no field names) so the JSON projection
-        // is an array — byte-identical to the tree-walk oracle's
-        // `Value::List`, not a branded object.
-        read_tuple_record_into_list(backend, &reader, return_schema)
+        // A tuple schema is laid out and verified exactly like any other
+        // record, but it decodes **positionally** to a `Value::Tuple`
+        // (declaration-order slots, no field names). JSON projection still
+        // collapses it to an array.
+        read_tuple_record_into_tuple(backend, &reader, return_schema)
     } else {
         let map = read_object_record_into_map(backend, &reader, return_schema)?;
         Ok(Value::branded_dict(map, Some(return_schema.name.clone())))
     }
 }
 
-/// Wave T2: drain a tuple schema's fields in declaration order into a
-/// positional `Value::List`. The slot readers are the same
+/// Drain a tuple schema's fields in declaration order into a positional
+/// `Value::Tuple`. The slot readers are the same
 /// [`read_object_field`] arms a branded record uses; only the container
-/// shape differs (ordered list vs named map), which is exactly the
+/// shape differs (ordered tuple vs named map), which is exactly the
 /// tuple-vs-record decode fork.
-fn read_tuple_record_into_list(
+fn read_tuple_record_into_tuple(
     backend: &str,
     reader: &BufferReader<'_>,
     schema: &Schema,
@@ -387,7 +390,7 @@ fn read_tuple_record_into_list(
     for field in &schema.fields {
         items.push(read_object_field(backend, reader, field, schema)?);
     }
-    Ok(Value::List(Arc::new(items)))
+    Ok(Value::Tuple(Arc::new(items)))
 }
 
 /// Drain every field of `schema` from the object record `reader` into a
@@ -505,8 +508,12 @@ fn read_object_field(
                     .map_err(map_err)?;
                 let mut items = Vec::with_capacity(sub_readers.len());
                 for sub in &sub_readers {
-                    let map = read_object_record_into_map(backend, sub, schema)?;
-                    items.push(Value::branded_dict(map, Some(schema.name.clone())));
+                    if schema.is_tuple {
+                        items.push(read_tuple_record_into_tuple(backend, sub, schema)?);
+                    } else {
+                        let map = read_object_record_into_map(backend, sub, schema)?;
+                        items.push(Value::branded_dict(map, Some(schema.name.clone())));
+                    }
                 }
                 Ok(Value::List(Arc::new(items)))
             }

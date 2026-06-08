@@ -25,7 +25,7 @@ available:
 |---|---|
 | `len(value)` | Element count of a `String` / `List` / `Dict`. |
 | `range(end)` / `range(start, end)` | Half-open `Int` list. |
-| `type(value)` | The value's type name (`"Int"`, `"String"`, `"List"`, …). |
+| `type(value)` | The value's type name (`"Int"`, `"String"`, `"List"`, `"Tuple"`, …). |
 
 ```relon
 {

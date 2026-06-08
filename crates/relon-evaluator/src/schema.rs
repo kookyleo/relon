@@ -86,16 +86,14 @@ impl TreeWalkEvaluator {
                     }
                     Ok(())
                 }
-                ("Tuple", Value::List(l)) => {
-                    // v1.7: a tuple is positionally-typed. The runtime
-                    // representation reuses `Value::List`, so we
-                    // length-check the list, then recurse per position
-                    // into each declared element type.
+                ("Tuple", Value::Tuple(l)) => {
+                    // Tuple is positionally typed and distinct from
+                    // `List<T>` at the runtime/host boundary.
                     let expected_arity = type_hint.generics.len();
                     if l.len() != expected_arity {
                         return Err(RuntimeError::TypeMismatch {
                             expected: format_type(type_hint),
-                            found: format!("List of length {}", l.len()),
+                            found: format!("Tuple of length {}", l.len()),
                             range,
                         });
                     }
@@ -187,13 +185,39 @@ impl TreeWalkEvaluator {
                 // sole refcount (e.g. a freshly-cloned schema lookup
                 // whose original handle has already been dropped);
                 // fall back to a deep clone otherwise.
-                let crate::value::SchemaData { generics, fields } =
-                    Arc::try_unwrap(schema_arc).unwrap_or_else(|arc| (*arc).clone());
+                let crate::value::SchemaData {
+                    generics,
+                    fields,
+                    tuple_elements,
+                } = Arc::try_unwrap(schema_arc).unwrap_or_else(|arc| (*arc).clone());
                 let mut subst_map = HashMap::new();
                 for (i, gname) in generics.iter().enumerate() {
                     if let Some(gtype) = type_hint.generics.get(i) {
                         subst_map.insert(gname.clone(), gtype.clone());
                     }
+                }
+                if let Some(elements) = tuple_elements {
+                    let resolved_elements = if subst_map.is_empty() {
+                        elements
+                    } else {
+                        elements
+                            .iter()
+                            .map(|t| substitute_generics_in_typenode(t, &subst_map))
+                            .collect()
+                    };
+                    let ptr = value as *const Value;
+                    if !visited.insert((type_name.clone(), ptr)) {
+                        return Ok(());
+                    }
+                    self.apply_tuple_schema(
+                        resolved_elements,
+                        value,
+                        scope,
+                        range,
+                        visited,
+                        depth + 1,
+                    )?;
+                    return Ok(());
                 }
                 let resolved_fields = if subst_map.is_empty() {
                     fields
@@ -321,6 +345,7 @@ impl TreeWalkEvaluator {
             ("String", Value::String(_)) => Some(true),
             ("Bool", Value::Bool(_)) => Some(true),
             ("List", Value::List(_)) => Some(true),
+            ("Tuple", Value::Tuple(_)) => Some(true),
             ("Dict", Value::Dict(_)) => Some(true),
             ("Closure" | "Fn", Value::Closure(_)) => Some(true),
             _ if is_builtin_type_name(p) => Some(false),
@@ -437,6 +462,36 @@ impl TreeWalkEvaluator {
             }
         }
         Ok(true)
+    }
+
+    fn apply_tuple_schema(
+        &self,
+        elements: Vec<TypeNode>,
+        value: &mut Value,
+        scope: &Arc<Scope>,
+        range: TokenRange,
+        visited: &mut HashSet<(String, *const Value)>,
+        depth: usize,
+    ) -> Result<(), RuntimeError> {
+        let Value::Tuple(items) = value else {
+            return Err(RuntimeError::TypeMismatch {
+                expected: "Tuple".to_string(),
+                found: value.type_name().to_string(),
+                range,
+            });
+        };
+        if items.len() != elements.len() {
+            return Err(RuntimeError::TypeMismatch {
+                expected: format!("Tuple of length {}", elements.len()),
+                found: format!("Tuple of length {}", items.len()),
+                range,
+            });
+        }
+        let items = Arc::make_mut(items);
+        for (item, slot_ty) in items.iter_mut().zip(elements.iter()) {
+            self.check_type_internal(item, slot_ty, scope, range, visited, depth)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn merge_schema_with_dict_pairs(

@@ -20,7 +20,7 @@ What harm can an untrusted script do?
   file the host process can read.
 - **Eval explosion**: an infinitely / exponentially recursive closure
   eats the process.
-- **Oversized values**: a million-element list / dict eats memory.
+- **Oversized values**: a million-element list / tuple / dict eats memory.
 - **Calling dangerous host-registered functions**: the host registers
   `secret.read`, `db.query`, but doesn't want arbitrary scripts to
   reach them.
@@ -50,7 +50,7 @@ ctx.prepend_module_resolver(Arc::new(
 // 2. Set a step budget (guards against recursion / comprehension explosions)
 ctx.capabilities.max_steps = Some(1_000_000);
 
-// 3. Set a value-element water mark (guards against giant list/dict)
+// 3. Set a value-element water mark (guards against giant list/tuple/dict)
 ctx.capabilities.max_value_elements = Some(10_000);
 
 // 4. Grant only the bits you actually need (e.g. clock read)
@@ -174,11 +174,11 @@ strict CPU control, add a wall-clock timer on the host side (see
 ### `max_value_elements: Option<usize>`
 
 The `_bytes` part of the name leaves room for future extension; the
-**current measurement is "Value element count"** — a list's element
-count, or a dict's key/value pair count. Check points cover every
-language-level entry where a list / dict is produced:
+**current measurement is "Value element count"** — a list or tuple's
+element count, or a dict's key/value pair count. Check points cover
+every language-level entry where a list / tuple / dict is produced:
 
-- Literal construction (`[...]` / `{ k: v }`).
+- Literal construction (`[...]` / `(...)` / `{ k: v }`).
 - Dict `+` merge.
 - Comprehensions (`[for x in xs: ...]`).
 - Standard-library built-ins (`range`, `string.split`,
@@ -204,9 +204,9 @@ lists slips through — recursive size checking is a separate design
 decision and isn't part of the current cap semantics.
 
 Native functions the host registers via `register_fn` also pass
-through this cap when they return list/dict values — the previous
+through this cap when they return list/tuple/dict values — the previous
 documentation's "that's the host's domain" statement was the pre-fix
-state; today it's unified to "any runtime-emitted list/dict goes
+state; today it's unified to "any runtime-emitted list/tuple/dict goes
 through the check". To opt out completely, set
 `max_value_elements = None`.
 
@@ -311,7 +311,7 @@ In this setup, the user script:
 - ❌ Can't call any native fn declaring a capability bit
   (`reads_fs` / `network` / …) the host didn't grant → `CapabilityDenied`.
 - ❌ Runs over 100k steps → `StepLimitExceeded`.
-- ❌ Constructs a list/dict with more than 10k elements → `ValueTooLarge`.
+- ❌ Constructs a list/tuple/dict with more than 10k elements → `ValueTooLarge`.
 
 ## Error list
 
@@ -322,7 +322,7 @@ Runtime errors triggered by the sandbox (the relevant variants of
 | --- | --- |
 | `CapabilityDenied { name, reason, range }` | `#import` reaches a default-reject resolver; or `#import` path escapes the root; or a call to a native fn declaring an ungranted bit (`reason` shaped like ``"function declared `<bit>` but caller did not grant it"``) |
 | `StepLimitExceeded { limit, range }` | `eval_internal` calls exceed `max_steps` |
-| `ValueTooLarge { limit, actual, range }` | A single list/dict's element count exceeds `max_value_elements` |
+| `ValueTooLarge { limit, actual, range }` | A single list/tuple/dict's element count exceeds `max_value_elements` |
 
 Each carries `TokenRange` — feed it straight to miette for readable
 output with source-code context.
@@ -337,7 +337,7 @@ To avoid overestimating the guarantees, here's what Relon's sandbox
   it on the host side with `tokio::time::timeout` or a separate
   thread + timeout channel.
 - ❌ **Exact heap-byte accounting**: `max_value_elements` only
-  counts list/dict element counts; it doesn't count String bytes or
+  counts list/tuple/dict element counts; it doesn't count String bytes or
   closure-captured ref-counted references. For a strict in-process
   memory ceiling, layer OS-level `setrlimit` / cgroup on top.
 - ❌ **Cross-process isolation**: Relon runs inside your process; if
