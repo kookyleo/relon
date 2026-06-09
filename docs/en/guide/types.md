@@ -17,8 +17,8 @@ during evaluation; a check failure raises a specific runtime error.
     String name: "Relon",
     Int port: 8080,
 
-    // Optional type annotation (? suffix)
-    String? optional_desc: None,
+    // Optional type annotation (Option<T>)
+    Option<String> optional_desc: None,
 
     // Generic annotations
     List<Int> scores: [100, 95, 80],
@@ -157,8 +157,8 @@ Tuple variants use arrays:
 
 Built-in `Option` and `Result` use the same target-typed boundary. For
 `#main(Option<Int> x)`, input may use `null`, the direct payload `41`, or the
-externally tagged form `{ "x": { "Some": { "value": 41 } } }`. The shorthand
-`Int?` follows the same rule. For `#main(Result<Int, String> r)`, use
+externally tagged form `{ "x": { "Some": { "value": 41 } } }`.
+For `#main(Result<Int, String> r)`, use
 `{ "r": { "Ok": { "value": 41 } } }` or
 `{ "r": { "Err": { "error": "bad" } } }`.
 
@@ -329,16 +329,16 @@ can write as a field-level type prefix:
   name as the bareword form.
 - **Generic forms**: `#brand Dict<String, Int>`,
   `#brand List<Weather>`, `#brand Foo<T>`.
-- **Optional modifier**: `#brand Weather?` — same behavior as the
-  field-level `Weather? w: ...` form. `None` passes; other values
-  follow the original type check.
+- **Optional form**: `#brand Option<Weather>` — same behavior as the
+  field-level `Option<Weather> w: ...` form. `None` passes; other
+  values follow the original type check.
 
 > About generic brand strings: the string written into `dict.brand`
 > matches `format_type_node` output.
 > - Single-segment, non-built-in type: `Weather`.
 > - Multi-segment path: `geo.Location`.
 > - Generic: `Dict<String, Int>`, `Foo<T>`.
-> - Optional: `Weather?`.
+> - Optional: `Option<Weather>`.
 >
 > In `match` arms the bareword form (`Weather: ...`) only matches
 > single-segment non-built-in brands. To match by full-string brand
@@ -442,7 +442,7 @@ directories, ASTs, and other recursive structures:
 {
     #schema Menu {
         String title: *,
-        List<Menu>? children: *
+        Option<List<Menu>> children: *
     },
 
     Menu root: {
@@ -491,8 +491,8 @@ declaration, distinguished by **modifier combinations**:
         // 1. Required (default): missing → error
         String name: *,
 
-        // 2. Optional (? suffix): the field may be absent; use None for no value
-        String? bio: *,
+        // 2. Optional (Option<T>): the field may be absent; use None for no value
+        Option<String> bio: *,
 
         // 3. Literal default (#default value): missing → this constant
         #default "user"

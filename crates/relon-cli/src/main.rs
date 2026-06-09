@@ -825,7 +825,7 @@ fn type_accepts_tuple_array(type_hint: &TypeNode, arity: usize, tree: &AnalyzedT
 
 fn targetless_json_to_value(json: JsonValue) -> Result<Value, String> {
     if json.is_null() {
-        return Err("JSON null needs an Option<T> or T? target type".to_string());
+        return Err("JSON null needs an Option<T> target type".to_string());
     }
     serde_json::from_value::<Value>(json).map_err(|e| format!("invalid JSON value: {e}"))
 }

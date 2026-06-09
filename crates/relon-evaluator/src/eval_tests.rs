@@ -1257,7 +1257,7 @@ fn recursion_limit_uses_dedicated_error_kind() {
                 r#"{{
                     #schema
                     Cell: {{
-                        Cell? next: *
+                        Option<Cell> next: *
                     }},
                     Cell root: {deeply_nested}
                 }}"#
@@ -1279,7 +1279,7 @@ fn test_recursive_schema() {
         #schema
         Menu: {
             String title: *,
-            List<Menu>? children: *
+            Option<List<Menu>> children: *
         },
 
         Menu root: {
@@ -1751,14 +1751,14 @@ fn test_brand_decorator_field_form_generic_brand_parity() {
 
 #[test]
 fn test_brand_decorator_optional_brand_string() {
-    // `#brand Weather?` — the `?` suffix flows into the brand string
-    // so type guards see the optionality marker. The schema validation
+    // `#brand Option<Weather>` — the option wrapper flows into the brand
+    // string so type guards see the optionality. The schema validation
     // proceeds against the underlying `Weather` schema.
     let result = eval_doc(
         r#"{
         #schema Weather: { String location: *, Int temperature: * },
 
-        w: #brand Weather? {
+        w: #brand Option<Weather> {
             location: "Tokyo",
             temperature: 18
         }
@@ -1771,7 +1771,7 @@ fn test_brand_decorator_optional_brand_string() {
     let Value::Dict(w) = d.map.get("w").unwrap() else {
         panic!("Expected Dict for w");
     };
-    assert_eq!(w.brand.as_deref(), Some("Weather?"));
+    assert_eq!(w.brand.as_deref(), Some("Option<Weather>"));
 }
 
 // -------- Task B: `#brand X` at schema-field position --------

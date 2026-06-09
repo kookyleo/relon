@@ -70,7 +70,7 @@ fn flags_static_type_mismatch_on_typed_field() {
 
 #[test]
 fn allows_optional_none() {
-    let tree = analyze_str(r#"{ Int? port: None }"#);
+    let tree = analyze_str(r#"{ Option<Int> port: None }"#);
     let mismatches: Vec<_> = tree
         .diagnostics
         .iter()
@@ -249,7 +249,7 @@ fn option_match_payload_pattern_bindings_are_typed() {
 #[test]
 fn optional_shorthand_match_payload_pattern_bindings_are_typed() {
     let tree = analyze_str(
-        r#"#main(Int? x) -> Int
+        r#"#main(Option<Int> x) -> Int
         x match { Some(v): v + 1, None: 0 }
         "#,
     );

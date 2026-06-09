@@ -48,8 +48,9 @@ let result = Evaluator::new(Arc::new(ctx))
 `Value::List`, and JSON `null` is rejected because `null` is not a Relon
 value. When writing a Rust host directly, construct `Value::tuple(...)` for
 `#main` tuple parameters and `Value::variant_dict(...)` for enum parameters,
-or decode with the `#main` signature. Only a known `Option<T>` or `T?` target
-maps JSON `null` to `None`; non-null input for `T?` is decoded as `Some(value)`.
+or decode with the `#main` signature. Only a known `Option<T>` target
+maps JSON `null` to `None`; non-null input for `Option<T>` is decoded as
+`Some(value)`.
 
 The CLI path (`relon run --args '<json>'`) and WASM playground `#main(args)`
 already read the entry signature: JSON arrays become `Value::Tuple` for

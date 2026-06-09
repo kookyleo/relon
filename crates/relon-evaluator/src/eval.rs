@@ -565,8 +565,7 @@ impl TreeWalkEvaluator {
 
         let mut val = match node.expr.as_ref() {
             Expr::Missing => Err(RuntimeError::ValidationError(
-                "`null` is not a Relon value; use None with an Option<T> or T? target type"
-                    .to_string(),
+                "`null` is not a Relon value; use None with an Option<T> target type".to_string(),
                 node.range,
             )),
             Expr::Bool(b) => Ok(Value::Bool(*b)),

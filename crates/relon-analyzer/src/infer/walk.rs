@@ -191,8 +191,8 @@ pub(crate) enum PathTailOutcome {
 /// * `Dict(value_ty)` → every key has the same value type, so the
 ///   segment is structurally fine and the walk continues with
 ///   `value_ty`.
-/// * `Optional(inner)` → strip the `?` wrapper and try again; matches
-///   the runtime's `T? . x` semantics.
+/// * `Optional(inner)` → strip the `Option` wrapper and try again;
+///   matches the runtime's `Option<T> . x` semantics.
 /// * `Schema` referring to a name not in the schema index → soft stop
 ///   (`UnknownStep`), so strict mode reports the user-visible reason.
 /// * Anything else (`Int`, `String`, `List<…>`, …) → `UnknownStep`,

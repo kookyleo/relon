@@ -573,7 +573,7 @@ pub enum Diagnostic {
     #[diagnostic(
         code(relon::analyze::reserved_type_name),
         help(
-            "Relon has no `Null` type or value. Use `Option<T>` / `T?` and `None` for absence; use `()` for the empty tuple instead of a user-written `Unit` type. Enum types are declared with `#enum Name ...`; the old generic `Enum` type form is not supported."
+            "Relon has no `Null` type or value. Use `Option<T>` and `None` for absence; use `()` for the empty tuple instead of a user-written `Unit` type. Enum types are declared with `#enum Name ...`; the old generic `Enum` type form is not supported."
         )
     )]
     ReservedTypeName {

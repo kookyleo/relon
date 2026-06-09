@@ -215,7 +215,7 @@ impl<'de> Visitor<'de> for ValueVisitor {
     type Value = Value;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a Relon value; JSON null is only valid with an Option<T> or T? target")
+        formatter.write_str("a Relon value; JSON null is only valid with an Option<T> target")
     }
 
     fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
@@ -256,7 +256,7 @@ impl<'de> Visitor<'de> for ValueVisitor {
         E: de::Error,
     {
         Err(E::custom(
-            "JSON null is not a Relon value; use an Option<T> or T? target type so it decodes as None",
+            "JSON null is not a Relon value; use an Option<T> target type so it decodes as None",
         ))
     }
 
@@ -265,7 +265,7 @@ impl<'de> Visitor<'de> for ValueVisitor {
         E: de::Error,
     {
         Err(E::custom(
-            "JSON null is not a Relon value; use an Option<T> or T? target type so it decodes as None",
+            "JSON null is not a Relon value; use an Option<T> target type so it decodes as None",
         ))
     }
 

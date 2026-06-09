@@ -42,8 +42,8 @@ let result = Evaluator::new(Arc::new(ctx))
 `Value::List`，JSON `null` 会被拒绝，因为 `null` 不是 Relon 值。直接写
 Rust host 时，如果 `#main` 参数是 tuple，请构造 `Value::tuple(...)`；如果
 参数是 enum，请构造 `Value::variant_dict(...)`，或按 `#main` 签名做目标
-类型感知解码。只有已知目标类型是 `Option<T>` 或 `T?` 时，JSON `null` 才会
-映射成 `None`；`T?` 的非 null 输入会解码成 `Some(value)`。
+类型感知解码。只有已知目标类型是 `Option<T>` 时，JSON `null` 才会
+映射成 `None`；`Option<T>` 的非 null 输入会解码成 `Some(value)`。
 
 CLI 的 `relon run --args '<json>'` 和 WASM playground 的 `#main(args)` 已读取
 入口签名：目标是 `Tuple<...>` 或 tuple schema 时，JSON array 会进入

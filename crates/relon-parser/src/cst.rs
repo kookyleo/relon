@@ -1416,17 +1416,21 @@ impl<'a> Parser<'a> {
         // is recognised as a primitive type name. Guarded by what
         // follows so plain VARIABLE_EXPR usage doesn't accidentally
         // become a TYPE_NODE: must be followed by `{` (type-tagged
-        // dict body, `#brand T { ... }`) or `?` (optional marker).
+        // dict body, `#brand T { ... }`) or a stray type-suffix `?`.
+        // The `?` no longer denotes optionality (that's `Option<T>`),
+        // but routing it here lets `parse_type` emit a precise "use
+        // Option<T>" error instead of a confusing ternary misparse.
         if known_head {
             let next = self.tokens.get(idx).map(|(k, _)| *k);
             if matches!(next, Some(SyntaxKind::QUESTION) | Some(SyntaxKind::L_BRACE)) {
                 return true;
             }
         }
-        // `IDENT ? {` — user-defined schema with optional marker and
-        // an immediately-following brace body (`Weather? { ... }`).
-        // The optional `?` plus brace makes this unambiguously a
-        // type-tagged value, never a ternary expression head.
+        // `IDENT ? {` — a legacy `Weather? { ... }` shape. The `?` is no
+        // longer a valid optional marker, but the trailing brace makes
+        // this unambiguously a (now-erroring) type-tagged value rather
+        // than a ternary head, so route it into `parse_type` for the
+        // helpful diagnostic.
         if self.tokens.get(idx).map(|(k, _)| *k) == Some(SyntaxKind::QUESTION) {
             let mut j = idx + 1;
             while j < self.tokens.len() && self.tokens[j].0.is_trivia() {
@@ -2038,17 +2042,17 @@ impl<'a> Parser<'a> {
     /// Parse a type-expression-shaped run of tokens into a TYPE_NODE.
     /// The grammar:
     ///
-    ///   TypeNode    := TupleType | (PathSeg ('.' PathSeg)* GenericArgs? '?'?)
+    ///   TypeNode    := TupleType | (PathSeg ('.' PathSeg)* GenericArgs?)
     ///   TupleType   := '(' ')' | '(' TypeNode ',' ')' | '(' TypeNode (',' TypeNode)+ ','? ')'
     ///   PathSeg     := IDENT | STRING
     ///   GenericArgs := '<' (TypeNode (',' TypeNode)*)? ','? '>'
     ///
-    /// Matches the winnow `parse_type_node` (in `expr.rs`) for every
-    /// shape the corpus uses today, including string-keyed segments
-    /// (`"namespaced".Foo`), nested generics (`Map<String, Int>`),
-    /// the optional `?` marker, and v1.7 tuple types in both
+    /// Handles string-keyed segments (`"namespaced".Foo`), nested
+    /// generics (`Map<String, Int>`), and v1.7 tuple types in both
     /// type-hint position (`(Int, String) pair: ...`) and as generic
-    /// arguments (`List<(Int, String)>`).
+    /// arguments (`List<(Int, String)>`). A trailing type-suffix `?`
+    /// (`T?`) is no longer valid — optionality is written `Option<T>` —
+    /// so we still consume any stray `?` token but flag it as an error.
     fn parse_type(&mut self) {
         // Tuple type — committed only when the caller picked
         // `parse_type` (typed-key / generic-arg / closure-param /
@@ -2093,8 +2097,12 @@ impl<'a> Parser<'a> {
             }
             self.expect(SyntaxKind::GT);
         }
-        // Optional `?` (i.e. `User?`).
+        // Type-suffix `?` is no longer valid syntax — optional types
+        // are written `Option<T>`. We still consume the token (keeping
+        // the tree lossless and avoiding recovery spin) but flag it as
+        // an error pointing the user to the named-type form.
         if self.at(SyntaxKind::QUESTION) {
+            self.error("optional types are written `Option<T>`, not `T?`");
             self.bump();
         }
         self.close();
@@ -2123,9 +2131,11 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(SyntaxKind::R_PAREN);
-        // Tuple types support the same trailing `?` as regular types
-        // (`(Int, String)?` — nullable pair).
+        // Type-suffix `?` is no longer valid syntax — optional tuple
+        // types are written `Option<(...)>`. Consume the token but flag
+        // it as an error.
         if self.at(SyntaxKind::QUESTION) {
+            self.error("optional types are written `Option<T>`, not `T?`");
             self.bump();
         }
         self.close();
@@ -2840,19 +2850,75 @@ mod tests {
 
     #[test]
     fn generic_type_in_closure_param() {
-        let parsed = parse_round_trip("{ extract(List<Int> xs, String? sep): xs }");
+        let parsed = parse_round_trip("{ extract(List<Int> xs, Option<String> sep): xs }");
         assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
         let types: Vec<_> = parsed
             .syntax()
             .descendants()
             .filter(|n| n.kind() == SyntaxKind::TYPE_NODE)
             .collect();
-        // `List<Int>` outer + `Int` nested + `String?` = 3 TYPE_NODEs.
+        // `List<Int>` outer + `Int` nested + `Option<String>` outer +
+        // `String` nested = 4 TYPE_NODEs.
         assert!(
             types.len() >= 3,
             "expected at least 3 TYPE_NODE, got {}",
             types.len()
         );
+    }
+
+    #[test]
+    fn type_suffix_question_is_rejected() {
+        // Wave A: the type-suffix `?` (`Int?`, `Weather?`, `List<T>?`)
+        // is no longer valid — optionality is written `Option<T>`. Each
+        // of these must surface a parse error pointing at `Option<T>`.
+        for source in [
+            "#main(Int? x) -> Int\n0\n",
+            "{ extract(String? sep): sep }",
+            "{ Weather? w: { a: 1 } }",
+            "{ x: #brand Weather? { a: 1 } }",
+            "{ extract(List<Int>? xs): xs }",
+        ] {
+            let parsed = parse_cst(source);
+            assert!(
+                parsed.has_errors(),
+                "expected a parse error for type-suffix `?` in {source:?}"
+            );
+            assert!(
+                parsed
+                    .errors
+                    .iter()
+                    .any(|e| e.message.contains("Option<T>")),
+                "expected an `Option<T>` hint in errors for {source:?}, got {:?}",
+                parsed.errors
+            );
+        }
+    }
+
+    #[test]
+    fn option_type_in_main_signature_parses_clean() {
+        // The migration target `Option<T>` parses without errors where
+        // the old `T?` used to.
+        let parsed = parse_cst("#main(Option<Int> x) -> Int\n0\n");
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+    }
+
+    #[test]
+    fn optional_chaining_and_ternary_still_parse() {
+        // The call-chain `?` (optional chaining) and the ternary `?:`
+        // must keep parsing cleanly — only the type-suffix `?` is gone.
+        for source in [
+            "{ f(a): a?.b }",
+            "{ f(a): a?[0] }",
+            "{ f(a): a?.b?.c }",
+            "{ g(x): x < 0 ? -x : x }",
+        ] {
+            let parsed = parse_round_trip(source);
+            assert!(
+                !parsed.has_errors(),
+                "unexpected errors for {source:?}: {:?}",
+                parsed.errors
+            );
+        }
     }
 
     #[test]

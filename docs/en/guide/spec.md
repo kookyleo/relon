@@ -522,8 +522,8 @@ with multiple segments):
 * `Schema(name)` head → next segment must be a declared field of that
   schema; missing → `UnknownReferenceType` (cross-mode).
 * `Dict<K, V>` head → every key step yields V (homogeneous values).
-* `Optional<T>` head → strip the `?` wrapper before stepping again,
-  matching the runtime's `T?.x` semantics.
+* `Option<T>` head → strip the `Option` wrapper before stepping again,
+  matching the runtime's `Option<T>.x` semantics.
 * `Any` head → after the v1.6/v1.7 double ban, the only path-head that
   can still land here is a closure parameter without a `type_hint`
   (strict raises `ClosureParamTypeMissing` and never reaches the
