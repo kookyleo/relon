@@ -4891,12 +4891,21 @@ fn lower_match(
             }
             StaticArmDecision::Never => continue,
             StaticArmDecision::Undecidable => {
+                // Defensive cap: an undecidable arm means the scrutinee is
+                // not pinned to a single type, i.e. this is dynamic
+                // runtime-`#brand` dispatch. The analyzer now rejects that
+                // shape up-front (`Diagnostic::DynamicBrandDispatchMatch`),
+                // so a well-analyzed program never reaches here. We keep
+                // the cap rather than `unreachable!` so a caller that
+                // lowers un-analyzed IR fails honestly instead of
+                // miscompiling.
                 return Err(cap!(
                     "lower_match.unsupported_expr.1",
                     LoweringError::UnsupportedExpr {
                         kind: format!(
                             "Match(arm pattern not statically decidable for scrutinee type \
-                             {ty:?} brand {brand:?} — deferred to dynamic brand-dispatch)"
+                             {ty:?} brand {brand:?} — dynamic brand-dispatch is rejected by \
+                             the analyzer; declare an `#enum`)"
                         ),
                         range: pattern.range,
                     }

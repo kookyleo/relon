@@ -384,6 +384,128 @@ fn skips_exhaustiveness_when_type_uninferrable() {
 }
 
 #[test]
+fn rejects_dynamic_brand_dispatch_match() {
+    // The canonical duck-typing residue: an untyped closure param `item`
+    // matched on runtime schema `#brand`s. Its static type is `Any`, so
+    // choosing an arm would require a runtime brand-string compare — the
+    // analyzer must reject it and steer the user to an `#enum`.
+    let tree = analyze_str(
+        r#"#relaxed
+        {
+            #schema Image { name: String, url: String },
+            #schema Text { name: String, content: String },
+            render_item(item): item match {
+                Image: "IMG",
+                Text: "TXT",
+                _: "UNKNOWN"
+            }
+        }"#,
+    );
+    let brand: Vec<_> = tree
+        .diagnostics
+        .iter()
+        .filter_map(|d| match d {
+            Diagnostic::DynamicBrandDispatchMatch { arm_brands, .. } => Some(arm_brands.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(brand.len(), 1, "{:?}", tree.diagnostics);
+    assert_eq!(brand[0], vec!["Image".to_string(), "Text".to_string()]);
+    assert_eq!(
+        tree.diagnostics
+            .iter()
+            .find(|d| matches!(d, Diagnostic::DynamicBrandDispatchMatch { .. }))
+            .unwrap()
+            .severity(),
+        crate::diagnostic::Severity::Error
+    );
+}
+
+#[test]
+fn typed_enum_replacement_for_brand_dispatch_analyzes_clean() {
+    // The Rust-aligned rewrite of the rejected case: a single `#enum`
+    // whose variants carry their payloads, matched on its variants. No
+    // brand-dispatch diagnostic, no other errors.
+    let tree = analyze_str(
+        r#"#enum Media {
+            Image { name: String, url: String },
+            Text { name: String, content: String }
+        }
+        {
+            render_item(Media item): item match {
+                Media.Image { url, name: _ }: "IMG(" + url + ")",
+                Media.Text { content, name: _ }: "TXT(" + content + ")"
+            }
+        }"#,
+    );
+    assert_eq!(
+        count(&tree, |d| matches!(
+            d,
+            Diagnostic::DynamicBrandDispatchMatch { .. }
+        )),
+        0,
+        "{:?}",
+        tree.diagnostics
+    );
+    assert_eq!(
+        count(&tree, |d| d.severity()
+            == crate::diagnostic::Severity::Error),
+        0,
+        "{:?}",
+        tree.diagnostics
+    );
+}
+
+#[test]
+fn keeps_static_brand_match_on_typed_param() {
+    // wave R5: a scrutinee pinned to a single concrete schema by a typed
+    // parameter is NOT dynamic brand-dispatch — the arm is decided at
+    // compile time. Must not trip the rejection.
+    let tree = analyze_str(
+        r#"#relaxed
+        {
+            #schema Weather { String location: *, Int temperature: * },
+            classify(Weather w): w match {
+                Weather: "is_weather",
+                _: "other"
+            }
+        }"#,
+    );
+    assert_eq!(
+        count(&tree, |d| matches!(
+            d,
+            Diagnostic::DynamicBrandDispatchMatch { .. }
+        )),
+        0,
+        "{:?}",
+        tree.diagnostics
+    );
+}
+
+#[test]
+fn keeps_scalar_scrutinee_brand_match() {
+    // A definite-scalar scrutinee (`Int`) matched against a schema brand:
+    // statically decidable (always `Never`), so it is kept (it lowers to
+    // a no-match trap, not a runtime brand compare).
+    let tree = analyze_str(
+        r#"{
+            #enum N { A { x: Int }, B { y: Int } }
+            mystery: 42,
+            out: mystery match { A: 1 }
+        }"#,
+    );
+    assert_eq!(
+        count(&tree, |d| matches!(
+            d,
+            Diagnostic::DynamicBrandDispatchMatch { .. }
+        )),
+        0,
+        "{:?}",
+        tree.diagnostics
+    );
+}
+
+#[test]
 fn flags_nested_list_mismatch() {
     let tree = analyze_str(r#"{ List<Int> items: [1, "two", 3] }"#);
     assert!(

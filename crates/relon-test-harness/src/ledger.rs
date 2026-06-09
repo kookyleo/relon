@@ -1949,13 +1949,15 @@ pub const LEDGER: &[LedgerEntry] = &[
     },
     LedgerEntry {
         id: "lower_match.unsupported_expr.1",
-        site: "lowering/mod.rs::lower_match",
+        site: "lowering/mod.rs::try_lower_runtime_enum_match",
         category: Category::ExprShape,
         status: Status::Capped,
         corpus: "",
-        reason: "match arm not statically decidable (coarsening/generic/branded-builtin \
-                 pattern); runtime brand-dispatch is the dynamic residue — honest cap \
-                 as a non-default escape hatch under the static-first decision",
+        reason: "runtime-enum `match` arm pattern is not a variant of the scrutinee enum \
+                 (or an unsupported pattern shape). The dynamic runtime-`#brand` dispatch \
+                 case that this id also defended is now rejected up-front by the analyzer \
+                 (Diagnostic::DynamicBrandDispatchMatch), so the lower_match arm-undecidable \
+                 site is a defensive cap unreachable for analyzed programs",
     },
     LedgerEntry {
         id: "lower_match.empty_enum_match",

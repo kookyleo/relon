@@ -1,29 +1,22 @@
-// Showcase fixture for match polymorphism; `#relaxed` keeps the
-// untyped `render_item(item)` closure shape concise.
-#relaxed
+// Showcase fixture for typed `match` polymorphism, the Rust-aligned way:
+// a heterogeneous list is modelled as a single `#enum` whose variants
+// carry their own payloads, and `render_item` matches the variants.
+// This replaces the old `#relaxed` runtime-`#brand` dispatch (matching a
+// list of structurally-different dicts on their runtime brand), which the
+// analyzer now rejects — the static-first language wants an `#enum` here,
+// exactly as Rust would.
+#enum Media {
+    Image { name: String, url: String },
+    Text { name: String, content: String }
+}
 {
-    #schema Image {
-        name: String,
-        url: String
-    },
-    #schema Text {
-        name: String,
-        content: String
-    },
     items: [
-        {
-            name: "a",
-            url: "http://a.png"
-        },
-        {
-            name: "b",
-            content: "hello world"
-        }
+        Media.Image { name: "a", url: "http://a.png" },
+        Media.Text { name: "b", content: "hello world" }
     ],
-    render_item(item): item match {
-        Image: "IMG(" + item.url + ")",
-        Text: "TXT(" + item.content + ")",
-        _: "UNKNOWN"
+    render_item(Media item): item match {
+        Media.Image { url, name: _ }: "IMG(" + url + ")",
+        Media.Text { content, name: _ }: "TXT(" + content + ")"
     },
 
     display: [

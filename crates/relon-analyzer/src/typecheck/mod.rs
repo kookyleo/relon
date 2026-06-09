@@ -482,6 +482,7 @@ impl<'a> Walker<'a> {
                 self.check_index_dispatch(path);
             }
             Expr::Match { expr, arms } => {
+                self.check_dynamic_brand_dispatch(node.range, expr, arms);
                 self.check_match_exhaustiveness(node.range, expr, arms);
                 self.check_match_arm_types(node.range, expr, arms);
                 self.visit_internal(expr, None);

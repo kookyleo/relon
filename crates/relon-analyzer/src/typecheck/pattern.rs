@@ -169,6 +169,81 @@ impl<'a> Walker<'a> {
         });
     }
 
+    /// Reject dynamic brand-dispatch `match` — the duck-typing residue.
+    ///
+    /// A brand/type-pattern `match` whose scrutinee is NOT statically
+    /// pinned to a single concrete type (or a typed `#enum`) can only
+    /// choose an arm by comparing a runtime `#brand` string. That is the
+    /// dynamic residue the static-first language rejects; the user should
+    /// declare an `#enum` and match its variants instead.
+    ///
+    /// Predicate (mirrors the reachable `StaticArmDecision::Undecidable`
+    /// case the IR lowering used to `cap!` at
+    /// `lower_match.unsupported_expr.1`):
+    ///
+    /// * KEEP — typed `#enum` / `Option` / `Result` match: handled by
+    ///   `infer_enum_type` returning `Some`; exhaustiveness owns it.
+    /// * KEEP — single-typed-brand scrutinee (wave R5 static arm-fold):
+    ///   the scrutinee infers to a concrete `Schema(name)`, so each brand
+    ///   arm is decided at compile time against that one brand.
+    /// * KEEP — definite-scalar scrutinee (`Int`/`Float`/`Bool`/`String`):
+    ///   a brand/type pattern is statically `Matches`/`Never`.
+    /// * REJECT — any other scrutinee (`Any`, `Dict`, `List`, `Number`,
+    ///   closure, tuple, or uninferrable) carrying a non-builtin
+    ///   brand/type-pattern arm: the arm choice needs a runtime brand
+    ///   compare.
+    pub(super) fn check_dynamic_brand_dispatch(
+        &mut self,
+        match_range: TokenRange,
+        scrutinee: &Node,
+        arms: &[(Node, Node)],
+    ) {
+        // Typed `#enum` / `Option` / `Result` match — exhaustiveness owns
+        // the verdict, never a brand string. Keep.
+        if self.infer_enum_type(scrutinee).is_some() {
+            return;
+        }
+
+        // Collect the non-builtin brand/type-pattern arms (the ones that
+        // would require a runtime brand compare). A `match` with no such
+        // arm (only `_`, builtin-type patterns, or literal patterns) is
+        // not brand dispatch — leave it for the other checks / lowering.
+        let mut arm_brands: Vec<String> = Vec::new();
+        for (pat, _) in arms {
+            if let Some(name) = brand_pattern_name(pat) {
+                arm_brands.push(name);
+            }
+        }
+        if arm_brands.is_empty() {
+            return;
+        }
+
+        // The scrutinee must be statically pinned to a single concrete
+        // type for the brand arms to be decided at compile time. Anything
+        // else is dynamic brand dispatch.
+        let scope = self.build_type_scope();
+        let pinned = match infer_type(scrutinee, &scope) {
+            Some(InferredType::Schema(_)) => true,
+            Some(
+                InferredType::Int | InferredType::Float | InferredType::Bool | InferredType::String,
+            ) => true,
+            // `Any`, `Number`, `List`, `Dict`, `Fn`, `Tuple`, variants of
+            // a non-enum schema, optionals of a non-enum, or an
+            // uninferrable scrutinee: not pinned to a single brand.
+            _ => false,
+        };
+        if pinned {
+            return;
+        }
+
+        self.tree
+            .diagnostics
+            .push(Diagnostic::DynamicBrandDispatchMatch {
+                arm_brands,
+                range: span_of(match_range),
+            });
+    }
+
     /// Conservative exhaustiveness check: only fires when we can statically
     /// determine the matched expression's type to be a sum-type Enum.
     /// Otherwise we silently fall through to the runtime mismatch path.
@@ -401,6 +476,27 @@ fn single_variable_name(node: &Node) -> Option<String> {
 fn pattern_variant_name(node: &Node) -> Option<String> {
     match node.expr.as_ref() {
         Expr::Type(t) if t.path.len() == 1 => Some(t.path[0].clone()),
+        Expr::VariantPattern { variant, .. } => Some(variant.clone()),
+        _ => None,
+    }
+}
+
+/// Name of a brand/type-pattern arm that would require a runtime `#brand`
+/// compare on a non-typed scrutinee: a single-segment, non-builtin
+/// `Type(Name)` pattern (a schema/brand name like `Image` / `Text`), or a
+/// `VariantPattern`. Builtin-type patterns (`Int`, `Dict`, ...) and
+/// optional/dotted/generic patterns are not brand dispatch and return
+/// `None`.
+fn brand_pattern_name(node: &Node) -> Option<String> {
+    match node.expr.as_ref() {
+        Expr::Type(t)
+            if t.path.len() == 1
+                && t.generics.is_empty()
+                && !t.is_optional
+                && !relon_parser::is_builtin_type_name(&t.path[0]) =>
+        {
+            Some(t.path[0].clone())
+        }
         Expr::VariantPattern { variant, .. } => Some(variant.clone()),
         _ => None,
     }

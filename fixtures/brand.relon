@@ -36,9 +36,11 @@
             temperature: 24
         }
     ],
-    // `match` distinguishes branded dicts by the brand label, so the two
-    // entry points (typed_field vs decorated) compare equal at this level.
-    classify(w): w match {
+    // `match` on a statically-`Weather` scrutinee: the brand is pinned by
+    // the typed parameter, so the arm is chosen at compile time (wave R5
+    // static arm-fold) — no runtime `#brand` dispatch. The `_` arm is dead
+    // but kept to show the catch-all spelling.
+    classify(Weather w): w match {
         Weather: "is_weather",
         _: "other"
     },
