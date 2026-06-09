@@ -547,6 +547,24 @@ pub const LEDGER: &[LedgerEntry] = &[
         reason: "expression shape has no IR/codegen lowering path yet",
     },
     LedgerEntry {
+        id: "lower_expr.unsupported_expr.spread_empty",
+        site: "lowering/mod.rs::lower_expr",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "list spread flattened to empty; element type cannot be inferred for the \
+                 materialiser",
+    },
+    LedgerEntry {
+        id: "lower_expr.unsupported_expr.spread_elem_ty",
+        site: "lowering/mod.rs::lower_expr",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "list spread element type is not Int/Float; only scalar Int/Float spread lists \
+                 are materialised in the AOT envelope",
+    },
+    LedgerEntry {
         id: "lower_expr.closure_across_boundary",
         site: "lowering/mod.rs::lower_expr",
         category: Category::Closure,
@@ -1213,6 +1231,55 @@ pub const LEDGER: &[LedgerEntry] = &[
         reason: "dict literal names a schema brand not present in the analyzed tree",
     },
     LedgerEntry {
+        id: "spread_source_schema.non_variable",
+        site: "lowering/mod.rs::spread_source_schema",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "dict spread source is not a schema-typed identifier; not statically resolvable",
+    },
+    LedgerEntry {
+        id: "spread_source_schema.non_string_head",
+        site: "lowering/mod.rs::spread_source_schema",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "dict spread source root is not a bare identifier",
+    },
+    LedgerEntry {
+        id: "spread_source_schema.non_string_segment",
+        site: "lowering/mod.rs::spread_source_schema",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "dict spread source path has an index/dynamic segment, not a plain schema field",
+    },
+    LedgerEntry {
+        id: "spread_source_schema.not_a_schema",
+        site: "lowering/mod.rs::spread_source_schema",
+        category: Category::FieldType,
+        status: Status::Capped,
+        corpus: "",
+        reason: "dict spread source does not resolve to a statically-known schema value",
+    },
+    LedgerEntry {
+        id: "lower_dict_into_record.duplicate_spread_field",
+        site: "lowering/mod.rs::lower_dict_into_record",
+        category: Category::FieldType,
+        status: Status::Capped,
+        corpus: "",
+        reason: "two contributors (spread + explicit, or two spreads) supply the same field; \
+                 relon rejects duplicates rather than letting a later key override",
+    },
+    LedgerEntry {
+        id: "lower_dict_into_record.duplicate_field",
+        site: "lowering/mod.rs::lower_dict_into_record",
+        category: Category::FieldType,
+        status: Status::Capped,
+        corpus: "",
+        reason: "the same explicit field appears twice in a branded dict literal",
+    },
+    LedgerEntry {
         id: "lower_dict_into_record.unsupported_expr.1",
         site: "lowering/mod.rs::lower_dict_into_record",
         category: Category::ExprShape,
@@ -1734,6 +1801,15 @@ pub const LEDGER: &[LedgerEntry] = &[
         status: Status::Capped,
         corpus: "",
         reason: "expression shape has no IR/codegen lowering path yet",
+    },
+    LedgerEntry {
+        id: "flatten_list_spread.unsupported_spread_source",
+        site: "lowering/peephole.rs::flatten_list_spread",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "r12_list_spread_param_src_capped",
+        reason: "list spread source is not a statically-resolvable list literal (a parameter / \
+                 call); the flat element count is not known at compile time",
     },
     LedgerEntry {
         id: "emit_list_value_materialize.unsupported_expr.1",
@@ -2666,5 +2742,26 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         status: Status::Covered,
         proof: "tree-walk + cranelift (TW_CR; wasm + llvm-native legs proven in \
                 relon-codegen-llvm::aot_wasm_parity::r11_field_decorator)",
+    },
+    // ---- Wave R12-lower: spread (`...x`), the two static forms ----
+    SurfaceEntry {
+        construct: "list spread `[...a, b, ...c] -> List<Int>` (literal sources, static flatten)",
+        wave: "R12",
+        corpus: "r12_list_spread_into_return",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (TW_CR; literal spread sources flattened to the runtime \
+                scalar-list materialiser; wasm + llvm-native legs proven in \
+                relon-codegen-llvm::inplace_return_four_way::list_spread_* and \
+                relon-codegen-llvm::aot_wasm_parity::r12_list_spread)",
+    },
+    SurfaceEntry {
+        construct: "dict spread `{ ...src, k: v } -> Schema` (schema-typed source, static fields)",
+        wave: "R12",
+        corpus: "r12_dict_spread_into_schema",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (TW_CR; each source field lowered as a synthesised \
+                `src.field` access into the matching schema slot; wasm + llvm-native legs proven \
+                in relon-codegen-llvm::inplace_return_four_way::dict_spread_* and \
+                relon-codegen-llvm::aot_wasm_parity::r12_dict_spread)",
     },
 ];
