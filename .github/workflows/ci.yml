@@ -22,6 +22,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Free disk space
+        # The workspace links cranelift + wasmtime + LLVM 18; the runner's
+        # ~14 GB default free space can exhaust during link (manifesting as
+        # `No space left on device` or a `ld` SIGBUS/Bus-error). Drop the
+        # preinstalled toolchains we don't use to reclaim ~20-30 GB before
+        # cargo runs. Done before toolchain install so nothing we need is
+        # removed.
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h /
       - name: Install LLVM 18 dev libs (with Polly)
         run: |
           sudo apt-get update
@@ -49,6 +60,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Free disk space
+        # The workspace links cranelift + wasmtime + LLVM 18; the runner's
+        # ~14 GB default free space can exhaust during link (manifesting as
+        # `No space left on device` or a `ld` SIGBUS/Bus-error). Drop the
+        # preinstalled toolchains we don't use to reclaim ~20-30 GB before
+        # cargo runs. Done before toolchain install so nothing we need is
+        # removed.
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h /
       - name: Install LLVM 18 dev libs (with Polly)
         run: |
           sudo apt-get update
@@ -83,6 +105,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Free disk space
+        # The workspace links cranelift + wasmtime + LLVM 18; the runner's
+        # ~14 GB default free space can exhaust during link (manifesting as
+        # `No space left on device` or a `ld` SIGBUS/Bus-error). Drop the
+        # preinstalled toolchains we don't use to reclaim ~20-30 GB before
+        # cargo runs. Done before toolchain install so nothing we need is
+        # removed.
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h /
       - name: Install nightly + miri
         uses: dtolnay/rust-toolchain@nightly
         with:
