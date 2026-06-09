@@ -92,10 +92,19 @@ pub fn stdlib_method_index(receiver_ty: IrType, name: &str) -> Option<u32> {
         // free-call name lookup — only this method route fires.
         // `ends_with` has NO tree-walk method form (only the free-call
         // `ends_with(s, p)`), so it is intentionally absent here to keep
-        // the four-way surface in lock-step. `trim` / `trim_start` /
-        // `trim_end` stay capped (UTF-8 decode seam unsupported on
-        // LLVM-native / wasm — see `string_ops` module docs).
+        // the four-way surface in lock-step.
         (IrType::String, "replace") => stdlib_function_index("replace"),
+        // `s.trim()` / `s.trim_start()` / `s.trim_end()` receiver-method
+        // dispatch (also registered as free fns in the evaluator, so the
+        // free-call form routes through `stdlib_function_index` directly).
+        // Lowered four-way now that the UTF-8 decode seam (R14) is in
+        // place: a forward decode scan + the `__is_whitespace` helper
+        // (Unicode `White_Space`, i.e. `char::is_whitespace`) bound the
+        // surviving slice, then a memcpy builds the result — see
+        // `string_ops::trim_body`.
+        (IrType::String, "trim") => stdlib_function_index("trim"),
+        (IrType::String, "trim_start") => stdlib_function_index("trim_start"),
+        (IrType::String, "trim_end") => stdlib_function_index("trim_end"),
         // Wave R15: `s.split(sep)` receiver-method dispatch. The tree-walk
         // surface defines `split(s, sep)` as a thin wrapper over the
         // `_string_split` free call (see `std_relon/string.relon`), and the

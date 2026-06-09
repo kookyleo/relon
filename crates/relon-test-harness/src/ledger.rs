@@ -2769,6 +2769,33 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         proof:
             "tree-walk + cranelift; wasm/llvm-native in aot_wasm_parity::js_size_in_range_list_*",
     },
+    // ---- `trim` / `trim_start` / `trim_end` (Rust `str::trim*`) and
+    //      the ASCII-structured validators `is_email` / `is_uri`, lowered
+    //      four-way now that the UTF-8 decode seam (R14) is in place ----
+    SurfaceEntry {
+        construct: "trim/trim_start/trim_end(String) -> String (Unicode White_Space, \
+                    char::is_whitespace-exact; forward UTF-8 decode + __is_whitespace + memcpy)",
+        wave: "JS",
+        corpus: "js_trim_ascii",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift; wasm/llvm-native in aot_wasm_parity::js_trim_*",
+    },
+    SurfaceEntry {
+        construct: "is_email(String) -> Bool (byte-level ASCII structure: @ split, local \
+                    char class + dot rules, domain label grammar; non-ASCII rejected)",
+        wave: "JS",
+        corpus: "js_is_email_valid",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift; wasm/llvm-native in aot_wasm_parity::js_is_email_*",
+    },
+    SurfaceEntry {
+        construct: "is_uri(String) -> Bool (scheme ':' non-empty-rest, ASCII scheme grammar; \
+                    no UTF-8 decode, no remainder)",
+        wave: "JS",
+        corpus: "js_is_uri_valid",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift; wasm/llvm-native in aot_wasm_parity::js_is_uri_*",
+    },
     // ---- Wave R15: `split(String, sep) -> List<String>` ----
     SurfaceEntry {
         construct: "String split on non-empty literal separator (List<String>, \

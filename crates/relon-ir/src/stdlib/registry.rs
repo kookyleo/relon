@@ -36,9 +36,13 @@ use super::normalization::{
     nfkc_string, nfkd_string,
 };
 use super::signatures::StdlibFunction;
-use super::string_ops::{ends_with_string, len_string_to_int, replace_string, split_string};
+use super::string_ops::{
+    ends_with_string, len_string_to_int, replace_string, split_string, trim_end_string,
+    trim_start_string, trim_string,
+};
 use super::validators::{
-    dict_size_in_range, in_range_float, is_uuid_string, multiple_of_int, size_in_range_list,
+    dict_size_in_range, in_range_float, is_email_string, is_uri_string, is_uuid_string,
+    multiple_of_int, size_in_range_list,
 };
 
 /// Return the ordered list of builtin stdlib functions. The order is
@@ -368,6 +372,29 @@ pub fn builtin_stdlib() -> &'static [StdlibFunction] {
             in_range_float(),
             size_in_range_list(),
             dict_size_in_range(),
+            // Whitespace-stripping String builders + ASCII-structured
+            // validators, lowered four-way now that the UTF-8 decode seam
+            // (R14) is in place. Appended at the tail (indices 65..69) so
+            // every position-pinned index above stays put — GENERATOR_VERSION
+            // does not move:
+            //   * `65` — `trim(s) -> String` (Rust `str::trim`).
+            //   * `66` — `trim_start(s) -> String` (Rust `str::trim_start`).
+            //   * `67` — `trim_end(s) -> String` (Rust `str::trim_end`).
+            //     All three forward-decode the input (trapping `InvalidUtf8`)
+            //     and use the `__is_whitespace` helper (Unicode `White_Space`,
+            //     i.e. `char::is_whitespace`), then memcpy the surviving
+            //     slice into a fresh record.
+            //   * `68` — `is_email(s) -> Bool` (byte-level ASCII structure;
+            //     non-ASCII bytes fail the local / label char class exactly
+            //     as the codepoint-level oracle rejects them).
+            //   * `69` — `is_uri(s) -> Bool` (scheme `:` non-empty-rest,
+            //     ASCII scheme grammar). Both are purely byte-level (no UTF-8
+            //     decode, no trap) — the same discipline `is_uuid` uses.
+            trim_string(),
+            trim_start_string(),
+            trim_end_string(),
+            is_email_string(),
+            is_uri_string(),
         ]
     })
 }
