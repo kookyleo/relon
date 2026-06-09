@@ -1581,12 +1581,11 @@ fn r7_abs_float_aligns_native_via_wasmtime() {
 // oracle; the tree-walk == cranelift legs are proven in
 // `relon-test-harness` corpus `r8_*` + the per-fn probes.
 //
-// `trim` / `trim_start` / `trim_end` stay capped: a
-// `char::is_whitespace()`-exact trim needs the UTF-8 decoder +
-// `__is_whitespace` helper + `Op::Trap { InvalidUtf8 }` seam the
-// LLVM-native / wasm backends do not lower (same seam that keeps
-// `upper` / `title` / `nfd` tree-walk + cranelift only — see
-// `phase0b_unicode.rs`). `matches` (regex engine) and `split`
+// `trim` / `trim_start` / `trim_end` are now compiled four-way (the
+// UTF-8 decode seam + `__is_whitespace` helper + `Op::Trap { InvalidUtf8 }`
+// they need landed with R14 — the same seam `upper` / `lower` / `title` /
+// `nfd` ride; see `unicode_four_way.rs`). Their wasm legs live in the
+// `js_trim_*` tests below. `matches` (regex engine) and `split`
 // (List<String> result) stay capped — no wasm-portable body.
 // ===========================================================
 
@@ -1886,5 +1885,172 @@ fn js_size_in_range_list_outside_aligns_native_via_wasmtime() {
         "js_sir_out",
         "#main(Int n) -> Bool\nsize_in_range([1, 2, 3, 4, 5, 6], 1, 5)",
         false,
+    );
+}
+
+// ===========================================================
+// `trim` / `trim_start` / `trim_end` (Rust `str::trim*`) and the
+// ASCII-structured validators `is_email` / `is_uri`, compiled
+// four-way. The trim bodies forward-decode the input (trapping
+// `InvalidUtf8`) and use the `__is_whitespace` helper (Unicode
+// `White_Space`, i.e. `char::is_whitespace`) to bound the surviving
+// slice, then memcpy it into a fresh record — the String result rides
+// the tail-record protocol (`r8_check_str`). The validators are
+// byte-level (a non-ASCII byte fails the char class exactly as the
+// codepoint-level oracle rejects a non-ASCII codepoint). Native
+// LLVM-AOT is the oracle; tree-walk == cranelift legs live in the
+// `relon-test-harness` corpus `js_trim_*` / `js_is_email_*` /
+// `js_is_uri_*`.
+// ===========================================================
+
+#[test]
+fn js_trim_ascii_aligns_native_via_wasmtime() {
+    r8_check_str("js_trim_ascii", "#main(Int n) -> String\ntrim(\"  hi  \")");
+}
+
+#[test]
+fn js_trim_start_ascii_aligns_native_via_wasmtime() {
+    r8_check_str(
+        "js_trim_start_ascii",
+        "#main(Int n) -> String\ntrim_start(\"  hi  \")",
+    );
+}
+
+#[test]
+fn js_trim_end_ascii_aligns_native_via_wasmtime() {
+    r8_check_str(
+        "js_trim_end_ascii",
+        "#main(Int n) -> String\ntrim_end(\"  hi  \")",
+    );
+}
+
+#[test]
+fn js_trim_multibyte_ws_aligns_native_via_wasmtime() {
+    // Leading NBSP (U+00A0) + trailing ideographic space (U+3000).
+    r8_check_str(
+        "js_trim_mb_ws",
+        "#main(Int n) -> String\ntrim(\"\u{00A0}hi\u{3000}\")",
+    );
+}
+
+#[test]
+fn js_trim_keeps_inner_unicode_aligns_native_via_wasmtime() {
+    r8_check_str(
+        "js_trim_inner_u",
+        "#main(Int n) -> String\ntrim(\"  a σ b  \")",
+    );
+}
+
+#[test]
+fn js_trim_all_whitespace_aligns_native_via_wasmtime() {
+    r8_check_str(
+        "js_trim_all_ws",
+        "#main(Int n) -> String\ntrim(\" \u{00A0}\u{3000} \")",
+    );
+}
+
+#[test]
+fn js_trim_empty_aligns_native_via_wasmtime() {
+    r8_check_str("js_trim_empty", "#main(Int n) -> String\ntrim(\"\")");
+}
+
+#[test]
+fn js_is_email_valid_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_email_t",
+        "#main(Int n) -> Bool\nis_email(\"a.b@example.com\")",
+        true,
+    );
+}
+
+#[test]
+fn js_is_email_no_at_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_email_noat",
+        "#main(Int n) -> Bool\nis_email(\"nope.example.com\")",
+        false,
+    );
+}
+
+#[test]
+fn js_is_email_double_dot_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_email_dd",
+        "#main(Int n) -> Bool\nis_email(\"a..b@example.com\")",
+        false,
+    );
+}
+
+#[test]
+fn js_is_email_single_label_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_email_1lbl",
+        "#main(Int n) -> Bool\nis_email(\"a@localhost\")",
+        false,
+    );
+}
+
+#[test]
+fn js_is_email_label_dash_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_email_dash",
+        "#main(Int n) -> Bool\nis_email(\"a@-bad.com\")",
+        false,
+    );
+}
+
+#[test]
+fn js_is_email_unicode_local_aligns_native_via_wasmtime() {
+    // Non-ASCII local part -> rejected (byte-level scan fails on the
+    // multi-byte sequence, matching `.chars().all(...)`).
+    r8_check_bool(
+        "js_email_u",
+        "#main(Int n) -> Bool\nis_email(\"résumé@example.com\")",
+        false,
+    );
+}
+
+#[test]
+fn js_is_uri_valid_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_uri_t",
+        "#main(Int n) -> Bool\nis_uri(\"https://example.com\")",
+        true,
+    );
+}
+
+#[test]
+fn js_is_uri_no_scheme_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_uri_nos",
+        "#main(Int n) -> Bool\nis_uri(\"no-scheme\")",
+        false,
+    );
+}
+
+#[test]
+fn js_is_uri_empty_scheme_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_uri_es",
+        "#main(Int n) -> Bool\nis_uri(\":empty-scheme\")",
+        false,
+    );
+}
+
+#[test]
+fn js_is_uri_digit_first_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_uri_df",
+        "#main(Int n) -> Bool\nis_uri(\"1http://x\")",
+        false,
+    );
+}
+
+#[test]
+fn js_is_uri_mailto_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_uri_mailto",
+        "#main(Int n) -> Bool\nis_uri(\"mailto:x@y.com\")",
+        true,
     );
 }

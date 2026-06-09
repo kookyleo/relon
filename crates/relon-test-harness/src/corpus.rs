@@ -1230,6 +1230,165 @@ pub fn all_cases() -> Vec<CorpusCase> {
         // inside an anon-dict construction). The Dict differential unlocks
         // the moment a free Dict value lowers (e.g. a `#main(Dict d)` param);
         // until then it is honestly left unexercised rather than claimed.
+        // ---- `trim` / `trim_start` / `trim_end` (Rust `str::trim*`), now
+        //      lowered four-way: a forward UTF-8 decode scan + the
+        //      `__is_whitespace` helper (Unicode `White_Space`, i.e.
+        //      `char::is_whitespace`) bound the surviving slice, then a
+        //      memcpy builds the result. Tree-walk == cranelift here; the
+        //      wasm + llvm-native legs live in
+        //      `relon-codegen-llvm::aot_wasm_parity::js_trim_*`. The battery
+        //      covers pure-ASCII whitespace, multi-byte whitespace (NBSP /
+        //      ideographic space), all-whitespace, no-whitespace and empty.
+        CorpusCase {
+            name: "js_trim_ascii",
+            source: "#main() -> String\ntrim(\"  hi  \")",
+            args_factory: no_args,
+            tier: Tier::StdlibCaseFold,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "js_trim_start_ascii",
+            source: "#main() -> String\ntrim_start(\"  hi  \")",
+            args_factory: no_args,
+            tier: Tier::StdlibCaseFold,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "js_trim_end_ascii",
+            source: "#main() -> String\ntrim_end(\"  hi  \")",
+            args_factory: no_args,
+            tier: Tier::StdlibCaseFold,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            // Leading NBSP (U+00A0, 2 bytes) + trailing ideographic space
+            // (U+3000, 3 bytes) around an ASCII core. Exercises the
+            // multi-byte whitespace decode + the non-ASCII range table.
+            name: "js_trim_multibyte_ws",
+            source: "#main() -> String\ntrim(\"\u{00A0}hi\u{3000}\")",
+            args_factory: no_args,
+            tier: Tier::StdlibCaseFold,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            // Inner whitespace + multi-byte non-whitespace content survive.
+            name: "js_trim_keeps_inner_and_unicode",
+            source: "#main() -> String\ntrim(\"  a σ b  \")",
+            args_factory: no_args,
+            tier: Tier::StdlibCaseFold,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            // All-whitespace -> empty string.
+            name: "js_trim_all_whitespace",
+            source: "#main() -> String\ntrim(\" \u{00A0}\u{3000} \")",
+            args_factory: no_args,
+            tier: Tier::StdlibCaseFold,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            // No whitespace -> unchanged.
+            name: "js_trim_no_whitespace",
+            source: "#main() -> String\ntrim(\"abc\")",
+            args_factory: no_args,
+            tier: Tier::StdlibCaseFold,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            // Empty string -> empty string.
+            name: "js_trim_empty",
+            source: "#main() -> String\ntrim(\"\")",
+            args_factory: no_args,
+            tier: Tier::StdlibCaseFold,
+            supported_by: TW_CR,
+        },
+        // ---- `is_email` / `is_uri` (ASCII-structured validators), now
+        //      lowered four-way (byte-level: a non-ASCII byte fails the
+        //      char class exactly as the codepoint-level oracle rejects a
+        //      non-ASCII codepoint; no UTF-8 decode, no remainder). The
+        //      wasm + llvm-native legs live in
+        //      `relon-codegen-llvm::aot_wasm_parity::js_is_email_*` /
+        //      `js_is_uri_*`.
+        CorpusCase {
+            name: "js_is_email_valid",
+            source: "#main() -> Bool\nis_email(\"a.b@example.com\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "js_is_email_no_at",
+            source: "#main() -> Bool\nis_email(\"nope.example.com\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "js_is_email_double_dot",
+            source: "#main() -> Bool\nis_email(\"a..b@example.com\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "js_is_email_single_label",
+            source: "#main() -> Bool\nis_email(\"a@localhost\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "js_is_email_label_dash",
+            source: "#main() -> Bool\nis_email(\"a@-bad.com\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            // Non-ASCII codepoint in the local part -> rejected (the
+            // byte-level scan fails on the multi-byte sequence, matching
+            // `.chars().all(...)`).
+            name: "js_is_email_unicode_local",
+            source: "#main() -> Bool\nis_email(\"résumé@example.com\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "js_is_uri_valid",
+            source: "#main() -> Bool\nis_uri(\"https://example.com\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "js_is_uri_no_scheme",
+            source: "#main() -> Bool\nis_uri(\"no-scheme\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "js_is_uri_empty_scheme",
+            source: "#main() -> Bool\nis_uri(\":empty-scheme\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "js_is_uri_digit_first",
+            source: "#main() -> Bool\nis_uri(\"1http://x\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "js_is_uri_mailto",
+            source: "#main() -> Bool\nis_uri(\"mailto:x@y.com\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
         // ---- Wave R15: `split(String, sep) -> List<String>`. The bundled
         //      `split` body scans the input twice (count segments, then
         //      emit) and builds the result as a `List<String>` pointer-array
