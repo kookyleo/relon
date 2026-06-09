@@ -3705,35 +3705,36 @@ fn r10b_strict_backward_root_entry_level_derives() {
     );
 }
 
-/// R10b negative: a FORWARD `&sibling.x` (target defined *after* the
-/// reference) is what R10's lowering caps, so strict mode must keep
-/// rejecting it — `UnknownReferenceType`, not a silent `Any`.
+/// R13 positive: a FORWARD `&sibling.x` (target defined *after* the
+/// reference) now derives its type from the target field — the compiled
+/// path emits anon-Dict fields in topological order, so forward
+/// references resolve four-way. Strict mode must therefore accept the
+/// forward-to-leaf shape with no `UnknownReferenceType` /
+/// `ExpressionTypeUnknown` leak (`x: a + b` is an Int, `y: &sibling.x * 2`
+/// derives to Int).
 #[test]
-fn r10b_strict_forward_sibling_still_rejected() {
+fn r13_strict_forward_sibling_to_leaf_derives() {
     let tree = analyze_str(
         r#"
         #main(Int a, Int b) -> Dict
         { y: &sibling.x * 2, x: a + b }
         "#,
     );
-    // Rejection surfaces as either `UnknownReferenceType` on the
-    // reference or `ExpressionTypeUnknown` on the enclosing field — both
-    // are clean diagnostics, the point is the program does NOT silently
-    // pass with an `Any` leak.
     let rejected = count(&tree, |d| {
         matches!(d, Diagnostic::UnknownReferenceType { .. })
             || matches!(d, Diagnostic::ExpressionTypeUnknown { .. })
     });
-    assert!(
-        rejected >= 1,
-        "forward `&sibling.x` must stay rejected under strict: {:?}",
+    assert_eq!(
+        rejected, 0,
+        "forward `&sibling.x` to a leaf must derive cleanly under strict: {:?}",
         tree.diagnostics
     );
 }
 
-/// R10b negative: a self-reference (`x: &sibling.x + 1`) is forward by
-/// definition and must stay rejected (the cycle guard + backward guard
-/// both refuse it).
+/// R13 negative: a self-reference (`x: &sibling.x + 1`) is a one-field
+/// cycle and must stay rejected (the self-ref guard in `infer_reference`
+/// refuses it; the compiled path rejects the same shape loudly in
+/// `anon_dict_emit_order`).
 #[test]
 fn r10b_strict_self_sibling_still_rejected() {
     let tree = analyze_str(

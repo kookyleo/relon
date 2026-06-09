@@ -290,6 +290,27 @@ pub const LEDGER: &[LedgerEntry] = &[
         reason: "schema/dict field type has no canonical layout in this position",
     },
     LedgerEntry {
+        id: "anon_dict_emit_order.cyclic_field_dependency",
+        site: "lowering/mod.rs::anon_dict_emit_order",
+        category: Category::SchemaMerge,
+        status: Status::Capped,
+        corpus: "",
+        reason: "anon-Dict-return fields form a `&sibling`/`&root` reference cycle (self or \
+                 mutually-recursive); the compiled path's loud analogue of the tree-walk \
+                 oracle's CircularReference",
+    },
+    LedgerEntry {
+        id: "anon_dict_emit_order.forward_ref_through_param",
+        site: "lowering/mod.rs::anon_dict_emit_order",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "forward `&sibling`/`&root` reference into a reference-bearing field whose \
+                 component reads a `#main` parameter — the tree-walk oracle loses the param \
+                 scope when forcing the forwarded thunk, so this shape is capped to avoid a \
+                 silent divergence",
+    },
+    LedgerEntry {
         id: "classify_anon_dict_scalar_field.unsupported_expr",
         site: "lowering/mod.rs::classify_anon_dict_scalar_field",
         category: Category::ExprShape,
@@ -383,8 +404,9 @@ pub const LEDGER: &[LedgerEntry] = &[
         category: Category::ExprShape,
         status: Status::Capped,
         corpus: "",
-        reason: "R10: backward `&sibling`/`&root` scalar field refs lower (corpus \
-                 `r10_*`); a forward / non-scalar / non-host-visible sibling name caps here",
+        reason: "R10/R13: forward + backward `&sibling`/`&root` scalar + List<scalar> field \
+                 refs lower (corpus `r10_*` / `r13_*`); a `#internal` / non-host-visible sibling \
+                 name caps here",
     },
     LedgerEntry {
         id: "lower_anon_dict_body.unsupported_expr.1",
@@ -1386,13 +1408,15 @@ pub const LEDGER: &[LedgerEntry] = &[
                  (&sibling.x.y) reference paths cap",
     },
     LedgerEntry {
-        id: "lower_reference.unresolved_backward_field",
+        id: "lower_reference.unresolved_field",
         site: "lowering/mod.rs::lower_reference",
         category: Category::ExprShape,
         status: Status::Capped,
         corpus: "",
-        reason: "forward / #internal sibling names are not yet bound at the reference site; \
-                 backward `&sibling`/`&root` scalar refs are covered in SUPPORTED_SURFACE",
+        reason: "the referenced name binds to no host-visible sibling let (a `#internal` \
+                 sibling, dropped from the compiled plan, or a non-field name); forward + \
+                 backward `&sibling`/`&root` scalar + List<scalar> refs are covered in \
+                 SUPPORTED_SURFACE",
     },
     LedgerEntry {
         id: "lower_variable.unsupported_expr.1",
@@ -2922,6 +2946,16 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
                 sibling/root field (infer::infer_reference); lowering unchanged. tree-walk + \
                 cranelift (TW_CR; wasm + llvm-native legs proven in \
                 relon-codegen-llvm::aot_wasm_parity::r10b_strict_sibling_root_backward)",
+    },
+    // ---- forward + mixed static sibling/root field reference ----
+    SurfaceEntry {
+        construct: "forward/backward `&sibling`/`&root` scalar + List<scalar> field reference \
+                    (anon-Dict return, topological emit order)",
+        wave: "R13",
+        corpus: "r13_forward_ref",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (TW_CR; wasm + llvm-native legs proven in \
+                relon-codegen-llvm::aot_wasm_parity::r13_forward_ref)",
     },
     // ---- field decorators on the anon-Dict-return path ----
     SurfaceEntry {

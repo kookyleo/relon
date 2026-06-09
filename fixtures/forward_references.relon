@@ -1,0 +1,33 @@
+// Flat entry-dict (`#main(...) -> Dict`) exercising forward AND backward
+// `&sibling` / `&root` field references across Int, String and List<Int>
+// field shapes. The entry dict IS the document root, so `&sibling.<name>`
+// and `&root.<name>` resolve to the same sibling field.
+//
+// Fields are emitted in topological order over their reference edges, so
+// a reference to a *later*-declared field (forward) resolves the same as
+// one to an earlier field (backward). A reference cycle is a loud error,
+// matching the tree-walk oracle's `CircularReference`.
+//
+// Canonical args (see fixtures/golden / CLI cross-backend parity):
+//   --args '{"a": 40, "b": 2}'
+#relaxed
+
+#main(Int a, Int b) -> Dict
+{
+    // forward Int reference: `doubled` reads the later `base`.
+    doubled: &sibling.base * 2,
+    // backward Int reference: `base` is the leaf, declared before `sum`.
+    base: a + b,
+    // backward Int reference over the entry root (`&root` == `&sibling`).
+    sum: &root.base + &sibling.doubled,
+    // forward String reference: `greeting` reads the later `name`.
+    greeting: &sibling.name,
+    name: "relon",
+    // forward List<Int> reference: `alias` reads the later `items`.
+    alias: &sibling.items,
+    items: [
+        1,
+        2,
+        3
+    ]
+}
