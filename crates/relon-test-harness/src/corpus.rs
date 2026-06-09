@@ -1149,6 +1149,87 @@ pub fn all_cases() -> Vec<CorpusCase> {
             tier: Tier::StdlibSimple,
             supported_by: TW_CR,
         },
+        // ---- JSON-Schema numeric / size predicates lowered four-way for
+        //      their statically-decidable arms. Tree-walk == cranelift here;
+        //      the wasm + llvm-native legs live in
+        //      `relon-codegen-llvm::aot_wasm_parity::js_*`. The capped arms
+        //      (Float `multiple_of` — `Op::Mod(F64)` has no native cranelift /
+        //      wasm remainder; `size_in_range` on a String — Unicode
+        //      code-point count needs the UTF-8 decode seam LLVM/wasm do not
+        //      lower) are NOT corpus cases: they cap loudly through the generic
+        //      `check_stdlib_arg` / unknown-method dispatch and stay tree-walk.
+        CorpusCase {
+            name: "js_multiple_of_true",
+            source: "#main() -> Bool\nmultiple_of(12, 4)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "js_multiple_of_false",
+            source: "#main() -> Bool\nmultiple_of(13, 4)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "js_multiple_of_zero_divisor",
+            source: "#main() -> Bool\nmultiple_of(7, 0)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "js_in_range_int_inside",
+            source: "#main() -> Bool\nin_range(5, 1, 10)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "js_in_range_int_edge",
+            source: "#main() -> Bool\nin_range(10, 1, 10)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "js_in_range_int_outside",
+            source: "#main() -> Bool\nin_range(11, 1, 10)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "js_in_range_float_mix",
+            source: "#main() -> Bool\nin_range(2.5, 1, 3)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "js_size_in_range_list_inside",
+            source: "#main() -> Bool\nsize_in_range([1, 2, 3], 1, 5)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "js_size_in_range_list_outside",
+            source: "#main() -> Bool\nsize_in_range([1, 2, 3, 4, 5, 6], 1, 5)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        // The Dict form (`dict_size_in_range`) body + peephole routing are
+        // wired (a Dict receiver reads the same `[entry_count: u32 LE]`
+        // header as a list), but it has no corpus case yet: a Dict value
+        // cannot currently be produced as a free expression that lowers (a
+        // standalone `{ a: 1 }` literal and a `where`-bound dict both hit
+        // the generic `Dict` lowering cap — Dict literals materialise only
+        // inside an anon-dict construction). The Dict differential unlocks
+        // the moment a free Dict value lowers (e.g. a `#main(Dict d)` param);
+        // until then it is honestly left unexercised rather than claimed.
         // ---- Wave R15: `split(String, sep) -> List<String>`. The bundled
         //      `split` body scans the input twice (count segments, then
         //      emit) and builds the result as a `List<String>` pointer-array

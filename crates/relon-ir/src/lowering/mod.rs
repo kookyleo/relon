@@ -5656,6 +5656,24 @@ fn lower_fn_call(
     {
         return Ok(());
     }
+    // JSON-Schema numeric predicates `multiple_of` / `in_range` (polymorphic
+    // numeric domain — same speculative-then-dispatch discipline as the
+    // scalar-math peephole). Float `multiple_of` rolls back here and caps
+    // loudly through the generic dispatch.
+    if let Some(()) =
+        peephole::try_lower_predicate_math(method_name, receiver_segments, args, range, ctx)?
+    {
+        return Ok(());
+    }
+    // JSON-Schema `size_in_range` over a List / Dict receiver (the element /
+    // entry count comes from the shared `[len: u32 LE]` header). A String
+    // receiver rolls back and caps loudly (Unicode code-point count needs the
+    // UTF-8 decode seam LLVM-native / wasm do not lower).
+    if let Some(()) =
+        peephole::try_lower_size_in_range(method_name, receiver_segments, args, range, ctx)?
+    {
+        return Ok(());
+    }
     let arity = if receiver_segments.is_empty() {
         // Free-call form. Each `CallArg` value contributes one
         // argument; named args are rejected here (Phase 4.a/4.b

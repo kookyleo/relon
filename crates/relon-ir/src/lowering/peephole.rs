@@ -1667,6 +1667,278 @@ pub(super) fn try_lower_scalar_math(
     Ok(Some(()))
 }
 
+/// JSON-Schema numeric predicates `multiple_of(n, d)` and
+/// `in_range(n, lo, hi)` as free calls. Both have a polymorphic numeric
+/// domain (Int / Float mixes) that the generic `stdlib_function_index`
+/// path cannot select by name alone, so — like [`try_lower_scalar_math`]
+/// — this peephole lowers the arguments speculatively, inspects their IR
+/// types, and routes to the body whose semantics match the tree-walk
+/// oracle:
+///
+///   * `multiple_of(Int, Int)` → bundled `multiple_of` body (index 61;
+///     `d == 0 ? false : n % d == 0`). Any Float operand returns
+///     `Ok(None)` so the generic dispatch caps it loudly — the Float
+///     arms need `Op::Mod(F64)` (no native cranelift / wasm remainder)
+///     and the oracle's `fract().abs() < 1e-9` tolerance, neither of
+///     which has a four-way body.
+///   * `in_range(n, lo, hi)` → bundled `in_range` body (index 62). The
+///     oracle widens every argument to f64 (`to_f64_val`), so any `I64`
+///     operand is widened here with `Op::ConvertI64ToF64` before the
+///     call; the body itself is all-`F64`. Four-way clean.
+///
+/// Returns `Ok(Some(()))` on a committed lowering, `Ok(None)` when the
+/// shape does not match (caller falls through to the generic dispatch,
+/// which caps loudly).
+pub(super) fn try_lower_predicate_math(
+    method_name: &str,
+    receiver_segments: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    // Free-call form only — both are registered solely as free fns in the
+    // tree-walk evaluator (never methods), so a method form (`n.in_range(...)`)
+    // must stay byte-equal with the oracle's `function_not_found`.
+    if !receiver_segments.is_empty() {
+        return Ok(None);
+    }
+    let expected_arity = match method_name {
+        "multiple_of" => 2usize,
+        "in_range" => 3usize,
+        _ => return Ok(None),
+    };
+    if args.len() != expected_arity || args.iter().any(|a| a.name.is_some()) {
+        return Ok(None);
+    }
+    let widen_to_f64 = method_name == "in_range";
+
+    // Speculatively lower every argument into a scratch stream so a
+    // non-numeric / failed lowering rolls back cleanly. For `in_range`,
+    // widen each `Int` operand to `F64` right after it is produced (so the
+    // body — which is all-`F64` — sees the oracle's `to_f64_val` coercion
+    // applied per operand, even for the buried `n` / `lo` slots).
+    let saved_out = std::mem::take(&mut ctx.out);
+    let saved_stack = std::mem::take(&mut ctx.tstack);
+    let saved_next_let = ctx.next_let_idx;
+    let saved_lambda_len = ctx.lambda_table.borrow().len();
+
+    let mut ok = true;
+    for arg in args {
+        if lower_expr(&arg.value.expr, arg.value.range, ctx).is_err() {
+            ok = false;
+            break;
+        }
+        match ctx.tstack.last().copied() {
+            Some(IrType::I64) => {
+                if widen_to_f64 {
+                    ctx.out.push(TaggedOp {
+                        op: Op::ConvertI64ToF64,
+                        range,
+                    });
+                    ctx.tstack.pop();
+                    ctx.tstack.push(IrType::F64);
+                }
+            }
+            Some(IrType::F64) => {
+                // `multiple_of` has no four-way Float arm; bail so the
+                // generic dispatch caps it loudly (`Op::Mod(F64)` has no
+                // native cranelift / wasm remainder).
+                if !widen_to_f64 {
+                    ok = false;
+                    break;
+                }
+            }
+            _ => {
+                ok = false;
+                break;
+            }
+        }
+    }
+    if !ok {
+        ctx.out = saved_out;
+        ctx.tstack = saved_stack;
+        ctx.next_let_idx = saved_next_let;
+        ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+        return Ok(None);
+    }
+
+    // Commit: splice the argument stream onto the outer ctx.
+    let arg_stream = std::mem::replace(&mut ctx.out, saved_out);
+    ctx.out.extend(arg_stream);
+    let arg_stack = std::mem::replace(&mut ctx.tstack, saved_stack);
+    ctx.tstack.extend(arg_stack);
+
+    let fn_index = stdlib_function_index(method_name).ok_or_else(|| {
+        cap!(
+            "try_lower_predicate_math.unknown_stdlib_method.1",
+            LoweringError::UnknownStdlibMethod {
+                name: method_name.to_string(),
+                arity: expected_arity as u32,
+                range,
+            }
+        )
+    })?;
+    let meta = builtin_stdlib().get(fn_index as usize).ok_or_else(|| {
+        cap!(
+            "try_lower_predicate_math.unknown_stdlib_method.2",
+            LoweringError::UnknownStdlibMethod {
+                name: method_name.to_string(),
+                arity: expected_arity as u32,
+                range,
+            }
+        )
+    })?;
+    for _ in 0..expected_arity {
+        ctx.tstack.pop();
+    }
+    ctx.out.push(TaggedOp {
+        op: Op::Call {
+            fn_index,
+            arg_count: expected_arity as u32,
+            param_tys: meta.params.clone(),
+            ret_ty: meta.ret,
+        },
+        range,
+    });
+    ctx.tstack.push(meta.ret);
+    Ok(Some(()))
+}
+
+/// JSON-Schema `size_in_range(recv, lo, hi)` free call. The receiver is a
+/// `List<_>` (`minItems` / `maxItems`) or `Dict` (`minProperties` /
+/// `maxProperties`); both share the `[len: u32 LE]` count prefix the
+/// bundled body reads via `ReadStringLen`. Like [`try_lower_scalar_math`],
+/// this peephole lowers the receiver speculatively, inspects its IR type,
+/// and routes to the matching body (`size_in_range` for any list,
+/// `dict_size_in_range` for a dict). `lo` / `hi` lower as `Int`.
+///
+/// A `String` receiver returns `Ok(None)` so the generic dispatch caps it
+/// loudly: the oracle counts Unicode code points (`chars().count()`),
+/// which needs the UTF-8 decode seam LLVM-native / wasm do not lower.
+/// Anything else (a scalar receiver, a non-Int bound) also rolls back.
+pub(super) fn try_lower_size_in_range(
+    method_name: &str,
+    receiver_segments: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    if !receiver_segments.is_empty() || method_name != "size_in_range" {
+        return Ok(None);
+    }
+    if args.len() != 3 || args.iter().any(|a| a.name.is_some()) {
+        return Ok(None);
+    }
+
+    let saved_out = std::mem::take(&mut ctx.out);
+    let saved_stack = std::mem::take(&mut ctx.tstack);
+    let saved_next_let = ctx.next_let_idx;
+    let saved_lambda_len = ctx.lambda_table.borrow().len();
+
+    // Lower receiver, then the two bounds.
+    let mut ok = lower_expr(&args[0].value.expr, args[0].value.range, ctx).is_ok();
+    let recv_ty = ctx.tstack.last().copied();
+    // The String arm MUST cap loudly here, not roll back: the bundled
+    // `size_in_range` body's first param is a `ListInt` (i32 slot) and a
+    // `String` also occupies the i32 slot, so the generic free-call
+    // dispatch would otherwise accept the `String` and route it into the
+    // list body — which reads the byte-length record header, NOT the
+    // Unicode code-point count the oracle uses. That is a silent wrong
+    // value for any multi-byte string. Rolling back first keeps the cap
+    // diagnostic clean.
+    if ok && recv_ty == Some(IrType::String) {
+        ctx.out = saved_out;
+        ctx.tstack = saved_stack;
+        ctx.next_let_idx = saved_next_let;
+        ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+        return Err(cap!(
+            "try_lower_size_in_range.string_charcount_capped",
+            LoweringError::UnsupportedExpr {
+                kind: "FnCall(size_in_range String receiver — Unicode code-point count \
+                       needs the UTF-8 decode seam LLVM-native / wasm do not lower)"
+                    .to_string(),
+                range,
+            }
+        ));
+    }
+    let body_name = match recv_ty {
+        Some(
+            IrType::ListInt
+            | IrType::ListFloat
+            | IrType::ListBool
+            | IrType::ListString
+            | IrType::ListSchema
+            | IrType::ListList,
+        ) => Some("size_in_range"),
+        Some(IrType::Dict) => Some("dict_size_in_range"),
+        // Every scalar receiver falls through to the loud generic cap (the
+        // String arm is already handled above).
+        _ => None,
+    };
+    if ok && body_name.is_some() {
+        for bound in &args[1..] {
+            if lower_expr(&bound.value.expr, bound.value.range, ctx).is_err() {
+                ok = false;
+                break;
+            }
+            if ctx.tstack.last().copied() != Some(IrType::I64) {
+                ok = false;
+                break;
+            }
+        }
+    } else {
+        ok = false;
+    }
+    let Some(body_name) = body_name.filter(|_| ok) else {
+        ctx.out = saved_out;
+        ctx.tstack = saved_stack;
+        ctx.next_let_idx = saved_next_let;
+        ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+        return Ok(None);
+    };
+
+    // Commit the argument stream onto the outer ctx.
+    let arg_stream = std::mem::replace(&mut ctx.out, saved_out);
+    ctx.out.extend(arg_stream);
+    let arg_stack = std::mem::replace(&mut ctx.tstack, saved_stack);
+    ctx.tstack.extend(arg_stack);
+
+    let fn_index = stdlib_function_index(body_name).ok_or_else(|| {
+        cap!(
+            "try_lower_size_in_range.unknown_stdlib_method.1",
+            LoweringError::UnknownStdlibMethod {
+                name: body_name.to_string(),
+                arity: 3,
+                range,
+            }
+        )
+    })?;
+    let meta = builtin_stdlib().get(fn_index as usize).ok_or_else(|| {
+        cap!(
+            "try_lower_size_in_range.unknown_stdlib_method.2",
+            LoweringError::UnknownStdlibMethod {
+                name: body_name.to_string(),
+                arity: 3,
+                range,
+            }
+        )
+    })?;
+    for _ in 0..3 {
+        ctx.tstack.pop();
+    }
+    ctx.out.push(TaggedOp {
+        op: Op::Call {
+            fn_index,
+            arg_count: 3,
+            param_tys: meta.params.clone(),
+            ret_ty: meta.ret,
+        },
+        range,
+    });
+    ctx.tstack.push(meta.ret);
+    Ok(Some(()))
+}
+
 /// AOT-4 (W16 slice): general `_list_filter(xs, (x) => <pred>)` over an
 /// arbitrary `List<Int>`-typed first argument (vs the fused
 /// `_len(_list_filter(range(...)))` peephole, which only handles a bare
