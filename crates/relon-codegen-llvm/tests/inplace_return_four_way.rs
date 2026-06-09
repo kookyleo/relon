@@ -1740,3 +1740,27 @@ fn dict_spread_field_order_independent() {
     // record is identical to the spread-first form (D2).
     assert_four_way(SRC_DICT_SPREAD_ORDER, src_two_arg());
 }
+
+// ====================================================================
+// Shape: declared-schema List<Option<T>> variant-record list field
+//
+// A `List<Option<T>>` value is a pointer array whose slots point at
+// tagged variant records (discriminant + payload). The list-literal
+// source builds that pointer-array-of-records directly and returns it
+// via the in-place region-walk ABI; the verifier gates every pointer
+// before decode. The tree-walk oracle serializes `Option` transparently
+// (`Some(x)` -> x, `None` -> null) and a `List<variant>` as a JSON array
+// — the four-way reproduces that exact array, element order, and the
+// Option-transparent shape. (The brand-bearing `#main -> Dict` anon
+// variant-list sources live in `cross_region_object_four_way.rs`, whose
+// `fields_of` normaliser ignores the synthesised `Ret` root brand.)
+// ====================================================================
+
+const SRC_OPT_INT_DECL: &str = "#schema S { items: List<Option<Int>> }\n\
+     #main(Int n) -> S\n\
+     { items: [Option.Some { value: n }, Option.None {}] }";
+
+#[test]
+fn variant_list_option_int_declared_schema() {
+    assert_four_way(SRC_OPT_INT_DECL, args1("n", Value::Int(42)));
+}

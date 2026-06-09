@@ -1771,8 +1771,13 @@ fn anon_dict_return_plan(
                     // shape the marshaller cannot handle (mixed / empty /
                     // nested element lists / schema elements) surfaces a
                     // loud error rather than silently dropping the field.
-                    let list_ty =
-                        classify_anon_dict_list_field(items, value.range, name, resolver)?;
+                    let list_ty = classify_anon_dict_list_field(
+                        items,
+                        value.range,
+                        name,
+                        resolver,
+                        &param_tys,
+                    )?;
                     fields.push(AnonDictField::Scalar {
                         name: name.clone(),
                         ty: list_ty,
@@ -2025,6 +2030,7 @@ fn classify_anon_dict_list_field(
     range: TokenRange,
     field_name: &str,
     resolver: &SchemaResolver<'_>,
+    main_param_tys: &HashMap<&str, IrType>,
 ) -> Result<TypeRepr, LoweringError> {
     let Some(first) = items.first() else {
         return Err(cap!(
@@ -2038,6 +2044,11 @@ fn classify_anon_dict_list_field(
             }
         ));
     };
+    if let Some(variant_list_ty) =
+        classify_anon_dict_variant_list_field(items, range, field_name, main_param_tys)?
+    {
+        return Ok(variant_list_ty);
+    }
     if let Some(enum_list_ty) =
         classify_anon_dict_enum_list_field(items, range, field_name, resolver)?
     {
@@ -2171,6 +2182,215 @@ fn classify_anon_dict_enum_list_field(
     Ok(Some(TypeRepr::List {
         element: Box::new(enum_ty),
     }))
+}
+
+/// Classify a host-visible anon-Dict-return list-literal field whose
+/// elements are built-in `Option` / `Result` variant constructors into a
+/// `List<Option<T>>` / `List<Result<T, E>>` [`TypeRepr`]. The named-enum
+/// counterpart ([`classify_anon_dict_enum_list_field`]) cannot reach these
+/// because `Option` / `Result` are prelude sum types — `resolver.resolve`
+/// returns `None` for them — so they fell through to the homogeneous-scalar
+/// classifier and capped (`classify_anon_dict_list_field.unsupported_field_type.2`).
+///
+/// Once a concrete element type is recovered the field becomes a normal
+/// `List<variant>` whose lowering already exists: the body walker routes the
+/// list literal through the `variant_list_literal_for_type` pointer-array of
+/// tagged variant records in `lower_dict_field_value`, returned via the
+/// in-place region-walk ABI (verifier-gated). So the only missing piece was
+/// recovering the payload type the declared-schema path gets for free from the
+/// annotation.
+///
+/// The inner type is inferred by sniffing the scalar payload of a
+/// payload-bearing variant (`Some { value }` / `Ok { value }` / `Err { error }`),
+/// requiring homogeneity across the list. Shapes whose inner type cannot be
+/// proven from the literal alone are left capped (returned as `Ok(None)` so the
+/// caller's own loud cap fires, or a precise `Err` for an outright malformed
+/// list):
+///   * an all-`None` `Option` list (no `Some` payload to type the inner),
+///   * a `Result` list missing either the `Ok` or the `Err` arm,
+///   * a non-scalar / non-param payload expression,
+///   * a heterogeneous payload type.
+fn classify_anon_dict_variant_list_field(
+    items: &[Node],
+    range: TokenRange,
+    field_name: &str,
+    main_param_tys: &HashMap<&str, IrType>,
+) -> Result<Option<TypeRepr>, LoweringError> {
+    let Some(first) = items.first() else {
+        return Ok(None);
+    };
+    let Some((enum_name, _)) = enum_variant_literal_path(first.expr.as_ref()) else {
+        return Ok(None);
+    };
+    // Only the two built-in sum types are handled here; named user enums
+    // stay on the resolver-backed path.
+    let kind = match enum_name.as_str() {
+        "Option" => VariantListKind::Option,
+        "Result" => VariantListKind::Result,
+        _ => return Ok(None),
+    };
+
+    // Accumulated payload scalar types per arm. `None` until a
+    // payload-bearing element pins it down.
+    let mut some_ty: Option<TypeRepr> = None; // Option.Some / Result.Ok
+    let mut err_ty: Option<TypeRepr> = None; // Result.Err
+
+    for node in items {
+        let Expr::VariantCtor {
+            enum_path,
+            variant,
+            body,
+        } = &*node.expr
+        else {
+            return Err(cap!(
+                "classify_anon_dict_variant_list_field.unsupported_field_type.1",
+                LoweringError::UnsupportedFieldType {
+                    schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+                    field: field_name.to_string(),
+                    ty: format!(
+                        "list element `{}` — expected a `{enum_name}` variant constructor",
+                        node.expr.kind()
+                    ),
+                    range: node.range,
+                }
+            ));
+        };
+        if enum_path.join(".") != enum_name {
+            return Err(cap!(
+                "classify_anon_dict_variant_list_field.unsupported_field_type.2",
+                LoweringError::UnsupportedFieldType {
+                    schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+                    field: field_name.to_string(),
+                    ty: format!(
+                        "heterogeneous variant list field: expected `{enum_name}`, found `{}`",
+                        enum_path.join(".")
+                    ),
+                    range: node.range,
+                }
+            ));
+        }
+        // Determine which payload slot this variant feeds and its key.
+        let payload_slot = match (kind, variant.as_str()) {
+            (VariantListKind::Option, "None") => None,
+            (VariantListKind::Option, "Some") => Some(("value", false)),
+            (VariantListKind::Result, "Ok") => Some(("value", false)),
+            (VariantListKind::Result, "Err") => Some(("error", true)),
+            (_, other) => {
+                return Err(cap!(
+                    "classify_anon_dict_variant_list_field.unsupported_field_type.3",
+                    LoweringError::UnsupportedFieldType {
+                        schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+                        field: field_name.to_string(),
+                        ty: format!("`{enum_name}` has no variant `{other}`"),
+                        range: node.range,
+                    }
+                ));
+            }
+        };
+        let Some((key, is_err)) = payload_slot else {
+            // Payload-free variant (`None`) — nothing to type.
+            continue;
+        };
+        let payload_node =
+            variant_payload_node(variant_body_pairs(body, node.range)?, key, node.range)?;
+        let payload_ty =
+            variant_payload_scalar_ty(&payload_node.expr, main_param_tys).ok_or_else(|| {
+                cap!(
+                    "classify_anon_dict_variant_list_field.unsupported_field_type.4",
+                    LoweringError::UnsupportedFieldType {
+                        schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+                        field: field_name.to_string(),
+                        ty: format!(
+                            "`{enum_name}.{variant}` payload `{}` is not a scalar literal or \
+                             scalar `#main` parameter — cannot type the variant list element",
+                            payload_node.expr.kind()
+                        ),
+                        range: payload_node.range,
+                    }
+                )
+            })?;
+        let slot = if is_err { &mut err_ty } else { &mut some_ty };
+        match slot {
+            Some(existing) if *existing != payload_ty => {
+                return Err(cap!(
+                    "classify_anon_dict_variant_list_field.unsupported_field_type.5",
+                    LoweringError::UnsupportedFieldType {
+                        schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+                        field: field_name.to_string(),
+                        ty: format!(
+                            "heterogeneous `{enum_name}` payload type: {existing:?} vs {payload_ty:?}"
+                        ),
+                        range: payload_node.range,
+                    }
+                ));
+            }
+            Some(_) => {}
+            None => *slot = Some(payload_ty),
+        }
+    }
+
+    match kind {
+        VariantListKind::Option => {
+            // All-`None` cannot pin the inner type from the literal alone.
+            let Some(inner) = some_ty else {
+                return Ok(None);
+            };
+            Ok(Some(TypeRepr::List {
+                element: Box::new(TypeRepr::Option {
+                    inner: Box::new(inner),
+                }),
+            }))
+        }
+        VariantListKind::Result => {
+            // Need both arms present to type `Result<T, E>` fully.
+            let (Some(ok), Some(err)) = (some_ty, err_ty) else {
+                return Ok(None);
+            };
+            let _ = range;
+            Ok(Some(TypeRepr::List {
+                element: Box::new(TypeRepr::Result {
+                    ok: Box::new(ok),
+                    err: Box::new(err),
+                }),
+            }))
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VariantListKind {
+    Option,
+    Result,
+}
+
+/// Recover the scalar [`TypeRepr`] of a variant payload expression. Only
+/// shapes whose type is provable at classify time are accepted: scalar
+/// literals and a bare `#main` scalar parameter reference. Anything else
+/// (computed expressions, nested collections, schemas) returns `None` so the
+/// caller caps loudly rather than guessing a layout.
+fn variant_payload_scalar_ty(
+    expr: &Expr,
+    main_param_tys: &HashMap<&str, IrType>,
+) -> Option<TypeRepr> {
+    match expr {
+        Expr::Int(_) => Some(TypeRepr::Int),
+        Expr::Float(_) => Some(TypeRepr::Float),
+        Expr::Bool(_) => Some(TypeRepr::Bool),
+        Expr::String(_) => Some(TypeRepr::String),
+        Expr::Variable(path) => {
+            if let [TokenKey::String(name, _, _)] = path.as_slice() {
+                return match main_param_tys.get(name.as_str())? {
+                    IrType::I64 => Some(TypeRepr::Int),
+                    IrType::F64 => Some(TypeRepr::Float),
+                    IrType::Bool => Some(TypeRepr::Bool),
+                    IrType::String => Some(TypeRepr::String),
+                    _ => None,
+                };
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 fn enum_variant_literal_path(expr: &Expr) -> Option<(String, String)> {
