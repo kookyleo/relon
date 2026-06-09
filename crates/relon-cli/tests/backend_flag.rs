@@ -1184,3 +1184,70 @@ fn cli_typed_field_preserves_enum_variant_brand() {
         "stdout was: {stdout:?}"
     );
 }
+
+/// Anon-Dict-return `List<Option<T>>` / `List<Result<T, E>>` fields must
+/// produce byte-identical JSON on tree-walk and cranelift-AOT. The field is
+/// a pointer array of tagged variant records (a marshalling silent-miscompile
+/// zone), built from the list literal and returned via the in-place ABI; the
+/// classifier infers the Option/Result element type that the declared-schema
+/// path got for free. Tree-walk serialises `Option` transparently
+/// (`Some(x)` -> x, `None` -> null) and `Result` externally tagged, so the
+/// compiled JSON must match that shape exactly.
+#[test]
+fn anon_dict_variant_list_byte_equal_across_backends() {
+    let cases: &[(&str, &str, serde_json::Value)] = &[
+        (
+            "#main(Int n) -> Dict\n{ items: [Option.Some { value: n }, Option.None {}] }\n",
+            r#"{"n":42}"#,
+            serde_json::json!({ "items": [42, serde_json::Value::Null] }),
+        ),
+        (
+            "#main(String s) -> Dict\n{ items: [Option.Some { value: s }, Option.None {}] }\n",
+            r#"{"s":"hi"}"#,
+            serde_json::json!({ "items": ["hi", serde_json::Value::Null] }),
+        ),
+        (
+            "#main(Int n) -> Dict\n{ items: [Result.Ok { value: n }, Result.Err { error: n }] }\n",
+            r#"{"n":7}"#,
+            serde_json::json!({ "items": [{ "Ok": { "value": 7 } }, { "Err": { "error": 7 } }] }),
+        ),
+    ];
+
+    for (src, args_json, expected) in cases {
+        let path = std::env::temp_dir().join(format!(
+            "relon-cli-anon-variant-list-{}-{}.relon",
+            std::process::id(),
+            FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::write(&path, src).expect("write fixture");
+
+        let run = |backend: &str| -> String {
+            let out = Command::new(BINARY)
+                .arg("run")
+                .arg(&path)
+                .arg("--backend")
+                .arg(backend)
+                .arg("--args")
+                .arg(args_json)
+                .output()
+                .expect("spawn relon CLI");
+            assert!(
+                out.status.success(),
+                "CLI exited non-zero for {backend} on `{src}`: stderr={}",
+                String::from_utf8_lossy(&out.stderr),
+            );
+            String::from_utf8(out.stdout).expect("utf-8 stdout")
+        };
+
+        let tw = run("tree-walk");
+        let aot = run("cranelift-aot");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            tw, aot,
+            "tree-walk vs cranelift-aot JSON differ for `{src}`"
+        );
+        let json: serde_json::Value = serde_json::from_str(&tw).expect("json stdout");
+        assert_eq!(&json, expected, "anon-Dict variant list shape for `{src}`");
+    }
+}

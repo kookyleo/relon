@@ -1075,3 +1075,70 @@ fn wasm_decode_rejects_out_of_region_field_pointer_loudly() {
         "an out-of-region cross-region field pointer must be a loud Err, got {res:?}"
     );
 }
+
+// ====================================================================
+// Anon-Dict-return List<Option/Result> variant-record list fields
+//
+// `#main(...) -> Dict { items: [Option.Some { value }, Option.None {}] }`
+// returns an anon-Dict whose `items` field is a pointer array of tagged
+// variant records. Previously the anon-Dict classifier could only type a
+// `List<#enum>` field (resolver-backed); the built-in `Option` / `Result`
+// sum types fell through and capped. Now the literal's payload type is
+// inferred so the field becomes a real `List<Option<T>>` / `List<Result<T,E>>`
+// and rides the existing `variant_list_literal_for_type` pointer-array
+// lowering + in-place return ABI.
+//
+// `fields_of` normalises away the synthesised `Ret` root brand the
+// compiled path stamps (tree-walk leaves the root unbranded); the field
+// *content* — the Option-transparent JSON-array shape (`Some(x)` -> x,
+// `None` -> null) and the externally-tagged Result objects — must match
+// the oracle byte-for-byte.
+// ====================================================================
+
+const SRC_OPT_INT_ANON: &str = "#main(Int n) -> Dict\n\
+     { items: [Option.Some { value: n }, Option.None {}] }";
+const SRC_OPT_STR_ANON: &str = "#main(String s) -> Dict\n\
+     { items: [Option.Some { value: s }, Option.None {}] }";
+const SRC_RESULT_INT_ANON: &str = "#main(Int n) -> Dict\n\
+     { items: [Result.Ok { value: n }, Result.Err { error: n }] }";
+const SRC_RESULT_STR_ANON: &str = "#main(String s) -> Dict\n\
+     { items: [Result.Ok { value: s }, Result.Err { error: s }] }";
+const SRC_OPT_INT_LITERALS_ANON: &str = "#main(Int n) -> Dict\n\
+     { items: [Option.Some { value: 7 }, Option.Some { value: 13 }, Option.None {}] }";
+
+#[test]
+fn anon_variant_list_option_int() {
+    assert_four_way(SRC_OPT_INT_ANON, args1("n", Value::Int(42)));
+}
+
+#[test]
+fn anon_variant_list_option_int_zero() {
+    assert_four_way(SRC_OPT_INT_ANON, args1("n", Value::Int(0)));
+}
+
+#[test]
+fn anon_variant_list_option_string() {
+    assert_four_way(SRC_OPT_STR_ANON, args1("s", s("hello")));
+}
+
+#[test]
+fn anon_variant_list_option_string_empty() {
+    assert_four_way(SRC_OPT_STR_ANON, args1("s", s("")));
+}
+
+#[test]
+fn anon_variant_list_option_int_literals_mixed() {
+    // All payloads are literals (param unused): literal-payload type
+    // inference + a 3-element Some/Some/None ordering.
+    assert_four_way(SRC_OPT_INT_LITERALS_ANON, args1("n", Value::Int(99)));
+}
+
+#[test]
+fn anon_variant_list_result_int() {
+    assert_four_way(SRC_RESULT_INT_ANON, args1("n", Value::Int(7)));
+}
+
+#[test]
+fn anon_variant_list_result_string() {
+    assert_four_way(SRC_RESULT_STR_ANON, args1("s", s("oops")));
+}
