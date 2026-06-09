@@ -967,7 +967,7 @@ fn type_accepts_tuple_array(type_hint: &TypeNode, arity: usize, tree: &AnalyzedT
 
 fn targetless_json_to_value(json: JsonValue) -> Result<Value, String> {
     if json.is_null() {
-        return Err("JSON null needs an Option<T> or T? target type".to_string());
+        return Err("JSON null needs an Option<T> target type".to_string());
     }
     serde_json::from_value::<Value>(json).map_err(|e| format!("invalid JSON value: {e}"))
 }
@@ -2254,7 +2254,7 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::InvalidInput);
         assert!(
             err.message
-                .contains("JSON null needs an Option<T> or T? target type"),
+                .contains("JSON null needs an Option<T> target type"),
             "unexpected message: {}",
             err.message
         );
@@ -2274,7 +2274,7 @@ mod tests {
             err.message.contains("JSON null is not a Relon value")
                 || err
                     .message
-                    .contains("JSON null needs an Option<T> or T? target type"),
+                    .contains("JSON null needs an Option<T> target type"),
             "unexpected message: {}",
             err.message
         );
@@ -2359,7 +2359,7 @@ s
     #[test]
     fn main_args_decode_optional_shorthand_to_option_value() {
         let sources = single_file(
-            "#main(Int? x) -> Int
+            "#main(Option<Int> x) -> Int
              x match { Some(v): v + 1, None: 0 }
 ",
         );

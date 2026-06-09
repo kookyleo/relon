@@ -313,8 +313,8 @@ impl<'a> Walker<'a> {
         };
         let mut accumulated = head.clone();
         // Walk path[1..]: each String segment must exist on the running
-        // type (or we punt). We strip Optional wrappers as we walk so
-        // `T? . x` is checked against `T`'s field set.
+        // type (or we punt). We strip Option wrappers as we walk so
+        // `Option<T> . x` is checked against `T`'s field set.
         for seg in &path[1..] {
             let TokenKey::String(name, _, _) = seg else {
                 return;

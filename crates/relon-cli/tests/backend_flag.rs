@@ -614,7 +614,7 @@ fn cli_args_reject_targetless_json_null() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("JSON null needs an Option<T> or T? target type"),
+        stderr.contains("JSON null needs an Option<T> target type"),
         "stderr should explain targetless null; got: {stderr}"
     );
 }
@@ -654,7 +654,7 @@ x
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("JSON null is not a Relon value")
-            || stderr.contains("JSON null needs an Option<T> or T? target type"),
+            || stderr.contains("JSON null needs an Option<T> target type"),
         "stderr should explain targetless null; got: {stderr}"
     );
 }
@@ -1010,7 +1010,7 @@ fn cli_args_decode_optional_shorthand_to_option_value() {
     ));
     std::fs::write(
         &path,
-        "#main(Int? x) -> Int\n\
+        "#main(Option<Int> x) -> Int\n\
          x match { Some(v): v + 1, None: 0 }\n",
     )
     .expect("write fixture");

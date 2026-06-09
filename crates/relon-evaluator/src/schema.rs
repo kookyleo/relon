@@ -40,9 +40,37 @@ impl TreeWalkEvaluator {
             });
         }
 
-        if type_hint.is_optional {
-            let mut inner_type = type_hint.clone();
-            inner_type.is_optional = false;
+        // Optional handling. Optionality is written `Option<T>` (the
+        // legacy `is_optional` flag is vestigial — never set from type
+        // syntax — but still honoured here for any in-memory `TypeNode`
+        // that sets it). Both forms share one semantics: `None` passes,
+        // a `Some(payload)` validates its payload against the inner
+        // type, and a bare value is auto-wrapped into `Some` after
+        // checking it against the inner type.
+        let optional_inner: Option<TypeNode> = if type_hint.is_optional {
+            let mut inner = type_hint.clone();
+            inner.is_optional = false;
+            Some(inner)
+        } else if type_hint.path == ["Option"] {
+            // `Option<T>` → inner is `T`; bare `Option` means `Option<Any>`.
+            Some(
+                type_hint
+                    .generics
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| TypeNode {
+                        path: vec!["Any".to_string()],
+                        generics: Vec::new(),
+                        is_optional: false,
+                        range: type_hint.range,
+                        variant_fields: None,
+                        doc_comment: None,
+                    }),
+            )
+        } else {
+            None
+        };
+        if let Some(inner_type) = optional_inner {
             if value.is_option_none() {
                 return Ok(());
             }
@@ -368,7 +396,10 @@ impl TreeWalkEvaluator {
                     d.map
                         .insert(SmolStr::from(field_name.as_str()), def.clone());
                 }
-            } else if field.type_hint.is_optional {
+            } else if field.type_hint.is_optional || field.type_hint.path == ["Option"] {
+                // An optional field (`Option<T>`, or the vestigial
+                // `is_optional` flag) may be absent — it stands in for
+                // `None`.
                 continue;
             } else {
                 return Err(RuntimeError::TypeMismatch {

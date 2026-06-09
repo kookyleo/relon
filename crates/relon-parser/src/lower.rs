@@ -1746,14 +1746,14 @@ fn lower_type_node_from_cst(node: &SyntaxNode, source: &str) -> Option<crate::Ty
                 elems.push(t);
             }
         }
-        let is_optional = node
-            .children_with_tokens()
-            .filter_map(|el| el.into_token())
-            .any(|t| t.kind() == SyntaxKind::QUESTION);
+        // Type-suffix `?` is rejected at parse time (wave A: optional
+        // types are written `Option<T>`). A stray `?` token may still be
+        // present in a tree that parsed with errors, but we never lower
+        // it into `is_optional` — the flag is vestigial for type syntax.
         return Some(crate::TypeNode {
             path: vec!["Tuple".to_string()],
             generics: elems,
-            is_optional,
+            is_optional: false,
             range: range_from_offsets(source, start, end),
             variant_fields: None,
             doc_comment: None,
@@ -1766,7 +1766,6 @@ fn lower_type_node_from_cst(node: &SyntaxNode, source: &str) -> Option<crate::Ty
     // hit `<` (generics), `?`, or end.
     let mut path: Vec<String> = Vec::new();
     let mut in_generics = false;
-    let mut is_optional = false;
     let mut after_path = false;
     let mut generics: Vec<crate::TypeNode> = Vec::new();
     for el in node.children_with_tokens() {
@@ -1791,9 +1790,9 @@ fn lower_type_node_from_cst(node: &SyntaxNode, source: &str) -> Option<crate::Ty
                 SyntaxKind::GT => {
                     in_generics = false;
                 }
-                SyntaxKind::QUESTION => {
-                    is_optional = true;
-                }
+                // Type-suffix `?` is rejected at parse time (wave A);
+                // never lower it into `is_optional`.
+                SyntaxKind::QUESTION => continue,
                 _ => continue,
             },
             rowan::NodeOrToken::Node(n) => {
@@ -1810,7 +1809,7 @@ fn lower_type_node_from_cst(node: &SyntaxNode, source: &str) -> Option<crate::Ty
     Some(crate::TypeNode {
         path,
         generics,
-        is_optional,
+        is_optional: false,
         range: range_from_offsets(source, start, end),
         variant_fields: None,
         doc_comment: None,

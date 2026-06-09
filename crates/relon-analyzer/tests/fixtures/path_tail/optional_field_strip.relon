@@ -1,8 +1,8 @@
 // v1.4 path-tail: an Optional schema reference still walks into its
-// fields. `Customer? customer` then `.name` strips the `?` and lands on
-// String, matching the declared return.
+// fields. `Option<Customer> customer` then `.name` strips the option and
+// lands on String, matching the declared return.
 // EXPECTED: no diagnostics.
 #schema Customer { String name: * }
-#schema Order { Customer? customer: *, Int id: * }
+#schema Order { Option<Customer> customer: *, Int id: * }
 #main(Order o) -> String
 o.customer.name

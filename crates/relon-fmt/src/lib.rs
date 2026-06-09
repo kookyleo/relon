@@ -847,7 +847,7 @@ impl<'a> SourceFormatter<'a> {
                         Some(TokenKind::Amp)
                     }
                     TokenKind::Question => {
-                        if self.is_type_optional(token) {
+                        if self.is_flush_chain_question(token) {
                             self.write_plain("?");
                             self.space_if_next_starts_value();
                         } else {
@@ -1021,17 +1021,20 @@ impl<'a> SourceFormatter<'a> {
             .is_some_and(|t| t.kind == TokenKind::Word)
     }
 
-    /// `?` marks a type as optional (e.g. `Foo?`, `Foo<X>?`) when it sits
-    /// flush against the closing token of a type expression — an identifier
-    /// or the `>` of a generic. With any whitespace before it the `?`
-    /// belongs to a ternary and gets full binary spacing.
-    fn is_type_optional(&self, current: Token<'a>) -> bool {
+    /// A `?` that sits flush against the preceding identifier (no source
+    /// whitespace) is the optional-chaining prefix `a?.b` / `a?[i]` — it
+    /// stays packed against its receiver and never picks up binary
+    /// spacing. With any whitespace before it the `?` belongs to a
+    /// ternary (`c ? a : b`) and gets full binary spacing.
+    ///
+    /// Note: the type-suffix optional marker `T?` is no longer valid
+    /// syntax (optionality is written `Option<T>`), so this only governs
+    /// the call-chain `?`.
+    fn is_flush_chain_question(&self, current: Token<'a>) -> bool {
         let Some(prev) = self.previous else {
             return false;
         };
-        let prev_closes_type =
-            prev.kind == TokenKind::Word || (prev.kind == TokenKind::Operator && prev.text == ">");
-        if !prev_closes_type {
+        if prev.kind != TokenKind::Word {
             return false;
         }
         current.start == prev.end
@@ -1049,10 +1052,10 @@ impl<'a> SourceFormatter<'a> {
     }
 
     /// Emit a space if the next non-trivia token starts a value-shaped
-    /// construct. Used to bridge `>` and `?` of a type expression to
-    /// whatever follows (e.g. `Foo<X> field`, `Foo? field`); skips when
-    /// the next token already includes its own leading layout (`,`,
-    /// closing bracket, another `?`, etc.).
+    /// construct. Used to bridge the `>` that closes a type's generics
+    /// to whatever follows (e.g. `Foo<X> field`); skips when the next
+    /// token already includes its own leading layout (`,`, closing
+    /// bracket, another `?`, etc.).
     fn space_if_next_starts_value(&mut self) {
         if let Some(next) = self.peek_next_non_trivia() {
             if matches!(
@@ -1460,12 +1463,26 @@ mod tests {
     }
 
     #[test]
-    fn keeps_type_optional_compact() {
+    fn keeps_optional_type_compact() {
+        // Optionality is written `Option<T>` (the legacy `T?` suffix is
+        // no longer valid syntax). These round-trip like any generic.
         for source in [
-            "{\n    Weather? w: {\n        a: 1\n    }\n}\n",
-            "{\n    x: #brand Weather? {\n        a: 1\n    }\n}\n",
-            "{\n    x: #brand Dict<String, Int>? {\n        a: 1\n    }\n}\n",
+            "{\n    Option<Weather> w: {\n        a: 1\n    }\n}\n",
+            "{\n    x: #brand Option<Weather> {\n        a: 1\n    }\n}\n",
+            "{\n    x: #brand Option<Dict<String, Int>> {\n        a: 1\n    }\n}\n",
         ] {
+            let formatted = format_source(source).unwrap();
+            assert_eq!(formatted, source, "input did not round-trip");
+            assert_eq!(format_source(&formatted).unwrap(), formatted);
+        }
+    }
+
+    #[test]
+    fn optional_chaining_question_stays_packed() {
+        // `a?.b` — the `?` is the optional-chaining prefix and must stay
+        // flush against its receiver, never picking up ternary binary
+        // spacing.
+        for source in ["{\n    f(a): a?.b\n}\n", "{\n    f(a): a?.b?.c\n}\n"] {
             let formatted = format_source(source).unwrap();
             assert_eq!(formatted, source, "input did not round-trip");
             assert_eq!(format_source(&formatted).unwrap(), formatted);
