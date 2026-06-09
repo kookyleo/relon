@@ -5,12 +5,16 @@
   ],
   "items": [
     {
-      "name": "a",
-      "url": "http://a.png"
+      "Image": {
+        "name": "a",
+        "url": "http://a.png"
+      }
     },
     {
-      "content": "hello world",
-      "name": "b"
+      "Text": {
+        "content": "hello world",
+        "name": "b"
+      }
     }
   ]
 }

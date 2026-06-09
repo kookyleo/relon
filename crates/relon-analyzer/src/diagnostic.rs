@@ -109,6 +109,22 @@ pub enum Diagnostic {
         range: SourceSpan,
     },
 
+    #[error("`match` dispatches on a runtime `#brand`, which is not supported")]
+    #[diagnostic(
+        code(relon::analyze::dynamic_brand_dispatch_match),
+        help(
+            "The scrutinee's type is not statically known to a single concrete type, so picking an arm would require comparing a runtime `#brand` string. Declare an `#enum` with the variants you are matching on, construct the value as that enum, and match its variants instead."
+        )
+    )]
+    DynamicBrandDispatchMatch {
+        /// The brand/type-pattern arm names that would be dispatched on at
+        /// runtime, in source order. Used purely to make the message and
+        /// tests readable; the rejection does not depend on their contents.
+        arm_brands: Vec<String>,
+        #[label("runtime brand-dispatch is not supported; use an `#enum`")]
+        range: SourceSpan,
+    },
+
     #[error(
         "schema field `{field}`: cannot combine an explicit type prefix `{type_prefix}` with `#brand`"
     )]
@@ -686,6 +702,11 @@ impl Diagnostic {
             | Diagnostic::NonExhaustiveMatch { .. }
             | Diagnostic::UnknownVariant { .. }
             | Diagnostic::DuplicateMatchArm { .. }
+            // Dynamic brand-dispatch `match` is the duck-typing residue:
+            // matching a not-statically-typed scrutinee on a runtime
+            // `#brand`. Rejected outright (the language is static-first;
+            // declare an `#enum` instead), so Error severity in every mode.
+            | Diagnostic::DynamicBrandDispatchMatch { .. }
             | Diagnostic::SchemaFieldBrandConflict { .. }
             | Diagnostic::SchemaFieldBrandInvalidArg { .. }
             | Diagnostic::DuplicateMainDirective { .. }
