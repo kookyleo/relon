@@ -6,17 +6,36 @@
 // analyzer now rejects — the static-first language wants an `#enum` here,
 // exactly as Rust would.
 #enum Media {
-    Image { name: String, url: String },
-    Text { name: String, content: String }
+    Image {
+        name: String,
+        url: String
+    },
+    Text {
+        name: String,
+        content: String
+    }
 }
+
 {
     items: [
-        Media.Image { name: "a", url: "http://a.png" },
-        Media.Text { name: "b", content: "hello world" }
+        Media.Image {
+            name: "a",
+            url: "http://a.png"
+        },
+        Media.Text {
+            name: "b",
+            content: "hello world"
+        }
     ],
     render_item(Media item): item match {
-        Media.Image { url, name: _ }: "IMG(" + url + ")",
-        Media.Text { content, name: _ }: "TXT(" + content + ")"
+        Media.Image {
+            url,
+            name: _
+        }: "IMG(" + url + ")",
+        Media.Text {
+            content,
+            name: _
+        }: "TXT(" + content + ")"
     },
 
     display: [
