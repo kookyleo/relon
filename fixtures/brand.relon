@@ -40,7 +40,7 @@
     // entry points (typed_field vs decorated) compare equal at this level.
     classify(w): w match {
         Weather: "is_weather",
-        *: "other"
+        _: "other"
     },
 
     typed_kind: classify(&sibling.typed_field),

@@ -77,7 +77,7 @@ Match arms can destructure payloads:
 ```relon
 #main(Packet p) -> Int
 p match {
-    Pair(n, *): n + 1,
+    Pair(n, _): n + 1,
     Empty: 0
 }
 ```
@@ -181,11 +181,11 @@ When the analyzer can statically infer the enum type of the matched value, it ch
 
 | Diagnostic | Trigger |
 | --- | --- |
-| `NonExhaustiveMatch` | Missing variants and no `*` wildcard |
+| `NonExhaustiveMatch` | Missing variants and no `_` wildcard |
 | `UnknownVariant` | Variant name does not exist |
 | `DuplicateMatchArm` | Same variant name appears twice |
 
-When the analyzer cannot infer the type, runtime keeps the verdict. To opt out of exhaustiveness, add a `*: ...` wildcard arm.
+When the analyzer cannot infer the type, runtime keeps the verdict. To opt out of exhaustiveness, add a `_: ...` wildcard arm.
 
 ### Complete example
 

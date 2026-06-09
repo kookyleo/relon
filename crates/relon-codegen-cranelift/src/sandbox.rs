@@ -140,6 +140,13 @@ pub enum TrapKind {
     /// `smul_overflow` so the trap mirrors the tree-walker's strict
     /// `RuntimeError::NumericOverflow` semantics.
     NumericOverflow = 6,
+    /// A strict-mode `match` fell through every arm with no `_`
+    /// catch-all and no arm matched at runtime. Lifts to
+    /// `RuntimeError::TypeMismatch { expected: "a matching arm", .. }`
+    /// — byte-aligned (modulo range) with the tree-walk oracle's
+    /// `Expr::Match` no-match path. Routed here from the IR-level
+    /// `TrapKind::NoMatch`.
+    NoMatch = 7,
 }
 
 impl TrapKind {
@@ -153,6 +160,7 @@ impl TrapKind {
             3 => TrapKind::CapabilityDenied,
             4 => TrapKind::ResourceExhausted,
             6 => TrapKind::NumericOverflow,
+            7 => TrapKind::NoMatch,
             _ => TrapKind::Unreachable,
         }
     }
@@ -176,6 +184,18 @@ impl TrapKind {
                 reason: "cranelift-native: lowered IR contained an unreachable op".to_string(),
             },
             TrapKind::NumericOverflow => RuntimeError::NumericOverflow(range),
+            TrapKind::NoMatch => RuntimeError::TypeMismatch {
+                // `expected` is byte-identical to the tree-walk oracle's
+                // `Expr::Match` no-match path. `found` cannot reproduce the
+                // oracle's `format!("value {}", val)` from a static trap (the
+                // runtime value is not carried through the trap code), so it
+                // states the structural cause; the harness's `trap_equivalent`
+                // keys on the `TypeMismatch` discriminant, and the analyzer
+                // proves the construct always traps.
+                expected: "a matching arm".to_string(),
+                found: "no matching arm".to_string(),
+                range,
+            },
         }
     }
 }

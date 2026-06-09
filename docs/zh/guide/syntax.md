@@ -66,12 +66,12 @@ enum 使用 Rust-like 的 `#enum` 声明。unit、struct、tuple 三种变体分
 
 输出 JSON 时采用外部标签：`Stat.Up` -> `{ "Up": {} }`，`Packet.Pair(7, "x")` -> `{ "Pair": [7, "x"] }`。
 
-`match` arm 可以在 pattern 中绑定 payload 字段。用 `*` 表示忽略某个 payload 槽：
+`match` arm 可以在 pattern 中绑定 payload 字段。用 `_` 表示忽略某个 payload 槽：
 
 ```relon
 #main(Packet p) -> Int
 p match {
-    Pair(n, *): n + 1,
+    Pair(n, _): n + 1,
     Empty: 0
 }
 ```
@@ -81,7 +81,7 @@ struct variant 按字段名绑定：
 ```relon
 #main(Notification msg) -> String
 msg match {
-    Notification.Email { address, subject: * }: address,
+    Notification.Email { address, subject: _ }: address,
     Push: ""
 }
 ```

@@ -113,6 +113,13 @@ pub enum SyntaxKind {
     BANG,
     /// `|`
     PIPE,
+    /// A bare `_` (an underscore NOT followed by another identifier
+    /// char). The Rust-style pattern wildcard for match catch-all arms
+    /// (`_: result`) and ignored variant-payload slots. A `_foo` /
+    /// `my_var` still lexes as `IDENT`. The schema-field "any-value"
+    /// validator keeps its own `*` spelling (`STAR`); the two roles are
+    /// deliberately distinct tokens.
+    UNDERSCORE,
 
     /// Any source byte the lexer couldn't classify (stray UTF-8
     /// punctuation, control characters, etc.). Emitted as a single-
@@ -344,6 +351,7 @@ impl SyntaxKind {
             x if x == Self::PERCENT as u16 => Self::PERCENT,
             x if x == Self::BANG as u16 => Self::BANG,
             x if x == Self::PIPE as u16 => Self::PIPE,
+            x if x == Self::UNDERSCORE as u16 => Self::UNDERSCORE,
             x if x == Self::UNKNOWN as u16 => Self::UNKNOWN,
             x if x == Self::F_STRING_OPEN as u16 => Self::F_STRING_OPEN,
             x if x == Self::F_STRING_CLOSE as u16 => Self::F_STRING_CLOSE,

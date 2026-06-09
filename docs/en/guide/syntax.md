@@ -71,12 +71,12 @@ Enums use Rust-like `#enum` declarations. Unit, struct, and tuple variants are c
 
 JSON output is externally tagged: `Stat.Up` -> `{ "Up": {} }`, and `Packet.Pair(7, "x")` -> `{ "Pair": [7, "x"] }`.
 
-`match` can bind payload fields in the arm pattern. Use `*` for a payload slot you want to ignore:
+`match` can bind payload fields in the arm pattern. Use `_` for a payload slot you want to ignore:
 
 ```relon
 #main(Packet p) -> Int
 p match {
-    Pair(n, *): n + 1,
+    Pair(n, _): n + 1,
     Empty: 0
 }
 ```
@@ -86,7 +86,7 @@ Struct variants bind by field name:
 ```relon
 #main(Notification msg) -> String
 msg match {
-    Notification.Email { address, subject: * }: address,
+    Notification.Email { address, subject: _ }: address,
     Push: ""
 }
 ```

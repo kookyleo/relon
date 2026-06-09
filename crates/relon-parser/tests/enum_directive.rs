@@ -76,7 +76,7 @@ fn enum_tuple_match_payload_pattern_lowers() {
     let node = parse_document(
         r#"#enum Packet { Pair(Int, String), Empty }
 #main(Packet p) -> Int
-p match { Pair(n, *): n + 1, Empty: 0 }
+p match { Pair(n, _): n + 1, Empty: 0 }
 "#,
     )
     .expect("parse tuple payload pattern");

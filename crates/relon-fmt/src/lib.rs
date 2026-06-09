@@ -107,6 +107,10 @@ fn map_syntax_to_token_kind(kind: SyntaxKind) -> Option<TokenKind> {
         SyntaxKind::LINE_COMMENT => TokenKind::LineComment,
         SyntaxKind::BLOCK_COMMENT => TokenKind::BlockComment,
         SyntaxKind::IDENT => TokenKind::Word,
+        // The bare-`_` pattern wildcard spaces like an identifier
+        // (`_: result` mirrors `Int: result`), so it joins the `Word`
+        // family rather than the operator one the old `*` lived in.
+        SyntaxKind::UNDERSCORE => TokenKind::Word,
         SyntaxKind::NUMBER => TokenKind::Number,
         SyntaxKind::STRING => TokenKind::String,
         SyntaxKind::L_BRACE => TokenKind::OpenBrace,

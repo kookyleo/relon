@@ -160,7 +160,7 @@ fn custom_enum_tuple_match_payload_pattern_bindings_are_typed() {
     let tree = analyze_str(
         r#"#enum Packet { Pair(Int, String), Empty }
         #main(Packet p) -> Int
-        p match { Pair(n, *): n + 1, Empty: 0 }
+        p match { Pair(n, _): n + 1, Empty: 0 }
         "#,
     );
     assert_eq!(
@@ -183,7 +183,7 @@ fn custom_enum_struct_match_payload_pattern_bindings_are_typed() {
     let tree = analyze_str(
         r#"#enum Notification { Email { code: Int, subject: String }, Push }
         #main(Notification msg) -> Int
-        msg match { Notification.Email { code, subject: * }: code + 1, Push: 0 }
+        msg match { Notification.Email { code, subject: _ }: code + 1, Push: 0 }
         "#,
     );
     assert_eq!(
@@ -349,7 +349,7 @@ fn wildcard_arm_satisfies_exhaustiveness() {
             N v: N.A { x: 1 },
             out: v match {
                 A: 1,
-                *: 9
+                _: 9
             }
         }"#,
     );

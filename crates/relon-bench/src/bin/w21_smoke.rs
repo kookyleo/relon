@@ -38,7 +38,7 @@ fn w21_src() -> &'static str {
        classify(it): it match {\n\
          Image: 1,\n\
          Text: 2,\n\
-         *: 0\n\
+         _: 0\n\
        },\n\
        result: range(n).reduce(0, (acc, i) => acc + classify(items[i % 2]))\n\
      }"

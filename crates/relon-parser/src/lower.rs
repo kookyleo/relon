@@ -394,7 +394,12 @@ fn lower_atom_via_legacy(node: &SyntaxNode, source: &str) -> Option<Node> {
             let start: usize = r.start().into();
             let end: usize = r.end().into();
             let slice = source.get(start..end)?;
-            if slice == "*" {
+            // Both spellings of the WILDCARD node lower to `Expr::Wildcard`:
+            // `_` (the Rust-style pattern wildcard for match catch-all /
+            // payload-ignore) and `*` (the schema-field "any-value"
+            // validator). The parser already routes each spelling to its
+            // legal position; here we only need to accept both lexemes.
+            if slice == "_" || slice == "*" {
                 Some(Node::new(
                     Expr::Wildcard,
                     range_from_offsets(source, start, end),
@@ -2906,11 +2911,22 @@ fn lower_closure_param_v2(node: &SyntaxNode, source: &str) -> Option<crate::Clos
     // the last IDENT child (since TYPE_NODE may contain IDENT
     // tokens too — but TYPE_NODE is a Node child, not a token
     // child of CLOSURE_PARAM).
+    //
+    // A bare `_` ignore-binding parameter (`(acc, _) => ...`) lexes as
+    // UNDERSCORE, not IDENT, so fall back to the last UNDERSCORE token
+    // when no IDENT name is present; its text is `"_"`, preserving the
+    // pre-split behaviour where `_` was a plain identifier parameter.
     let name_tok = node
         .children_with_tokens()
         .filter_map(|el| el.into_token())
         .filter(|t| t.kind() == SyntaxKind::IDENT)
-        .last()?;
+        .last()
+        .or_else(|| {
+            node.children_with_tokens()
+                .filter_map(|el| el.into_token())
+                .filter(|t| t.kind() == SyntaxKind::UNDERSCORE)
+                .last()
+        })?;
     Some(crate::ClosureParam {
         name: name_tok.text().to_string(),
         type_hint,
@@ -3216,7 +3232,7 @@ fn lower_match_pattern_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
                 match tok.kind() {
                     SyntaxKind::R_PAREN => break,
                     SyntaxKind::COMMA => continue,
-                    SyntaxKind::STAR => bindings.push(PatternBinding {
+                    SyntaxKind::UNDERSCORE => bindings.push(PatternBinding {
                         field: None,
                         binding: None,
                     }),
@@ -3241,7 +3257,7 @@ fn lower_match_pattern_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
                                 tokens.next();
                                 let bind_tok = tokens.next()?;
                                 match bind_tok.kind() {
-                                    SyntaxKind::STAR => None,
+                                    SyntaxKind::UNDERSCORE => None,
                                     SyntaxKind::IDENT => Some(bind_tok.text().to_string()),
                                     _ => return None,
                                 }
