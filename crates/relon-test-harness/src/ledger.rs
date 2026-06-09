@@ -1730,7 +1730,7 @@ pub const LEDGER: &[LedgerEntry] = &[
         category: Category::ExprShape,
         status: Status::Capped,
         corpus: "",
-        reason: "comprehension iterable does not lower to a List<Int> in the AOT envelope",
+        reason: "comprehension iterable does not lower to a List<Int>/Float/String in the AOT envelope (e.g. List<Bool>)",
     },
     LedgerEntry {
         id: "lower_comprehension.unsupported_expr.2",
@@ -1738,7 +1738,15 @@ pub const LEDGER: &[LedgerEntry] = &[
         category: Category::ExprShape,
         status: Status::Capped,
         corpus: "",
-        reason: "internal guard: list_int_map/filter closure arg signature missing",
+        reason: "filtered List<String> comprehension (no four-way String->Bool predicate body), or internal guard: list_*_map/filter closure arg signature missing",
+    },
+    LedgerEntry {
+        id: "lower_comprehension.unsupported_expr.3",
+        site: "lowering/mod.rs::lower_comprehension",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "comprehension element type matches no bundled map body for the source (no cross-type list_*_map_to_* exists)",
     },
     LedgerEntry {
         id: "lower_comprehension.unknown_stdlib_method.1",
@@ -1746,7 +1754,7 @@ pub const LEDGER: &[LedgerEntry] = &[
         category: Category::ExprShape,
         status: Status::Capped,
         corpus: "",
-        reason: "internal guard: bundled list_int_map/filter slot missing from registry",
+        reason: "internal guard: bundled list_*_map/filter slot missing from registry",
     },
     LedgerEntry {
         id: "lower_comprehension.unknown_stdlib_method.2",
@@ -1754,7 +1762,7 @@ pub const LEDGER: &[LedgerEntry] = &[
         category: Category::ExprShape,
         status: Status::Capped,
         corpus: "",
-        reason: "internal guard: bundled list_int_map/filter metadata missing from registry",
+        reason: "internal guard: bundled list_*_map/filter metadata missing from registry",
     },
     LedgerEntry {
         id: "try_lower_list_sum_value.unknown_stdlib_method.1",
@@ -2579,6 +2587,34 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         corpus: "r3_comprehension_if",
         status: Status::Covered,
         proof: "tree-walk + cranelift inline (desugars to map/filter)",
+    },
+    SurfaceEntry {
+        construct: "comprehension over List<Float> source (map / guard)",
+        wave: "R3b",
+        corpus: "r3b_comprehension_float_if",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift; four-way in inplace_return_four_way::comprehension_float_*",
+    },
+    SurfaceEntry {
+        construct: "comprehension Int->Float element map",
+        wave: "R3b",
+        corpus: "r3b_comprehension_int_to_float",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift; four-way in inplace_return_four_way::comprehension_int_to_float",
+    },
+    SurfaceEntry {
+        construct: "comprehension over List<String> source (map)",
+        wave: "R3c",
+        corpus: "r3c_comprehension_string",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift; four-way in inplace_return_four_way::comprehension_string_source_map",
+    },
+    SurfaceEntry {
+        construct: "comprehension Int->String element map",
+        wave: "R3c",
+        corpus: "r3c_comprehension_int_to_string",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift; four-way in inplace_return_four_way::comprehension_int_to_string",
     },
     // ---- Wave R2: pipe + f-string ----
     SurfaceEntry {

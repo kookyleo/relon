@@ -828,6 +828,53 @@ pub fn all_cases() -> Vec<CorpusCase> {
             tier: Tier::StdlibList,
             supported_by: TW_CR,
         },
+        // ---- Comprehension over List<Float> / List<String> sources +
+        //      the element-type-changing shapes. `lower_comprehension`
+        //      routes the desugared filter-then-map onto the per-source
+        //      bundled bodies (`list_float_*` / `list_string_map`) and
+        //      selects the map body from the closure's inferred return
+        //      type, so a Float-source comprehension and an Int -> Float /
+        //      * -> String element map lower the same way the method /
+        //      free forms do. Ride `TW_CR` alongside the sibling
+        //      `r3b_*` / `r3c_*` HOF cases (the `List<Float>` /
+        //      `List<String>` return shape is out of the bytecode entry
+        //      envelope and has no trace recipe); the llvm-native leg is
+        //      covered three-way in `relon-codegen-llvm`.
+        CorpusCase {
+            name: "r3b_comprehension_float",
+            source: "#main() -> List<Float>\n[x * 2.0 for x in [1.0, 2.0, 3.0]]",
+            args_factory: no_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r3b_comprehension_float_if",
+            source: "#main() -> List<Float>\n[x * 2.0 for x in [0.5, 1.5, 2.5, 0.9] if x > 1.0]",
+            args_factory: no_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r3b_comprehension_int_to_float",
+            source: "#main(Int n) -> List<Float>\n[x * 2.0 for x in range(n)]",
+            args_factory: || one_int("n", 4),
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r3c_comprehension_string",
+            source: "#main() -> List<String>\n[s + \"!\" for s in [\"a\", \"b\", \"c\"]]",
+            args_factory: no_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r3c_comprehension_int_to_string",
+            source: "#main(Int n) -> List<String>\n[f\"#${x}\" for x in range(n)]",
+            args_factory: || one_int("n", 3),
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
         // ---- Wave R3b: typed list higher-order ops over List<Float> +
         //      the element-type-changing numeric `map` shapes. The
         //      `list_float_*` bundled bodies share the `List<Int>` record

@@ -548,6 +548,70 @@ fn r13_int_to_string_fstring_longer() {
 }
 
 // ====================================================================
+// List comprehensions over Float / String sources + the
+// element-type-changing shapes.
+//
+// `lower_comprehension` desugars `[ element for id in src (if cond)? ]`
+// onto the same per-source bundled bodies the method / free HOF forms use
+// (`list_float_*` / `list_string_map` / the cross-type `list_*_map_to_*`),
+// selecting the map body from the closure's inferred return type. A
+// `List<String>` result is the self-contained scratch pointer-array the
+// R13 string-result HOFs build, so it rides the identical in-place
+// region-walk return ABI (the comprehension AST root is now recognised by
+// `string_result_list_hof_call`). The numeric `List<Float>` results ride
+// the rigid-copy inline-fixed return like the float HOF results. Every
+// case is bit-equal across tree-walk == native llvm == wasm.
+// ====================================================================
+
+// Float-source homogeneous map: each element scaled by a Float literal.
+const SRC_COMP_FLOAT: &str = "#main() -> List<Float>\n[x * 2.0 for x in [1.0, 2.0, 3.0]]";
+
+#[test]
+fn comprehension_float_source_map() {
+    assert_four_way(SRC_COMP_FLOAT, HashMap::new());
+}
+
+// Float-source guarded comprehension (filter-then-map): the guard keeps
+// the passing Float elements unchanged, then the map scales each survivor.
+const SRC_COMP_FLOAT_IF: &str =
+    "#main() -> List<Float>\n[x * 2.0 for x in [0.5, 1.5, 2.5, 0.9] if x > 1.0]";
+
+#[test]
+fn comprehension_float_source_guard() {
+    assert_four_way(SRC_COMP_FLOAT_IF, HashMap::new());
+}
+
+// Element-type-changing Int -> Float comprehension: an Int source with a
+// Float-returning element expr resolves the `list_int_map_to_float` body
+// through the closure-return probe.
+const SRC_COMP_INT_TO_FLOAT: &str = "#main(Int n) -> List<Float>\n[x * 2.0 for x in range(n)]";
+
+#[test]
+fn comprehension_int_to_float() {
+    assert_four_way(SRC_COMP_INT_TO_FLOAT, args1("n", Value::Int(4)));
+}
+
+// String-source homogeneous map: build a fresh String per element in
+// scratch (const-pool literal `"!"` + concat), collected into the scratch
+// result pointer array — the R13 in-place return shape.
+const SRC_COMP_STRING: &str = "#main() -> List<String>\n[s + \"!\" for s in [\"a\", \"b\", \"c\"]]";
+
+#[test]
+fn comprehension_string_source_map() {
+    assert_four_way(SRC_COMP_STRING, HashMap::new());
+}
+
+// Element-type-changing Int -> String comprehension via an f-string body
+// (resolves the `list_int_map_to_string` body through the closure-return
+// probe).
+const SRC_COMP_INT_TO_STRING: &str = "#main(Int n) -> List<String>\n[f\"#${x}\" for x in range(n)]";
+
+#[test]
+fn comprehension_int_to_string() {
+    assert_four_way(SRC_COMP_INT_TO_STRING, args1("n", Value::Int(3)));
+}
+
+// ====================================================================
 // Wave R15: `s.split(sep)` -> List<String> (data-dependent count).
 //
 // The body scans the input twice (count segments, then emit), building a
