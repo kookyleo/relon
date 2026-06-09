@@ -781,16 +781,24 @@ fn infer_reference(
     };
     let target_id = frame.fields.get(name).copied()?;
     let target = tree.node_index.get(&target_id)?;
-    // Guard 3: backward only. The target field must start earlier in
-    // source than the reference site. This mirrors R10's "earlier
-    // host-visible scalar field" lowering guard and rejects forward /
-    // self references (which the compiled path caps).
-    if target.range.start.offset >= node.range.start.offset {
+    // R13: forward references are allowed — the compiled path emits
+    // anon-Dict fields in topological order, so a reference to a
+    // later-declared sibling/root field resolves four-way. We therefore
+    // drop the old backward-only guard. Two guards remain:
+    //
+    // * Self reference (`x: &sibling.x`): the reference site sits inside
+    //   its own target field, so the target's source range encloses the
+    //   reference node. This is a one-field cycle; reject it (and avoid
+    //   recursing into our own value). The compiled path rejects the
+    //   same shape loudly in `anon_dict_emit_order`.
+    if target.range.start.offset <= node.range.start.offset
+        && node.range.end.offset <= target.range.end.offset
+    {
         return None;
     }
-    // Cycle guard: refuse to re-enter a field already on the resolution
-    // stack (`x: &sibling.x`, or a mutually-recursive pair). Returns
-    // `None` → `Any` → strict still rejects.
+    // * Multi-field cycle: refuse to re-enter a field already on the
+    //   resolution stack (a mutually-recursive pair `x: &sibling.y,
+    //   y: &sibling.x`). Returns `None` → `Any` → strict still rejects.
     if scope.resolving.iter().any(|n| n == name) {
         return None;
     }

@@ -195,6 +195,9 @@ fn args_s_world() -> HashMap<String, Value> {
 fn args_x_40_y_2() -> HashMap<String, Value> {
     two_ints("x", 40, "y", 2)
 }
+fn args_a_40_b_2() -> HashMap<String, Value> {
+    two_ints("a", 40, "b", 2)
+}
 fn args_x_7_y_6() -> HashMap<String, Value> {
     two_ints("x", 7, "y", 6)
 }
@@ -1600,6 +1603,54 @@ pub fn all_cases() -> Vec<CorpusCase> {
             name: "r10b_strict_sibling_chain",
             source: "#main(Int a, Int b) -> Dict\n{ x: a + b, y: &sibling.x * 2, z: &root.x + &sibling.y }",
             args_factory: args_x_17_y_5,
+            tier: Tier::DictReturn,
+            supported_by: TW_CR,
+        },
+        // ---- Wave R13: FORWARD static `&sibling` / `&root` field refs ----
+        // A field reads a *later*-declared sibling/root field. R13 emits
+        // anon-Dict fields in topological order over their reference
+        // edges (`anon_dict_emit_order`), so the forward target's let is
+        // bound before the reference lowers — the symmetric counterpart
+        // of R10's backward refs. Backward-only bodies keep declaration
+        // order, so R10/R10b output stays byte-identical.
+        //
+        // The tree-walk oracle resolves these lazily; a forward reference
+        // INTO a reference-bearing field whose component reads a `#main`
+        // param loses the param scope in the oracle, so that shape stays
+        // a loud cap. The cases below are the oracle-agreeing subset:
+        // forward-to-leaf (`y: &sibling.x` where `x: a + b`), forward
+        // chains over a param-free component, and forward String / List
+        // references. `Int`/`String`/`List` Dict return ⇒ `TW_CR`.
+        CorpusCase {
+            // forward-to-leaf: `y` reads later `x`, `x` is a non-ref leaf.
+            name: "r13_forward_ref",
+            source: "#relaxed\n#main(Int a, Int b) -> Dict\n{ y: &sibling.x * 2, x: a + b }",
+            args_factory: args_a_40_b_2,
+            tier: Tier::DictReturn,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            // forward chain over a param-free component (z -> y -> x, x
+            // literal). Exercises a transitive forward reference.
+            name: "r13_forward_chain_paramfree",
+            source: "#relaxed\n#main(Int a) -> Dict\n{ z: &sibling.y + 1, y: &sibling.x * 2, x: 100 }",
+            args_factory: || one_int("a", 1),
+            tier: Tier::DictReturn,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            // forward String reference: `greeting` reads later `name`.
+            name: "r13_forward_string_ref",
+            source: "#relaxed\n#main(Int a) -> Dict\n{ greeting: &sibling.name, name: \"hello\" }",
+            args_factory: || one_int("a", 1),
+            tier: Tier::DictReturn,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            // forward List<Int> reference: `alias` reads later `items`.
+            name: "r13_forward_list_ref",
+            source: "#relaxed\n#main(Int a) -> Dict\n{ alias: &sibling.items, items: [1, 2, 3] }",
+            args_factory: || one_int("a", 1),
             tier: Tier::DictReturn,
             supported_by: TW_CR,
         },

@@ -1226,11 +1226,16 @@ mod tests {
         // file with `#main(Dict user)` would surface as `Variable not
         // found: user`. Each #main example has its own canonical args
         // documented in the file header for hands-on `cargo run` use.
+        // `fixtures/forward_references.relon` is likewise a `#main(...)`
+        // entry: its four-way coverage lives in the corpus differential
+        // (`r13_*`) + the wasm/llvm parity tests, and its CLI cross-
+        // backend output is documented in the file header.
         let main_entry_examples: &[&Path] = &[
             Path::new("examples/validation.relon"),
             Path::new("examples/feature_flag.relon"),
             Path::new("examples/pricing.relon"),
             Path::new("examples/workflow.relon"),
+            Path::new("fixtures/forward_references.relon"),
         ];
         files.retain(|file| {
             let rel_path = file.strip_prefix(root).unwrap();

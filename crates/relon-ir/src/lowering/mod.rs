@@ -1400,6 +1400,13 @@ struct AnonDictPlan {
     /// walker iterates these to decide whether to emit a closure
     /// let-binding (no host-visible field) or a normal record store.
     fields: Vec<AnonDictField>,
+    /// R13: indices into `fields` giving the topological order the body
+    /// walker must emit them in, so a `&sibling` / `&root` reference (to
+    /// an earlier *or* later declared sibling) sees its target field's
+    /// let already bound. For backward-only / reference-free bodies this
+    /// is `0..fields.len()` (declaration order), preserving the
+    /// pre-existing byte-for-byte compiled output.
+    emit_order: Vec<usize>,
 }
 
 /// One classified entry from [`AnonDictPlan::fields`]. The walker
@@ -1644,21 +1651,39 @@ fn anon_dict_return_plan(
         }
     }
 
-    let mut fields: Vec<AnonDictField> = Vec::with_capacity(pairs.len());
+    // R13: reference-aware emit order. Fields are classified (and later
+    // lowered) in topological order over their `&sibling` / `&root`
+    // reference edges so a forward reference sees its target already
+    // bound; a reference cycle surfaces here as a loud error aligned
+    // with the tree-walk oracle's `CircularReference`. Backward-only /
+    // reference-free bodies reproduce declaration order exactly, so the
+    // pre-existing compiled output stays byte-for-byte identical. The
+    // `#main` param name set drives the forward-reference oracle-
+    // agreement gate (a forward ref into a reference-bearing field whose
+    // component reads a param diverges from the tree-walk oracle).
+    let main_param_names: HashSet<&str> = sig.params.iter().map(|p| p.name.as_str()).collect();
+    let emit_order = anon_dict_emit_order(pairs, &main_param_names, root.range)?;
+
+    // Classified entries indexed by *declaration* position so the
+    // synthesised return schema (and its layout) keeps declaration
+    // order regardless of the classification order. `None` marks a
+    // dropped `#internal` scalar field.
+    let mut fields_by_decl: Vec<Option<AnonDictField>> = vec![None; pairs.len()];
     let mut closure_field_sigs: HashMap<&str, (Vec<IrType>, IrType)> = HashMap::new();
     // W5-P3: `{String -> Int}` dict fields seen so far, so a later
     // sibling field's `d[k]` index classifies to the dict's `Int`
     // value type. Source order makes `d` visible before `result`.
     let mut dict_field_names: HashSet<&str> = HashSet::new();
-    // R10: host-visible scalar fields classified so far, name -> IR
-    // type, in source declaration order. A backward `&sibling.<name>`
-    // (or entry-level `&root.<name>`, which is the same — the entry
-    // dict IS the root) classifies to the earlier field's scalar type.
-    // Source order is what makes "backward" well-defined; a forward
-    // reference simply isn't in the map yet and caps cleanly.
+    // R10/R13: host-visible scalar / list fields classified so far,
+    // name -> IR type. A `&sibling.<name>` (or entry-level
+    // `&root.<name>`, which is the same — the entry dict IS the root)
+    // classifies to the target field's type. Topological classification
+    // order guarantees the target is in this map before the reference is
+    // classified, for both backward and forward references.
     let mut scalar_field_irts: HashMap<&str, IrType> = HashMap::new();
 
-    for (key, value) in pairs {
+    for &decl_idx in &emit_order {
+        let (key, value) = &pairs[decl_idx];
         let TokenKey::String(name, _, _) = key else {
             return Err(cap!(
                 "anon_dict_return_plan.unsupported_expr",
@@ -1714,7 +1739,7 @@ fn anon_dict_return_plan(
                 // surface (`(k) => k < 2 ? k : fib(k-1) + fib(k-2)`).
                 let ret_ty = IrType::I64;
                 closure_field_sigs.insert(name.as_str(), (param_irts.clone(), ret_ty));
-                fields.push(AnonDictField::Closure {
+                fields_by_decl[decl_idx] = Some(AnonDictField::Closure {
                     name: name.clone(),
                     param_tys: param_irts,
                     ret_ty,
@@ -1744,7 +1769,7 @@ fn anon_dict_return_plan(
                 }
                 let entries = classify_anon_dict_str_int_field(inner_pairs, value.range, name)?;
                 dict_field_names.insert(name.as_str());
-                fields.push(AnonDictField::DictStrInt {
+                fields_by_decl[decl_idx] = Some(AnonDictField::DictStrInt {
                     name: name.clone(),
                     entries,
                 });
@@ -1758,7 +1783,7 @@ fn anon_dict_return_plan(
                     // accepted; any other element surfaces UnsupportedExpr
                     // so the edge stays honest.
                     let elements = classify_anon_dict_list_string_field(items, value.range, name)?;
-                    fields.push(AnonDictField::ListString {
+                    fields_by_decl[decl_idx] = Some(AnonDictField::ListString {
                         name: name.clone(),
                         elements,
                     });
@@ -1778,7 +1803,13 @@ fn anon_dict_return_plan(
                         resolver,
                         &param_tys,
                     )?;
-                    fields.push(AnonDictField::Scalar {
+                    // R13: register the list field's IR type so a sibling
+                    // `&sibling.<name>` / `&root.<name>` reference (forward
+                    // or backward) resolves to the same `List<...>` type.
+                    if let Ok(irt) = type_repr_to_ir_type(&list_ty) {
+                        scalar_field_irts.insert(name.as_str(), irt);
+                    }
+                    fields_by_decl[decl_idx] = Some(AnonDictField::Scalar {
                         name: name.clone(),
                         ty: list_ty,
                     });
@@ -1808,7 +1839,7 @@ fn anon_dict_return_plan(
                 let ty = anon_dict_cross_region_param_list(path, &param_canonicals)
                     .expect("guarded by the match arm guard")
                     .clone();
-                fields.push(AnonDictField::CrossRegionParamList {
+                fields_by_decl[decl_idx] = Some(AnonDictField::CrossRegionParamList {
                     name: name.clone(),
                     ty,
                 });
@@ -1838,13 +1869,37 @@ fn anon_dict_return_plan(
                 if let Ok(irt) = type_repr_to_ir_type(&ty) {
                     scalar_field_irts.insert(name.as_str(), irt);
                 }
-                fields.push(AnonDictField::Scalar {
+                fields_by_decl[decl_idx] = Some(AnonDictField::Scalar {
                     name: name.clone(),
                     ty,
                 });
             }
         }
     }
+
+    // Collapse the declaration-indexed slots into the declaration-order
+    // field list (dropped `#internal` scalar slots stay `None`). The
+    // schema / layout below is built from this declaration-ordered list,
+    // so record offsets are independent of the topological emit order.
+    // `decl_to_field` maps each surviving declaration index to its
+    // position in `fields` so the topological `emit_order` (in
+    // declaration indices) can be re-expressed in `fields` indices for
+    // the body walker.
+    let mut fields: Vec<AnonDictField> = Vec::with_capacity(pairs.len());
+    let mut decl_to_field: Vec<Option<usize>> = vec![None; pairs.len()];
+    for (decl_idx, slot) in fields_by_decl.into_iter().enumerate() {
+        if let Some(field) = slot {
+            decl_to_field[decl_idx] = Some(fields.len());
+            fields.push(field);
+        }
+    }
+    // Body-walker emit order over `fields` indices: walk the declaration
+    // indices in topological order, keeping only those that survived as
+    // host-visible / let-bound fields.
+    let field_emit_order: Vec<usize> = emit_order
+        .iter()
+        .filter_map(|&decl_idx| decl_to_field[decl_idx])
+        .collect();
 
     // Build the host-visible schema from the scalar entries only.
     let schema_fields: Vec<Field> = fields
@@ -1875,7 +1930,303 @@ fn anon_dict_return_plan(
         fields: schema_fields,
         is_tuple: false,
     };
-    Ok(Some(AnonDictPlan { schema, fields }))
+    Ok(Some(AnonDictPlan {
+        schema,
+        fields,
+        emit_order: field_emit_order,
+    }))
+}
+
+/// Collect the host-visible sibling fields a value expression
+/// references through a single-segment `&sibling.<name>` / `&root.<name>`
+/// reference, restricted to names present in `field_names`. Used to
+/// build the anon-Dict-return field dependency graph so forward
+/// references can be emitted after their targets and reference cycles
+/// surface as a loud `CircularReference`-aligned error.
+///
+/// Only the reference shape the compiled path lowers contributes an
+/// edge: positional/runtime bases, dynamic keys, multi-segment paths
+/// and bare `Variable` heads (which name `#main` params, not fields) are
+/// deliberately ignored here — they are handled (or capped) elsewhere.
+fn collect_anon_dict_ref_edges<'a>(
+    expr: &'a Expr,
+    field_names: &HashSet<&'a str>,
+    out: &mut Vec<&'a str>,
+) {
+    match expr {
+        Expr::Reference {
+            base: RefBase::Sibling | RefBase::Root,
+            path,
+        } => {
+            if let [TokenKey::String(name, _, _)] = path.as_slice() {
+                let n = name.as_str();
+                if field_names.contains(n) && !out.contains(&n) {
+                    out.push(n);
+                }
+            }
+        }
+        Expr::Binary(_, a, b) => {
+            collect_anon_dict_ref_edges(&a.expr, field_names, out);
+            collect_anon_dict_ref_edges(&b.expr, field_names, out);
+        }
+        Expr::Unary(_, inner) => collect_anon_dict_ref_edges(&inner.expr, field_names, out),
+        Expr::Ternary { cond, then, els } => {
+            collect_anon_dict_ref_edges(&cond.expr, field_names, out);
+            collect_anon_dict_ref_edges(&then.expr, field_names, out);
+            collect_anon_dict_ref_edges(&els.expr, field_names, out);
+        }
+        Expr::List(items) => {
+            for n in items {
+                collect_anon_dict_ref_edges(&n.expr, field_names, out);
+            }
+        }
+        Expr::FnCall { args, .. } => {
+            for a in args {
+                collect_anon_dict_ref_edges(&a.value.expr, field_names, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// True when `expr` reads a `#main` parameter through a bare
+/// single-segment `Variable([param])`. Walks the same expression shapes
+/// the anon-Dict-return scalar / list classifier understands. Used by
+/// the forward-reference oracle-agreement gate in [`anon_dict_emit_order`].
+fn expr_reads_main_param(expr: &Expr, main_param_names: &HashSet<&str>) -> bool {
+    match expr {
+        Expr::Variable(path) => {
+            matches!(path.as_slice(), [TokenKey::String(name, _, _)]
+                if main_param_names.contains(name.as_str()))
+                // A `d[k]` style index still reads its head identifier;
+                // treat any leading param identifier as a param read.
+                || matches!(path.first(), Some(TokenKey::String(name, _, _))
+                    if main_param_names.contains(name.as_str()))
+        }
+        Expr::Binary(_, a, b) => {
+            expr_reads_main_param(&a.expr, main_param_names)
+                || expr_reads_main_param(&b.expr, main_param_names)
+        }
+        Expr::Unary(_, inner) => expr_reads_main_param(&inner.expr, main_param_names),
+        Expr::Ternary { cond, then, els } => {
+            expr_reads_main_param(&cond.expr, main_param_names)
+                || expr_reads_main_param(&then.expr, main_param_names)
+                || expr_reads_main_param(&els.expr, main_param_names)
+        }
+        Expr::List(items) => items
+            .iter()
+            .any(|n| expr_reads_main_param(&n.expr, main_param_names)),
+        Expr::FnCall { args, .. } => args
+            .iter()
+            .any(|a| expr_reads_main_param(&a.value.expr, main_param_names)),
+        _ => false,
+    }
+}
+
+/// Connected-component labelling of the undirected anon-Dict reference
+/// graph (`field_refs[i]` = the sibling fields field `i` references).
+/// Returns a component id per field. Used by the forward-reference
+/// oracle-agreement gate so a reference whose component reads a `#main`
+/// parameter can be distinguished from a fully param-free one.
+fn anon_dict_ref_components(n: usize, field_refs: &[Vec<usize>]) -> Vec<usize> {
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        let mut root = x;
+        while parent[root] != root {
+            root = parent[root];
+        }
+        // Path compression.
+        let mut cur = x;
+        while parent[cur] != root {
+            let next = parent[cur];
+            parent[cur] = root;
+            cur = next;
+        }
+        root
+    }
+    for (i, refs) in field_refs.iter().enumerate() {
+        for &j in refs {
+            let ri = find(&mut parent, i);
+            let rj = find(&mut parent, j);
+            if ri != rj {
+                parent[ri] = rj;
+            }
+        }
+    }
+    (0..n).map(|i| find(&mut parent, i)).collect()
+}
+
+/// Decide the order in which the anon-Dict-return body fields must be
+/// classified / emitted so that a `&sibling.<name>` / `&root.<name>`
+/// reference always sees its target field already bound — regardless of
+/// whether the target is declared earlier (backward) or later (forward)
+/// in source.
+///
+/// `pairs` are the source dict entries in declaration order. The
+/// returned vector is a permutation of `0..pairs.len()` (the topological
+/// order over the reference-edge graph). A field `i` that references a
+/// sibling field `j` produces edge `j → i` (j must be ready first), so
+/// Kahn's algorithm emits `j` before `i`.
+///
+/// The ready queue is drained in ascending declaration index so that a
+/// graph with **only backward edges** (every reference targets an
+/// earlier field) yields the identity order `0,1,2,…` — preserving the
+/// byte-for-byte output of the pre-existing source-ordered lowering. A
+/// forward reference is the only thing that perturbs the order.
+///
+/// A reference cycle (`x: &sibling.y, y: &sibling.x`, or a self
+/// reference `x: &sibling.x`) leaves Kahn unable to drain the graph and
+/// surfaces as [`LoweringError::CyclicFieldDependency`] — the compiled
+/// path's loud analogue of the tree-walk oracle's `CircularReference`.
+fn anon_dict_emit_order(
+    pairs: &[(TokenKey, Node)],
+    main_param_names: &HashSet<&str>,
+    range: TokenRange,
+) -> Result<Vec<usize>, LoweringError> {
+    let n = pairs.len();
+    let mut name_to_idx: HashMap<&str, usize> = HashMap::with_capacity(n);
+    for (i, (key, _)) in pairs.iter().enumerate() {
+        if let TokenKey::String(name, _, _) = key {
+            // First declaration wins for duplicate keys; the dict
+            // builder rejects genuine duplicates elsewhere, and using
+            // the first keeps edge resolution deterministic.
+            name_to_idx.entry(name.as_str()).or_insert(i);
+        }
+    }
+    let field_names: HashSet<&str> = name_to_idx.keys().copied().collect();
+
+    let mut incoming = vec![0usize; n];
+    let mut outgoing: Vec<Vec<usize>> = vec![Vec::new(); n];
+    // Per-field: reference-bearing (references some sibling), reads a
+    // `#main` param directly, and the sibling fields it references (by
+    // declaration index). Used by the forward-reference oracle-agreement
+    // gate below.
+    let mut is_ref_bearing = vec![false; n];
+    let mut reads_param = vec![false; n];
+    let mut field_refs: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, (_, value)) in pairs.iter().enumerate() {
+        reads_param[i] = expr_reads_main_param(&value.expr, main_param_names);
+        let mut refs: Vec<&str> = Vec::new();
+        collect_anon_dict_ref_edges(&value.expr, &field_names, &mut refs);
+        is_ref_bearing[i] = !refs.is_empty();
+        for r in refs {
+            // edge target → this field; skip a self edge so a field that
+            // references its own name still surfaces as a cycle (Kahn
+            // counts the incoming edge and never drains it).
+            if let Some(&j) = name_to_idx.get(r) {
+                outgoing[j].push(i);
+                incoming[i] += 1;
+                field_refs[i].push(j);
+            }
+        }
+    }
+
+    // Forward-reference oracle-agreement gate.
+    //
+    // The tree-walk oracle resolves anon-Dict field references lazily.
+    // A *forward* reference (a field referencing a later-declared
+    // sibling) forces the target field's thunk; when that target is
+    // itself reference-bearing and its connected reference component
+    // reaches a `#main` parameter, the oracle forces it under a scope
+    // that has lost the `#main` parameter frame and raises
+    // `variable_not_found`. The compiled path *can* evaluate it, but
+    // emitting a value where the reference oracle errors would be a
+    // silent divergence — so we cap that exact shape loudly. Forward
+    // references whose target is a non-reference leaf (`x: a + b`), and
+    // reference chains whose whole connected component is `#main`-param-
+    // free, both resolve consistently four-way and are admitted.
+    let component = anon_dict_ref_components(n, &field_refs);
+    let mut component_reads_param: HashSet<usize> = HashSet::new();
+    for (i, &reads) in reads_param.iter().enumerate() {
+        if reads {
+            component_reads_param.insert(component[i]);
+        }
+    }
+    for (i, refs) in field_refs.iter().enumerate() {
+        for &j in refs {
+            // forward reference: the target is declared after the
+            // referencing field.
+            if j > i && is_ref_bearing[j] && component_reads_param.contains(&component[i]) {
+                let (fname, frange) = match &pairs[i].0 {
+                    TokenKey::String(s, r, _) => (s.clone(), *r),
+                    other => (format!("{other:?}"), range),
+                };
+                return Err(cap!(
+                    "anon_dict_emit_order.forward_ref_through_param",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "AnonDictReturn(field `{}`: forward reference into a reference-bearing \
+                             field whose component reads a `#main` parameter — the tree-walk \
+                             oracle cannot resolve this shape consistently)",
+                            fname
+                        ),
+                        range: frange,
+                    }
+                ));
+            }
+        }
+    }
+
+    // Kahn's algorithm with an ascending-index ready set so backward-only
+    // graphs reproduce declaration order exactly.
+    let mut ready: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for (i, &deg) in incoming.iter().enumerate() {
+        if deg == 0 {
+            ready.insert(i);
+        }
+    }
+    let mut order: Vec<usize> = Vec::with_capacity(n);
+    while let Some(&i) = ready.iter().next() {
+        ready.remove(&i);
+        order.push(i);
+        for &j in &outgoing[i] {
+            incoming[j] -= 1;
+            if incoming[j] == 0 {
+                ready.insert(j);
+            }
+        }
+    }
+    if order.len() != n {
+        let cycle = find_anon_dict_ref_cycle(pairs, &outgoing, &incoming);
+        return Err(cap!(
+            "anon_dict_emit_order.cyclic_field_dependency",
+            LoweringError::CyclicFieldDependency {
+                schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+                cycle,
+                range,
+            }
+        ));
+    }
+    Ok(order)
+}
+
+/// Build a representative reference-cycle path (field names, first name
+/// repeated at the end) for the anon-Dict-return diagnostic. The caller
+/// has already proven a cycle exists (Kahn could not drain the graph).
+fn find_anon_dict_ref_cycle(
+    pairs: &[(TokenKey, Node)],
+    outgoing: &[Vec<usize>],
+    incoming: &[usize],
+) -> Vec<String> {
+    let n = outgoing.len();
+    let field_name = |i: usize| match &pairs[i].0 {
+        TokenKey::String(name, _, _) => name.clone(),
+        other => format!("{other:?}"),
+    };
+    let mut visited = vec![false; n];
+    let mut on_stack = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    for start in 0..n {
+        if visited[start] || incoming[start] == 0 {
+            continue;
+        }
+        if let Some(cycle) =
+            dfs_find_cycle(start, outgoing, &mut visited, &mut on_stack, &mut stack)
+        {
+            return cycle.into_iter().map(field_name).collect();
+        }
+    }
+    Vec::new()
 }
 
 /// True when `t` is a single-segment `Dict` with no generic
@@ -2438,14 +2789,17 @@ fn classify_anon_dict_scalar_field_irt(
         Expr::Float(_) => Ok(IrType::F64),
         Expr::Bool(_) => Ok(IrType::Bool),
         Expr::String(_) => Ok(IrType::String),
-        // R10: a backward static sibling/root reference to an earlier
-        // scalar field. At the entry-level dict (which IS the document
-        // root) `&sibling.<name>` and `&root.<name>` resolve to the
-        // same field, so both bases classify here. Only a single static
-        // `String` trailing segment naming an already-classified
-        // host-visible scalar field is accepted; positional bases
-        // (Uncle/Prev/Next/Index/This), forward names, dynamic keys and
-        // multi-segment paths fall through to the loud cap below.
+        // R10/R13: a static sibling/root reference to another
+        // host-visible field. At the entry-level dict (which IS the
+        // document root) `&sibling.<name>` and `&root.<name>` resolve to
+        // the same field, so both bases classify here. Classification
+        // runs in topological order over the reference edges, so the
+        // target field's type is in `scalar_field_irts` whether it is
+        // declared earlier (backward) or later (forward). Only a single
+        // static `String` trailing segment naming a host-visible scalar
+        // *or list* field is accepted; positional bases
+        // (Uncle/Prev/Next/Index/This), dynamic keys and multi-segment
+        // paths fall through to the loud cap below.
         Expr::Reference {
             base: RefBase::Sibling | RefBase::Root,
             path,
@@ -2459,8 +2813,8 @@ fn classify_anon_dict_scalar_field_irt(
                 "classify_anon_dict_scalar_field_irt.reference_unresolved",
                 LoweringError::UnsupportedExpr {
                     kind: format!(
-                        "AnonDictReturn(field `{}`: backward sibling/root reference {:?} \
-                         does not name an earlier host-visible scalar field)",
+                        "AnonDictReturn(field `{}`: sibling/root reference {:?} \
+                         does not name a host-visible field)",
                         field_name, path
                     ),
                     range,
@@ -2582,17 +2936,29 @@ fn classify_anon_dict_scalar_field_irt(
     }
 }
 
-/// Reverse of `type_repr_to_ir_type` for the scalar / String cases
-/// needed by [`anon_dict_return_plan`]. Returns `None` for IR types
-/// that have no anon-Dict-return canonical form (lists, schemas,
-/// unit, closure).
+/// Reverse of `type_repr_to_ir_type` for the host-visible anon-Dict
+/// field types. Covers the scalar / String leaves plus the marshalled
+/// scalar-element list types — the latter so a `&sibling.<list>` /
+/// `&root.<list>` reference field classifies to the same `List<...>`
+/// type as the field it aliases. Returns `None` for IR types that have
+/// no anon-Dict-return canonical form (schemas, cross-region pointer
+/// lists, closures, dicts).
 fn ir_type_to_type_repr(t: IrType) -> Option<TypeRepr> {
+    let list = |element: TypeRepr| {
+        Some(TypeRepr::List {
+            element: Box::new(element),
+        })
+    };
     match t {
         IrType::I64 => Some(TypeRepr::Int),
         IrType::F64 => Some(TypeRepr::Float),
         IrType::Bool => Some(TypeRepr::Bool),
         IrType::String => Some(TypeRepr::String),
         IrType::Unit => Some(TypeRepr::Unit),
+        IrType::ListInt => list(TypeRepr::Int),
+        IrType::ListFloat => list(TypeRepr::Float),
+        IrType::ListBool => list(TypeRepr::Bool),
+        IrType::ListString => list(TypeRepr::String),
         _ => None,
     }
 }
@@ -2622,13 +2988,20 @@ fn lower_anon_dict_body(
         }
     }
 
-    // Index plan-scalar fields against the layout (which only sees
-    // those scalar entries). Layout walks `schema.fields` in
-    // declaration order so the i-th scalar plan field maps to the
-    // i-th layout field.
-    let mut scalar_layout_idx: usize = 0;
+    // Resolve each host-visible scalar / cross-region field's layout
+    // slot by name. The layout walks `schema.fields` in declaration
+    // order; looking the slot up by name (rather than a running index)
+    // lets the body walker emit fields in topological order — needed so
+    // a forward `&sibling` / `&root` reference's target field is already
+    // bound — without disturbing the record offset each value stores to.
+    let layout_field_by_name = |name: &str| layout.fields.iter().find(|f| f.name == name);
 
-    for plan_field in &plan.fields {
+    // R13: emit fields in topological order over their reference edges
+    // (see `AnonDictPlan::emit_order`). Backward-only / reference-free
+    // bodies keep declaration order, so the pre-existing byte output is
+    // unchanged.
+    for &field_idx in &plan.emit_order {
+        let plan_field = &plan.fields[field_idx];
         match plan_field {
             AnonDictField::Closure {
                 name,
@@ -2857,12 +3230,12 @@ fn lower_anon_dict_body(
                     },
                     range: value.range,
                 });
-                let layout_field = layout.fields.get(scalar_layout_idx).ok_or_else(|| {
+                let layout_field = layout_field_by_name(name).ok_or_else(|| {
                     cap!(
                         "lower_anon_dict_body.unsupported_expr.5",
                         LoweringError::UnsupportedExpr {
                             kind: format!(
-                                "AnonDictReturn(scalar field `{}`: layout index out of range)",
+                                "AnonDictReturn(scalar field `{}`: no matching layout slot)",
                                 name
                             ),
                             range: value.range,
@@ -2902,7 +3275,6 @@ fn lower_anon_dict_body(
                     },
                     range: value.range,
                 });
-                scalar_layout_idx += 1;
             }
             AnonDictField::CrossRegionParamList { name, ty, .. } => {
                 // F1b: cross-region object field. The value is a `#main`
@@ -2984,14 +3356,14 @@ fn lower_anon_dict_body(
                         }
                     ));
                 }
-                let layout_field = layout.fields.get(scalar_layout_idx).ok_or_else(|| {
+                let layout_field = layout_field_by_name(name).ok_or_else(|| {
                     cap!(
                         "lower_anon_dict_body.unsupported_expr.8",
                         LoweringError::UnsupportedExpr {
                             kind: format!(
-                            "AnonDictReturn(cross-region field `{}`: layout index out of range)",
-                            name
-                        ),
+                                "AnonDictReturn(cross-region field `{}`: no matching layout slot)",
+                                name
+                            ),
                             range: value.range,
                         }
                     )
@@ -3008,7 +3380,6 @@ fn lower_anon_dict_body(
                     },
                     range: value.range,
                 });
-                scalar_layout_idx += 1;
             }
         }
     }
@@ -11433,10 +11804,15 @@ fn lower_reference(
             ));
         }
     };
-    // Backward-only: the named field must already be bound as a let
-    // (declared earlier in source order). Inline a scalar-const let to
-    // the literal exactly as `lower_variable` does so all backends fold
-    // an identical compile-time value; otherwise emit the `LetGet`.
+    // R13: the named field must be bound as a let. The body walker emits
+    // anon-Dict fields in topological order over their reference edges,
+    // so a `&sibling` / `&root` reference's target field — declared
+    // earlier (backward) *or* later (forward) in source — is already
+    // registered as a let by the time this reference lowers. Inline a
+    // scalar-const let to the literal exactly as `lower_variable` does so
+    // all backends fold an identical compile-time value; otherwise emit
+    // the `LetGet`. A reference cycle never reaches here: it is rejected
+    // up front in `anon_dict_emit_order`.
     if let Some(b) = ctx.lets.iter().rev().find(|b| b.name == name).cloned() {
         if let Some(sc) = ctx.const_let_values.get(&b.idx).copied() {
             let (op, ty) = match sc {
@@ -11458,8 +11834,11 @@ fn lower_reference(
         ctx.tstack.push(b.ty);
         return Ok(());
     }
+    // The name binds to no in-scope let. On this surface that means a
+    // reference to an `#internal` sibling (dropped from the compiled
+    // plan) or to a name that is not a host-visible sibling field at all.
     Err(cap!(
-        "lower_reference.unresolved_backward_field",
+        "lower_reference.unresolved_field",
         LoweringError::UnresolvedVariable {
             name: name.to_string(),
             range,

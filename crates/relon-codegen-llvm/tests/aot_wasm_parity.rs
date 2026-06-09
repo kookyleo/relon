@@ -1177,6 +1177,163 @@ fn r10b_strict_sibling_root_backward_aligns_native_via_wasmtime() {
     assert_eq!(out.get("z"), Some(&Decoded::Int(want_z)), "r10b field z");
 }
 
+/// Wave R13 — FORWARD `&sibling` / `&root` field references on the
+/// anon-Dict-return path run on wasm32. R13 emits the dict fields in
+/// topological order over their reference edges, so a field reading a
+/// *later*-declared sibling (`y: &sibling.x` with `x` declared after)
+/// has its target's let bound before the reference lowers. Covers the
+/// scalar-Int forward-to-leaf shape plus a transitive forward chain over
+/// a param-free component, a forward String reference, and a forward
+/// List<Int> reference. Verified byte-equal on the wasm32 leg against the
+/// LLVM native oracle (itself bit-aligned to tree-walk + cranelift via
+/// the `r13_*` corpus). The reference-in-dict-field surface is `#relaxed`.
+#[test]
+fn r13_forward_ref_aligns_native_via_wasmtime() {
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping r13 forward refs");
+        return;
+    }
+    // Forward-to-leaf: `y` reads later `x`, `x: a + b` is a non-ref leaf.
+    let src = "#relaxed\n#main(Int a, Int b) -> Dict\n{ y: &sibling.x * 2, x: a + b }";
+    let (a, b) = (40i64, 2i64);
+    let dict = match native_run(
+        src,
+        HashMap::from([
+            ("a".to_string(), Value::Int(a)),
+            ("b".to_string(), Value::Int(b)),
+        ]),
+    ) {
+        Value::Dict(d) => d,
+        other => panic!("native expected Dict, got {other:?}"),
+    };
+    let want = |k: &str| match dict.map.get(k) {
+        Some(Value::Int(v)) => *v,
+        other => panic!("{k} not Int: {other:?}"),
+    };
+    let (want_x, want_y) = (want("x"), want("y"));
+    // Oracle sanity: x = a+b = 42, y = x*2 = 84.
+    assert_eq!((want_x, want_y), (42, 84), "r13 oracle drifted");
+
+    let (bytes, info) = build("r13_forward_ref", src);
+    let mut in_record = vec![0u8; info.main_root_size as usize];
+    for f in &info.main_fields {
+        let off = f.offset as usize;
+        let v = match f.name.as_str() {
+            "a" => a,
+            "b" => b,
+            other => panic!("unexpected main field {other}"),
+        };
+        in_record[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    let out = run_buffer(&bytes, "relon_parity_r13_forward_ref", &info, &in_record);
+    assert_eq!(out.get("x"), Some(&Decoded::Int(want_x)), "r13 field x");
+    assert_eq!(out.get("y"), Some(&Decoded::Int(want_y)), "r13 field y");
+}
+
+/// Wave R13 — forward String reference: `greeting: &sibling.name` reads a
+/// later-declared `name: "hello"`. Confirms the topological emit order
+/// binds the pointer-indirect String field's let before the forward
+/// reference re-loads and tail-copies it, byte-equal wasm vs native.
+#[test]
+fn r13_forward_string_ref_aligns_native_via_wasmtime() {
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping r13 forward String ref");
+        return;
+    }
+    let src = "#relaxed\n#main(Int a) -> Dict\n{ greeting: &sibling.name, name: \"hello\" }";
+    let dict = match native_run(src, HashMap::from([("a".to_string(), Value::Int(1))])) {
+        Value::Dict(d) => d,
+        other => panic!("native expected Dict, got {other:?}"),
+    };
+    let want = |k: &str| match dict.map.get(k) {
+        Some(Value::String(s)) => s.to_string(),
+        other => panic!("{k} not String: {other:?}"),
+    };
+    let (want_g, want_n) = (want("greeting"), want("name"));
+    assert_eq!((want_g.as_str(), want_n.as_str()), ("hello", "hello"));
+
+    let (bytes, info) = build("r13_forward_string_ref", src);
+    let mut in_record = vec![0u8; info.main_root_size as usize];
+    for f in &info.main_fields {
+        let off = f.offset as usize;
+        if f.name == "a" {
+            in_record[off..off + 8].copy_from_slice(&1i64.to_le_bytes());
+        }
+    }
+    let out = run_buffer(
+        &bytes,
+        "relon_parity_r13_forward_string_ref",
+        &info,
+        &in_record,
+    );
+    assert_eq!(
+        out.get("greeting"),
+        Some(&Decoded::Str(want_g)),
+        "r13 field greeting"
+    );
+    assert_eq!(
+        out.get("name"),
+        Some(&Decoded::Str(want_n)),
+        "r13 field name"
+    );
+}
+
+/// Wave R13 — forward List<Int> reference: `alias: &sibling.items` reads
+/// a later-declared `items: [1, 2, 3]`. Confirms the topological emit
+/// order binds the const-pool list field's let before the forward
+/// reference re-loads its address and tail-copies the block, byte-equal
+/// wasm vs native.
+#[test]
+fn r13_forward_list_ref_aligns_native_via_wasmtime() {
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping r13 forward List ref");
+        return;
+    }
+    let src = "#relaxed\n#main(Int a) -> Dict\n{ alias: &sibling.items, items: [1, 2, 3] }";
+    let dict = match native_run(src, HashMap::from([("a".to_string(), Value::Int(1))])) {
+        Value::Dict(d) => d,
+        other => panic!("native expected Dict, got {other:?}"),
+    };
+    let want = |k: &str| match dict.map.get(k) {
+        Some(Value::List(items)) => items
+            .iter()
+            .map(|v| match v {
+                Value::Int(i) => *i,
+                other => panic!("list elem not Int: {other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        other => panic!("{k} not List: {other:?}"),
+    };
+    let (want_alias, want_items) = (want("alias"), want("items"));
+    assert_eq!(want_alias, vec![1, 2, 3]);
+    assert_eq!(want_items, vec![1, 2, 3]);
+
+    let (bytes, info) = build("r13_forward_list_ref", src);
+    let mut in_record = vec![0u8; info.main_root_size as usize];
+    for f in &info.main_fields {
+        let off = f.offset as usize;
+        if f.name == "a" {
+            in_record[off..off + 8].copy_from_slice(&1i64.to_le_bytes());
+        }
+    }
+    let out = run_buffer(
+        &bytes,
+        "relon_parity_r13_forward_list_ref",
+        &info,
+        &in_record,
+    );
+    assert_eq!(
+        out.get("alias"),
+        Some(&Decoded::ListInt(want_alias)),
+        "r13 field alias"
+    );
+    assert_eq!(
+        out.get("items"),
+        Some(&Decoded::ListInt(want_items)),
+        "r13 field items"
+    );
+}
+
 /// Wave R11 — field decorators on the anon-Dict-return path run on
 /// wasm32. A decorated field `@deco(args) k: v` desugars to the call
 /// `deco(v, args)` (value-first), and stacked decorators apply bottom-up

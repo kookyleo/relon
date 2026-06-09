@@ -40,25 +40,26 @@ impl<'a> Walker<'a> {
 
     pub(super) fn check_unresolved_ref(&mut self, node: &Node, base: &RefBase, path: &[TokenKey]) {
         if self.tree.references.contains_key(&node.id) {
-            // R10b: a single-segment, *backward* `&sibling.<name>` /
-            // entry-level `&root.<name>` derives its type from the target
-            // sibling/root field's static type (`infer::infer_reference`,
-            // which carries the base / single-segment / backward / cycle
-            // guards). When that derivation produces a concrete type, the
-            // reference is statically known — accept it and skip the
-            // base-blind strict-path walk that would otherwise refuse a
-            // context-dependent target value (`x: a + b`).
+            // R10b/R13: a single-segment `&sibling.<name>` / entry-level
+            // `&root.<name>` derives its type from the target sibling/root
+            // field's static type (`infer::infer_reference`, which carries
+            // the base / single-segment / self-ref / multi-field-cycle
+            // guards). R13 lifts the old backward-only restriction: the
+            // target may be declared earlier OR later in source, since the
+            // compiled path emits anon-Dict fields in topological order
+            // and forward references resolve four-way. When the derivation
+            // produces a concrete type, the reference is statically known
+            // — accept it and skip the base-blind strict-path walk that
+            // would otherwise refuse a context-dependent target value
+            // (`x: a + b`).
             //
-            // When `infer_reference` declines (forward / self ref,
+            // When `infer_reference` declines (self / multi-field cycle,
             // multi-segment, `&uncle` / `&this`, or a target whose value
             // genuinely can't be derived), we deliberately DON'T hard-
             // reject here — we fall through to the unchanged
-            // `check_strict_path`, preserving the pre-R10b behavior:
-            // forward refs to a self-contained (e.g. literal) target stay
-            // accepted (they run fine on tree-walk), while a forward ref
-            // whose target value needs the enclosing scope still surfaces
-            // `UnknownReferenceType` through the frame-reset lookup. So
-            // R10b strictly *adds* derivable cases; it removes none.
+            // `check_strict_path`, preserving prior behavior: a cyclic
+            // reference still surfaces `UnknownReferenceType` through the
+            // frame-reset lookup.
             if self.tree.strict_mode
                 && matches!(base, RefBase::Sibling | RefBase::Root)
                 && matches!(path, [TokenKey::String(_, _, _)])
