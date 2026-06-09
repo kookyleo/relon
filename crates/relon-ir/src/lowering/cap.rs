@@ -258,6 +258,7 @@ pub const LOWERING_CAP_IDS: &[&str] = &[
     "emit_list_int_fold_call.unsupported_expr.2",
     "lower_comprehension.unsupported_expr.1",
     "lower_comprehension.unsupported_expr.2",
+    "lower_comprehension.unsupported_expr.3",
     "lower_comprehension.unknown_stdlib_method.1",
     "lower_comprehension.unknown_stdlib_method.2",
     "try_lower_list_sum_value.unknown_stdlib_method.1",

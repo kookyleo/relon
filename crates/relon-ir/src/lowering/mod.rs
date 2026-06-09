@@ -3323,6 +3323,18 @@ fn pointer_array_param_identity_walk(expr: &Expr) -> bool {
 /// selects a String-result body, so a `map` returning a numeric list never
 /// reaches here with a `ListString` return type).
 fn string_result_list_hof_call(expr: &Expr) -> bool {
+    // A list comprehension `[ element for id in src (if cond)? ]` desugars
+    // in `lower_comprehension` onto the same `list_*_map` bundled body the
+    // method / free forms use, so a `List<String>` comprehension result is
+    // the same self-contained scratch pointer-array record (every `off_i`
+    // an arena-absolute String handle). The caller gates on
+    // `ret_ir_ty == IrType::ListString`, which a comprehension only reaches
+    // by lowering through a String-result map body — the numeric / inline
+    // shapes never produce a `ListString` return — so the in-place
+    // region-walk return ABI applies unchanged.
+    if matches!(expr, Expr::Comprehension { .. }) {
+        return true;
+    }
     let Expr::FnCall { path, .. } = expr else {
         return false;
     };
@@ -5946,8 +5958,8 @@ fn lower_fn_call(
 }
 
 /// Wave R3: lower a list comprehension `[ element for id in iterable
-/// (if condition)? ]` by desugaring onto the bundled `list_int_filter`
-/// then `list_int_map` higher-order bodies — the same machinery the
+/// (if condition)? ]` by desugaring onto the bundled `list_*_filter`
+/// then `list_*_map` higher-order bodies — the same machinery the
 /// `xs.filter(...)` / `xs.map(...)` method forms use.
 ///
 /// Semantics (matched byte-exactly to the tree-walk `Expr::Comprehension`
@@ -5955,17 +5967,26 @@ fn lower_fn_call(
 /// order; when a `condition` is present, keep only the elements for which
 /// `condition` (evaluated with `id` bound to the element) is truthy; emit
 /// `element` (evaluated with `id` bound to the element) for each surviving
-/// element. Filter-then-map composes to exactly this: `list_int_filter`
-/// retains the passing source elements (unchanged), then `list_int_map`
+/// element. Filter-then-map composes to exactly this: the filter body
+/// retains the passing source elements (unchanged), then the map body
 /// computes `element` from each survivor.
 ///
 /// The loop variable `id` becomes the synthesised closure parameter, so
 /// any outer reference inside `condition` / `element` (a `#main` param, a
 /// where-bound value) resolves through the closure's free-variable
 /// capture path exactly as a hand-written `iterable.filter((id) =>
-/// condition).map((id) => element)` would. Only the `List<Int>` element
-/// shape is supported in the AOT envelope today (the bundled HOF bodies
-/// are i64-typed); other element shapes stay capped.
+/// condition).map((id) => element)` would.
+///
+/// Source-element coverage mirrors the method-form HOF emitter
+/// ([`peephole::emit_list_hof_call`]): `List<Int>` and `List<Float>`
+/// sources ride the 8-byte-slot numeric bodies; `List<String>` rides the
+/// 4-byte pointer-array bodies. The map body is selected from the
+/// closure's inferred return type so an element-type-changing map (e.g.
+/// `[float(x) for x in ints]` -> `list_int_map_to_float`) lowers four-way
+/// when a bundled cross-type body exists. A `List<String>` filter caps
+/// (no four-way `String -> Bool` predicate body, matching the method
+/// form), as does any source whose element type lacks bundled HOF bodies
+/// (e.g. `List<Bool>`).
 fn lower_comprehension(
     element: &Node,
     id: &str,
@@ -5974,28 +5995,37 @@ fn lower_comprehension(
     range: TokenRange,
     ctx: &mut LowerCtx<'_>,
 ) -> Result<(), LoweringError> {
-    // 1. Lower the iterable to a `List<Int>` handle. `range(n)`, a
-    //    where-bound list, a `#main` `List<Int>` param, and nested
-    //    comprehensions / map / filter results all land here as
-    //    `IrType::ListInt`.
+    // 1. Lower the iterable to a list handle. `range(n)`, a where-bound
+    //    list, a `#main` list param, and nested comprehensions / map /
+    //    filter results all land here. The element type drives body
+    //    selection: `ListInt`/`ListFloat` ride the 8-byte numeric bodies,
+    //    `ListString` rides the 4-byte pointer-array bodies.
     lower_expr(&iterable.expr, iterable.range, ctx)?;
     let src_ty = ctx.tstack.last().copied();
-    if src_ty != Some(IrType::ListInt) {
-        return Err(cap!(
-            "lower_comprehension.unsupported_expr.1",
-            LoweringError::UnsupportedExpr {
-                kind: format!(
-                    "comprehension iterable must be a List<Int> in the AOT envelope, got {:?}",
-                    src_ty
-                ),
-                range: iterable.range,
-            }
-        ));
-    }
+    let src_elem = match src_ty {
+        Some(IrType::ListInt) => IrType::I64,
+        Some(IrType::ListFloat) => IrType::F64,
+        Some(IrType::ListString) => IrType::String,
+        _ => {
+            return Err(cap!(
+                "lower_comprehension.unsupported_expr.1",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "comprehension iterable must be a List<Int>, List<Float>, or List<String> in the AOT envelope, got {:?}",
+                        src_ty
+                    ),
+                    range: iterable.range,
+                }
+            ));
+        }
+    };
 
     // Helper: synthesise a single-param closure `(id) => body` over the
     // loop variable and emit `Op::Call(<builtin>)` against a list source
-    // already sitting on top of the vstack.
+    // already sitting on top of the vstack. The bundled body's fixed
+    // closure signature is used directly — a body that doesn't match it is
+    // a loud error, not a fall-through (used for the filter pass, whose
+    // predicate signature is fixed `elem -> Bool`).
     fn emit_hof_with_synthetic_closure(
         builtin: &'static str,
         id: &str,
@@ -6060,12 +6090,160 @@ fn lower_comprehension(
         Ok(())
     }
 
-    // 2. Optional filter pass `(id) => condition`.
+    // 2. Optional filter pass `(id) => condition`. The filter retains the
+    //    passing source elements unchanged, so the body stays at the
+    //    source element type. `List<String>` filter caps (no four-way
+    //    `String -> Bool` predicate body), matching the method form.
     if let Some(cond) = condition {
-        emit_hof_with_synthetic_closure("list_int_filter", id, cond, range, ctx)?;
+        let filter_builtin = match src_elem {
+            IrType::I64 => "list_int_filter",
+            IrType::F64 => "list_float_filter",
+            _ => {
+                return Err(cap!(
+                    "lower_comprehension.unsupported_expr.2",
+                    LoweringError::UnsupportedExpr {
+                        kind: "filtered List<String> comprehension is not compiled yet".to_string(),
+                        range,
+                    }
+                ));
+            }
+        };
+        emit_hof_with_synthetic_closure(filter_builtin, id, cond, range, ctx)?;
     }
-    // 3. Map pass `(id) => element`.
-    emit_hof_with_synthetic_closure("list_int_map", id, element, range, ctx)?;
+
+    // 3. Map pass `(id) => element`. Probe the closure body against each
+    //    candidate result type for this source — homogeneous (src -> src)
+    //    first, then the cross-type widths — and select the matching
+    //    bundled body, exactly as `peephole::emit_list_hof_call`'s map arm
+    //    does. The candidates are mutually exclusive (the body yields one
+    //    result slot), so the first probe that accepts wins. A body that
+    //    matches no candidate caps loudly.
+    let map_candidates: &[(IrType, &'static str)] = match src_elem {
+        IrType::I64 => &[
+            (IrType::I64, "list_int_map"),
+            (IrType::F64, "list_int_map_to_float"),
+            (IrType::String, "list_int_map_to_string"),
+        ],
+        IrType::F64 => &[
+            (IrType::F64, "list_float_map"),
+            (IrType::I64, "list_float_map_to_int"),
+            (IrType::String, "list_float_map_to_string"),
+        ],
+        IrType::String => &[(IrType::String, "list_string_map")],
+        _ => unreachable!("src_elem is I64, F64, or String"),
+    };
+    let mut last_err: Option<LoweringError> = None;
+    for &(ret_ty, builtin) in map_candidates {
+        // Roll-back discipline mirrors `peephole::try_lower_closure_with_ret`:
+        // a body that produces a different result slot than `ret_ty` rolls
+        // back (out / tstack / next_let_idx / lambda_table) so the next
+        // candidate width is tried; any other error propagates.
+        let saved_out_len = ctx.out.len();
+        let saved_stack_len = ctx.tstack.len();
+        let saved_next_let = ctx.next_let_idx;
+        let saved_lambda_len = ctx.lambda_table.borrow().len();
+        match emit_map_with_ret(builtin, id, element, ret_ty, range, ctx) {
+            Ok(()) => return Ok(()),
+            Err(LoweringError::StdlibArgTypeMismatch { .. }) => {
+                ctx.out.truncate(saved_out_len);
+                ctx.tstack.truncate(saved_stack_len);
+                ctx.next_let_idx = saved_next_let;
+                ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+            }
+            Err(e) => {
+                last_err = Some(e);
+                ctx.out.truncate(saved_out_len);
+                ctx.tstack.truncate(saved_stack_len);
+                ctx.next_let_idx = saved_next_let;
+                ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+            }
+        }
+    }
+    // No candidate matched — cap loudly with the last concrete error (or a
+    // generic unsupported-element error when every candidate rolled back).
+    Err(last_err.unwrap_or_else(|| {
+        cap!(
+            "lower_comprehension.unsupported_expr.3",
+            LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "comprehension element type is not compiled yet for {:?} source",
+                    src_ty
+                ),
+                range,
+            }
+        )
+    }))
+}
+
+/// Map-pass helper for [`lower_comprehension`]: synthesise the
+/// single-param closure `(id) => element` with the closure return pinned
+/// to `ret_ty` (so the cross-type bundled bodies resolve), then emit
+/// `Op::Call(<builtin>)` against the source list already on the vstack.
+/// Returns `Err(StdlibArgTypeMismatch)` when the body produces a result
+/// slot other than `ret_ty`, which the caller treats as a probe miss.
+fn emit_map_with_ret(
+    builtin: &'static str,
+    id: &str,
+    body: &Node,
+    ret_ty: IrType,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    let fn_idx = stdlib_function_index(builtin).ok_or_else(|| {
+        cap!(
+            "lower_comprehension.unknown_stdlib_method.1",
+            LoweringError::UnknownStdlibMethod {
+                name: builtin.to_string(),
+                arity: 2,
+                range,
+            }
+        )
+    })?;
+    let meta = builtin_stdlib().get(fn_idx as usize).ok_or_else(|| {
+        cap!(
+            "lower_comprehension.unknown_stdlib_method.2",
+            LoweringError::UnknownStdlibMethod {
+                name: builtin.to_string(),
+                arity: 2,
+                range,
+            }
+        )
+    })?;
+    let params = meta.params.clone();
+    let ret = meta.ret;
+    let (param_tys_c, _ret_ty_c) = stdlib_closure_arg_signature(builtin, 1).ok_or_else(|| {
+        cap!(
+            "lower_comprehension.unsupported_expr.2",
+            LoweringError::UnsupportedExpr {
+                kind: format!("{builtin} closure signature missing"),
+                range,
+            }
+        )
+    })?;
+    let closure_expr = Expr::Closure {
+        params: vec![relon_parser::ClosureParam {
+            name: id.to_string(),
+            type_hint: None,
+            range: body.range,
+        }],
+        return_type: None,
+        body: body.clone(),
+    };
+    // Pin the closure return to the candidate `ret_ty` so a body whose
+    // result slot differs trips `StdlibArgTypeMismatch` (the probe miss).
+    lower_closure_as_value(&closure_expr, body.range, &param_tys_c, ret_ty, ctx)?;
+    ctx.tstack.pop(); // closure
+    ctx.tstack.pop(); // source list handle
+    ctx.out.push(TaggedOp {
+        op: Op::Call {
+            fn_index: fn_idx,
+            arg_count: 2,
+            param_tys: params,
+            ret_ty: ret,
+        },
+        range,
+    });
+    ctx.tstack.push(ret);
     Ok(())
 }
 
