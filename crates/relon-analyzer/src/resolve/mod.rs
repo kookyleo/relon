@@ -399,6 +399,25 @@ impl<'a> Walker<'a> {
                     self.visit(expr);
                 }
             }
+            Expr::Match { expr, arms } => {
+                self.visit(expr);
+                for (pat, body) in arms {
+                    self.visit(pat);
+                    if let Expr::VariantPattern { bindings, .. } = &*pat.expr {
+                        let mut frame = ScopeFrame::default();
+                        for binding in bindings {
+                            if let Some(name) = binding.binding.as_ref() {
+                                frame.closure_params.insert(name.clone(), body.id);
+                            }
+                        }
+                        self.scope_stack.push(frame);
+                        self.visit(body);
+                        self.scope_stack.pop();
+                    } else {
+                        self.visit(body);
+                    }
+                }
+            }
             Expr::Reference { base, path } => {
                 // List-iteration bases used outside a list / list-
                 // comprehension are statically wrong: `&prev / &next /

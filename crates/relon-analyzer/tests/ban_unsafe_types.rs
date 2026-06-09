@@ -1,5 +1,5 @@
 //! Integration tests for the bans on user-facing `Any` (v1.6) and on
-//! the bare-generic shorthand `List` / `Dict` / `Closure` / `Fn` / `Enum`
+//! the bare-generic shorthand `List` / `Dict` / `Closure` / `Fn`
 //! without explicit generic arguments (v1.7).
 
 use relon_analyzer::Diagnostic;

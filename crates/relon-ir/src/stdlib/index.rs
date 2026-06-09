@@ -162,6 +162,7 @@ pub fn stdlib_method_index(receiver_ty: IrType, name: &str) -> Option<u32> {
         (IrType::ListString, "map") => stdlib_function_index("list_string_map"),
         (IrType::ListSchema, "length") => stdlib_function_index("list_schema_length"),
         (IrType::ListList, "length") => stdlib_function_index("list_list_length"),
+        (IrType::ListList, "filter") => stdlib_function_index("list_list_filter"),
         _ => None,
     }
 }
@@ -207,6 +208,10 @@ pub fn stdlib_closure_arg_signature(name: &str, arg_idx: u32) -> Option<(Vec<IrT
         ("list_string_map", 1) => Some((vec![IrType::String], IrType::String)),
         ("list_int_map_to_string", 1) => Some((vec![IrType::I64], IrType::String)),
         ("list_float_map_to_string", 1) => Some((vec![IrType::F64], IrType::String)),
+        ("list_int_map_to_variant_list", 1) => Some((vec![IrType::I64], IrType::I32)),
+        ("list_float_map_to_variant_list", 1) => Some((vec![IrType::F64], IrType::I32)),
+        ("list_string_map_to_variant_list", 1) => Some((vec![IrType::String], IrType::I32)),
+        ("list_list_filter", 1) => Some((vec![IrType::I32], IrType::Bool)),
         _ => None,
     }
 }

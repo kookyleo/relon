@@ -217,7 +217,7 @@ Variant 大小不等时（`Result<Int, String>`），padding 填到最大 varian
 
 ## Enum / Sum types layout
 
-`#schema Notification: Enum<Email { ... }, SMS { ... }>` 编译成 tag +
+Rust-like `#enum Notification { Email { ... }, SMS { ... } }` 编译成 tag +
 inline largest variant：
 
 ```

@@ -6,7 +6,7 @@ the manual.
 
 ## Primitives
 
-Relon natively supports every JSON primitive, with a few additions:
+Relon supports JSON-shaped primitives except JSON `null`; absence is represented by `None` and only becomes JSON `null` when projected out.
 
 ```relon
 {
@@ -20,7 +20,7 @@ Relon natively supports every JSON primitive, with a few additions:
     "binary": 0b1010,
 
     "boolean": true,
-    "null_value": null
+    "none_value": None
 }
 ```
 
@@ -52,6 +52,45 @@ in Relon source and projects to a JSON array at output.
 ```
 
 One-element tuples require a trailing comma: `(1,)`.
+
+### Enum
+
+Enums use Rust-like `#enum` declarations. Unit, struct, and tuple variants are constructed like this:
+
+```relon
+#enum Stat { Up, Down }
+#enum Notification { Email { address: String }, Push }
+#enum Packet { Pair(Int, String), Empty }
+
+{
+    up: Stat.Up,
+    mail: Notification.Email { address: "x@y.z" },
+    pair: Packet.Pair(7, "x")
+}
+```
+
+JSON output is externally tagged: `Stat.Up` -> `{ "Up": {} }`, and `Packet.Pair(7, "x")` -> `{ "Pair": [7, "x"] }`.
+
+`match` can bind payload fields in the arm pattern. Use `*` for a payload slot you want to ignore:
+
+```relon
+#main(Packet p) -> Int
+p match {
+    Pair(n, *): n + 1,
+    Empty: 0
+}
+```
+
+Struct variants bind by field name:
+
+```relon
+#main(Notification msg) -> String
+msg match {
+    Notification.Email { address, subject: * }: address,
+    Push: ""
+}
+```
+
 
 #### List comprehensions
 
@@ -132,8 +171,8 @@ Bare `Dict` (without generics) is rejected by v1.7's
 
 ## Document root
 
-Each `.relon` file evaluates to a single JSON value — Object, Array,
-String, Number, Bool, or Null. **The root may be any expression**:
+Each `.relon` file evaluates to a Relon value that can be projected to JSON — Object, Array,
+String, Number, Bool, or `None` as JSON null. **The root may be any expression**:
 dict / list / tuple literal, atomic literal, binary / ternary / pipe
 expression, function call, variant constructor, reference,
 where / match, … as long as the final value lands in the JSON type
@@ -153,7 +192,7 @@ set. Directives, decorators, comments, and whitespace may precede it.
 42
 "hello"
 true
-null
+None                  // projects to JSON null
 
 // Legal: top-level directives are allowed
 #import string from "std/string"
@@ -165,14 +204,14 @@ n + 1
 
 // Legal: variant constructor as the root
 #main(Order o) -> Result<Order, String>
-Result.Ok { value: o }
+Ok(o)
 ```
 
 > Historical note: v1.1 and earlier accepted only dict / list literals
 > at the root (a bare scalar or expression was rejected by the parser).
 > v1.2 widened this to any expression (a superset extension); legacy
 > scripts are unaffected. This lets `#main(Int n) -> Int` write `n + 1`
-> directly and `#main(...) -> Result<T, E>` write `Result.Ok { ... }`
+> directly and `#main(...) -> Result<T, E>` write `Ok(...)`
 > directly — no longer needing a `{ value: ... }` wrapper dict.
 
 `Closure` / `Schema` / `Type` are not JSON values. If the root

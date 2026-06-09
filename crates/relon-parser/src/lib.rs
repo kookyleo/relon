@@ -179,7 +179,7 @@ pub fn parse_document_recovering(source: &str) -> ParsedDocument {
                 let end_offset = source.len();
                 nodes.push(Node {
                     id: NodeId::alloc(),
-                    expr: std::sync::Arc::new(Expr::Null),
+                    expr: std::sync::Arc::new(Expr::Missing),
                     decorators: Vec::new(),
                     directives: Vec::new(),
                     type_hint: None,
@@ -202,7 +202,7 @@ pub fn parse_document_recovering(source: &str) -> ParsedDocument {
             let end_offset = source.len();
             nodes.push(Node {
                 id: NodeId::alloc(),
-                expr: std::sync::Arc::new(Expr::Null),
+                expr: std::sync::Arc::new(Expr::Missing),
                 decorators: Vec::new(),
                 directives: Vec::new(),
                 type_hint: None,
@@ -382,11 +382,12 @@ pub fn child_nodes(node: &Node) -> Vec<&Node> {
         }
         Expr::Closure { body, .. } => out.push(body),
         Expr::VariantCtor { body, .. } => out.push(body),
+        Expr::VariantPattern { .. } => {}
         Expr::Reference { .. }
         | Expr::Variable(_)
         | Expr::Type(_)
         | Expr::Wildcard
-        | Expr::Null
+        | Expr::Missing
         | Expr::Bool(_)
         | Expr::Int(_)
         | Expr::Float(_)
@@ -662,7 +663,7 @@ mod tests {
         assert!(matches!(*node.expr, Expr::Bool(true)));
 
         let node = parse_document("null").unwrap();
-        assert!(matches!(*node.expr, Expr::Null));
+        assert!(matches!(*node.expr, Expr::Missing));
     }
 
     #[test]
@@ -756,9 +757,9 @@ mod tests {
     fn recovering_includes_empty_document_diagnostic() {
         let result = parse_document_recovering("");
         // Partial-tolerant contract: every input yields at least one
-        // navigable root Node — empty source gets a Null placeholder.
+        // navigable root Node — empty source gets a Missing placeholder.
         assert_eq!(result.nodes.len(), 1);
-        assert!(matches!(&*result.nodes[0].expr, Expr::Null));
+        assert!(matches!(&*result.nodes[0].expr, Expr::Missing));
         // Either a CST error or our own "empty document" — but
         // diagnostics MUST be non-empty (the caller has nothing to
         // attach a "you must write something" hint to otherwise).

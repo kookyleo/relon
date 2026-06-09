@@ -6,16 +6,14 @@
 //! v1 scope (Phase 2.a / 2.b / 2.c):
 //!
 //! * Phase 2.a / 2.b: the four scalar leaves — `Int`, `Float`, `Bool`,
-//!   `Null` — are laid out inline. Each field's start offset is rounded
+//!   `Unit` — are laid out inline. Each field's start offset is rounded
 //!   up to its alignment; the root is padded to `root_align` so the
 //!   next record starts aligned.
-//! * Phase 2.c: `String` and `List<Int>` join via pointer indirection.
-//!   Each variable field contributes a fixed-area `u32` pointer slot
-//!   (size = 4, align = 4); the actual `[len][bytes...]` payload lives
-//!   in a tail area the [`crate::buffer::BufferBuilder`] appends after
-//!   the root record. Other variable-length leaves (`Dict`, `Option`,
-//!   `Result`, nested schemas, lists of non-`Int` element types) are
-//!   still rejected via [`LayoutError::UnsupportedTypeInLayoutV1`].
+//! * Phase 2.c+: variable fields (`String`, `List<T>`, nested schemas,
+//!   `Option<T>`, and `Result<T, E>`) use pointer indirection. Each
+//!   contributes a fixed-area `u32` pointer slot (size = 4, align = 4);
+//!   the payload lives in a tail area the [`crate::buffer::BufferBuilder`]
+//!   appends after the root record.
 
 use crate::schema_canonical::{Schema, TypeRepr};
 use thiserror::Error;
@@ -170,8 +168,8 @@ impl OffsetTable {
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum LayoutError {
     /// The schema references a type the v1 layout does not yet model.
-    /// String / List / Dict / Option / Result / Enum live in this
-    /// bucket until Phase 2.b plumbs pointer-indirection in.
+    /// Type shapes that still have no host-visible v1 binary layout live
+    /// in this bucket.
     #[error("layout v1 does not yet support type `{kind}` in field `{field}`")]
     UnsupportedTypeInLayoutV1 {
         /// Field name that triggered the error.
@@ -179,10 +177,9 @@ pub enum LayoutError {
         /// Human-readable type kind (`"String"`, `"List"`, ...).
         kind: &'static str,
     },
-    /// Phase 10-c: `List<T>` with an element type the v1 layout
-    /// declines. Currently covers `List<List<...>>`, `List<Option<T>>`,
-    /// and `List<Result<T, E>>`. The error spells out the inner kind
-    /// so the host SDK can surface a precise message.
+    /// `List<T>` with an element type the v1 layout declines. The error
+    /// spells out the inner kind so the host SDK can surface a precise
+    /// message.
     #[error("layout v1 does not yet support list element `{inner}` in field `{field}`")]
     UnsupportedListElement {
         /// Field name that triggered the error.
@@ -223,7 +220,7 @@ struct FieldLayoutDecision {
 ///
 /// Supported set:
 ///
-/// * `Null`, `Bool` → `Inline { size: 1, align: 1 }`.
+/// * `Unit`, `Bool` → `Inline { size: 1, align: 1 }`.
 /// * `Int`, `Float` → `Inline { size: 8, align: 8 }`.
 /// * `String` → `PointerIndirect { tail_alignment: 1 }`.
 /// * `List<Int>` / `List<Float>` → `PointerIndirect { tail_alignment: 8 }`
@@ -241,7 +238,7 @@ fn field_layout_decision_for(
     ty: &TypeRepr,
 ) -> Result<FieldLayoutDecision, LayoutError> {
     match ty {
-        TypeRepr::Null => Ok(FieldLayoutDecision {
+        TypeRepr::Unit => Ok(FieldLayoutDecision {
             kind: FieldKind::Inline { size: 1, align: 1 },
             list_element: None,
         }),
@@ -275,14 +272,14 @@ fn field_layout_decision_for(
                 list_element: None,
             })
         }
-        TypeRepr::Option { .. } => Err(LayoutError::UnsupportedTypeInLayoutV1 {
-            field: field_name.to_string(),
-            kind: "Option",
-        }),
-        TypeRepr::Result { .. } => Err(LayoutError::UnsupportedTypeInLayoutV1 {
-            field: field_name.to_string(),
-            kind: "Result",
-        }),
+        TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => {
+            Ok(FieldLayoutDecision {
+                kind: FieldKind::PointerIndirect {
+                    tail_alignment: variant_record_alignment(field_name, ty)?,
+                },
+                list_element: None,
+            })
+        }
         // Phase F.2: closure fields have no host-visible binary layout
         // — the runtime handle is a scratch-heap pointer that doesn't
         // survive the `run_main` boundary. Reject here so the binary
@@ -353,17 +350,17 @@ fn list_layout_decision(
                 }),
             })
         }
-        TypeRepr::Option { .. } => Err(LayoutError::UnsupportedListElement {
+        TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => {
+            Ok(FieldLayoutDecision {
+                kind: FieldKind::PointerIndirect { tail_alignment: 4 },
+                list_element: Some(ListElementKind::PointerArray {
+                    elem_alignment: variant_record_alignment(field_name, element)?,
+                }),
+            })
+        }
+        TypeRepr::Unit => Err(LayoutError::UnsupportedListElement {
             field: field_name.to_string(),
-            inner: "Option",
-        }),
-        TypeRepr::Result { .. } => Err(LayoutError::UnsupportedListElement {
-            field: field_name.to_string(),
-            inner: "Result",
-        }),
-        TypeRepr::Null => Err(LayoutError::UnsupportedListElement {
-            field: field_name.to_string(),
-            inner: "Null",
+            inner: "Unit",
         }),
         // Phase F.2: `List<Closure>` is not part of any v1 binary
         // surface — closures are non-portable scratch-heap pointers.
@@ -418,17 +415,136 @@ fn inner_list_record_alignment(field_name: &str, inner: &TypeRepr) -> Result<usi
             inner_list_record_alignment(field_name, deeper)?;
             Ok(4)
         }
+        TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => {
+            variant_record_alignment(field_name, inner)?;
+            Ok(4)
+        }
         other => Err(LayoutError::UnsupportedListElement {
             field: field_name.to_string(),
             inner: match other {
-                TypeRepr::Option { .. } => "Option",
-                TypeRepr::Result { .. } => "Result",
-                TypeRepr::Null => "Null",
+                TypeRepr::Unit => "Unit",
                 TypeRepr::Closure { .. } => "Closure",
                 _ => "List",
             },
         }),
     }
+}
+
+/// Fixed payload slot layout inside an Option/Result variant record.
+/// Scalars are stored inline; variable or composite values store a u32
+/// pointer to their own tail record.
+fn variant_payload_slot(field_name: &str, ty: &TypeRepr) -> Result<(usize, usize), LayoutError> {
+    match ty {
+        TypeRepr::Unit | TypeRepr::Bool => Ok((1, 1)),
+        TypeRepr::Int | TypeRepr::Float => Ok((8, 8)),
+        TypeRepr::String
+        | TypeRepr::List { .. }
+        | TypeRepr::Schema { .. }
+        | TypeRepr::Option { .. }
+        | TypeRepr::Result { .. }
+        | TypeRepr::Enum { .. } => {
+            ensure_type_layoutable(field_name, ty)?;
+            Ok((4, 4))
+        }
+        TypeRepr::Closure { .. } => Err(LayoutError::UnsupportedTypeInLayoutV1 {
+            field: field_name.to_string(),
+            kind: "Closure",
+        }),
+    }
+}
+
+/// Deep alignment required by any tail record reachable from `ty` after a
+/// detached record is pasted into a parent. This mirrors buffer.rs' runtime
+/// relocation rule but stays local to layout so unsupported shapes remain
+/// compile-time errors.
+fn type_graph_alignment(field_name: &str, ty: &TypeRepr) -> Result<usize, LayoutError> {
+    match ty {
+        TypeRepr::Unit | TypeRepr::Bool | TypeRepr::String => Ok(1),
+        TypeRepr::Int | TypeRepr::Float => Ok(8),
+        TypeRepr::List { element } => match element.as_ref() {
+            TypeRepr::Int | TypeRepr::Float => Ok(8),
+            TypeRepr::Bool => Ok(1),
+            other => type_graph_alignment(field_name, other),
+        },
+        TypeRepr::Schema { schema } => {
+            let sub = SchemaLayout::offsets_for(schema)?;
+            let tail = schema
+                .fields
+                .iter()
+                .map(|f| type_graph_alignment(&f.name, &f.ty))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .max()
+                .unwrap_or(1);
+            Ok(sub.root_align.max(tail))
+        }
+        TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => {
+            variant_record_alignment(field_name, ty)
+        }
+        TypeRepr::Closure { .. } => Err(LayoutError::UnsupportedTypeInLayoutV1 {
+            field: field_name.to_string(),
+            kind: "Closure",
+        }),
+    }
+}
+
+fn ensure_type_layoutable(field_name: &str, ty: &TypeRepr) -> Result<(), LayoutError> {
+    match ty {
+        TypeRepr::List { element } => {
+            list_layout_decision(field_name, element)?;
+            Ok(())
+        }
+        TypeRepr::Schema { schema } => {
+            SchemaLayout::offsets_for(schema)?;
+            Ok(())
+        }
+        TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => {
+            variant_record_alignment(field_name, ty)?;
+            Ok(())
+        }
+        TypeRepr::Closure { .. } => Err(LayoutError::UnsupportedTypeInLayoutV1 {
+            field: field_name.to_string(),
+            kind: "Closure",
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Start alignment required by a variant tail record. The first byte is the
+/// tag; payload, when present, starts at the next offset satisfying the
+/// payload slot alignment. The returned alignment also includes any deeper
+/// tail records reachable through pointer payloads so relocation after paste
+/// preserves absolute alignment.
+fn variant_record_alignment(field_name: &str, ty: &TypeRepr) -> Result<usize, LayoutError> {
+    let payloads: Vec<TypeRepr> = match ty {
+        TypeRepr::Option { inner } => vec![inner.as_ref().clone()],
+        TypeRepr::Result { ok, err } => vec![ok.as_ref().clone(), err.as_ref().clone()],
+        TypeRepr::Enum { name, variants } => variants
+            .iter()
+            .filter_map(|variant| {
+                variant.payload_schema(name).map(|schema| TypeRepr::Schema {
+                    schema: Box::new(schema),
+                })
+            })
+            .collect(),
+        other => {
+            return Err(LayoutError::UnsupportedTypeInLayoutV1 {
+                field: field_name.to_string(),
+                kind: match other {
+                    TypeRepr::Closure { .. } => "Closure",
+                    _ => "Variant",
+                },
+            })
+        }
+    };
+
+    let mut align = 4usize;
+    for payload in &payloads {
+        let (_, slot_align) = variant_payload_slot(field_name, payload)?;
+        let graph_align = type_graph_alignment(field_name, payload)?;
+        align = align.max(slot_align).max(graph_align).max(1);
+    }
+    Ok(align)
 }
 
 /// Round `value` up to the next multiple of `align`. `align` is
@@ -805,9 +921,12 @@ mod tests {
     }
 
     #[test]
-    fn list_of_inner_list_with_unsupported_leaf_is_rejected() {
-        // The leaf must still be materialisable: `List<List<Option<…>>>`
-        // (a non-pointer-array, non-scalar leaf) stays a loud cap.
+    fn list_of_inner_list_with_option_leaf_is_accepted() {
+        // `List<List<Option<Int>>>` is a legal nested shape (cf. Rust's
+        // `Vec<Vec<Option<i32>>>`): the layout materialises the outer slot as
+        // a pointer array whose entries point at inner pointer-array list
+        // headers. (Return-side codegen that cannot yet marshal a given
+        // *source* of such a value still caps loudly — never miscompiles.)
         let schema = Schema {
             name: "Nested".into(),
             generics: vec![],
@@ -823,10 +942,10 @@ mod tests {
                 },
             )],
         };
-        let err = SchemaLayout::offsets_for(&schema).expect_err("unsupported leaf must reject");
-        assert!(
-            matches!(err, LayoutError::UnsupportedListElement { .. }),
-            "got {err:?}"
+        let table = SchemaLayout::offsets_for(&schema).expect("nested Option list must layout");
+        assert_eq!(
+            table.fields[0].list_element,
+            Some(ListElementKind::PointerArray { elem_alignment: 4 })
         );
     }
 
@@ -887,7 +1006,7 @@ mod tests {
             name: "Sentinel".into(),
             generics: vec![],
             is_tuple: false,
-            fields: vec![field("nil", TypeRepr::Null)],
+            fields: vec![field("nil", TypeRepr::Unit)],
         };
         let table = SchemaLayout::offsets_for(&schema).expect("layout");
         assert_eq!(table.fields[0].offset, 0);

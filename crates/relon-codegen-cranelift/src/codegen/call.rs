@@ -211,7 +211,7 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
     ///      the current function.
     ///   4. Pop `param_tys.len()` operands off the virtual stack and
     ///      `call_indirect(sig_ref, fn_ptr, args)`.
-    ///   5. Push the (single) return value if `ret_ty != Null`.
+    ///   5. Push the (single) return value if `ret_ty != Unit`.
     ///
     /// ABI: every host fn is exposed as `extern "C"` (`SystemV` calling
     /// convention) — host SDKs that register fns must transmute their
@@ -293,9 +293,9 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
             let cl_ty = ir_ty_to_cl(*ty)?;
             sig.params.push(AbiParam::new(cl_ty));
         }
-        // Null return type means "no return value"; everything else
+        // Unit return type means "no return value"; everything else
         // gets one return slot.
-        if !matches!(ret_ty, IrType::Null) {
+        if !matches!(ret_ty, IrType::Unit) {
             let cl_ret = ir_ty_to_cl(ret_ty)?;
             sig.returns.push(AbiParam::new(cl_ret));
         }
@@ -311,7 +311,7 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         let call_inst = self.builder.ins().call_indirect(sig_ref, fn_ptr, &args);
 
         // 5. Push the return value (if any).
-        if !matches!(ret_ty, IrType::Null) {
+        if !matches!(ret_ty, IrType::Unit) {
             let result = self.builder.inst_results(call_inst)[0];
             self.push(result);
         }
@@ -331,7 +331,7 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
     ///
     /// Scope (phase-4a parity with the bytecode VM): scalar args travel
     /// through the i64 lane and the return is the i64-encoded scalar.
-    /// `ret_ty` outside `{ I64, Null }` is rejected — the richer return
+    /// `ret_ty` outside `{ I64, Unit }` is rejected — the richer return
     /// lanes (Bool / Float / String) ship with the buffer-protocol
     /// envelope.
     fn emit_call_native_dynamic(
@@ -340,10 +340,10 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         param_tys: &[IrType],
         ret_ty: IrType,
     ) -> Result<(), CraneliftError> {
-        if !matches!(ret_ty, IrType::I64 | IrType::Null) {
+        if !matches!(ret_ty, IrType::I64 | IrType::Unit) {
             return Err(CraneliftError::Codegen(format!(
                 "CallNative dynamic dispatch (import #{import_idx}) ret_ty {ret_ty:?} \
-                 outside the phase-4a scalar envelope (I64 / Null only)"
+                 outside the phase-4a scalar envelope (I64 / Unit only)"
             )));
         }
         let n = param_tys.len();
@@ -407,7 +407,7 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         let trapped = self.builder.ins().icmp(IntCC::NotEqual, trap_code, zero);
         self.cond_trap_with_code(trapped, trap_code);
 
-        if !matches!(ret_ty, IrType::Null) {
+        if !matches!(ret_ty, IrType::Unit) {
             self.push(result);
         }
         Ok(())

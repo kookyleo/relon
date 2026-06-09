@@ -75,6 +75,7 @@ pub use workspace::{
     analyze_entry, analyze_entry_with_options, LoadError, LoadedModule, ModuleLoader, Workspace,
     WorkspaceDiagnostic, WorkspaceDiagnosticItem, WorkspaceTree,
 };
+pub use workspace_build::WorkspaceImportIndex;
 
 use relon_parser::{DirectiveBody, Expr, Node, Operator, TypeNode};
 use std::collections::{HashMap, HashSet};
@@ -90,8 +91,8 @@ use std::collections::{HashMap, HashSet};
 /// Returns `true` when:
 /// * Exactly one `#main(...)` directive is present, no `#import`s
 ///   on the root, every parameter type is a single-segment scalar
-///   builtin (`Int` / `Float` / `Bool` / `Null` / `String`).
-/// * The body is a literal (Int / Float / Bool / Null / String),
+///   builtin (`Int` / `Float` / `Bool` / `String`).
+/// * The body is a literal (Int / Float / Bool / String),
 ///   a `Variable`, a `Unary` over a trivial leaf, a `Binary` over
 ///   two trivial leaves with an arithmetic / comparison / logical
 ///   operator (the set the trivial-tree-walker actually evaluates),
@@ -133,15 +134,13 @@ fn is_scalar_builtin_type(t: &TypeNode) -> bool {
     if !t.generics.is_empty() {
         return false;
     }
-    matches!(
-        t.path[0].as_str(),
-        "Int" | "Float" | "Bool" | "Null" | "String"
-    )
+    matches!(t.path[0].as_str(), "Int" | "Float" | "Bool" | "String")
 }
 
 fn is_trivial_body_expr(expr: &Expr) -> bool {
     match expr {
-        Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::String(_) => true,
+        Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::String(_) => true,
+        Expr::Missing => false,
         Expr::Variable(_) => true,
         Expr::Unary(_, inner) => is_trivial_body_expr(&inner.expr),
         Expr::Binary(op, l, r) => {

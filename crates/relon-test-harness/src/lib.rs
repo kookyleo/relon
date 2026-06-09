@@ -25,7 +25,7 @@
 //! ```
 //!
 //! Bit-equality compares:
-//! * `Value::Int(_)` / `Value::Bool(_)` / `Value::Null` directly.
+//! * `Value::Int(_)` / `Value::Bool(_)` directly, with `None` projected as JSON null.
 //! * `Value::Float(_)` via `to_bits()` so NaN bit patterns stay
 //!   distinct.
 //! * `Value::String(_)` byte-equal.
@@ -519,7 +519,6 @@ fn assert_values_agree(backend: &str, reference: &Value, candidate: &Value) {
 fn value_to_json(v: &Value) -> serde_json::Value {
     use serde_json::Value as J;
     match v {
-        Value::Null => J::Null,
         Value::Bool(b) => J::Bool(*b),
         Value::Int(i) => J::Number((*i).into()),
         Value::Float(f) => J::String(format!("f64:{:#018x}", f.into_inner().to_bits())),
@@ -528,6 +527,9 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             J::Array(items.iter().map(value_to_json).collect())
         }
         Value::Dict(d) => {
+            if v.is_option_none() {
+                return J::Null;
+            }
             let mut map = serde_json::Map::new();
             for (k, val) in &d.map {
                 map.insert(k.to_string(), value_to_json(val));
@@ -550,7 +552,6 @@ pub fn value_bit_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Int(x), Int(y)) => x == y,
         (Bool(x), Bool(y)) => x == y,
-        (Null, Null) => true,
         (Float(x), Float(y)) => x.into_inner().to_bits() == y.into_inner().to_bits(),
         (String(x), String(y)) => x == y,
         (List(x), List(y)) => {

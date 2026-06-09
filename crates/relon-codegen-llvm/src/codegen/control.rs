@@ -170,7 +170,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         {
             let v = self.pop(ip_hint)?;
             // Coerce the popped value's width to the slot type if
-            // needed (Bool / Null on an i32 stack but stored as i32
+            // needed (Bool / Unit on an i32 stack but stored as i32
             // already — no coercion. String / ListInt on i32 — same.
             // I64 on i64 — same. We rely on the caller's typing
             // contract.)
@@ -230,7 +230,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 IrType::I64 | IrType::F64 => 64,
                 IrType::I32
                 | IrType::Bool
-                | IrType::Null
+                | IrType::Unit
                 | IrType::String
                 | IrType::ListInt
                 | IrType::ListFloat
@@ -662,14 +662,14 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         self.builder.position_at_end(merge_bb);
         match (then_result, else_result) {
             (Some(t), Some(e)) => {
-                let phi_ty: inkwell::types::BasicTypeEnum<'ctx> = match result_ty {
+                let phi_ty: inkwell::types::BasicTypeEnum<'ctx> = match result_ty.wasm_slot() {
                     // AOT-1: F64 rides as i64 bits, so both arms feed an
                     // i64-typed phi (the bit pattern, never a `double`).
                     IrType::I64 | IrType::F64 => self.ctx.i64_type().into(),
-                    IrType::I32 | IrType::Bool | IrType::Null => self.ctx.i32_type().into(),
+                    IrType::I32 => self.ctx.i32_type().into(),
                     other => {
                         return Err(LlvmError::Codegen(format!(
-                            "If result_ty {other:?} unsupported"
+                            "If result_ty {result_ty:?} maps to unsupported slot {other:?}"
                         )));
                     }
                 };

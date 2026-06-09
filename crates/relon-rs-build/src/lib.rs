@@ -10,7 +10,7 @@
 //! ## Supported signature surface
 //!
 //! The accepted leaf types for `#main` parameters and the return slot
-//! are `Int`, `Float`, `Bool`, `Null`, `String`, and `List<Int>` (the
+//! are `Int`, `Float`, `Bool`, `String`, and `List<Int>`; internal unit slots map to Rust `()` (the
 //! [`rust_type_for`] table is the authoritative list — a new
 //! codegen-llvm leaf variant fails the exhaustive `match` until a row
 //! is added). Each `.relon` source contributes:
@@ -118,7 +118,7 @@ pub struct NativeHostFn {
     /// wires the scalar lane the closed-world dynamic envelope accepts:
     /// `"Int"`, `"Bool"`. Each maps onto an `i64` C ABI slot.
     pub param_types: Vec<String>,
-    /// Return leaf type — `"Int"`, `"Bool"`, or `"Null"`.
+    /// Return leaf type — for example `"Int"`, `"Bool"`, or an internal unit slot.
     pub return_type: String,
     /// Capability bits this function requires. A non-empty gate makes
     /// the source gated: the binding surfaces `Result<T,
@@ -686,12 +686,12 @@ fn render_one_buffer(out: &mut String, m: &BindingModule) {
     // Return type: under Phase 2 the buffer wrapper always boxes the
     // return into a single-field `Ret { value: T }`. We surface T
     // directly to the caller. A `None` return (no return field) maps to
-    // the same shape as a `Null` slot.
+    // the same shape as an internal unit slot.
     let return_map = m
         .return_fields
         .first()
         .map(|f| rust_type_for(f.ty))
-        .unwrap_or_else(|| rust_type_for(EmittedFieldType::Null));
+        .unwrap_or_else(|| rust_type_for(EmittedFieldType::Unit));
     let inner_ret_ty = return_map.ret_rust_ty;
     let ret_match_arm = return_map.ret_match_arm;
 
@@ -891,12 +891,12 @@ fn rust_type_for(ty: EmittedFieldType) -> RustTypeMap {
             ret_rust_ty: "bool",
             ret_match_arm: "RetValue::Bool(v) => v",
         },
-        EmittedFieldType::Null => RustTypeMap {
-            tag_path: "EmittedFieldType::Null",
+        EmittedFieldType::Unit => RustTypeMap {
+            tag_path: "EmittedFieldType::Unit",
             arg_rust_ty: "()",
-            arg_value_expr: |_p| "ArgValue::Null".to_string(),
+            arg_value_expr: |_p| "ArgValue::Unit".to_string(),
             ret_rust_ty: "()",
-            ret_match_arm: "RetValue::Null => ()",
+            ret_match_arm: "RetValue::Unit => ()",
         },
         EmittedFieldType::String => RustTypeMap {
             tag_path: "EmittedFieldType::String",

@@ -1,5 +1,5 @@
 {
-    "null_val": null,
+    "none_val": Option.None {},
     "bool_true": true,
     "bool_false": false,
     "int_dec": 123,

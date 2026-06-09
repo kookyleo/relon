@@ -177,7 +177,12 @@ pub const LOWERING_CAP_IDS: &[&str] = &[
     "lower_ternary.unsupported_expr",
     "lower_ternary.if_condition_not_bool",
     "lower_ternary.if_branch_type_mismatch",
+    "lower_ternary_as_type.unsupported_expr",
+    "lower_ternary_as_type.if_condition_not_bool",
+    "lower_ternary_as_type.if_branch_type_mismatch",
+    "lower_ternary_as_type.unsupported_expr.branch_type",
     "lower_branch.unsupported_expr",
+    "lower_branch_as_type.unsupported_expr",
     "canonical_schema_from_def.unsupported_expr",
     "canonical_schema_from_def.cyclic_field_dependency",
     "canonical_schema_from_def.unsupported_field_type",
@@ -273,6 +278,58 @@ pub const LOWERING_CAP_IDS: &[&str] = &[
     "lower_match.unsupported_expr.1",
     "lower_match.unsupported_expr.2",
     "lower_match.unsupported_expr.3",
+    "canonical_schema_from_def.unsupported_tuple_element_type",
+    "canonical_type_repr.unsupported_field_type.generics",
+    "canonical_type_repr.unsupported_field_type.reserved",
+    "canonical_type_repr.unsupported_field_type.tuple",
+    "classify_anon_dict_enum_list_field.unsupported_field_type.1",
+    "classify_anon_dict_enum_list_field.unsupported_field_type.2",
+    "classify_anon_dict_enum_list_field.unsupported_field_type.3",
+    "classify_anon_dict_enum_list_field.unsupported_field_type.4",
+    "emit_standard_variant_record.empty_payload_stack",
+    "emit_standard_variant_record.missing_payload",
+    "emit_standard_variant_record.payload_type_mismatch",
+    "emit_standard_variant_record.unexpected_payload",
+    "lower_dict_field_value.unsupported_expr.variant_list_stack_empty",
+    "lower_dict_field_value.unsupported_field_type.variant_list_stack",
+    "lower_match.enum_pattern_binding_stack",
+    "lower_match.enum_pattern_duplicate_binding",
+    "lower_match.enum_pattern_unit_payload",
+    "lower_match.enum_pattern_unknown_payload",
+    "lower_plain_dict_into_record.missing_field",
+    "lower_plain_dict_into_record.unsupported_expr.1",
+    "lower_plain_dict_into_record.unsupported_expr.2",
+    "lower_plain_dict_into_record.unsupported_field_type.1",
+    "lower_plain_dict_into_record.unsupported_field_type.2",
+    "lower_plain_dict_into_record.unsupported_field_type.3",
+    "lower_plain_dict_into_record.unsupported_field_type.4",
+    "lower_prelude_variant_call_as_type.arity_mismatch",
+    "lower_schema_value_as_absolute_pointer.arity_mismatch",
+    "lower_tuple_field.arity_mismatch",
+    "lower_variable.unsupported_expr.enum_payload_missing_layout",
+    "lower_variable.unsupported_expr.enum_payload_path",
+    "lower_variable.unsupported_expr.enum_payload_segment",
+    "lower_variable.unsupported_expr.enum_payload_stack",
+    "lower_variable.unsupported_expr.enum_payload_stack_type",
+    "lower_variable.unsupported_expr.enum_payload_unknown_field",
+    "lower_variable.unsupported_expr.enum_unit_payload_access",
+    "lower_variant_ctor_as_type.body_not_dict",
+    "lower_variant_ctor_as_type.duplicate_payload",
+    "lower_variant_ctor_as_type.missing_payload",
+    "lower_variant_ctor_as_type.non_string_key",
+    "lower_variant_ctor_as_type.unexpected_field",
+    "lower_variant_ctor_as_type.unit_variant_has_fields",
+    "lower_variant_record_list_literal.element_type_mismatch",
+    "lower_variant_record_list_literal.empty_element_stack",
+    "lower_variant_record_list_literal.length_overflow",
+    "payload_slot_layout_for_lowering.unsupported_type",
+    "standard_variant_shape.not_variant_type",
+    "standard_variant_shape.option_enum_mismatch",
+    "standard_variant_shape.option_variant_mismatch",
+    "standard_variant_shape.result_enum_mismatch",
+    "standard_variant_shape.result_variant_mismatch",
+    "type_graph_alignment_for_lowering.unsupported_type",
+    "variant_record_alignment_for_lowering.unsupported_type",
 ];
 
 #[cfg(test)]
@@ -301,6 +358,42 @@ pub(crate) fn fired_caps() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn collect_cap_ids<'a>(src: &'a str, out: &mut std::collections::HashSet<&'a str>) {
+        let mut rest = src;
+        while let Some(start) = rest.find("cap!") {
+            rest = &rest[start + "cap!".len()..];
+            let trimmed = rest.trim_start();
+            if !trimmed.starts_with('(') {
+                continue;
+            }
+            let after_paren = trimmed[1..].trim_start();
+            if !after_paren.starts_with('"') {
+                continue;
+            }
+            let after_quote = &after_paren[1..];
+            if let Some(end) = after_quote.find('"') {
+                out.insert(&after_quote[..end]);
+                rest = &after_quote[end + 1..];
+            } else {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn all_cap_macro_ids_are_registered() {
+        let mut used = std::collections::HashSet::new();
+        collect_cap_ids(include_str!("mod.rs"), &mut used);
+        collect_cap_ids(include_str!("peephole.rs"), &mut used);
+        collect_cap_ids(include_str!("closure.rs"), &mut used);
+        for id in used {
+            assert!(
+                LOWERING_CAP_IDS.contains(&id),
+                "cap! id `{id}` is used but missing from LOWERING_CAP_IDS"
+            );
+        }
+    }
 
     #[test]
     fn ids_are_unique() {

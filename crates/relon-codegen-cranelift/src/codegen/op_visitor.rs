@@ -470,6 +470,15 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         self.emit_alloc_sub_record(record_local_idx, root_size, root_align)
     }
 
+    fn visit_alloc_scratch_record(
+        &mut self,
+        record_local_idx: u32,
+        root_size: u32,
+        root_align: u32,
+    ) -> Result<(), CraneliftError> {
+        self.emit_alloc_scratch_record(record_local_idx, root_size, root_align)
+    }
+
     fn visit_store_field_at_record(
         &mut self,
         record_local_idx: u32,
@@ -479,8 +488,24 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         self.emit_store_field_at_record(record_local_idx, offset, ty)
     }
 
+    fn visit_store_field_at_record_absolute(
+        &mut self,
+        record_local_idx: u32,
+        offset: u32,
+        ty: IrType,
+    ) -> Result<(), CraneliftError> {
+        self.emit_store_field_at_record_absolute(record_local_idx, offset, ty)
+    }
+
     fn visit_push_record_base(&mut self, record_local_idx: u32) -> Result<(), CraneliftError> {
         self.emit_push_record_base(record_local_idx)
+    }
+
+    fn visit_push_record_base_absolute(
+        &mut self,
+        record_local_idx: u32,
+    ) -> Result<(), CraneliftError> {
+        self.emit_push_record_base_absolute(record_local_idx)
     }
 
     fn visit_emit_tail_record_from_absolute_addr(
@@ -488,6 +513,38 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         ty: IrType,
     ) -> Result<(), CraneliftError> {
         self.emit_tail_record_from_absolute(ty)
+    }
+
+    fn visit_build_variant_record(
+        &mut self,
+        tag: u8,
+        record_size: u32,
+        record_align: u32,
+        payload_offset: Option<u32>,
+        payload_ty: Option<IrType>,
+    ) -> Result<(), CraneliftError> {
+        self.emit_build_variant_record(tag, record_size, record_align, payload_offset, payload_ty)
+    }
+
+    fn visit_build_variant_record_scratch(
+        &mut self,
+        tag: u8,
+        record_size: u32,
+        record_align: u32,
+        payload_offset: Option<u32>,
+        payload_ty: Option<IrType>,
+    ) -> Result<(), CraneliftError> {
+        self.emit_build_variant_record_scratch(
+            tag,
+            record_size,
+            record_align,
+            payload_offset,
+            payload_ty,
+        )
+    }
+
+    fn visit_build_pointer_list(&mut self, len: u32) -> Result<(), CraneliftError> {
+        self.emit_build_pointer_list(len)
     }
 
     // Calls.

@@ -28,6 +28,16 @@ use crate::resolve::path_head;
 use relon_parser::{Expr, Node, RefBase, TokenKey};
 
 impl<'a> Walker<'a> {
+    fn is_unit_enum_variant_path(&self, path: &[TokenKey]) -> bool {
+        let [TokenKey::String(enum_name, _, _), TokenKey::String(variant_name, _, _)] = path else {
+            return false;
+        };
+        self.variant_field_index
+            .get(enum_name)
+            .and_then(|variants| variants.get(variant_name))
+            .is_some_and(|(_, fields)| fields.is_empty())
+    }
+
     pub(super) fn check_unresolved_ref(&mut self, node: &Node, base: &RefBase, path: &[TokenKey]) {
         if self.tree.references.contains_key(&node.id) {
             // R10b: a single-segment, *backward* `&sibling.<name>` /
@@ -114,6 +124,9 @@ impl<'a> Walker<'a> {
 
     pub(super) fn check_unresolved_var(&mut self, node: &Node, path: &[TokenKey]) {
         if self.tree.references.contains_key(&node.id) {
+            if self.is_unit_enum_variant_path(path) {
+                return;
+            }
             // Same Stage 2.6 tail walk as `check_unresolved_ref`.
             self.check_path_tail(node, path);
             // v1.4 strict: also run the inference-driven tail walk so
@@ -124,11 +137,27 @@ impl<'a> Walker<'a> {
             return;
         }
         let Some(name) = path_head(path) else { return };
+        if self
+            .match_arm_locals
+            .iter()
+            .rev()
+            .any(|layer| layer.contains_key(&name))
+        {
+            self.check_path_tail(node, path);
+            self.check_strict_path(node, path);
+            return;
+        }
         // Variables also resolve against function names registered
         // by the host (stdlib like `range`, `len`, ...). The analyzer
         // consults the evaluator's hardcoded stdlib name set plus the
         // host-supplied `host_fn_names` (Stage 2.4) before flagging.
-        if self.dynamic_save(&name) || self.is_known_fn(&name) {
+        let is_option_none = matches!(path, [TokenKey::String(head, _, _)] if head == "None")
+            || matches!(path, [TokenKey::String(head, _, _), TokenKey::String(variant, _, _)] if head == "Option" && variant == "None");
+        if self.dynamic_save(&name)
+            || self.is_known_fn(&name)
+            || is_option_none
+            || self.is_unit_enum_variant_path(path)
+        {
             return;
         }
         self.tree.diagnostics.push(Diagnostic::UnresolvedReference {
@@ -163,6 +192,9 @@ impl<'a> Walker<'a> {
     /// * `UnknownHead` is owned by the resolution-side
     ///   `UnresolvedReference` diagnostic, so we don't report here.
     pub(super) fn check_strict_path(&mut self, node: &Node, path: &[TokenKey]) {
+        if self.is_unit_enum_variant_path(path) {
+            return;
+        }
         let segs = infer::path_segments(path);
         if segs.is_empty() {
             return;
@@ -236,7 +268,7 @@ impl<'a> Walker<'a> {
     /// * `Any` / FnCall result / unknown / closure-param-without-type
     ///   → silent fall-back (defer to runtime).
     pub(super) fn check_path_tail(&mut self, node: &Node, path: &[TokenKey]) {
-        if path.len() < 2 {
+        if path.len() < 2 || self.is_unit_enum_variant_path(path) {
             return;
         }
         let scope = self.build_type_scope();

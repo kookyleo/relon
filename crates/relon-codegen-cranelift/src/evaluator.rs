@@ -1856,8 +1856,8 @@ fn write_value_into_builder(
         (TypeRepr::Bool, Value::Bool(v)) => builder
             .write_bool(&field.name, *v)
             .map_err(buffer_to_runtime_error),
-        (TypeRepr::Null, Value::Null) => builder
-            .write_null(&field.name)
+        (TypeRepr::Unit, v) if v.is_option_none() => builder
+            .write_unit(&field.name)
             .map_err(buffer_to_runtime_error),
         (TypeRepr::String, Value::String(s)) => builder
             .write_string(&field.name, s.as_str())
@@ -1884,6 +1884,9 @@ fn write_value_into_builder(
         (TypeRepr::Schema { schema }, Value::Tuple(items)) if schema.is_tuple => {
             write_tuple_arg_into_builder(builder, &field.name, schema, items.as_ref())
         }
+        (TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. }, _) => builder
+            .write_value(&field.name, &field.ty, value)
+            .map_err(buffer_to_runtime_error),
         _ => Err(RuntimeError::MainArgTypeMismatch {
             name: field.name.clone(),
             expected: format!("{:?}", field.ty),
@@ -2049,6 +2052,14 @@ fn write_list_arg_into_builder(
                 )
                 .map_err(buffer_to_runtime_error),
             }
+        }
+        TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => {
+            let ty = TypeRepr::List {
+                element: Box::new(element.clone()),
+            };
+            builder
+                .write_value(name, &ty, &Value::List(Arc::new(items.to_vec())))
+                .map_err(buffer_to_runtime_error)
         }
         other => Err(RuntimeError::Unsupported {
             reason: format!(

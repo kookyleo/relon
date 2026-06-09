@@ -97,7 +97,7 @@ pub enum CompletionKind {
     Pragma,
     /// Decorator (just `@name`).
     Decorator,
-    /// Reserved word (`for`, `in`, `if`, `else`, `true`, `false`, `null`).
+    /// Reserved word (`for`, `in`, `if`, `else`, `true`, `false`).
     Keyword,
 }
 

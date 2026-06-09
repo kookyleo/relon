@@ -106,12 +106,13 @@ Relon 没有「文件级别 library/entry 标记」这一概念。是否有 `#ma
 
 ```relon
 // platform/notify.relon —— 共享库（无 #main）
+#enum Channel {
+    Email { address: String, subject: String },
+    SMS { phone: String },
+    Push
+}
+
 {
-    #schema Channel Enum<
-        Email { String address: *, String subject: * },
-        SMS   { String phone: * },
-        Push
-    >,
     #schema Notification {
         Channel via: *,
         String title: *
@@ -144,7 +145,7 @@ Relon 支持以下的定位符：
 - `&uncle`: 上一级目录（父级的兄弟）。
 
 在列表处理中，你可以使用以下基于游标的相对引用：
-- `&prev`: 获取列表中的上一个元素（如果是第一个元素则返回 null）。
+- `&prev`: 获取列表中的上一个元素（如果是第一个元素则返回 `None`）。
 - `&next`: 获取列表中的下一个元素（支持前瞻预测/Lookahead）。
 - `&index`: 获取当前元素在列表中的索引（整数）。
 - `&this`: 获取列表或整个遍历范围的顶层上下文容器。

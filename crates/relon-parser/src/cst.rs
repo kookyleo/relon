@@ -408,10 +408,83 @@ impl<'a> Parser<'a> {
                 }
             }
             crate::DirectiveShape::NameBody => self.parse_directive_name_body(),
+            crate::DirectiveShape::Enum => self.parse_directive_enum(),
             crate::DirectiveShape::Import => self.parse_directive_import(),
             crate::DirectiveShape::Main => self.parse_directive_main(),
         }
         self.close();
+    }
+
+    /// `#enum Name<T, U>? { Variant, Variant { field: Type }, Variant(Type) }`.
+    /// The lowerer turns this into the internal tagged-enum schema form.
+    fn parse_directive_enum(&mut self) {
+        if self.at(SyntaxKind::IDENT) {
+            self.bump();
+        } else {
+            return;
+        }
+        if self.at(SyntaxKind::LT) {
+            self.bump();
+            while !self.at(SyntaxKind::GT) && !self.at_end() {
+                if self.at(SyntaxKind::IDENT) {
+                    self.bump();
+                } else {
+                    self.error_at_current("expected generic param");
+                    break;
+                }
+                if !self.eat(SyntaxKind::COMMA) {
+                    break;
+                }
+            }
+            self.expect(SyntaxKind::GT);
+        }
+        if !self.eat(SyntaxKind::L_BRACE) {
+            return;
+        }
+        while !self.at(SyntaxKind::R_BRACE) && !self.at_end() {
+            if self.at(SyntaxKind::COMMA) {
+                self.bump();
+                continue;
+            }
+            self.open(SyntaxKind::ENUM_VARIANT);
+            if self.at(SyntaxKind::IDENT) {
+                self.bump();
+            } else {
+                self.error_at_current("expected enum variant name");
+                self.close();
+                break;
+            }
+            if self.at(SyntaxKind::L_BRACE) {
+                self.bump();
+                while !self.at(SyntaxKind::R_BRACE) && !self.at_end() {
+                    if self.at(SyntaxKind::COMMA) {
+                        self.bump();
+                        continue;
+                    }
+                    self.open(SyntaxKind::ENUM_VARIANT_FIELD);
+                    if self.at(SyntaxKind::IDENT) {
+                        self.bump();
+                    } else {
+                        self.error_at_current("expected enum variant field name");
+                    }
+                    self.expect(SyntaxKind::COLON);
+                    self.parse_type();
+                    self.close();
+                    if !self.eat(SyntaxKind::COMMA) {
+                        break;
+                    }
+                }
+                self.expect(SyntaxKind::R_BRACE);
+            } else if self.at(SyntaxKind::L_PAREN) {
+                self.parse_tuple_type();
+            }
+            self.close();
+            if !self.eat(SyntaxKind::COMMA) && !self.at(SyntaxKind::R_BRACE) {
+                self.error_at_current("expected `,` or `}` after enum variant");
+                break;
+            }
+        }
+        self.expect(SyntaxKind::R_BRACE);
     }
 
     /// `#schema Name <T, U>? body? (with { methods... })?`. The body
@@ -466,8 +539,7 @@ impl<'a> Parser<'a> {
             // following `#schema X` in a `: ...` context.
             if !self.peek_attribute_terminator() {
                 // Schema bodies are typically dicts (`#schema U { ... }`)
-                // but the v1 grammar also accepts a type alias body
-                // (`#schema Status Enum<"on", "off">`). When the body
+                // but the grammar also accepts a type-alias body. When the body
                 // looks like a bare type expression — IDENT immediately
                 // followed by `<...>` — parse it as a type so the
                 // string-literal generic args don't surprise the Pratt
@@ -496,8 +568,8 @@ impl<'a> Parser<'a> {
     }
 
     /// True when the upcoming token stream is an IDENT followed
-    /// immediately (no intervening whitespace) by `<` — the type-alias
-    /// body shape `Enum<"on", "off">` / `Int` / `List<T>`. Used by
+    /// immediately (no intervening whitespace) by `<` — a type-alias
+    /// body shape such as `Int` / `List<T>`. Used by
     /// `parse_directive_name_body` to disambiguate the type-body shape
     /// from a regular expression body. The IDENT-and-no-`<` case
     /// (bare-type body like `#schema MyAlias String`) is also
@@ -509,19 +581,17 @@ impl<'a> Parser<'a> {
         }
         // Only commit to the type body if the IDENT is one of the
         // known type heads (`Int`, `String`, `Bool`, `List`, `Dict`,
-        // `Enum`, `Any`, `Null`, `Float`) — otherwise a regular
+        // `Any`, `Float`) — otherwise a regular
         // expression with a leading IDENT is the safer fallback.
         let head = self.current_text().unwrap_or("");
         if !matches!(
             head,
-            "Int" | "String" | "Bool" | "Float" | "Any" | "Null" | "List" | "Dict" | "Enum"
+            "Int" | "String" | "Bool" | "Float" | "Any" | "List" | "Dict"
         ) {
             return false;
         }
-        // For `Enum` specifically, only commit when followed by `<`
-        // (with no whitespace) — bare `Enum` isn't a sensible body.
-        // For other type heads, allow both `Int` (alone) and
-        // `List<T>` (with generics).
+        // Allow both primitive aliases (`Int`) and generic containers
+        // (`List<T>`) as type-body starts.
         let head_idx = self.pos_skip_trivia();
         let mut idx = head_idx + 1;
         let mut had_ws = false;
@@ -536,11 +606,10 @@ impl<'a> Parser<'a> {
         // accept when nothing else follows on the line. We approximate
         // "nothing else" by checking the next non-trivia token isn't
         // a typical expression-continuation symbol.
-        head != "Enum"
-            && matches!(
-                self.tokens.get(idx).map(|(k, _)| *k),
-                Some(SyntaxKind::HASH) | Some(SyntaxKind::L_BRACE) | None
-            )
+        matches!(
+            self.tokens.get(idx).map(|(k, _)| *k),
+            Some(SyntaxKind::HASH) | Some(SyntaxKind::L_BRACE) | None
+        )
     }
 
     /// `with { (pragma | method)* }` — body of a `#schema` / `#extend`
@@ -940,15 +1009,20 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// One match arm: `pattern: body`. Pattern is either a TYPE_NODE
-    /// (the common case) or `*` (the wildcard fallback). Body is a
-    /// regular expression.
+    /// One match arm: `pattern: body`. Pattern is one of:
+    ///
+    /// * a TYPE_NODE (`Up`, `Int`) for existing unit/schema patterns;
+    /// * `*` for wildcard;
+    /// * a Rust-like enum payload pattern (`Pair(a, b)`,
+    ///   `Email { address, subject: s }`).
     fn parse_match_arm(&mut self) {
         self.open(SyntaxKind::MATCH_ARM);
         if self.at(SyntaxKind::STAR) {
             self.open(SyntaxKind::WILDCARD);
             self.bump();
             self.close();
+        } else if self.looks_like_match_payload_pattern() {
+            self.parse_match_pattern();
         } else if self.at(SyntaxKind::IDENT) {
             self.parse_type();
         } else {
@@ -958,6 +1032,80 @@ impl<'a> Parser<'a> {
             self.parse_expr();
         } else {
             self.error("expected `:` in match arm");
+        }
+        self.close();
+    }
+
+    fn looks_like_match_payload_pattern(&self) -> bool {
+        if !self.at(SyntaxKind::IDENT) {
+            return false;
+        }
+        let mut idx = self.pos_skip_trivia() + 1;
+        while idx < self.tokens.len() && self.tokens[idx].0.is_trivia() {
+            idx += 1;
+        }
+        while self.tokens.get(idx).map(|(k, _)| *k) == Some(SyntaxKind::DOT) {
+            idx += 1;
+            while idx < self.tokens.len() && self.tokens[idx].0.is_trivia() {
+                idx += 1;
+            }
+            if self.tokens.get(idx).map(|(k, _)| *k) != Some(SyntaxKind::IDENT) {
+                return false;
+            }
+            idx += 1;
+            while idx < self.tokens.len() && self.tokens[idx].0.is_trivia() {
+                idx += 1;
+            }
+        }
+        matches!(
+            self.tokens.get(idx).map(|(k, _)| *k),
+            Some(SyntaxKind::L_PAREN | SyntaxKind::L_BRACE)
+        )
+    }
+
+    fn parse_match_pattern(&mut self) {
+        self.open(SyntaxKind::MATCH_PATTERN);
+        self.expect(SyntaxKind::IDENT);
+        while self.at(SyntaxKind::DOT) {
+            self.bump();
+            self.expect(SyntaxKind::IDENT);
+        }
+        if self.at(SyntaxKind::L_PAREN) {
+            self.bump();
+            while !self.at(SyntaxKind::R_PAREN) && !self.at_end() {
+                if self.at(SyntaxKind::STAR) || self.at(SyntaxKind::IDENT) {
+                    self.bump();
+                } else {
+                    self.error_at_current("expected tuple pattern binding");
+                    break;
+                }
+                if !self.eat(SyntaxKind::COMMA) {
+                    break;
+                }
+            }
+            self.expect(SyntaxKind::R_PAREN);
+        } else if self.at(SyntaxKind::L_BRACE) {
+            self.bump();
+            while !self.at(SyntaxKind::R_BRACE) && !self.at_end() {
+                if self.at(SyntaxKind::IDENT) {
+                    self.bump();
+                    if self.eat(SyntaxKind::COLON) {
+                        if self.at(SyntaxKind::STAR) || self.at(SyntaxKind::IDENT) {
+                            self.bump();
+                        } else {
+                            self.error_at_current("expected struct pattern binding");
+                            break;
+                        }
+                    }
+                } else {
+                    self.error_at_current("expected struct pattern field");
+                    break;
+                }
+                if !self.eat(SyntaxKind::COMMA) {
+                    break;
+                }
+            }
+            self.expect(SyntaxKind::R_BRACE);
         }
         self.close();
     }
@@ -1089,7 +1237,7 @@ impl<'a> Parser<'a> {
                 }
             }
             Some(SyntaxKind::IDENT) => {
-                // `null` / `true` / `false` / `Infinity` / `NaN` are
+                // `true` / `false` / `Infinity` / `NaN` and the removed `null` spelling are
                 // keyword-shaped literals but lex as IDENT — promote
                 // here so the lowering can decode them via the LITERAL
                 // walker (which dispatches on the inner token text).
@@ -1111,7 +1259,7 @@ impl<'a> Parser<'a> {
                     // `List<Int>`, `Foo?`). Legacy `parse_type_expr`
                     // lowers these into `Expr::Type`; we follow suit so
                     // forms like `#brand Dict<String, Int> { ... }`
-                    // and `#schema Status Enum<"on", "off">` parse
+                    // and `#schema Id Type<Arg>` parse
                     // cleanly without the Pratt grammar misreading
                     // `<` as a comparison.
                     self.parse_type();
@@ -1235,7 +1383,7 @@ impl<'a> Parser<'a> {
         }
         let known_head = matches!(
             head_text,
-            "Int" | "String" | "Bool" | "Float" | "Any" | "Null" | "List" | "Dict" | "Enum"
+            "Int" | "String" | "Bool" | "Float" | "Any" | "List" | "Dict"
         );
         // `IDENT < ...>` — type with generics. Requires `<`
         // immediately adjacent (no whitespace).
@@ -1939,13 +2087,6 @@ impl<'a> Parser<'a> {
                     break;
                 }
                 self.parse_type();
-                // `Enum<Variant { field: T, ... }, ...>` — a struct-
-                // variant body inside a sum-type's generic-arg list.
-                // The body is a dict of field-type pairs; we accept
-                // any DICT here and let the analyzer enforce shape.
-                if self.at(SyntaxKind::L_BRACE) {
-                    self.parse_dict();
-                }
                 if !self.eat(SyntaxKind::COMMA) {
                     break;
                 }
@@ -2943,17 +3084,6 @@ mod tests {
             .filter(|n| n.kind() == SyntaxKind::TYPE_NODE)
             .collect();
         assert!(!types.is_empty(), "expected a TYPE_NODE for Dict<...>");
-    }
-
-    #[test]
-    fn enum_with_struct_variant_inside_generic_args() {
-        // v1.8 Phase C: sum-type generics admit a struct-variant body
-        // (`Enum<Variant { field: Type }>`) as one of the generic
-        // arguments. Round-trip captures the inner `{ ... }` as a
-        // child of the outer TYPE_NODE.
-        let src = "#schema Pair<T, U> Enum<Both { left: T, right: U }>\n{}\n";
-        let parsed = parse_round_trip(src);
-        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
     }
 
     #[test]

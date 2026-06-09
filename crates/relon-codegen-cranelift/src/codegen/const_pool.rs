@@ -705,7 +705,18 @@ impl OpVisitor for ConstPool {
     fn visit_alloc_sub_record(&mut self, _: u32, _: u32, _: u32) -> Result<(), CraneliftError> {
         Ok(())
     }
+    fn visit_alloc_scratch_record(&mut self, _: u32, _: u32, _: u32) -> Result<(), CraneliftError> {
+        Ok(())
+    }
     fn visit_store_field_at_record(
+        &mut self,
+        _: u32,
+        _: u32,
+        _: IrType,
+    ) -> Result<(), CraneliftError> {
+        Ok(())
+    }
+    fn visit_store_field_at_record_absolute(
         &mut self,
         _: u32,
         _: u32,
@@ -716,10 +727,36 @@ impl OpVisitor for ConstPool {
     fn visit_push_record_base(&mut self, _: u32) -> Result<(), CraneliftError> {
         Ok(())
     }
+    fn visit_push_record_base_absolute(&mut self, _: u32) -> Result<(), CraneliftError> {
+        Ok(())
+    }
     fn visit_emit_tail_record_from_absolute_addr(
         &mut self,
         _: IrType,
     ) -> Result<(), CraneliftError> {
+        Ok(())
+    }
+    fn visit_build_variant_record(
+        &mut self,
+        _: u8,
+        _: u32,
+        _: u32,
+        _: Option<u32>,
+        _: Option<IrType>,
+    ) -> Result<(), CraneliftError> {
+        Ok(())
+    }
+    fn visit_build_variant_record_scratch(
+        &mut self,
+        _: u8,
+        _: u32,
+        _: u32,
+        _: Option<u32>,
+        _: Option<IrType>,
+    ) -> Result<(), CraneliftError> {
+        Ok(())
+    }
+    fn visit_build_pointer_list(&mut self, _: u32) -> Result<(), CraneliftError> {
         Ok(())
     }
     fn visit_call_native(

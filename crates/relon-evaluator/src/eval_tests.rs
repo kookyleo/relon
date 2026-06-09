@@ -191,7 +191,6 @@ fn test_mixed_numeric_operations() {
 fn test_invalid_numeric_operands_are_rejected() {
     assert_number_type_mismatch(r#"{ "value": "x" / 2 }"#, "String");
     assert_number_type_mismatch(r#"{ "value": 2 / "x" }"#, "String");
-    assert_number_type_mismatch(r#"{ "value": null % 2 }"#, "Null");
     assert_number_type_mismatch(r#"{ "value": "x" < 2 }"#, "String");
     assert_number_type_mismatch(r#"{ "value": -false }"#, "Bool");
 }
@@ -404,9 +403,9 @@ fn test_virtual_stdlib_modules() {
         #import dict from "std/dict"
         {
             "first": list.first([10, 20, 30]),
-            "compact": list.compact([1, null, 2]),
+            "compact": list.compact([1, Option.None {}, 2]),
             "clamped": math.clamp(12, 0, 10),
-            "defaulted": value.default(null, "fallback"),
+            "defaulted": value.default(Option.None {}, "fallback"),
             "kept_false": value.default(false, true),
             "is_number": is.number(1.5),
             "is_empty": is.empty([]),
@@ -974,7 +973,7 @@ fn test_schema_predicates() {
         #schema
         Server: {
             Int port: (p) => p > 0 && p < 65536,
-            String status: Enum<"up", "down">
+            String status: (s) => s == "up" || s == "down"
         },
 
         Server s1: { port: 8080, status: "up" }
@@ -1016,7 +1015,7 @@ fn test_optional_chaining() {
             map.map.get("email").unwrap(),
             &Value::String("alice@example.com".into())
         );
-        assert_eq!(map.map.get("missing").unwrap(), &Value::Null);
+        assert!(map.map.get("missing").is_some_and(Value::is_option_none));
         assert_eq!(
             map.map.get("default").unwrap(),
             &Value::String("default".into())
@@ -1024,36 +1023,6 @@ fn test_optional_chaining() {
     } else {
         panic!("Expected Dict");
     }
-}
-
-#[test]
-fn test_enum_type() {
-    let result = eval_doc(
-        r#"{
-        #schema
-        Theme: {
-            mode: Enum<"light", "dark", "system">,
-            id: Enum<Int, String>
-        },
-
-        Theme t1: { mode: "light", id: 123 },
-        Theme t2: { mode: "dark", id: "abc" }
-    }"#,
-    )
-    .unwrap();
-    assert!(matches!(result, Value::Dict(_)));
-}
-
-#[test]
-fn test_enum_type_failure() {
-    let result = eval_doc(
-        r#"{
-        #schema
-        Theme: { mode: Enum<"light", "dark"> },
-        Theme t: { mode: "other" }
-    }"#,
-    );
-    assert!(matches!(result, Err(RuntimeError::TypeMismatch { .. })));
 }
 
 #[test]
@@ -1280,7 +1249,7 @@ fn recursion_limit_uses_dedicated_error_kind() {
             for _ in 0..150 {
                 deeply_nested.push_str("{ next: ");
             }
-            deeply_nested.push_str("null");
+            deeply_nested.push_str("Option.None {}");
             for _ in 0..150 {
                 deeply_nested.push_str(" }");
             }
@@ -1380,7 +1349,7 @@ fn test_list_relative_references() {
         r#"[
         { title: "Step 1", active: true },
         { title: "Step 2", enabled: &prev.active },
-        { index: &index, has_prev: &prev != null }
+        { index: &index, has_prev: &prev != Option.None {} }
     ]"#,
     )
     .unwrap();
@@ -2166,11 +2135,8 @@ fn test_forward_lookahead_next() {
 #[test]
 fn variant_ctor_constructs_branded_dict() {
     let result = eval_doc(
-        r#"{
-            #schema Notification Enum<
-                Email { address: String, subject: String },
-                Push,
-            >,
+        r#"#enum Notification { Email { address: String, subject: String }, Push }
+        {
             msg: Notification.Email { address: "a@b.c", subject: "hi" }
         }"#,
     )
@@ -2192,12 +2158,9 @@ fn variant_ctor_constructs_branded_dict() {
 #[test]
 fn variant_ctor_unit_variant_works() {
     let result = eval_doc(
-        r#"{
-            #schema Notification Enum<
-                Email { address: String },
-                Push,
-            >,
-            msg: Notification.Push {}
+        r#"#enum Notification { Email { address: String }, Push }
+        {
+            msg: Notification.Push
         }"#,
     )
     .unwrap();
@@ -2211,10 +2174,38 @@ fn variant_ctor_unit_variant_works() {
 }
 
 #[test]
+fn enum_tuple_match_payload_pattern_binds_payload() {
+    let result = eval_doc(
+        r#"#enum Packet { Pair(Int, String), Empty }
+        {
+            p: Packet.Pair(7, "x"),
+            out: p match { Pair(n, *): n + 1, Empty: 0 }
+        }"#,
+    )
+    .unwrap();
+    let Value::Dict(outer) = result else { panic!() };
+    assert_eq!(outer.map.get("out"), Some(&Value::Int(8)));
+}
+
+#[test]
+fn enum_struct_match_payload_pattern_binds_payload() {
+    let result = eval_doc(
+        r#"#enum Notification { Email { code: Int, subject: String }, Push }
+        {
+            msg: Notification.Email { code: 41, subject: "hi" },
+            out: msg match { Notification.Email { code, subject: * }: code + 1, Push: 0 }
+        }"#,
+    )
+    .unwrap();
+    let Value::Dict(outer) = result else { panic!() };
+    assert_eq!(outer.map.get("out"), Some(&Value::Int(42)));
+}
+
+#[test]
 fn variant_ctor_unknown_variant_runtime_error() {
     let result = eval_doc(
-        r#"{
-            #schema N Enum<A { x: Int }>,
+        r#"#enum N { A { x: Int } }
+        {
             msg: N.Bogus { x: 1 }
         }"#,
     );
@@ -2224,8 +2215,8 @@ fn variant_ctor_unknown_variant_runtime_error() {
 #[test]
 fn variant_ctor_missing_required_field_errors() {
     let result = eval_doc(
-        r#"{
-            #schema N Enum<Email { address: String, subject: String }>,
+        r#"#enum N { Email { address: String, subject: String } }
+        {
             msg: N.Email { address: "a@b" }
         }"#,
     );
@@ -2237,8 +2228,8 @@ fn variant_value_field_access_is_flat() {
     // `msg.address` reads the variant's payload field directly with
     // no `.Email.` indirection — same access path as a plain dict.
     let result = eval_doc(
-        r#"{
-            #schema N Enum<Email { address: String }>,
+        r#"#enum N { Email { address: String } }
+        {
             msg: N.Email { address: "a@b.c" },
             got: &sibling.msg.address
         }"#,
@@ -2251,11 +2242,8 @@ fn variant_value_field_access_is_flat() {
 #[test]
 fn match_on_variant_dispatches_via_brand() {
     let result = eval_doc(
-        r#"{
-            #schema N Enum<
-                Email { address: String },
-                Push,
-            >,
+        r#"#enum N { Email { address: String }, Push }
+        {
             msg: N.Email { address: "a@b.c" },
             out: msg match {
                 Email: f"emailed ${msg.address}",
@@ -2269,29 +2257,6 @@ fn match_on_variant_dispatches_via_brand() {
         d.map.get("out").unwrap(),
         &Value::String("emailed a@b.c".into())
     );
-}
-
-#[test]
-fn untagged_enum_string_literal_still_validates() {
-    // Regression: classic `Enum<"up", "down">` must keep working.
-    let result = eval_doc(
-        r#"{
-            #schema Status: { String mode: Enum<"up", "down"> },
-            Status s: { mode: "up" }
-        }"#,
-    );
-    assert!(result.is_ok(), "{:?}", result);
-}
-
-#[test]
-fn untagged_enum_type_set_still_validates() {
-    let result = eval_doc(
-        r#"{
-            #schema Theme: { id: Enum<Int, String> },
-            Theme t: { id: 7 }
-        }"#,
-    );
-    assert!(result.is_ok(), "{:?}", result);
 }
 
 #[test]
@@ -2586,7 +2551,7 @@ fn private_field_is_not_visible_through_alias_import() {
 
 #[test]
 fn private_field_is_skipped_by_import_spread() {
-    // `@import(..., spread=true)` copies the module's exported keys
+    // `#import * from ...` copies the module's exported keys
     // into the importing scope. Private fields aren't in that export,
     // so they don't appear in the spread either.
     let dir = std::env::temp_dir().join(format!("relon-private-spread-{}", std::process::id()));
@@ -3426,30 +3391,6 @@ fn v1_5_strict_typed_list_comp_silent() {
 // ---------- Generic schema tests (Phase 7) ----------
 
 #[test]
-fn user_defined_generic_enum_schema_lowers_with_generics() {
-    // `#schema Box<T> Enum<Wrap { value: T }>` lowers to a
-    // `Value::EnumSchema` whose `generics` vector carries the
-    // declared parameter names. The variant's payload type still
-    // mentions the bare `T` (substitution happens at the use site).
-    let result = eval_doc(
-        r#"{
-            #schema Box<T> Enum<Wrap { value: T }>,
-            value: Box.Wrap { value: 42 }
-        }"#,
-    )
-    .unwrap();
-    let Value::Dict(outer) = result else {
-        panic!("dict")
-    };
-    let Value::Dict(b) = outer.map.get("value").unwrap() else {
-        panic!("variant dict")
-    };
-    assert_eq!(b.brand.as_deref(), Some("Wrap"));
-    assert_eq!(b.variant_of.as_deref(), Some("Box"));
-    assert_eq!(b.map.get("value"), Some(&Value::Int(42)));
-}
-
-#[test]
 fn builtin_result_schema_is_seeded_at_startup() {
     // `Result.Ok { ... }` is reachable without any user-side
     // `#schema Result<...>` declaration — the prelude seeds it into
@@ -3569,24 +3510,6 @@ fn generic_option_field_type_substitutes_payload() {
         matches!(&result, Err(RuntimeError::TypeMismatch { .. })),
         "expected TypeMismatch for String value where T=Int, got {result:?}"
     );
-}
-
-#[test]
-fn user_can_override_prelude_option_schema() {
-    // A user-defined `#schema Option ...` should shadow the prelude's
-    // entry. Prove it by giving Option a non-prelude variant `Many`.
-    let result = eval_doc(
-        r#"{
-            #schema Option Enum<Many { items: List }>,
-            v: Option.Many { items: [1, 2] }
-        }"#,
-    )
-    .unwrap();
-    let Value::Dict(outer) = result else { panic!() };
-    let Value::Dict(many) = outer.map.get("v").unwrap() else {
-        panic!()
-    };
-    assert_eq!(many.brand.as_deref(), Some("Many"));
 }
 
 // =====================================================================
@@ -3857,9 +3780,30 @@ fn v12_root_atomic_bool() {
 }
 
 #[test]
-fn v12_root_atomic_null() {
-    let result = eval_doc("null").unwrap();
-    assert_eq!(result, Value::Null);
+fn root_null_literal_is_rejected() {
+    let result = eval_doc("null");
+    assert!(
+        matches!(result, Err(RuntimeError::ValidationError(ref message, _)) if message.contains("not a Relon value")),
+        "expected null literal rejection, got {result:?}"
+    );
+}
+
+#[test]
+fn to_json_projects_option_none_to_json_null() {
+    let result = eval_doc("to_json(Option.None {})").expect("eval");
+    match result {
+        Value::String(s) => assert_eq!(s.as_str(), "null"),
+        other => panic!("expected JSON string, got {other:?}"),
+    }
+}
+
+#[test]
+fn to_json_rejects_runtime_only_values() {
+    let result = eval_doc("to_json((n) => n)");
+    assert!(
+        matches!(result, Err(RuntimeError::ValidationError(ref message, _)) if message.contains("to_json cannot serialise Closure")),
+        "expected to_json closure rejection, got {result:?}"
+    );
 }
 
 #[test]
@@ -5921,8 +5865,8 @@ fn iter_next_on_dict_yields_key_sorted_entries() {
 /// schema derives `Indexable` and supplies an `index(key) -> Option<V>`
 /// body desugars to a `.index(i)` method call. The evaluator unwraps
 /// the returned `Option`: a `Some { value }` becomes the inner value;
-/// a `None` becomes `Null` when the access used `a[i]?`, or surfaces
-/// a `VariableNotFound` when it didn't.
+/// a `None` stays `Option.None {}` when the access used `a[i]?`, or
+/// surfaces a `VariableNotFound` when it didn't.
 ///
 /// Covers all three legs of the Optional protocol — Some payload,
 /// `?`-unwrapped None, and (separately) the no-`?` None error.
@@ -5931,7 +5875,7 @@ fn indexable_lowering_dispatches_through_index_method() {
     use std::collections::HashMap;
     // Optional-bracket syntax is the *prefix* `?[expr]` form, mirroring
     // the path-tail prefix `?.field` convention. The witness's
-    // `Option.None` becomes `Value::Null` at this site; without the `?`
+    // `Option.None` stays an Option value at this site; without the `?`
     // it would surface as `VariableNotFound` (covered in the
     // companion test below).
     let source = r#"#schema Bag {
@@ -5981,9 +5925,8 @@ fn indexable_lowering_dispatches_through_index_method() {
     assert_eq!(d.map.get("first"), Some(&Value::Int(10)));
     assert_eq!(d.map.get("second"), Some(&Value::Int(20)));
     // `a[i]?` on an out-of-range key flows the witness's
-    // `Option.None` through the Optional-unwrap protocol and lands as
-    // `Null` at the call site.
-    assert_eq!(d.map.get("missing"), Some(&Value::Null));
+    // `Option.None` through unchanged.
+    assert!(d.map.get("missing").is_some_and(Value::is_option_none));
 }
 
 /// Decision 22: `a[i]` without the `?` flag on a missing key (witness
@@ -6356,9 +6299,8 @@ fn fused_list_sum_range_falls_through_when_list_shadowed() {
 }
 
 // ---------------------------------------------------------------------
-// Wave T1: tuple oracle (tree-walk) semantics. The tree-walk evaluator
-// is the gold oracle that the four-way compiled backends (T2) will
-// match. A tuple constructs to a positional `Value::Tuple`; JSON output
+// Tuple tree-walk semantics. The tree-walk evaluator is the reference
+// behaviour that compiled backends should match. A tuple constructs to a positional `Value::Tuple`; JSON output
 // is still a positional array byte-identical to the equivalent list.
 // ---------------------------------------------------------------------
 

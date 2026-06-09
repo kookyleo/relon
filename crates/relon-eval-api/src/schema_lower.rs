@@ -8,7 +8,7 @@
 //! pipeline reasons about; this module strips it down to the field
 //! `(name, type)` pairs the binary layout cares about.
 //!
-//! Phase 2.b scope: only `Int` / `Float` / `Bool` / `Null` field types
+//! Phase 2.b scope: only `Int` / `Float` / `Bool` field types
 //! are supported by [`lower_schema_def`]; the function is used to
 //! lower the synthesised `MainParams` schema. Pointer-indirect leaves
 //! (`String`, `List<Int>`) and nested branded schemas are constructed
@@ -27,7 +27,7 @@ pub enum SchemaLowerError {
     /// model. The string in `ty` is the type head as written in
     /// source (e.g. `"String"`, `"List<Int>"`), so the user sees
     /// the exact annotation that triggered the gap.
-    #[error("field `{field}` has unsupported type `{ty}` (Phase 2.b layout supports Int / Float / Bool / Null only)")]
+    #[error("field `{field}` has unsupported type `{ty}` (Phase 2.b layout supports Int / Float / Bool only)")]
     UnsupportedFieldType {
         /// Field name that triggered the error.
         field: String,
@@ -106,7 +106,6 @@ pub fn lower_type_node(field_name: &str, ty: &TypeNode) -> Result<TypeRepr, Sche
         "Int" => Ok(TypeRepr::Int),
         "Float" => Ok(TypeRepr::Float),
         "Bool" => Ok(TypeRepr::Bool),
-        "Null" => Ok(TypeRepr::Null),
         _ => Err(unsupported()),
     }
 }
@@ -194,23 +193,32 @@ mod tests {
     }
 
     #[test]
-    fn lowers_int_float_bool_null() {
+    fn lowers_int_float_bool() {
         let def = schema_def(
             "Mix",
             vec![
                 field("a", type_node("Int")),
                 field("b", type_node("Float")),
                 field("c", type_node("Bool")),
-                field("d", type_node("Null")),
             ],
         );
         let s = lower_schema_def(&def, "fallback").expect("lower");
         assert_eq!(s.name, "Mix");
-        assert_eq!(s.fields.len(), 4);
+        assert_eq!(s.fields.len(), 3);
         assert_eq!(s.fields[0].ty, TypeRepr::Int);
         assert_eq!(s.fields[1].ty, TypeRepr::Float);
         assert_eq!(s.fields[2].ty, TypeRepr::Bool);
-        assert_eq!(s.fields[3].ty, TypeRepr::Null);
+    }
+
+    #[test]
+    fn rejects_unknown_field_type() {
+        let def = schema_def("S", vec![field("custom", type_node("Bytes"))]);
+        let err = lower_schema_def(&def, "fallback").expect_err("must reject");
+        assert!(matches!(
+            err,
+            SchemaLowerError::UnsupportedFieldType { ref field, ref ty }
+            if field == "custom" && ty == "Bytes"
+        ));
     }
 
     #[test]

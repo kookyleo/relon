@@ -64,7 +64,10 @@
 use crate::ast;
 use crate::cst::Parse;
 use crate::syntax::{SyntaxKind, SyntaxNode};
-use crate::{position_at_source, Expr, Node, ParseDocumentError, RefBase, TokenKey, TokenRange};
+use crate::{
+    position_at_source, Expr, Node, ParseDocumentError, PatternBinding, RefBase, TokenKey,
+    TokenRange,
+};
 
 // Strict vs recovering lowering: when a sub-tree fails to lower
 // (malformed DICT_FIELD, rejected schema-method shape, unknown
@@ -123,7 +126,7 @@ impl Drop for RecoveringScope {
 //
 //   helper / construct           | status              | notes
 //   -----------------------------|---------------------|--------------------------------------------
-//   atoms                        | done (CST walk)     | null/bool inline, NUMBER/STRING leaf parser
+//   atoms                        | done (CST walk)     | bool inline, NUMBER/STRING leaf parser; removed `null` lowers to Missing
 //   variable / reference         | done (CST walk)     | `walk_path_tokens` w/ builtin-name → Type promotion
 //   spread (atomic position)     | done (CST walk)     | `lower_spread_expr_v2`
 //   list + comprehension         | done (CST walk)     | leading directive/decorator collection
@@ -406,9 +409,9 @@ fn lower_atom_via_legacy(node: &SyntaxNode, source: &str) -> Option<Node> {
 }
 
 /// Lower a `LITERAL` CST node to the corresponding `Node`. The
-/// CST groups null / true / false / NUMBER / STRING under a single
-/// LITERAL kind; we dispatch by inspecting the inner token. Bool
-/// and null are inlined; number and string keep delegating to the
+/// CST groups true / false / NUMBER / STRING and the removed `null`
+/// spelling under a single LITERAL kind; we dispatch by inspecting the
+/// inner token. Bool literals are inlined; number and string keep delegating to the
 /// prim combinators (escape decoding / overflow handling lives
 /// there). Either way the leaf parser runs on the exact token
 /// bytes — no recursion through `parse_expr` happens here.
@@ -428,7 +431,7 @@ fn lower_literal_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
     let range = range_from_offsets(source, start, end);
     match token.kind() {
         SyntaxKind::IDENT => match token.text() {
-            "null" => Some(Node::new(Expr::Null, range)),
+            "null" => Some(Node::new(Expr::Missing, range)),
             "true" => Some(Node::new(Expr::Bool(true), range)),
             "false" => Some(Node::new(Expr::Bool(false), range)),
             "Infinity" => Some(Node::new(
@@ -479,7 +482,7 @@ fn lower_variable_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
     let end: usize = r.end().into();
     let path = walk_path_tokens(node, source, /*is_reference=*/ false)?;
     // Legacy `parse_type_expr` upgrades a single-segment builtin-name
-    // path (`Int` / `String` / `Bool` / ... / `Enum`) to `Expr::Type`
+    // path (`Int` / `String` / `Bool` / ... ) to `Expr::Type`
     // unconditionally — the CST emits VARIABLE_EXPR for the bare-
     // bareword form (no generics, no `?`) but the analyzer / evaluator
     // expect the Type shape so the rest of the pipeline can flow.
@@ -487,7 +490,7 @@ fn lower_variable_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
         if let TokenKey::String(name, name_range, false) = &path[0] {
             if matches!(
                 name.as_str(),
-                "Int" | "String" | "Bool" | "Any" | "Null" | "List" | "Dict" | "Enum"
+                "Int" | "String" | "Bool" | "Any" | "List" | "Dict"
             ) {
                 let t = crate::TypeNode {
                     path: vec![name.clone()],
@@ -749,6 +752,7 @@ fn lower_directive_v2(dir: &ast::Directive, source: &str) -> Option<crate::Direc
         crate::DirectiveShape::Bare => crate::DirectiveBody::Bare,
         crate::DirectiveShape::Value => lower_directive_value_body(node, source)?,
         crate::DirectiveShape::NameBody => lower_directive_name_body(node, source)?,
+        crate::DirectiveShape::Enum => lower_directive_enum_body(node, source)?,
         crate::DirectiveShape::Import => lower_directive_import_body(node, source)?,
         crate::DirectiveShape::Main => lower_directive_main_body(node, source)?,
     };
@@ -1347,6 +1351,134 @@ fn lower_directive_name_body(node: &SyntaxNode, source: &str) -> Option<crate::D
     })
 }
 
+fn lower_directive_enum_body(node: &SyntaxNode, source: &str) -> Option<crate::DirectiveBody> {
+    let mut after_dir_name = false;
+    let mut declared_name: Option<(String, TokenRange)> = None;
+    let mut in_generics = false;
+    let mut before_body = true;
+    let mut generics: Vec<String> = Vec::new();
+
+    for el in node.children_with_tokens() {
+        let rowan::NodeOrToken::Token(t) = el else {
+            continue;
+        };
+        match t.kind() {
+            SyntaxKind::WHITESPACE
+            | SyntaxKind::LINE_COMMENT
+            | SyntaxKind::BLOCK_COMMENT
+            | SyntaxKind::HASH
+            | SyntaxKind::COMMA => continue,
+            SyntaxKind::L_BRACE => {
+                before_body = false;
+                in_generics = false;
+            }
+            SyntaxKind::IDENT => {
+                if !after_dir_name {
+                    after_dir_name = true;
+                    continue;
+                }
+                if declared_name.is_none() {
+                    let tr = t.text_range();
+                    let s: usize = tr.start().into();
+                    let e: usize = tr.end().into();
+                    declared_name = Some((t.text().to_string(), range_from_offsets(source, s, e)));
+                    continue;
+                }
+                if before_body && in_generics {
+                    generics.push(t.text().to_string());
+                }
+            }
+            SyntaxKind::LT if before_body => in_generics = true,
+            SyntaxKind::GT if before_body => in_generics = false,
+            _ => {}
+        }
+    }
+
+    let (name, name_range) = declared_name?;
+    let mut variants = Vec::new();
+    for child in node
+        .children()
+        .filter(|c| c.kind() == SyntaxKind::ENUM_VARIANT)
+    {
+        variants.push(lower_enum_directive_variant(&child, source)?);
+    }
+
+    let r = node.text_range();
+    let start: usize = r.start().into();
+    let end: usize = r.end().into();
+    let range = range_from_offsets(source, start, end);
+    let enum_type = crate::TypeNode {
+        path: vec![crate::INTERNAL_ENUM_TYPE_NAME.to_string()],
+        generics: variants,
+        is_optional: false,
+        range,
+        variant_fields: None,
+        doc_comment: None,
+    };
+    let body = Box::new(crate::Node {
+        id: crate::NodeId::alloc(),
+        expr: std::sync::Arc::new(crate::Expr::Type(enum_type)),
+        decorators: Vec::new(),
+        directives: Vec::new(),
+        type_hint: None,
+        range,
+        doc_comment: None,
+    });
+
+    Some(crate::DirectiveBody::NameBody {
+        name,
+        name_range,
+        generics,
+        body,
+        methods: Vec::new(),
+        schema_no_auto_derives: Vec::new(),
+    })
+}
+
+fn lower_enum_directive_variant(node: &SyntaxNode, source: &str) -> Option<crate::TypeNode> {
+    let name_token = node
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .find(|t| t.kind() == SyntaxKind::IDENT)?;
+    let name = name_token.text().to_string();
+    let mut fields: Vec<(String, crate::TypeNode)> = Vec::new();
+
+    for field_node in node
+        .children()
+        .filter(|c| c.kind() == SyntaxKind::ENUM_VARIANT_FIELD)
+    {
+        let field_name = field_node
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .find(|t| t.kind() == SyntaxKind::IDENT)
+            .map(|t| t.text().to_string())?;
+        let ty = field_node.children().find_map(|c| match c.kind() {
+            SyntaxKind::TYPE_NODE | SyntaxKind::TUPLE_TYPE => lower_type_node_from_cst(&c, source),
+            _ => None,
+        })?;
+        fields.push((field_name, ty));
+    }
+
+    if let Some(tuple_node) = node.children().find(|c| c.kind() == SyntaxKind::TUPLE_TYPE) {
+        let tuple_ty = lower_type_node_from_cst(&tuple_node, source)?;
+        for (idx, ty) in tuple_ty.generics.into_iter().enumerate() {
+            fields.push((idx.to_string(), ty));
+        }
+    }
+
+    let r = node.text_range();
+    let start: usize = r.start().into();
+    let end: usize = r.end().into();
+    Some(crate::TypeNode {
+        path: vec![name],
+        generics: Vec::new(),
+        is_optional: false,
+        range: range_from_offsets(source, start, end),
+        variant_fields: Some(fields),
+        doc_comment: None,
+    })
+}
+
 /// Walk a SCHEMA_WITH CST node into the `(methods, schema_no_auto_derives)`
 /// pair the legacy `DirectiveBody::NameBody` carries.
 ///
@@ -1596,8 +1728,6 @@ fn directive_constraint_name(node: &SyntaxNode) -> Option<String> {
 ///    `List<Dict<String, Int>>`
 ///  * Optional `?` suffix
 ///  * Tuple types: `()`, `(T,)`, `(T1, T2)`
-///  * `Enum<Variant, Other { field: T }>` — emitting variant_fields
-///    on the variant alternative TypeNodes.
 fn lower_type_node_from_cst(node: &SyntaxNode, source: &str) -> Option<crate::TypeNode> {
     let r = node.text_range();
     // The legacy `parse_type_node` starts after `parse_leading_comments`,
@@ -1639,8 +1769,6 @@ fn lower_type_node_from_cst(node: &SyntaxNode, source: &str) -> Option<crate::Ty
     let mut is_optional = false;
     let mut after_path = false;
     let mut generics: Vec<crate::TypeNode> = Vec::new();
-    let mut is_enum_head = false;
-
     for el in node.children_with_tokens() {
         match el {
             rowan::NodeOrToken::Token(t) => match t.kind() {
@@ -1659,9 +1787,6 @@ fn lower_type_node_from_cst(node: &SyntaxNode, source: &str) -> Option<crate::Ty
                 SyntaxKind::LT => {
                     after_path = true;
                     in_generics = true;
-                    if path.len() == 1 && path[0] == "Enum" {
-                        is_enum_head = true;
-                    }
                 }
                 SyntaxKind::GT => {
                     in_generics = false;
@@ -1674,39 +1799,11 @@ fn lower_type_node_from_cst(node: &SyntaxNode, source: &str) -> Option<crate::Ty
             rowan::NodeOrToken::Node(n) => {
                 if in_generics && matches!(n.kind(), SyntaxKind::TYPE_NODE | SyntaxKind::TUPLE_TYPE)
                 {
-                    let mut g = lower_type_node_from_cst(&n, source)?;
-                    if is_enum_head {
-                        attach_enum_variant_fields(&mut g, &n, source);
-                    }
-                    generics.push(g);
-                } else if !in_generics && n.kind() == SyntaxKind::DICT {
-                    // This shouldn't happen for a regular TYPE_NODE —
-                    // DICT children are inside Enum variant alternatives,
-                    // not directly under TYPE_NODE.
-                    continue;
+                    generics.push(lower_type_node_from_cst(&n, source)?);
                 }
             }
         }
     }
-    // For Enum heads without any variant-struct alternative, clear
-    // the tentative unit-variant markers so the rest of the pipeline
-    // treats this as a classic untagged enum.
-    if is_enum_head {
-        // Bare unit-variants stay marked (legacy `parse_enum_alternative`
-        // sets `variant_fields = Some(vec![])` for them). If no
-        // generic actually carries a struct body, clear the
-        // tentative markers so downstream treats this as a classic
-        // untagged enum — matching the legacy fallthrough behaviour.
-        let any_struct_form = generics
-            .iter()
-            .any(|g| g.variant_fields.as_ref().is_some_and(|f| !f.is_empty()));
-        if !any_struct_form {
-            for g in &mut generics {
-                g.variant_fields = None;
-            }
-        }
-    }
-
     if path.is_empty() {
         return None;
     }
@@ -1718,96 +1815,6 @@ fn lower_type_node_from_cst(node: &SyntaxNode, source: &str) -> Option<crate::Ty
         variant_fields: None,
         doc_comment: None,
     })
-}
-
-/// Apply the enum-variant-struct detection rules to a single generic
-/// argument under an `Enum<...>` head. Mutates `g.variant_fields` in
-/// place when the generic is a unit variant (bare IDENT) or a
-/// struct-bodied variant (`Email { field: T }`); also extends `g.range`
-/// to cover the trailing `{...}` body so downstream consumers see the
-/// full source span. Extracted from `lower_type_node_from_cst` to keep
-/// that function's main flow at one nesting level.
-fn attach_enum_variant_fields(g: &mut crate::TypeNode, n: &SyntaxNode, source: &str) {
-    // Bare single-segment IDENT-headed Enum alternative is a unit
-    // variant. Legacy `parse_enum_alternative` calls `id` (IDENT-only)
-    // first; if that fails (e.g. for STRING-headed `"hot"`) it falls
-    // through to `parse_type_node` and never marks it as a variant.
-    // We replicate by checking the first non-trivia token of `n`.
-    let first_tok = n.children_with_tokens().find_map(|el| {
-        el.into_token().filter(|t| {
-            !matches!(
-                t.kind(),
-                SyntaxKind::WHITESPACE | SyntaxKind::LINE_COMMENT | SyntaxKind::BLOCK_COMMENT
-            )
-        })
-    });
-    let ident_headed = first_tok
-        .map(|t| t.kind() == SyntaxKind::IDENT)
-        .unwrap_or(false);
-    if ident_headed
-        && g.path.len() == 1
-        && g.generics.is_empty()
-        && !g.is_optional
-        && g.variant_fields.is_none()
-    {
-        g.variant_fields = Some(Vec::new());
-    }
-    let Some(next) = n.next_sibling() else {
-        return;
-    };
-    if next.kind() != SyntaxKind::DICT {
-        return;
-    }
-    // Extend the variant TypeNode's range to cover the body `{...}`
-    // — legacy `parse_enum_alternative` captures
-    // `range = start_offset..end_offset` where end_offset is after `}`.
-    let dict_end: usize = next.text_range().end().into();
-    g.range = range_from_offsets(source, g.range.start.offset, dict_end);
-    let mut fields: Vec<(String, crate::TypeNode)> = Vec::new();
-    for f in next
-        .children()
-        .filter(|c| c.kind() == SyntaxKind::DICT_FIELD)
-    {
-        let name = f
-            .children_with_tokens()
-            .filter_map(|el| el.into_token())
-            .find(|t| t.kind() == SyntaxKind::IDENT)
-            .map(|t| t.text().to_string());
-        let ty = f.children().find_map(|c| match c.kind() {
-            SyntaxKind::TYPE_NODE | SyntaxKind::TUPLE_TYPE => lower_type_node_from_cst(&c, source),
-            SyntaxKind::VARIABLE_EXPR => {
-                // Legacy `parse_variant_field` always calls
-                // `parse_type_node`; the CST sometimes emits a
-                // VARIABLE_EXPR for bare identifiers (`T`). Mirror
-                // by building a TypeNode from the IDENT-only path.
-                let segs: Vec<String> = c
-                    .children_with_tokens()
-                    .filter_map(|el| el.into_token())
-                    .filter(|t| t.kind() == SyntaxKind::IDENT)
-                    .map(|t| t.text().to_string())
-                    .collect();
-                if segs.is_empty() {
-                    return None;
-                }
-                let r = c.text_range();
-                let s: usize = r.start().into();
-                let e: usize = r.end().into();
-                Some(crate::TypeNode {
-                    path: segs,
-                    generics: Vec::new(),
-                    is_optional: false,
-                    range: range_from_offsets(source, s, e),
-                    variant_fields: None,
-                    doc_comment: None,
-                })
-            }
-            _ => None,
-        });
-        if let (Some(name), Some(ty)) = (name, ty) {
-            fields.push((name, ty));
-        }
-    }
-    g.variant_fields = Some(fields);
 }
 
 /// Find the offset of the first non-trivia child element (token or
@@ -2324,9 +2331,8 @@ fn lower_dict_field(node: &SyntaxNode, source: &str) -> Option<DictFieldOut> {
                         // Leading typed-key hint.
                         type_hint = Some(lower_type_node_from_cst(&n, source)?);
                     } else if !in_brack && saw_dict_field_colon && value_expr_ast.is_none() {
-                        // TYPE_NODE in value position (`key: SomeType`
-                        // or `key: Enum<...>`). Cast as an Expr::Type-
-                        // shaped value.
+                        // TYPE_NODE in value position (`key: SomeType`).
+                        // Cast as an Expr::Type-shaped value.
                         if let Some(e) = ast::Expr::cast(n) {
                             value_expr_ast = Some(e);
                         }
@@ -2506,7 +2512,7 @@ fn lower_dict_field(node: &SyntaxNode, source: &str) -> Option<DictFieldOut> {
         // shares the `Arc` earlier — defensive belt-and-braces.
         let owned_expr = std::sync::Arc::try_unwrap(std::mem::replace(
             &mut cls_node.expr,
-            std::sync::Arc::new(Expr::Null),
+            std::sync::Arc::new(Expr::Missing),
         ))
         .unwrap_or_else(|shared| (*shared).clone());
         cls_node.expr = match owned_expr {
@@ -2588,14 +2594,14 @@ fn lower_list_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
                     let item_opt = lower_expr_v2(&e, source);
                     let mut item = match item_opt {
                         Some(n) => n,
-                        // Recovering mode: substitute a Null
+                        // Recovering mode: substitute a Missing
                         // placeholder so the list's ordinal positions
                         // stay stable. Strict mode: bail.
                         None if is_recovering() => {
                             let r = child.text_range();
                             let start_o: usize = r.start().into();
                             let end_o: usize = r.end().into();
-                            Node::new(Expr::Null, range_from_offsets(source, start_o, end_o))
+                            Node::new(Expr::Missing, range_from_offsets(source, start_o, end_o))
                         }
                         None => return None,
                     };
@@ -2620,7 +2626,7 @@ fn lower_list_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
 /// are the element expressions; `()` yields `Expr::Tuple(vec![])`. Unlike
 /// a list, a tuple never carries spreads or decorators on its elements,
 /// so the walk is a straight expression collect (with the recovering-mode
-/// Null-placeholder substitution that keeps ordinal positions stable).
+/// Missing-placeholder substitution that keeps ordinal positions stable).
 fn lower_tuple_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
     let r = node.text_range();
     let start: usize = r.start().into();
@@ -2634,7 +2640,7 @@ fn lower_tuple_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
                     let cr = child.text_range();
                     let start_o: usize = cr.start().into();
                     let end_o: usize = cr.end().into();
-                    Node::new(Expr::Null, range_from_offsets(source, start_o, end_o))
+                    Node::new(Expr::Missing, range_from_offsets(source, start_o, end_o))
                 }
                 None => return None,
             };
@@ -3142,17 +3148,124 @@ fn lower_match_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
         .children()
         .filter(|c| c.kind() == SyntaxKind::MATCH_ARM)
     {
-        let mut arm_exprs = arm.children().filter_map(ast::Expr::cast);
-        let pat_ast = arm_exprs.next()?;
-        let body_ast = arm_exprs.next()?;
-        let pattern = lower_expr_v2(&pat_ast, source)?;
-        let body = lower_expr_v2(&body_ast, source)?;
-        arms.push((pattern, body));
+        let mut pattern: Option<Node> = None;
+        let mut body: Option<Node> = None;
+        for child in arm.children() {
+            match child.kind() {
+                SyntaxKind::MATCH_PATTERN => {
+                    pattern = Some(lower_match_pattern_v2(&child, source)?);
+                }
+                SyntaxKind::WILDCARD if pattern.is_none() => {
+                    let pat_ast = ast::Expr::cast(child)?;
+                    pattern = Some(lower_expr_v2(&pat_ast, source)?);
+                }
+                _ => {
+                    if let Some(expr_ast) = ast::Expr::cast(child) {
+                        let lowered = lower_expr_v2(&expr_ast, source)?;
+                        if pattern.is_none() {
+                            pattern = Some(lowered);
+                        } else if body.is_none() {
+                            body = Some(lowered);
+                        }
+                    }
+                }
+            }
+        }
+        arms.push((pattern?, body?));
     }
     Some(Node::new(
         Expr::Match {
             expr: scrutinee,
             arms,
+        },
+        range_from_offsets(source, start, end),
+    ))
+}
+
+fn lower_match_pattern_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
+    let r = node.text_range();
+    let start: usize = r.start().into();
+    let end: usize = r.end().into();
+    let mut tokens = node
+        .children_with_tokens()
+        .filter_map(|el| el.into_token())
+        .filter(|tok| !tok.kind().is_trivia())
+        .peekable();
+
+    let mut path: Vec<String> = Vec::new();
+    let first = tokens.next()?;
+    if first.kind() != SyntaxKind::IDENT {
+        return None;
+    }
+    path.push(first.text().to_string());
+    while matches!(tokens.peek().map(|t| t.kind()), Some(SyntaxKind::DOT)) {
+        tokens.next();
+        let ident = tokens.next()?;
+        if ident.kind() != SyntaxKind::IDENT {
+            return None;
+        }
+        path.push(ident.text().to_string());
+    }
+    let variant = path.pop()?;
+    let enum_path = path;
+    let mut bindings = Vec::new();
+
+    match tokens.peek().map(|t| t.kind()) {
+        Some(SyntaxKind::L_PAREN) => {
+            tokens.next();
+            for tok in tokens.by_ref() {
+                match tok.kind() {
+                    SyntaxKind::R_PAREN => break,
+                    SyntaxKind::COMMA => continue,
+                    SyntaxKind::STAR => bindings.push(PatternBinding {
+                        field: None,
+                        binding: None,
+                    }),
+                    SyntaxKind::IDENT => bindings.push(PatternBinding {
+                        field: None,
+                        binding: Some(tok.text().to_string()),
+                    }),
+                    _ => return None,
+                }
+            }
+        }
+        Some(SyntaxKind::L_BRACE) => {
+            tokens.next();
+            while let Some(tok) = tokens.next() {
+                match tok.kind() {
+                    SyntaxKind::R_BRACE => break,
+                    SyntaxKind::COMMA => continue,
+                    SyntaxKind::IDENT => {
+                        let field = tok.text().to_string();
+                        let binding =
+                            if matches!(tokens.peek().map(|t| t.kind()), Some(SyntaxKind::COLON)) {
+                                tokens.next();
+                                let bind_tok = tokens.next()?;
+                                match bind_tok.kind() {
+                                    SyntaxKind::STAR => None,
+                                    SyntaxKind::IDENT => Some(bind_tok.text().to_string()),
+                                    _ => return None,
+                                }
+                            } else {
+                                Some(field.clone())
+                            };
+                        bindings.push(PatternBinding {
+                            field: Some(field),
+                            binding,
+                        });
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        _ => {}
+    }
+
+    Some(Node::new(
+        Expr::VariantPattern {
+            enum_path,
+            variant,
+            bindings,
         },
         range_from_offsets(source, start, end),
     ))
@@ -3285,7 +3398,7 @@ pub fn lower_document_node_v2(doc: &ast::Document, source: &str) -> Option<Node>
             let placeholder_expr = match root_ast.syntax().kind() {
                 SyntaxKind::DICT => Expr::Dict(Vec::new()),
                 SyntaxKind::LIST => Expr::List(Vec::new()),
-                _ => Expr::Null,
+                _ => Expr::Missing,
             };
             Node::new(placeholder_expr, range_from_offsets(source, start_o, end_o))
         }
@@ -3540,13 +3653,14 @@ mod tests {
             }
             Expr::Closure { body, .. } => strip_node_ids(body),
             Expr::VariantCtor { body, .. } => strip_node_ids(body),
-            Expr::Null
+            Expr::Missing
             | Expr::Bool(_)
             | Expr::Int(_)
             | Expr::Float(_)
             | Expr::String(_)
             | Expr::Type(_)
-            | Expr::Wildcard => {}
+            | Expr::Wildcard
+            | Expr::VariantPattern { .. } => {}
         }
         for dec in &mut node.decorators {
             for arg in &mut dec.args {
@@ -3742,7 +3856,6 @@ mod tests {
             "[1, 2, 3]",
             "42",
             "true",
-            "null",
             "1 + 2",
             r#""hello""#,
             "range(0, 10)",

@@ -47,8 +47,9 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum TypeRepr {
-    /// `Null` — the unit type.
-    Null,
+    /// Internal unit slot. New source schemas should use `Option<T>`
+    /// or `T?` for absence instead of producing this type.
+    Unit,
     /// `Bool` — a 0/1 byte.
     Bool,
     /// `Int` — a signed 64-bit integer.
@@ -73,6 +74,16 @@ pub enum TypeRepr {
         ok: Box<TypeRepr>,
         /// `Err` payload type.
         err: Box<TypeRepr>,
+    },
+    /// User-defined Rust-like `#enum Name { ... }`. The binary ABI is a
+    /// variant record: one tag byte plus an optional payload slot. Struct
+    /// and tuple variant payloads are represented as ordinary schemas, with
+    /// tuple payloads marked by [`EnumVariant::is_tuple`].
+    Enum {
+        /// Enum type name.
+        name: String,
+        /// Variants in declaration/tag order.
+        variants: Vec<EnumVariant>,
     },
     /// Inline reference to a named nested schema. The hash flattens
     /// the nested structure rather than recording the name, so two
@@ -134,6 +145,42 @@ pub struct Field {
     pub default: Option<serde_json::Value>,
 }
 
+/// One variant in a canonical `#enum` description.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnumVariant {
+    /// Variant name as declared in source.
+    pub name: String,
+    /// Stable ABI tag. Tags are assigned in declaration order and must fit
+    /// in one byte for the current variant-record layout.
+    pub tag: u8,
+    /// Payload fields. Empty means a unit variant.
+    pub fields: Vec<Field>,
+    /// `true` when the payload came from a tuple variant, e.g.
+    /// `Rgb(Int, Int, Int)`. Field names are then synthetic decimal
+    /// indices (`"0"`, `"1"`, ...), and host JSON projection emits an
+    /// array payload.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_tuple: bool,
+}
+
+impl EnumVariant {
+    /// Build the record schema used for this variant's payload. Tuple
+    /// variants deliberately use a normal record schema with numeric field
+    /// names, because `Value::variant_dict` stores tuple payloads as a dict;
+    /// JSON projection recognizes those numeric keys and emits an array.
+    pub fn payload_schema(&self, enum_name: &str) -> Option<Schema> {
+        if self.fields.is_empty() {
+            return None;
+        }
+        Some(Schema {
+            name: format!("{enum_name}.{}", self.name),
+            generics: Vec::new(),
+            fields: self.fields.clone(),
+            is_tuple: false,
+        })
+    }
+}
+
 /// Canonical schema description. Field order is preserved exactly as
 /// declared; see the module docs for the rationale.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +210,24 @@ pub struct Schema {
     /// canonical bytes — and therefore its ABI hash — stay unchanged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_tuple: bool,
+}
+
+impl TypeRepr {
+    /// Return a custom enum variant by ABI tag.
+    pub fn enum_variant_by_tag(&self, tag: u8) -> Option<&EnumVariant> {
+        match self {
+            TypeRepr::Enum { variants, .. } => variants.iter().find(|v| v.tag == tag),
+            _ => None,
+        }
+    }
+
+    /// Return a custom enum variant by source name.
+    pub fn enum_variant_by_name(&self, variant_name: &str) -> Option<&EnumVariant> {
+        match self {
+            TypeRepr::Enum { variants, .. } => variants.iter().find(|v| v.name == variant_name),
+            _ => None,
+        }
+    }
 }
 
 impl Schema {
@@ -209,12 +274,11 @@ impl Schema {
 ///   order can't poison the hash even when `BTreeMap` / `HashMap`
 ///   internals reshuffle between minor releases),
 /// * no whitespace (compact form),
-/// * a top-level `"version": 2` marker so future canonical-form
+/// * a top-level `"version": 3` marker so future canonical-form
 ///   evolutions can bump and stay distinguishable. Phase F.2 lifted
-///   v1 → v2 when adding the [`TypeRepr::Closure`] variant: pre-Phase-F
-///   schemas serialise an enum tag set the new decoders don't
-///   recognise, so the version bump lets a host SDK refuse to load a
-///   module whose digest was computed against the older variant set.
+///   v1 -> v2 when adding the [`TypeRepr::Closure`] variant; v3 adds
+///   [`TypeRepr::Enum`] so custom `#enum` boundary shapes are explicit
+///   in the hash.
 ///
 /// Field order inside [`Schema::fields`] is **not** sorted — the
 /// `Vec<Field>` is serialised in the order callers declared, matching
@@ -227,7 +291,7 @@ pub fn canonical_schema(schema: &Schema) -> Vec<u8> {
     // structure when constructed via `json!`, which gives us the
     // sorted-keys property without us writing a custom serializer.
     let value = serde_json::json!({
-        "version": 2,
+        "version": 3,
         "schema": schema,
     });
     // `serde_json::to_vec` on a `serde_json::Value` produces compact

@@ -72,12 +72,12 @@ fn expected_encoding(ty: EmittedFieldType) -> Encoding {
             ret_rust_ty: "bool",
             ret_value_ctor: "RetValue::Bool",
         },
-        EmittedFieldType::Null => Encoding {
-            tag_path: "EmittedFieldType::Null",
+        EmittedFieldType::Unit => Encoding {
+            tag_path: "EmittedFieldType::Unit",
             arg_rust_ty: "()",
-            arg_value_ctor: "ArgValue::Null",
+            arg_value_ctor: "ArgValue::Unit",
             ret_rust_ty: "()",
-            ret_value_ctor: "RetValue::Null",
+            ret_value_ctor: "RetValue::Unit",
         },
         EmittedFieldType::String => Encoding {
             tag_path: "EmittedFieldType::String",
@@ -105,7 +105,7 @@ const ALL_VARIANTS: &[EmittedFieldType] = &[
     EmittedFieldType::Int,
     EmittedFieldType::Float,
     EmittedFieldType::Bool,
-    EmittedFieldType::Null,
+    EmittedFieldType::Unit,
     EmittedFieldType::String,
     EmittedFieldType::ListInt,
 ];

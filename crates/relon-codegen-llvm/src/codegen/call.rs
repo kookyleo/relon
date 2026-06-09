@@ -186,11 +186,11 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     ///      count)`;
     ///   4. load `state.trap_code`; a non-zero value branches to an
     ///      `llvm.trap` (surfaces as a typed host error);
-    ///   5. push the i64 result if `ret_ty != Null`.
+    ///   5. push the i64 result if `ret_ty != Unit`.
     ///
     /// Scope (phase-0b parity with the bytecode VM + the cranelift
     /// dynamic path): scalar args ride the i64 lane; `ret_ty` must be
-    /// `I64` / `Bool` / `Null`. The capability gate is enforced
+    /// `I64` / `Bool` / `Unit`. The capability gate is enforced
     /// independently by the preceding `Op::CheckCap` op (which the
     /// source lowering always prepends for a gated call); a
     /// source-lowered `Op::CallNative` carries `cap_bit ==
@@ -256,10 +256,10 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 ret_ty, import.ret_ty
             )));
         }
-        if !matches!(ret_ty, IrType::I64 | IrType::Bool | IrType::Null) {
+        if !matches!(ret_ty, IrType::I64 | IrType::Bool | IrType::Unit) {
             return Err(LlvmError::Codegen(format!(
                 "CallNative dynamic dispatch (import #{import_idx}) ret_ty {ret_ty:?} outside the \
-                 phase-0b scalar envelope (I64 / Bool / Null only)"
+                 phase-0b scalar envelope (I64 / Bool / Unit only)"
             )));
         }
 
@@ -453,7 +453,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         //    all ride the i64 lane; truncate Bool back to i32 to match
         //    the operand-stack width convention.
         match ret_ty {
-            IrType::Null => {}
+            IrType::Unit => {}
             IrType::I64 => self.push(result, IrType::I64),
             IrType::Bool => {
                 let b = self
@@ -544,7 +544,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         // Push the result (if any). I64 / Bool both ride the i64 lane;
         // Bool truncates back to the i32 operand-stack width.
         match ret_ty {
-            IrType::Null => {}
+            IrType::Unit => {}
             IrType::I64 => {
                 let result = match call_site.try_as_basic_value() {
                     inkwell::values::ValueKind::Basic(BasicValueEnum::IntValue(v)) => v,
@@ -701,7 +701,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 IrType::I64 => 64,
                 IrType::I32
                 | IrType::Bool
-                | IrType::Null
+                | IrType::Unit
                 | IrType::String
                 | IrType::ListInt
                 | IrType::ListFloat
@@ -849,15 +849,17 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             IrType::I64 | IrType::F64 => self.ctx.i64_type().into(),
             IrType::I32
             | IrType::Bool
-            | IrType::Null
+            | IrType::Unit
             | IrType::String
             | IrType::ListInt
             | IrType::ListFloat
             | IrType::ListBool
             // Wave R3c: a stdlib body returning a pointer-array list
-            // (`list_string_map` / `list_*_map_to_string` -> `ListString`)
-            // hands back an i32 arena-relative handle, same as `ListInt`.
-            | IrType::ListString => self.ctx.i32_type().into(),
+            // (`list_string_map` / `list_*_map_to_string` -> `ListString`,
+            // variant-list map -> `ListList`) hands back an i32
+            // arena-relative handle, same as `ListInt`.
+            | IrType::ListString
+            | IrType::ListList => self.ctx.i32_type().into(),
             other => {
                 return Err(LlvmError::Codegen(format!(
                     "Op::Call ret_ty {other:?} unsupported in inline frame"

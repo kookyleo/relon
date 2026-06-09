@@ -28,10 +28,12 @@ use relon_analyzer::schema::{SchemaDef, SchemaMethodInfo};
 use relon_analyzer::tree::AnalyzedTree;
 use relon_analyzer::workspace::WorkspaceTree;
 use relon_eval_api::layout::{FieldKind, OffsetTable, SchemaLayout};
-use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
+use relon_eval_api::schema_canonical::{
+    EnumVariant as CanonicalEnumVariant, Field, Schema, TypeRepr,
+};
 use relon_parser::{
-    is_builtin_type_name, ClosureParam, Expr, FStringPart, Node, Operator, RefBase, TokenKey,
-    TokenRange, TypeNode,
+    is_builtin_type_name, CallArg, ClosureParam, Expr, FStringPart, Node, Operator, PatternBinding,
+    RefBase, TokenKey, TokenRange, TypeNode,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -52,7 +54,7 @@ pub mod cap;
 mod closure;
 mod peephole;
 
-use closure::lower_closure_as_value;
+use closure::{lower_closure_as_value, lower_closure_as_value_with_expected_type};
 use peephole::{
     emit_list_float_literal_materialize, emit_list_int_literal_materialize,
     emit_list_value_materialize, list_has_computed_element, list_is_float_shaped, match_bare_range,
@@ -124,6 +126,14 @@ struct LowerCtx<'a> {
     /// pulls them onto the stack. Empty for entry bodies; populated
     /// only when `self_binding` is `Some`.
     method_params: Vec<MethodParam>,
+    /// Variant known for an enum variable while lowering a concrete
+    /// `match` arm. This enables flat payload access such as `msg.address`
+    /// inside `msg match { Email: ... }` without adding pattern bindings yet.
+    enum_variant_narrowing: HashMap<String, EnumVariantNarrowing>,
+    /// When true, enum-like variant records are allocated in scratch instead
+    /// of the entry output tail. Closure bodies use this because they receive
+    /// `ArenaState` but do not have the entry-only `out_ptr` local.
+    variant_records_in_scratch: bool,
     /// Phase 10-a: lambda functions emitted in this lowering pass.
     /// Each entry is a fully-lowered closure body with the implicit
     /// `captures_ptr: i32` as its first parameter; the closure-table
@@ -224,6 +234,19 @@ struct MethodParam {
     schema: Option<Schema>,
 }
 
+#[derive(Debug, Clone)]
+struct DirectEnumPayload {
+    field_name: String,
+    ty: TypeRepr,
+}
+
+#[derive(Debug, Clone)]
+struct EnumVariantNarrowing {
+    enum_name: String,
+    variant: CanonicalEnumVariant,
+    direct_payload: Option<DirectEnumPayload>,
+}
+
 /// Schema-method dispatch table built once per `lower_workspace_*`
 /// call. Phase 5 wires user-declared `with { ... }` methods into the
 /// IR module's `funcs` list and records the wasm-level function index
@@ -317,6 +340,9 @@ struct LetBinding {
     /// method table without re-deriving the type. `None` for plain
     /// scalar / pointer-record let bindings.
     schema_brand: Option<String>,
+    /// Optional surface type for let-locals whose IR slot (`I32`) is not
+    /// enough to recover enum identity inside nested expressions.
+    type_repr: Option<TypeRepr>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -339,6 +365,8 @@ impl<'a> LowerCtx<'a> {
             method_registry,
             self_binding: None,
             method_params: Vec::new(),
+            enum_variant_narrowing: HashMap::new(),
+            variant_records_in_scratch: false,
             lambda_table: Rc::new(RefCell::new(Vec::new())),
             closure_let_signatures: HashMap::new(),
             const_let_values: HashMap::new(),
@@ -371,6 +399,8 @@ impl<'a> LowerCtx<'a> {
             method_registry,
             self_binding: Some(self_binding),
             method_params,
+            enum_variant_narrowing: HashMap::new(),
+            variant_records_in_scratch: false,
             lambda_table: Rc::new(RefCell::new(Vec::new())),
             closure_let_signatures: HashMap::new(),
             const_let_values: HashMap::new(),
@@ -756,17 +786,14 @@ fn lower_entry_with_resolver<'a>(
     let resolved_user_return_schema =
         resolve_return_user_schema(sig.return_type.as_ref(), &resolver)?;
 
-    // Wave T2: a `#main(...) -> Tuple<...>` return synthesises an
-    // anonymous positional-record schema. It reuses the whole record /
-    // return ABI (alloc root record + per-element `StoreFieldAtRecord`,
-    // host object-return decode + verifier) — the only fork is that the
-    // host decodes it positionally to a JSON array (`is_tuple`). An
-    // out-of-surface element type is a loud cap here, not a silent
-    // mis-encode.
+    // A `#main(...) -> Tuple<...>` return uses an anonymous
+    // positional-record schema. It reuses the existing record return ABI;
+    // the host only changes the final projection by decoding the record as
+    // a JSON array because `schema.is_tuple` is set.
     let tuple_return_schema: Option<Schema> = match resolved_user_return_schema.as_ref() {
         Some(schema) if schema.is_tuple => Some(schema.clone()),
         _ => match sig.return_type.as_ref() {
-            Some(rt) => match return_tuple_canonical(rt) {
+            Some(rt) => match return_tuple_canonical(rt, &resolver) {
                 Some(res) => Some(res?),
                 None => None,
             },
@@ -788,7 +815,7 @@ fn lower_entry_with_resolver<'a>(
     // value. `None` ⇒ no field carried a decorator, so the byte-exact
     // original `root` is used unchanged. Only the anon-Dict path is
     // rewritten here; a branded `-> Schema` return rejects field
-    // decorators in `lower_dict_field_value` (loud cap, not silent).
+    // decorators in `lower_dict_field_value` and returns an explicit error.
     let desugared_root: Option<Node> =
         if user_return_schema.is_none() && tuple_return_schema.is_none() {
             desugar_anon_dict_decorators(root)?
@@ -813,9 +840,9 @@ fn lower_entry_with_resolver<'a>(
         // input. No `value` wrapping.
         user_schema.clone()
     } else if let Some(ref tuple_schema) = tuple_return_schema {
-        // Wave T2: the tuple return lays the positional record directly
-        // into the fixed area (no `value` wrapping), exactly like a
-        // branded-dict return — only the host decode forks to an array.
+        // Tuple returns lay the positional record directly into the fixed
+        // area, with no `value` wrapper. The host decodes that record as a
+        // JSON array instead of a JSON object.
         tuple_schema.clone()
     } else if let Some(ref plan) = anon_dict_plan {
         plan.schema.clone()
@@ -906,7 +933,7 @@ fn lower_entry_with_resolver<'a>(
             &mut ctx,
         )?;
     } else if let Some(ref tuple_schema) = tuple_return_schema {
-        // Wave T2: tuple-return path. The body must be a tuple literal
+        // Tuple-return path. The body must be a tuple literal
         // (`Expr::Tuple`) whose arity matches the declared `Tuple<...>`.
         // Allocate the root record, then lower + store each element into
         // its positional slot per the element's canonical type — the same
@@ -1062,7 +1089,10 @@ fn lower_entry_with_resolver<'a>(
         // R3c String-result HOF results), so it returns in place through the
         // same `inplace_return` decoder rather than the rigid-block copy.
         let is_inplace_split = ret_ir_ty == IrType::ListString && string_split_call(&root.expr);
-        let is_inplace_param_walk = is_inplace_param_walk || is_inplace_split;
+        let is_inplace_constructed_variant_list = ret_ir_ty == IrType::ListList
+            && variant_record_list_inplace_expr_for_type(&return_schema.fields[0].ty, &root.expr);
+        let is_inplace_param_walk =
+            is_inplace_param_walk || is_inplace_split || is_inplace_constructed_variant_list;
         if pointer_array_list_ir_type(ret_ir_ty)
             && !pointer_array_list_source_is_const_pool(&root.expr)
             && !is_inplace_param_walk
@@ -1080,7 +1110,7 @@ fn lower_entry_with_resolver<'a>(
                 }
             ));
         }
-        lower_expr(&root.expr, root.range, &mut ctx)?;
+        lower_value_as_type(&return_schema.fields[0].ty, root, &mut ctx)?;
 
         // Trailing StoreField for the single root return value. Pops
         // the top stack entry — codegen will translate this to
@@ -1228,68 +1258,66 @@ fn build_main_params_schema(
     })
 }
 
-/// Widened [`type_node_to_canonical`] that also accepts single-segment
-/// references to user-declared schemas. Used by [`build_main_params_schema`]
-/// so `#main(User u)` lowers the `u` param into a pointer-indirect
-/// schema slot. Scalar / String / List<Int> heads still resolve via
-/// the narrower [`type_node_to_canonical`] helper — keeping that path
-/// dependency-free lets the rest of the lowering pass reach for it
-/// without threading the resolver through.
+/// Convert a parsed type into the canonical boundary representation, while
+/// allowing references to user-declared schemas. This is used for `#main`
+/// parameters and return shapes that must cross the host boundary.
 fn type_node_to_canonical_with_schemas(
     t: &TypeNode,
     resolver: &SchemaResolver<'_>,
 ) -> Option<TypeRepr> {
-    if let Some(scalar) = type_node_to_canonical(t) {
-        return Some(scalar);
-    }
-    // Wave T3: `Tuple<...>` parameters ride the existing schema-pointer
-    // input ABI as anonymous positional records, symmetric with T2 tuple
-    // returns. The first compiled surface keeps the T2 scalar element
-    // boundary; nested tuples / lists fall through to the caller's loud
-    // unsupported-type cap.
-    if let Some(schema) = tuple_type_node_to_schema(t) {
-        return Some(TypeRepr::Schema {
-            schema: Box::new(schema),
-        });
-    }
-    // Phase 10-c: `List<User>` — the head is `List` with a single
-    // generic naming a user schema. Recurse into the generic via
-    // `with_schemas` so the inner schema lookup succeeds, then wrap
-    // it in a List variant. Also accepts a nested `List<List<…>>`
-    // generic (the inner is itself a `List`), so a `#main(List<List<Int>>
-    // xss)` param canonicalises; the layout pass enforces that the
-    // innermost element is an inline-fixed scalar.
-    if t.path.len() == 1
-        && t.path[0].as_str() == "List"
-        && t.generics.len() == 1
-        && t.variant_fields.is_none()
-    {
-        let inner = type_node_to_canonical_with_schemas(&t.generics[0], resolver)?;
-        if matches!(inner, TypeRepr::Schema { .. } | TypeRepr::List { .. }) {
-            return Some(TypeRepr::List {
-                element: Box::new(inner),
-            });
-        }
-        return None;
-    }
-    // Only a single-segment, non-variant, non-generic head can name a
-    // user schema. Anything else falls through.
-    if t.path.len() != 1 || !t.generics.is_empty() || t.variant_fields.is_some() {
+    if t.path.len() != 1 || t.variant_fields.is_some() {
         return None;
     }
     let head = t.path[0].as_str();
-    if matches!(
-        head,
-        "Int" | "Float" | "Bool" | "Null" | "String" | "List" | "Option" | "Result"
-    ) {
+    if is_removed_unit_null_type_name(head) {
         return None;
     }
-    let def = resolver.resolve(head)?;
-    let mut stack: Vec<&str> = Vec::new();
-    let schema = canonical_schema_from_def(def, resolver, &mut stack, t.range).ok()?;
-    Some(TypeRepr::Schema {
-        schema: Box::new(schema),
-    })
+
+    let base = match (head, t.generics.as_slice()) {
+        ("Int", []) => TypeRepr::Int,
+        ("Float", []) => TypeRepr::Float,
+        ("Bool", []) => TypeRepr::Bool,
+        ("String", []) => TypeRepr::String,
+        ("List", [elem]) => TypeRepr::List {
+            element: Box::new(type_node_to_canonical_with_schemas(elem, resolver)?),
+        },
+        ("Option", [inner]) => TypeRepr::Option {
+            inner: Box::new(type_node_to_canonical_with_schemas(inner, resolver)?),
+        },
+        ("Result", [ok, err]) => TypeRepr::Result {
+            ok: Box::new(type_node_to_canonical_with_schemas(ok, resolver)?),
+            err: Box::new(type_node_to_canonical_with_schemas(err, resolver)?),
+        },
+        ("Tuple", _) => TypeRepr::Schema {
+            schema: Box::new(tuple_type_node_to_schema(t, Some(resolver))?),
+        },
+        _ => {
+            if matches!(
+                head,
+                "Int" | "Float" | "Bool" | "String" | "List" | "Option" | "Result" | "Tuple"
+            ) {
+                return None;
+            }
+            let def = resolver.resolve(head)?;
+            let subst = generic_subst_for_def(def, t)?;
+            let mut stack: Vec<&str> = Vec::new();
+            if !def.variants.is_empty() {
+                canonical_enum_from_def_with_subst(def, resolver, &mut stack, t.range, &subst)
+                    .ok()?
+            } else {
+                TypeRepr::Schema {
+                    schema: Box::new(
+                        canonical_schema_from_def_with_subst(
+                            def, resolver, &mut stack, t.range, &subst,
+                        )
+                        .ok()?,
+                    ),
+                }
+            }
+        }
+    };
+
+    Some(maybe_optional(t, base))
 }
 
 /// Synthesise the [`MAIN_RETURN_SCHEMA_NAME`] canonical schema with a
@@ -1330,7 +1358,8 @@ fn build_main_return_schema(
     // `List<List<Schema>>` (and deeper nested lists) resolve through the
     // schema-aware nested-list canonicaliser; the layout pass is the final
     // arbiter of materialisable inner element types.
-    let ty = type_node_to_canonical(rt)
+    let ty = type_node_to_canonical_with_schemas(rt, resolver)
+        .or_else(|| type_node_to_canonical(rt))
         .or_else(|| return_nested_list_canonical(rt, Some(resolver)))
         .or_else(|| return_list_schema_canonical(rt, resolver))
         .ok_or_else(|| {
@@ -1741,7 +1770,8 @@ fn anon_dict_return_plan(
                     // shape the marshaller cannot handle (mixed / empty /
                     // nested element lists / schema elements) surfaces a
                     // loud error rather than silently dropping the field.
-                    let list_ty = classify_anon_dict_list_field(items, value.range, name)?;
+                    let list_ty =
+                        classify_anon_dict_list_field(items, value.range, name, resolver)?;
                     fields.push(AnonDictField::Scalar {
                         name: name.clone(),
                         ty: list_ty,
@@ -1993,6 +2023,7 @@ fn classify_anon_dict_list_field(
     items: &[Node],
     range: TokenRange,
     field_name: &str,
+    resolver: &SchemaResolver<'_>,
 ) -> Result<TypeRepr, LoweringError> {
     let Some(first) = items.first() else {
         return Err(cap!(
@@ -2006,6 +2037,11 @@ fn classify_anon_dict_list_field(
             }
         ));
     };
+    if let Some(enum_list_ty) =
+        classify_anon_dict_enum_list_field(items, range, field_name, resolver)?
+    {
+        return Ok(enum_list_ty);
+    }
     let element = match &*first.expr {
         Expr::Int(_) => TypeRepr::Int,
         Expr::Float(_) => TypeRepr::Float,
@@ -2056,6 +2092,115 @@ fn classify_anon_dict_list_field(
     Ok(TypeRepr::List {
         element: Box::new(element),
     })
+}
+
+fn classify_anon_dict_enum_list_field(
+    items: &[Node],
+    range: TokenRange,
+    field_name: &str,
+    resolver: &SchemaResolver<'_>,
+) -> Result<Option<TypeRepr>, LoweringError> {
+    let Some(first) = items.first() else {
+        return Ok(None);
+    };
+    let Some((enum_name, first_variant)) = enum_variant_literal_path(first.expr.as_ref()) else {
+        return Ok(None);
+    };
+    let Some(def) = resolver.resolve(&enum_name) else {
+        return Ok(None);
+    };
+    if def.variants.is_empty() {
+        return Ok(None);
+    }
+    if !def.variants.iter().any(|v| v.name == first_variant) {
+        return Err(cap!(
+            "classify_anon_dict_enum_list_field.unsupported_field_type.1",
+            LoweringError::UnsupportedFieldType {
+                schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+                field: field_name.to_string(),
+                ty: format!("enum `{enum_name}` has no variant `{first_variant}`"),
+                range: first.range,
+            }
+        ));
+    }
+
+    for node in &items[1..] {
+        let Some((item_enum, item_variant)) = enum_variant_literal_path(node.expr.as_ref()) else {
+            return Err(cap!(
+                "classify_anon_dict_enum_list_field.unsupported_field_type.2",
+                LoweringError::UnsupportedFieldType {
+                    schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+                    field: field_name.to_string(),
+                    ty: format!(
+                        "heterogeneous list field: expected `{enum_name}` enum variants, found `{}`",
+                        node.expr.kind()
+                    ),
+                    range: node.range,
+                }
+            ));
+        };
+        if item_enum != enum_name {
+            return Err(cap!(
+                "classify_anon_dict_enum_list_field.unsupported_field_type.3",
+                LoweringError::UnsupportedFieldType {
+                    schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+                    field: field_name.to_string(),
+                    ty: format!(
+                        "heterogeneous enum list field: expected `{enum_name}`, found `{item_enum}`"
+                    ),
+                    range: node.range,
+                }
+            ));
+        }
+        if !def.variants.iter().any(|v| v.name == item_variant) {
+            return Err(cap!(
+                "classify_anon_dict_enum_list_field.unsupported_field_type.4",
+                LoweringError::UnsupportedFieldType {
+                    schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
+                    field: field_name.to_string(),
+                    ty: format!("enum `{enum_name}` has no variant `{item_variant}`"),
+                    range: node.range,
+                }
+            ));
+        }
+    }
+
+    let mut stack: Vec<&str> = Vec::new();
+    let enum_ty = canonical_enum_from_def(def, resolver, &mut stack, range)?;
+    Ok(Some(TypeRepr::List {
+        element: Box::new(enum_ty),
+    }))
+}
+
+fn enum_variant_literal_path(expr: &Expr) -> Option<(String, String)> {
+    match expr {
+        Expr::Variable(path) | Expr::FnCall { path, .. } => enum_variant_literal_token_path(path),
+        Expr::VariantCtor {
+            enum_path, variant, ..
+        } => {
+            if enum_path.is_empty() {
+                None
+            } else {
+                Some((enum_path.join("."), variant.clone()))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn enum_variant_literal_token_path(path: &[TokenKey]) -> Option<(String, String)> {
+    let mut parts = Vec::with_capacity(path.len());
+    for seg in path {
+        match seg {
+            TokenKey::String(s, _, _) => parts.push(s.clone()),
+            _ => return None,
+        }
+    }
+    if parts.len() < 2 {
+        return None;
+    }
+    let variant = parts.pop()?;
+    Some((parts.join("."), variant))
 }
 
 fn classify_anon_dict_scalar_field_irt(
@@ -2219,14 +2364,14 @@ fn classify_anon_dict_scalar_field_irt(
 /// Reverse of `type_repr_to_ir_type` for the scalar / String cases
 /// needed by [`anon_dict_return_plan`]. Returns `None` for IR types
 /// that have no anon-Dict-return canonical form (lists, schemas,
-/// null, closure).
+/// unit, closure).
 fn ir_type_to_type_repr(t: IrType) -> Option<TypeRepr> {
     match t {
         IrType::I64 => Some(TypeRepr::Int),
         IrType::F64 => Some(TypeRepr::Float),
         IrType::Bool => Some(TypeRepr::Bool),
         IrType::String => Some(TypeRepr::String),
-        IrType::Null => Some(TypeRepr::Null),
+        IrType::Unit => Some(TypeRepr::Unit),
         _ => None,
     }
 }
@@ -2292,6 +2437,7 @@ fn lower_anon_dict_body(
                     idx: let_idx,
                     ty: IrType::Closure,
                     schema_brand: None,
+                    type_repr: None,
                 });
                 ctx.closure_let_signatures
                     .insert(let_idx, (param_tys.clone(), *ret_ty));
@@ -2337,6 +2483,7 @@ fn lower_anon_dict_body(
                     idx: let_idx,
                     ty: IrType::Dict,
                     schema_brand: None,
+                    type_repr: None,
                 });
                 let dict_idx = ctx.const_intern.borrow_mut().alloc_dict_idx();
                 ctx.out.push(TaggedOp {
@@ -2369,6 +2516,7 @@ fn lower_anon_dict_body(
                     idx: let_idx,
                     ty: IrType::ListString,
                     schema_brand: None,
+                    type_repr: None,
                 });
                 let list_idx = ctx.const_intern.borrow_mut().alloc_list_string_idx();
                 ctx.out.push(TaggedOp {
@@ -2400,16 +2548,15 @@ fn lower_anon_dict_body(
                     )
                 })?;
                 let expected_ir = type_repr_to_ir_type(ty)?;
+                let is_variant_list_literal = variant_list_literal_for_type(ty, &value.expr);
                 // Same pointer-array-list provenance guard as the
-                // top-level and branded-struct return paths: a
-                // `List<String>` (or any pointer-array list) anon-Dict
-                // field is only marshalled correctly from a const-pool
-                // list literal. The host-visible classifier already only
-                // admits list literals, but gate defensively so a future
-                // widening of the classifier can't silently reintroduce
-                // the rigid-copy miscompile.
+                // top-level and branded-struct return paths. `List<String>`
+                // still needs the const-pool path; `List<Enum>` source
+                // literals are constructed directly in the output tail by
+                // `BuildPointerList`, so they are also safe here.
                 if pointer_array_list_ir_type(expected_ir)
                     && !pointer_array_list_source_is_const_pool(&value.expr)
+                    && !is_variant_list_literal
                 {
                     return Err(cap!(
                         "lower_anon_dict_body.unsupported_field_type.1",
@@ -2417,15 +2564,18 @@ fn lower_anon_dict_body(
                             schema: MAIN_RETURN_SCHEMA_NAME.to_string(),
                             field: name.clone(),
                             ty: format!(
-                            "{expected_ir:?} sourced from `{}` — pointer-array list fields are \
-                             only marshalled from in-source list literals",
+                            "{expected_ir:?} sourced from `{}` — pointer-array list fields are                              only marshalled from in-source list literals",
                             value.expr.kind()
                         ),
                             range: value.range,
                         }
                     ));
                 }
-                lower_expr(&value.expr, value.range, ctx)?;
+                if is_variant_list_literal {
+                    lower_value_as_type(ty, value, ctx)?;
+                } else {
+                    lower_expr(&value.expr, value.range, ctx)?;
+                }
                 let top = ctx.tstack.pop().ok_or_else(|| {
                     cap!(
                         "lower_anon_dict_body.unsupported_expr.4",
@@ -2470,6 +2620,7 @@ fn lower_anon_dict_body(
                     idx: field_let_idx,
                     ty: expected_ir,
                     schema_brand: None,
+                    type_repr: None,
                 });
                 ctx.out.push(TaggedOp {
                     op: Op::LetSet {
@@ -2511,7 +2662,9 @@ fn lower_anon_dict_body(
                 // this the slot held the raw arena pointer and the host
                 // reader dereferenced garbage → a silent empty
                 // String / List (the W7-anon-dict mis-compile).
-                let store_ty = if pointer_indirect_ir_type(expected_ir) {
+                let store_ty = if is_variant_list_literal {
+                    expected_ir
+                } else if pointer_indirect_ir_type(expected_ir) {
                     ctx.out.push(TaggedOp {
                         op: Op::EmitTailRecordFromAbsoluteAddr { ty: expected_ir },
                         range: value.range,
@@ -2642,116 +2795,111 @@ fn lower_anon_dict_body(
     Ok(())
 }
 
-/// Wave T2: name reserved for the synthesised anonymous positional-record
-/// schema a `Tuple<...>` lowers to. Distinct from `MainParams` / `Ret` so
+/// Name reserved for the anonymous positional-record schema that
+/// represents a compiled `Tuple<...>` boundary. Distinct from `MainParams` / `Ret` so
 /// the backends and the host decode never confuse a tuple record with a
 /// scalar-wrapper or branded return.
 pub const TUPLE_RETURN_SCHEMA_NAME: &str = "Tuple";
 
-/// Wave T3: canonicalise a `Tuple<T0, T1, ...>` type node into the
-/// anonymous positional-record schema used by the compiled boundary.
-///
-/// This helper is intentionally positive-only: it returns `None` both
-/// when `t` is not a tuple and when a tuple element is outside the T2/T3
-/// scalar surface. Callers that need a precise "tuple element unsupported"
-/// diagnostic (currently tuple returns) own that cap at their call site;
-/// parameter/method signature builders can keep using their existing
-/// broad unsupported-type caps.
-fn tuple_type_node_to_schema(t: &TypeNode) -> Option<Schema> {
+fn is_removed_unit_null_type_name(name: &str) -> bool {
+    matches!(name, "Null" | "Unit")
+}
+
+fn maybe_optional(t: &TypeNode, base: TypeRepr) -> TypeRepr {
+    if t.is_optional {
+        TypeRepr::Option {
+            inner: Box::new(base),
+        }
+    } else {
+        base
+    }
+}
+
+/// Convert a `Tuple<...>` type node into the anonymous positional schema used
+/// by compiled host boundaries. Element types are converted recursively, so
+/// tuples can contain tuples, lists, options, results, and named schemas; the
+/// layout pass remains responsible for rejecting shapes a backend cannot yet
+/// materialise.
+fn tuple_type_node_to_schema(
+    t: &TypeNode,
+    resolver: Option<&SchemaResolver<'_>>,
+) -> Option<Schema> {
     if t.path.len() != 1 || t.path[0].as_str() != "Tuple" || t.variant_fields.is_some() {
         return None;
     }
     let mut elements = Vec::with_capacity(t.generics.len());
     for g in &t.generics {
-        let elem = match type_node_to_canonical(g) {
-            Some(e @ (TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool | TypeRepr::String)) => e,
-            _ => return None,
+        let elem = match resolver {
+            Some(r) => type_node_to_canonical_with_schemas(g, r)?,
+            None => type_node_to_canonical(g)?,
         };
         elements.push(elem);
     }
     Some(Schema::tuple(TUPLE_RETURN_SCHEMA_NAME, elements))
 }
 
-/// Wave T2: canonicalise a `Tuple<T0, T1, ...>` return type node to a
-/// tuple [`Schema`] (an anonymous positional record). First cut: every
-/// element must be a scalar (`Int` / `Float` / `Bool` / `String`) so the
-/// whole record/return ABI + verifier is reused and the four-way decode
-/// is byte-provable. Heterogeneous elements are allowed (that is the
-/// point of a tuple). Nested tuples and pointer-array list elements
-/// (`List<...>`) are deferred — they stay a loud `UnsupportedTypeInMain`
-/// cap at the call site so no shape silently mis-encodes.
-///
-/// Returns `None` when the head is not `Tuple` (so the caller falls
-/// through to the other return canonicalisers), and `Some(Err(..))` when
-/// the head IS `Tuple` but an element type is out of the first-cut
-/// surface (a loud cap rather than a silent miscompile).
-#[allow(clippy::type_complexity)]
-fn return_tuple_canonical(t: &TypeNode) -> Option<Result<Schema, LoweringError>> {
+/// Convert a `Tuple<...>` return type into the same positional schema used for
+/// tuple parameters. A non-tuple head returns `None`; a tuple with an element
+/// type that cannot be represented canonically returns an explicit lowering
+/// error at the element span.
+fn return_tuple_canonical(
+    t: &TypeNode,
+    resolver: &SchemaResolver<'_>,
+) -> Option<Result<Schema, LoweringError>> {
     if t.path.len() != 1 || t.path[0].as_str() != "Tuple" || t.variant_fields.is_some() {
         return None;
     }
     let mut elements = Vec::with_capacity(t.generics.len());
     for g in &t.generics {
-        let elem = match type_node_to_canonical(g) {
-            Some(e @ (TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool | TypeRepr::String)) => e,
-            // Out of first-cut surface: nested tuple, List<...>, Null,
-            // Option/Result, or an unresolved head. Cap loudly.
-            _ => {
-                return Some(Err(cap!(
-                    "return_tuple_canonical.unsupported_type_in_main",
-                    LoweringError::UnsupportedTypeInMain {
-                        type_name: format!(
-                            "Tuple element `{}` — T2 lowers tuples of scalars \
-                             (Int/Float/Bool/String); nested tuples / list elements are capped",
-                            type_head_for_display(g)
-                        ),
-                        range: g.range,
-                    }
-                )));
-            }
+        let Some(elem) = type_node_to_canonical_with_schemas(g, resolver) else {
+            return Some(Err(cap!(
+                "return_tuple_canonical.unsupported_type_in_main",
+                LoweringError::UnsupportedTypeInMain {
+                    type_name: format!("Tuple element `{}`", type_head_for_display(g)),
+                    range: g.range,
+                }
+            )));
         };
         elements.push(elem);
     }
     Some(Ok(Schema::tuple(TUPLE_RETURN_SCHEMA_NAME, elements)))
 }
 
-/// Map a parser [`TypeNode`] to a canonical [`TypeRepr`].
-///
-/// Phase 2.c surface:
-///   * `Int` / `Float` / `Bool` / `Null` — the v1 scalar leaves.
-///   * `String` — pointer-indirect leaf.
-///   * `List<Int>` — pointer-indirect leaf with i64 elements. Other
-///     list element types still return `None` so the schema build
-///     rejects them with `UnsupportedTypeInMain`.
+/// Map a parsed builtin type to a canonical [`TypeRepr`] without resolving
+/// user schemas. This keeps the scalar/list paths usable in places that do not
+/// have a schema resolver, while still allowing normal recursive builtin
+/// nesting such as `List<Tuple<Int, String>>` and `Option<List<Int>>`.
 fn type_node_to_canonical(t: &TypeNode) -> Option<TypeRepr> {
     if t.path.len() != 1 || t.variant_fields.is_some() {
         return None;
     }
     let head = t.path[0].as_str();
-    match (head, t.generics.as_slice()) {
-        ("Int", []) => Some(TypeRepr::Int),
-        ("Float", []) => Some(TypeRepr::Float),
-        ("Bool", []) => Some(TypeRepr::Bool),
-        ("Null", []) => Some(TypeRepr::Null),
-        ("String", []) => Some(TypeRepr::String),
-        ("List", [elem]) => {
-            // Phase 10-c: `List<T>` with T in `{Int, Float, Bool,
-            // String}` is supported via the matching IR / layout
-            // paths. Nested lists / Option / Result still reject.
-            let inner = type_node_to_canonical(elem)?;
-            if matches!(
-                inner,
-                TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool | TypeRepr::String
-            ) {
-                Some(TypeRepr::List {
-                    element: Box::new(inner),
-                })
-            } else {
-                None
-            }
-        }
-        _ => None,
+    if is_removed_unit_null_type_name(head) {
+        return None;
     }
+
+    let base = match (head, t.generics.as_slice()) {
+        ("Int", []) => TypeRepr::Int,
+        ("Float", []) => TypeRepr::Float,
+        ("Bool", []) => TypeRepr::Bool,
+        ("String", []) => TypeRepr::String,
+        ("List", [elem]) => TypeRepr::List {
+            element: Box::new(type_node_to_canonical(elem)?),
+        },
+        ("Option", [inner]) => TypeRepr::Option {
+            inner: Box::new(type_node_to_canonical(inner)?),
+        },
+        ("Result", [ok, err]) => TypeRepr::Result {
+            ok: Box::new(type_node_to_canonical(ok)?),
+            err: Box::new(type_node_to_canonical(err)?),
+        },
+        ("Tuple", _) => TypeRepr::Schema {
+            schema: Box::new(tuple_type_node_to_schema(t, None)?),
+        },
+        _ => return None,
+    };
+
+    Some(maybe_optional(t, base))
 }
 
 /// Return-side canonicalizer for the `List<List<…>>` return type
@@ -3092,15 +3240,17 @@ fn cross_region_param_field_chain<'s>(
 ///   * `List<Int|Float|Bool>` — inline-fixed scalar list,
 ///   * `List<List<scalar>>` — nested-scalar pointer array (inner element
 ///     must be an inline-fixed scalar; a deeper nesting or String / Schema
-///     inner element is out of scope), or
-///   * `List<Schema{…}>` confined to the S4 sub-record decode scope
+///     inner element is out of scope),
+///   * `List<Schema{…}>` confined to the S4 sub-record decode scope, or
+///   * `List<Option|Result|Enum>` variant-record elements.
 ///     (`list_schema_subrecord_in_s4_scope`).
 ///
 /// F5 widens this to the double pointer array `List<List<String>>` /
 /// `List<List<Schema>>` (and deeper nested lists): the recursive input
 /// marshaller, relocation walker, multi-region verifier, and in-place
-/// reader all follow them cross-region bit-equal. A leaf type the layout
-/// pass cannot materialise (Option / Result / Closure) returns `false`,
+/// reader all follow them cross-region bit-equal. Variant-record elements
+/// (`Option` / `Result` / custom `#enum`) use the same pointer-array path.
+/// A leaf type the layout pass cannot materialise (Closure) returns `false`,
 /// keeping it a loud cap.
 fn cross_region_list_envelope(ty: &TypeRepr) -> bool {
     let TypeRepr::List { element } = ty else {
@@ -3121,6 +3271,7 @@ fn cross_region_list_element_ok(element: &TypeRepr) -> bool {
             element: Box::new(element.clone()),
         }),
         TypeRepr::List { element: inner } => cross_region_list_element_ok(inner.as_ref()),
+        TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => true,
         _ => false,
     }
 }
@@ -3191,7 +3342,7 @@ fn anon_dict_cross_region_param_list<'p>(
 /// two paths reach the field — the field type / value-shape admission rules
 /// and the resulting arena-absolute slot store are identical. The element
 /// type envelope matches: `List<Schema>` confined to S4 sub-record scope,
-/// `List<List<scalar>>`, `List<String>`, and `List<Int|Float|Bool>`.
+/// `List<List<scalar>>`, `List<String>`, `List<Option|Result|Enum>`, and `List<Int|Float|Bool>`.
 ///
 /// The value may be either a single-segment `Variable` resolving to a
 /// `#main` param whose `IrType` matches the field (the F3 identity walk),
@@ -3214,7 +3365,10 @@ fn branded_field_cross_region_param_list(
     // Field element-type envelope (mirrors `anon_dict_cross_region_param_list`).
     let field_ir = match element.as_ref() {
         TypeRepr::Schema { .. } => IrType::ListSchema,
-        TypeRepr::List { .. } => IrType::ListList,
+        TypeRepr::List { .. }
+        | TypeRepr::Option { .. }
+        | TypeRepr::Result { .. }
+        | TypeRepr::Enum { .. } => IrType::ListList,
         TypeRepr::String => IrType::ListString,
         TypeRepr::Int => IrType::ListInt,
         TypeRepr::Float => IrType::ListFloat,
@@ -3258,7 +3412,7 @@ fn branded_field_cross_region_param_list(
 /// True when a `List<Schema>` return type's per-element sub-record carries
 /// only fields the in-place sub-record reader can decode — **recursively,
 /// to any depth** (F7). The admission is type-driven: a field is in scope
-/// when its type is a scalar leaf (`Int` / `Float` / `Bool` / `Null` /
+/// when its type is a scalar leaf (`Int` / `Float` / `Bool` /
 /// `String`) or a `List<element>` whose element is itself in scope
 /// ([`cross_region_list_element_ok`]). The list arm reaches back into this
 /// predicate for a `List<Schema>` element, so a sub-record field that is
@@ -3282,7 +3436,7 @@ fn list_schema_subrecord_in_s4_scope(ty: &TypeRepr) -> bool {
         return false;
     };
     schema.fields.iter().all(|f| match &f.ty {
-        TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool | TypeRepr::Null | TypeRepr::String => {
+        TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool | TypeRepr::Unit | TypeRepr::String => {
             true
         }
         // F7: a list field recurses through the shared element predicate,
@@ -3305,7 +3459,7 @@ fn type_repr_to_ir_type(t: &TypeRepr) -> Result<IrType, LoweringError> {
         TypeRepr::Int => Ok(IrType::I64),
         TypeRepr::Float => Ok(IrType::F64),
         TypeRepr::Bool => Ok(IrType::Bool),
-        TypeRepr::Null => Ok(IrType::Null),
+        TypeRepr::Unit => Ok(IrType::Unit),
         TypeRepr::String => Ok(IrType::String),
         TypeRepr::List { element } => match element.as_ref() {
             TypeRepr::Int => Ok(IrType::ListInt),
@@ -3313,7 +3467,10 @@ fn type_repr_to_ir_type(t: &TypeRepr) -> Result<IrType, LoweringError> {
             TypeRepr::Bool => Ok(IrType::ListBool),
             TypeRepr::String => Ok(IrType::ListString),
             TypeRepr::Schema { .. } => Ok(IrType::ListSchema),
-            TypeRepr::List { .. } => Ok(IrType::ListList),
+            TypeRepr::List { .. }
+            | TypeRepr::Option { .. }
+            | TypeRepr::Result { .. }
+            | TypeRepr::Enum { .. } => Ok(IrType::ListList),
             _ => Err(cap!(
                 "type_repr_to_ir_type.unsupported_type_in_main.1",
                 LoweringError::UnsupportedTypeInMain {
@@ -3322,8 +3479,10 @@ fn type_repr_to_ir_type(t: &TypeRepr) -> Result<IrType, LoweringError> {
                 }
             )),
         },
-        // Composite / list-of-other types are rejected upstream
-        // during schema build; this branch fires only for a directly
+        TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => {
+            Ok(IrType::I32)
+        }
+        // Composite types rejected upstream reach this branch only from a
         // hand-crafted IR.
         _ => Err(cap!(
             "type_repr_to_ir_type.unsupported_type_in_main.2",
@@ -3347,7 +3506,6 @@ fn type_node_to_ir_type(t: &TypeNode) -> Option<IrType> {
         "Int" => IrType::I64,
         "Float" => IrType::F64,
         "Bool" => IrType::Bool,
-        "Null" => IrType::Null,
         "String" => IrType::String,
         "List" => {
             let elem = t.generics.first()?;
@@ -3476,6 +3634,10 @@ struct LocalBinding {
     /// address and so `x.method()` resolves through the schema's
     /// method table.
     schema_brand: Option<String>,
+    /// Canonical type of this parameter. Kept alongside the IR type so
+    /// runtime enum match lowering can read the variant table after the
+    /// boundary type has collapsed to an `I32` pointer.
+    type_repr: TypeRepr,
     /// When `schema_brand` is set this carries the canonical schema
     /// shape so multi-segment field walks (`x.a.b`) can find the
     /// nested field layouts without re-running the type resolver.
@@ -3513,6 +3675,7 @@ fn build_local_index(
             ty: ir_ty,
             offset: slot.offset as u32,
             schema_brand,
+            type_repr: field.ty.clone(),
             schema: schema_shape,
         });
     }
@@ -3929,10 +4092,9 @@ fn static_type_pattern_decision(
             ("Float", IrType::F64) => StaticArmDecision::Matches,
             ("Bool", IrType::Bool) => StaticArmDecision::Matches,
             ("String", IrType::String) => StaticArmDecision::Matches,
-            ("Null", IrType::Null) => StaticArmDecision::Matches,
             // A scalar builtin pattern naming a DIFFERENT scalar than the
             // (definite-scalar) static type can never match.
-            ("Int" | "Float" | "Bool" | "String" | "Null", t) if is_definite_scalar(t) => {
+            ("Int" | "Float" | "Bool" | "String", t) if is_definite_scalar(t) => {
                 StaticArmDecision::Never
             }
             _ => StaticArmDecision::Undecidable,
@@ -3952,14 +4114,624 @@ fn static_type_pattern_decision(
 }
 
 /// `true` when the IR type pins the runtime value to a single concrete
-/// scalar Relon shape (`Int` / `Float` / `Bool` / `String` / `Null`).
+/// scalar Relon shape (`Int` / `Float` / `Bool` / `String`).
 /// These are the only types for which a scalar / schema pattern decision
 /// can be made with certainty.
 fn is_definite_scalar(ty: IrType) -> bool {
     matches!(
         ty,
-        IrType::I64 | IrType::F64 | IrType::Bool | IrType::String | IrType::Null
+        IrType::I64 | IrType::F64 | IrType::Bool | IrType::String | IrType::Unit
     )
+}
+
+/// One lowered source arm in a runtime `#enum` match.
+struct RuntimeEnumMatchArm {
+    /// `Some(tag)` for a concrete variant arm, `None` for wildcard.
+    tag: Option<u8>,
+    body_ops: Vec<TaggedOp>,
+    body_ty: IrType,
+    range: TokenRange,
+}
+
+fn enum_scrutinee_binding(scrutinee: &Node, ctx: &LowerCtx<'_>) -> Option<(String, TypeRepr)> {
+    let Expr::Variable(path) = &*scrutinee.expr else {
+        return None;
+    };
+    if path.len() != 1 {
+        return None;
+    }
+    let TokenKey::String(name, _, _) = &path[0] else {
+        return None;
+    };
+    if let Some(binding) = ctx
+        .params
+        .iter()
+        .find(|binding| binding.name == name.as_str())
+    {
+        return enum_like_type(&binding.type_repr)
+            .then(|| (binding.name.clone(), binding.type_repr.clone()));
+    }
+    let binding = ctx
+        .lets
+        .iter()
+        .rev()
+        .find(|binding| binding.name == name.as_str())?;
+    let type_repr = binding.type_repr.as_ref()?;
+    enum_like_type(type_repr).then(|| (binding.name.clone(), type_repr.clone()))
+}
+
+fn enum_like_type(ty: &TypeRepr) -> bool {
+    matches!(
+        ty,
+        TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. }
+    )
+}
+
+fn enum_like_name(ty: &TypeRepr) -> Option<&str> {
+    match ty {
+        TypeRepr::Option { .. } => Some("Option"),
+        TypeRepr::Result { .. } => Some("Result"),
+        TypeRepr::Enum { name, .. } => Some(name.as_str()),
+        _ => None,
+    }
+}
+
+fn enum_like_tags(ty: &TypeRepr) -> Option<Vec<u8>> {
+    match ty {
+        TypeRepr::Option { .. } | TypeRepr::Result { .. } => Some(vec![0, 1]),
+        TypeRepr::Enum { variants, .. } => {
+            Some(variants.iter().map(|variant| variant.tag).collect())
+        }
+        _ => None,
+    }
+}
+
+fn type_pattern_variant_name(enum_ty: &TypeRepr, pattern: &TypeNode) -> Option<String> {
+    if pattern.is_optional || !pattern.generics.is_empty() || pattern.variant_fields.is_some() {
+        return None;
+    }
+    let parts: Vec<&str> = pattern.path.iter().map(String::as_str).collect();
+    match enum_ty {
+        TypeRepr::Option { .. } => match parts.as_slice() {
+            ["None"] | ["Option", "None"] => Some("None".to_string()),
+            ["Some"] | ["Option", "Some"] => Some("Some".to_string()),
+            _ => None,
+        },
+        TypeRepr::Result { .. } => match parts.as_slice() {
+            ["Ok"] | ["Result", "Ok"] => Some("Ok".to_string()),
+            ["Err"] | ["Result", "Err"] => Some("Err".to_string()),
+            _ => None,
+        },
+        TypeRepr::Enum { name, variants } => {
+            let variant_name = match parts.as_slice() {
+                [variant] => *variant,
+                [enum_name, variant] if enum_name == name => *variant,
+                _ => return None,
+            };
+            variants
+                .iter()
+                .find(|variant| variant.name == variant_name)
+                .map(|variant| variant.name.clone())
+        }
+        _ => None,
+    }
+}
+
+fn matched_enum_variant(
+    enum_ty: &TypeRepr,
+    enum_path: Option<&[String]>,
+    variant: &str,
+    range: TokenRange,
+) -> Option<EnumVariantNarrowing> {
+    let enum_name = enum_like_name(enum_ty)?.to_string();
+    match enum_ty {
+        TypeRepr::Option { inner } => {
+            if !enum_path_matches("Option", enum_path) {
+                return None;
+            }
+            let (tag, fields, direct_payload) = match variant {
+                "None" => (0, Vec::new(), None),
+                "Some" => {
+                    let field = Field {
+                        name: "value".to_string(),
+                        ty: inner.as_ref().clone(),
+                        default: None,
+                    };
+                    let direct_payload = DirectEnumPayload {
+                        field_name: field.name.clone(),
+                        ty: field.ty.clone(),
+                    };
+                    (1, vec![field], Some(direct_payload))
+                }
+                _ => return None,
+            };
+            Some(EnumVariantNarrowing {
+                enum_name,
+                variant: CanonicalEnumVariant {
+                    name: variant.to_string(),
+                    tag,
+                    fields,
+                    is_tuple: false,
+                },
+                direct_payload,
+            })
+        }
+        TypeRepr::Result { ok, err } => {
+            if !enum_path_matches("Result", enum_path) {
+                return None;
+            }
+            let (tag, field_name, ty) = match variant {
+                "Ok" => (0, "value", ok.as_ref().clone()),
+                "Err" => (1, "error", err.as_ref().clone()),
+                _ => return None,
+            };
+            let field = Field {
+                name: field_name.to_string(),
+                ty,
+                default: None,
+            };
+            let direct_payload = DirectEnumPayload {
+                field_name: field.name.clone(),
+                ty: field.ty.clone(),
+            };
+            Some(EnumVariantNarrowing {
+                enum_name,
+                variant: CanonicalEnumVariant {
+                    name: variant.to_string(),
+                    tag,
+                    fields: vec![field],
+                    is_tuple: false,
+                },
+                direct_payload: Some(direct_payload),
+            })
+        }
+        TypeRepr::Enum { name, variants } => {
+            if !enum_path_matches(name, enum_path) {
+                return None;
+            }
+            let variant = variants
+                .iter()
+                .find(|candidate| candidate.name == variant)?;
+            Some(EnumVariantNarrowing {
+                enum_name,
+                variant: variant.clone(),
+                direct_payload: None,
+            })
+        }
+        _ => {
+            let _ = range;
+            None
+        }
+    }
+}
+
+fn enum_pattern_variant(
+    enum_ty: &TypeRepr,
+    pattern: &Expr,
+    range: TokenRange,
+) -> Option<(EnumVariantNarrowing, Vec<PatternBinding>)> {
+    match pattern {
+        Expr::Type(tn) => {
+            let variant_name = type_pattern_variant_name(enum_ty, tn)?;
+            matched_enum_variant(enum_ty, None, &variant_name, range).map(|n| (n, Vec::new()))
+        }
+        Expr::VariantPattern {
+            enum_path,
+            variant,
+            bindings,
+        } => matched_enum_variant(enum_ty, Some(enum_path), variant, range)
+            .map(|n| (n, bindings.clone())),
+        _ => None,
+    }
+}
+
+fn enum_payload_field_type(
+    narrowing: &EnumVariantNarrowing,
+    field_name: &str,
+    range: TokenRange,
+) -> Result<TypeRepr, LoweringError> {
+    if let Some(payload) = &narrowing.direct_payload {
+        if field_name == payload.field_name {
+            return Ok(payload.ty.clone());
+        }
+        return Err(cap!(
+            "lower_match.enum_pattern_unknown_payload",
+            LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "Enum(variant `{}` has no payload field `{field_name}`)",
+                    narrowing.variant.name
+                ),
+                range,
+            }
+        ));
+    }
+
+    let payload_schema = narrowing
+        .variant
+        .payload_schema(&narrowing.enum_name)
+        .ok_or_else(|| {
+            cap!(
+                "lower_match.enum_pattern_unit_payload",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "Enum(unit variant `{}` has no payload field `{field_name}`)",
+                        narrowing.variant.name
+                    ),
+                    range,
+                }
+            )
+        })?;
+    payload_schema
+        .fields
+        .iter()
+        .find(|field| field.name == field_name)
+        .map(|field| field.ty.clone())
+        .ok_or_else(|| {
+            cap!(
+                "lower_match.enum_pattern_unknown_payload",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "Enum(variant `{}` has no payload field `{field_name}`)",
+                        narrowing.variant.name
+                    ),
+                    range,
+                }
+            )
+        })
+}
+
+fn enum_pattern_binding_field_name(
+    narrowing: &EnumVariantNarrowing,
+    binding: &PatternBinding,
+    idx: usize,
+) -> String {
+    if let Some(field) = binding.field.clone() {
+        return field;
+    }
+    if let Some(payload) = &narrowing.direct_payload {
+        return payload.field_name.clone();
+    }
+    idx.to_string()
+}
+
+fn emit_enum_pattern_bindings(
+    scrutinee_let_idx: u32,
+    narrowing: &EnumVariantNarrowing,
+    bindings: &[PatternBinding],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Vec<String>, LoweringError> {
+    let mut added = Vec::new();
+    let mut seen_bindings: HashSet<&str> = HashSet::new();
+    for (idx, binding) in bindings.iter().enumerate() {
+        let Some(name) = binding.binding.as_ref() else {
+            continue;
+        };
+        if !seen_bindings.insert(name.as_str()) {
+            return Err(cap!(
+                "lower_match.enum_pattern_duplicate_binding",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("duplicate enum pattern binding `{name}`"),
+                    range,
+                }
+            ));
+        }
+        let field_name = enum_pattern_binding_field_name(narrowing, binding, idx);
+        let field_ty = enum_payload_field_type(narrowing, &field_name, range)?;
+        ctx.out.push(TaggedOp {
+            op: Op::LetGet {
+                idx: scrutinee_let_idx,
+                ty: IrType::I32,
+            },
+            range,
+        });
+        ctx.tstack.push(IrType::I32);
+        let key = TokenKey::String(field_name, range, false);
+        lower_enum_payload_path(&[key], narrowing, range, ctx)?;
+        let ty = ctx.tstack.pop().ok_or_else(|| {
+            cap!(
+                "lower_match.enum_pattern_binding_stack",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("enum pattern binding `{name}` produced no value"),
+                    range,
+                }
+            )
+        })?;
+        let let_idx = ctx.next_let_idx;
+        ctx.next_let_idx += 1;
+        ctx.out.push(TaggedOp {
+            op: Op::LetSet { idx: let_idx, ty },
+            range,
+        });
+        let schema_brand = match &field_ty {
+            TypeRepr::Schema { schema } => Some(schema.name.clone()),
+            _ => None,
+        };
+        ctx.lets.push(LetBinding {
+            name: name.clone(),
+            idx: let_idx,
+            ty,
+            schema_brand,
+            type_repr: Some(field_ty.clone()),
+        });
+        added.push(name.clone());
+    }
+    Ok(added)
+}
+
+fn enum_tag_test_ops(scrutinee_let_idx: u32, tag: u8, range: TokenRange) -> Vec<TaggedOp> {
+    vec![
+        TaggedOp {
+            op: Op::LetGet {
+                idx: scrutinee_let_idx,
+                ty: IrType::I32,
+            },
+            range,
+        },
+        TaggedOp {
+            op: Op::LoadI8UAtAbsolute { offset: 0 },
+            range,
+        },
+        TaggedOp {
+            op: Op::ConstI32(i32::from(tag)),
+            range,
+        },
+        TaggedOp {
+            op: Op::Eq(IrType::I32),
+            range,
+        },
+    ]
+}
+
+fn runtime_enum_match_chain(
+    arms: &[RuntimeEnumMatchArm],
+    scrutinee_let_idx: u32,
+    result_ty: IrType,
+    range: TokenRange,
+) -> Vec<TaggedOp> {
+    let mut else_body = arms
+        .last()
+        .expect("runtime enum match must have at least one arm")
+        .body_ops
+        .clone();
+    for arm in arms[..arms.len().saturating_sub(1)].iter().rev() {
+        let Some(tag) = arm.tag else {
+            else_body = arm.body_ops.clone();
+            continue;
+        };
+        let mut seq = enum_tag_test_ops(scrutinee_let_idx, tag, arm.range);
+        seq.push(TaggedOp {
+            op: Op::If {
+                result_ty,
+                then_body: arm.body_ops.clone(),
+                else_body,
+            },
+            range,
+        });
+        else_body = seq;
+    }
+    else_body
+}
+
+fn lower_branch_with_enum_narrowing(
+    node: &Node,
+    range: TokenRange,
+    parent: &mut LowerCtx<'_>,
+    scrutinee_name: &str,
+    scrutinee_let_idx: u32,
+    narrowing: Option<EnumVariantNarrowing>,
+    pattern_bindings: &[PatternBinding],
+) -> Result<(Vec<TaggedOp>, IrType), LoweringError> {
+    let previous = narrowing.clone().map(|narrowing| {
+        parent
+            .enum_variant_narrowing
+            .insert(scrutinee_name.to_string(), narrowing)
+    });
+
+    let saved_out = std::mem::take(&mut parent.out);
+    let saved_stack = std::mem::take(&mut parent.tstack);
+    let let_len_before = parent.lets.len();
+
+    if let Some(narrowing) = narrowing.as_ref() {
+        emit_enum_pattern_bindings(
+            scrutinee_let_idx,
+            narrowing,
+            pattern_bindings,
+            range,
+            parent,
+        )?;
+    }
+    lower_expr(&node.expr, node.range, parent)?;
+    let branch_ops = std::mem::replace(&mut parent.out, saved_out);
+    let branch_stack = std::mem::replace(&mut parent.tstack, saved_stack);
+    parent.lets.truncate(let_len_before);
+
+    if let Some(previous) = previous {
+        match previous {
+            Some(old) => {
+                parent
+                    .enum_variant_narrowing
+                    .insert(scrutinee_name.to_string(), old);
+            }
+            None => {
+                parent.enum_variant_narrowing.remove(scrutinee_name);
+            }
+        }
+    }
+
+    if branch_stack.len() != 1 {
+        return Err(cap!(
+            "lower_branch.unsupported_expr",
+            LoweringError::UnsupportedExpr {
+                kind: format!("Match(branch-stack={})", branch_stack.len()),
+                range,
+            }
+        ));
+    }
+    Ok((branch_ops, branch_stack[0]))
+}
+
+fn try_lower_runtime_enum_match(
+    scrutinee: &Node,
+    arms: &[(Node, Node)],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<bool, LoweringError> {
+    let Some((scrutinee_name, enum_ty)) = enum_scrutinee_binding(scrutinee, ctx) else {
+        return Ok(false);
+    };
+    if enum_like_name(&enum_ty).is_none() {
+        return Ok(false);
+    }
+    if arms.is_empty() {
+        return Err(cap!(
+            "lower_match.unsupported_expr.2",
+            LoweringError::UnsupportedExpr {
+                kind: "Match(enum with no arms)".to_string(),
+                range,
+            }
+        ));
+    }
+
+    let scrutinee_let_idx = ctx.next_let_idx;
+    ctx.next_let_idx += 1;
+    let all_tags: HashSet<u8> = enum_like_tags(&enum_ty)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let mut covered_tags: HashSet<u8> = HashSet::new();
+    let mut lowered: Vec<RuntimeEnumMatchArm> = Vec::new();
+    let mut has_wildcard = false;
+
+    for (pattern, body) in arms {
+        match &*pattern.expr {
+            Expr::Wildcard => {
+                let (body_ops, body_ty) = lower_branch(body, range, ctx)?;
+                lowered.push(RuntimeEnumMatchArm {
+                    tag: None,
+                    body_ops,
+                    body_ty,
+                    range: pattern.range,
+                });
+                has_wildcard = true;
+                break;
+            }
+            Expr::Type(_) | Expr::VariantPattern { .. } => {
+                let Some((narrowing, pattern_bindings)) =
+                    enum_pattern_variant(&enum_ty, pattern.expr.as_ref(), pattern.range)
+                else {
+                    return Err(cap!(
+                        "lower_match.unsupported_expr.1",
+                        LoweringError::UnsupportedExpr {
+                            kind: format!(
+                                "Match(enum pattern `{}` is not a variant of the scrutinee enum)",
+                                pattern.expr.kind()
+                            ),
+                            range: pattern.range,
+                        }
+                    ));
+                };
+                let tag = narrowing.variant.tag;
+                let narrowing = Some(narrowing);
+                let (body_ops, body_ty) = lower_branch_with_enum_narrowing(
+                    body,
+                    range,
+                    ctx,
+                    &scrutinee_name,
+                    scrutinee_let_idx,
+                    narrowing,
+                    &pattern_bindings,
+                )?;
+                covered_tags.insert(tag);
+                lowered.push(RuntimeEnumMatchArm {
+                    tag: Some(tag),
+                    body_ops,
+                    body_ty,
+                    range: pattern.range,
+                });
+            }
+            other => {
+                return Err(cap!(
+                    "lower_match.unsupported_expr.1",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "Match(enum pattern `{}` is not supported by compiled runtime dispatch)",
+                            other.kind()
+                        ),
+                        range: pattern.range,
+                    }
+                ));
+            }
+        }
+    }
+
+    if lowered.is_empty() {
+        return Err(cap!(
+            "lower_match.unsupported_expr.2",
+            LoweringError::UnsupportedExpr {
+                kind: "Match(enum with no lowerable arms)".to_string(),
+                range,
+            }
+        ));
+    }
+
+    if !has_wildcard && !all_tags.is_subset(&covered_tags) {
+        return Err(cap!(
+            "lower_match.unsupported_expr.2",
+            LoweringError::UnsupportedExpr {
+                kind: "Match(enum is not exhaustive and has no wildcard arm)".to_string(),
+                range,
+            }
+        ));
+    }
+
+    let result_ty = lowered[0].body_ty;
+    for arm in lowered.iter().skip(1) {
+        if arm.body_ty != result_ty {
+            return Err(cap!(
+                "lower_ternary.if_branch_type_mismatch",
+                LoweringError::IfBranchTypeMismatch {
+                    then_ty: result_ty,
+                    else_ty: arm.body_ty,
+                    range,
+                }
+            ));
+        }
+    }
+
+    lower_expr(&scrutinee.expr, scrutinee.range, ctx)?;
+    let scrut_ty = ctx.tstack.pop().ok_or_else(|| {
+        cap!(
+            "lower_match.unsupported_expr.3",
+            LoweringError::UnsupportedExpr {
+                kind: "Match(enum scrutinee produced no value)".to_string(),
+                range: scrutinee.range,
+            }
+        )
+    })?;
+    if scrut_ty != IrType::I32 {
+        return Err(cap!(
+            "lower_match.unsupported_expr.3",
+            LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "Match(enum scrutinee lowered to {scrut_ty:?}, expected I32 pointer)"
+                ),
+                range: scrutinee.range,
+            }
+        ));
+    }
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet {
+            idx: scrutinee_let_idx,
+            ty: IrType::I32,
+        },
+        range: scrutinee.range,
+    });
+
+    let chain = runtime_enum_match_chain(&lowered, scrutinee_let_idx, result_ty, range);
+    ctx.out.extend(chain);
+    ctx.tstack.push(result_ty);
+    Ok(true)
 }
 
 /// Wave R5 — static lowering of a strict-mode `match` whose scrutinee's
@@ -3988,6 +4760,10 @@ fn lower_match(
     range: TokenRange,
     ctx: &mut LowerCtx<'_>,
 ) -> Result<(), LoweringError> {
+    if try_lower_runtime_enum_match(scrutinee, arms, range, ctx)? {
+        return Ok(());
+    }
+
     // 1. Determine the scrutinee's static IR type by speculatively
     //    lowering it (rolled back — the real evaluation is re-emitted
     //    below for trap / side-effect parity).
@@ -4899,6 +5675,135 @@ fn lower_comprehension(
     }
     // 3. Map pass `(id) => element`.
     emit_hof_with_synthetic_closure("list_int_map", id, element, range, ctx)?;
+    Ok(())
+}
+
+fn lower_comprehension_as_type(
+    expected_element: &TypeRepr,
+    element: &Node,
+    id: &str,
+    iterable: &Node,
+    condition: Option<&Node>,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    lower_expr(&iterable.expr, iterable.range, ctx)?;
+    let src_ty = ctx.tstack.last().copied();
+    let (filter_builtin, map_builtin) = match src_ty {
+        Some(IrType::ListInt) => (Some("list_int_filter"), "list_int_map_to_variant_list"),
+        Some(IrType::ListFloat) => (Some("list_float_filter"), "list_float_map_to_variant_list"),
+        Some(IrType::ListString) => (None, "list_string_map_to_variant_list"),
+        _ => {
+            return Err(cap!(
+                "lower_comprehension.unsupported_expr.1",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "comprehension iterable must be List<Int>, List<Float>, or List<String> for variant-list output, got {:?}",
+                        src_ty
+                    ),
+                    range: iterable.range,
+                }
+            ))
+        }
+    };
+
+    fn emit_hof_with_synthetic_closure_as_type(
+        builtin: &'static str,
+        id: &str,
+        body: &Node,
+        expected_body_ty: Option<&TypeRepr>,
+        range: TokenRange,
+        ctx: &mut LowerCtx<'_>,
+    ) -> Result<(), LoweringError> {
+        let fn_idx = stdlib_function_index(builtin).ok_or_else(|| {
+            cap!(
+                "lower_comprehension.unknown_stdlib_method.1",
+                LoweringError::UnknownStdlibMethod {
+                    name: builtin.to_string(),
+                    arity: 2,
+                    range,
+                }
+            )
+        })?;
+        let meta = builtin_stdlib().get(fn_idx as usize).ok_or_else(|| {
+            cap!(
+                "lower_comprehension.unknown_stdlib_method.2",
+                LoweringError::UnknownStdlibMethod {
+                    name: builtin.to_string(),
+                    arity: 2,
+                    range,
+                }
+            )
+        })?;
+        let params = meta.params.clone();
+        let ret = meta.ret;
+        let (param_tys_c, ret_ty_c) =
+            stdlib_closure_arg_signature(builtin, 1).ok_or_else(|| {
+                cap!(
+                    "lower_comprehension.unsupported_expr.2",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!("{builtin} closure signature missing"),
+                        range,
+                    }
+                )
+            })?;
+        let closure_expr = Expr::Closure {
+            params: vec![relon_parser::ClosureParam {
+                name: id.to_string(),
+                type_hint: None,
+                range: body.range,
+            }],
+            return_type: None,
+            body: body.clone(),
+        };
+        if let Some(expected) = expected_body_ty {
+            lower_closure_as_value_with_expected_type(
+                &closure_expr,
+                body.range,
+                &param_tys_c,
+                ret_ty_c,
+                None,
+                Some(expected),
+                ctx,
+            )?;
+        } else {
+            lower_closure_as_value(&closure_expr, body.range, &param_tys_c, ret_ty_c, ctx)?;
+        }
+        ctx.tstack.pop();
+        ctx.tstack.pop();
+        ctx.out.push(TaggedOp {
+            op: Op::Call {
+                fn_index: fn_idx,
+                arg_count: 2,
+                param_tys: params,
+                ret_ty: ret,
+            },
+            range,
+        });
+        ctx.tstack.push(ret);
+        Ok(())
+    }
+
+    if let Some(cond) = condition {
+        let Some(filter_builtin) = filter_builtin else {
+            return Err(cap!(
+                "lower_comprehension.unsupported_expr.2",
+                LoweringError::UnsupportedExpr {
+                    kind: "filtered List<String> comprehension is not compiled yet".to_string(),
+                    range,
+                }
+            ));
+        };
+        emit_hof_with_synthetic_closure_as_type(filter_builtin, id, cond, None, range, ctx)?;
+    }
+    emit_hof_with_synthetic_closure_as_type(
+        map_builtin,
+        id,
+        element,
+        Some(expected_element),
+        range,
+        ctx,
+    )?;
     Ok(())
 }
 
@@ -6495,6 +7400,7 @@ fn lower_where(
                 idx,
                 ty: IrType::Closure,
                 schema_brand: None,
+                type_repr: None,
             });
             ctx.closure_let_signatures
                 .insert(idx, (param_irts.clone(), ret_ty));
@@ -6559,6 +7465,7 @@ fn lower_where(
                 idx,
                 ty: IrType::ListInt,
                 schema_brand: None,
+                type_repr: None,
             });
             continue;
         }
@@ -6597,6 +7504,7 @@ fn lower_where(
                     idx,
                     ty: IrType::ListFloat,
                     schema_brand: None,
+                    type_repr: None,
                 });
                 continue;
             }
@@ -6636,6 +7544,7 @@ fn lower_where(
             idx,
             ty: value_ty,
             schema_brand: None,
+            type_repr: None,
         });
     }
     lower_expr(&expr.expr, expr.range, ctx)?;
@@ -6878,14 +7787,14 @@ fn lower_binary(
             ));
         }
         // Phase 2.c supports comparisons on Int / Float / Bool /
-        // Null. Bool / Null only support `==` / `!=`; ordering
+        // Unit. Bool / Unit only support `==` / `!=`; ordering
         // (`<`, `<=`, `>`, `>=`) is rejected at the comparison
         // codegen layer too, but we surface it here as a lowering
         // error so the message stays user-facing.
         match (lhs_ty, op) {
             (IrType::I64 | IrType::F64, _) => {}
             (IrType::Bool, Operator::Eq | Operator::Ne) => {}
-            (IrType::Null, Operator::Eq | Operator::Ne) => {}
+            (IrType::Unit, Operator::Eq | Operator::Ne) => {}
             _ => {
                 return Err(cap!(
                     "lower_binary.unsupported_operator.13",
@@ -7232,6 +8141,78 @@ fn lower_ternary(
     Ok(())
 }
 
+/// Lower a ternary when the surrounding expression already declares the
+/// result type. This is required for enum variants such as
+/// `flag ? Stat.Up : Stat.Down`, where `Stat.Up` only has meaning once
+/// the expected enum type is known.
+fn lower_ternary_as_type(
+    expected: &TypeRepr,
+    cond: &Node,
+    then: &Node,
+    els: &Node,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    lower_expr(&cond.expr, cond.range, ctx)?;
+    let cond_ty = ctx.tstack.pop().ok_or(cap!(
+        "lower_ternary_as_type.unsupported_expr",
+        LoweringError::UnsupportedExpr {
+            kind: "Ternary(cond)".to_string(),
+            range,
+        }
+    ))?;
+    if cond_ty != IrType::Bool {
+        return Err(cap!(
+            "lower_ternary_as_type.if_condition_not_bool",
+            LoweringError::IfConditionNotBool {
+                got: cond_ty,
+                range,
+            }
+        ));
+    }
+
+    let then_ops = lower_branch_as_type(expected, then, range, ctx)?;
+    let then_ty = then_ops.1;
+    let then_body = then_ops.0;
+
+    let else_ops = lower_branch_as_type(expected, els, range, ctx)?;
+    let else_ty = else_ops.1;
+    let else_body = else_ops.0;
+
+    if then_ty != else_ty {
+        return Err(cap!(
+            "lower_ternary_as_type.if_branch_type_mismatch",
+            LoweringError::IfBranchTypeMismatch {
+                then_ty,
+                else_ty,
+                range,
+            }
+        ));
+    }
+
+    let expected_ty = type_repr_to_ir_type_dict(expected);
+    if then_ty != expected_ty {
+        return Err(cap!(
+            "lower_ternary_as_type.unsupported_expr.branch_type",
+            LoweringError::UnsupportedExpr {
+                kind: format!("Ternary(branch produced {then_ty:?}, expected {expected_ty:?})"),
+                range,
+            }
+        ));
+    }
+
+    ctx.out.push(TaggedOp {
+        op: Op::If {
+            result_ty: then_ty,
+            then_body,
+            else_body,
+        },
+        range,
+    });
+    ctx.tstack.push(then_ty);
+    Ok(())
+}
+
 /// Lower one branch of a ternary into a self-contained op stream +
 /// the type it leaves on top of its private virtual stack.
 ///
@@ -7253,6 +8234,29 @@ fn lower_branch(
     if branch_stack.len() != 1 {
         return Err(cap!(
             "lower_branch.unsupported_expr",
+            LoweringError::UnsupportedExpr {
+                kind: format!("Ternary(branch-stack={})", branch_stack.len()),
+                range,
+            }
+        ));
+    }
+    Ok((branch_ops, branch_stack[0]))
+}
+
+fn lower_branch_as_type(
+    expected: &TypeRepr,
+    node: &Node,
+    range: TokenRange,
+    parent: &mut LowerCtx<'_>,
+) -> Result<(Vec<TaggedOp>, IrType), LoweringError> {
+    let saved_out = std::mem::take(&mut parent.out);
+    let saved_stack = std::mem::take(&mut parent.tstack);
+    lower_value_as_type(expected, node, parent)?;
+    let branch_ops = std::mem::replace(&mut parent.out, saved_out);
+    let branch_stack = std::mem::replace(&mut parent.tstack, saved_stack);
+    if branch_stack.len() != 1 {
+        return Err(cap!(
+            "lower_branch_as_type.unsupported_expr",
             LoweringError::UnsupportedExpr {
                 kind: format!("Ternary(branch-stack={})", branch_stack.len()),
                 range,
@@ -7292,10 +8296,33 @@ fn arithmetic_op_ctor(op: Operator) -> Option<fn(IrType) -> Op> {
 // Phase 3.b: dict-literal lowering helpers.
 // =====================================================================
 
-/// If `return_type` names a user-declared schema (single-segment
+type GenericSubst = HashMap<String, TypeNode>;
+
+fn generic_subst_for_def(def: &SchemaDef, ty: &TypeNode) -> Option<GenericSubst> {
+    if def.generics.len() != ty.generics.len() {
+        return None;
+    }
+    Some(
+        def.generics
+            .iter()
+            .cloned()
+            .zip(ty.generics.iter().cloned())
+            .collect(),
+    )
+}
+
+fn apply_generic_subst(ty: &TypeNode, subst: &GenericSubst) -> TypeNode {
+    if subst.is_empty() {
+        ty.clone()
+    } else {
+        relon_analyzer::substitute_generics_in_typenode(ty, subst)
+    }
+}
+
+/// If `return_type` names a user-declared record schema (single-segment
 /// TypeNode with no generics), return its canonical-form `Schema`
-/// recursively flattened. Returns `Ok(None)` when the return type is
-/// not a user schema (the v1 scalar-return path stays in effect).
+/// recursively flattened. Returns `Ok(None)` for custom `#enum` so the
+/// normal single-field return path can carry `TypeRepr::Enum`.
 fn resolve_return_user_schema(
     return_type: Option<&TypeNode>,
     resolver: &SchemaResolver<'_>,
@@ -7311,16 +8338,125 @@ fn resolve_return_user_schema(
     // though they would also fail the user-schema lookup below.
     if matches!(
         name.as_str(),
-        "Int" | "Float" | "Bool" | "Null" | "String" | "List" | "Option" | "Result"
+        "Int"
+            | "Float"
+            | "Bool"
+            | "String"
+            | "List"
+            | "Option"
+            | "Result"
+            | "Tuple"
+            | "Null"
+            | "Unit"
     ) {
         return Ok(None);
     }
     let Some(def) = resolver.resolve(name) else {
         return Ok(None);
     };
+    if !def.variants.is_empty() {
+        return Ok(None);
+    }
     let mut stack: Vec<&str> = Vec::new();
     let schema = canonical_schema_from_def(def, resolver, &mut stack, t.range)?;
     Ok(Some(schema))
+}
+
+fn canonical_enum_from_def<'a>(
+    def: &'a SchemaDef,
+    resolver: &SchemaResolver<'a>,
+    stack: &mut Vec<&'a str>,
+    range: TokenRange,
+) -> Result<TypeRepr, LoweringError> {
+    canonical_enum_from_def_with_subst(def, resolver, stack, range, &GenericSubst::new())
+}
+
+fn canonical_enum_from_def_with_subst<'a>(
+    def: &'a SchemaDef,
+    resolver: &SchemaResolver<'a>,
+    stack: &mut Vec<&'a str>,
+    range: TokenRange,
+    subst: &GenericSubst,
+) -> Result<TypeRepr, LoweringError> {
+    let name = def.name.as_deref().ok_or_else(|| {
+        cap!(
+            "canonical_schema_from_def.unsupported_expr",
+            LoweringError::UnsupportedExpr {
+                kind: "anonymous-enum-schema".to_string(),
+                range,
+            }
+        )
+    })?;
+    if stack.contains(&name) {
+        let mut cycle: Vec<String> = stack.iter().map(|s| s.to_string()).collect();
+        cycle.push(name.to_string());
+        return Err(cap!(
+            "canonical_schema_from_def.cyclic_field_dependency",
+            LoweringError::CyclicFieldDependency {
+                schema: name.to_string(),
+                cycle,
+                range,
+            }
+        ));
+    }
+    if def.variants.len() > u8::MAX as usize + 1 {
+        return Err(cap!(
+            "canonical_schema_from_def.unsupported_expr",
+            LoweringError::UnsupportedExpr {
+                kind: format!("enum `{name}` has more than 256 variants"),
+                range,
+            }
+        ));
+    }
+
+    stack.push(name);
+    let mut variants = Vec::with_capacity(def.variants.len());
+    for (tag, variant) in def.variants.iter().enumerate() {
+        let mut fields = Vec::with_capacity(variant.fields.len());
+        for field in &variant.fields {
+            let ty_node = field.type_hint.as_ref().ok_or_else(|| {
+                cap!(
+                    "canonical_schema_from_def.unsupported_field_type",
+                    LoweringError::UnsupportedFieldType {
+                        schema: name.to_string(),
+                        field: format!("{}.{}", variant.name, field.name),
+                        ty: "<untyped>".to_string(),
+                        range: field.value_range,
+                    }
+                )
+            })?;
+            fields.push(Field {
+                name: field.name.clone(),
+                ty: canonical_type_repr_with_subst(
+                    ty_node,
+                    resolver,
+                    stack,
+                    field.value_range,
+                    subst,
+                )?,
+                default: None,
+            });
+        }
+        variants.push(CanonicalEnumVariant {
+            name: variant.name.clone(),
+            tag: tag as u8,
+            is_tuple: fields_are_tuple_payload(&fields),
+            fields,
+        });
+    }
+    stack.pop();
+    Ok(TypeRepr::Enum {
+        name: name.to_string(),
+        variants,
+    })
+}
+
+fn fields_are_tuple_payload(fields: &[Field]) -> bool {
+    !fields.is_empty()
+        && fields
+            .iter()
+            .enumerate()
+            .all(|(idx, field)| field.name == idx.to_string())
 }
 
 /// Recursively build a canonical [`Schema`] from a [`SchemaDef`].
@@ -7337,6 +8473,16 @@ fn canonical_schema_from_def<'a>(
     resolver: &SchemaResolver<'a>,
     stack: &mut Vec<&'a str>,
     range: TokenRange,
+) -> Result<Schema, LoweringError> {
+    canonical_schema_from_def_with_subst(def, resolver, stack, range, &GenericSubst::new())
+}
+
+fn canonical_schema_from_def_with_subst<'a>(
+    def: &'a SchemaDef,
+    resolver: &SchemaResolver<'a>,
+    stack: &mut Vec<&'a str>,
+    range: TokenRange,
+    subst: &GenericSubst,
 ) -> Result<Schema, LoweringError> {
     let name = def.name.as_deref().ok_or_else(|| {
         cap!(
@@ -7363,17 +8509,18 @@ fn canonical_schema_from_def<'a>(
     if let Some(elements) = &def.tuple_elements {
         let mut tys = Vec::with_capacity(elements.len());
         for (idx, ty_node) in elements.iter().enumerate() {
-            let ty = canonical_type_repr(ty_node, resolver, stack, range).map_err(|_| {
-                cap!(
-                    "canonical_schema_from_def.unsupported_tuple_element_type",
-                    LoweringError::UnsupportedFieldType {
-                        schema: name.to_string(),
-                        field: idx.to_string(),
-                        ty: type_head_for_display(ty_node),
-                        range: ty_node.range,
-                    }
-                )
-            })?;
+            let ty = canonical_type_repr_with_subst(ty_node, resolver, stack, range, subst)
+                .map_err(|_| {
+                    cap!(
+                        "canonical_schema_from_def.unsupported_tuple_element_type",
+                        LoweringError::UnsupportedFieldType {
+                            schema: name.to_string(),
+                            field: idx.to_string(),
+                            ty: type_head_for_display(ty_node),
+                            range: ty_node.range,
+                        }
+                    )
+                })?;
             tys.push(ty);
         }
         stack.pop();
@@ -7394,7 +8541,7 @@ fn canonical_schema_from_def<'a>(
                 }
             )
         })?;
-        let ty = canonical_type_repr(ty_node, resolver, stack, f.value_range)?;
+        let ty = canonical_type_repr_with_subst(ty_node, resolver, stack, f.value_range, subst)?;
         fields.push(Field {
             name: f.name.clone(),
             ty,
@@ -7410,17 +8557,31 @@ fn canonical_schema_from_def<'a>(
     })
 }
 
-/// Convert a `TypeNode` into the canonical `TypeRepr`. Supports the
-/// Phase 3.b surface (scalar leaves, `String`, `List<Int>`, nested
-/// user schemas); everything else surfaces
-/// [`LoweringError::UnsupportedFieldType`] at the call site that
-/// owns the field name.
+/// Convert a schema field type into the canonical [`TypeRepr`]. This is the
+/// resolver-aware form used for named schemas, including tuple schemas.
 fn canonical_type_repr<'a>(
     ty: &TypeNode,
     resolver: &SchemaResolver<'a>,
     stack: &mut Vec<&'a str>,
     range: TokenRange,
 ) -> Result<TypeRepr, LoweringError> {
+    canonical_type_repr_with_subst(ty, resolver, stack, range, &GenericSubst::new())
+}
+
+fn canonical_type_repr_with_subst<'a>(
+    ty: &TypeNode,
+    resolver: &SchemaResolver<'a>,
+    stack: &mut Vec<&'a str>,
+    range: TokenRange,
+    subst: &GenericSubst,
+) -> Result<TypeRepr, LoweringError> {
+    let concrete_ty;
+    let ty = if subst.is_empty() {
+        ty
+    } else {
+        concrete_ty = apply_generic_subst(ty, subst);
+        &concrete_ty
+    };
     if ty.path.len() != 1 || ty.variant_fields.is_some() {
         return Err(cap!(
             "canonical_type_repr.unsupported_field_type.1",
@@ -7432,41 +8593,56 @@ fn canonical_type_repr<'a>(
             }
         ));
     }
+
     let head = ty.path[0].as_str();
-    match (head, ty.generics.as_slice()) {
-        ("Int", []) => Ok(TypeRepr::Int),
-        ("Float", []) => Ok(TypeRepr::Float),
-        ("Bool", []) => Ok(TypeRepr::Bool),
-        ("Null", []) => Ok(TypeRepr::Null),
-        ("String", []) => Ok(TypeRepr::String),
-        ("List", [elem]) => {
-            let inner = canonical_type_repr(elem, resolver, stack, range)?;
-            // Scalar / String element lists are materialised by both
-            // compiled backends (`write_list_*` host encoders +
-            // `LoadFieldAtAbsolute` pointer-indirect field decode).
-            // `List<Schema>` and nested `List<List<…>>` element lists
-            // are pointer arrays whose entries are themselves records
-            // (a schema sub-record / an inner list record); the host
-            // encoders recurse through `list_record_writer` /
-            // `write_list_arg_into_builder`, the layout pass models the
-            // per-entry pointer array, and `relocate_pointers` rebases
-            // the inner slots. The element decode is consumed through
-            // the `[len]` header (`.length()`) — the only cross-backend
-            // consumer that lowers for these shapes.
+    if is_removed_unit_null_type_name(head) {
+        return Err(cap!(
+            "canonical_type_repr.unsupported_field_type.reserved",
+            LoweringError::UnsupportedFieldType {
+                schema: stack.last().copied().unwrap_or("?").to_string(),
+                field: "?".to_string(),
+                ty: head.to_string(),
+                range,
+            }
+        ));
+    }
+
+    let base = match (head, ty.generics.as_slice()) {
+        ("Int", []) => TypeRepr::Int,
+        ("Float", []) => TypeRepr::Float,
+        ("Bool", []) => TypeRepr::Bool,
+        ("String", []) => TypeRepr::String,
+        ("List", [elem]) => TypeRepr::List {
+            element: Box::new(canonical_type_repr(elem, resolver, stack, range)?),
+        },
+        ("Option", [inner]) => TypeRepr::Option {
+            inner: Box::new(canonical_type_repr(inner, resolver, stack, range)?),
+        },
+        ("Result", [ok, err]) => TypeRepr::Result {
+            ok: Box::new(canonical_type_repr(ok, resolver, stack, range)?),
+            err: Box::new(canonical_type_repr(err, resolver, stack, range)?),
+        },
+        ("Tuple", _) => TypeRepr::Schema {
+            schema: Box::new(
+                tuple_type_node_to_schema(ty, Some(resolver)).ok_or_else(|| {
+                    cap!(
+                        "canonical_type_repr.unsupported_field_type.tuple",
+                        LoweringError::UnsupportedFieldType {
+                            schema: stack.last().copied().unwrap_or("?").to_string(),
+                            field: "?".to_string(),
+                            ty: type_head_for_display(ty),
+                            range,
+                        }
+                    )
+                })?,
+            ),
+        },
+        _ => {
             if matches!(
-                inner,
-                TypeRepr::Int
-                    | TypeRepr::Float
-                    | TypeRepr::Bool
-                    | TypeRepr::String
-                    | TypeRepr::Schema { .. }
-                    | TypeRepr::List { .. }
+                head,
+                "Int" | "Float" | "Bool" | "String" | "List" | "Option" | "Result" | "Tuple"
             ) {
-                Ok(TypeRepr::List {
-                    element: Box::new(inner),
-                })
-            } else {
-                Err(cap!(
+                return Err(cap!(
                     "canonical_type_repr.unsupported_field_type.2",
                     LoweringError::UnsupportedFieldType {
                         schema: stack.last().copied().unwrap_or("?").to_string(),
@@ -7474,11 +8650,8 @@ fn canonical_type_repr<'a>(
                         ty: type_head_for_display(ty),
                         range,
                     }
-                ))
+                ));
             }
-        }
-        _ => {
-            // Treat any single-segment head as a user-schema reference.
             let Some(def) = resolver.resolve(head) else {
                 return Err(cap!(
                     "canonical_type_repr.unsupported_field_type.3",
@@ -7490,12 +8663,34 @@ fn canonical_type_repr<'a>(
                     }
                 ));
             };
-            let sub = canonical_schema_from_def(def, resolver, stack, range)?;
-            Ok(TypeRepr::Schema {
-                schema: Box::new(sub),
-            })
+            let Some(schema_subst) = generic_subst_for_def(def, ty) else {
+                return Err(cap!(
+                    "canonical_type_repr.unsupported_field_type.generics",
+                    LoweringError::UnsupportedFieldType {
+                        schema: stack.last().copied().unwrap_or("?").to_string(),
+                        field: "?".to_string(),
+                        ty: type_head_for_display(ty),
+                        range,
+                    }
+                ));
+            };
+            if !def.variants.is_empty() {
+                canonical_enum_from_def_with_subst(def, resolver, stack, range, &schema_subst)?
+            } else {
+                TypeRepr::Schema {
+                    schema: Box::new(canonical_schema_from_def_with_subst(
+                        def,
+                        resolver,
+                        stack,
+                        range,
+                        &schema_subst,
+                    )?),
+                }
+            }
         }
-    }
+    };
+
+    Ok(maybe_optional(ty, base))
 }
 
 /// Decide topological order in which a schema's fields must be
@@ -7790,10 +8985,950 @@ fn type_repr_to_ir_type_dict(t: &TypeRepr) -> IrType {
         return ty;
     }
     match t {
-        TypeRepr::Schema { .. } | TypeRepr::Option { .. } | TypeRepr::Result { .. } => IrType::I32,
+        TypeRepr::Schema { .. }
+        | TypeRepr::Option { .. }
+        | TypeRepr::Result { .. }
+        | TypeRepr::Enum { .. } => IrType::I32,
         TypeRepr::List { .. } => IrType::ListInt,
         _ => IrType::I32,
     }
+}
+
+fn align_up_for_lowering(value: usize, align: usize) -> usize {
+    if align <= 1 {
+        value
+    } else {
+        (value + (align - 1)) & !(align - 1)
+    }
+}
+
+fn payload_slot_layout_for_lowering(ty: &TypeRepr) -> Result<(usize, usize), LoweringError> {
+    match ty {
+        TypeRepr::Bool | TypeRepr::Unit => Ok((1, 1)),
+        TypeRepr::Int | TypeRepr::Float => Ok((8, 8)),
+        TypeRepr::String
+        | TypeRepr::List { .. }
+        | TypeRepr::Schema { .. }
+        | TypeRepr::Option { .. }
+        | TypeRepr::Result { .. }
+        | TypeRepr::Enum { .. } => Ok((4, 4)),
+        other => Err(cap!(
+            "payload_slot_layout_for_lowering.unsupported_type",
+            LoweringError::UnsupportedTypeInMain {
+                type_name: format!("{other:?}"),
+                range: TokenRange::default(),
+            }
+        )),
+    }
+}
+
+fn type_graph_alignment_for_lowering(ty: &TypeRepr) -> Result<usize, LoweringError> {
+    match ty {
+        TypeRepr::Bool | TypeRepr::Unit => Ok(1),
+        TypeRepr::Int | TypeRepr::Float => Ok(8),
+        TypeRepr::String | TypeRepr::List { .. } | TypeRepr::Schema { .. } => Ok(4),
+        TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => {
+            variant_record_alignment_for_lowering(ty)
+        }
+        other => Err(cap!(
+            "type_graph_alignment_for_lowering.unsupported_type",
+            LoweringError::UnsupportedTypeInMain {
+                type_name: format!("{other:?}"),
+                range: TokenRange::default(),
+            }
+        )),
+    }
+}
+
+fn variant_record_alignment_for_lowering(ty: &TypeRepr) -> Result<usize, LoweringError> {
+    let payloads: Vec<TypeRepr> = match ty {
+        TypeRepr::Option { inner } => vec![inner.as_ref().clone()],
+        TypeRepr::Result { ok, err } => vec![ok.as_ref().clone(), err.as_ref().clone()],
+        TypeRepr::Enum { name, variants } => variants
+            .iter()
+            .filter_map(|variant| {
+                variant.payload_schema(name).map(|schema| TypeRepr::Schema {
+                    schema: Box::new(schema),
+                })
+            })
+            .collect(),
+        other => {
+            return Err(cap!(
+                "variant_record_alignment_for_lowering.unsupported_type",
+                LoweringError::UnsupportedTypeInMain {
+                    type_name: format!("{other:?}"),
+                    range: TokenRange::default(),
+                }
+            ))
+        }
+    };
+    let mut align = 4usize;
+    for payload in &payloads {
+        let (_, slot_align) = payload_slot_layout_for_lowering(payload)?;
+        align = align
+            .max(slot_align)
+            .max(type_graph_alignment_for_lowering(payload)?);
+    }
+    Ok(align)
+}
+
+fn variant_payload_offset_for_lowering(payload_ty: &TypeRepr) -> Result<usize, LoweringError> {
+    let (_, payload_align) = payload_slot_layout_for_lowering(payload_ty)?;
+    Ok(align_up_for_lowering(1, payload_align))
+}
+
+fn variant_body_pairs(
+    body: &Node,
+    range: TokenRange,
+) -> Result<&[(TokenKey, Node)], LoweringError> {
+    match &*body.expr {
+        Expr::Dict(pairs) => Ok(pairs.as_slice()),
+        other => Err(cap!(
+            "lower_variant_ctor_as_type.body_not_dict",
+            LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "variant constructor body must be a dict literal, got `{}`",
+                    other.kind()
+                ),
+                range,
+            }
+        )),
+    }
+}
+
+fn variant_payload_node<'a>(
+    pairs: &'a [(TokenKey, Node)],
+    key_name: &str,
+    range: TokenRange,
+) -> Result<&'a Node, LoweringError> {
+    let mut found: Option<&Node> = None;
+    for (key, value) in pairs {
+        let TokenKey::String(name, _, _) = key else {
+            return Err(cap!(
+                "lower_variant_ctor_as_type.non_string_key",
+                LoweringError::UnsupportedExpr {
+                    kind: "variant constructor field key must be a string identifier".to_string(),
+                    range,
+                }
+            ));
+        };
+        if name == key_name {
+            if found.is_some() {
+                return Err(cap!(
+                    "lower_variant_ctor_as_type.duplicate_payload",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!("duplicate variant payload field `{key_name}`"),
+                        range,
+                    }
+                ));
+            }
+            found = Some(value);
+        } else {
+            return Err(cap!(
+                "lower_variant_ctor_as_type.unexpected_field",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("unexpected variant payload field `{name}`"),
+                    range,
+                }
+            ));
+        }
+    }
+    found.ok_or_else(|| {
+        cap!(
+            "lower_variant_ctor_as_type.missing_payload",
+            LoweringError::UnsupportedExpr {
+                kind: format!("missing variant payload field `{key_name}`"),
+                range,
+            }
+        )
+    })
+}
+
+fn lower_schema_value_as_absolute_pointer(
+    schema: &Schema,
+    value: &Node,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    match (&*value.expr, schema.is_tuple) {
+        (Expr::Dict(pairs), false) => {
+            let layout = SchemaLayout::offsets_for(schema)?;
+            let record_local = ctx.alloc_record_local();
+            ctx.out.push(TaggedOp {
+                op: alloc_record_op(
+                    ctx,
+                    record_local,
+                    layout.root_size as u32,
+                    layout.root_align as u32,
+                ),
+                range,
+            });
+            if ctx.schema_resolver.resolve(&schema.name).is_some() {
+                lower_dict_into_record(schema, &layout, pairs, range, record_local, ctx)?;
+            } else {
+                lower_plain_dict_into_record(schema, &layout, pairs, range, record_local, ctx)?;
+            }
+            push_record_base_for_pointer(record_local, range, ctx);
+            Ok(())
+        }
+        (Expr::Tuple(elements), true) => {
+            if elements.len() != schema.fields.len() {
+                return Err(cap!(
+                    "lower_schema_value_as_absolute_pointer.arity_mismatch",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "tuple payload has {} elements but schema declares {}",
+                            elements.len(),
+                            schema.fields.len()
+                        ),
+                        range,
+                    }
+                ));
+            }
+            let layout = SchemaLayout::offsets_for(schema)?;
+            let record_local = ctx.alloc_record_local();
+            ctx.out.push(TaggedOp {
+                op: alloc_record_op(
+                    ctx,
+                    record_local,
+                    layout.root_size as u32,
+                    layout.root_align as u32,
+                ),
+                range,
+            });
+            lower_tuple_into_record(schema, &layout, elements, record_local, ctx)?;
+            push_record_base_for_pointer(record_local, range, ctx);
+            Ok(())
+        }
+        _ => lower_expr(&value.expr, range, ctx),
+    }
+}
+
+fn alloc_record_op(ctx: &LowerCtx<'_>, record_local: u32, root_size: u32, root_align: u32) -> Op {
+    if ctx.variant_records_in_scratch {
+        Op::AllocScratchRecord {
+            record_local_idx: record_local,
+            root_size,
+            root_align,
+        }
+    } else {
+        Op::AllocSubRecord {
+            record_local_idx: record_local,
+            root_size,
+            root_align,
+        }
+    }
+}
+
+fn store_field_at_record_op(ctx: &LowerCtx<'_>, record_local: u32, offset: u32, ty: IrType) -> Op {
+    if ctx.variant_records_in_scratch {
+        Op::StoreFieldAtRecordAbsolute {
+            record_local_idx: record_local,
+            offset,
+            ty,
+        }
+    } else {
+        Op::StoreFieldAtRecord {
+            record_local_idx: record_local,
+            offset,
+            ty,
+        }
+    }
+}
+
+fn push_record_base_for_pointer(record_local: u32, range: TokenRange, ctx: &mut LowerCtx<'_>) {
+    if ctx.variant_records_in_scratch {
+        ctx.out.push(TaggedOp {
+            op: Op::PushRecordBaseAbsolute {
+                record_local_idx: record_local,
+            },
+            range,
+        });
+        ctx.tstack.push(IrType::I32);
+    } else {
+        push_record_base_as_absolute(record_local, range, ctx);
+    }
+}
+
+fn push_record_base_as_absolute(record_local: u32, range: TokenRange, ctx: &mut LowerCtx<'_>) {
+    ctx.out.push(TaggedOp {
+        op: Op::PushRecordBase {
+            record_local_idx: record_local,
+        },
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::LocalGet(2),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+    ctx.out.push(TaggedOp {
+        op: Op::Add(IrType::I32),
+        range,
+    });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+}
+
+fn lower_value_as_type(
+    expected: &TypeRepr,
+    value: &Node,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    match (expected, &*value.expr) {
+        (expected, Expr::Ternary { cond, then, els }) => {
+            lower_ternary_as_type(expected, cond, then, els, value.range, ctx)
+        }
+        (TypeRepr::List { element }, Expr::FnCall { path, args })
+            if variant_record_list_element(element) =>
+        {
+            if let Some(()) = peephole::emit_variant_list_filter_call_as_type(
+                element,
+                path,
+                args,
+                value.range,
+                ctx,
+            )? {
+                Ok(())
+            } else if let Some(()) = peephole::emit_variant_list_filter_method_as_type(
+                element,
+                path,
+                args,
+                value.range,
+                ctx,
+            )? {
+                Ok(())
+            } else if let Some(()) =
+                peephole::emit_variant_list_map_call_as_type(element, path, args, value.range, ctx)?
+            {
+                Ok(())
+            } else if let Some(()) = peephole::emit_variant_list_map_method_as_type(
+                element,
+                path,
+                args,
+                value.range,
+                ctx,
+            )? {
+                Ok(())
+            } else {
+                lower_expr(&value.expr, value.range, ctx)
+            }
+        }
+        (
+            TypeRepr::List {
+                element: expected_element,
+            },
+            Expr::Comprehension {
+                element,
+                id,
+                iterable,
+                condition,
+            },
+        ) if variant_record_list_element(expected_element) => lower_comprehension_as_type(
+            expected_element,
+            element,
+            id,
+            iterable,
+            condition.as_ref(),
+            value.range,
+            ctx,
+        ),
+        (TypeRepr::List { element }, Expr::List(items)) if variant_record_list_element(element) => {
+            lower_variant_record_list_literal(element, items, value.range, ctx)
+        }
+        (
+            TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. },
+            Expr::VariantCtor {
+                enum_path,
+                variant,
+                body,
+            },
+        ) => lower_variant_ctor_as_type(expected, enum_path, variant, body, value.range, ctx),
+        (
+            TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. },
+            Expr::Variable(path),
+        ) => {
+            if let Some(variant) = variant_name_from_path(expected, path, false) {
+                lower_standard_variant_record(expected, variant.as_str(), None, value.range, ctx)
+            } else {
+                lower_expr(&value.expr, value.range, ctx)
+            }
+        }
+        (
+            TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. },
+            Expr::FnCall { path, args },
+        ) => {
+            if let Some(variant) = variant_name_from_path(expected, path, true) {
+                lower_variant_call_as_type(expected, variant.as_str(), args, value.range, ctx)
+            } else {
+                lower_expr(&value.expr, value.range, ctx)
+            }
+        }
+        (TypeRepr::Schema { schema }, _) => {
+            lower_schema_value_as_absolute_pointer(schema, value, value.range, ctx)
+        }
+        _ => lower_expr(&value.expr, value.range, ctx),
+    }
+}
+
+fn variant_record_list_element(element: &TypeRepr) -> bool {
+    matches!(
+        element,
+        TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. }
+    )
+}
+
+fn variant_list_literal_for_type(expected: &TypeRepr, expr: &Expr) -> bool {
+    matches!(expected, TypeRepr::List { element } if variant_record_list_element(element))
+        && matches!(expr, Expr::List(_))
+}
+
+fn variant_record_list_inplace_expr_for_type(expected: &TypeRepr, expr: &Expr) -> bool {
+    if !matches!(expected, TypeRepr::List { element } if variant_record_list_element(element)) {
+        return false;
+    }
+    match expr {
+        Expr::List(_) | Expr::Comprehension { .. } => true,
+        Expr::FnCall { path, .. } => {
+            if let [TokenKey::String(name, _, _), ..] = path.as_slice() {
+                if name == "_list_map" || name == "_list_filter" {
+                    return true;
+                }
+            }
+            matches!(path.last(), Some(TokenKey::String(name, _, _)) if name == "map" || name == "filter")
+        }
+        _ => false,
+    }
+}
+
+fn lower_variant_record_list_literal(
+    element: &TypeRepr,
+    items: &[Node],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    for item in items {
+        lower_value_as_type(element, item, ctx)?;
+        let top = ctx.tstack.pop().ok_or_else(|| {
+            cap!(
+                "lower_variant_record_list_literal.empty_element_stack",
+                LoweringError::UnsupportedExpr {
+                    kind: "List<Enum>(element produced no value)".to_string(),
+                    range: item.range,
+                }
+            )
+        })?;
+        if top.wasm_slot() != IrType::I32.wasm_slot() {
+            return Err(cap!(
+                "lower_variant_record_list_literal.element_type_mismatch",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("List<Enum>(element produced {top:?}, expected variant pointer)"),
+                    range: item.range,
+                }
+            ));
+        }
+    }
+    let len = u32::try_from(items.len()).map_err(|_| {
+        cap!(
+            "lower_variant_record_list_literal.length_overflow",
+            LoweringError::UnsupportedExpr {
+                kind: "List<Enum>(too many elements)".to_string(),
+                range,
+            }
+        )
+    })?;
+    ctx.out.push(TaggedOp {
+        op: Op::BuildPointerList { len },
+        range,
+    });
+    ctx.tstack.push(IrType::ListList);
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct VariantPayloadShape {
+    ty: TypeRepr,
+    key: Option<&'static str>,
+}
+
+#[derive(Debug, Clone)]
+struct VariantShape {
+    tag: u8,
+    payload: Option<VariantPayloadShape>,
+}
+
+fn path_strings(path: &[TokenKey]) -> Option<Vec<&str>> {
+    path.iter()
+        .map(|key| match key {
+            TokenKey::String(name, _, _) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn enum_path_matches(expected_name: &str, enum_path: Option<&[String]>) -> bool {
+    match enum_path {
+        Some(path) => path.is_empty() || path == [expected_name],
+        None => true,
+    }
+}
+
+fn variant_name_from_path(
+    expected: &TypeRepr,
+    path: &[TokenKey],
+    require_payload: bool,
+) -> Option<String> {
+    let parts = path_strings(path)?;
+    match expected {
+        TypeRepr::Option { .. } => {
+            let name = match parts.as_slice() {
+                ["None"] if !require_payload => "None",
+                ["Option", "None"] if !require_payload => "None",
+                ["Some"] if require_payload => "Some",
+                ["Option", "Some"] if require_payload => "Some",
+                _ => return None,
+            };
+            Some(name.to_string())
+        }
+        TypeRepr::Result { .. } => {
+            let name = match parts.as_slice() {
+                ["Ok"] if require_payload => "Ok",
+                ["Result", "Ok"] if require_payload => "Ok",
+                ["Err"] if require_payload => "Err",
+                ["Result", "Err"] if require_payload => "Err",
+                _ => return None,
+            };
+            Some(name.to_string())
+        }
+        TypeRepr::Enum { name, variants } => {
+            let variant_name = match parts.as_slice() {
+                [variant] => *variant,
+                [enum_name, variant] if enum_name == name => *variant,
+                _ => return None,
+            };
+            let variant = variants.iter().find(|v| v.name == variant_name)?;
+            if require_payload != variant.fields.is_empty() {
+                Some(variant.name.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn standard_variant_shape(
+    expected: &TypeRepr,
+    enum_path: Option<&[String]>,
+    variant: &str,
+    range: TokenRange,
+) -> Result<VariantShape, LoweringError> {
+    match expected {
+        TypeRepr::Option { inner } => {
+            if !enum_path_matches("Option", enum_path) {
+                return Err(cap!(
+                    "standard_variant_shape.option_enum_mismatch",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "expected Option variant, got {}.{variant}",
+                            enum_path.map(|p| p.join(".")).unwrap_or_default()
+                        ),
+                        range,
+                    }
+                ));
+            }
+            match variant {
+                "None" => Ok(VariantShape {
+                    tag: 0,
+                    payload: None,
+                }),
+                "Some" => Ok(VariantShape {
+                    tag: 1,
+                    payload: Some(VariantPayloadShape {
+                        ty: inner.as_ref().clone(),
+                        key: Some("value"),
+                    }),
+                }),
+                other => Err(cap!(
+                    "standard_variant_shape.option_variant_mismatch",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!("unknown Option variant `{other}`"),
+                        range,
+                    }
+                )),
+            }
+        }
+        TypeRepr::Result { ok, err } => {
+            if !enum_path_matches("Result", enum_path) {
+                return Err(cap!(
+                    "standard_variant_shape.result_enum_mismatch",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "expected Result variant, got {}.{variant}",
+                            enum_path.map(|p| p.join(".")).unwrap_or_default()
+                        ),
+                        range,
+                    }
+                ));
+            }
+            match variant {
+                "Ok" => Ok(VariantShape {
+                    tag: 0,
+                    payload: Some(VariantPayloadShape {
+                        ty: ok.as_ref().clone(),
+                        key: Some("value"),
+                    }),
+                }),
+                "Err" => Ok(VariantShape {
+                    tag: 1,
+                    payload: Some(VariantPayloadShape {
+                        ty: err.as_ref().clone(),
+                        key: Some("error"),
+                    }),
+                }),
+                other => Err(cap!(
+                    "standard_variant_shape.result_variant_mismatch",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!("unknown Result variant `{other}`"),
+                        range,
+                    }
+                )),
+            }
+        }
+        TypeRepr::Enum { name, variants } => {
+            if !enum_path_matches(name, enum_path) {
+                return Err(cap!(
+                    "standard_variant_shape.not_variant_type",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "expected {name} variant, got {}.{variant}",
+                            enum_path.map(|p| p.join(".")).unwrap_or_default()
+                        ),
+                        range,
+                    }
+                ));
+            }
+            let Some(v) = variants.iter().find(|v| v.name == variant) else {
+                return Err(cap!(
+                    "standard_variant_shape.not_variant_type",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!("unknown {name} variant `{variant}`"),
+                        range,
+                    }
+                ));
+            };
+            Ok(VariantShape {
+                tag: v.tag,
+                payload: v.payload_schema(name).map(|schema| VariantPayloadShape {
+                    ty: TypeRepr::Schema {
+                        schema: Box::new(schema),
+                    },
+                    key: None,
+                }),
+            })
+        }
+        other => Err(cap!(
+            "standard_variant_shape.not_variant_type",
+            LoweringError::UnsupportedExpr {
+                kind: format!("variant constructor needs enum target, got `{other:?}`"),
+                range,
+            }
+        )),
+    }
+}
+
+fn lower_variant_call_as_type(
+    expected: &TypeRepr,
+    variant: &str,
+    args: &[CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    let shape = standard_variant_shape(expected, None, variant, range)?;
+    let Some(payload) = shape.payload.as_ref() else {
+        if args.is_empty() {
+            return emit_standard_variant_record(
+                expected, variant, shape.tag, None, None, range, ctx,
+            );
+        }
+        return Err(cap!(
+            "lower_prelude_variant_call_as_type.arity_mismatch",
+            LoweringError::UnsupportedExpr {
+                kind: format!("{variant}(...) does not take payload"),
+                range,
+            }
+        ));
+    };
+
+    if payload.key.is_some() {
+        if args.len() != 1 || args[0].name.is_some() {
+            return Err(cap!(
+                "lower_prelude_variant_call_as_type.arity_mismatch",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("{variant}(...) expects exactly one positional payload"),
+                    range,
+                }
+            ));
+        }
+        return emit_standard_variant_record(
+            expected,
+            variant,
+            shape.tag,
+            Some(&payload.ty),
+            Some(&args[0].value),
+            range,
+            ctx,
+        );
+    }
+
+    let TypeRepr::Schema { schema } = &payload.ty else {
+        return Err(cap!(
+            "standard_variant_shape.not_variant_type",
+            LoweringError::UnsupportedExpr {
+                kind: format!("variant `{variant}` payload is not a record"),
+                range,
+            }
+        ));
+    };
+    if !fields_are_tuple_payload(&schema.fields) {
+        return Err(cap!(
+            "lower_prelude_variant_call_as_type.arity_mismatch",
+            LoweringError::UnsupportedExpr {
+                kind: format!("struct variant `{variant}` must be constructed with `{{ ... }}`"),
+                range,
+            }
+        ));
+    }
+    if args.len() != schema.fields.len() || args.iter().any(|arg| arg.name.is_some()) {
+        return Err(cap!(
+            "lower_prelude_variant_call_as_type.arity_mismatch",
+            LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "{variant}(...) expects {} positional payload values",
+                    schema.fields.len()
+                ),
+                range,
+            }
+        ));
+    }
+    let layout = SchemaLayout::offsets_for(schema)?;
+    let record_local = ctx.alloc_record_local();
+    ctx.out.push(TaggedOp {
+        op: alloc_record_op(
+            ctx,
+            record_local,
+            layout.root_size as u32,
+            layout.root_align as u32,
+        ),
+        range,
+    });
+    for (idx, arg) in args.iter().enumerate() {
+        lower_dict_field_value(schema, idx, &arg.value, arg.value.range, ctx)?;
+        let canonical_field = &schema.fields[idx];
+        let layout_field = &layout.fields[idx];
+        let ir_ty = type_repr_to_ir_type_dict(&canonical_field.ty);
+        let store_ty = match layout_field.kind {
+            FieldKind::Inline { .. } => ir_ty,
+            FieldKind::PointerIndirect { .. } => IrType::I32,
+        };
+        let top = ctx.tstack.pop().ok_or_else(|| {
+            cap!(
+                "lower_tuple_return.unsupported_expr",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("tuple variant field {idx} produced no value"),
+                    range: arg.value.range,
+                }
+            )
+        })?;
+        if top.wasm_slot() != store_ty.wasm_slot() {
+            return Err(cap!(
+                "lower_tuple_return.unsupported_expr",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("tuple variant field {idx}: got {top:?}, expected {store_ty:?}"),
+                    range: arg.value.range,
+                }
+            ));
+        }
+        ctx.out.push(TaggedOp {
+            op: store_field_at_record_op(ctx, record_local, layout_field.offset as u32, store_ty),
+            range: arg.value.range,
+        });
+    }
+    push_record_base_for_pointer(record_local, range, ctx);
+    emit_variant_record_from_lowered_payload(
+        expected,
+        variant,
+        shape.tag,
+        Some(&payload.ty),
+        range,
+        ctx,
+    )
+}
+
+fn lower_variant_ctor_as_type(
+    expected: &TypeRepr,
+    enum_path: &[String],
+    variant: &str,
+    body: &Node,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    let shape = standard_variant_shape(expected, Some(enum_path), variant, range)?;
+    let pairs = variant_body_pairs(body, range)?;
+    let payload_node = if let Some(payload) = shape.payload.as_ref() {
+        if let Some(key_name) = payload.key {
+            Some(variant_payload_node(pairs, key_name, range)?)
+        } else {
+            Some(body)
+        }
+    } else {
+        if !pairs.is_empty() {
+            return Err(cap!(
+                "lower_variant_ctor_as_type.unit_variant_has_fields",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("variant `{variant}` does not take payload fields"),
+                    range,
+                }
+            ));
+        }
+        None
+    };
+    emit_standard_variant_record(
+        expected,
+        variant,
+        shape.tag,
+        shape.payload.as_ref().map(|p| &p.ty),
+        payload_node,
+        range,
+        ctx,
+    )
+}
+
+fn lower_standard_variant_record(
+    expected: &TypeRepr,
+    variant: &str,
+    payload_node: Option<&Node>,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    let shape = standard_variant_shape(expected, None, variant, range)?;
+    emit_standard_variant_record(
+        expected,
+        variant,
+        shape.tag,
+        shape.payload.as_ref().map(|p| &p.ty),
+        payload_node,
+        range,
+        ctx,
+    )
+}
+
+fn emit_standard_variant_record(
+    expected: &TypeRepr,
+    variant: &str,
+    tag: u8,
+    payload_ty: Option<&TypeRepr>,
+    payload_node: Option<&Node>,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    if let Some(payload_ty) = payload_ty {
+        let Some(payload_node) = payload_node else {
+            return Err(cap!(
+                "emit_standard_variant_record.missing_payload",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("variant `{variant}` requires a payload"),
+                    range,
+                }
+            ));
+        };
+        lower_value_as_type(payload_ty, payload_node, ctx)?;
+        emit_variant_record_from_lowered_payload(
+            expected,
+            variant,
+            tag,
+            Some(payload_ty),
+            range,
+            ctx,
+        )
+    } else {
+        if payload_node.is_some() {
+            return Err(cap!(
+                "emit_standard_variant_record.unexpected_payload",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("variant `{variant}` does not take a payload"),
+                    range,
+                }
+            ));
+        }
+        emit_variant_record_from_lowered_payload(expected, variant, tag, None, range, ctx)
+    }
+}
+
+fn emit_variant_record_from_lowered_payload(
+    expected: &TypeRepr,
+    variant: &str,
+    tag: u8,
+    payload_ty: Option<&TypeRepr>,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    let record_align = variant_record_alignment_for_lowering(expected)?;
+    let (payload_offset, payload_ir_ty, record_size) = if let Some(payload_ty) = payload_ty {
+        let expected_ir = type_repr_to_ir_type_dict(payload_ty);
+        let top = ctx.tstack.pop().ok_or_else(|| {
+            cap!(
+                "emit_standard_variant_record.empty_payload_stack",
+                LoweringError::UnsupportedExpr {
+                    kind: format!("variant `{variant}` payload produced no value"),
+                    range,
+                }
+            )
+        })?;
+        if top.wasm_slot() != expected_ir.wasm_slot() {
+            return Err(cap!(
+                "emit_standard_variant_record.payload_type_mismatch",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "variant `{variant}` payload produced {top:?}, expected {expected_ir:?}"
+                    ),
+                    range,
+                }
+            ));
+        }
+        let (payload_size, _) = payload_slot_layout_for_lowering(payload_ty)?;
+        let offset = variant_payload_offset_for_lowering(payload_ty)?;
+        (
+            Some(offset as u32),
+            Some(expected_ir),
+            (offset + payload_size) as u32,
+        )
+    } else {
+        (None, None, 1)
+    };
+
+    let op = if ctx.variant_records_in_scratch {
+        Op::BuildVariantRecordScratch {
+            tag,
+            record_size,
+            record_align: record_align as u32,
+            payload_offset,
+            payload_ty: payload_ir_ty,
+        }
+    } else {
+        Op::BuildVariantRecord {
+            tag,
+            record_size,
+            record_align: record_align as u32,
+            payload_offset,
+            payload_ty: payload_ir_ty,
+        }
+    };
+    ctx.out.push(TaggedOp { op, range });
+    ctx.tstack.push(IrType::I32);
+    Ok(())
 }
 
 /// Lower a dict literal into the in-construction record at
@@ -7909,7 +10044,14 @@ fn lower_dict_into_record(
             // simpler shape: emit a `LetSet` for every default-
             // evaluated field so the wasm side caches the value and
             // a later default can read it back via `LetGet`.
-            lower_dict_default(&schema.name, idx, def, ctx, field_range)?;
+            lower_dict_default(
+                &schema.name,
+                idx,
+                &canonical_field.ty,
+                def,
+                ctx,
+                field_range,
+            )?;
         }
         // Stack now holds the field's value (with type matching the
         // canonical Field). Emit the StoreFieldAtRecord.
@@ -7943,11 +10085,7 @@ fn lower_dict_into_record(
             ));
         }
         ctx.out.push(TaggedOp {
-            op: Op::StoreFieldAtRecord {
-                record_local_idx: record_local,
-                offset: layout_field.offset as u32,
-                ty: store_ty,
-            },
+            op: store_field_at_record_op(ctx, record_local, layout_field.offset as u32, store_ty),
             range: field_range,
         });
 
@@ -8005,6 +10143,7 @@ fn lower_dict_into_record(
             idx: let_idx,
             ty: bound_ty,
             schema_brand: None,
+            type_repr: None,
         });
     }
 
@@ -8017,8 +10156,118 @@ fn lower_dict_into_record(
     Ok(())
 }
 
-/// Wave T2: lower the elements of a tuple literal into a positional
-/// record. `tuple_schema` is the synthesised anonymous positional-record
+/// Lower a record literal whose schema is synthetic, such as a custom enum
+/// payload. These records have no `SchemaDef`, so there are no defaults or
+/// sibling-default references to resolve; every declared field must be present.
+fn lower_plain_dict_into_record(
+    schema: &Schema,
+    layout: &OffsetTable,
+    dict_pairs: &[(TokenKey, Node)],
+    range: TokenRange,
+    record_local: u32,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    let mut user_values: HashMap<String, &Node> = HashMap::new();
+    for (key, value) in dict_pairs {
+        let TokenKey::String(name, _, _) = key else {
+            return Err(cap!(
+                "lower_plain_dict_into_record.unsupported_expr.1",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "Dict(non-string-key in payload record for `{}`)",
+                        schema.name
+                    ),
+                    range,
+                }
+            ));
+        };
+        if !schema.fields.iter().any(|f| &f.name == name) {
+            return Err(cap!(
+                "lower_plain_dict_into_record.unsupported_field_type.1",
+                LoweringError::UnsupportedFieldType {
+                    schema: schema.name.clone(),
+                    field: name.clone(),
+                    ty: format!("(unknown field, not declared on `{}`)", schema.name),
+                    range,
+                }
+            ));
+        }
+        if user_values.insert(name.clone(), value).is_some() {
+            return Err(cap!(
+                "lower_plain_dict_into_record.unsupported_field_type.2",
+                LoweringError::UnsupportedFieldType {
+                    schema: schema.name.clone(),
+                    field: name.clone(),
+                    ty: "duplicate field".to_string(),
+                    range,
+                }
+            ));
+        }
+    }
+
+    for (idx, canonical_field) in schema.fields.iter().enumerate() {
+        let layout_field = &layout.fields[idx];
+        debug_assert_eq!(layout_field.name, canonical_field.name);
+        let Some(user_value) = user_values.get(canonical_field.name.as_str()) else {
+            return Err(cap!(
+                "lower_plain_dict_into_record.missing_field",
+                LoweringError::MissingFieldNoDefault {
+                    schema: schema.name.clone(),
+                    field: canonical_field.name.clone(),
+                    range,
+                }
+            ));
+        };
+        if !user_value.decorators.is_empty() {
+            return Err(cap!(
+                "lower_plain_dict_into_record.unsupported_field_type.3",
+                LoweringError::UnsupportedFieldType {
+                    schema: schema.name.clone(),
+                    field: canonical_field.name.clone(),
+                    ty: "field decorator on an enum payload field is not lowered".to_string(),
+                    range: user_value.range,
+                }
+            ));
+        }
+        lower_dict_field_value(schema, idx, user_value, user_value.range, ctx)?;
+        let ir_ty = type_repr_to_ir_type_dict(&canonical_field.ty);
+        let store_ty = match layout_field.kind {
+            FieldKind::Inline { .. } => ir_ty,
+            FieldKind::PointerIndirect { .. } => IrType::I32,
+        };
+        let top = ctx.tstack.pop().ok_or_else(|| {
+            cap!(
+                "lower_plain_dict_into_record.unsupported_expr.2",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "Dict field `{}` of `{}` produced no value",
+                        canonical_field.name, schema.name
+                    ),
+                    range,
+                }
+            )
+        })?;
+        if top.wasm_slot() != store_ty.wasm_slot() {
+            return Err(cap!(
+                "lower_plain_dict_into_record.unsupported_field_type.4",
+                LoweringError::UnsupportedFieldType {
+                    schema: schema.name.clone(),
+                    field: canonical_field.name.clone(),
+                    ty: format!("got {:?}, expected {:?}", top, store_ty),
+                    range,
+                }
+            ));
+        }
+        ctx.out.push(TaggedOp {
+            op: store_field_at_record_op(ctx, record_local, layout_field.offset as u32, store_ty),
+            range: user_value.range,
+        });
+    }
+    Ok(())
+}
+
+/// Lower the elements of a tuple literal into a positional record.
+/// `tuple_schema` is the synthesised anonymous positional-record
 /// schema (`is_tuple == true`); `layout` is its offset table; `elements`
 /// are the source-level element expressions in declaration order (arity
 /// already validated by the caller).
@@ -8042,40 +10291,7 @@ fn lower_tuple_into_record(
         let layout_field = &layout.fields[idx];
         debug_assert_eq!(layout_field.name, canonical_field.name);
 
-        // Lower the element value. For a `String` element materialise the
-        // tail record (absolute addr -> tail copy -> i32 buffer offset);
-        // scalars lower directly to their inline value.
-        match &canonical_field.ty {
-            TypeRepr::String => {
-                lower_expr(&element.expr, element.range, ctx)?;
-                let popped = ctx.tstack.pop().ok_or_else(|| {
-                    cap!(
-                        "lower_tuple_return.unsupported_expr",
-                        LoweringError::UnsupportedExpr {
-                            kind: format!("tuple element {idx} produced no value"),
-                            range: element.range,
-                        }
-                    )
-                })?;
-                if popped != IrType::String {
-                    return Err(cap!(
-                        "lower_tuple_return.unsupported_expr",
-                        LoweringError::UnsupportedExpr {
-                            kind: format!("tuple element {idx} expected String, got {popped:?}"),
-                            range: element.range,
-                        }
-                    ));
-                }
-                ctx.out.push(TaggedOp {
-                    op: Op::EmitTailRecordFromAbsoluteAddr { ty: IrType::String },
-                    range: element.range,
-                });
-                ctx.tstack.push(IrType::I32);
-            }
-            _ => {
-                lower_expr(&element.expr, element.range, ctx)?;
-            }
-        }
+        lower_dict_field_value(tuple_schema, idx, element, element.range, ctx)?;
 
         let ir_ty = type_repr_to_ir_type_dict(&canonical_field.ty);
         let store_ty = match layout_field.kind {
@@ -8101,11 +10317,7 @@ fn lower_tuple_into_record(
             ));
         }
         ctx.out.push(TaggedOp {
-            op: Op::StoreFieldAtRecord {
-                record_local_idx: record_local,
-                offset: layout_field.offset as u32,
-                ty: store_ty,
-            },
+            op: store_field_at_record_op(ctx, record_local, layout_field.offset as u32, store_ty),
             range: element.range,
         });
     }
@@ -8124,32 +10336,72 @@ fn lower_dict_field_value(
 ) -> Result<(), LoweringError> {
     let canonical = &schema.fields[field_idx];
     match (&canonical.ty, &*value.expr) {
-        (TypeRepr::Schema { schema: sub_schema }, Expr::Dict(pairs)) => {
+        (TypeRepr::Schema { schema: sub_schema }, Expr::Dict(pairs)) if !sub_schema.is_tuple => {
             // Nested branded dict. Allocate a sub-record, recurse,
             // then push the sub-record's base offset for the parent's
             // pointer slot.
             let sub_layout = SchemaLayout::offsets_for(sub_schema)?;
             let record_local = ctx.alloc_record_local();
             ctx.out.push(TaggedOp {
-                op: Op::AllocSubRecord {
-                    record_local_idx: record_local,
-                    root_size: sub_layout.root_size as u32,
-                    root_align: sub_layout.root_align as u32,
-                },
+                op: alloc_record_op(
+                    ctx,
+                    record_local,
+                    sub_layout.root_size as u32,
+                    sub_layout.root_align as u32,
+                ),
                 range,
             });
             lower_dict_into_record(sub_schema, &sub_layout, pairs, range, record_local, ctx)?;
-            // Push the sub-record base so the parent's pointer-slot
-            // store can consume it.
-            ctx.out.push(TaggedOp {
-                op: Op::PushRecordBase {
-                    record_local_idx: record_local,
-                },
-                range,
-            });
-            ctx.tstack.push(IrType::I32);
+            // Store pointer slots use arena-absolute offsets. The record-local
+            // itself is out-buffer-relative, so rebase it before the parent
+            // field store consumes it.
+            push_record_base_for_pointer(record_local, range, ctx);
             Ok(())
         }
+        (TypeRepr::Schema { schema: sub_schema }, Expr::Tuple(elements)) if sub_schema.is_tuple => {
+            if elements.len() != sub_schema.fields.len() {
+                return Err(cap!(
+                    "lower_tuple_field.arity_mismatch",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "tuple field has {} elements but schema declares {}",
+                            elements.len(),
+                            sub_schema.fields.len()
+                        ),
+                        range,
+                    }
+                ));
+            }
+            let sub_layout = SchemaLayout::offsets_for(sub_schema)?;
+            let record_local = ctx.alloc_record_local();
+            ctx.out.push(TaggedOp {
+                op: alloc_record_op(
+                    ctx,
+                    record_local,
+                    sub_layout.root_size as u32,
+                    sub_layout.root_align as u32,
+                ),
+                range,
+            });
+            lower_tuple_into_record(sub_schema, &sub_layout, elements, record_local, ctx)?;
+            // Store pointer slots use arena-absolute offsets. The record-local
+            // itself is out-buffer-relative, so rebase it before the parent
+            // field store consumes it.
+            push_record_base_for_pointer(record_local, range, ctx);
+            Ok(())
+        }
+        (
+            TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. },
+            Expr::VariantCtor { .. },
+        )
+        | (
+            TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. },
+            Expr::Variable(_),
+        )
+        | (
+            TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. },
+            Expr::FnCall { .. },
+        ) => lower_value_as_type(&canonical.ty, value, ctx),
         (TypeRepr::String, _) | (TypeRepr::List { .. }, _) => {
             // F3: cross-region branded-struct field. When the field is a
             // `List<…>` and its value is a bare `#main` parameter identity
@@ -8197,6 +10449,30 @@ fn lower_dict_field_value(
                     return Ok(());
                 }
             }
+            if variant_list_literal_for_type(&canonical.ty, &value.expr) {
+                lower_value_as_type(&canonical.ty, value, ctx)?;
+                let popped = ctx.tstack.pop().ok_or(cap!(
+                    "lower_dict_field_value.unsupported_expr.variant_list_stack_empty",
+                    LoweringError::UnsupportedExpr {
+                        kind: "Dict(variant-list-field-value-stack-empty)".to_string(),
+                        range,
+                    }
+                ))?;
+                if popped != IrType::ListList {
+                    return Err(cap!(
+                        "lower_dict_field_value.unsupported_field_type.variant_list_stack",
+                        LoweringError::UnsupportedFieldType {
+                            schema: schema.name.clone(),
+                            field: canonical.name.clone(),
+                            ty: format!("variant list field expected ListList, got {popped:?}"),
+                            range,
+                        }
+                    ));
+                }
+                ctx.tstack.push(IrType::I32);
+                return Ok(());
+            }
+
             // Pointer-array list fields (`List<String>` / `List<Schema>`
             // / `List<List<_>>`) inside a branded-struct return are only
             // marshalled correctly from a const-pool `ConstListString`
@@ -8212,7 +10488,10 @@ fn lower_dict_field_value(
                 let field_ir = match element.as_ref() {
                     TypeRepr::String => IrType::ListString,
                     TypeRepr::Schema { .. } => IrType::ListSchema,
-                    TypeRepr::List { .. } => IrType::ListList,
+                    TypeRepr::List { .. }
+                    | TypeRepr::Option { .. }
+                    | TypeRepr::Result { .. }
+                    | TypeRepr::Enum { .. } => IrType::ListList,
                     _ => IrType::ListInt,
                 };
                 if pointer_array_list_ir_type(field_ir)
@@ -8261,6 +10540,10 @@ fn lower_dict_field_value(
                     TypeRepr::Bool => IrType::ListBool,
                     TypeRepr::String => IrType::ListString,
                     TypeRepr::Schema { .. } => IrType::ListSchema,
+                    TypeRepr::List { .. }
+                    | TypeRepr::Option { .. }
+                    | TypeRepr::Result { .. }
+                    | TypeRepr::Enum { .. } => IrType::ListList,
                     _ => IrType::ListInt,
                 },
                 _ => unreachable!(),
@@ -8276,10 +10559,12 @@ fn lower_dict_field_value(
                     }
                 ));
             }
-            ctx.out.push(TaggedOp {
-                op: Op::EmitTailRecordFromAbsoluteAddr { ty: expected_ir },
-                range,
-            });
+            if !ctx.variant_records_in_scratch {
+                ctx.out.push(TaggedOp {
+                    op: Op::EmitTailRecordFromAbsoluteAddr { ty: expected_ir },
+                    range,
+                });
+            }
             ctx.tstack.push(IrType::I32);
             Ok(())
         }
@@ -8298,6 +10583,7 @@ fn lower_dict_field_value(
 fn lower_dict_default(
     schema_name: &str,
     field_idx: usize,
+    expected_ty: &TypeRepr,
     def: &SchemaDef,
     ctx: &mut LowerCtx<'_>,
     range: TokenRange,
@@ -8318,7 +10604,14 @@ fn lower_dict_default(
     // value` bindings because the topological order placed
     // dependencies first.
     let value_node = &field.value_node;
-    lower_expr(&value_node.expr, value_node.range, ctx)?;
+    if matches!(
+        expected_ty,
+        TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. }
+    ) {
+        lower_value_as_type(expected_ty, value_node, ctx)?;
+    } else {
+        lower_expr(&value_node.expr, value_node.range, ctx)?;
+    }
     Ok(())
 }
 
@@ -8419,19 +10712,192 @@ fn lower_reference(
     ))
 }
 
-/// Lower a bare-identifier reference. Phase 3.a checks the user-let
-/// scope first (innermost shadow wins) and falls back to the `#main`
-/// parameter index. The let-binding hit emits an [`Op::LetGet`]; the
-/// param hit emits a typed [`Op::LoadField`] reading from the `in_buf`.
-///
-/// Phase 5 extends the surface in two ways:
-///
-/// * `self` (when the lowering context owns a `self_binding`) lowers
-///   to the wasm-local that holds the schema instance's absolute
-///   address.
-/// * Multi-segment paths whose head resolves to a schema-typed
-///   binding chase field offsets through the schema's layout chain,
-///   emitting [`Op::LoadFieldAtAbsolute`] per segment.
+// NOTE (orphaned doc, stranded by a refactor — kept for reference):
+// Lower a bare-identifier reference. Phase 3.a checks the user-let
+// scope first (innermost shadow wins) and falls back to the `#main`
+// parameter index. The let-binding hit emits an `Op::LetGet`; the
+// param hit emits a typed `Op::LoadField` reading from the `in_buf`.
+// Phase 5 extends the surface in two ways:
+// * `self` (when the lowering context owns a `self_binding`) lowers
+//   to the wasm-local that holds the schema instance's absolute address.
+// * Multi-segment paths whose head resolves to a schema-typed binding
+//   chase field offsets through the schema's layout chain, emitting
+//   `Op::LoadFieldAtAbsolute` per segment.
+
+fn enum_payload_field_name(segment: &TokenKey, variant: &CanonicalEnumVariant) -> Option<String> {
+    match segment {
+        TokenKey::String(name, _, optional) if !*optional => Some(name.clone()),
+        TokenKey::Index(index, optional) if !*optional && variant.is_tuple => {
+            Some(index.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn direct_payload_load_op(ty: IrType, offset: u32) -> Op {
+    match ty {
+        IrType::I64 => Op::LoadI64AtAbsolute { offset },
+        IrType::F64 => Op::LoadF64AtAbsolute { offset },
+        IrType::Bool => Op::LoadI8UAtAbsolute { offset },
+        IrType::I32
+        | IrType::Unit
+        | IrType::String
+        | IrType::ListInt
+        | IrType::ListFloat
+        | IrType::ListBool
+        | IrType::ListString
+        | IrType::ListSchema
+        | IrType::ListList
+        | IrType::Closure
+        | IrType::Dict => Op::LoadI32AtAbsolute { offset },
+    }
+}
+
+fn validate_enum_payload_base(
+    ctx: &mut LowerCtx<'_>,
+    range: TokenRange,
+) -> Result<(), LoweringError> {
+    let base_ty = ctx.tstack.pop().ok_or_else(|| {
+        cap!(
+            "lower_variable.unsupported_expr.enum_payload_stack",
+            LoweringError::UnsupportedExpr {
+                kind: "Enum(payload access without a variant pointer)".to_string(),
+                range,
+            }
+        )
+    })?;
+    if base_ty != IrType::I32 {
+        return Err(cap!(
+            "lower_variable.unsupported_expr.enum_payload_stack_type",
+            LoweringError::UnsupportedExpr {
+                kind: format!("Enum(payload access expected I32 variant pointer, got {base_ty:?}"),
+                range,
+            }
+        ));
+    }
+    Ok(())
+}
+
+fn lower_enum_payload_path(
+    path_tail: &[TokenKey],
+    narrowing: &EnumVariantNarrowing,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    if path_tail.len() != 1 {
+        return Err(cap!(
+            "lower_variable.unsupported_expr.enum_payload_path",
+            LoweringError::UnsupportedExpr {
+                kind: "Enum(payload access with more than one segment)".to_string(),
+                range,
+            }
+        ));
+    }
+    let Some(field_name) = enum_payload_field_name(&path_tail[0], &narrowing.variant) else {
+        return Err(cap!(
+            "lower_variable.unsupported_expr.enum_payload_segment",
+            LoweringError::UnsupportedExpr {
+                kind: "Enum(payload access expects a field name or tuple index)".to_string(),
+                range,
+            }
+        ));
+    };
+
+    if let Some(payload) = &narrowing.direct_payload {
+        if field_name != payload.field_name {
+            return Err(cap!(
+                "lower_variable.unsupported_expr.enum_payload_unknown_field",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "Enum(variant `{}` has no payload field `{field_name}`)",
+                        narrowing.variant.name
+                    ),
+                    range,
+                }
+            ));
+        }
+        let payload_slot_offset = variant_payload_offset_for_lowering(&payload.ty)? as u32;
+        let field_ir = type_repr_to_ir_type_dict(&payload.ty);
+        ctx.out.push(TaggedOp {
+            op: direct_payload_load_op(field_ir, payload_slot_offset),
+            range,
+        });
+        validate_enum_payload_base(ctx, range)?;
+        ctx.tstack.push(field_ir);
+        return Ok(());
+    }
+
+    let payload_schema = narrowing
+        .variant
+        .payload_schema(&narrowing.enum_name)
+        .ok_or_else(|| {
+            cap!(
+                "lower_variable.unsupported_expr.enum_unit_payload_access",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "Enum(unit variant `{}` has no payload field `{field_name}`)",
+                        narrowing.variant.name
+                    ),
+                    range,
+                }
+            )
+        })?;
+    let field_meta = payload_schema
+        .fields
+        .iter()
+        .find(|field| field.name == field_name)
+        .ok_or_else(|| {
+            cap!(
+                "lower_variable.unsupported_expr.enum_payload_unknown_field",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "Enum(variant `{}` has no payload field `{field_name}`)",
+                        narrowing.variant.name
+                    ),
+                    range,
+                }
+            )
+        })?;
+    let payload_ty = TypeRepr::Schema {
+        schema: Box::new(payload_schema.clone()),
+    };
+    let payload_slot_offset = variant_payload_offset_for_lowering(&payload_ty)? as u32;
+    let layout = SchemaLayout::offsets_for(&payload_schema)?;
+    let field_slot = layout
+        .fields
+        .iter()
+        .find(|slot| slot.name == field_meta.name)
+        .ok_or_else(|| {
+            cap!(
+                "lower_variable.unsupported_expr.enum_payload_missing_layout",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "Enum(variant `{}` payload field `{}` has no layout slot)",
+                        narrowing.variant.name, field_meta.name
+                    ),
+                    range,
+                }
+            )
+        })?;
+    let field_ir = type_repr_to_ir_type_dict(&field_meta.ty);
+    ctx.out.push(TaggedOp {
+        op: Op::LoadI32AtAbsolute {
+            offset: payload_slot_offset,
+        },
+        range,
+    });
+    ctx.out.push(TaggedOp {
+        op: Op::LoadFieldAtAbsolute {
+            offset: field_slot.offset as u32,
+            ty: field_ir,
+        },
+        range,
+    });
+    validate_enum_payload_base(ctx, range)?;
+    ctx.tstack.push(field_ir);
+    Ok(())
+}
+
 fn lower_variable(
     path: &[TokenKey],
     range: TokenRange,
@@ -8458,6 +10924,7 @@ fn lower_variable(
             ));
         }
     };
+    let enum_narrowing = ctx.enum_variant_narrowing.get(head).cloned();
     // #359 (W20 container perf): a bare reference to a where-bound
     // SCALAR CONSTANT let (`soft` / `dt` / a mass) lowers to the literal
     // `Op::Const*` directly instead of a `LetGet` (an alloca load
@@ -8613,6 +11080,9 @@ fn lower_variable(
     if path.len() == 1 {
         return Ok(());
     }
+    if let Some(narrowing) = enum_narrowing.as_ref() {
+        return lower_enum_payload_path(&path[1..], narrowing, range, ctx);
+    }
     // AOT-4 (W16 slice): 1D `xs[i]` index on a materialised `List<Int>`
     // receiver. The parser lowers the bracket form to a single trailing
     // `TokenKey::Dynamic(<index Node>)` segment after the root name (a
@@ -8657,7 +11127,7 @@ fn lower_variable(
                 let TokenKey::Dynamic(index_node, optional) = seg else {
                     unreachable!("guarded by the all-Dynamic check above");
                 };
-                // Optional indexing (`xs[i]?`) would need a Null-or-value
+                // Optional indexing (`xs[i]?`) needs an Option.None-or-value
                 // result the i64 element path can't represent; decline.
                 if *optional {
                     return Err(cap!(
@@ -9006,7 +11476,7 @@ struct MethodSig {
 /// IR-side types plus, for schema-typed params, their canonical shape
 /// (needed so method-body walks can resolve chained field access on
 /// those params). Phase 5 restricts the return surface to scalar /
-/// `Bool` / `Null` types — variable-length return values (`String` /
+/// `Bool` / `Unit` types — variable-length return values (`String` /
 /// `List<Int>` / nested dict) require a tail-cursor protocol the
 /// non-entry wasm signature doesn't carry yet.
 fn method_signature_ir_types(
@@ -9049,7 +11519,7 @@ fn method_signature_ir_types(
                 }
             )
         })?;
-    // Phase 5 scope: only scalar / `Bool` / `Null` returns ride the
+    // Phase 5 scope: only scalar / `Bool` / `Unit` returns ride the
     // wasm function's single-value return slot. Variable-length
     // returns are deferred — they need a tail-cursor handshake the
     // non-entry signature doesn't carry yet.
@@ -9057,7 +11527,7 @@ fn method_signature_ir_types(
         TypeRepr::Int => IrType::I64,
         TypeRepr::Float => IrType::F64,
         TypeRepr::Bool => IrType::Bool,
-        TypeRepr::Null => IrType::Null,
+        TypeRepr::Unit => IrType::Unit,
         _ => {
             return Err(cap!(
                 "method_signature_ir_types.unsupported_type_in_main.3",
@@ -9189,6 +11659,90 @@ fn lower_one_method<'a>(
 #[cfg(test)]
 mod intern_tests {
     use super::*;
+
+    fn type_node(name: &str, generics: Vec<TypeNode>) -> TypeNode {
+        TypeNode {
+            path: vec![name.to_string()],
+            generics,
+            is_optional: false,
+            range: TokenRange::default(),
+            variant_fields: None,
+            doc_comment: None,
+        }
+    }
+
+    #[test]
+    fn tuple_type_canonicalizer_accepts_normal_nested_types() {
+        let ty = type_node(
+            "Tuple",
+            vec![
+                type_node("Int", vec![]),
+                type_node(
+                    "Tuple",
+                    vec![type_node("String", vec![]), type_node("Bool", vec![])],
+                ),
+                type_node("List", vec![type_node("Int", vec![])]),
+                type_node("Option", vec![type_node("String", vec![])]),
+                type_node(
+                    "Result",
+                    vec![type_node("Int", vec![]), type_node("String", vec![])],
+                ),
+            ],
+        );
+
+        let TypeRepr::Schema { schema } = type_node_to_canonical(&ty).expect("tuple canonical")
+        else {
+            panic!("Tuple<...> should canonicalize as a tuple schema");
+        };
+        assert!(schema.is_tuple);
+        assert_eq!(schema.fields.len(), 5);
+        assert!(matches!(schema.fields[0].ty, TypeRepr::Int));
+        assert!(matches!(&schema.fields[1].ty, TypeRepr::Schema { schema } if schema.is_tuple));
+        assert!(
+            matches!(&schema.fields[2].ty, TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::Int))
+        );
+        assert!(
+            matches!(&schema.fields[3].ty, TypeRepr::Option { inner } if matches!(inner.as_ref(), TypeRepr::String))
+        );
+        assert!(
+            matches!(&schema.fields[4].ty, TypeRepr::Result { ok, err } if matches!(ok.as_ref(), TypeRepr::Int) && matches!(err.as_ref(), TypeRepr::String))
+        );
+    }
+
+    #[test]
+    fn null_and_unit_type_names_do_not_canonicalize() {
+        assert!(type_node_to_canonical(&type_node("Null", vec![])).is_none());
+        assert!(type_node_to_canonical(&type_node("Unit", vec![])).is_none());
+    }
+
+    #[test]
+    fn tuple_return_lowers_nested_tuple_and_list_elements() {
+        let src = r#"
+            #main(Int n) -> Tuple<Tuple<Int, String>, List<Int>, String>
+            ((n, "x"), [n, n + 1], "done")
+        "#;
+        let ast = relon_parser::parse_document(src).expect("parse");
+        let analyzed = relon_analyzer::analyze(&ast);
+        assert!(
+            !analyzed.has_errors(),
+            "analyze errors: {:?}",
+            analyzed.diagnostics
+        );
+        let lowered = lower_workspace_single(&analyzed, &ast).expect("lower nested tuple return");
+
+        assert!(lowered.return_schema.is_tuple);
+        assert_eq!(lowered.return_schema.fields.len(), 3);
+        assert!(
+            matches!(&lowered.return_schema.fields[0].ty, TypeRepr::Schema { schema } if schema.is_tuple)
+        );
+        assert!(
+            matches!(&lowered.return_schema.fields[1].ty, TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::Int))
+        );
+        assert!(matches!(
+            lowered.return_schema.fields[2].ty,
+            TypeRepr::String
+        ));
+    }
 
     /// Recursively flatten a func body's op stream into `out`, descending
     /// into `If` / `Block` / `Loop` arms so assertions see ops wherever

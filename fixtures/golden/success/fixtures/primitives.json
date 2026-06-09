@@ -6,7 +6,7 @@
   "int_bin": 10,
   "int_dec": 123,
   "int_hex": 255,
-  "null_val": null,
+  "none_val": null,
   "string_normal": "Hello World",
   "string_raw": "No \\escape \\here"
 }

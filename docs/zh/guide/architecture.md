@@ -51,17 +51,17 @@ AnalyzedTree {
 plain JSON
 ```
 
-`AnalyzedTree` 是**只读的侧表**，不修改 AST。求值器需要哪一项就查哪一项；如果某一项缺失，evaluator 走 fallback（例如 schema 没预降级时按需调用 `lower_schema_pure`）。
+`AnalyzedTree` 是**只读的侧表**，不修改 AST。求值器需要哪一项就查哪一项；如果某一项缺失，evaluator 走 fallback（例如 schema 没预转换时按需调用 `lower_schema_pure`）。
 
 ## Analyzer 的四个 pass
 
 执行顺序固定，下一 pass 可读上一 pass 的产物：
 
-1. **`schema`**：识别 `#schema Name { ... }` / `#schema Name: { ... }` / `#schema Name Enum<...>`，降级为 `SchemaDef`。tagged-enum sum type 的 variant 列表也在这里抽取。
+1. **`schema`**：识别 `#schema Name { ... }`、`#schema Name: { ... }`、`#enum Name { ... }`，转换为 `SchemaDef`。tagged enum 的 variant 列表也在这里抽取。
 2. **`resolve`**：把 `Reference` / `Variable` 节点绑定到目标字段的 `NodeId`。保守策略：闭包参数和 dict spread 标记 frame 为 dynamic，引用不强行报错。
 3. **`modules`**：扫描 `#import ... from "..."` 顶层指令，收集 import 边。
 4. **`main_sig`**：识别根级 `#main(Type name, ...) [-> ReturnType]` 指令，构建 `MainSignature`。
-5. **`typecheck`**：聚合诊断 —— `UnresolvedReference`、`StaticTypeMismatch`、`NonExhaustiveMatch`、`UnknownVariant`（带 did-you-mean）、`DuplicateMatchArm`、`HeterogeneousEnum`、`SchemaBodyNotDict` 等。
+5. **`typecheck`**：聚合诊断 —— `UnresolvedReference`、`StaticTypeMismatch`、`NonExhaustiveMatch`、`UnknownVariant`（带 did-you-mean）、`DuplicateMatchArm`、`SchemaBodyNotDict` 等。
 
 诊断分两级：`Severity::Error` 阻断求值，`Severity::Warning` 仅提示，evaluator 仍会执行。
 

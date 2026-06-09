@@ -185,6 +185,8 @@ pub enum SyntaxKind {
     MATCH_EXPR,
     /// One arm inside a MATCH_EXPR.
     MATCH_ARM,
+    /// Rust-like enum payload match pattern, e.g. `Pair(a, b)`.
+    MATCH_PATTERN,
     /// `EnumName.VariantName { ... }`.
     VARIANT_CTOR,
     /// `f"..."` rendered as a CST node so interpolations are children.
@@ -202,7 +204,7 @@ pub enum SyntaxKind {
     TYPE_NODE,
     /// `*` in wildcard / placeholder position.
     WILDCARD,
-    /// Literal `null` / `true` / `false`.
+    /// Literal `true` / `false` and removed `null` spelling.
     LITERAL,
     /// Unrecoverable parse failure: spans the bytes the parser
     /// couldn't fit into any production. Always has at least one
@@ -225,6 +227,10 @@ pub enum SyntaxKind {
     /// `CLOSURE_PARAM` list, a TYPE_NODE return type, and an
     /// expression body (omitted when `#native` is set).
     SCHEMA_METHOD,
+    /// One variant inside a Rust-like `#enum Name { ... }` declaration.
+    ENUM_VARIANT,
+    /// One named payload field inside a `#enum` variant body.
+    ENUM_VARIANT_FIELD,
     /// `(e1, e2, ...)` tuple value literal. Distinct from a
     /// parenthesised group `(e)` (which carries no comma) and from the
     /// `(p, q) => body` closure form. The 1-tuple uses a trailing-comma
@@ -363,6 +369,7 @@ impl SyntaxKind {
             x if x == Self::WHERE_EXPR as u16 => Self::WHERE_EXPR,
             x if x == Self::MATCH_EXPR as u16 => Self::MATCH_EXPR,
             x if x == Self::MATCH_ARM as u16 => Self::MATCH_ARM,
+            x if x == Self::MATCH_PATTERN as u16 => Self::MATCH_PATTERN,
             x if x == Self::VARIANT_CTOR as u16 => Self::VARIANT_CTOR,
             x if x == Self::F_STRING as u16 => Self::F_STRING,
             x if x == Self::F_STRING_INTERPOLATION as u16 => Self::F_STRING_INTERPOLATION,
@@ -374,6 +381,8 @@ impl SyntaxKind {
             x if x == Self::TUPLE_TYPE as u16 => Self::TUPLE_TYPE,
             x if x == Self::SCHEMA_WITH as u16 => Self::SCHEMA_WITH,
             x if x == Self::SCHEMA_METHOD as u16 => Self::SCHEMA_METHOD,
+            x if x == Self::ENUM_VARIANT as u16 => Self::ENUM_VARIANT,
+            x if x == Self::ENUM_VARIANT_FIELD as u16 => Self::ENUM_VARIANT_FIELD,
             x if x == Self::TUPLE as u16 => Self::TUPLE,
             _ => return None,
         };

@@ -30,16 +30,20 @@ fn join_unrelated_is_any() {
 }
 
 #[test]
-fn subsumes_optional_null() {
-    let t = TypeNode {
+fn option_none_subsumes_optional_slot_only() {
+    let mut int_slot = relon_parser::TypeNode {
         path: vec!["Int".to_string()],
-        generics: Vec::new(),
-        is_optional: true,
+        generics: vec![],
+        is_optional: false,
         range: relon_parser::TokenRange::default(),
         variant_fields: None,
         doc_comment: None,
     };
-    assert!(InferredType::Null.subsumes(&t));
+    let none = InferredType::Variant("Option".to_string(), "None".to_string());
+
+    assert!(!none.subsumes(&int_slot));
+    int_slot.is_optional = true;
+    assert!(none.subsumes(&int_slot));
 }
 
 #[test]

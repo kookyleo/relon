@@ -122,6 +122,7 @@ fn resolve_capture(
             idx,
             ty: p.ty,
             schema_brand: None,
+            type_repr: None,
         });
         return Ok(Some((p.ty, idx)));
     }
@@ -166,6 +167,7 @@ fn resolve_capture(
             idx,
             ty: p.ty,
             schema_brand: None,
+            type_repr: None,
         });
         return Ok(Some((p.ty, idx)));
     }
@@ -235,6 +237,26 @@ pub(super) fn lower_closure_as_value(
     closure_range: TokenRange,
     expected_param_tys: &[IrType],
     expected_ret_ty: IrType,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    lower_closure_as_value_with_expected_type(
+        closure_expr,
+        closure_range,
+        expected_param_tys,
+        expected_ret_ty,
+        None,
+        None,
+        ctx,
+    )
+}
+
+pub(super) fn lower_closure_as_value_with_expected_type(
+    closure_expr: &Expr,
+    closure_range: TokenRange,
+    expected_param_tys: &[IrType],
+    expected_ret_ty: IrType,
+    expected_param_reprs: Option<&[Option<&TypeRepr>]>,
+    expected_ret_repr: Option<&TypeRepr>,
     ctx: &mut LowerCtx<'_>,
 ) -> Result<(), LoweringError> {
     let Expr::Closure {
@@ -339,6 +361,7 @@ pub(super) fn lower_closure_as_value(
         ctx.native_imports_handle(),
     );
     inner.lambda_table = ctx.lambda_table_handle();
+    inner.variant_records_in_scratch = true;
 
     // Prologue: load each capture into a fresh inner let-local.
     let mut inner_let_idx: u32 = 0;
@@ -363,7 +386,7 @@ pub(super) fn lower_closure_as_value(
                 range: lambda_body.range,
             }),
             IrType::I32
-            | IrType::Null
+            | IrType::Unit
             | IrType::String
             | IrType::ListInt
             | IrType::ListFloat
@@ -389,6 +412,7 @@ pub(super) fn lower_closure_as_value(
             idx: inner_let_idx,
             ty: *ty,
             schema_brand: None,
+            type_repr: None,
         });
         // Phase F.2 (W7 anon-Dict-return): when a captured value is
         // a closure handle, propagate its signature into the inner
@@ -419,6 +443,7 @@ pub(super) fn lower_closure_as_value(
             idx: inner_let_idx,
             ty: *ty,
             schema_brand: None,
+            type_repr: None,
         });
         inner.const_let_values.insert(inner_let_idx, *sc);
         inner_let_idx += 1;
@@ -440,18 +465,27 @@ pub(super) fn lower_closure_as_value(
             },
             range: lambda_body.range,
         });
+        let type_repr = expected_param_reprs
+            .and_then(|reprs| reprs.get(i).copied().flatten())
+            .cloned();
         inner.lets.push(LetBinding {
             name: lp.name.clone(),
             idx: inner_let_idx,
             ty,
             schema_brand: None,
+            type_repr,
         });
         inner_let_idx += 1;
     }
     inner.next_let_idx = inner_let_idx;
 
-    // Body lowering.
-    lower_expr(&lambda_body.expr, lambda_body.range, &mut inner)?;
+    // Body lowering. Enum-like values need the declared return type so
+    // constructors such as `Stat.Up` / `Some(x)` can resolve inside HOFs.
+    if let Some(expected) = expected_ret_repr {
+        lower_value_as_type(expected, lambda_body, &mut inner)?;
+    } else {
+        lower_expr(&lambda_body.expr, lambda_body.range, &mut inner)?;
+    }
     let body_ty = inner.tstack.last().copied().ok_or_else(|| {
         cap!(
             "lower_closure_as_value.unsupported_expr.3",

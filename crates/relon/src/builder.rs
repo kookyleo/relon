@@ -405,7 +405,7 @@ mod tests {
     struct NoopFn;
     impl RelonFunction for NoopFn {
         fn call(&self, _args: NativeArgs, _range: TokenRange) -> Result<Value, RuntimeError> {
-            Ok(Value::Null)
+            Ok(Value::option_none())
         }
     }
 }

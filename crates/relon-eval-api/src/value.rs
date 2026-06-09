@@ -2,6 +2,7 @@ use crate::scope::Scope;
 use crate::smol_str::SmolStr;
 use ordered_float::OrderedFloat;
 use relon_parser::Node;
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -162,10 +163,9 @@ pub struct EnumSchemaData {
 /// typed-field validation, and a deep field-map clone there was a
 /// measurable cost; refcount-clone collapses it to a single atomic bump
 /// while keeping immutable-snapshot semantics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum Value {
-    Null,
     Bool(bool),
     Int(i64),
     Float(OrderedFloat<f64>),
@@ -184,8 +184,9 @@ pub enum Value {
     #[serde(skip)]
     Schema(Arc<SchemaData>),
     /// A tagged-enum (sum-type) schema: variants by name, each with its
-    /// own field set. Built from `#schema Name: Enum<Var1 { ... }, ...>`.
-    /// Construction with `Name.Var1 { ... }` is dispatched via this value.
+    /// own field set. Built from `#enum Name { Var1 { ... }, ... }`
+    /// declarations. Construction with `Name.Var1 { ... }` is
+    /// dispatched via this value.
     /// Payload is refcounted; see [`EnumSchemaData`].
     #[serde(skip)]
     EnumSchema(Arc<EnumSchemaData>),
@@ -199,10 +200,105 @@ pub enum Value {
     Wildcard,
 }
 
+impl<'de> Deserialize<'de> for Value {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(ValueVisitor)
+    }
+}
+
+struct ValueVisitor;
+
+impl<'de> Visitor<'de> for ValueVisitor {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a Relon value; JSON null is only valid with an Option<T> or T? target")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(Value::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(Value::Int(value))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        let value =
+            i64::try_from(value).map_err(|_| E::custom("integer is out of range for Int"))?;
+        Ok(Value::Int(value))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E> {
+        Ok(Value::Float(OrderedFloat(value)))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(Value::String(SmolStr::from(value)))
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E> {
+        Ok(Value::String(SmolStr::from(value)))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(Value::String(SmolStr::from(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(E::custom(
+            "JSON null is not a Relon value; use an Option<T> or T? target type so it decodes as None",
+        ))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(E::custom(
+            "JSON null is not a Relon value; use an Option<T> or T? target type so it decodes as None",
+        ))
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = seq.next_element::<Value>()? {
+            values.push(value);
+        }
+        Ok(Value::list(values))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = BTreeMap::new();
+        while let Some((key, value)) = map.next_entry::<String, Value>()? {
+            values.insert(SmolStr::from(key), value);
+        }
+        Ok(Value::Dict(Arc::new(ValueDict {
+            map: values,
+            brand: None,
+            variant_of: None,
+        })))
+    }
+}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Null, Self::Null) => true,
             (Self::Bool(l), Self::Bool(r)) => l == r,
             (Self::Int(l), Self::Int(r)) => l == r,
             (Self::Float(l), Self::Float(r)) => l == r,
@@ -235,6 +331,59 @@ impl Value {
     /// in `Arc` so subsequent clones are O(1).
     pub fn tuple(items: Vec<Value>) -> Self {
         Self::Tuple(Arc::new(items))
+    }
+
+    /// Build the standard `Some(value)` tagged value.
+    pub fn option_some(value: Value) -> Self {
+        let mut map = BTreeMap::new();
+        map.insert(SmolStr::from("value"), value);
+        Self::variant_dict(map, "Some".to_string(), "Option".to_string())
+    }
+
+    /// Build the standard `None` tagged value.
+    pub fn option_none() -> Self {
+        Self::variant_dict(
+            BTreeMap::<SmolStr, Value>::new(),
+            "None".to_string(),
+            "Option".to_string(),
+        )
+    }
+
+    /// Build the standard `Ok(value)` tagged value.
+    pub fn result_ok(value: Value) -> Self {
+        let mut map = BTreeMap::new();
+        map.insert(SmolStr::from("value"), value);
+        Self::variant_dict(map, "Ok".to_string(), "Result".to_string())
+    }
+
+    /// Build the standard `Err(error)` tagged value.
+    pub fn result_err(error: Value) -> Self {
+        let mut map = BTreeMap::new();
+        map.insert(SmolStr::from("error"), error);
+        Self::variant_dict(map, "Err".to_string(), "Result".to_string())
+    }
+
+    /// True for the standard `None` tagged value.
+    pub fn is_option_none(&self) -> bool {
+        matches!(
+            self,
+            Value::Dict(d)
+                if d.variant_of.as_deref() == Some("Option")
+                    && d.brand.as_deref() == Some("None")
+        )
+    }
+
+    /// Return the payload of a standard `Option.Some { value }` tagged value.
+    pub fn option_some_value(&self) -> Option<&Value> {
+        match self {
+            Value::Dict(d)
+                if d.variant_of.as_deref() == Some("Option")
+                    && d.brand.as_deref() == Some("Some") =>
+            {
+                d.map.get("value")
+            }
+            _ => None,
+        }
     }
 
     /// Build a `Value::Dict` from any iterable of key/value pairs. The
@@ -305,7 +454,6 @@ impl Value {
 
     pub fn is_truthy(&self) -> bool {
         match self {
-            Value::Null => false,
             Value::Bool(b) => *b,
             Value::Int(i) => *i != 0,
             Value::Float(f) => f.into_inner() != 0.0,
@@ -322,7 +470,6 @@ impl Value {
 
     pub fn type_name(&self) -> &'static str {
         match self {
-            Value::Null => "Null",
             Value::Bool(_) => "Bool",
             Value::Int(_) => "Int",
             Value::Float(_) => "Float",
@@ -343,9 +490,7 @@ impl Value {
             (Value::Dict(base), Value::Dict(patch)) => {
                 let base = Arc::make_mut(base);
                 for (k, v) in &patch.map {
-                    if v == &Value::Null {
-                        base.map.remove(k);
-                    } else if let Some(base_val) = base.map.get_mut(k) {
+                    if let Some(base_val) = base.map.get_mut(k) {
                         base_val.deep_merge(v);
                     } else {
                         base.map.insert(k.clone(), v.clone());
@@ -399,7 +544,6 @@ impl Value {
 impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Value::Null => write!(f, "null"),
             Value::Bool(b) => write!(f, "{}", b),
             Value::Int(i) => write!(f, "{}", i),
             Value::Float(fl) => write!(f, "{}", fl),
@@ -425,6 +569,38 @@ impl std::fmt::Display for Value {
             Value::Type(t) => write!(f, "Type<{}>", relon_analyzer::format_type(t)),
             Value::Wildcard => write!(f, "*"),
         }
+    }
+}
+
+#[cfg(test)]
+mod deserialize_tests {
+    use super::Value;
+
+    #[test]
+    fn rejects_json_null_at_root() {
+        let err = serde_json::from_value::<Value>(serde_json::json!(null)).unwrap_err();
+        assert!(
+            err.to_string().contains("JSON null is not a Relon value"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_json_null_inside_list() {
+        let err = serde_json::from_value::<Value>(serde_json::json!([1, null])).unwrap_err();
+        assert!(
+            err.to_string().contains("JSON null is not a Relon value"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_json_null_inside_dict() {
+        let err = serde_json::from_value::<Value>(serde_json::json!({ "k": null })).unwrap_err();
+        assert!(
+            err.to_string().contains("JSON null is not a Relon value"),
+            "unexpected error: {err}"
+        );
     }
 }
 

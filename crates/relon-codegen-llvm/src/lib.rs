@@ -50,7 +50,7 @@
 //!   API hides the engine choice so Phase C / ORC migration is a
 //!   localised diff.
 //! - **Pointer-indirect StoreField** — Phase B accepts only scalar
-//!   `LoadField` / `StoreField` (I32 / I64 / F64 / Bool / Null). The
+//!   `LoadField` / `StoreField` (I32 / I64 / F64 / Bool / Unit). The
 //!   IR's tail-cursor protocol for String / ListInt returns stays on
 //!   the cranelift backend. W1 / W2 only emit scalar Int returns,
 //!   so this is sufficient for the Phase B target workloads.

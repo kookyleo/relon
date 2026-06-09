@@ -64,7 +64,7 @@ rationale and [Sandbox & capabilities](./sandbox) for the capability model.
     n: list.len([1, 2, 3]),                         // 3
     head: list.first([10, 20, 30]),                 // 10
     tail: list.last([10, 20, 30]),                  // 30
-    cleaned: list.compact([1, null, 2]),            // [1, 2]
+    cleaned: list.compact([1, None, 2]),            // [1, 2]
     flat: list.flatten([[1, 2], [3]])               // [1, 2, 3]
 }
 ```
@@ -131,8 +131,8 @@ must expose a native fn explicitly.
 ```relon
 #import value from "std/value"
 {
-    a: value.default(null, "fallback"),  // "fallback"
-    b: value.default(false, true)        // false (only null triggers fallback)
+    a: value.default(None, "fallback"),  // "fallback"
+    b: value.default(false, true)          // false (only None triggers fallback)
 }
 ```
 

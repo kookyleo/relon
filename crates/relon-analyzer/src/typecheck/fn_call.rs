@@ -45,7 +45,10 @@ impl<'a> Walker<'a> {
         let TokenKey::String(name, _, _) = &path[0] else {
             return;
         };
-        if self.dynamic_save(name) || self.is_known_fn(name) {
+        if self.dynamic_save(name)
+            || self.is_known_fn(name)
+            || matches!(name.as_str(), "Some" | "Ok" | "Err")
+        {
             return;
         }
         // Sibling-bound name? `{ helper(): 1, x: helper() }` — the
@@ -251,6 +254,9 @@ impl<'a> Walker<'a> {
                 }
             }
         }
+        if self.is_enum_tuple_variant_call(path) {
+            return None;
+        }
         // Schema-rooted Phase B: schema method dispatch. Three flavors:
         //
         //   1. `value.method(args)` — `value` is a 1-segment binding
@@ -294,7 +300,7 @@ impl<'a> Walker<'a> {
     /// `UnknownTypeName` machinery already covers that, and we must
     /// not double-count names like sibling closures or aliased imports.
     pub(super) fn check_method_dispatch(&mut self, _node: &Node, path: &[TokenKey]) {
-        if path.len() < 2 {
+        if path.len() < 2 || self.is_enum_tuple_variant_call(path) {
             return;
         }
         let TokenKey::String(head, _, _) = &path[0] else {
@@ -347,6 +353,41 @@ impl<'a> Walker<'a> {
                     range: span_of(*method_range),
                 });
         }
+    }
+
+    fn is_enum_tuple_variant_call(&self, path: &[TokenKey]) -> bool {
+        if path.len() < 2 {
+            return false;
+        }
+        let last_idx = path.len() - 1;
+        let TokenKey::String(variant, _, _) = &path[last_idx] else {
+            return false;
+        };
+        let Some(enum_name) = self.resolve_method_receiver_prefix(&path[..last_idx]) else {
+            return false;
+        };
+        let Some((_, fields)) = self
+            .variant_field_index
+            .get(&enum_name)
+            .and_then(|variants| variants.get(variant))
+        else {
+            return false;
+        };
+        if fields.is_empty() {
+            return false;
+        }
+        let mut indexes = Vec::with_capacity(fields.len());
+        for field_name in fields.keys() {
+            let Ok(index) = field_name.parse::<usize>() else {
+                return false;
+            };
+            indexes.push(index);
+        }
+        indexes.sort_unstable();
+        indexes
+            .iter()
+            .enumerate()
+            .all(|(expected, actual)| expected == *actual)
     }
 
     /// Schema-rooted §J follow-up: walk `path` for any `Dynamic`
@@ -462,8 +503,7 @@ impl<'a> Walker<'a> {
         // in `schema_index`), a name explicitly recorded in
         // `schema_methods` is still a valid receiver root — that
         // covers schemas declared via `#schema X with { ... }` whose
-        // body is empty / `Enum<...>` and never propagated into the
-        // base index.
+        // body is empty and never propagated into the base index.
         if self.tree.schema_methods.contains_key(head) {
             return Some(head.to_string());
         }

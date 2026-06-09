@@ -630,10 +630,109 @@ fn verify_pointer_target(
         TypeRepr::List { element } => {
             verify_list_target(bytes, field, element, list_element, ptr, bounds, depth)
         }
+        TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => {
+            verify_variant_target(bytes, field, ty, ptr, bounds, depth)
+        }
         other => Err(VerifyError::UnsupportedType {
             field: field.to_string(),
             ty: type_label(other),
         }),
+    }
+}
+
+fn verify_variant_target(
+    bytes: &[u8],
+    field: &str,
+    ty: &TypeRepr,
+    ptr: usize,
+    bounds: Bounds,
+    depth: usize,
+) -> Result<(), VerifyError> {
+    if depth >= MAX_DEPTH {
+        return Err(VerifyError::DepthExceeded {
+            field: field.to_string(),
+            depth: MAX_DEPTH,
+        });
+    }
+    bounds.require_span(field, "variant tag", ptr, 1)?;
+    let tag = bytes[ptr];
+    let Some(payload_ty) =
+        variant_payload_type(ty, tag).ok_or_else(|| VerifyError::UnsupportedType {
+            field: field.to_string(),
+            ty: type_label(ty),
+        })?
+    else {
+        return Ok(());
+    };
+    let (slot_size, slot_align) = variant_payload_slot_layout(&payload_ty);
+    let slot = align_up(
+        ptr.checked_add(1)
+            .ok_or_else(|| VerifyError::SpanOverflow {
+                field: field.to_string(),
+                what: "variant payload slot start",
+            })?,
+        slot_align,
+    )
+    .ok_or_else(|| VerifyError::SpanOverflow {
+        field: field.to_string(),
+        what: "variant payload slot alignment",
+    })?;
+    bounds.require_span(field, "variant payload slot", slot, slot_size)?;
+    match &payload_ty {
+        TypeRepr::Unit | TypeRepr::Bool | TypeRepr::Int | TypeRepr::Float => Ok(()),
+        TypeRepr::String
+        | TypeRepr::Schema { .. }
+        | TypeRepr::List { .. }
+        | TypeRepr::Option { .. }
+        | TypeRepr::Result { .. }
+        | TypeRepr::Enum { .. } => {
+            let target = read_u32(bytes, slot, field, "variant payload pointer", bounds)?;
+            verify_pointer_target(
+                bytes,
+                field,
+                &payload_ty,
+                list_kind_for_list_type(&payload_ty),
+                target,
+                bounds,
+                depth + 1,
+            )
+        }
+        TypeRepr::Closure { .. } => Err(VerifyError::UnsupportedType {
+            field: field.to_string(),
+            ty: "Closure",
+        }),
+    }
+}
+
+fn variant_payload_type(ty: &TypeRepr, tag: u8) -> Option<Option<TypeRepr>> {
+    match ty {
+        TypeRepr::Option { inner } => match tag {
+            0 => Some(None),
+            1 => Some(Some(inner.as_ref().clone())),
+            _ => None,
+        },
+        TypeRepr::Result { ok, err } => match tag {
+            0 => Some(Some(ok.as_ref().clone())),
+            1 => Some(Some(err.as_ref().clone())),
+            _ => None,
+        },
+        TypeRepr::Enum { name, variants } => variants
+            .iter()
+            .find(|variant| variant.tag == tag)
+            .map(|variant| {
+                variant.payload_schema(name).map(|schema| TypeRepr::Schema {
+                    schema: Box::new(schema),
+                })
+            }),
+        _ => None,
+    }
+}
+
+fn variant_payload_slot_layout(ty: &TypeRepr) -> (usize, usize) {
+    match ty {
+        TypeRepr::Unit | TypeRepr::Bool => (1, 1),
+        TypeRepr::Int | TypeRepr::Float => (8, 8),
+        _ => (4, 4),
     }
 }
 
@@ -723,20 +822,24 @@ fn verify_list_target(
 /// the inner level.
 fn element_list_kind(element: &TypeRepr) -> Option<ListElementKind> {
     let TypeRepr::List { .. } = element else {
-        // String / Schema element of a pointer array: the recursion
-        // into `verify_pointer_target` dispatches on the type directly
-        // and never reads `list_element`.
+        // String / Schema / Option / Result elements dispatch on the type
+        // directly and never read a nested list sidecar.
         return None;
     };
-    // Inner list: build a throwaway `List<inner>` field and read back
-    // the layout's element kind.
+    list_kind_for_list_type(element)
+}
+
+fn list_kind_for_list_type(ty: &TypeRepr) -> Option<ListElementKind> {
+    let TypeRepr::List { .. } = ty else {
+        return None;
+    };
     let probe = Schema {
         name: "<probe>".to_string(),
         generics: vec![],
         is_tuple: false,
         fields: vec![Field {
             name: "f".to_string(),
-            ty: element.clone(),
+            ty: ty.clone(),
             default: None,
         }],
     };
@@ -773,7 +876,7 @@ fn align_up(off: usize, align: usize) -> Option<usize> {
 /// Human-readable label for an unmodelled type in an error path.
 fn type_label(ty: &TypeRepr) -> &'static str {
     match ty {
-        TypeRepr::Null => "Null",
+        TypeRepr::Unit => "Unit",
         TypeRepr::Bool => "Bool",
         TypeRepr::Int => "Int",
         TypeRepr::Float => "Float",
@@ -781,6 +884,7 @@ fn type_label(ty: &TypeRepr) -> &'static str {
         TypeRepr::List { .. } => "List",
         TypeRepr::Option { .. } => "Option",
         TypeRepr::Result { .. } => "Result",
+        TypeRepr::Enum { .. } => "Enum",
         TypeRepr::Schema { .. } => "Schema",
         TypeRepr::Closure { .. } => "Closure",
     }

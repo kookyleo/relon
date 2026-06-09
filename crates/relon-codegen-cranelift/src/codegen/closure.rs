@@ -200,7 +200,7 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         for ty in param_tys {
             sig.params.push(AbiParam::new(ir_ty_to_cl(*ty)?));
         }
-        if !matches!(ret_ty, IrType::Null) {
+        if !matches!(ret_ty, IrType::Unit) {
             sig.returns.push(AbiParam::new(ir_ty_to_cl(ret_ty)?));
         }
         let sig_ref = self.builder.import_signature(sig);
@@ -216,7 +216,7 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
             .ins()
             .call_indirect(sig_ref, fn_ptr, &call_args);
 
-        if !matches!(ret_ty, IrType::Null) {
+        if !matches!(ret_ty, IrType::Unit) {
             let r = self.builder.inst_results(inst)[0];
             self.push(r);
         }

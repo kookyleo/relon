@@ -40,6 +40,18 @@ pub(crate) enum DictStepResult {
     NotFound,
 }
 
+fn prelude_unit_variant(path: &[TokenKey]) -> Option<Value> {
+    match path {
+        [TokenKey::String(name, _, _)] if name == "None" => Some(Value::option_none()),
+        [TokenKey::String(head, _, _), TokenKey::String(variant, _, _)]
+            if head == "Option" && variant == "None" =>
+        {
+            Some(Value::option_none())
+        }
+        _ => None,
+    }
+}
+
 /// Decrement `owning_depth` for the next step, or convert it to `None`
 /// once we've descended past the owning dict. See the docstring on
 /// `TreeWalkEvaluator::resolve_reference` for the meaning of the counter.
@@ -57,9 +69,9 @@ pub(crate) enum ValueStep {
     /// Lookup succeeded; this is the next `current_val`.
     Found(Value),
     /// Lookup missed but the segment is `?`-marked, so the whole
-    /// reference resolves to `Value::Null` and the caller should
+    /// reference resolves to the standard `None` value and the caller should
     /// stop walking.
-    OptionalNull,
+    OptionalNone,
 }
 
 /// How the structural fallback reports a malformed list index. The
@@ -87,11 +99,11 @@ pub(crate) enum ListIndexErrorKind {
 /// shape stays exactly as the unduplicated code emitted. Behaviour
 /// guarantees (each leg is covered by existing tests):
 ///
-/// * Dict miss / List/Tuple out-of-bounds: `OptionalNull` when `is_optional`,
+/// * Dict miss / List/Tuple out-of-bounds: `OptionalNone` when `is_optional`,
 ///   else `VariableNotFound(display_name, range)`.
-/// * Null receiver: `OptionalNull` when `is_optional`, else
-///   `TypeMismatch { expected: "Dict/List/Tuple", found: "Null" }`.
-/// * Non-collection receiver: same — `OptionalNull` when optional,
+/// * Option.None receiver: `OptionalNone` when `is_optional`, else
+///   `TypeMismatch { expected: "Dict/List/Tuple", found: "Option.None" }`.
+/// * Non-collection receiver: same — `OptionalNone` when optional,
 ///   else `TypeMismatch { expected: "Dict/List/Tuple" }`.
 /// * List index parse failure: shape depends on `list_index_err`
 ///   (see [`ListIndexErrorKind`]).
@@ -108,7 +120,7 @@ pub(crate) fn step_into_value(
             if let Some(val) = d.map.get(key) {
                 Ok(ValueStep::Found(val.clone()))
             } else if is_optional {
-                Ok(ValueStep::OptionalNull)
+                Ok(ValueStep::OptionalNone)
             } else {
                 Err(RuntimeError::VariableNotFound(
                     display_name.to_string(),
@@ -130,7 +142,7 @@ pub(crate) fn step_into_value(
             if let Some(val) = list.get(idx) {
                 Ok(ValueStep::Found(val.clone()))
             } else if is_optional {
-                Ok(ValueStep::OptionalNull)
+                Ok(ValueStep::OptionalNone)
             } else {
                 Err(RuntimeError::VariableNotFound(
                     display_name.to_string(),
@@ -152,7 +164,7 @@ pub(crate) fn step_into_value(
             if let Some(val) = items.get(idx) {
                 Ok(ValueStep::Found(val.clone()))
             } else if is_optional {
-                Ok(ValueStep::OptionalNull)
+                Ok(ValueStep::OptionalNone)
             } else {
                 Err(RuntimeError::VariableNotFound(
                     display_name.to_string(),
@@ -160,10 +172,10 @@ pub(crate) fn step_into_value(
                 ))
             }
         }
-        Value::Null if is_optional => Ok(ValueStep::OptionalNull),
+        v if v.is_option_none() && is_optional => Ok(ValueStep::OptionalNone),
         _ => {
             if is_optional {
-                Ok(ValueStep::OptionalNull)
+                Ok(ValueStep::OptionalNone)
             } else {
                 Err(RuntimeError::TypeMismatch {
                     expected: "Dict/List/Tuple".to_string(),
@@ -194,6 +206,8 @@ impl TreeWalkEvaluator {
             val
         } else if let Some(thunk) = scope.get_thunk(&first_name) {
             self.force_thunk(&thunk)?
+        } else if let Some(value) = prelude_unit_variant(path) {
+            return Ok(value);
         } else {
             return Err(RuntimeError::VariableNotFound(first_name, range));
         };
@@ -261,13 +275,43 @@ impl TreeWalkEvaluator {
                     ListIndexErrorKind::TypeMismatchIndex,
                 )? {
                     ValueStep::Found(v) => current_val = v,
-                    ValueStep::OptionalNull => return Ok(Value::Null),
+                    ValueStep::OptionalNone => return Ok(Value::option_none()),
                 }
                 continue;
             }
             let key = part.to_string_key();
             parts.push(key.clone());
             let display_name = parts.join(".");
+
+            if let Value::EnumSchema(enum_schema) = &current_val {
+                let Some(variant_fields) = enum_schema.variants.get(&key) else {
+                    return Err(RuntimeError::TypeMismatch {
+                        expected: format!("a variant of `{}`", enum_schema.name),
+                        found: format!("`{key}`"),
+                        range,
+                    });
+                };
+                if !variant_fields.is_empty() {
+                    return Err(RuntimeError::TypeMismatch {
+                        expected: format!("payload for variant `{key}`"),
+                        found: "unit variant path".to_string(),
+                        range,
+                    });
+                }
+                if parts.len() != path.len() {
+                    return Err(RuntimeError::TypeMismatch {
+                        expected: "unit enum variant path to end here".to_string(),
+                        found: display_name,
+                        range,
+                    });
+                }
+                current_val = Value::variant_dict(
+                    std::collections::BTreeMap::<crate::value::SmolStr, Value>::new(),
+                    key,
+                    enum_schema.name.clone(),
+                );
+                continue;
+            }
 
             match step_into_value(
                 &current_val,
@@ -278,7 +322,7 @@ impl TreeWalkEvaluator {
                 ListIndexErrorKind::TypeMismatchIndex,
             )? {
                 ValueStep::Found(v) => current_val = v,
-                ValueStep::OptionalNull => return Ok(Value::Null),
+                ValueStep::OptionalNone => return Ok(Value::option_none()),
             }
         }
         Ok(current_val)
@@ -310,7 +354,7 @@ impl TreeWalkEvaluator {
                 })?;
                 let cur_index = context.current_index();
                 if cur_index == 0 {
-                    return Ok(Value::Null);
+                    return Ok(Value::option_none());
                 }
                 let target_index = cur_index - 1;
                 let thunk = context.elements.get(target_index).unwrap();
@@ -327,7 +371,7 @@ impl TreeWalkEvaluator {
                 })?;
                 let cur_index = context.current_index();
                 if cur_index + 1 >= context.elements.len() {
-                    return Ok(Value::Null);
+                    return Ok(Value::option_none());
                 }
                 let target_index = cur_index + 1;
                 let thunk = context.elements.get(target_index).unwrap();
@@ -614,7 +658,7 @@ impl TreeWalkEvaluator {
                         // the value in the owning dict's locals and
                         // that fallback would silently leak it.
                         if is_optional {
-                            Ok(Value::Null)
+                            Ok(Value::option_none())
                         } else {
                             Err(RuntimeError::VariableNotFound(
                                 display_path.to_string(),
@@ -638,7 +682,7 @@ impl TreeWalkEvaluator {
                             );
                         }
                         if is_optional {
-                            Ok(Value::Null)
+                            Ok(Value::option_none())
                         } else {
                             Err(RuntimeError::VariableNotFound(
                                 display_path.to_string(),
@@ -705,7 +749,7 @@ impl TreeWalkEvaluator {
                         child_owning_depth(owning_depth),
                     )
                 } else if is_optional {
-                    Ok(Value::Null)
+                    Ok(Value::option_none())
                 } else {
                     Err(RuntimeError::VariableNotFound(
                         display_path.to_string(),
@@ -716,7 +760,7 @@ impl TreeWalkEvaluator {
             _ => {
                 let part = &path[0];
                 if part.is_optional() {
-                    Ok(Value::Null)
+                    Ok(Value::option_none())
                 } else {
                     let value = self.eval_node_with_path_cache(node, scope, display_path)?;
                     self.lookup_value_path(value, path, display_path, scope, range)
@@ -907,8 +951,8 @@ impl TreeWalkEvaluator {
                     range,
                 )? {
                     current_val = result;
-                    if current_val == Value::Null && is_optional {
-                        return Ok(Value::Null);
+                    if current_val.is_option_none() && is_optional {
+                        return Ok(Value::option_none());
                     }
                     continue;
                 }
@@ -934,10 +978,10 @@ impl TreeWalkEvaluator {
                     ListIndexErrorKind::VariableNotFound,
                 )? {
                     ValueStep::Found(v) => current_val = v,
-                    ValueStep::OptionalNull => return Ok(Value::Null),
+                    ValueStep::OptionalNone => return Ok(Value::option_none()),
                 }
-                if current_val == Value::Null && is_optional {
-                    return Ok(Value::Null);
+                if current_val.is_option_none() && is_optional {
+                    return Ok(Value::option_none());
                 }
                 continue;
             }
@@ -955,10 +999,10 @@ impl TreeWalkEvaluator {
                 ListIndexErrorKind::VariableNotFound,
             )? {
                 ValueStep::Found(v) => current_val = v,
-                ValueStep::OptionalNull => return Ok(Value::Null),
+                ValueStep::OptionalNone => return Ok(Value::option_none()),
             }
-            if current_val == Value::Null && is_optional {
-                return Ok(Value::Null);
+            if current_val.is_option_none() && is_optional {
+                return Ok(Value::option_none());
             }
         }
 

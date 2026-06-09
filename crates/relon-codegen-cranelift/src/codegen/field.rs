@@ -121,10 +121,10 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
             self.buffer_field_addr(0 /* in_ptr */, offset, size)?
         };
         let loaded = self.builder.ins().load(cr_ty, MemFlags::trusted(), addr, 0);
-        // For `Bool` / `Null` the IR's virtual stack expects an i32
+        // For `Bool` / `Unit` the IR's virtual stack expects an i32
         // slot — widen the loaded byte to i32 zero-extended.
         let val = match ty {
-            IrType::Bool | IrType::Null => self.builder.ins().uextend(I32, loaded),
+            IrType::Bool | IrType::Unit => self.builder.ins().uextend(I32, loaded),
             _ => loaded,
         };
         let _ = push_ty;
@@ -134,7 +134,7 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
 
     /// Lower `Op::StoreField { offset, ty }`. Pops the top of the
     /// virtual stack and writes it into `out_ptr + offset` (wasm slot
-    /// 2). Scalar (I64 / F64 / I32 / Bool / Null) stores go through a
+    /// 2). Scalar (I64 / F64 / I32 / Bool / Unit) stores go through a
     /// direct cranelift `store`. Pointer-indirect stores (String /
     /// ListInt / ListFloat / ListBool) route through
     /// [`Codegen::emit_store_pointer_indirect`], which mirrors the
@@ -227,17 +227,17 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         }
         let (cr_ty, size, _push_ty) = field_load_shape(ty)?;
         let value = self.pop()?;
-        // For `Bool` / `Null` the stack slot is i32 but the store
+        // For `Bool` / `Unit` the stack slot is i32 but the store
         // width is i8.
         let store_val = match ty {
-            IrType::Bool | IrType::Null => self
+            IrType::Bool | IrType::Unit => self
                 .builder
                 .ins()
                 .ireduce(cranelift_codegen::ir::types::I8, value),
             _ => value,
         };
         let store_ty = match ty {
-            IrType::Bool | IrType::Null => cranelift_codegen::ir::types::I8,
+            IrType::Bool | IrType::Unit => cranelift_codegen::ir::types::I8,
             _ => cr_ty,
         };
         let addr = self.buffer_field_addr(2 /* out_ptr */, offset, size)?;
@@ -745,7 +745,7 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
             return Ok(());
         }
         match ty {
-            IrType::I64 | IrType::F64 | IrType::I32 | IrType::Bool | IrType::Null => {}
+            IrType::I64 | IrType::F64 | IrType::I32 | IrType::Bool | IrType::Unit => {}
             other => {
                 return Err(CraneliftError::Codegen(format!(
                     "LoadFieldAtAbsolute: field type {other:?} not yet materialised on the \
@@ -761,7 +761,7 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         let addr = self.arena_addr(composed, size)?;
         let loaded = self.builder.ins().load(cr_ty, MemFlags::trusted(), addr, 0);
         let val = match ty {
-            IrType::Bool | IrType::Null => self.builder.ins().uextend(I32, loaded),
+            IrType::Bool | IrType::Unit => self.builder.ins().uextend(I32, loaded),
             _ => loaded,
         };
         self.push(val);

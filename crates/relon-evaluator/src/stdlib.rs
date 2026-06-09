@@ -1809,7 +1809,7 @@ impl RelonFunction for IterFromDict {
 }
 
 /// User-callable `Iter.next()` advance primitive — returns the next
-/// element wrapped in `Option.Some { value: ... }`, or `Option.None {}`
+/// element wrapped in `Some(value)`, or `None`
 /// once the underlying source is exhausted. The cursor itself lives in
 /// a per-Context table (`Context::iter_cursors`); the immutable-
 /// `Value` invariant (`Arc`-shared, no interior mutability) rules out
@@ -1827,7 +1827,7 @@ impl RelonFunction for IterFromDict {
 /// * Aliased iterators (`Iter<Int> it2: it`) share the same `_id` and
 ///   therefore the same cursor — the standard "iterator handle" model.
 ///   A user who wants a fresh cursor re-calls `xs.iter()`.
-/// * Returning `Option.None {}` is idempotent: continuing to call
+/// * Returning `None` is idempotent: continuing to call
 ///   `next()` after exhaustion keeps returning `None`. The cursor
 ///   stops advancing once it reaches `len`.
 /// * `Iter.next()` does **not** drive `for x in c: ...` /
@@ -1955,7 +1955,7 @@ impl RelonFunction for IterNext {
                         .iter()
                         .nth(idx)
                         .map(|(k, v)| (k.as_str(), v.clone()))
-                        .unwrap_or(("", Value::Null));
+                        .unwrap_or_else(|| ("", Value::option_none()));
                     Value::tuple(vec![Value::String(key.into()), v])
                 })
             }
@@ -1972,21 +1972,13 @@ impl RelonFunction for IterNext {
 }
 
 /// Build an `Option.Some { value }` (when `inner` is `Some`) or
-/// `Option.None {}` variant dict. Matches the prelude's `Option<T>`
+/// `None` variant value. Matches the prelude's `Option<T>`
 /// tagged-enum shape so downstream `match`/projection sees a normal
 /// `Option` value.
 fn option_value(inner: Option<Value>) -> Value {
     match inner {
-        Some(v) => {
-            let mut map = std::collections::BTreeMap::new();
-            map.insert(SmolStr::from("value"), v);
-            Value::variant_dict(map, "Some".to_string(), "Option".to_string())
-        }
-        None => Value::variant_dict(
-            std::collections::BTreeMap::<SmolStr, Value>::new(),
-            "None".to_string(),
-            "Option".to_string(),
-        ),
+        Some(v) => Value::option_some(v),
+        None => Value::option_none(),
     }
 }
 
@@ -2716,7 +2708,7 @@ impl RelonFunction for ToJson {
     ) -> Result<Value, RuntimeError> {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
-        let json = value_to_json(&args[0]);
+        let json = value_to_json(&args[0], range)?;
         let s = serde_json::to_string(&json).map_err(|e| {
             RuntimeError::ValidationError(format!("to_json serialise failed: {e}"), range)
         })?;
@@ -2724,32 +2716,48 @@ impl RelonFunction for ToJson {
     }
 }
 
-/// Minimal `Value` → `serde_json::Value` for stdlib `to_json`. Schema /
-/// EnumSchema / Closure / Wildcard / Brand-only / Native types fall to
-/// `null` because they have no JSON representation; user code that
-/// needs richer projection should reach for the host facade's
-/// `projector::to_json_value` which respects #brand / Selector rules.
-fn value_to_json(value: &Value) -> serde_json::Value {
+/// Minimal `Value` → `serde_json::Value` for stdlib `to_json`.
+/// `None` projects to JSON null and `Some(value)` projects to
+/// its payload. Values with no JSON representation are rejected instead of
+/// silently becoming JSON null.
+fn value_to_json(
+    value: &Value,
+    range: relon_parser::TokenRange,
+) -> Result<serde_json::Value, RuntimeError> {
     match value {
-        Value::Null => serde_json::Value::Null,
-        Value::Bool(b) => serde_json::Value::Bool(*b),
-        Value::Int(i) => serde_json::Value::Number((*i).into()),
+        Value::Bool(b) => Ok(serde_json::Value::Bool(*b)),
+        Value::Int(i) => Ok(serde_json::Value::Number((*i).into())),
         Value::Float(f) => serde_json::Number::from_f64(f.into_inner())
             .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        Value::String(s) => serde_json::Value::String(s.as_str().to_owned()),
-        Value::List(items) | Value::Tuple(items) => {
-            serde_json::Value::Array(items.iter().map(value_to_json).collect())
-        }
+            .ok_or_else(|| {
+                RuntimeError::ValidationError(
+                    "to_json cannot serialise non-finite Float".to_string(),
+                    range,
+                )
+            }),
+        Value::String(s) => Ok(serde_json::Value::String(s.as_str().to_owned())),
+        Value::List(items) | Value::Tuple(items) => items
+            .iter()
+            .map(|item| value_to_json(item, range))
+            .collect::<Result<Vec<_>, _>>()
+            .map(serde_json::Value::Array),
         Value::Dict(dict) => {
-            let map = dict
-                .map
-                .iter()
-                .map(|(k, v)| (k.as_str().to_owned(), value_to_json(v)))
-                .collect();
-            serde_json::Value::Object(map)
+            if value.is_option_none() {
+                return Ok(serde_json::Value::Null);
+            }
+            if let Some(inner) = value.option_some_value() {
+                return value_to_json(inner, range);
+            }
+            let mut map = serde_json::Map::new();
+            for (k, v) in &dict.map {
+                map.insert(k.as_str().to_owned(), value_to_json(v, range)?);
+            }
+            Ok(serde_json::Value::Object(map))
         }
-        _ => serde_json::Value::Null,
+        _ => Err(RuntimeError::ValidationError(
+            format!("to_json cannot serialise {}", value.type_name()),
+            range,
+        )),
     }
 }
 
@@ -3096,8 +3104,8 @@ impl RelonFunction for SizeInRange {
 }
 
 /// `parse_iso_date(s) -> Dict { year, month, day }` — parse an
-/// `YYYY-MM-DD` string into a structured dict. Returns `Value::Null`
-/// when the format is invalid. Avoids a `chrono` dep — date math
+/// `YYYY-MM-DD` string into `Option.Some { value: { year, month, day } }`.
+/// Returns `None` when the format is invalid. Avoids a `chrono` dep — date math
 /// stays on the caller side via `year` / `month` / `day` fields.
 struct ParseIsoDate;
 impl RelonFunction for ParseIsoDate {
@@ -3110,7 +3118,7 @@ impl RelonFunction for ParseIsoDate {
         expect_arg_count(&args, 1, range)?;
         let s = expect_string(&args[0], range)?;
         if !is_iso_date_str(s) {
-            return Ok(Value::Null);
+            return Ok(Value::option_none());
         }
         let year: i64 = s[0..4].parse().unwrap();
         let month: i64 = s[5..7].parse().unwrap();
@@ -3119,7 +3127,7 @@ impl RelonFunction for ParseIsoDate {
         map.insert(crate::value::SmolStr::from("year"), Value::Int(year));
         map.insert(crate::value::SmolStr::from("month"), Value::Int(month));
         map.insert(crate::value::SmolStr::from("day"), Value::Int(day));
-        Ok(Value::dict(map))
+        Ok(Value::option_some(Value::dict(map)))
     }
 }
 

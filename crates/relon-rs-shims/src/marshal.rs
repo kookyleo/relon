@@ -92,7 +92,7 @@ pub enum EmittedFieldType {
     /// `bool` (Inline 1/1).
     Bool,
     /// `()` (Inline 1/1, always zero).
-    Null,
+    Unit,
     /// `&str` / `String` — pointer-indirect, fixed slot is a 4-byte
     /// buffer-relative offset to a `[len: u32 LE][utf8 bytes]` tail
     /// record.
@@ -118,8 +118,8 @@ pub enum ArgValue<'a> {
     Float(f64),
     /// `bool` argument bound to an `EmittedFieldType::Bool` slot.
     Bool(bool),
-    /// `Null` argument bound to an `EmittedFieldType::Null` slot.
-    Null,
+    /// Unit argument bound to an `EmittedFieldType::Unit` slot.
+    Unit,
     /// `&str` argument bound to an `EmittedFieldType::String` slot.
     /// The buffer writer copies the bytes into the arena's tail
     /// region — no caller-side aliasing constraint beyond `'a >`
@@ -146,10 +146,8 @@ pub enum RetValue {
     Float(f64),
     /// `bool` return decoded from an `EmittedFieldType::Bool` slot.
     Bool(bool),
-    /// `Null` return — present so a `#main(...) -> Null` shape
-    /// round-trips through the marshalling helper without special-
-    /// casing.
-    Null,
+    /// Unit return for an internal no-payload slot.
+    Unit,
     /// `String` return decoded from an `EmittedFieldType::String`
     /// slot. The bytes are copied out of the arena before the per-
     /// call buffer is recycled, so the caller can keep the value
@@ -469,7 +467,7 @@ fn pack_arg(
         (EmittedFieldType::Int, ArgValue::Int(v)) => pack_int(builder, field.name, *v),
         (EmittedFieldType::Float, ArgValue::Float(v)) => pack_float(builder, field.name, *v),
         (EmittedFieldType::Bool, ArgValue::Bool(v)) => pack_bool(builder, field.name, *v),
-        (EmittedFieldType::Null, ArgValue::Null) => pack_null(builder, field.name),
+        (EmittedFieldType::Unit, ArgValue::Unit) => pack_unit(builder, field.name),
         (EmittedFieldType::String, ArgValue::String(s)) => pack_string(builder, field.name, s),
         (EmittedFieldType::ListInt, ArgValue::ListInt(v)) => pack_list_int(builder, field.name, v),
         // ----- add new leaf pack arm above this line -----
@@ -499,9 +497,9 @@ fn pack_bool(builder: &mut BufferBuilder<'_>, name: &str, v: bool) -> Result<(),
         .map_err(|e| BufferEntryError::Buffer(format!("{e}")))
 }
 
-fn pack_null(builder: &mut BufferBuilder<'_>, name: &str) -> Result<(), BufferEntryError> {
+fn pack_unit(builder: &mut BufferBuilder<'_>, name: &str) -> Result<(), BufferEntryError> {
     builder
-        .write_null(name)
+        .write_unit(name)
         .map_err(|e| BufferEntryError::Buffer(format!("{e}")))
 }
 
@@ -535,7 +533,7 @@ fn unpack_ret(
         EmittedFieldType::Int => unpack_int(reader, field.name),
         EmittedFieldType::Float => unpack_float(reader, field.name),
         EmittedFieldType::Bool => unpack_bool(reader, field.name),
-        EmittedFieldType::Null => unpack_null(reader, field.name),
+        EmittedFieldType::Unit => unpack_unit(reader, field.name),
         EmittedFieldType::String => unpack_string(reader, field.name),
         EmittedFieldType::ListInt => unpack_list_int(reader, field.name),
         // ----- add new leaf unpack arm above this line -----
@@ -563,10 +561,10 @@ fn unpack_bool(reader: &BufferReader<'_>, name: &str) -> Result<RetValue, Buffer
         .map_err(|e| BufferEntryError::Buffer(format!("{e}")))
 }
 
-fn unpack_null(reader: &BufferReader<'_>, name: &str) -> Result<RetValue, BufferEntryError> {
+fn unpack_unit(reader: &BufferReader<'_>, name: &str) -> Result<RetValue, BufferEntryError> {
     reader
-        .read_null(name)
-        .map(|_| RetValue::Null)
+        .read_unit(name)
+        .map(|_| RetValue::Unit)
         .map_err(|e| BufferEntryError::Buffer(format!("{e}")))
 }
 
@@ -589,7 +587,7 @@ fn arg_variant_name(arg: &ArgValue<'_>) -> &'static str {
         ArgValue::Int(_) => "Int",
         ArgValue::Float(_) => "Float",
         ArgValue::Bool(_) => "Bool",
-        ArgValue::Null => "Null",
+        ArgValue::Unit => "Unit",
         ArgValue::String(_) => "String",
         ArgValue::ListInt(_) => "ListInt",
     }
@@ -600,7 +598,7 @@ fn ty_to_repr(ty: EmittedFieldType) -> TypeRepr {
         EmittedFieldType::Int => TypeRepr::Int,
         EmittedFieldType::Float => TypeRepr::Float,
         EmittedFieldType::Bool => TypeRepr::Bool,
-        EmittedFieldType::Null => TypeRepr::Null,
+        EmittedFieldType::Unit => TypeRepr::Unit,
         EmittedFieldType::String => TypeRepr::String,
         EmittedFieldType::ListInt => TypeRepr::List {
             element: Box::new(TypeRepr::Int),
@@ -642,7 +640,7 @@ fn synthesise_layout(fields: &[EmittedField], root_size: u32) -> OffsetTable {
             EmittedFieldType::Int => (8, 8, FieldKind::Inline { size: 8, align: 8 }, None),
             EmittedFieldType::Float => (8, 8, FieldKind::Inline { size: 8, align: 8 }, None),
             EmittedFieldType::Bool => (1, 1, FieldKind::Inline { size: 1, align: 1 }, None),
-            EmittedFieldType::Null => (1, 1, FieldKind::Inline { size: 1, align: 1 }, None),
+            EmittedFieldType::Unit => (1, 1, FieldKind::Inline { size: 1, align: 1 }, None),
             EmittedFieldType::String => {
                 (4, 4, FieldKind::PointerIndirect { tail_alignment: 1 }, None)
             }

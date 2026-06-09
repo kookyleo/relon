@@ -38,7 +38,7 @@
 //! import is therefore declared `(i64 ...n) -> i64` — identical to the
 //! closed-world `declare_host_fn_direct` shape — so the host fn observes
 //! the same i64-bits ABI on both targets and the wasm result is
-//! bit-for-bit equal to the native dispatch. A `Null`-returning host fn
+//! bit-for-bit equal to the native dispatch. A `Unit`-returning host fn
 //! declares a `void` wasm import (no result lane).
 //!
 //! ## What this is *not*
@@ -68,7 +68,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// `import_idx` indexes the module's validated `#native` import
     /// table; the caller (`emit_call_native`) has already checked the
     /// param/ret shapes and the scalar return envelope (I64 / Bool /
-    /// Null). This routine:
+    /// Unit). This routine:
     ///   1. declares the host fn as an undefined external `(i64..)->i64`
     ///      (or `->void`) symbol — the LLVM wasm backend emits it as an
     ///      `(import "env" "<name>")`, kept unresolved by
@@ -104,7 +104,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 let params: Vec<inkwell::types::BasicMetadataTypeEnum<'ctx>> =
                     import.param_tys.iter().map(|_| i64_t.into()).collect();
                 let fn_ty = match import.ret_ty {
-                    IrType::Null => self.ctx.void_type().fn_type(&params, false),
+                    IrType::Unit => self.ctx.void_type().fn_type(&params, false),
                     _ => i64_t.fn_type(&params, false),
                 };
                 self.module.add_function(
@@ -146,7 +146,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .map_err(|e| LlvmError::Codegen(format!("CallNative wasm build_call: {e}")))?;
 
         match ret_ty {
-            IrType::Null => {}
+            IrType::Unit => {}
             IrType::I64 => {
                 let result = match call_site.try_as_basic_value() {
                     inkwell::values::ValueKind::Basic(BasicValueEnum::IntValue(v)) => v,

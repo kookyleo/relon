@@ -6,7 +6,7 @@
 //! * exactly one `#main(<ScalarType> <ident>[, ...]) [-> <ScalarType>]`
 //!   directive, no other directives, no decorators, no leading
 //!   comments;
-//! * a body that is a literal (Int / Float / Bool / Null / String), a
+//! * a body that is a literal (Int / Float / Bool / String), a
 //!   single-segment `Variable`, or a `Binary` / `Unary` / `Ternary`
 //!   over those leaves (whitelisted operators only).
 //!
@@ -263,12 +263,12 @@ impl<'a> FastParser<'a> {
         Some(params)
     }
 
-    /// Recognise one of `Int` / `Float` / `Bool` / `Null` / `String`.
+    /// Recognise one of `Int` / `Float` / `Bool` / `String`.
     /// No generics, no `?`, no dotted path. Anything else flips back.
     fn parse_scalar_type(&mut self) -> Option<TypeNode> {
         let start = self.pos;
         let name = self.parse_identifier()?;
-        if !matches!(name.as_str(), "Int" | "Float" | "Bool" | "Null" | "String") {
+        if !matches!(name.as_str(), "Int" | "Float" | "Bool" | "String") {
             return None;
         }
         // Reject any modifier that would push us out of the scalar
@@ -468,14 +468,14 @@ impl<'a> FastParser<'a> {
         if b.is_ascii_digit() {
             return self.parse_number(start);
         }
-        // Boolean / null literals + identifier.
+        // Boolean literals + identifier.
         if b.is_ascii_alphabetic() || b == b'_' {
             let name = self.parse_identifier()?;
             self.pos_after_last_token = self.pos;
             return Some(match name.as_str() {
                 "true" => Expr::Bool(true),
                 "false" => Expr::Bool(false),
-                "null" => Expr::Null,
+                "null" => return None,
                 _ => {
                     // Single-segment Variable. Reject if a `.` / `(` /
                     // `[` follows — those would be paths / fn calls /

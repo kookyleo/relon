@@ -25,10 +25,11 @@ use super::defs::{
     abs_float, abs_int, ceil_float_to_int, concat_string_string, contains_string,
     floor_float_to_int, glob_match_string, is_empty_string, length_string_to_int, list_bool_length,
     list_float_filter, list_float_fold, list_float_length, list_float_map, list_float_map_to_int,
-    list_float_map_to_string, list_int_filter, list_int_fold, list_int_length_to_int, list_int_map,
-    list_int_map_to_float, list_int_map_to_string, list_int_max, list_int_sum, list_list_length,
-    list_schema_length, list_string_length, list_string_map, max_int, min_int, round_float_to_int,
-    sqrt_float, starts_with_string, substring_string,
+    list_float_map_to_string, list_float_map_to_variant_list, list_int_filter, list_int_fold,
+    list_int_length_to_int, list_int_map, list_int_map_to_float, list_int_map_to_string,
+    list_int_map_to_variant_list, list_int_max, list_int_sum, list_list_filter, list_list_length,
+    list_schema_length, list_string_length, list_string_map, list_string_map_to_variant_list,
+    max_int, min_int, round_float_to_int, sqrt_float, starts_with_string, substring_string,
 };
 use super::normalization::{
     ccc_lookup_helper, compose_lookup_helper, decomp_lookup_helper, nfc_string, nfd_string,
@@ -325,6 +326,14 @@ pub fn builtin_stdlib() -> &'static [StdlibFunction] {
             //             `UnsupportedOperator` rather than producing a value,
             //             so there is no value to be byte-equal to.
             split_string(),
+            // Enum-like list-producing maps. Appended at indices 57..59:
+            // each body returns a 4-byte pointer-array ListList whose slots
+            // point at variant records produced by the closure.
+            list_int_map_to_variant_list(),
+            list_float_map_to_variant_list(),
+            list_string_map_to_variant_list(),
+            // Pointer-array list filter. Appended at index 60.
+            list_list_filter(),
         ]
     })
 }

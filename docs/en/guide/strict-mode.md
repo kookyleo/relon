@@ -56,7 +56,7 @@ regardless of mode — `#relaxed` does not give them a free pass.
 | Path descends past a leaf type (`&u.id.something` where `u.id: Int`) | `unknown_reference_type` |
 | Duplicate field — spread contributes a key the dict already declares | `duplicate_field` |
 | Explicit `Any` annotation (`Any x: 1`, `(Any n) => …`, `List<Any>`, nested forms) | `explicit_any_forbidden` |
-| Bare generic container — `List` / `Dict` / `Closure` / `Fn` / `Enum` without `<...>` | `bare_generic_container` |
+| Bare generic container — `List` / `Dict` / `Closure` / `Fn` without `<...>` | `bare_generic_container` |
 
 > `unresolved_reference` (warning) still fires for free identifiers
 > that don't resolve to any binding. It stays a warning because the

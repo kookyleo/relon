@@ -28,6 +28,7 @@ pub const MSG: &str = "msg";
 pub const ERROR: &str = "error";
 pub const BRAND: &str = "brand";
 pub const SCHEMA: &str = "schema";
+pub const ENUM: &str = "enum";
 pub const IMPORT: &str = "import";
 pub const MAIN: &str = "main";
 /// `#relaxed` — bare file-level directive that opts the module out
@@ -88,6 +89,7 @@ pub const DIRECTIVE_SHAPES: &[(&str, DirectiveShape)] = &[
     (ERROR, DirectiveShape::Value),
     (BRAND, DirectiveShape::Value),
     (SCHEMA, DirectiveShape::NameBody),
+    (ENUM, DirectiveShape::Enum),
     (IMPORT, DirectiveShape::Import),
     (MAIN, DirectiveShape::Main),
     (RELAXED, DirectiveShape::Bare),

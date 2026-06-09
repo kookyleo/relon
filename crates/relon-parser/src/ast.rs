@@ -149,9 +149,9 @@ ast_node!(ErrorNode, ERROR);
 /// [`Expr::cast`].
 ///
 /// Note the variant naming follows the CST kinds, not the legacy
-/// [`crate::Expr`] enum — `Literal` covers `null` / `true` / `false`
-/// / numeric / string atoms uniformly, where the legacy enum split
-/// them into `Null` / `Bool` / `Int` / `Float` / `String`. Downstream
+/// [`crate::Expr`] enum — `Literal` covers `true` / `false` / numeric / string atoms uniformly,
+/// plus the removed `null` spelling for diagnostics. The legacy enum split
+/// them into `Bool` / `Int` / `Float` / `String` plus internal `Missing`. Downstream
 /// callers that need the specific literal type read it from
 /// [`Literal::kind`] / [`Literal::value_text`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -559,7 +559,7 @@ impl VariableExpr {
 
 impl Literal {
     /// Kind of the underlying literal token. Useful for the
-    /// `null`/`true`/`false`/NUMBER/STRING dispatch downstream
+    /// `true`/`false`/NUMBER/STRING dispatch downstream
     /// callers need to type-check.
     pub fn kind(&self) -> Option<SyntaxKind> {
         self.0

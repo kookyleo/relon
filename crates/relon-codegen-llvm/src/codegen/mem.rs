@@ -73,7 +73,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// the result on the int-typed virtual stack. The per-type load /
     /// widen logic mirrors [`Self::emit_load_field`]: F64 loads a
     /// `double` then bit-casts to i64 bits so the operand stack stays
-    /// integer-typed, and Bool / Null (i8 on the wire) zero-extend to
+    /// integer-typed, and Bool / Unit (i8 on the wire) zero-extend to
     /// i32 to match the IR's virtual-stack convention.
     ///
     /// No bounds check — same "trust the IR + LLVM trap on UB" stance
@@ -139,7 +139,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .map_err(|e| LlvmError::Codegen(format!("LoadFieldAtAbsolute load: {e}")))?
             .into_int_value();
         let widened = match push_ty {
-            IrType::Bool | IrType::Null => {
+            IrType::Bool | IrType::Unit => {
                 let name = self.next_name("loadfa_zext");
                 self.builder
                     .build_int_z_extend(raw, self.ctx.i32_type(), &name)
@@ -218,11 +218,11 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .build_load(llvm_ty, addr, &name)
             .map_err(|e| LlvmError::Codegen(format!("LoadField load: {e}")))?
             .into_int_value();
-        // Widen Bool / Null (i8 on the wire) to i32 to match the IR's
-        // virtual-stack convention; I32 / I64 / I8-tagged-as-Null are
+        // Widen Bool / Unit (i8 on the wire) to i32 to match the IR's
+        // virtual-stack convention; I32 / I64 / I8-tagged-as-Unit are
         // already the correct width.
         let widened = match push_ty {
-            IrType::Bool | IrType::Null => {
+            IrType::Bool | IrType::Unit => {
                 let name = self.next_name("loadf_zext");
                 self.builder
                     .build_int_z_extend(raw, self.ctx.i32_type(), &name)
@@ -363,7 +363,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 // the host side.
                 v.into()
             }
-            IrType::Bool | IrType::Null => {
+            IrType::Bool | IrType::Unit => {
                 // Narrow the i32 to i8 before storing.
                 let name = self.next_name("storef_trunc");
                 let narrowed = self
@@ -433,7 +433,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             IrType::I32 => (self.ctx.i32_type().into(), IrType::I32),
             IrType::F64 => (self.ctx.f64_type().into(), IrType::F64),
             IrType::Bool => (self.ctx.i8_type().into(), IrType::Bool),
-            IrType::Null => (self.ctx.i8_type().into(), IrType::Null),
+            IrType::Unit => (self.ctx.i8_type().into(), IrType::Unit),
             other => {
                 return Err(LlvmError::Codegen(format!(
                     "LoadField: Phase B envelope rejects {other:?}"

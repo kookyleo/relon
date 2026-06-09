@@ -3,6 +3,10 @@ use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
+/// Internal TypeNode head used by the lowered representation of `#enum`.
+/// User source cannot write this name directly as public enum syntax.
+pub const INTERNAL_ENUM_TYPE_NAME: &str = "__RelonEnum";
+
 /// Stable identifier assigned to every `Node` at parse time.
 ///
 /// Used as the key in side-tables maintained by `relon-analyzer` (resolved
@@ -124,11 +128,13 @@ pub enum DirectiveShape {
     Value,
     /// `#name <ident> <body-expr>` — one named declaration with a
     /// single body expression (no colon). Example:
-    /// `#schema User { String name: * }`,
-    /// `#schema Color Enum<"r", "g", "b">`. Inside a dict literal,
+    /// `#schema User { String name: * }`. Inside a dict literal,
     /// `#schema X: { ... }` retains the dict-field grammar — the `:`
     /// belongs to the field separator, not the directive.
     NameBody,
+    /// `#enum Name { Variant, Variant { field: Type } }` — Rust-like enum
+    /// declaration lowered to the internal tagged-enum schema shape.
+    Enum,
     /// `#import <bindspec> from <string>`. Example:
     /// `#import string from "std/string"`,
     /// `#import * from "std/list"`,
@@ -342,11 +348,10 @@ pub struct TypeNode {
     pub generics: Vec<TypeNode>,
     pub is_optional: bool,
     pub range: TokenRange,
-    /// `Some(_)` only when this node is an alternative inside a tagged
-    /// `Enum<...>` (sum type). `Some(vec![])` is a unit variant; `Some(non-empty)`
-    /// carries the variant's struct-shape payload as `(field_name, field_type)`
-    /// pairs. Stays `None` for every non-variant type expression so the rest
-    /// of the type system continues to ignore it.
+    /// `Some(_)` only when this node is an alternative inside the lowered
+    /// internal representation of `#enum`. `Some(vec![])` is a unit variant;
+    /// `Some(non-empty)` carries the variant payload as `(field_name, field_type)`
+    /// pairs. Stays `None` for every non-variant type expression.
     pub variant_fields: Option<Vec<(String, TypeNode)>>,
     /// Documentation extracted from leading comments.
     pub doc_comment: Option<String>,
@@ -357,6 +362,15 @@ pub struct ClosureParam {
     pub name: String,
     pub type_hint: Option<TypeNode>,
     pub range: TokenRange,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub struct PatternBinding {
+    /// `Some(field)` for struct payload patterns (`Email { address: a }`),
+    /// `None` for tuple payload patterns (`Pair(a, b)`).
+    pub field: Option<String>,
+    /// Bound local name. `None` means the payload slot is ignored (`*`).
+    pub binding: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -451,7 +465,8 @@ impl Node {
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Expr {
-    Null,
+    /// Internal placeholder for parse recovery or removed literals.
+    Missing,
     Bool(bool),
     Int(i64),
     Float(OrderedFloat<f64>),
@@ -509,6 +524,12 @@ pub enum Expr {
     Match {
         expr: Node,
         arms: Vec<(Node, Node)>,
+    },
+
+    VariantPattern {
+        enum_path: Vec<String>,
+        variant: String,
+        bindings: Vec<PatternBinding>,
     },
 
     Closure {
@@ -570,7 +591,7 @@ impl Expr {
     /// dispatch tag without matching the full enum.
     pub fn kind(&self) -> &'static str {
         match self {
-            Expr::Null => "Null",
+            Expr::Missing => "Missing",
             Expr::Bool(_) => "Bool",
             Expr::Int(_) => "Int",
             Expr::Float(_) => "Float",
@@ -591,6 +612,7 @@ impl Expr {
             Expr::Wildcard => "Wildcard",
             Expr::Where { .. } => "Where",
             Expr::Match { .. } => "Match",
+            Expr::VariantPattern { .. } => "VariantPattern",
             Expr::Closure { .. } => "Closure",
             Expr::VariantCtor { .. } => "VariantCtor",
         }
@@ -600,7 +622,7 @@ impl Expr {
 impl Display for Expr {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Expr::Null => write!(f, "null"),
+            Expr::Missing => write!(f, "<missing>"),
             Expr::Bool(v) => write!(f, "{}", v),
             Expr::Int(v) => write!(f, "{}", v),
             Expr::Float(v) => write!(f, "{}", v),
@@ -610,9 +632,10 @@ impl Display for Expr {
     }
 }
 
-/// Cheap predicate over the canonical builtin-type identifier set used by
-/// the type system (`Int`, `String`, ..., `Enum`). Centralized here so the
-/// analyzer, evaluator, and runtime checker all agree on one list.
+/// Cheap predicate over primitive/container type identifiers such as `Int`,
+/// `String`, `List`, `Dict`, and `Tuple`. Prelude enum schemas such as `Option`
+/// and `Result` are resolved by the analyzer/evaluator schema paths, not by
+/// this primitive set.
 pub fn is_builtin_type_name(name: &str) -> bool {
     matches!(
         name,
@@ -622,12 +645,10 @@ pub fn is_builtin_type_name(name: &str) -> bool {
             | "String"
             | "Bool"
             | "Any"
-            | "Null"
             | "List"
             | "Dict"
             | "Closure"
             | "Fn"
-            | "Enum"
             // v1.7: tuple types `(T1, T2, ...)` are encoded internally
             // as a single-segment path `Tuple` whose `generics` carry
             // the element types in order. Reserved as a builtin name
@@ -648,7 +669,7 @@ pub fn is_builtin_type_name(name: &str) -> bool {
 /// Accepted shapes:
 ///
 /// * Full type expression (`Map<String, Int>`, `Foo<T>`, `Weather?`,
-///   `Int`, `Enum<...>`) — produced by `crate::expr::parse_type_expr`
+///   `Int`) — produced by `crate::expr::parse_type_expr`
 ///   and surfaced as `Expr::Type`. The contained `TypeNode` is returned
 ///   verbatim so generics and `is_optional` survive.
 /// * Bareword / dotted path (`Weather`, `geo.Location`) — surfaced as

@@ -142,7 +142,6 @@ pub(crate) fn type_node_for(t: &InferredType) -> TypeNode {
     use crate::sig::{type_node_generic, type_node_simple};
     match t {
         InferredType::Any => type_node_simple("Any"),
-        InferredType::Null => type_node_simple("Null"),
         InferredType::Bool => type_node_simple("Bool"),
         InferredType::Int => type_node_simple("Int"),
         InferredType::Float => type_node_simple("Float"),
@@ -153,7 +152,9 @@ pub(crate) fn type_node_for(t: &InferredType) -> TypeNode {
             type_node_generic("Dict", vec![type_node_simple("String"), type_node_for(val)])
         }
         InferredType::Schema(name) => type_node_simple(name),
-        InferredType::Variant(enum_name, _) => type_node_simple(enum_name),
+        InferredType::Variant(enum_name, _) | InferredType::VariantPayload(enum_name, _, _) => {
+            type_node_simple(enum_name)
+        }
         InferredType::Optional(inner) => {
             let mut node = type_node_for(inner);
             node.is_optional = true;

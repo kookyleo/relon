@@ -22,8 +22,8 @@
 //!   signature for forward compatibility. Matches the Phase 1 trivial
 //!   demo path.
 //! - **Buffer-protocol (`Buffer`)** — every other supported shape.
-//!   The accepted leaf types are `Int`, `Float`, `Bool`, `Null`,
-//!   `String`, and `List<Int>` (mirrored by the [`EmittedFieldType`]
+//!   The accepted leaf types are `Int`, `Float`, `Bool`,
+//!   `String`, and `List<Int>`; internal unit slots map to Rust `()` (mirrored by the [`EmittedFieldType`]
 //!   enum). The binding builds an [`ArgValue`] vector from typed Rust
 //!   args, hands it to [`call_buffer_entry`], which packs the arena,
 //!   dispatches the JIT, and decodes the return record into a
@@ -42,7 +42,7 @@
 //! ## What's deferred to Phase 3
 //!
 //! - `List<Float>` / `List<List<…>>` / nested-`Schema` argument /
-//!   return marshalling (`Int` / `Float` / `Bool` / `Null` / `String` /
+//!   return marshalling (`Int` / `Float` / `Bool` / `String` /
 //!   `List<Int>` are wired today)
 //! - Closure-valued returns
 //! - Cross-platform host shim coverage (macOS / Windows AOT linking)

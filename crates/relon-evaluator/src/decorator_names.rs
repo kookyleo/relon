@@ -14,7 +14,7 @@
 #![allow(dead_code)]
 
 pub use relon_parser::directive::{
-    BRAND, DEFAULT, ERROR, EXPECT, IMPORT, INTERNAL, MAIN, MSG, SCHEMA,
+    BRAND, DEFAULT, ENUM, ERROR, EXPECT, IMPORT, INTERNAL, MAIN, MSG, SCHEMA,
 };
 
 // `@`-decorator names ----------------------------------------------------

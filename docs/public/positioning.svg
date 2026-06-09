@@ -19,9 +19,9 @@
     <text x="60" y="92" font-size="18" font-weight="700" fill="#0f766e">Platform Team</text>
     <text x="60" y="112" font-size="13" fill="#0f766e" font-style="italic">Rust extensions + .relon libraries</text>
     <line x1="60" y1="124" x2="360" y2="124" stroke="#5eead4" stroke-width="1"/>
-    <text x="60" y="148" font-size="13.5" fill="#134e4a">• @schema · sum types, recursion, validation</text>
+    <text x="60" y="148" font-size="13.5" fill="#134e4a">• #schema / #enum · recursion, validation</text>
     <text x="60" y="170" font-size="13.5" fill="#134e4a">• @decorator plugins · host-registered native fns</text>
-    <text x="60" y="192" font-size="13.5" fill="#134e4a">• @library + helpers + base configs</text>
+    <text x="60" y="192" font-size="13.5" fill="#134e4a">• shared libraries + helper functions</text>
     <text x="60" y="214" font-size="13.5" fill="#134e4a">• Capability gates for sandbox policy</text>
   </g>
 
@@ -37,11 +37,11 @@
     <text x="480" y="214" font-size="13.5" fill="#78350f">• No language plumbing visible</text>
   </g>
 
-  <!-- @import arrow between team boxes -->
+  <!-- #import arrow between team boxes -->
   <g>
     <line x1="380" y1="145" x2="460" y2="145" stroke="#0d9488" stroke-width="2" marker-end="url(#arrow-teal)"/>
     <rect x="395" y="124" width="50" height="20" rx="10" fill="#ffffff" stroke="#0d9488" stroke-width="1.5"/>
-    <text x="420" y="138" font-size="12" font-weight="600" fill="#0d9488" text-anchor="middle">@import</text>
+    <text x="420" y="138" font-size="12" font-weight="600" fill="#0d9488" text-anchor="middle">#import</text>
   </g>
 
   <!-- arrows down into evaluator -->

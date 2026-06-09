@@ -164,7 +164,7 @@ pub fn diff_test_3way(
             if trap_kinds_match(tw_err, cr_err) {
                 match &trace_outcome {
                     Ok(_) => Ok(ThreeWayResult::TraceJitNotApplicable {
-                        baseline: Value::Null,
+                        baseline: Value::option_none(),
                         reason: format!(
                             "{REASON_TRACE_JIT_SKIPPED_TRAP}: tw={tw_err:?} cr={cr_err:?} trace={:?}",
                             trace_outcome.as_ref().ok()

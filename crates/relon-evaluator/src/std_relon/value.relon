@@ -2,5 +2,5 @@
 // fallback works for any value type.
 #relaxed
 {
-    default(v, fallback): v == null ? fallback: v
+    default(v, fallback): v == None ? fallback: v
 }

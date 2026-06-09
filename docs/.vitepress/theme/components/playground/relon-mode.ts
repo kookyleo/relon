@@ -7,15 +7,13 @@
 // `<RelonEditor>` consumer only sees a `LanguageSupport`.
 //
 // Tokens emitted (mapped to standard CodeMirror tags via StreamLanguage):
-//   - `keyword`              : `#schema`, `#main`, `#extend`, ... and the
-//                              legacy `@fn` / `@schema` decorators that
-//                              still appear in `examples/*.relon`.
+//   - `keyword`              : `#schema`, `#enum`, `#main`, `#extend`, ... .
 //   - `meta`                 : `@<ident>` decorator invocations.
 //   - `string`               : `"..."` and `f"..."` (interpolation
 //                              handled as plain string at this layer).
 //   - `number`               : integers + floats.
 //   - `comment`              : `// line` and `/* block */`.
-//   - `atom`                 : `true` / `false` / `null`.
+//   - `atom`                 : `true` / `false`.
 //   - `variableName.special` : reference prefixes `&root`, `&sibling`,
 //                              `&uncle`, `&prev`, `&next`, `&index`,
 //                              `&this` (path tail is plain identifier).
@@ -52,6 +50,7 @@ import { tags as t } from '@lezer/highlight';
 // Hash-prefixed keywords. Order is irrelevant; `Set.has` lookup.
 const HASH_KEYWORDS = new Set([
     '#schema',
+    '#enum',
     '#main',
     '#extend',
     '#derive',
@@ -62,10 +61,9 @@ const HASH_KEYWORDS = new Set([
     '#import',
 ]);
 
-// `@`-prefixed forms that the language treats as keywords (not user
-// decorators). Older examples still use these; keeping them highlighted
-// distinctly avoids visual noise.
-const AT_KEYWORDS = new Set(['@schema', '@fn']);
+// `@`-prefixed forms are user decorators in current Relon. Keep this set
+// empty so old directive spellings are not highlighted as recommended syntax.
+const AT_KEYWORDS = new Set<string>();
 
 // Reference bases that follow `&`. Source of truth:
 // `crates/relon-parser/src/reference_var.rs` (`RefBase` literal table).
@@ -107,7 +105,6 @@ const BUILTIN_TYPES = new Set([
     'Number',
     'String',
     'Bool',
-    'Null',
     'Any',
     'List',
     'Dict',
@@ -229,7 +226,7 @@ const parser: StreamParser<RelonState> = {
             return 'string';
         }
 
-        // Hash-prefixed keyword: `#schema`, `#main`, ...
+        // Hash-prefixed keyword: `#schema`, `#enum`, `#main`, ...
         if (stream.peek() === '#') {
             const match = stream.match(/^#[A-Za-z_][A-Za-z0-9_]*/);
             if (match) {
@@ -241,9 +238,8 @@ const parser: StreamParser<RelonState> = {
             return null;
         }
 
-        // `@<ident>`: either a built-in keyword form (`@fn`, `@schema`)
-        // or a user decorator. Both highlight as `meta`/`keyword`; the
-        // visual difference is intentional but subtle.
+        // `@<ident>` is a user decorator in current Relon. Old directive
+        // spellings are not treated as keywords here.
         if (stream.peek() === '@') {
             const match = stream.match(/^@[A-Za-z_][A-Za-z0-9_]*/);
             if (match) {
@@ -291,7 +287,7 @@ const parser: StreamParser<RelonState> = {
         if (stream.match(/^[A-Za-z_][A-Za-z0-9_]*/)) {
             const word = stream.current() as string;
             const lower = word.toLowerCase();
-            if (lower === 'true' || lower === 'false' || lower === 'null') {
+            if (lower === 'true' || lower === 'false') {
                 return 'atom';
             }
             if (CONTROL_KEYWORDS.has(word)) {
@@ -405,7 +401,6 @@ export const playgroundHighlightStyle = HighlightStyle.define([
     { tag: t.number, class: 'cm-r-number' },
     { tag: t.atom, class: 'cm-r-atom' },
     { tag: t.bool, class: 'cm-r-atom' },
-    { tag: t.null, class: 'cm-r-atom' },
     { tag: t.keyword, class: 'cm-r-keyword' },
     { tag: t.controlKeyword, class: 'cm-r-keyword' },
     { tag: t.typeName, class: 'cm-r-type' },

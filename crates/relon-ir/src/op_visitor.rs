@@ -213,7 +213,19 @@ pub trait OpVisitor {
         root_size: u32,
         root_align: u32,
     ) -> Result<Self::Output, Self::Error>;
+    fn visit_alloc_scratch_record(
+        &mut self,
+        record_local_idx: u32,
+        root_size: u32,
+        root_align: u32,
+    ) -> Result<Self::Output, Self::Error>;
     fn visit_store_field_at_record(
+        &mut self,
+        record_local_idx: u32,
+        offset: u32,
+        ty: IrType,
+    ) -> Result<Self::Output, Self::Error>;
+    fn visit_store_field_at_record_absolute(
         &mut self,
         record_local_idx: u32,
         offset: u32,
@@ -223,10 +235,31 @@ pub trait OpVisitor {
         &mut self,
         record_local_idx: u32,
     ) -> Result<Self::Output, Self::Error>;
+    fn visit_push_record_base_absolute(
+        &mut self,
+        record_local_idx: u32,
+    ) -> Result<Self::Output, Self::Error>;
     fn visit_emit_tail_record_from_absolute_addr(
         &mut self,
         ty: IrType,
     ) -> Result<Self::Output, Self::Error>;
+    fn visit_build_variant_record(
+        &mut self,
+        tag: u8,
+        record_size: u32,
+        record_align: u32,
+        payload_offset: Option<u32>,
+        payload_ty: Option<IrType>,
+    ) -> Result<Self::Output, Self::Error>;
+    fn visit_build_variant_record_scratch(
+        &mut self,
+        tag: u8,
+        record_size: u32,
+        record_align: u32,
+        payload_offset: Option<u32>,
+        payload_ty: Option<IrType>,
+    ) -> Result<Self::Output, Self::Error>;
+    fn visit_build_pointer_list(&mut self, len: u32) -> Result<Self::Output, Self::Error>;
 
     // Calls.
     fn visit_call(
@@ -364,17 +397,57 @@ pub fn walk_op<V: OpVisitor>(op: &Op, visitor: &mut V) -> Result<V::Output, V::E
             root_size,
             root_align,
         } => visitor.visit_alloc_sub_record(*record_local_idx, *root_size, *root_align),
+        Op::AllocScratchRecord {
+            record_local_idx,
+            root_size,
+            root_align,
+        } => visitor.visit_alloc_scratch_record(*record_local_idx, *root_size, *root_align),
         Op::StoreFieldAtRecord {
             record_local_idx,
             offset,
             ty,
         } => visitor.visit_store_field_at_record(*record_local_idx, *offset, *ty),
+        Op::StoreFieldAtRecordAbsolute {
+            record_local_idx,
+            offset,
+            ty,
+        } => visitor.visit_store_field_at_record_absolute(*record_local_idx, *offset, *ty),
         Op::PushRecordBase { record_local_idx } => {
             visitor.visit_push_record_base(*record_local_idx)
+        }
+        Op::PushRecordBaseAbsolute { record_local_idx } => {
+            visitor.visit_push_record_base_absolute(*record_local_idx)
         }
         Op::EmitTailRecordFromAbsoluteAddr { ty } => {
             visitor.visit_emit_tail_record_from_absolute_addr(*ty)
         }
+        Op::BuildVariantRecord {
+            tag,
+            record_size,
+            record_align,
+            payload_offset,
+            payload_ty,
+        } => visitor.visit_build_variant_record(
+            *tag,
+            *record_size,
+            *record_align,
+            *payload_offset,
+            *payload_ty,
+        ),
+        Op::BuildVariantRecordScratch {
+            tag,
+            record_size,
+            record_align,
+            payload_offset,
+            payload_ty,
+        } => visitor.visit_build_variant_record_scratch(
+            *tag,
+            *record_size,
+            *record_align,
+            *payload_offset,
+            *payload_ty,
+        ),
+        Op::BuildPointerList { len } => visitor.visit_build_pointer_list(*len),
         Op::Call {
             fn_index,
             arg_count,
@@ -512,6 +585,11 @@ mod tests {
         fn visit_const_dict(&mut self, _: u32, _: &[(String, i64)]) -> Result<(), ()> {
             self.calls += 1;
             self.last = "ConstDict";
+            Ok(())
+        }
+        fn visit_build_pointer_list(&mut self, _: u32) -> Result<(), ()> {
+            self.calls += 1;
+            self.last = "BuildPointerList";
             Ok(())
         }
         fn visit_local_get(&mut self, _: u32) -> Result<(), ()> {
@@ -745,9 +823,24 @@ mod tests {
             self.last = "AllocSubRecord";
             Ok(())
         }
+        fn visit_alloc_scratch_record(&mut self, _: u32, _: u32, _: u32) -> Result<(), ()> {
+            self.calls += 1;
+            self.last = "AllocScratchRecord";
+            Ok(())
+        }
         fn visit_store_field_at_record(&mut self, _: u32, _: u32, _: IrType) -> Result<(), ()> {
             self.calls += 1;
             self.last = "StoreFieldAtRecord";
+            Ok(())
+        }
+        fn visit_store_field_at_record_absolute(
+            &mut self,
+            _: u32,
+            _: u32,
+            _: IrType,
+        ) -> Result<(), ()> {
+            self.calls += 1;
+            self.last = "StoreFieldAtRecordAbsolute";
             Ok(())
         }
         fn visit_push_record_base(&mut self, _: u32) -> Result<(), ()> {
@@ -755,9 +848,38 @@ mod tests {
             self.last = "PushRecordBase";
             Ok(())
         }
+        fn visit_push_record_base_absolute(&mut self, _: u32) -> Result<(), ()> {
+            self.calls += 1;
+            self.last = "PushRecordBaseAbsolute";
+            Ok(())
+        }
         fn visit_emit_tail_record_from_absolute_addr(&mut self, _: IrType) -> Result<(), ()> {
             self.calls += 1;
             self.last = "EmitTailRecordFromAbsoluteAddr";
+            Ok(())
+        }
+        fn visit_build_variant_record(
+            &mut self,
+            _: u8,
+            _: u32,
+            _: u32,
+            _: Option<u32>,
+            _: Option<IrType>,
+        ) -> Result<(), ()> {
+            self.calls += 1;
+            self.last = "BuildVariantRecord";
+            Ok(())
+        }
+        fn visit_build_variant_record_scratch(
+            &mut self,
+            _: u8,
+            _: u32,
+            _: u32,
+            _: Option<u32>,
+            _: Option<IrType>,
+        ) -> Result<(), ()> {
+            self.calls += 1;
+            self.last = "BuildVariantRecordScratch";
             Ok(())
         }
         fn visit_call(&mut self, _: u32, _: u32, _: &[IrType], _: IrType) -> Result<(), ()> {
@@ -928,5 +1050,67 @@ mod tests {
         let mut v = CountingVisitor::default();
         walk_op(&op, &mut v).unwrap();
         assert_eq!(v.last, "CallNative");
+    }
+
+    #[test]
+    fn dispatch_routes_alloc_scratch_record() {
+        let op = Op::AllocScratchRecord {
+            record_local_idx: 2,
+            root_size: 16,
+            root_align: 8,
+        };
+        let mut v = CountingVisitor::default();
+        walk_op(&op, &mut v).unwrap();
+        assert_eq!(v.last, "AllocScratchRecord");
+    }
+
+    #[test]
+    fn dispatch_routes_store_field_at_record_absolute() {
+        let op = Op::StoreFieldAtRecordAbsolute {
+            record_local_idx: 2,
+            offset: 8,
+            ty: IrType::I64,
+        };
+        let mut v = CountingVisitor::default();
+        walk_op(&op, &mut v).unwrap();
+        assert_eq!(v.last, "StoreFieldAtRecordAbsolute");
+    }
+
+    #[test]
+    fn dispatch_routes_push_record_base_absolute() {
+        let op = Op::PushRecordBaseAbsolute {
+            record_local_idx: 2,
+        };
+        let mut v = CountingVisitor::default();
+        walk_op(&op, &mut v).unwrap();
+        assert_eq!(v.last, "PushRecordBaseAbsolute");
+    }
+
+    #[test]
+    fn dispatch_routes_build_variant_record() {
+        let op = Op::BuildVariantRecord {
+            tag: 1,
+            record_size: 16,
+            record_align: 8,
+            payload_offset: Some(8),
+            payload_ty: Some(IrType::I64),
+        };
+        let mut v = CountingVisitor::default();
+        walk_op(&op, &mut v).unwrap();
+        assert_eq!(v.last, "BuildVariantRecord");
+    }
+
+    #[test]
+    fn dispatch_routes_build_variant_record_scratch() {
+        let op = Op::BuildVariantRecordScratch {
+            tag: 1,
+            record_size: 16,
+            record_align: 8,
+            payload_offset: Some(8),
+            payload_ty: Some(IrType::I64),
+        };
+        let mut v = CountingVisitor::default();
+        walk_op(&op, &mut v).unwrap();
+        assert_eq!(v.last, "BuildVariantRecordScratch");
     }
 }

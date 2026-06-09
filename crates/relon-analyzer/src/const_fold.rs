@@ -96,7 +96,7 @@ pub(crate) fn try_fold(node: &Node) -> Result<Option<ConstValue>, FoldError> {
             }
         }
         // Anything else (Variable, Reference, FnCall, Closure, Dict,
-        // List, FString, Match, VariantCtor, Type, Wildcard, Null,
+        // List, FString, Match, VariantCtor, Type, Wildcard,
         // Where, Spread, Comprehension) is non-foldable at this stage.
         // Runtime keeps owning the verdict.
         _ => Ok(None),

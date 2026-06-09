@@ -16,7 +16,7 @@
 //! `#main` param.
 //!
 //! Scope (matches the agent report's honesty note): only **scalar**
-//! schema fields (`Int` / `Float` / `Bool` / `Null`) are exercised —
+//! schema fields (`Int` / `Float` / `Bool` / `Unit`) are exercised —
 //! the analyzer cannot yet type `String` / `List` schema-field reads or
 //! multi-segment nested-schema walks (`o.inner.x`), and `Dict` /
 //! nested-list `#main` params are rejected by the shared IR lowering

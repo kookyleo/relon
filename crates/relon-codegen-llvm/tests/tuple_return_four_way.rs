@@ -460,3 +460,629 @@ fn named_tuple_schema_return() {
         args1("n", Value::Int(5)),
     );
 }
+
+// ---- custom enum buffer-path coverage --------------------------------
+
+fn enum_value(variant: &str, enum_name: &str, fields: Vec<(&str, Value)>) -> Value {
+    Value::variant_dict(
+        fields.into_iter().map(|(k, v)| (k.to_string(), v)),
+        variant.to_string(),
+        enum_name.to_string(),
+    )
+}
+
+#[test]
+fn custom_enum_unit_return_four_way() {
+    assert_value_four_way(
+        "#enum Stat { Up, Down }\n#main() -> Stat\nStat.Up",
+        HashMap::new(),
+    );
+}
+
+#[test]
+fn custom_enum_struct_return_four_way() {
+    assert_value_four_way(
+        "#enum Notification { Email { address: String, subject: String }, Push }\n\
+         #main() -> Notification\n\
+         Notification.Email { address: \"a@b.c\", subject: \"hi\" }",
+        HashMap::new(),
+    );
+}
+
+#[test]
+fn custom_enum_tuple_return_four_way() {
+    assert_value_four_way(
+        "#enum Packet { Pair(Int, String), Empty }\n#main() -> Packet\nPacket.Pair(7, \"x\")",
+        HashMap::new(),
+    );
+}
+
+#[test]
+fn custom_enum_unit_ternary_return_four_way() {
+    assert_value_four_way(
+        "#enum Stat { Up, Down }
+#main(Bool b) -> Stat
+b ? Stat.Up : Stat.Down",
+        args1("b", Value::Bool(true)),
+    );
+    assert_value_four_way(
+        "#enum Stat { Up, Down }
+#main(Bool b) -> Stat
+b ? Stat.Up : Stat.Down",
+        args1("b", Value::Bool(false)),
+    );
+}
+
+#[test]
+fn custom_enum_payload_ternary_return_four_way() {
+    assert_value_four_way(
+        r#"#enum Packet { Pair(Int, String), Empty }
+#main(Bool b) -> Packet
+b ? Packet.Pair(7, "x") : Packet.Empty"#,
+        args1("b", Value::Bool(true)),
+    );
+    assert_value_four_way(
+        r#"#enum Packet { Pair(Int, String), Empty }
+#main(Bool b) -> Packet
+b ? Packet.Pair(7, "x") : Packet.Empty"#,
+        args1("b", Value::Bool(false)),
+    );
+}
+
+#[test]
+fn custom_enum_unit_param_identity_four_way() {
+    assert_value_four_way(
+        "#enum Stat { Up, Down }\n#main(Stat s) -> Stat\ns",
+        args1("s", enum_value("Down", "Stat", vec![])),
+    );
+}
+
+#[test]
+fn custom_enum_tuple_param_identity_four_way() {
+    assert_value_four_way(
+        "#enum Packet { Pair(Int, String), Empty }\n#main(Packet p) -> Packet\np",
+        args1(
+            "p",
+            enum_value(
+                "Pair",
+                "Packet",
+                vec![("0", Value::Int(7)), ("1", Value::String("x".into()))],
+            ),
+        ),
+    );
+}
+
+#[test]
+fn custom_enum_unit_list_param_identity_four_way() {
+    assert_value_four_way(
+        "#enum Stat { Up, Down }
+#main(List<Stat> xs) -> List<Stat>
+xs",
+        args1(
+            "xs",
+            Value::List(Arc::new(vec![
+                enum_value("Up", "Stat", vec![]),
+                enum_value("Down", "Stat", vec![]),
+            ])),
+        ),
+    );
+}
+
+#[test]
+fn custom_enum_tuple_list_param_identity_four_way() {
+    assert_value_four_way(
+        "#enum Packet { Pair(Int, String), Empty }
+#main(List<Packet> xs) -> List<Packet>
+xs",
+        args1(
+            "xs",
+            Value::List(Arc::new(vec![
+                enum_value(
+                    "Pair",
+                    "Packet",
+                    vec![("0", Value::Int(7)), ("1", Value::String("x".into()))],
+                ),
+                enum_value("Empty", "Packet", vec![]),
+            ])),
+        ),
+    );
+}
+
+#[test]
+fn custom_enum_unit_list_literal_return_four_way() {
+    assert_value_four_way(
+        "#enum Stat { Up, Down }
+#main() -> List<Stat>
+[Stat.Up, Stat.Down]",
+        HashMap::new(),
+    );
+}
+
+#[test]
+fn custom_enum_tuple_list_literal_return_four_way() {
+    assert_value_four_way(
+        r#"#enum Packet { Pair(Int, String), Empty }
+#main() -> List<Packet>
+[Packet.Pair(7, "x"), Packet.Empty]"#,
+        HashMap::new(),
+    );
+}
+
+#[test]
+fn custom_enum_empty_list_literal_return_four_way() {
+    assert_value_four_way(
+        "#enum Stat { Up, Down }
+#main() -> List<Stat>
+[]",
+        HashMap::new(),
+    );
+}
+
+#[test]
+fn custom_enum_unit_list_map_return_four_way() {
+    assert_value_four_way(
+        "#enum Stat { Up, Down }
+#main(List<Int> xs) -> List<Stat>
+xs.map((Int x) => x > 0 ? Stat.Up : Stat.Down)",
+        args1(
+            "xs",
+            Value::List(Arc::new(vec![Value::Int(1), Value::Int(-1), Value::Int(2)])),
+        ),
+    );
+}
+
+#[test]
+fn option_list_map_return_four_way() {
+    assert_value_four_way(
+        "#main(List<Int> xs) -> List<Option<Int>>
+xs.map((Int x) => x > 0 ? Some(x) : None)",
+        args1(
+            "xs",
+            Value::List(Arc::new(vec![Value::Int(1), Value::Int(-1), Value::Int(2)])),
+        ),
+    );
+}
+
+#[test]
+fn result_list_map_return_four_way() {
+    assert_value_four_way(
+        "#main(List<Int> xs) -> List<Result<Int, String>>
+xs.map((Int x) => x > 0 ? Ok(x) : Err(\"bad\"))",
+        args1(
+            "xs",
+            Value::List(Arc::new(vec![Value::Int(1), Value::Int(-1), Value::Int(2)])),
+        ),
+    );
+}
+
+#[test]
+fn custom_enum_tuple_list_map_return_four_way() {
+    assert_value_four_way(
+        r#"#enum Packet { Pair(Int, String), Empty }
+#main(List<Int> xs) -> List<Packet>
+xs.map((Int x) => x > 0 ? Packet.Pair(x, "x") : Packet.Empty)"#,
+        args1(
+            "xs",
+            Value::List(Arc::new(vec![Value::Int(1), Value::Int(-1), Value::Int(2)])),
+        ),
+    );
+}
+
+#[test]
+fn custom_enum_struct_list_map_return_four_way() {
+    assert_value_four_way(
+        r#"#enum Msg { Email { code: Int, subject: String }, Push }
+#main(List<Int> xs) -> List<Msg>
+xs.map((Int x) => x > 0 ? Msg.Email { code: x, subject: "hi" } : Msg.Push)"#,
+        args1(
+            "xs",
+            Value::List(Arc::new(vec![Value::Int(1), Value::Int(-1), Value::Int(2)])),
+        ),
+    );
+}
+
+#[test]
+fn custom_enum_tuple_comprehension_return_four_way() {
+    assert_value_four_way(
+        r#"#enum Packet { Pair(Int, String), Empty }
+#main(List<Int> xs) -> List<Packet>
+[x > 0 ? Packet.Pair(x, "x") : Packet.Empty for x in xs]"#,
+        args1(
+            "xs",
+            Value::List(Arc::new(vec![Value::Int(1), Value::Int(-1), Value::Int(2)])),
+        ),
+    );
+}
+
+#[test]
+fn option_list_filter_return_four_way() {
+    assert_value_four_way(
+        "#main(List<Option<Int>> xs) -> List<Option<Int>>
+xs.filter((Option<Int> x) => true)",
+        args1(
+            "xs",
+            Value::List(Arc::new(vec![
+                Value::option_some(Value::Int(1)),
+                Value::option_none(),
+                Value::option_some(Value::Int(2)),
+            ])),
+        ),
+    );
+}
+
+#[test]
+fn result_list_filter_return_four_way() {
+    assert_value_four_way(
+        "#main(List<Result<Int, String>> xs) -> List<Result<Int, String>>
+xs.filter((Result<Int, String> x) => true)",
+        args1(
+            "xs",
+            Value::List(Arc::new(vec![
+                enum_value("Ok", "Result", vec![("value", Value::Int(1))]),
+                enum_value(
+                    "Err",
+                    "Result",
+                    vec![("error", Value::String("bad".into()))],
+                ),
+            ])),
+        ),
+    );
+}
+
+#[test]
+fn custom_enum_unit_list_filter_return_four_way() {
+    let input = Value::List(Arc::new(vec![
+        enum_value("Up", "Stat", vec![]),
+        enum_value("Down", "Stat", vec![]),
+        enum_value("Up", "Stat", vec![]),
+    ]));
+    assert_value_four_way(
+        "#enum Stat { Up, Down }
+#main(List<Stat> xs) -> List<Stat>
+xs.filter((Stat s) => s match { Up: true, Down: false })",
+        args1("xs", input.clone()),
+    );
+    assert_value_four_way(
+        "#enum Stat { Up, Down }
+#main(List<Stat> xs) -> List<Stat>
+_list_filter(xs, (Stat s) => s match { Up: true, Down: false })",
+        args1("xs", input),
+    );
+}
+
+#[test]
+fn custom_enum_tuple_list_filter_payload_pattern_four_way() {
+    assert_value_four_way(
+        r#"#enum Packet { Pair(Int, String), Empty }
+#main(List<Packet> xs) -> List<Packet>
+xs.filter((Packet p) => p match { Pair(n, *): n > 0, Empty: false })"#,
+        args1(
+            "xs",
+            Value::List(Arc::new(vec![
+                enum_value(
+                    "Pair",
+                    "Packet",
+                    vec![("0", Value::Int(1)), ("1", Value::String("x".into()))],
+                ),
+                enum_value("Empty", "Packet", vec![]),
+                enum_value(
+                    "Pair",
+                    "Packet",
+                    vec![("0", Value::Int(-1)), ("1", Value::String("n".into()))],
+                ),
+            ])),
+        ),
+    );
+}
+
+#[test]
+fn custom_enum_unit_comprehension_return_four_way() {
+    assert_value_four_way(
+        "#enum Stat { Up, Down }
+#main(List<Int> xs) -> List<Stat>
+[x > 0 ? Stat.Up : Stat.Down for x in xs]",
+        args1(
+            "xs",
+            Value::List(Arc::new(vec![Value::Int(1), Value::Int(-1), Value::Int(2)])),
+        ),
+    );
+}
+
+#[test]
+fn option_match_param_four_way() {
+    assert_value_four_way(
+        "#main(Option<Int> x) -> Int
+x match { Some(v): v + 1, None: 0 }",
+        args1("x", Value::option_some(Value::Int(41))),
+    );
+    assert_value_four_way(
+        "#main(Option<Int> x) -> Int
+x match { Some(v): v + 1, None: 0 }",
+        args1("x", Value::option_none()),
+    );
+}
+
+#[test]
+fn option_match_direct_payload_access_four_way() {
+    assert_value_four_way(
+        "#main(Option<Int> x) -> Int
+x match { Some: x.value, None: 0 }",
+        args1("x", Value::option_some(Value::Int(7))),
+    );
+}
+
+#[test]
+fn result_match_param_four_way() {
+    assert_value_four_way(
+        "#main(Result<Int, String> r) -> Int
+r match { Ok(v): v + 1, Err(e): 0 }",
+        args1(
+            "r",
+            Value::variant_dict(
+                [("value", Value::Int(41))],
+                "Ok".to_string(),
+                "Result".to_string(),
+            ),
+        ),
+    );
+    assert_value_four_way(
+        "#main(Result<Int, String> r) -> Int
+r match { Ok(v): v + 1, Err(e): 0 }",
+        args1(
+            "r",
+            Value::variant_dict(
+                [("error", Value::String("no".into()))],
+                "Err".to_string(),
+                "Result".to_string(),
+            ),
+        ),
+    );
+}
+
+#[test]
+fn custom_enum_unit_match_param_four_way() {
+    assert_value_four_way(
+        "#enum Stat { Up, Down }\n#main(Stat s) -> Int\ns match { Up: 1, Down: 0 }",
+        args1("s", enum_value("Down", "Stat", vec![])),
+    );
+}
+
+#[test]
+fn custom_enum_struct_match_param_four_way() {
+    assert_value_four_way(
+        "#enum Notification { Email { address: String }, Push }\n\
+         #main(Notification msg) -> Int\n\
+         msg match { Push: 0, Email: 1 }",
+        args1(
+            "msg",
+            enum_value(
+                "Email",
+                "Notification",
+                vec![("address", Value::String("a@b.c".into()))],
+            ),
+        ),
+    );
+}
+
+#[test]
+fn custom_enum_tuple_match_param_with_wildcard_four_way() {
+    assert_value_four_way(
+        "#enum Packet { Pair(Int, String), Empty }\n\
+         #main(Packet p) -> Int\n\
+         p match { Empty: 0, *: 1 }",
+        args1(
+            "p",
+            enum_value(
+                "Pair",
+                "Packet",
+                vec![("0", Value::Int(7)), ("1", Value::String("x".into()))],
+            ),
+        ),
+    );
+}
+
+#[test]
+fn custom_enum_struct_match_payload_field_four_way() {
+    assert_value_four_way(
+        "#enum Notification { Email { address: String }, Push }\n\
+         #main(Notification msg) -> String\n\
+         msg match { Push: \"\", Email: msg.address }",
+        args1(
+            "msg",
+            enum_value(
+                "Email",
+                "Notification",
+                vec![("address", Value::String("a@b.c".into()))],
+            ),
+        ),
+    );
+}
+
+#[test]
+fn custom_enum_tuple_match_payload_index_four_way() {
+    assert_value_four_way(
+        "#enum Packet { Pair(Int, String), Empty }\n\
+         #main(Packet p) -> Int\n\
+         p match { Empty: 0, Pair: p.0 }",
+        args1(
+            "p",
+            enum_value(
+                "Pair",
+                "Packet",
+                vec![("0", Value::Int(7)), ("1", Value::String("x".into()))],
+            ),
+        ),
+    );
+}
+
+#[test]
+fn custom_enum_tuple_match_payload_pattern_four_way() {
+    assert_value_four_way(
+        "#enum Packet { Pair(Int, String), Empty }\n\
+         #main(Packet p) -> Int\n\
+         p match { Pair(n, *): n + 1, Empty: 0 }",
+        args1(
+            "p",
+            enum_value(
+                "Pair",
+                "Packet",
+                vec![("0", Value::Int(7)), ("1", Value::String("x".into()))],
+            ),
+        ),
+    );
+}
+
+#[test]
+fn custom_enum_struct_match_payload_pattern_four_way() {
+    assert_value_four_way(
+        "#enum Notification { Email { code: Int, subject: String }, Push }\n\
+         #main(Notification msg) -> Int\n\
+         msg match { Notification.Email { code, subject: * }: code + 1, Push: 0 }",
+        args1(
+            "msg",
+            enum_value(
+                "Email",
+                "Notification",
+                vec![
+                    ("code", Value::Int(41)),
+                    ("subject", Value::String("hi".into())),
+                ],
+            ),
+        ),
+    );
+}
+
+#[test]
+fn custom_generic_enum_input_identity_four_way() {
+    assert_value_four_way(
+        "#enum Box<T> { Some(T), None }\n#main(Box<Int> b) -> Box<Int>\nb",
+        args1("b", enum_value("Some", "Box", vec![("0", Value::Int(7))])),
+    );
+}
+
+#[test]
+fn custom_generic_enum_match_payload_pattern_four_way() {
+    assert_value_four_way(
+        "#enum Box<T> { Some(T), None }\n\
+         #main(Box<Int> b) -> Int\n\
+         b match { Some(n): n + 1, None: 0 }",
+        args1("b", enum_value("Some", "Box", vec![("0", Value::Int(7))])),
+    );
+}
+
+#[test]
+fn custom_enum_nested_tuple_payload_identity_four_way() {
+    assert_value_four_way(
+        "#enum Payload { Nested(Tuple<Int, String>), Empty }\n\
+         #main(Payload p) -> Payload\n\
+         p",
+        args1(
+            "p",
+            enum_value(
+                "Nested",
+                "Payload",
+                vec![(
+                    "0",
+                    Value::Tuple(Arc::new(vec![Value::Int(7), Value::String("x".into())])),
+                )],
+            ),
+        ),
+    );
+}
+
+#[test]
+fn custom_enum_list_payload_identity_four_way() {
+    assert_value_four_way(
+        "#enum Payload { Numbers(List<Int>), Empty }\n\
+         #main(Payload p) -> Payload\n\
+         p",
+        args1(
+            "p",
+            enum_value(
+                "Numbers",
+                "Payload",
+                vec![(
+                    "0",
+                    Value::List(Arc::new(vec![Value::Int(1), Value::Int(2)])),
+                )],
+            ),
+        ),
+    );
+}
+
+#[test]
+fn custom_enum_option_result_payload_identity_four_way() {
+    assert_value_four_way(
+        "#enum Payload { Maybe(Option<Int>), Outcome(Result<Int, String>), Empty }\n\
+         #main(Payload p) -> Payload\n\
+         p",
+        args1(
+            "p",
+            enum_value(
+                "Maybe",
+                "Payload",
+                vec![("0", Value::option_some(Value::Int(9)))],
+            ),
+        ),
+    );
+    assert_value_four_way(
+        "#enum Payload { Maybe(Option<Int>), Outcome(Result<Int, String>), Empty }\n\
+         #main(Payload p) -> Payload\n\
+         p",
+        args1(
+            "p",
+            enum_value(
+                "Outcome",
+                "Payload",
+                vec![(
+                    "0",
+                    Value::variant_dict(
+                        [("error", Value::String("no".into()))],
+                        "Err".to_string(),
+                        "Result".to_string(),
+                    ),
+                )],
+            ),
+        ),
+    );
+}
+
+#[test]
+fn custom_generic_enum_return_constructor_four_way() {
+    assert_value_four_way(
+        "#enum Box<T> { Some(T), None }\n#main() -> Box<Int>\nBox.Some(7)",
+        HashMap::new(),
+    );
+}
+
+#[test]
+fn custom_generic_enum_struct_payload_constructor_four_way() {
+    assert_value_four_way(
+        "#enum Box<T> { Some { value: T }, None }
+#main() -> Box<Int>
+Box.Some { value: 7 }",
+        HashMap::new(),
+    );
+}
+
+#[test]
+fn custom_enum_nested_payload_constructors_four_way() {
+    assert_value_four_way(
+        "#enum Payload { Nested(Tuple<Int, String>), Numbers(List<Int>), Maybe(Option<Int>), Empty }\n\
+         #main() -> Payload\n\
+         Payload.Nested((7, \"x\"))",
+        HashMap::new(),
+    );
+    assert_value_four_way(
+        "#enum Payload { Nested(Tuple<Int, String>), Numbers(List<Int>), Maybe(Option<Int>), Empty }\n\
+         #main() -> Payload\n\
+         Payload.Numbers([1, 2])",
+        HashMap::new(),
+    );
+    assert_value_four_way(
+        "#enum Payload { Nested(Tuple<Int, String>), Numbers(List<Int>), Maybe(Option<Int>), Empty }\n\
+         #main() -> Payload\n\
+         Payload.Maybe(Some(9))",
+        HashMap::new(),
+    );
+}

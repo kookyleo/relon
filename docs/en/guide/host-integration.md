@@ -45,9 +45,25 @@ let result = Evaluator::new(Arc::new(ctx))
 ```
 
 `serde_json::from_value::<Value>` is targetless: JSON arrays decode as
-`Value::List`. For a `#main` tuple parameter, construct
-`Value::tuple(...)` directly, or decode with the `#main` signature so
-the array-shaped payload can become `Value::Tuple`.
+`Value::List`, and JSON `null` is rejected because `null` is not a Relon
+value. When writing a Rust host directly, construct `Value::tuple(...)` for
+`#main` tuple parameters and `Value::variant_dict(...)` for enum parameters,
+or decode with the `#main` signature. Only a known `Option<T>` or `T?` target
+maps JSON `null` to `None`; non-null input for `T?` is decoded as `Some(value)`.
+
+The CLI path (`relon run --args '<json>'`) and WASM playground `#main(args)`
+already read the entry signature: JSON arrays become `Value::Tuple` for
+`Tuple<...>` or tuple-schema targets, remain `Value::List` for `List<T>`
+targets before list element validation, and scalar targets reject incompatible
+JSON shapes. Enum parameters accept JSON strings for matching unit variants,
+and externally tagged objects for payload variants. For example,
+`#enum Stat { Up, Down }` with a `Stat` parameter accepts `{ "s": "Up" }`;
+`#enum Msg { Email { address: String }, Pair(Int, String) }` accepts
+`{ "m": { "Email": { "address": "x@y.z" } } }` and
+`{ "m": { "Pair": [7, "x"] } }`. `Option<Int>` accepts `null`, `41`, or
+`{ "x": { "Some": { "value": 41 } } }`; `Result<Int, String>` accepts
+`{ "r": { "Ok": { "value": 41 } } }` or `{ "r": { "Err": { "error": "bad" } } }`. Payload
+variants do not decode from a bare string.
 
 Pair it with a `#main(...)` signature on the script side, describing
 the shape the host must push:
@@ -78,7 +94,7 @@ signature**; each parameter declares one host-pushed slot:
 > `#main` parameters over their buffer protocol, not just scalars. All
 > of the following flow through bit-identically to the tree-walk oracle:
 >
-> - scalar leaves (`Int` / `Float` / `Bool` / `Null`),
+> - scalar leaves (`Int` / `Float` / `Bool`),
 > - **`String`** parameters (e.g. file contents the host read and pushes
 >   in),
 > - **tuple schema** parameters such as
@@ -163,7 +179,7 @@ signature**; each parameter declares one host-pushed slot:
 >   `List<List<…>>` field (e.g. `Team { name: String, members: List<Person>,
 >   tags: List<List<Int>> }`) is **also supported, recursively to any depth**
 >   (F7): the in-place sub-record reader recurses through the same unified
->   list reader and the lowering admission walks the element schema's field
+>   list reader and the IR conversion admission walks the element schema's field
 >   types recursively, so nested object arrays and nested lists inside the
 >   element schema decode bit-equal at any nesting depth,
 > - **deep nested-schema field-walk returns** (`#main(Outer o) ->
@@ -213,7 +229,7 @@ signature**; each parameter declares one host-pushed slot:
 >   four-way at any depth (F7); tuple-return caps are listed separately
 >   below.
 > - tuple returns outside the scalar/literal envelope: nested tuple
->   elements, `List<...>` / `Null` tuple elements, or a tuple return body
+>   elements, `List<...>` / `Option<...>` / `Result<...>` tuple elements, or a tuple return body
 >   that is not a tuple literal. These stay loud caps until the positional
 >   tuple-element work is proven four-way.
 >

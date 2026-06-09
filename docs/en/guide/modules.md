@@ -118,12 +118,13 @@ A complete example:
 
 ```relon
 // platform/notify.relon — shared library (no #main)
+#enum Channel {
+    Email { address: String, subject: String },
+    SMS { phone: String },
+    Push
+}
+
 {
-    #schema Channel Enum<
-        Email { String address: *, String subject: * },
-        SMS   { String phone: * },
-        Push
-    >,
     #schema Notification {
         Channel via: *,
         String title: *
@@ -160,7 +161,7 @@ Relon supports these locators:
 - `&uncle`: the parent's sibling (one level up).
 
 In list processing, cursor-based relative references are available:
-- `&prev`: the previous list element (null on the first element).
+- `&prev`: the previous list element (`None` on the first element).
 - `&next`: the next list element (supports lookahead).
 - `&index`: the current element's index (Int).
 - `&this`: the top-level context container of the list or traversal.

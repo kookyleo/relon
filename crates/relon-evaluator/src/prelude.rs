@@ -7,10 +7,10 @@
 //!
 //! ```relon
 //! #main(...) -> Result<Order, String>
-//! { result: Result.Ok { value: order } }
+//! Ok(order)
 //! ```
 //!
-//! without any explicit `#schema Result<...>` declaration. Users who
+//! without declaring `Result` yourself. Users who
 //! want to override (e.g. a custom `Option`) can still call
 //! [`crate::Context::register_schema`] — that simply replaces the
 //! prelude entry in the per-context schema table.

@@ -99,7 +99,9 @@ pub trait Evaluator: Send + Sync {
     /// Tuple parameters must be supplied as `Value::Tuple` (or
     /// `Value::tuple(...)`). Targetless JSON decoding such as
     /// `serde_json::from_value::<Value>` maps JSON arrays to `Value::List`,
-    /// which intentionally does not satisfy `Tuple<...>` parameters.
+    /// which intentionally does not satisfy `Tuple<...>` parameters; JSON
+    /// `null` is rejected unless a host boundary decodes it against an
+    /// explicit `Option<T>` or `T?` target.
     ///
     /// Returns `NoMainSignature` if the file lacks `#main(...)`.
     fn run_main(&self, args: HashMap<String, Value>) -> Result<Value, RuntimeError>;

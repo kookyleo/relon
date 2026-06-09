@@ -13,13 +13,14 @@ use miette::{IntoDiagnostic, LabeledSpan, NamedSource, Report};
 // already declares a direct dep on `relon-evaluator` for them.
 use relon::{Evaluator as EvaluatorTrait, ResolverChainLoader, Scope, Value};
 use relon_analyzer::{
-    analyze_entry_with_options, analyze_with_options, AnalyzeOptions, WorkspaceDiagnostic,
-    WorkspaceTree,
+    analyze_entry_with_options, analyze_with_options, format_type, substitute_generics_in_typenode,
+    AnalyzeOptions, AnalyzedTree, MainSignature, SchemaDef, WorkspaceDiagnostic, WorkspaceTree,
 };
 use relon_codegen_cranelift::AotEvaluator;
 use relon_evaluator::module::FilesystemModuleResolver;
 use relon_evaluator::{Capabilities, Context, TreeWalkEvaluator};
-use relon_parser::{parse_document, ParseDocumentError};
+use relon_parser::{parse_document, ParseDocumentError, TypeNode};
+use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -316,6 +317,664 @@ fn warn_trust_unsupported_on_aot() {
     eprintln!("{TRUST_UNSUPPORTED_ON_AOT}");
 }
 
+fn parse_main_args_json(
+    args_json: &str,
+    signature: &MainSignature,
+    tree: &AnalyzedTree,
+) -> Result<HashMap<String, Value>, String> {
+    let raw_args: serde_json::Map<String, JsonValue> =
+        serde_json::from_str(args_json).map_err(|e| {
+            format!("--args must be a JSON object keyed by `#main(...)` parameter names: {e}")
+        })?;
+    let param_types: HashMap<&str, &TypeNode> = signature
+        .params
+        .iter()
+        .map(|param| (param.name.as_str(), &param.type_node))
+        .collect();
+    let mut args = HashMap::with_capacity(raw_args.len());
+    for (name, json) in raw_args {
+        let value = if let Some(type_hint) = param_types.get(name.as_str()) {
+            let type_hint = *type_hint;
+            decode_json_for_type(json, type_hint, tree).map_err(|e| {
+                format!(
+                    "--args value for `{name}` cannot be decoded as {}: {e}",
+                    format_type(type_hint)
+                )
+            })?
+        } else {
+            targetless_json_to_value(json)?
+        };
+        args.insert(name, value);
+    }
+    Ok(args)
+}
+
+fn decode_json_for_type(
+    json: JsonValue,
+    type_hint: &TypeNode,
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    if type_hint.is_optional {
+        let mut inner_type = type_hint.clone();
+        inner_type.is_optional = false;
+        return decode_json_for_option(json, Some(&inner_type), tree);
+    }
+
+    if type_key(type_hint) == "Option" {
+        return decode_json_for_option(json, type_hint.generics.first(), tree);
+    }
+
+    if type_key(type_hint) == "Result" {
+        return decode_json_for_result(
+            json,
+            type_hint.generics.first(),
+            type_hint.generics.get(1),
+            tree,
+        );
+    }
+
+    if let Some(value) = decode_json_for_builtin_scalar(json.clone(), type_hint) {
+        return value;
+    }
+
+    match type_key(type_hint).as_str() {
+        "Tuple" => decode_json_array_as_tuple_or_targetless(json, &type_hint.generics, tree),
+        "List" => decode_json_array_as_list_or_targetless(json, type_hint.generics.first(), tree),
+        "Dict" => decode_json_object_as_dict_or_targetless(json, type_hint.generics.get(1), tree),
+        "Enum" => decode_json_for_enum(json, type_hint, tree),
+        _ => {
+            if let Some(def) = schema_def_for_type(type_hint, tree) {
+                if !def.variants.is_empty() {
+                    return decode_json_for_tagged_enum_schema(json, type_hint, def, tree);
+                }
+            }
+            if let Some(elements) = schema_tuple_elements_for_type(type_hint, tree) {
+                decode_json_array_as_tuple_or_targetless(json, &elements, tree)
+            } else if let Some(fields) = schema_fields_for_type(type_hint, tree) {
+                decode_json_object_as_schema_or_targetless(json, &fields, tree)
+            } else {
+                targetless_json_to_value(json)
+            }
+        }
+    }
+}
+
+fn decode_json_for_builtin_scalar(
+    json: JsonValue,
+    type_hint: &TypeNode,
+) -> Option<Result<Value, String>> {
+    match type_key(type_hint).as_str() {
+        "Any" => Some(targetless_json_to_value(json)),
+        "Bool" => Some(match json {
+            JsonValue::Bool(value) => Ok(Value::Bool(value)),
+            other => Err(format!("expected JSON bool, got {}", json_kind(&other))),
+        }),
+        "Int" => Some(match json {
+            JsonValue::Number(value) => value
+                .as_i64()
+                .map(Value::Int)
+                .ok_or_else(|| "expected JSON integer in i64 range".to_string()),
+            other => Err(format!("expected JSON integer, got {}", json_kind(&other))),
+        }),
+        "Float" => Some(match json {
+            JsonValue::Number(value) => value
+                .as_f64()
+                .map(|value| Value::Float(value.into()))
+                .ok_or_else(|| "expected finite JSON number".to_string()),
+            other => Err(format!("expected JSON number, got {}", json_kind(&other))),
+        }),
+        "Number" => Some(match json {
+            JsonValue::Number(value) => {
+                if let Some(int) = value.as_i64() {
+                    Ok(Value::Int(int))
+                } else {
+                    value
+                        .as_f64()
+                        .map(|value| Value::Float(value.into()))
+                        .ok_or_else(|| "expected finite JSON number".to_string())
+                }
+            }
+            other => Err(format!("expected JSON number, got {}", json_kind(&other))),
+        }),
+        "String" => Some(match json {
+            JsonValue::String(value) => Ok(Value::String(value.into())),
+            other => Err(format!("expected JSON string, got {}", json_kind(&other))),
+        }),
+        _ => None,
+    }
+}
+
+fn json_kind(value: &JsonValue) -> &'static str {
+    match value {
+        JsonValue::Null => "null",
+        JsonValue::Bool(_) => "bool",
+        JsonValue::Number(_) => "number",
+        JsonValue::String(_) => "string",
+        JsonValue::Array(_) => "array",
+        JsonValue::Object(_) => "object",
+    }
+}
+
+fn decode_json_for_option(
+    json: JsonValue,
+    inner_type: Option<&TypeNode>,
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    match json {
+        JsonValue::Null => Ok(Value::option_none()),
+        JsonValue::String(name) if name == "None" => Ok(Value::option_none()),
+        JsonValue::Object(mut map) if map.len() == 1 && map.contains_key("None") => {
+            let payload = map.remove("None").expect("checked None payload");
+            match payload {
+                JsonValue::Null => Ok(Value::option_none()),
+                JsonValue::Object(obj) if obj.is_empty() => Ok(Value::option_none()),
+                _ => Err("Option.None expects null or an empty object payload".to_string()),
+            }
+        }
+        JsonValue::Object(mut map) if map.len() == 1 && map.contains_key("Some") => {
+            let payload = map.remove("Some").expect("checked Some payload");
+            decode_json_single_payload(payload, "value", inner_type, tree).map(Value::option_some)
+        }
+        other => {
+            decode_json_single_payload(other, "value", inner_type, tree).map(Value::option_some)
+        }
+    }
+}
+
+fn decode_json_for_result(
+    json: JsonValue,
+    ok_type: Option<&TypeNode>,
+    err_type: Option<&TypeNode>,
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    let JsonValue::Object(mut map) = json else {
+        return Err(
+            r#"Result<T, E> expects an externally tagged object: {"Ok": ...} or {"Err": ...}"#
+                .to_string(),
+        );
+    };
+    if map.len() != 1 {
+        return Err("Result<T, E> expects exactly one variant key: Ok or Err".to_string());
+    }
+    if let Some(payload) = map.remove("Ok") {
+        return decode_json_single_payload(payload, "value", ok_type, tree).map(Value::result_ok);
+    }
+    if let Some(payload) = map.remove("Err") {
+        return decode_json_single_payload(payload, "error", err_type, tree).map(Value::result_err);
+    }
+    let name = map.keys().next().cloned().unwrap_or_default();
+    Err(format!(
+        "object key `{name}` is not a Result variant; expected Ok or Err"
+    ))
+}
+
+fn decode_json_single_payload(
+    payload: JsonValue,
+    field_name: &str,
+    field_type: Option<&TypeNode>,
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    let Some(field_type) = field_type else {
+        return targetless_json_to_value(payload);
+    };
+    match decode_json_for_type(payload.clone(), field_type, tree) {
+        Ok(value) => Ok(value),
+        Err(direct_err) => match payload {
+            JsonValue::Object(mut map) if map.len() == 1 && map.contains_key(field_name) => {
+                let inner = map.remove(field_name).expect("checked payload field");
+                decode_json_for_type(inner, field_type, tree)
+            }
+            _ => Err(direct_err),
+        },
+    }
+}
+
+fn decode_json_array_as_tuple_or_targetless(
+    json: JsonValue,
+    element_types: &[TypeNode],
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    match json {
+        JsonValue::Array(items) => {
+            let mut values = Vec::with_capacity(items.len());
+            for (idx, item) in items.into_iter().enumerate() {
+                let value = match element_types.get(idx) {
+                    Some(slot_type) => decode_json_for_type(item, slot_type, tree)?,
+                    None => targetless_json_to_value(item)?,
+                };
+                values.push(value);
+            }
+            Ok(Value::tuple(values))
+        }
+        other => targetless_json_to_value(other),
+    }
+}
+
+fn decode_json_array_as_list_or_targetless(
+    json: JsonValue,
+    item_type: Option<&TypeNode>,
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    match json {
+        JsonValue::Array(items) => {
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                let value = match item_type {
+                    Some(item_type) => decode_json_for_type(item, item_type, tree)?,
+                    None => targetless_json_to_value(item)?,
+                };
+                values.push(value);
+            }
+            Ok(Value::list(values))
+        }
+        other => targetless_json_to_value(other),
+    }
+}
+
+fn decode_json_object_as_dict_or_targetless(
+    json: JsonValue,
+    value_type: Option<&TypeNode>,
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    match json {
+        JsonValue::Object(map) => {
+            let mut values = Vec::with_capacity(map.len());
+            for (key, item) in map {
+                let value = match value_type {
+                    Some(value_type) => decode_json_for_type(item, value_type, tree)?,
+                    None => targetless_json_to_value(item)?,
+                };
+                values.push((key, value));
+            }
+            Ok(Value::dict(values))
+        }
+        other => targetless_json_to_value(other),
+    }
+}
+
+fn decode_json_object_as_schema_or_targetless(
+    json: JsonValue,
+    field_types: &HashMap<String, TypeNode>,
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    match json {
+        JsonValue::Object(map) => {
+            let mut values = Vec::with_capacity(map.len());
+            for (key, item) in map {
+                let value = match field_types.get(&key) {
+                    Some(field_type) => decode_json_for_type(item, field_type, tree)?,
+                    None => targetless_json_to_value(item)?,
+                };
+                values.push((key, value));
+            }
+            Ok(Value::dict(values))
+        }
+        other => targetless_json_to_value(other),
+    }
+}
+
+fn decode_json_for_tagged_enum_schema(
+    json: JsonValue,
+    type_hint: &TypeNode,
+    def: &SchemaDef,
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    let enum_name = def.name.clone().unwrap_or_else(|| type_key(type_hint));
+    match json {
+        JsonValue::String(name) => decode_json_string_as_enum_unit(name, &enum_name, def),
+        JsonValue::Object(map) => {
+            if map.len() != 1 {
+                return Err(format!(
+                    "enum `{enum_name}` expects an externally tagged object with exactly one variant key"
+                ));
+            }
+            let (variant_name, payload) = map
+                .into_iter()
+                .next()
+                .expect("checked exactly one externally tagged enum entry");
+            decode_json_object_as_enum_variant(variant_name, payload, type_hint, def, tree)
+        }
+        other => targetless_json_to_value(other),
+    }
+}
+
+fn decode_json_string_as_enum_unit(
+    name: String,
+    enum_name: &str,
+    def: &SchemaDef,
+) -> Result<Value, String> {
+    let matching: Vec<_> = def
+        .variants
+        .iter()
+        .filter(|variant| variant.name == name)
+        .collect();
+    match matching.as_slice() {
+        [variant] if variant.fields.is_empty() => Ok(Value::variant_dict(
+            Vec::<(String, Value)>::new(),
+            variant.name.clone(),
+            enum_name.to_string(),
+        )),
+        [variant] => Err(format!(
+            "string `{}` names enum variant `{}` but that variant requires payload fields",
+            name, variant.name
+        )),
+        [] => Err(format!(
+            "string `{name}` does not name a unit variant of enum `{enum_name}`"
+        )),
+        _ => Err(format!(
+            "string `{name}` is ambiguous for enum `{enum_name}`"
+        )),
+    }
+}
+
+fn decode_json_object_as_enum_variant(
+    variant_name: String,
+    payload: JsonValue,
+    type_hint: &TypeNode,
+    def: &SchemaDef,
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    let enum_name = def.name.clone().unwrap_or_else(|| type_key(type_hint));
+    let variant = def
+        .variants
+        .iter()
+        .find(|variant| variant.name == variant_name)
+        .ok_or_else(|| {
+            format!("object key `{variant_name}` is not a variant of enum `{enum_name}`")
+        })?;
+    let fields = substituted_variant_fields(variant, def, &type_hint.generics)?;
+    if fields.is_empty() {
+        return match payload {
+            JsonValue::Object(map) if map.is_empty() => Ok(Value::variant_dict(
+                Vec::<(String, Value)>::new(),
+                variant.name.clone(),
+                enum_name,
+            )),
+            _ => Err(format!(
+                "unit enum variant `{}` expects an empty object payload",
+                variant.name
+            )),
+        };
+    }
+
+    let values = if variant_fields_are_tuple_payload(&fields) {
+        decode_json_payload_as_tuple_variant(payload, &fields, tree, &variant.name)?
+    } else {
+        decode_json_payload_as_struct_variant(payload, &fields, tree, &variant.name)?
+    };
+    Ok(Value::variant_dict(values, variant.name.clone(), enum_name))
+}
+
+fn substituted_variant_fields(
+    variant: &relon_analyzer::schema::EnumVariant,
+    def: &SchemaDef,
+    concrete_args: &[TypeNode],
+) -> Result<Vec<(String, TypeNode)>, String> {
+    variant
+        .fields
+        .iter()
+        .map(|field| {
+            let type_hint = field.type_hint.as_ref().ok_or_else(|| {
+                format!(
+                    "enum variant `{}` field `{}` has no static type",
+                    variant.name, field.name
+                )
+            })?;
+            Ok((
+                field.name.clone(),
+                substitute_schema_type(type_hint, &def.generics, concrete_args),
+            ))
+        })
+        .collect()
+}
+
+fn variant_fields_are_tuple_payload(fields: &[(String, TypeNode)]) -> bool {
+    !fields.is_empty()
+        && fields
+            .iter()
+            .enumerate()
+            .all(|(idx, (name, _))| *name == idx.to_string())
+}
+
+fn decode_json_payload_as_tuple_variant(
+    payload: JsonValue,
+    fields: &[(String, TypeNode)],
+    tree: &AnalyzedTree,
+    variant_name: &str,
+) -> Result<Vec<(String, Value)>, String> {
+    let JsonValue::Array(items) = payload else {
+        return Err(format!(
+            "tuple enum variant `{variant_name}` expects a JSON array payload"
+        ));
+    };
+    if items.len() != fields.len() {
+        return Err(format!(
+            "tuple enum variant `{variant_name}` expects {} elements, got {}",
+            fields.len(),
+            items.len()
+        ));
+    }
+    fields
+        .iter()
+        .zip(items)
+        .map(|((name, field_type), item)| {
+            decode_json_for_type(item, field_type, tree).map(|value| (name.clone(), value))
+        })
+        .collect()
+}
+
+fn decode_json_payload_as_struct_variant(
+    payload: JsonValue,
+    fields: &[(String, TypeNode)],
+    tree: &AnalyzedTree,
+    variant_name: &str,
+) -> Result<Vec<(String, Value)>, String> {
+    let JsonValue::Object(mut map) = payload else {
+        return Err(format!(
+            "struct enum variant `{variant_name}` expects a JSON object payload"
+        ));
+    };
+    let mut values = Vec::with_capacity(fields.len());
+    for (name, field_type) in fields {
+        let item = map
+            .remove(name)
+            .ok_or_else(|| format!("enum variant `{variant_name}` is missing field `{name}`"))?;
+        values.push((name.clone(), decode_json_for_type(item, field_type, tree)?));
+    }
+    if !map.is_empty() {
+        let mut names: Vec<_> = map.keys().cloned().collect();
+        names.sort();
+        return Err(format!(
+            "enum variant `{variant_name}` received unknown field(s): {}",
+            names.join(", ")
+        ));
+    }
+    Ok(values)
+}
+
+fn decode_json_for_enum(
+    json: JsonValue,
+    type_hint: &TypeNode,
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    let arity = match &json {
+        JsonValue::Array(items) => items.len(),
+        _ => return targetless_json_to_value(json),
+    };
+    let matching_tuple_alts: Vec<&TypeNode> = type_hint
+        .generics
+        .iter()
+        .filter(|alt| type_accepts_tuple_array(alt, arity, tree))
+        .collect();
+    if matching_tuple_alts.len() == 1 {
+        decode_json_for_type(json, matching_tuple_alts[0], tree)
+    } else {
+        targetless_json_to_value(json)
+    }
+}
+
+fn type_accepts_tuple_array(type_hint: &TypeNode, arity: usize, tree: &AnalyzedTree) -> bool {
+    if type_key(type_hint) == "Tuple" {
+        return type_hint.generics.len() == arity;
+    }
+    matches!(
+        schema_tuple_elements_for_type(type_hint, tree),
+        Some(elements) if elements.len() == arity
+    )
+}
+
+fn targetless_json_to_value(json: JsonValue) -> Result<Value, String> {
+    if json.is_null() {
+        return Err("JSON null needs an Option<T> or T? target type".to_string());
+    }
+    serde_json::from_value::<Value>(json).map_err(|e| format!("invalid JSON value: {e}"))
+}
+
+fn schema_tuple_elements_for_type(
+    type_hint: &TypeNode,
+    tree: &AnalyzedTree,
+) -> Option<Vec<TypeNode>> {
+    if let Some(def) = local_schema_def_for_type(type_hint, tree) {
+        if let Some(elements) = &def.tuple_elements {
+            return Some(substitute_schema_types(
+                elements,
+                &def.generics,
+                &type_hint.generics,
+            ));
+        }
+    }
+    let key = type_key(type_hint);
+    let imports = tree.workspace_import_index.as_ref()?;
+    let elements = imports.imported_tuple_schemas.get(&key)?;
+    let generics = imports
+        .imported_schema_generics
+        .get(&key)
+        .cloned()
+        .unwrap_or_default();
+    Some(substitute_schema_types(
+        elements,
+        &generics,
+        &type_hint.generics,
+    ))
+}
+
+fn schema_fields_for_type(
+    type_hint: &TypeNode,
+    tree: &AnalyzedTree,
+) -> Option<HashMap<String, TypeNode>> {
+    if let Some(def) = local_schema_def_for_type(type_hint, tree) {
+        return Some(substitute_schema_fields_from_def(def, &type_hint.generics));
+    }
+    let key = type_key(type_hint);
+    let imports = tree.workspace_import_index.as_ref()?;
+    let fields = imports.imported_schemas.get(&key)?;
+    let generics = imports
+        .imported_schema_generics
+        .get(&key)
+        .cloned()
+        .unwrap_or_default();
+    Some(substitute_schema_fields(
+        fields,
+        &generics,
+        &type_hint.generics,
+    ))
+}
+
+fn local_schema_def_for_type<'a>(
+    type_hint: &TypeNode,
+    tree: &'a AnalyzedTree,
+) -> Option<&'a SchemaDef> {
+    if type_hint.path.len() != 1 {
+        return None;
+    }
+    let name = &type_hint.path[0];
+    let decl = tree.root_schemas.iter().find(|decl| &decl.name == name)?;
+    tree.schemas.get(&decl.schema_node.id)
+}
+
+fn schema_def_for_type<'a>(type_hint: &TypeNode, tree: &'a AnalyzedTree) -> Option<&'a SchemaDef> {
+    if let Some(def) = local_schema_def_for_type(type_hint, tree) {
+        return Some(def);
+    }
+    let key = type_key(type_hint);
+    tree.workspace_import_index
+        .as_ref()?
+        .imported_schema_defs
+        .get(&key)
+}
+
+fn substitute_schema_fields_from_def(
+    def: &SchemaDef,
+    concrete_args: &[TypeNode],
+) -> HashMap<String, TypeNode> {
+    let fields = def.fields.iter().filter_map(|field| {
+        let type_hint = field.type_hint.as_ref()?;
+        Some((field.name.clone(), type_hint.clone()))
+    });
+    substitute_schema_fields_from_iter(fields, &def.generics, concrete_args)
+}
+
+fn substitute_schema_fields(
+    fields: &HashMap<String, TypeNode>,
+    generic_names: &[String],
+    concrete_args: &[TypeNode],
+) -> HashMap<String, TypeNode> {
+    substitute_schema_fields_from_iter(
+        fields
+            .iter()
+            .map(|(name, type_hint)| (name.clone(), type_hint.clone())),
+        generic_names,
+        concrete_args,
+    )
+}
+
+fn substitute_schema_fields_from_iter(
+    fields: impl Iterator<Item = (String, TypeNode)>,
+    generic_names: &[String],
+    concrete_args: &[TypeNode],
+) -> HashMap<String, TypeNode> {
+    fields
+        .map(|(name, type_hint)| {
+            (
+                name,
+                substitute_schema_type(&type_hint, generic_names, concrete_args),
+            )
+        })
+        .collect()
+}
+
+fn substitute_schema_types(
+    types: &[TypeNode],
+    generic_names: &[String],
+    concrete_args: &[TypeNode],
+) -> Vec<TypeNode> {
+    types
+        .iter()
+        .map(|type_hint| substitute_schema_type(type_hint, generic_names, concrete_args))
+        .collect()
+}
+
+fn substitute_schema_type(
+    type_hint: &TypeNode,
+    generic_names: &[String],
+    concrete_args: &[TypeNode],
+) -> TypeNode {
+    let subst: HashMap<String, TypeNode> = generic_names
+        .iter()
+        .cloned()
+        .zip(concrete_args.iter().cloned())
+        .collect();
+    if subst.is_empty() {
+        type_hint.clone()
+    } else {
+        substitute_generics_in_typenode(type_hint, &subst)
+    }
+}
+
+fn type_key(type_hint: &TypeNode) -> String {
+    type_hint.path.join(".")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_run(
     file: PathBuf,
@@ -399,7 +1058,7 @@ fn cmd_run(
     // (before the loader runs). All other analyzer knobs stay
     // at their defaults so this branch keeps its prior behavior.
     // v6-fix-D2 default-path-2: detect trivial scalar
-    // `#main(...)` shapes (single Int/Float/Bool/Null/String
+    // `#main(...)` shapes (single Int/Float/Bool/String
     // param + literal-or-arith body, no `#import`) so the
     // default branch can take the same fast-analyze path
     // `--lite` does. The classifier reads the raw source
@@ -728,11 +1387,17 @@ fn cmd_run(
                         .with_source_code(NamedSource::new(file.to_string_lossy(), content)));
             }
         };
-        let args_map: HashMap<String, Value> = serde_json::from_str(&args_json).map_err(|e| {
-            miette::miette!(
-                "--args must be a JSON object keyed by `#main(...)` parameter names: {e}"
-            )
-            .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
+        let entry_tree = workspace
+            .modules
+            .get(&cache_namespace)
+            .expect("workspace passed has_main check but entry tree missing");
+        let signature = entry_tree
+            .main_signature
+            .as_ref()
+            .expect("workspace passed has_main check but entry signature missing");
+        let args_map = parse_main_args_json(&args_json, signature, entry_tree).map_err(|e| {
+            miette::miette!("{e}")
+                .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
         })?;
         // `--backend auto` (default) flows through
         // [`relon::AutoEvaluator`], which (a) probes the

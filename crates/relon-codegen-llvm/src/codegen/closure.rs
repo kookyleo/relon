@@ -378,7 +378,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 let callee = self.closure_fn_table[slot];
                 let want_arity = 2 + user_args.len();
                 let want_ret_llvm = match ret_ty {
-                    IrType::Null => None,
+                    IrType::Unit => None,
                     other => Some(self.ir_ty_to_llvm_int(other)?.get_bit_width()),
                 };
                 let have_ret_llvm = callee.get_type().get_return_type().and_then(|t| match t {
@@ -470,7 +470,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         let post_bb = self.ctx.append_basic_block(self.func, "cc_post");
         // Pre-allocate the ret slot in the entry block so mem2reg can
         // promote it across the switch joins.
-        let ret_slot = if !matches!(ret_ty, IrType::Null) {
+        let ret_slot = if !matches!(ret_ty, IrType::Unit) {
             let ret_llvm_ty = self.ir_ty_to_llvm_int(ret_ty)?;
             let cur = self.builder.get_insert_block();
             // Position at entry block start to place the alloca
@@ -571,7 +571,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             // call site's expected return width, not just on arity.
             let want_arity = 2 + user_args.len();
             let want_ret_llvm = match ret_ty {
-                IrType::Null => None,
+                IrType::Unit => None,
                 other => Some(self.ir_ty_to_llvm_int(other)?.get_bit_width()),
             };
             let have_ret_llvm = callee.get_type().get_return_type().and_then(|t| match t {
@@ -644,7 +644,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                     inkwell::values::ValueKind::Basic(v) => v,
                     inkwell::values::ValueKind::Instruction(_) => {
                         return Err(LlvmError::Codegen(
-                            "CallClosure: callee returned void but ret_ty != Null".into(),
+                            "CallClosure: callee returned void but ret_ty != Unit".into(),
                         ));
                     }
                 };
@@ -695,7 +695,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     ///
     /// Width-coerces each user arg the same way the slow-path
     /// dispatcher does, then pushes the call result back onto the
-    /// operand stack (when the callee's return type isn't `Null`).
+    /// operand stack (when the callee's return type isn't `Unit`).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn emit_call_closure_direct(
         &mut self,
@@ -714,7 +714,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 IrType::I64 => 64,
                 IrType::I32
                 | IrType::Bool
-                | IrType::Null
+                | IrType::Unit
                 | IrType::String
                 | IrType::ListInt
                 | IrType::ListFloat
@@ -764,12 +764,12 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .builder
             .build_call(callee, &call_args, &name)
             .map_err(|e| LlvmError::Codegen(format!("CallClosure(direct) call: {e}")))?;
-        if !matches!(ret_ty, IrType::Null) {
+        if !matches!(ret_ty, IrType::Unit) {
             let v = match call_site.try_as_basic_value() {
                 inkwell::values::ValueKind::Basic(v) => v,
                 inkwell::values::ValueKind::Instruction(_) => {
                     return Err(LlvmError::Codegen(
-                        "CallClosure(direct): callee returned void but ret_ty != Null".into(),
+                        "CallClosure(direct): callee returned void but ret_ty != Unit".into(),
                     ));
                 }
             };

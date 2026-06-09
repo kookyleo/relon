@@ -5,6 +5,7 @@
 //! cycle-detection machinery, which is implementation-detail-heavy.
 
 use crate::diagnostic::Diagnostic;
+use crate::schema::SchemaDef;
 use crate::sig::FnSignature;
 use crate::tree::AnalyzedTree;
 use crate::workspace::{LoadError, ModuleLoader, WorkspaceDiagnostic, WorkspaceTree};
@@ -853,6 +854,12 @@ pub struct WorkspaceImportIndex {
     /// `u.name` for cross-module schema parameters too. Last-write-wins
     /// on name collisions (same permissive policy as `spread_closures`).
     pub imported_schemas: HashMap<String, HashMap<String, TypeNode>>,
+    /// Full imported schema definitions, keyed with the same rules as
+    /// `imported_schemas` (`alias.Name` for alias imports, flattened local
+    /// names for spread/destructure). CLI/WASM typed JSON input uses this
+    /// to decode JSON strings into unit enum variants for imported `#enum`
+    /// parameter types.
+    pub imported_schema_defs: HashMap<String, SchemaDef>,
     /// v1.8 tuple schema: positional element info for imported tuple
     /// schemas, keyed like `imported_schemas` (`alias.Name` for alias
     /// imports, flattened local names for spread/destructure). This lets
@@ -955,6 +962,17 @@ pub(crate) fn build_import_index(ws: &WorkspaceTree, importer_id: &str) -> Works
                 Some((name, def.tuple_elements.clone()?))
             })
             .collect();
+        let exported_schema_defs: HashMap<String, SchemaDef> = target_tree
+            .schemas
+            .values()
+            .filter_map(|def| {
+                let name = def.name.clone()?;
+                if !exported_names.contains(&name) {
+                    return None;
+                }
+                Some((name, def.clone()))
+            })
+            .collect();
         // Schema-rooted §J follow-up (generics): pair `exported_schema_fields`
         // with each schema's declared generic-parameter names (e.g.
         // `Container<T>` → `["T"]`). The path-tail walker uses these
@@ -1032,6 +1050,10 @@ pub(crate) fn build_import_index(ws: &WorkspaceTree, importer_id: &str) -> Works
                 let qualified = format!("{alias}.{name}");
                 index.imported_schemas.insert(qualified, fields.clone());
             }
+            for (name, def) in &exported_schema_defs {
+                let qualified = format!("{alias}.{name}");
+                index.imported_schema_defs.insert(qualified, def.clone());
+            }
             for (name, elements) in &exported_tuple_schemas {
                 let qualified = format!("{alias}.{name}");
                 index
@@ -1061,6 +1083,9 @@ pub(crate) fn build_import_index(ws: &WorkspaceTree, importer_id: &str) -> Works
             // importer's namespace.
             for (name, fields) in &exported_schema_fields {
                 index.imported_schemas.insert(name.clone(), fields.clone());
+            }
+            for (name, def) in &exported_schema_defs {
+                index.imported_schema_defs.insert(name.clone(), def.clone());
             }
             for (name, elements) in &exported_tuple_schemas {
                 index
@@ -1092,6 +1117,11 @@ pub(crate) fn build_import_index(ws: &WorkspaceTree, importer_id: &str) -> Works
                 // references like `MyUser` (alias of `User`) resolve.
                 if let Some(fields) = exported_schema_fields.get(upstream) {
                     index.imported_schemas.insert(local.clone(), fields.clone());
+                }
+                if let Some(def) = exported_schema_defs.get(upstream) {
+                    index
+                        .imported_schema_defs
+                        .insert(local.clone(), def.clone());
                 }
                 if let Some(elements) = exported_tuple_schemas.get(upstream) {
                     index
@@ -2497,6 +2527,40 @@ mod tests {
             entry.cross_module_references.is_empty(),
             "same-file call site shouldn't produce cross-module refs"
         );
+    }
+
+    #[test]
+    fn workspace_import_index_carries_imported_enum_schema_defs() {
+        let mut loader = MapLoader::new();
+        loader.add(
+            "./lib",
+            "/abs/lib",
+            "#enum Stat { Up, Down }
+{}",
+        );
+        let ws = build(
+            "/abs/entry".to_string(),
+            r#"#import lib from "./lib"
+#import * from "./lib"
+{ x: 1 }"#,
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        let entry = ws.modules.get("/abs/entry").expect("entry analyzed");
+        let idx = entry
+            .workspace_import_index
+            .as_ref()
+            .expect("entry should carry a workspace_import_index");
+        let spread = idx
+            .imported_schema_defs
+            .get("Stat")
+            .expect("spread import should expose Stat");
+        assert!(spread.variants.iter().any(|v| v.name == "Up"));
+        let aliased = idx
+            .imported_schema_defs
+            .get("lib.Stat")
+            .expect("alias import should expose lib.Stat");
+        assert!(aliased.variants.iter().any(|v| v.name == "Down"));
     }
 
     #[test]

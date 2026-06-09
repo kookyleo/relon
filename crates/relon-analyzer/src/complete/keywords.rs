@@ -25,7 +25,10 @@ use relon_parser::Node;
 /// caught the slot — capital-letter prefix filtering on the client
 /// keeps the list focused.
 pub(super) fn push_type_primitive_candidates(items: &mut Vec<CompletionItem>) {
-    for name in &["Null", "Bool", "Int", "Float", "String", "List", "Dict"] {
+    for name in &[
+        "Bool", "Int", "Float", "Number", "String", "List", "Tuple", "Dict", "Option", "Result",
+        "Closure",
+    ] {
         items.push(CompletionItem {
             label: (*name).into(),
             kind: CompletionKind::Schema,
@@ -43,12 +46,12 @@ pub(super) fn push_schema_candidates_partial(items: &mut Vec<CompletionItem>, ro
     use relon_parser::DirectiveBody;
     fn visit(node: &Node, items: &mut Vec<CompletionItem>) {
         for dir in &node.directives {
-            if dir.name == "schema" {
+            if matches!(dir.name.as_str(), "schema" | "enum") {
                 if let DirectiveBody::NameBody { name, .. } = &dir.body {
                     items.push(CompletionItem {
                         label: name.clone(),
                         kind: CompletionKind::Schema,
-                        detail: Some("schema".into()),
+                        detail: Some(dir.name.clone()),
                         apply_snippet: None,
                     });
                 }
@@ -197,6 +200,7 @@ pub(super) fn push_directive_candidates(items: &mut Vec<CompletionItem>) {
     // lands the user inside the body, not just on the bare name.
     for (name, snippet) in [
         ("schema", "schema ${1:Name} { ${0} }"),
+        ("enum", "enum ${1:Name} { ${0:Variant} }"),
         ("extend", "extend ${1:Target} { ${0} }"),
         ("main", "main(${1:Type param}) -> ${0:Return}"),
         ("import", "import ${1:bindings} from \"${0:path}\""),

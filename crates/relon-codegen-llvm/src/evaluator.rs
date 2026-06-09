@@ -1756,7 +1756,7 @@ fn write_value_into_builder(
         }
         (TypeRepr::Float, Value::Int(v)) => marshal_float_in(builder, &field.name, *v as f64),
         (TypeRepr::Bool, Value::Bool(v)) => marshal_bool_in(builder, &field.name, *v),
-        (TypeRepr::Null, Value::Null) => marshal_null_in(builder, &field.name),
+        (TypeRepr::Unit, v) if v.is_option_none() => marshal_unit_in(builder, &field.name),
         (TypeRepr::String, Value::String(s)) => marshal_string_in(builder, &field.name, s),
         (TypeRepr::Schema { schema }, Value::Dict(dict)) if !schema.is_tuple => {
             marshal_schema_in(builder, &field.name, schema, dict)
@@ -1767,6 +1767,9 @@ fn write_value_into_builder(
         (TypeRepr::List { element }, Value::List(items)) => {
             marshal_list_in(builder, &field.name, element, items)
         }
+        (TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. }, _) => builder
+            .write_value(&field.name, &field.ty, value)
+            .map_err(buffer_to_runtime_error),
         // ----- add new leaf marshalling arm above this line -----
         (ty, v) => Err(RuntimeError::Unsupported {
             reason: format!(
@@ -1809,11 +1812,11 @@ fn marshal_bool_in(
     builder.write_bool(name, v).map_err(buffer_to_runtime_error)
 }
 
-fn marshal_null_in(
+fn marshal_unit_in(
     builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
     name: &str,
 ) -> Result<(), RuntimeError> {
-    builder.write_null(name).map_err(buffer_to_runtime_error)
+    builder.write_unit(name).map_err(buffer_to_runtime_error)
 }
 
 /// Top-level / schema `String` `#main` arg marshalling. The
@@ -1907,6 +1910,14 @@ fn marshal_list_in(
         }
         TypeRepr::Schema { schema } => marshal_list_schema_in(builder, name, schema, items),
         TypeRepr::List { element: inner } => marshal_list_list_in(builder, name, inner, items),
+        TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => {
+            let ty = TypeRepr::List {
+                element: Box::new(element.clone()),
+            };
+            builder
+                .write_value(name, &ty, &Value::List(Arc::new(items.to_vec())))
+                .map_err(buffer_to_runtime_error)
+        }
         other => Err(RuntimeError::Unsupported {
             reason: format!(
                 "llvm-aot: List element type {other:?} for arg `{name}` is not yet materialised \
@@ -2112,7 +2123,12 @@ fn return_needs_tail_region(schema: &relon_eval_api::schema_canonical::Schema) -
     schema.fields.iter().any(|f| {
         matches!(
             f.ty,
-            TypeRepr::String | TypeRepr::List { .. } | TypeRepr::Schema { .. }
+            TypeRepr::String
+                | TypeRepr::List { .. }
+                | TypeRepr::Schema { .. }
+                | TypeRepr::Option { .. }
+                | TypeRepr::Result { .. }
+                | TypeRepr::Enum { .. }
         )
     })
 }
@@ -2247,7 +2263,7 @@ fn scan_body_effectful(body: &[relon_ir::ir::TaggedOp], effectful: &mut [bool]) 
 fn build_fast_path_profile(schema: &BufferSchema) -> Result<FastPathProfile, ()> {
     use relon_eval_api::schema_canonical::TypeRepr;
     // Every declared #main arg must be `Int`. Pointer-indirect /
-    // floating-point / bool / null are out — those would require
+    // floating-point / bool / unit are out — those would require
     // f64 / i32 fast-entry slots we don't enumerate.
     for f in &schema.main_schema.fields {
         if !matches!(f.ty, TypeRepr::Int) {
@@ -2338,7 +2354,7 @@ pub struct EmittedField {
 /// Erased canonical type tag the build.rs binding generator uses to
 /// pick the Rust type for each `#main` parameter / return slot.
 ///
-/// Phase 2 covers `Int` / `Bool` / `String` / `Null`. Float, Lists,
+/// Phase 2 covers `Int` / `Bool` / `String` / internal unit slots. Float, Lists,
 /// nested schemas, and closure-valued returns surface as
 /// `UnsupportedSignature` at emit-object time so the binding never
 /// sees a type tag it can't handle.
@@ -2372,7 +2388,7 @@ pub enum EmittedFieldType {
     /// `bool`. Inline slot at offset, 1/1.
     Bool,
     /// `()`. Inline slot at offset, 1/1 (always reads as zero).
-    Null,
+    Unit,
     /// `&str` / `String`. Pointer-indirect: fixed slot is a 4-byte
     /// buffer-relative offset to a `[len: u32 LE][utf8 bytes]` tail
     /// record. Build.rs uses `BufferBuilder::write_string` to pack
@@ -3002,7 +3018,7 @@ fn emitted_field_type_for(
         TypeRepr::Int => Some(EmittedFieldType::Int),
         TypeRepr::Float => Some(EmittedFieldType::Float),
         TypeRepr::Bool => Some(EmittedFieldType::Bool),
-        TypeRepr::Null => Some(EmittedFieldType::Null),
+        TypeRepr::Unit => Some(EmittedFieldType::Unit),
         TypeRepr::String => Some(EmittedFieldType::String),
         TypeRepr::List { element } if matches!(element.as_ref(), TypeRepr::Int) => {
             Some(EmittedFieldType::ListInt)

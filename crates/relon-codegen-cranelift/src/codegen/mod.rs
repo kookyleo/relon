@@ -551,7 +551,7 @@ fn lower_module_into<M: CrModule>(
         for p in &lambda.params {
             sig.params.push(AbiParam::new(ir_ty_to_cl(*p)?));
         }
-        if !matches!(lambda.ret, IrType::Null) {
+        if !matches!(lambda.ret, IrType::Unit) {
             sig.returns.push(AbiParam::new(ir_ty_to_cl(lambda.ret)?));
         }
         let name = format!("__closure_{slot}");
@@ -639,7 +639,7 @@ fn lower_module_into<M: CrModule>(
             mode: CodegenMode::Entry,
         };
 
-        codegen.emit_prologue();
+        codegen.emit_prologue()?;
         codegen.emit_body(&entry.body)?;
 
         // Now fill the trap block body. Every guard branched in with
@@ -785,7 +785,7 @@ fn lower_module_into<M: CrModule>(
                 },
             };
 
-            codegen.emit_prologue();
+            codegen.emit_prologue()?;
             codegen.emit_body(&lambda.body)?;
 
             builder.switch_to_block(trap_block);
@@ -833,7 +833,7 @@ fn ir_ty_to_cl(ty: IrType) -> Result<cranelift_codegen::ir::Type, CraneliftError
     Ok(match ty {
         IrType::I64 => I64,
         IrType::F64 => cranelift_codegen::ir::types::F64,
-        IrType::I32 | IrType::Bool | IrType::Null => I32,
+        IrType::I32 | IrType::Bool | IrType::Unit => I32,
         // Pointer-indirect leaves carry an i32 buffer-relative
         // offset in the IR's wasm-shaped slot model. Cranelift
         // mirrors that as a plain i32.
@@ -864,7 +864,7 @@ pub(super) fn field_load_shape(
         IrType::I64 => Ok((I64, 8, IrType::I64)),
         IrType::F64 => Ok((cranelift_codegen::ir::types::F64, 8, IrType::F64)),
         IrType::I32 => Ok((I32, 4, IrType::I32)),
-        IrType::Bool | IrType::Null => Ok((cranelift_codegen::ir::types::I8, 1, IrType::Bool)),
+        IrType::Bool | IrType::Unit => Ok((cranelift_codegen::ir::types::I8, 1, IrType::Bool)),
         // Pointer-indirect leaves: the fixed-area slot holds a single
         // i32 buffer-relative offset. Loads / stores against the slot
         // therefore use an `i32` access width — the IR-visible value
@@ -913,7 +913,9 @@ fn body_needs_tail_cursor(body: &[TaggedOp]) -> bool {
             } => return true,
             Op::AllocRootRecord { .. }
             | Op::AllocSubRecord { .. }
-            | Op::EmitTailRecordFromAbsoluteAddr { .. } => return true,
+            | Op::EmitTailRecordFromAbsoluteAddr { .. }
+            | Op::BuildVariantRecord { .. }
+            | Op::BuildPointerList { .. } => return true,
             Op::If {
                 then_body,
                 else_body,
@@ -1229,7 +1231,16 @@ impl<'a, 'b> Codegen<'a, 'b> {
     /// dict-construction ops, also initialise `state.tail_cursor` to
     /// `return_root_size` so the first tail allocation lands
     /// immediately past the fixed area.
-    fn emit_prologue(&mut self) {
+    fn emit_prologue(&mut self) -> Result<(), CraneliftError> {
+        // Define every IR-visible function parameter in the entry block.
+        // Cranelift Variables are path-sensitive: if a LocalGet first appears
+        // inside only one If arm, declaring it lazily there leaves the other
+        // arm without a definition. Predefining params keeps branch joins from
+        // receiving a zero/default value for locals such as out_ptr.
+        for idx in 0..self.arg_values.len() {
+            let _ = self.get_local(idx as u32)?;
+        }
+
         if self.sandbox.deadline_check {
             self.emit_resource_check();
         }
@@ -1245,6 +1256,7 @@ impl<'a, 'b> Codegen<'a, 'b> {
                 STATE_OFFSET_TAIL_CURSOR,
             );
         }
+        Ok(())
     }
 
     /// Conditional trap: when `cond` is non-zero, jump to the trap

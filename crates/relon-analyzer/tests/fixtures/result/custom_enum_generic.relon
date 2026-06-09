@@ -1,8 +1,0 @@
-// v1.8 C3: the variant-generic check works for any user-declared
-// sum-type schema, not just `Result`. Here `Pair<T, U>` has a
-// `Both { left: T, right: U }` variant; the slot
-// `Pair<Int, String>` flows `T -> Int, U -> String` into the
-// constructor, so a swapped pair is rejected statically.
-// EXPECTED: ≥ 1 × StaticTypeMismatch on the swapped value.
-#schema Pair<T, U> Enum<Both { left: T, right: U }>
-{ Pair<Int, String> p: Pair.Both { left: "wrong", right: 99 } }

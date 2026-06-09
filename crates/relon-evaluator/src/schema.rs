@@ -40,7 +40,35 @@ impl TreeWalkEvaluator {
             });
         }
 
-        if type_hint.is_optional && matches!(value, Value::Null) {
+        if type_hint.is_optional {
+            let mut inner_type = type_hint.clone();
+            inner_type.is_optional = false;
+            if value.is_option_none() {
+                return Ok(());
+            }
+            if let Value::Dict(d) = value {
+                if d.variant_of.as_deref() == Some("Option") && d.brand.as_deref() == Some("Some") {
+                    let d_mut = Arc::make_mut(d);
+                    let Some(payload) = d_mut.map.get_mut("value") else {
+                        return Err(RuntimeError::TypeMismatch {
+                            expected: format_type(type_hint),
+                            found: value.type_name().to_string(),
+                            range,
+                        });
+                    };
+                    return self.check_type_internal(
+                        payload,
+                        &inner_type,
+                        scope,
+                        range,
+                        visited,
+                        depth + 1,
+                    );
+                }
+            }
+            self.check_type_internal(value, &inner_type, scope, range, visited, depth + 1)?;
+            let payload = std::mem::replace(value, Value::option_none());
+            *value = Value::option_some(payload);
             return Ok(());
         }
 
@@ -102,52 +130,6 @@ impl TreeWalkEvaluator {
                         self.check_type_internal(item, slot_ty, scope, range, visited, depth + 1)?;
                     }
                     Ok(())
-                }
-                ("Enum", val) => {
-                    // Two-pass match: cheap literal/primitive matchers
-                    // first (no clone), then structural alternatives
-                    // (clone-and-recurse).
-                    let mut matched = false;
-                    for alt in &type_hint.generics {
-                        if Self::enum_alt_matches_cheaply(alt, val) {
-                            matched = true;
-                            break;
-                        }
-                    }
-                    if !matched {
-                        for alt in &type_hint.generics {
-                            // Skip alts already ruled out by the cheap pass.
-                            if Self::is_cheap_enum_alt(alt) {
-                                continue;
-                            }
-                            let mut temp_val = val.clone();
-                            if self
-                                .check_type_internal(
-                                    &mut temp_val,
-                                    alt,
-                                    scope,
-                                    range,
-                                    visited,
-                                    depth + 1,
-                                )
-                                .is_ok()
-                            {
-                                matched = true;
-                                break;
-                            }
-                        }
-                    }
-                    if matched {
-                        Ok(())
-                    } else {
-                        let alts: Vec<String> =
-                            type_hint.generics.iter().map(format_type).collect();
-                        Err(RuntimeError::TypeMismatch {
-                            expected: format!("one of [{}]", alts.join(", ")),
-                            found: val.to_string(),
-                            range,
-                        })
-                    }
                 }
                 (expected, found_val) => Err(RuntimeError::TypeMismatch {
                     expected: expected.to_string(),
@@ -314,59 +296,6 @@ impl TreeWalkEvaluator {
                 range,
             }),
         }
-    }
-
-    /// True if `alt` is matchable without cloning: a string-literal
-    /// alternative (quoted or bareword) or a single-segment built-in
-    /// type name with no generics. Bareword non-builtins are treated as
-    /// candidate string literals — they could still resolve to a custom
-    /// schema in a later pass, but the cheap pre-check is allowed to
-    /// pre-empt that with a `Value::String` match.
-    fn is_cheap_enum_alt(alt: &TypeNode) -> bool {
-        alt.path.len() == 1 && alt.generics.is_empty() && !alt.is_optional
-    }
-
-    /// Cheap, no-clone match for an enum alternative against `val`.
-    /// Returns `true` only if the alt definitively matches; complex
-    /// alts (custom schemas, generics, optionals) fall through to the
-    /// structural pass.
-    fn enum_alt_matches_cheaply(alt: &TypeNode, val: &Value) -> bool {
-        if !Self::is_cheap_enum_alt(alt) {
-            return false;
-        }
-        let p = &alt.path[0];
-        // Built-in primitive / collection check.
-        let prim_match = match (p.as_str(), val) {
-            ("Any", _) => Some(true),
-            ("Null", Value::Null) => Some(true),
-            ("Int", Value::Int(_)) => Some(true),
-            ("Float", Value::Float(_)) => Some(true),
-            ("Number", Value::Int(_) | Value::Float(_)) => Some(true),
-            ("String", Value::String(_)) => Some(true),
-            ("Bool", Value::Bool(_)) => Some(true),
-            ("List", Value::List(_)) => Some(true),
-            ("Tuple", Value::Tuple(_)) => Some(true),
-            ("Dict", Value::Dict(_)) => Some(true),
-            ("Closure" | "Fn", Value::Closure(_)) => Some(true),
-            _ if is_builtin_type_name(p) => Some(false),
-            _ => None,
-        };
-        if let Some(m) = prim_match {
-            return m;
-        }
-        // Bareword or quoted string literal alternative — match the
-        // cleaned form against the string value.
-        let clean = if Self::is_quoted_string_literal(p) {
-            &p[1..p.len() - 1]
-        } else {
-            p.as_str()
-        };
-        matches!(val, Value::String(s) if s == clean)
-    }
-
-    fn is_quoted_string_literal(p: &str) -> bool {
-        (p.starts_with('"') && p.ends_with('"') && p.len() >= 2)
-            || (p.starts_with('\'') && p.ends_with('\'') && p.len() >= 2)
     }
 
     /// Substitute generic-parameter names in every field's `type_hint`.

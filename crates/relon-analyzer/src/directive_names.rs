@@ -7,5 +7,5 @@
 #![allow(dead_code)]
 
 pub(crate) use relon_parser::directive::{
-    BRAND, DEFAULT, ERROR, EXPECT, EXTEND, IMPORT, MAIN, MSG, RELAXED, SCHEMA, UNSTRICT,
+    BRAND, DEFAULT, ENUM, ERROR, EXPECT, EXTEND, IMPORT, MAIN, MSG, RELAXED, SCHEMA, UNSTRICT,
 };

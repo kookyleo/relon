@@ -1,5 +1,6 @@
 //! Backend-shared host side of the in-place region-walk return ABI
-//! (S1/S2 `List<List<scalar>>`, S3 `List<String>`, S4 `List<Schema>`).
+//! (S1/S2 `List<List<scalar>>`, S3 `List<String>`, S4 `List<Schema>`,
+//! and pointer-array variant lists such as `List<Enum>`).
 //! When a compiled
 //! `#main` returns a parameter-sourced pointer-array list, the machine
 //! code does **not** copy the value into `out_buf`. Instead the epilogue
@@ -101,7 +102,8 @@ pub fn decode_inplace_sentinel(ret: i32) -> Result<usize, RuntimeError> {
 
 /// Decode an in-place region-walk return for a single-value return whose
 /// root is a parameter-sourced pointer-array list: `List<List<scalar>>`
-/// (S1/S2), `List<String>` (S3), or `List<Schema>` (S4). The machine
+/// (S1/S2), `List<String>` (S3), `List<Schema>` (S4), or a variant list
+/// such as `List<Option<T>>` / `List<Result<T, E>>` / `List<Enum>`. The machine
 /// code reported `root_abs`
 /// (the arena-absolute offset of the return root) via the negative
 /// sentinel; the caller already recovered it with
@@ -127,13 +129,13 @@ pub fn decode_inplace_return(
     return_fields: &[Field],
 ) -> Result<Value, RuntimeError> {
     // The return must be a pointer-array list the in-place ABI emits:
-    // `List<List<scalar>>`, `List<String>`, or `List<Schema>`. Classify it
+    // `List<List<scalar>>`, `List<String>`, `List<Schema>`, or a variant list. Classify it
     // up front so the region/verify pipeline below is shape-agnostic and
     // only the final decode branches. Anything else is ABI drift — surface
     // it loudly.
     // The `List` prefix on every variant is intentional: each names the
     // concrete pointer-array return shape (`List<List>` / `List<String>` /
-    // `List<Schema>`) the sentinel can carry, so the shared prefix is the
+    // `List<Schema>` / `List<Variant>`) the sentinel can carry, so the shared prefix is the
     // point rather than noise.
     #[allow(clippy::enum_variant_names)]
     enum InplaceShape<'a> {
@@ -148,6 +150,9 @@ pub fn decode_inplace_return(
         /// element** type (`List<String>` / `List<Schema>`); the unified
         /// recursive reader walks one level deeper than the scalar path.
         ListListPointerArray(&'a TypeRepr),
+        /// A pointer-array list of variant records: `List<Option<T>>`,
+        /// `List<Result<T, E>>`, or `List<CustomEnum>`.
+        ListVariant(&'a TypeRepr),
     }
     let shape = match &return_field.ty {
         TypeRepr::List { element } => match element.as_ref() {
@@ -163,10 +168,13 @@ pub fn decode_inplace_return(
             },
             TypeRepr::String => InplaceShape::ListString,
             TypeRepr::Schema { schema } => InplaceShape::ListSchema(schema.as_ref()),
+            TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => {
+                InplaceShape::ListVariant(element.as_ref())
+            }
             other => {
                 return Err(RuntimeError::IoError(format!(
                     "{backend} in-place return: unsupported list element {other:?} \
-                     (expected List<scalar>, String, or Schema)"
+                     (expected List<scalar>, String, Schema, Option, Result, or Enum)"
                 )));
             }
         },
@@ -250,6 +258,12 @@ pub fn decode_inplace_return(
             // level of recursion per outer entry.
             let rows = reader
                 .read_list_value_at(root_abs, outer_element)
+                .map_err(|e| RuntimeError::IoError(format!("{backend} buffer: {e}")))?;
+            Ok(Value::List(Arc::new(rows)))
+        }
+        InplaceShape::ListVariant(element) => {
+            let rows = reader
+                .read_list_value_at(root_abs, element)
                 .map_err(|e| RuntimeError::IoError(format!("{backend} buffer: {e}")))?;
             Ok(Value::List(Arc::new(rows)))
         }
@@ -416,7 +430,7 @@ fn read_object_record_into_map(
 /// (debt 1): adding a new field type now changes exactly this one arm set.
 ///
 /// It covers the full object-field type space — scalars (`Int` / `Float` /
-/// `Bool` / `Null`), `String`, every `List<…>` shape, and a bare nested
+/// `Bool` / internal unit), `String`, every `List<…>` shape, and a bare nested
 /// `Schema` (sub-record) — by mapping each leaf onto the matching
 /// [`BufferReader`] reader. The `List<List<scalar>>` arm keeps the
 /// dedicated `read_list_list` reader (inline-fixed inner rows); every
@@ -446,9 +460,9 @@ fn read_object_field(
             .read_bool(&field.name)
             .map(Value::Bool)
             .map_err(map_err),
-        TypeRepr::Null => reader
-            .read_null(&field.name)
-            .map(|()| Value::Null)
+        TypeRepr::Unit => reader
+            .read_unit(&field.name)
+            .map(|()| Value::option_none())
             .map_err(map_err),
         TypeRepr::String => reader
             .read_string(&field.name)
@@ -468,6 +482,9 @@ fn read_object_field(
                 .map_err(map_err)?;
             let map = read_object_record_into_map(backend, &sub_reader, schema)?;
             Ok(Value::branded_dict(map, Some(schema.name.clone())))
+        }
+        TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => {
+            reader.read_value(&field.name, &field.ty).map_err(map_err)
         }
         TypeRepr::List { element } => match element.as_ref() {
             TypeRepr::Int => reader
@@ -517,6 +534,10 @@ fn read_object_field(
                 }
                 Ok(Value::List(Arc::new(items)))
             }
+            TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => reader
+                .read_list_value(&field.name, element.as_ref())
+                .map(|rows| Value::List(Arc::new(rows)))
+                .map_err(map_err),
             // `List<List<…>>`: the inner inline-fixed scalar case keeps the
             // dedicated `read_list_list` reader; `List<List<String|Schema>>`
             // routes through the recursive `read_list_value` one level
@@ -606,14 +627,17 @@ fn read_record_field(
             .map(|f| Value::Float(ordered_float::OrderedFloat(f)))
             .map_err(map_err),
         TypeRepr::Bool => reader.read_bool(name).map(Value::Bool).map_err(map_err),
-        TypeRepr::Null => reader
-            .read_null(name)
-            .map(|()| Value::Null)
+        TypeRepr::Unit => reader
+            .read_unit(name)
+            .map(|()| Value::option_none())
             .map_err(map_err),
         TypeRepr::String => reader
             .read_string(name)
             .map(|s| Value::String(s.into()))
             .map_err(map_err),
+        TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => {
+            reader.read_value(name, &field.ty).map_err(map_err)
+        }
         // Every list field — `List<scalar>` / `List<String>` /
         // `List<Schema>` / `List<List<…>>` — decodes through the unified
         // recursive list reader. It dispatches on `element` and recurses

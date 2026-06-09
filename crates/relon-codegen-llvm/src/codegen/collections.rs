@@ -48,12 +48,56 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 root_size,
                 root_align,
             } => self.emit_alloc_sub_record(*record_local_idx, *root_size, *root_align),
+            Op::AllocScratchRecord {
+                record_local_idx,
+                root_size,
+                root_align,
+            } => {
+                self.emit_alloc_scratch_record(ip_hint, *record_local_idx, *root_size, *root_align)
+            }
             Op::PushRecordBase { record_local_idx } => {
                 self.emit_push_record_base(*record_local_idx)
             }
+            Op::PushRecordBaseAbsolute { record_local_idx } => {
+                self.emit_push_record_base_absolute(*record_local_idx)
+            }
+            Op::StoreFieldAtRecordAbsolute {
+                record_local_idx,
+                offset,
+                ty,
+            } => self.emit_store_field_at_record_absolute(ip_hint, *record_local_idx, *offset, *ty),
             Op::EmitTailRecordFromAbsoluteAddr { ty } => {
                 self.emit_tail_record_from_absolute(ip_hint, *ty)
             }
+            Op::BuildVariantRecord {
+                tag,
+                record_size,
+                record_align,
+                payload_offset,
+                payload_ty,
+            } => self.emit_build_variant_record(
+                ip_hint,
+                *tag,
+                *record_size,
+                *record_align,
+                *payload_offset,
+                *payload_ty,
+            ),
+            Op::BuildVariantRecordScratch {
+                tag,
+                record_size,
+                record_align,
+                payload_offset,
+                payload_ty,
+            } => self.emit_build_variant_record_scratch(
+                ip_hint,
+                *tag,
+                *record_size,
+                *record_align,
+                *payload_offset,
+                *payload_ty,
+            ),
+            Op::BuildPointerList { len } => self.emit_build_pointer_list(ip_hint, *len),
             _ => Err(LlvmError::Codegen(format!(
                 "unsupported op (Phase 0b collections seam): {op:?} at ip={ip}"
             ))),
@@ -245,6 +289,58 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         Ok(())
     }
 
+    /// Lower `Op::AllocScratchRecord { .. }`. Bump-allocates inside the
+    /// scratch region and binds the record-local to an arena-relative base.
+    pub(crate) fn emit_alloc_scratch_record(
+        &mut self,
+        ip_hint: &str,
+        idx: u32,
+        root_size: u32,
+        root_align: u32,
+    ) -> Result<(), LlvmError> {
+        let alloc_size = root_size
+            .checked_add(root_align.saturating_sub(1))
+            .ok_or_else(|| LlvmError::Codegen("AllocScratchRecord size overflow".into()))?;
+        let i32_t = self.ctx.i32_type();
+        self.emit_alloc_scratch_common(i32_t.const_int(u64::from(alloc_size), false))?;
+        let raw = self.pop_int(ip_hint)?;
+        let aligned = if root_align <= 1 {
+            raw
+        } else {
+            let add = i32_t.const_int(u64::from(root_align - 1), false);
+            let mask = i32_t.const_int(u64::from(!(root_align - 1)), false);
+            let sum = self
+                .builder
+                .build_int_add(raw, add, "scratch_record_align_sum")
+                .map_err(|e| LlvmError::Codegen(format!("AllocScratchRecord align add: {e}")))?;
+            self.builder
+                .build_and(sum, mask, "scratch_record_align")
+                .map_err(|e| LlvmError::Codegen(format!("AllocScratchRecord align and: {e}")))?
+        };
+        let slot = self.get_or_create_record_local(idx)?;
+        self.builder
+            .build_store(slot, aligned)
+            .map_err(|e| LlvmError::Codegen(format!("AllocScratchRecord store: {e}")))?;
+        Ok(())
+    }
+
+    /// Lower `Op::PushRecordBaseAbsolute { .. }`. The record-local already
+    /// stores an arena-relative base, so the value can be used directly.
+    pub(crate) fn emit_push_record_base_absolute(&mut self, idx: u32) -> Result<(), LlvmError> {
+        let slot = self.record_locals.get(&idx).copied().ok_or_else(|| {
+            LlvmError::Codegen(format!(
+                "PushRecordBaseAbsolute({idx}) before matching AllocScratchRecord"
+            ))
+        })?;
+        let v = self
+            .builder
+            .build_load(self.ctx.i32_type(), slot, "scratch_record_base")
+            .map_err(|e| LlvmError::Codegen(format!("PushRecordBaseAbsolute load: {e}")))?
+            .into_int_value();
+        self.push(v, IrType::I32);
+        Ok(())
+    }
+
     /// Lower `Op::EmitTailRecordFromAbsoluteAddr { ty }`. Pops an
     /// arena-relative source pointer (an `i32` offset where a
     /// `[len:u32 LE][payload]` record lives), copies that record into
@@ -343,6 +439,353 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         Ok(())
     }
 
+    /// Lower `Op::BuildVariantRecord`. Layout has already been computed
+    /// by the IR lowering pass; LLVM only emits the tail allocation and
+    /// typed stores. The pushed value is the arena-absolute i32 offset of
+    /// the new variant record.
+    pub(crate) fn emit_build_variant_record(
+        &mut self,
+        ip_hint: &str,
+        tag: u8,
+        record_size: u32,
+        record_align: u32,
+        payload_offset: Option<u32>,
+        payload_ty: Option<IrType>,
+    ) -> Result<(), LlvmError> {
+        let payload = match payload_ty {
+            Some(_) => Some(self.pop_int(ip_hint)?),
+            None => None,
+        };
+        if payload.is_some() != payload_offset.is_some() {
+            return Err(LlvmError::Codegen(
+                "BuildVariantRecord payload metadata mismatch".into(),
+            ));
+        }
+
+        let i32_t = self.ctx.i32_type();
+        let i8_t = self.ctx.i8_type();
+        let size_v = i32_t.const_int(u64::from(record_size), false);
+        let base_rel = self.emit_tail_alloc(size_v, record_align)?;
+        let out_ptr_i32 = self.lookup_param(2)?;
+        let record_abs = self
+            .builder
+            .build_int_add(out_ptr_i32, base_rel, "variant_record_abs")
+            .map_err(|e| LlvmError::Codegen(format!("BuildVariantRecord abs add: {e}")))?;
+
+        let tag_addr = self.arena_addr_i32(record_abs)?;
+        let tag_v = i8_t.const_int(u64::from(tag), false);
+        self.builder
+            .build_store(tag_addr, tag_v)
+            .map_err(|e| LlvmError::Codegen(format!("BuildVariantRecord tag store: {e}")))?;
+
+        if let (Some(payload), Some(offset), Some(ty)) = (payload, payload_offset, payload_ty) {
+            let slot_off = self
+                .builder
+                .build_int_add(
+                    record_abs,
+                    i32_t.const_int(u64::from(offset), false),
+                    "variant_payload_off",
+                )
+                .map_err(|e| LlvmError::Codegen(format!("BuildVariantRecord slot off: {e}")))?;
+            let slot_addr = self.arena_addr_i32(slot_off)?;
+            match ty {
+                IrType::I64 => {
+                    self.builder.build_store(slot_addr, payload).map_err(|e| {
+                        LlvmError::Codegen(format!("BuildVariantRecord I64 store: {e}"))
+                    })?;
+                }
+                IrType::F64 => {
+                    let f = self
+                        .builder
+                        .build_bit_cast(payload, self.ctx.f64_type(), "variant_f64_bitcast")
+                        .map_err(|e| {
+                            LlvmError::Codegen(format!("BuildVariantRecord F64 bitcast: {e}"))
+                        })?;
+                    self.builder.build_store(slot_addr, f).map_err(|e| {
+                        LlvmError::Codegen(format!("BuildVariantRecord F64 store: {e}"))
+                    })?;
+                }
+                IrType::I32
+                | IrType::String
+                | IrType::ListInt
+                | IrType::ListFloat
+                | IrType::ListBool
+                | IrType::ListString
+                | IrType::ListSchema
+                | IrType::ListList
+                | IrType::Closure
+                | IrType::Dict => {
+                    self.builder.build_store(slot_addr, payload).map_err(|e| {
+                        LlvmError::Codegen(format!("BuildVariantRecord I32 store: {e}"))
+                    })?;
+                }
+                IrType::Bool | IrType::Unit => {
+                    let v8 = self
+                        .builder
+                        .build_int_truncate(payload, i8_t, "variant_bool_trunc")
+                        .map_err(|e| {
+                            LlvmError::Codegen(format!("BuildVariantRecord Bool trunc: {e}"))
+                        })?;
+                    self.builder.build_store(slot_addr, v8).map_err(|e| {
+                        LlvmError::Codegen(format!("BuildVariantRecord Bool store: {e}"))
+                    })?;
+                }
+            }
+        }
+
+        self.push(record_abs, IrType::I32);
+        Ok(())
+    }
+
+    /// Build a variant record in scratch. Used by closure bodies, which have
+    /// `ArenaState` but do not have the entry-only `out_ptr` local that the
+    /// output-tail variant builder uses.
+    pub(crate) fn emit_build_variant_record_scratch(
+        &mut self,
+        ip_hint: &str,
+        tag: u8,
+        record_size: u32,
+        record_align: u32,
+        payload_offset: Option<u32>,
+        payload_ty: Option<IrType>,
+    ) -> Result<(), LlvmError> {
+        let payload = match payload_ty {
+            Some(_) => Some(self.pop_int(ip_hint)?),
+            None => None,
+        };
+        if payload.is_some() != payload_offset.is_some() {
+            return Err(LlvmError::Codegen(
+                "BuildVariantRecordScratch payload metadata mismatch".into(),
+            ));
+        }
+
+        let i32_t = self.ctx.i32_type();
+        let i8_t = self.ctx.i8_type();
+        let alloc_size = record_size
+            .checked_add(record_align.saturating_sub(1))
+            .ok_or_else(|| LlvmError::Codegen("BuildVariantRecordScratch size overflow".into()))?;
+        self.emit_alloc_scratch_common(i32_t.const_int(u64::from(alloc_size), false))?;
+        let raw = self.pop_int(ip_hint)?;
+        let record_abs = if record_align <= 1 {
+            raw
+        } else {
+            let add = i32_t.const_int(u64::from(record_align - 1), false);
+            let mask = i32_t.const_int(u64::from(!(record_align - 1)), false);
+            let sum = self
+                .builder
+                .build_int_add(raw, add, "variant_scratch_align_sum")
+                .map_err(|e| {
+                    LlvmError::Codegen(format!("BuildVariantRecordScratch align add: {e}"))
+                })?;
+            self.builder
+                .build_and(sum, mask, "variant_scratch_align")
+                .map_err(|e| {
+                    LlvmError::Codegen(format!("BuildVariantRecordScratch align and: {e}"))
+                })?
+        };
+
+        let tag_addr = self.arena_addr_i32(record_abs)?;
+        let tag_v = i8_t.const_int(u64::from(tag), false);
+        self.builder
+            .build_store(tag_addr, tag_v)
+            .map_err(|e| LlvmError::Codegen(format!("BuildVariantRecordScratch tag store: {e}")))?;
+
+        if let (Some(payload), Some(offset), Some(ty)) = (payload, payload_offset, payload_ty) {
+            let slot_off = self
+                .builder
+                .build_int_add(
+                    record_abs,
+                    i32_t.const_int(u64::from(offset), false),
+                    "variant_scratch_payload_off",
+                )
+                .map_err(|e| {
+                    LlvmError::Codegen(format!("BuildVariantRecordScratch slot off: {e}"))
+                })?;
+            let slot_addr = self.arena_addr_i32(slot_off)?;
+            match ty {
+                IrType::I64 => {
+                    self.builder.build_store(slot_addr, payload).map_err(|e| {
+                        LlvmError::Codegen(format!("BuildVariantRecordScratch I64 store: {e}"))
+                    })?;
+                }
+                IrType::F64 => {
+                    let f = self
+                        .builder
+                        .build_bit_cast(payload, self.ctx.f64_type(), "variant_scratch_f64_bitcast")
+                        .map_err(|e| {
+                            LlvmError::Codegen(format!(
+                                "BuildVariantRecordScratch F64 bitcast: {e}"
+                            ))
+                        })?;
+                    self.builder.build_store(slot_addr, f).map_err(|e| {
+                        LlvmError::Codegen(format!("BuildVariantRecordScratch F64 store: {e}"))
+                    })?;
+                }
+                IrType::I32
+                | IrType::String
+                | IrType::ListInt
+                | IrType::ListFloat
+                | IrType::ListBool
+                | IrType::ListString
+                | IrType::ListSchema
+                | IrType::ListList
+                | IrType::Closure
+                | IrType::Dict => {
+                    self.builder.build_store(slot_addr, payload).map_err(|e| {
+                        LlvmError::Codegen(format!("BuildVariantRecordScratch I32 store: {e}"))
+                    })?;
+                }
+                IrType::Bool | IrType::Unit => {
+                    let v8 = self
+                        .builder
+                        .build_int_truncate(payload, i8_t, "variant_scratch_bool_trunc")
+                        .map_err(|e| {
+                            LlvmError::Codegen(format!("BuildVariantRecordScratch Bool trunc: {e}"))
+                        })?;
+                    self.builder.build_store(slot_addr, v8).map_err(|e| {
+                        LlvmError::Codegen(format!("BuildVariantRecordScratch Bool store: {e}"))
+                    })?;
+                }
+            }
+        }
+
+        self.push(record_abs, IrType::I32);
+        Ok(())
+    }
+
+    /// Build a pointer-array list header from `len` pointer values already
+    /// on the operand stack. The header is allocated in the output tail and
+    /// stores arena-absolute offsets, which is the same representation used
+    /// by host-marshalled `List<String>` / `List<Schema>` / `List<Enum>`.
+    pub(crate) fn emit_build_pointer_list(
+        &mut self,
+        ip_hint: &str,
+        len: u32,
+    ) -> Result<(), LlvmError> {
+        let mut elems = Vec::with_capacity(len as usize);
+        for _ in 0..len {
+            elems.push(self.pop_int(ip_hint)?);
+        }
+        elems.reverse();
+
+        let size = 4u32
+            .checked_add(
+                len.checked_mul(4)
+                    .ok_or_else(|| LlvmError::Codegen("BuildPointerList length overflow".into()))?,
+            )
+            .ok_or_else(|| LlvmError::Codegen("BuildPointerList size overflow".into()))?;
+        let i32_t = self.ctx.i32_type();
+        let size_v = i32_t.const_int(u64::from(size), false);
+        let base_rel = self.emit_tail_alloc(size_v, 4)?;
+        let out_ptr_i32 = self.lookup_param(2)?;
+        let header_abs = self
+            .builder
+            .build_int_add(out_ptr_i32, base_rel, "ptr_list_abs")
+            .map_err(|e| LlvmError::Codegen(format!("BuildPointerList abs add: {e}")))?;
+
+        let header_addr = self.arena_addr_i32(header_abs)?;
+        self.builder
+            .build_store(header_addr, i32_t.const_int(u64::from(len), false))
+            .map_err(|e| LlvmError::Codegen(format!("BuildPointerList len store: {e}")))?;
+
+        for (idx, elem) in elems.into_iter().enumerate() {
+            let off = 4u32 + (idx as u32) * 4;
+            let slot_off = self
+                .builder
+                .build_int_add(
+                    header_abs,
+                    i32_t.const_int(u64::from(off), false),
+                    "ptr_list_slot",
+                )
+                .map_err(|e| LlvmError::Codegen(format!("BuildPointerList slot off: {e}")))?;
+            let slot_addr = self.arena_addr_i32(slot_off)?;
+            self.builder
+                .build_store(slot_addr, elem)
+                .map_err(|e| LlvmError::Codegen(format!("BuildPointerList elem store: {e}")))?;
+        }
+
+        self.push(header_abs, IrType::ListList);
+        Ok(())
+    }
+
+    /// Lower `Op::StoreFieldAtRecordAbsolute { .. }`. Pops the top of the
+    /// operand stack and writes it into `record_local + offset`, where the
+    /// record-local is already an arena-relative scratch base.
+    pub(crate) fn emit_store_field_at_record_absolute(
+        &mut self,
+        ip_hint: &str,
+        idx: u32,
+        offset: u32,
+        ty: IrType,
+    ) -> Result<(), LlvmError> {
+        let value = self.pop_int(ip_hint)?;
+        let slot = self.record_locals.get(&idx).copied().ok_or_else(|| {
+            LlvmError::Codegen(format!(
+                "StoreFieldAtRecordAbsolute({idx}) before matching AllocScratchRecord"
+            ))
+        })?;
+        let i32_t = self.ctx.i32_type();
+        let i8_t = self.ctx.i8_type();
+        let record_base = self
+            .builder
+            .build_load(i32_t, slot, "scratch_record_base")
+            .map_err(|e| LlvmError::Codegen(format!("scratch record base load: {e}")))?
+            .into_int_value();
+        let slot_off = self
+            .builder
+            .build_int_add(
+                record_base,
+                i32_t.const_int(u64::from(offset), false),
+                "scratch_record_slot_off",
+            )
+            .map_err(|e| LlvmError::Codegen(format!("scratch record slot off: {e}")))?;
+        let addr = self.arena_addr_i32(slot_off)?;
+        match ty {
+            IrType::I64 => {
+                self.builder.build_store(addr, value).map_err(|e| {
+                    LlvmError::Codegen(format!("StoreFieldAtRecordAbsolute I64: {e}"))
+                })?;
+            }
+            IrType::F64 => {
+                let f = self
+                    .builder
+                    .build_bit_cast(value, self.ctx.f64_type(), "scratch_record_f64_bitcast")
+                    .map_err(|e| {
+                        LlvmError::Codegen(format!("StoreFieldAtRecordAbsolute F64 bitcast: {e}"))
+                    })?;
+                self.builder.build_store(addr, f).map_err(|e| {
+                    LlvmError::Codegen(format!("StoreFieldAtRecordAbsolute F64: {e}"))
+                })?;
+            }
+            IrType::I32
+            | IrType::String
+            | IrType::ListInt
+            | IrType::ListFloat
+            | IrType::ListBool
+            | IrType::ListString
+            | IrType::ListSchema
+            | IrType::ListList
+            | IrType::Closure
+            | IrType::Dict => {
+                self.builder.build_store(addr, value).map_err(|e| {
+                    LlvmError::Codegen(format!("StoreFieldAtRecordAbsolute I32: {e}"))
+                })?;
+            }
+            IrType::Bool | IrType::Unit => {
+                let v8 = self
+                    .builder
+                    .build_int_truncate(value, i8_t, "scratch_record_bool_trunc")
+                    .map_err(|e| {
+                        LlvmError::Codegen(format!("StoreFieldAtRecordAbsolute Bool trunc: {e}"))
+                    })?;
+                self.builder.build_store(addr, v8).map_err(|e| {
+                    LlvmError::Codegen(format!("StoreFieldAtRecordAbsolute Bool: {e}"))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Lower `Op::StoreFieldAtRecord { record_local_idx, offset, ty }`.
     /// Pops the top of the operand stack and writes it into
     /// `out_ptr + record_local + offset`. Mirrors cranelift's
@@ -432,7 +875,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 .build_in_bounds_gep(i8_t, arena_base_ptr, &[total_off64], "record_dst")
                 .map_err(|e| LlvmError::Codegen(format!("record_dst GEP: {e}")))?
         };
-        // Emit the typed store. For `Bool` / `Null`, narrow the i32
+        // Emit the typed store. For `Bool` / `Unit`, narrow the i32
         // stack slot to i8 before writing — matches the on-wire
         // record layout. For pointer-indirect types (`String`,
         // `List*`) the slot stores the i32 buffer-relative offset
@@ -469,7 +912,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                     .build_store(addr, value)
                     .map_err(|e| LlvmError::Codegen(format!("StoreFieldAtRecord I32: {e}")))?;
             }
-            IrType::Bool | IrType::Null => {
+            IrType::Bool | IrType::Unit => {
                 let v8 = self
                     .builder
                     .build_int_truncate(value, i8_t, "record_bool_trunc")

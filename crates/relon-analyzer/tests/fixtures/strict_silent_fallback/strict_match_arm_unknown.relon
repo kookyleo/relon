@@ -2,6 +2,6 @@
 // (an unknown function `mystery_call`) — strict mode reports
 // InferenceLimit pinned on the arm body.
 // EXPECTED: ≥ 1 × InferenceLimit.
-#schema Status Enum<"on", "off">
+#enum Status { on, off }
 #main(Status s) -> Dict<String, Int>
 { result: s match { on: mystery_call(), off: 0 } }

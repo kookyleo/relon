@@ -36,12 +36,10 @@ assert on it.
   concrete types).
 - `v1_7/` — tuple types + ban bare generics: `tuple/` (homogeneous
   fold, heterogeneous typed, arity / per-position checks, nesting),
-  `ban_bare/` (`List` / `Dict` / `Closure` / `Fn` / `Enum` without
+  `ban_bare/` (`List` / `Dict` / `Closure` / `Fn` without
   generic arguments).
 - `v1_8/` — Enum / Result first-class typing + cross-module +
-  tuple-index: `enum/` (Enum<...> slot checks each alternative;
-  heterogeneous, string-literal, and primitive alts), `result/`
-  (Result<T, E> / user sum types substitute generic args into
+  tuple-index: `result/` (Result<T, E> substitutes generic args into
   variant fields), `cross_module/` (`pkg.SchemaName` slot
   resolution through the workspace import index, with `lib.relon`
   as the imported module), `tuple_index/` (positional access on

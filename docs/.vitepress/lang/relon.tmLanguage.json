@@ -2,19 +2,43 @@
   "$comment": "Relon TextMate grammar. Kept in lock-step with the CodeMirror tokenizer at docs/.vitepress/theme/components/playground/relon-mode.ts. Token group -> scope name mapping (mirror the comment in relon-mode.ts): reference (&root, &sibling, ...) -> variable.language.relon; control (where, match, for, in, if, as, with) -> keyword.control.relon; type (Int, String, List, ...) -> support.type.relon; operator (==, !=, &&, =>, ->, ...) -> keyword.operator.relon.",
   "name": "relon",
   "scopeName": "source.relon",
-  "fileTypes": ["relon"],
+  "fileTypes": [
+    "relon"
+  ],
   "patterns": [
-    { "include": "#comments" },
-    { "include": "#strings" },
-    { "include": "#hash-keywords" },
-    { "include": "#at-forms" },
-    { "include": "#references" },
-    { "include": "#numbers" },
-    { "include": "#atoms" },
-    { "include": "#control-keywords" },
-    { "include": "#builtin-types" },
-    { "include": "#operators" },
-    { "include": "#identifiers" }
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#hash-keywords"
+    },
+    {
+      "include": "#at-forms"
+    },
+    {
+      "include": "#references"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#atoms"
+    },
+    {
+      "include": "#control-keywords"
+    },
+    {
+      "include": "#builtin-types"
+    },
+    {
+      "include": "#operators"
+    },
+    {
+      "include": "#identifiers"
+    }
   ],
   "repository": {
     "comments": {
@@ -24,7 +48,9 @@
           "begin": "//",
           "end": "$",
           "beginCaptures": {
-            "0": { "name": "punctuation.definition.comment.relon" }
+            "0": {
+              "name": "punctuation.definition.comment.relon"
+            }
           }
         },
         {
@@ -32,10 +58,14 @@
           "begin": "/\\*",
           "end": "\\*/",
           "beginCaptures": {
-            "0": { "name": "punctuation.definition.comment.begin.relon" }
+            "0": {
+              "name": "punctuation.definition.comment.begin.relon"
+            }
           },
           "endCaptures": {
-            "0": { "name": "punctuation.definition.comment.end.relon" }
+            "0": {
+              "name": "punctuation.definition.comment.end.relon"
+            }
           }
         }
       ]
@@ -47,10 +77,14 @@
           "begin": "f\"",
           "end": "\"",
           "beginCaptures": {
-            "0": { "name": "punctuation.definition.string.begin.relon" }
+            "0": {
+              "name": "punctuation.definition.string.begin.relon"
+            }
           },
           "endCaptures": {
-            "0": { "name": "punctuation.definition.string.end.relon" }
+            "0": {
+              "name": "punctuation.definition.string.end.relon"
+            }
           },
           "patterns": [
             {
@@ -64,10 +98,14 @@
           "begin": "\"",
           "end": "\"",
           "beginCaptures": {
-            "0": { "name": "punctuation.definition.string.begin.relon" }
+            "0": {
+              "name": "punctuation.definition.string.begin.relon"
+            }
           },
           "endCaptures": {
-            "0": { "name": "punctuation.definition.string.end.relon" }
+            "0": {
+              "name": "punctuation.definition.string.end.relon"
+            }
           },
           "patterns": [
             {
@@ -123,10 +161,6 @@
         {
           "name": "constant.language.boolean.relon",
           "match": "\\b(?:true|false)\\b"
-        },
-        {
-          "name": "constant.language.null.relon",
-          "match": "\\bnull\\b"
         }
       ]
     },
@@ -142,7 +176,7 @@
       "patterns": [
         {
           "name": "support.type.relon",
-          "match": "\\b(?:Int|Float|Number|String|Bool|Null|Any|List|Dict|Tuple|Enum|Closure|Fn|Iter|Option|Result|Bytes|Date|Time|DateTime)\\b"
+          "match": "\\b(?:Int|Float|Number|String|Bool|Any|List|Dict|Tuple|Enum|Closure|Fn|Iter|Option|Result|Bytes|Date|Time|DateTime)\\b"
         }
       ]
     },

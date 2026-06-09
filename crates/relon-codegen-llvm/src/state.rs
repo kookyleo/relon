@@ -172,7 +172,7 @@ pub enum NativeTrap {
     /// class is identical across backends.
     HostFnMissing = 5,
     /// The host fn returned an error, or a value outside the phase-0b
-    /// scalar return envelope (`Int` / `Bool` / `Null`). Surfaces as
+    /// scalar return envelope (`Int` / `Bool` / `Unit`). Surfaces as
     /// `RuntimeError::Unsupported`. A distinct code from `HostFnMissing`
     /// only for post-mortem readability — both lift to `Unsupported`.
     HostFnError = 7,
@@ -372,7 +372,7 @@ pub const RELON_LLVM_CALL_NATIVE_SYMBOL: &str = "relon_llvm_call_native";
 /// the cranelift backend's `SandboxState::call_native`.
 ///
 /// Scope (phase-0b parity with the bytecode VM + cranelift dynamic
-/// path): scalar `Int` args in, `Int` / `Bool` / `Null` result out.
+/// path): scalar `Int` args in, `Int` / `Bool` / `Unit` result out.
 ///
 /// # Safety
 ///
@@ -419,7 +419,7 @@ pub unsafe extern "C" fn relon_llvm_call_native(
     match func.call(native_args, TokenRange::default()) {
         Ok(Value::Int(v)) => v,
         Ok(Value::Bool(b)) => i64::from(b),
-        Ok(Value::Null) => 0,
+        Ok(v) if v.is_option_none() => 0,
         Ok(_) | Err(_) => {
             record_trap(NativeTrap::HostFnError);
             0

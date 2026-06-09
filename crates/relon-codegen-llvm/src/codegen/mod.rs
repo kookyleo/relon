@@ -15,7 +15,7 @@
 //! - Op set widened to the W1 / W2 production-source surface:
 //!   `LocalGet`, `ConstI64` / `ConstI32` / `ConstBool`, `LetGet` /
 //!   `LetSet`, `LoadField` / `StoreField` (scalar slots: I32 / I64 /
-//!   F64 / Bool / Null), `Add` / `Sub` / `Mul` / `Div` / `Mod` /
+//!   F64 / Bool / Unit), `Add` / `Sub` / `Mul` / `Div` / `Mod` /
 //!   `BitAnd` (`I32` and `I64`), comparison ops (`Eq` / `Ne` /
 //!   `Lt` / `Le` / `Gt` / `Ge` — `I32` / `I64` / `Bool` for `Eq`/`Ne`),
 //!   structured control flow (`Block` / `Loop` / `Br` / `BrIf` /
@@ -1267,7 +1267,7 @@ fn declare_call_native<'ctx>(ctx: &'ctx Context, module: &LlvmModule<'ctx>) -> F
 /// Stage 1.B closed-world: declare a host `#native` fn as an external
 /// `(i64...) -> i64` so `Op::CallNative` can emit a direct
 /// `call @<host_symbol>`. Every scalar arg / return rides the i64 lane
-/// (Bool / I32 zero-extend in; Null returns `void`), matching the host
+/// (Bool / I32 zero-extend in; Unit returns `void`), matching the host
 /// shim's `#[no_mangle] extern "C" fn(i64...) -> i64` ABI the
 /// co-compile step links in. Idempotent: a repeated import name reuses
 /// the existing declaration.
@@ -1286,7 +1286,7 @@ fn declare_host_fn_direct<'ctx>(
     let params: Vec<BasicMetadataTypeEnum<'ctx>> =
         import.param_tys.iter().map(|_| i64_t.into()).collect();
     let fn_ty = match import.ret_ty {
-        IrType::Null => ctx.void_type().fn_type(&params, false),
+        IrType::Unit => ctx.void_type().fn_type(&params, false),
         _ => i64_t.fn_type(&params, false),
     };
     module.add_function(&import.name, fn_ty, Some(Linkage::External))
@@ -1306,7 +1306,7 @@ fn declare_host_fn_direct<'ctx>(
 fn ir_ty_to_llvm_abi<'ctx>(ctx: &'ctx Context, ty: IrType) -> Option<BasicTypeEnum<'ctx>> {
     match ty {
         IrType::I64 | IrType::F64 => Some(ctx.i64_type().into()),
-        IrType::I32 | IrType::Bool | IrType::Null => Some(ctx.i32_type().into()),
+        IrType::I32 | IrType::Bool | IrType::Unit => Some(ctx.i32_type().into()),
         IrType::String
         | IrType::ListInt
         | IrType::ListFloat
@@ -2550,7 +2550,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             // the IR / cranelift / LLVM boundary alike).
             IrType::I32
             | IrType::Bool
-            | IrType::Null
+            | IrType::Unit
             | IrType::String
             | IrType::ListInt
             | IrType::ListFloat
@@ -2790,7 +2790,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                     IrType::I64 | IrType::F64 => self.ctx.i64_type().into(),
                     IrType::I32
                     | IrType::Bool
-                    | IrType::Null
+                    | IrType::Unit
                     | IrType::String
                     | IrType::ListInt
                     | IrType::ListFloat
@@ -3167,8 +3167,14 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             | Op::DictGetByStringKey { .. }
             | Op::ListGetByIntIdx { .. }
             | Op::AllocSubRecord { .. }
+            | Op::AllocScratchRecord { .. }
             | Op::PushRecordBase { .. }
-            | Op::EmitTailRecordFromAbsoluteAddr { .. } => {
+            | Op::PushRecordBaseAbsolute { .. }
+            | Op::StoreFieldAtRecordAbsolute { .. }
+            | Op::EmitTailRecordFromAbsoluteAddr { .. }
+            | Op::BuildVariantRecord { .. }
+            | Op::BuildVariantRecordScratch { .. }
+            | Op::BuildPointerList { .. } => {
                 self.lower_collections_rest(ip, &ip_hint, &tagged.op)?
             }
 
@@ -3231,7 +3237,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             IrType::I64 | IrType::F64 => 64,
             IrType::I32
             | IrType::Bool
-            | IrType::Null
+            | IrType::Unit
             | IrType::String
             | IrType::ListInt
             | IrType::ListFloat
@@ -3288,7 +3294,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             IrType::I64 | IrType::F64 => Ok(self.ctx.i64_type()),
             IrType::I32
             | IrType::Bool
-            | IrType::Null
+            | IrType::Unit
             | IrType::String
             | IrType::ListInt
             | IrType::ListFloat

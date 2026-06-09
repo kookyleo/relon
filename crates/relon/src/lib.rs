@@ -911,10 +911,7 @@ mod tests {
     #[test]
     fn json_externally_tags_sum_type_variant() {
         let value = json_from_str(
-            r#"#schema Notification Enum<
-    Email { address: String, subject: String },
-    Push,
->
+            r#"#enum Notification { Email { address: String, subject: String }, Push }
 { msg: Notification.Email { address: "a@b.c", subject: "hi" } }"#,
         )
         .unwrap();

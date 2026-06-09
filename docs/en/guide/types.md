@@ -18,7 +18,7 @@ during evaluation; a check failure raises a specific runtime error.
     Int port: 8080,
 
     // Optional type annotation (? suffix)
-    String? optional_desc: null,
+    String? optional_desc: None,
 
     // Generic annotations
     List<Int> scores: [100, 95, 80],
@@ -27,108 +27,144 @@ during evaluation; a check failure raises a specific runtime error.
 ```
 
 Built-in type names include: `Int`, `Float`, `Number` (covers both
-Int and Float), `String`, `Bool`, `Null`, `List<T>`,
-`Tuple<T1, T2, ...>`, `Dict<K, V>`, and `Closure<...>`. (Note:
+Int and Float), `String`, `Bool`, `Option<T>`, `Result<T, E>`,
+`List<T>`, `Tuple<T1, T2, ...>`, `Dict<K, V>`, and `Closure<...>`.
+Relon has no `null` value; absence is written as `None` and is projected as JSON `null` at the output boundary. (Note:
 `Any` was retired from the user-facing surface in v1.6; bare `List` /
 `Dict` / `Closure` without generic arguments are rejected by v1.7's
-`BareGenericContainer` diagnostic — see spec §6.6.)
+`BareGenericContainer` diagnostic — see spec §6.6.) Enum definitions use the `#enum` form below.
 
-## Union types / untagged enums
+## Enum: Rust-like tagged variants
 
-`Enum<...>` has two shapes in Relon: this section covers the
-**untagged union** form; the next section covers the **tagged sum
-type**.
-
-Untagged unions constrain a value to "must be one of these
-alternatives". The alternatives can be literals or type names:
+Relon's public enum syntax is Rust-like `#enum`. It says that a value is one of several mutually exclusive variants. A variant may be unit-like, carry named fields, or carry a tuple payload.
 
 ```relon
-{
-    String theme: Enum<"light", "dark", "system">,
+#enum Notification {
+    Email { address: String, subject: String },
+    SMS { phone: String },
+    Push
+}
 
-    // Type union
-    id: Enum<Int, String>
+#enum Packet {
+    Pair(Int, String),
+    Empty
 }
 ```
 
-> This form introduces neither a brand nor a runtime tag — it is pure
-> constraint. If your domain has a clear "which variant is this?"
-> semantic (e.g. "is this notification an Email or an SMS"), use the
-> sum type covered in the next section.
+Relon does not support string-literal enum variants such as `"up" | "down"`, nor `#enum Stat { "up", "down" }`. For convenient string input from hosts, use the typed JSON string rule below.
 
-## Sum types: tagged enum variants
-
-When you want to express "this value is one of several mutually
-exclusive variants, each carrying different fields" — order states,
-notification channels, UI nodes — sum types are the right tool.
-
-### Declaring in a schema
-
-```relon
-#schema Notification Enum<
-    Email { String address: *, String subject: * },
-    SMS   { String phone: * },
-    Push
->
-```
-
-Notes:
-
-- `Email { ... }` is a variant with fields. The brace syntax is the
-  same as regular `#schema` fields (type annotation + predicate).
-- `Push` is a **unit variant** (no fields). The declaration omits
-  the braces.
-- Fields are independent across variants — they don't auto-merge.
-
-### Constructing a variant
+### Constructing variants
 
 ```relon
 {
     a: Notification.Email { address: "x@y.z", subject: "hi" },
-    b: Notification.SMS   { phone: "+1-555-0100" },
+    b: Notification.SMS { phone: "+1-555-0100" },
+    c: Notification.Push,
 
-    // Unit variants still write `{}` at the call site — empty braces
-    c: Notification.Push  {}
+    pair: Packet.Pair(7, "x"),
+    empty: Packet.Empty
 }
 ```
 
-> Writing `{}` keeps the "this is a value" syntax consistent: a
-> variant is always `EnumName.Variant { ... }`.
+Rules match Rust's shapes:
 
-### In-memory shape vs JSON output
+- Unit variants are written as `EnumName.Variant`; no empty `{}` is needed.
+- Struct variants are written as `EnumName.Variant { field: value }`.
+- Tuple variants are written as `EnumName.Variant(value1, value2)`.
 
-Internally Relon stores a variant as a plain dict with two implicit
-tags: `brand` (the variant name, e.g. `"Email"`) and `variant_of`
-(the parent enum's name, e.g. `"Notification"`). Field access is
-**flat**:
+Match arms can destructure payloads:
+
+```relon
+#main(Packet p) -> Int
+p match {
+    Pair(n, *): n + 1,
+    Empty: 0
+}
+```
+
+### In-memory shape and JSON output
+
+Internally, an enum value is a tagged `Value::Dict`: `brand` is the variant name and `variant_of` is the enum name. Field access is flat:
 
 ```relon
 {
     msg: Notification.Email { address: "x@y.z", subject: "hi" },
-    addr: msg.address      // -> "x@y.z", no .Email. layer
+    addr: msg.address      // -> "x@y.z", no .Email layer
 }
 ```
 
-But JSON output uses the **externally tagged** form, with the variant
-name as the outer key:
+The default JSON output is externally tagged:
 
 ```json
 {
-  "msg": { "Email": { "address": "x@y.z", "subject": "hi" } }
+  "msg": { "Email": { "address": "x@y.z", "subject": "hi" } },
+  "pair": { "Pair": [7, "x"] },
+  "empty": { "Empty": {} }
 }
 ```
 
-This is the only case in Relon where "branding changes the output
-shape" — a regular `#schema User` branded dict still serializes flat;
-the brand only takes effect at runtime.
+Both List and tuple project to JSON arrays; tuple-variant payloads also project to JSON arrays.
 
-> Want a different sum-type encoding (internally tagged, object
-> aggregation, …)? Implement a custom `Projector` on the host side —
-> see [Host integration](./host-integration).
+Lists of variants can be returned directly, built from literals, or produced from `map`, `filter`, or comprehension when the surrounding type is known:
 
-### Dispatch with `match` + compile-time exhaustiveness
+```relon
+#enum Stat { Up, Down }
+#main(List<Int> xs) -> List<Stat>
+xs.map((Int x) => x > 0 ? Stat.Up : Stat.Down)
+```
 
-The common variant pattern is `match`:
+The same rule applies to `List<Option<T>>` and `List<Result<T, E>>`.
+
+### Input: typed JSON for variants
+
+CLI and WASM playground `#main(args)` JSON input reads the entry signature. When the target type is an enum, a JSON string may decode into a unit variant of the same name:
+
+```relon
+#enum Stat { Up, Down }
+#main(Stat s) -> Stat
+s
+```
+
+Input:
+
+```json
+{ "s": "Up" }
+```
+
+Output:
+
+```json
+{ "Up": {} }
+```
+
+Bare strings apply only to unit variants. Payload variants use the same externally tagged shape as JSON output:
+
+```relon
+#enum Msg { Email { address: String }, Pair(Int, String), Push }
+#main(Msg m) -> Msg
+m
+```
+
+```json
+{ "m": { "Email": { "address": "x@y.z" } } }
+```
+
+Tuple variants use arrays:
+
+```json
+{ "m": { "Pair": [7, "x"] } }
+```
+
+Built-in `Option` and `Result` use the same target-typed boundary. For
+`#main(Option<Int> x)`, input may use `null`, the direct payload `41`, or the
+externally tagged form `{ "x": { "Some": { "value": 41 } } }`. The shorthand
+`Int?` follows the same rule. For `#main(Result<Int, String> r)`, use
+`{ "r": { "Ok": { "value": 41 } } }` or
+`{ "r": { "Err": { "error": "bad" } } }`.
+
+Rust hosts that call `run_main` directly should pass `Value::variant_dict(...)`, or decode their business JSON into a Relon `Value` before calling the evaluator.
+
+### Dispatch with `match`
 
 ```relon
 {
@@ -141,33 +177,26 @@ The common variant pattern is `match`:
 }
 ```
 
-When the analyzer can **statically infer** the enum type of the
-matched value (e.g. `msg` is a `Notification`-typed field, or it's
-itself a `VariantCtor`), the following cases escalate to
-**compile-time errors**:
+When the analyzer can statically infer the enum type of the matched value, it checks:
 
 | Diagnostic | Trigger |
 | --- | --- |
 | `NonExhaustiveMatch` | Missing variants and no `*` wildcard |
-| `UnknownVariant` | Variant name doesn't exist (with did-you-mean) |
+| `UnknownVariant` | Variant name does not exist |
 | `DuplicateMatchArm` | Same variant name appears twice |
-| `HeterogeneousEnum` | `Enum<...>` mixes literal/type alternatives with named variants |
 
-When the analyzer can't infer (e.g. the matched value comes from
-dynamic computation), these checks fall back to runtime. To opt out
-of exhaustiveness, add a `*: ...` wildcard arm.
+When the analyzer cannot infer the type, runtime keeps the verdict. To opt out of exhaustiveness, add a `*: ...` wildcard arm.
 
-### A complete state-machine example
+### Complete example
 
 ```relon
-{
-    #schema Order Enum<
-        Pending  { String customer: * },
-        Shipped  { String tracking: * },
-        Delivered { String signed_by: * }
-    >,
+#enum Order {
+    Pending { customer: String },
+    Shipped { tracking: String },
+    Delivered { signed_by: String }
+}
 
-    // Render a variant as a human-readable string for the UI
+{
     summarize(Order o): o match {
         Pending:   f"awaiting shipment: ${o.customer}",
         Shipped:   f"in transit: ${o.tracking}",
@@ -175,6 +204,7 @@ of exhaustiveness, add a `*: ...` wildcard arm.
     }
 }
 ```
+
 
 ## Schema definitions and identity guards
 
@@ -298,10 +328,9 @@ can write as a field-level type prefix:
 - **String literal**: `#brand "Weather"`, parsed as the same type
   name as the bareword form.
 - **Generic forms**: `#brand Dict<String, Int>`,
-  `#brand List<Weather>`, `#brand Foo<T>`,
-  `#brand Enum<"a", "b">`.
+  `#brand List<Weather>`, `#brand Foo<T>`.
 - **Optional modifier**: `#brand Weather?` — same behavior as the
-  field-level `Weather? w: ...` form. `null` passes; other values
+  field-level `Weather? w: ...` form. `None` passes; other values
   follow the original type check.
 
 > About generic brand strings: the string written into `dict.brand`
@@ -323,9 +352,10 @@ can write as a field-level type prefix:
   to `dict.brand`. For built-in type names (`Int`/`String`/…) in the
   **single-segment, no-generic, no-`?`** form, the check runs but no
   brand is written — identical to field-level hints.
-- Built-in container generics (`Dict<K, V>`, `List<T>`, `Enum<...>`):
+- Built-in container generics (`Dict<K, V>`, `List<T>`):
   `check_type`'s existing rules recurse; on success the brand string
-  uses the full generic expression (e.g. `"Dict<String, Int>"`).
+  uses the full generic expression (e.g. `"Dict<String, Int>"`). Tagged
+  sums should use Rust-like `#enum`.
 - Custom type + generic parameters (e.g. `Foo<T>`): the runtime
   currently runs `check_custom_schema` keyed on `Foo` alone; generic
   parameters are preserved in the brand string but **don't
@@ -461,7 +491,7 @@ declaration, distinguished by **modifier combinations**:
         // 1. Required (default): missing → error
         String name: *,
 
-        // 2. Optional (? suffix): missing → null
+        // 2. Optional (? suffix): the field may be absent; use None for no value
         String? bio: *,
 
         // 3. Literal default (#default value): missing → this constant
@@ -477,7 +507,7 @@ declaration, distinguished by **modifier combinations**:
 
     // Usage
     User u: { name: "Ada" }
-    // u.bio          == null
+    // u.bio may be absent; optional lookup returns None
     // u.role         == "user"
     // u.display_name == "Ada <unset>"
 }

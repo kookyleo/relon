@@ -507,6 +507,7 @@ pub(super) fn try_lower_materialized_list_reduce(
         idx: acc_param_let,
         ty: acc_ty,
         schema_brand: None,
+        type_repr: None,
     });
     // Bind elem. When `elem` is a list handle, `LetSet{ListInt}`
     // truncates the i64 element to the i32 row handle.
@@ -529,6 +530,7 @@ pub(super) fn try_lower_materialized_list_reduce(
         idx: elem_param_let,
         ty: elem_ty,
         schema_brand: None,
+        type_repr: None,
     });
 
     // Lower the reduce body — leaves the new acc on top.
@@ -967,6 +969,7 @@ fn emit_nested_range_map_reduce(
         idx: outer_param_let,
         ty: IrType::I64,
         schema_brand: None,
+        type_repr: None,
     });
 
     // ---- inner row fold: allocate counters + accumulator ----------
@@ -1030,6 +1033,7 @@ fn emit_nested_range_map_reduce(
         idx: inner_param_let,
         ty: IrType::I64,
         schema_brand: None,
+        type_repr: None,
     });
 
     // cell = <cell_body(i, j)> — must be I64.
@@ -1082,12 +1086,14 @@ fn emit_nested_range_map_reduce(
                 idx: acc_param_let,
                 ty: IrType::I64,
                 schema_brand: None,
+                type_repr: None,
             });
             ctx.lets.push(LetBinding {
                 name: cell_param.name.clone(),
                 idx: cell_let,
                 ty: IrType::I64,
                 schema_brand: None,
+                type_repr: None,
             });
             lower_expr(&body.expr, body.range, ctx)?;
             expect_int_top(ctx, body.range)?;
@@ -2102,6 +2108,286 @@ pub(super) fn emit_list_hof_method(
             finish_list_hof(builtin, range, ctx)
         }
     }
+}
+
+fn variant_list_map_builtin(src_elem: IrType) -> Option<&'static str> {
+    match src_elem {
+        IrType::I64 => Some("list_int_map_to_variant_list"),
+        IrType::F64 => Some("list_float_map_to_variant_list"),
+        IrType::String => Some("list_string_map_to_variant_list"),
+        _ => None,
+    }
+}
+
+fn list_source_elem_from_ir(list_ty: IrType) -> Option<IrType> {
+    match list_ty {
+        IrType::ListInt => Some(IrType::I64),
+        IrType::ListFloat => Some(IrType::F64),
+        IrType::ListString => Some(IrType::String),
+        _ => None,
+    }
+}
+
+/// Target-typed `_list_map(xs, f)` for `List<Option<_>>`,
+/// `List<Result<_, _>>`, and `List<CustomEnum>`. The target element type
+/// is required so constructor expressions inside the closure body can be
+/// resolved, then the stdlib body writes a pointer-array list of variant
+/// record offsets.
+pub(super) fn emit_variant_list_map_call_as_type(
+    element: &TypeRepr,
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    if !variant_record_list_element(element)
+        || path.len() != 1
+        || args.len() != 2
+        || args.iter().any(|a| a.name.is_some())
+        || !matches!(&path[0], TokenKey::String(s, _, _) if s == "_list_map")
+    {
+        return Ok(None);
+    }
+    let Expr::Closure { params, .. } = &*args[1].value.expr else {
+        return Ok(None);
+    };
+    if params.len() != 1 {
+        return Ok(None);
+    }
+
+    let saved_out = std::mem::take(&mut ctx.out);
+    let saved_stack = std::mem::take(&mut ctx.tstack);
+    let saved_next_let = ctx.next_let_idx;
+    let saved_lambda_len = ctx.lambda_table.borrow().len();
+    let restore = |ctx: &mut LowerCtx<'_>, out: Vec<TaggedOp>, stack: Vec<IrType>| {
+        ctx.out = out;
+        ctx.tstack = stack;
+        ctx.next_let_idx = saved_next_let;
+        ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+    };
+
+    let lower_res = lower_expr(&args[0].value.expr, args[0].value.range, ctx);
+    let produced = ctx.tstack.last().copied();
+    let Some(src_elem) = produced.and_then(list_source_elem_from_ir) else {
+        restore(ctx, saved_out, saved_stack);
+        return Ok(None);
+    };
+    if lower_res.is_err() {
+        restore(ctx, saved_out, saved_stack);
+        return Ok(None);
+    }
+    let Some(builtin) = variant_list_map_builtin(src_elem) else {
+        restore(ctx, saved_out, saved_stack);
+        return Ok(None);
+    };
+
+    let src_stream = std::mem::take(&mut ctx.out);
+    let src_stack = std::mem::take(&mut ctx.tstack);
+    lower_closure_as_value_with_expected_type(
+        &args[1].value.expr,
+        args[1].value.range,
+        &[src_elem],
+        IrType::I32,
+        None,
+        Some(element),
+        ctx,
+    )?;
+
+    let closure_stream = std::mem::take(&mut ctx.out);
+    let closure_stack = std::mem::take(&mut ctx.tstack);
+    ctx.out = saved_out;
+    ctx.out.extend(src_stream);
+    ctx.out.extend(closure_stream);
+    ctx.tstack = saved_stack;
+    ctx.tstack.extend(src_stack);
+    ctx.tstack.extend(closure_stack);
+    finish_list_hof(builtin, range, ctx)
+}
+
+/// Target-typed method form sibling for `xs.map(f) -> List<variant>`.
+pub(super) fn emit_variant_list_map_method_as_type(
+    element: &TypeRepr,
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    if !variant_record_list_element(element)
+        || path.len() < 2
+        || args.len() != 1
+        || args[0].name.is_some()
+        || !matches!(path.last(), Some(TokenKey::String(m, _, _)) if m == "map")
+    {
+        return Ok(None);
+    }
+    let Expr::Closure { params, .. } = &*args[0].value.expr else {
+        return Ok(None);
+    };
+    if params.len() != 1 {
+        return Ok(None);
+    }
+
+    let saved_out = std::mem::take(&mut ctx.out);
+    let saved_stack = std::mem::take(&mut ctx.tstack);
+    let saved_next_let = ctx.next_let_idx;
+    let saved_lambda_len = ctx.lambda_table.borrow().len();
+    let restore = |ctx: &mut LowerCtx<'_>, out: Vec<TaggedOp>, stack: Vec<IrType>| {
+        ctx.out = out;
+        ctx.tstack = stack;
+        ctx.next_let_idx = saved_next_let;
+        ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+    };
+
+    let receiver_segments = &path[..path.len() - 1];
+    if lower_method_receiver(receiver_segments, range, ctx).is_err() {
+        restore(ctx, saved_out, saved_stack);
+        return Ok(None);
+    }
+    let Some(receiver_ty) = ctx.tstack.last().copied() else {
+        restore(ctx, saved_out, saved_stack);
+        return Ok(None);
+    };
+    let Some(src_elem) = list_source_elem_from_ir(receiver_ty) else {
+        restore(ctx, saved_out, saved_stack);
+        return Ok(None);
+    };
+    let Some(builtin) = variant_list_map_builtin(src_elem) else {
+        restore(ctx, saved_out, saved_stack);
+        return Ok(None);
+    };
+
+    lower_closure_as_value_with_expected_type(
+        &args[0].value.expr,
+        args[0].value.range,
+        &[src_elem],
+        IrType::I32,
+        None,
+        Some(element),
+        ctx,
+    )?;
+    finish_list_hof(builtin, range, ctx)
+}
+
+/// Target-typed `_list_filter(xs, f)` for `List<CustomEnum>` and other
+/// enum-like pointer-array lists. The source and result use the same ListList
+/// representation; the target element type is needed so the predicate can
+/// match on the closure parameter's variants.
+pub(super) fn emit_variant_list_filter_call_as_type(
+    element: &TypeRepr,
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    if !variant_record_list_element(element)
+        || path.len() != 1
+        || args.len() != 2
+        || args.iter().any(|a| a.name.is_some())
+        || !matches!(&path[0], TokenKey::String(s, _, _) if s == "_list_filter")
+    {
+        return Ok(None);
+    }
+    let Expr::Closure { params, .. } = &*args[1].value.expr else {
+        return Ok(None);
+    };
+    if params.len() != 1 {
+        return Ok(None);
+    }
+
+    let saved_out = std::mem::take(&mut ctx.out);
+    let saved_stack = std::mem::take(&mut ctx.tstack);
+    let saved_next_let = ctx.next_let_idx;
+    let saved_lambda_len = ctx.lambda_table.borrow().len();
+    let restore = |ctx: &mut LowerCtx<'_>, out: Vec<TaggedOp>, stack: Vec<IrType>| {
+        ctx.out = out;
+        ctx.tstack = stack;
+        ctx.next_let_idx = saved_next_let;
+        ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+    };
+
+    let lower_res = lower_expr(&args[0].value.expr, args[0].value.range, ctx);
+    if lower_res.is_err() || ctx.tstack.last().copied() != Some(IrType::ListList) {
+        restore(ctx, saved_out, saved_stack);
+        return Ok(None);
+    }
+
+    let src_stream = std::mem::take(&mut ctx.out);
+    let src_stack = std::mem::take(&mut ctx.tstack);
+    let param_reprs = [Some(element)];
+    lower_closure_as_value_with_expected_type(
+        &args[1].value.expr,
+        args[1].value.range,
+        &[IrType::I32],
+        IrType::Bool,
+        Some(&param_reprs),
+        None,
+        ctx,
+    )?;
+
+    let closure_stream = std::mem::take(&mut ctx.out);
+    let closure_stack = std::mem::take(&mut ctx.tstack);
+    ctx.out = saved_out;
+    ctx.out.extend(src_stream);
+    ctx.out.extend(closure_stream);
+    ctx.tstack = saved_stack;
+    ctx.tstack.extend(src_stack);
+    ctx.tstack.extend(closure_stack);
+    finish_list_hof("list_list_filter", range, ctx)
+}
+
+/// Target-typed method form sibling for `xs.filter(f) -> List<variant>`.
+pub(super) fn emit_variant_list_filter_method_as_type(
+    element: &TypeRepr,
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    if !variant_record_list_element(element)
+        || path.len() < 2
+        || args.len() != 1
+        || args[0].name.is_some()
+        || !matches!(path.last(), Some(TokenKey::String(m, _, _)) if m == "filter")
+    {
+        return Ok(None);
+    }
+    let Expr::Closure { params, .. } = &*args[0].value.expr else {
+        return Ok(None);
+    };
+    if params.len() != 1 {
+        return Ok(None);
+    }
+
+    let saved_out = std::mem::take(&mut ctx.out);
+    let saved_stack = std::mem::take(&mut ctx.tstack);
+    let saved_next_let = ctx.next_let_idx;
+    let saved_lambda_len = ctx.lambda_table.borrow().len();
+    let restore = |ctx: &mut LowerCtx<'_>, out: Vec<TaggedOp>, stack: Vec<IrType>| {
+        ctx.out = out;
+        ctx.tstack = stack;
+        ctx.next_let_idx = saved_next_let;
+        ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+    };
+
+    let receiver_segments = &path[..path.len() - 1];
+    if lower_method_receiver(receiver_segments, range, ctx).is_err()
+        || ctx.tstack.last().copied() != Some(IrType::ListList)
+    {
+        restore(ctx, saved_out, saved_stack);
+        return Ok(None);
+    }
+
+    let param_reprs = [Some(element)];
+    lower_closure_as_value_with_expected_type(
+        &args[0].value.expr,
+        args[0].value.range,
+        &[IrType::I32],
+        IrType::Bool,
+        Some(&param_reprs),
+        None,
+        ctx,
+    )?;
+    finish_list_hof("list_list_filter", range, ctx)
 }
 
 /// Finish a single-closure list HOF: pop the closure + source handles,
@@ -3951,6 +4237,7 @@ pub(super) fn emit_list_value_materialize(
         idx: param_let,
         ty: IrType::I64,
         schema_brand: None,
+        type_repr: None,
     });
 
     // Fill loop: redirect ctx.out into a sub-buffer for the body.
@@ -4508,6 +4795,7 @@ fn emit_range_pipeline_loop(
             idx: param_let_idx,
             ty: current_value_ty,
             schema_brand: None,
+            type_repr: None,
         });
         let body_node = stage.closure_body;
         lower_expr(&body_node.expr, body_node.range, ctx)?;
@@ -4727,6 +5015,7 @@ fn emit_range_pipeline_loop(
                 idx: acc_param_let,
                 ty: acc_ty,
                 schema_brand: None,
+                type_repr: None,
             });
             // Bind elem into a fresh let under params[1].name. Source
             // value: current_value_idx.
@@ -4751,6 +5040,7 @@ fn emit_range_pipeline_loop(
                 idx: elem_param_let,
                 ty: current_value_ty,
                 schema_brand: None,
+                type_repr: None,
             });
             // Lower the closure body — leaves the new acc value on
             // top of the vstack.

@@ -17,7 +17,7 @@
 //! `AllocSubRecord` / `PushRecordBase`) or a **String/List field
 //! inside a sub-record** (for `EmitTailRecordFromAbsoluteAddr`). The
 //! host-side return *decoder* (`read_value_from_reader`) supports only
-//! top-level Int/Float/Bool/Null/String fields today — it rejects a
+//! top-level Int/Float/Bool/Unit/String fields today — it rejects a
 //! nested-`Schema` or List return field with `RuntimeError::Unsupported`
 //! ("not supported in Phase B"). That limitation is identical on the
 //! cranelift golden backend (`cranelift-native: cannot decode field …`)

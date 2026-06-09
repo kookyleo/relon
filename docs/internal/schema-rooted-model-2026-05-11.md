@@ -53,7 +53,7 @@ Relon v1.x 同时存在两条调用 dispatch 路径：
 | 8 | **#extend 显式扩展，含 built-in** | `#schema X { ... } with { ... }` 是初始声明（重复报错）；`#extend X with { ... }` 是显式扩展，可针对任意 schema 包括 built-in |
 | 9 | **按 import 链可见** | `#extend` 加的方法只在该文件 + `#import` 链能到达它的文件中可见，不全局生效 |
 | 10 | **内置 schema 省 body 形态** | `#schema String with { ... }`（无字段集 body） vs `#schema MyType { Int x: * } with { ... }`（dict-shape body）。parser 放松「body 必须存在」要求，无 body 表示「纯方法 holder」 |
-| 11 | **不引入 nominal inheritance** | 已有的 `Schema + Schema` 组合 + `Enum<...>` sum types + constraint `#derive` 三条机制覆盖业务建模需求。OO 风格的 `Y extends X` 不在 spec 范畴内 |
+| 11 | **不引入 nominal inheritance** | 已有的 `Schema + Schema` 组合 + Rust-like `#enum` sum types + constraint `#derive` 三条机制覆盖业务建模需求。OO 风格的 `Y extends X` 不在 spec 范畴内 |
 | 12 | **`+` 在 schema 产出场景同时合并方法表** | `Schema + Schema` 和 `Schema + Dict_of_fields`（产出新 schema）合并字段 + 合并方法表；`Dict_value + Dict_value`（产出值）只合并字段，方法本来就由值的类型 schema 给，不存在合并 |
 | 13a | **方法冲突报错（B 严）** | `Schema L + Schema R` 同名方法 → analyzer 报 `MethodNameConflict`。要覆盖父 schema 方法，结果 schema M 形成后用 `#extend M with { ... }` 显式重写 |
 | 13b | **字段冲突 right-wins**（保持现状） | 与 v1.x 字段合并语义一致：`type_hint` 由 R 覆盖、`predicates` 累加（去 Wildcard）、`custom_error` / `default_value` 由 R 覆盖。**不报错**；字段是数据合并，方法是行为合并，二者粒度不同 |
@@ -250,7 +250,7 @@ strategy / hierarchy）的现有覆盖：
 | --- | --- |
 | 内容层级 | `Schema + Schema` 字段加 + 方法合（决策 12）+ constraint |
 | 角色 / 权限 | constraint + `#derive` |
-| 事件 / 状态 / 变体 | `Enum<...>` sum types |
+| 事件 / 状态 / 变体 | Rust-like `#enum` sum types |
 | 表单字段 | sum types 或 composition |
 | Strategy | sum types + constraint |
 | 严格嵌套 | composition 链 |

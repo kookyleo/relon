@@ -57,7 +57,7 @@ builtin。理由见 [ADR](https://github.com/kookyleo/relon/blob/main/docs/inter
     n: list.len([1, 2, 3]),                         // 3
     head: list.first([10, 20, 30]),                 // 10
     tail: list.last([10, 20, 30]),                  // 30
-    cleaned: list.compact([1, null, 2]),            // [1, 2]
+    cleaned: list.compact([1, None, 2]),            // [1, 2]
     flat: list.flatten([[1, 2], [3]])               // [1, 2, 3]
 }
 ```
@@ -124,8 +124,8 @@ builtin。理由见 [ADR](https://github.com/kookyleo/relon/blob/main/docs/inter
 ```relon
 #import value from "std/value"
 {
-    a: value.default(null, "fallback"),  // "fallback"
-    b: value.default(false, true)        // false（仅 null 触发 fallback）
+    a: value.default(None, "fallback"),  // "fallback"
+    b: value.default(false, true)          // false（仅 None 触发 fallback）
 }
 ```
 

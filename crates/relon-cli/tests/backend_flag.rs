@@ -446,3 +446,741 @@ fn lite_rejects_cranelift_aot_backend() {
         "stderr should mention --lite; got: {err}"
     );
 }
+
+#[test]
+fn cli_args_decode_builtin_tuple_array_with_main_signature() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-builtin-tuple-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(
+        &path,
+        "#main(Tuple<Int, String> pair) -> String\n\
+         pair.1\n",
+    )
+    .expect("write fixture");
+
+    let out = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--backend")
+        .arg("tree-walk")
+        .arg("--args")
+        .arg(r#"{"pair":[7,"x"]}"#)
+        .output()
+        .expect("spawn relon CLI");
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        out.status.success(),
+        "CLI must decode JSON array as Value::Tuple for Tuple<...>; stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    assert_eq!(stdout.trim(), r#""x""#, "stdout was: {stdout:?}");
+}
+
+#[test]
+fn cli_args_decode_tuple_schema_array_with_main_signature() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-tuple-schema-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(
+        &path,
+        "#schema IPv4 (Int, Int, Int, Int)\n\
+         #main(IPv4 ip) -> Int\n\
+         ip.0 + ip.1 + ip.2 + ip.3\n",
+    )
+    .expect("write fixture");
+
+    let out = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--backend")
+        .arg("tree-walk")
+        .arg("--args")
+        .arg(r#"{"ip":[127,0,0,1]}"#)
+        .output()
+        .expect("spawn relon CLI");
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        out.status.success(),
+        "CLI must decode JSON array as Value::Tuple for IPv4; stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    assert_eq!(stdout.trim(), "128", "stdout was: {stdout:?}");
+}
+
+#[test]
+fn cli_args_decode_nested_tuple_schema_field() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-nested-tuple-schema-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(
+        &path,
+        "#schema Pair (Int, String)\n\
+         #schema Wrapper { Pair pair: * }\n\
+         #main(Wrapper w) -> String\n\
+         w.pair.1\n",
+    )
+    .expect("write fixture");
+
+    let out = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--backend")
+        .arg("tree-walk")
+        .arg("--args")
+        .arg(r#"{"w":{"pair":[7,"x"]}}"#)
+        .output()
+        .expect("spawn relon CLI");
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        out.status.success(),
+        "CLI must recursively decode schema tuple fields; stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    assert_eq!(stdout.trim(), r#""x""#, "stdout was: {stdout:?}");
+}
+
+#[test]
+fn cli_args_decode_json_null_as_option_none_when_typed() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-option-null-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(&path, "#main(Option<Int> maybe) -> Option<Int>\nmaybe\n")
+        .expect("write fixture");
+
+    let out = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--backend")
+        .arg("tree-walk")
+        .arg("--args")
+        .arg(r#"{"maybe":null}"#)
+        .output()
+        .expect("spawn relon CLI");
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        out.status.success(),
+        "Option<Int> JSON null should decode as Option.None; stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    assert_eq!(stdout.trim(), "null", "stdout was: {stdout:?}");
+}
+
+#[test]
+fn cli_args_reject_targetless_json_null() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-targetless-null-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(&path, "#main(Int x) -> Int\nx\n").expect("write fixture");
+
+    let out = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--backend")
+        .arg("tree-walk")
+        .arg("--args")
+        .arg(r#"{"x":1,"extra":null}"#)
+        .output()
+        .expect("spawn relon CLI");
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        !out.status.success(),
+        "targetless JSON null should be rejected; stdout={}",
+        String::from_utf8_lossy(&out.stdout),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("JSON null needs an Option<T> or T? target type"),
+        "stderr should explain targetless null; got: {stderr}"
+    );
+}
+
+#[test]
+fn cli_args_reject_nested_targetless_json_null() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-targetless-nested-null-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(
+        &path,
+        "#main(Int x) -> Int
+x
+",
+    )
+    .expect("write fixture");
+
+    let out = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--backend")
+        .arg("tree-walk")
+        .arg("--args")
+        .arg(r#"{"x":1,"extra":{"k":null}}"#)
+        .output()
+        .expect("spawn relon CLI");
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        !out.status.success(),
+        "nested targetless JSON null should be rejected; stdout={}",
+        String::from_utf8_lossy(&out.stdout),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("JSON null is not a Relon value")
+            || stderr.contains("JSON null needs an Option<T> or T? target type"),
+        "stderr should explain targetless null; got: {stderr}"
+    );
+}
+
+#[test]
+fn cli_args_keep_list_semantics_and_reject_heterogeneous_list() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-list-mismatch-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(&path, "#main(List<Int> xs) -> Int\nlen(xs)\n").expect("write fixture");
+
+    let out = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--backend")
+        .arg("tree-walk")
+        .arg("--args")
+        .arg(r#"{"xs":[1,"x"]}"#)
+        .output()
+        .expect("spawn relon CLI");
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        !out.status.success(),
+        "List<Int> must reject a JSON array with a string element; stdout={}",
+        String::from_utf8_lossy(&out.stdout),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("List<Int>")
+            && stderr.contains("expected JSON")
+            && stderr.contains("integer"),
+        "stderr should report the list element type mismatch; got: {stderr}"
+    );
+}
+
+#[test]
+fn cli_args_decode_unit_enum_variant_from_string() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-enum-string-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(
+        &path,
+        "#enum Stat { Up, Down }\n\
+         #main(Stat s) -> Stat\n\
+         s\n",
+    )
+    .expect("write fixture");
+
+    let out = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--backend")
+        .arg("tree-walk")
+        .arg("--args")
+        .arg(r#"{"s":"Up"}"#)
+        .output()
+        .expect("spawn relon CLI");
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        out.status.success(),
+        "CLI should decode JSON string as a unit enum variant; stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("json stdout");
+    assert_eq!(
+        json,
+        serde_json::json!({ "Up": {} }),
+        "stdout was: {stdout:?}"
+    );
+}
+
+#[test]
+fn cli_args_decode_spread_imported_unit_enum_variant_from_string() {
+    let dir = std::env::temp_dir().join(format!(
+        "relon-cli-import-enum-spread-{}-{}",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::create_dir_all(&dir).expect("create fixture dir");
+    let main_path = dir.join("main.relon");
+    let lib_path = dir.join("lib.relon");
+    std::fs::write(&lib_path, "#enum Stat { Up, Down }\n{}\n").expect("write lib fixture");
+    std::fs::write(
+        &main_path,
+        "#import * from \"./lib.relon\"\n#main(Stat s) -> Stat\ns\n",
+    )
+    .expect("write main fixture");
+
+    let out = Command::new(BINARY)
+        .arg("run")
+        .arg(&main_path)
+        .arg("--backend")
+        .arg("tree-walk")
+        .arg("--trust")
+        .arg("--args")
+        .arg(r#"{"s":"Up"}"#)
+        .output()
+        .expect("spawn relon CLI");
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        out.status.success(),
+        "CLI should decode JSON string as a spread-imported unit enum variant; stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("json stdout");
+    assert_eq!(json, serde_json::json!({ "Up": {} }));
+}
+
+#[test]
+fn cli_args_decode_alias_imported_unit_enum_variant_from_string() {
+    let dir = std::env::temp_dir().join(format!(
+        "relon-cli-import-enum-alias-{}-{}",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::create_dir_all(&dir).expect("create fixture dir");
+    let main_path = dir.join("main.relon");
+    let lib_path = dir.join("lib.relon");
+    std::fs::write(&lib_path, "#enum Stat { Up, Down }\n{}\n").expect("write lib fixture");
+    std::fs::write(
+        &main_path,
+        "#import lib from \"./lib.relon\"\n#main(lib.Stat s) -> lib.Stat\ns\n",
+    )
+    .expect("write main fixture");
+
+    let out = Command::new(BINARY)
+        .arg("run")
+        .arg(&main_path)
+        .arg("--backend")
+        .arg("tree-walk")
+        .arg("--trust")
+        .arg("--args")
+        .arg(r#"{"s":"Down"}"#)
+        .output()
+        .expect("spawn relon CLI");
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        out.status.success(),
+        "CLI should decode JSON string as an alias-imported unit enum variant; stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("json stdout");
+    assert_eq!(json, serde_json::json!({ "Down": {} }));
+}
+
+#[test]
+fn cli_args_reject_payload_enum_variant_from_string() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-enum-payload-string-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(
+        &path,
+        "#enum Msg { Email { address: String }, Push }\n\
+         #main(Msg m) -> String\n\
+         \"ok\"\n",
+    )
+    .expect("write fixture");
+
+    let out = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--backend")
+        .arg("tree-walk")
+        .arg("--args")
+        .arg(r#"{"m":"Email"}"#)
+        .output()
+        .expect("spawn relon CLI");
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        !out.status.success(),
+        "payload enum variant should not decode from a bare string; stdout={}",
+        String::from_utf8_lossy(&out.stdout),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("requires payload fields"),
+        "stderr should explain payload requirement; got: {stderr}"
+    );
+}
+
+#[test]
+fn cli_args_decode_struct_payload_enum_variant_from_object() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-enum-payload-object-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(
+        &path,
+        "#enum Msg { Email { address: String, subject: String }, Push }\n\
+         #main(Msg m) -> Msg\n\
+         m\n",
+    )
+    .expect("write fixture");
+
+    let out = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--backend")
+        .arg("tree-walk")
+        .arg("--args")
+        .arg(r#"{"m":{"Email":{"address":"a@b.c","subject":"hi"}}}"#)
+        .output()
+        .expect("spawn relon CLI");
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        out.status.success(),
+        "CLI should decode externally tagged struct enum payload; stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("json stdout");
+    assert_eq!(
+        json,
+        serde_json::json!({ "Email": { "address": "a@b.c", "subject": "hi" } })
+    );
+}
+
+#[test]
+fn cli_args_decode_tuple_payload_enum_variant_from_array() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-enum-payload-array-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(
+        &path,
+        "#enum Packet { Pair(Int, String), Empty }\n\
+         #main(Packet p) -> Packet\n\
+         p\n",
+    )
+    .expect("write fixture");
+
+    let out = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--backend")
+        .arg("tree-walk")
+        .arg("--args")
+        .arg(r#"{"p":{"Pair":[7,"x"]}}"#)
+        .output()
+        .expect("spawn relon CLI");
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        out.status.success(),
+        "CLI should decode externally tagged tuple enum payload; stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("json stdout");
+    assert_eq!(json, serde_json::json!({ "Pair": [7, "x"] }));
+}
+
+#[test]
+fn cli_args_decode_option_some_externally_tagged_payload() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-option-some-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(
+        &path,
+        "#main(Option<Int> x) -> Int\n\
+         x match { Some(v): v + 1, None: 0 }\n",
+    )
+    .expect("write fixture");
+
+    let out = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--backend")
+        .arg("tree-walk")
+        .arg("--args")
+        .arg(r#"{"x":{"Some":{"value":41}}}"#)
+        .output()
+        .expect("spawn relon CLI");
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        out.status.success(),
+        "CLI should decode externally tagged Option.Some; stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    assert_eq!(stdout.trim(), "42", "stdout was: {stdout:?}");
+}
+
+#[test]
+fn cli_args_decode_result_ok_externally_tagged_payload() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-result-ok-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(
+        &path,
+        "#main(Result<Int, String> r) -> Int\n\
+         r match { Ok(v): v + 1, Err(e): 0 }\n",
+    )
+    .expect("write fixture");
+
+    let out = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--backend")
+        .arg("tree-walk")
+        .arg("--args")
+        .arg(r#"{"r":{"Ok":{"value":41}}}"#)
+        .output()
+        .expect("spawn relon CLI");
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        out.status.success(),
+        "CLI should decode externally tagged Result.Ok; stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    assert_eq!(stdout.trim(), "42", "stdout was: {stdout:?}");
+}
+
+#[test]
+fn cli_args_decode_optional_shorthand_to_option_value() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-optional-shorthand-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(
+        &path,
+        "#main(Int? x) -> Int\n\
+         x match { Some(v): v + 1, None: 0 }\n",
+    )
+    .expect("write fixture");
+
+    let run = |args: &str| -> String {
+        let out = Command::new(BINARY)
+            .arg("run")
+            .arg(&path)
+            .arg("--backend")
+            .arg("tree-walk")
+            .arg("--args")
+            .arg(args)
+            .output()
+            .expect("spawn relon CLI");
+        assert!(
+            out.status.success(),
+            "CLI should decode optional shorthand args; stderr={}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        String::from_utf8(out.stdout).expect("utf-8 stdout")
+    };
+
+    let some_out = run(r#"{"x":41}"#);
+    let none_out = run(r#"{"x":null}"#);
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(some_out.trim(), "42", "stdout was: {some_out:?}");
+    assert_eq!(none_out.trim(), "0", "stdout was: {none_out:?}");
+}
+
+#[test]
+fn cli_runs_rust_like_enum_struct_variant_constructor() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-enum-struct-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(
+        &path,
+        "#enum Notification { Email { address: String, subject: String }, Push }\n\
+         Notification.Email { address: \"a@b.c\", subject: \"hi\" }\n",
+    )
+    .expect("write fixture");
+
+    let out = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--backend")
+        .arg("tree-walk")
+        .output()
+        .expect("spawn relon CLI");
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        out.status.success(),
+        "CLI should run #enum struct variant constructor; stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("json stdout");
+    assert_eq!(
+        json,
+        serde_json::json!({ "Email": { "address": "a@b.c", "subject": "hi" } }),
+        "stdout was: {stdout:?}"
+    );
+}
+
+#[test]
+fn cli_runs_rust_like_enum_tuple_variant_constructor() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-enum-tuple-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(
+        &path,
+        "#enum Packet { Pair(Int, String), Empty }
+\
+         Packet.Pair(7, \"x\")
+",
+    )
+    .expect("write fixture");
+
+    let out = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--backend")
+        .arg("tree-walk")
+        .output()
+        .expect("spawn relon CLI");
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        out.status.success(),
+        "CLI should run #enum tuple variant constructor; stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("json stdout");
+    assert_eq!(
+        json,
+        serde_json::json!({ "Pair": [7, "x"] }),
+        "stdout was: {stdout:?}"
+    );
+}
+
+#[test]
+fn cli_runs_rust_like_enum_unit_variant_path() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-enum-unit-path-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(&path, "#enum Stat { Up, Down }\nStat.Up\n").expect("write fixture");
+
+    let out = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--backend")
+        .arg("tree-walk")
+        .output()
+        .expect("spawn relon CLI");
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        out.status.success(),
+        "CLI should run #enum unit variant path; stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("json stdout");
+    assert_eq!(
+        json,
+        serde_json::json!({ "Up": {} }),
+        "stdout was: {stdout:?}"
+    );
+}
+
+#[test]
+fn cli_typed_field_preserves_enum_variant_brand() {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-enum-typed-field-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(&path, "#enum Stat { Up, Down }\n{ Stat s: Stat.Up }\n").expect("write fixture");
+
+    let out = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--backend")
+        .arg("tree-walk")
+        .output()
+        .expect("spawn relon CLI");
+
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        out.status.success(),
+        "typed enum field should preserve variant brand; stderr={}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("json stdout");
+    assert_eq!(
+        json,
+        serde_json::json!({ "s": { "Up": {} } }),
+        "stdout was: {stdout:?}"
+    );
+}

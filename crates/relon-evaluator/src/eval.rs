@@ -7,7 +7,7 @@ use crate::value::{SmolStr, Value};
 use relon_eval_api::context::{Context, GatedNativeFn};
 use relon_parser::{
     is_builtin_type_name, parse_document, CallArg, Decorator as DecoratorNode, Expr, FStringPart,
-    Node, Operator, TokenKey, TokenRange,
+    Node, Operator, PatternBinding, TokenKey, TokenRange,
 };
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -117,7 +117,7 @@ impl TreeWalkEvaluator {
     /// **Contract**: caller must guarantee the source under this
     /// Context fits the trivial-scalar `#main` envelope as classified
     /// by `relon::is_trivial_scalar_main` — single
-    /// Int/Float/Bool/Null/String parameter, body is a literal /
+    /// Int/Float/Bool/String parameter, body is a literal /
     /// Variable / arithmetic / ternary over leaves, no `#import`,
     /// no decorator, no fn call. Outside that envelope this skips
     /// registrations the evaluator may dispatch into (stdlib lookup,
@@ -239,6 +239,12 @@ impl TreeWalkEvaluator {
             )
         })?;
         let scope = self.prepare_root_scope(scope, &root)?;
+        if let Some(tree) = self.context.analyzed.as_ref() {
+            if !tree.root_schemas.is_empty() {
+                self.seed_root_schemas(&tree.root_schemas, &scope)?;
+            }
+        }
+        self.prepare_dict_scope(&root, &scope)?;
         self.eval(&root, &scope)
     }
 
@@ -251,7 +257,9 @@ impl TreeWalkEvaluator {
     /// Tuple parameters must be supplied as `Value::Tuple` (or
     /// `Value::tuple(...)`). Targetless JSON decoding such as
     /// `serde_json::from_value::<Value>` maps JSON arrays to `Value::List`,
-    /// which intentionally does not satisfy `Tuple<...>` parameters.
+    /// which intentionally does not satisfy `Tuple<...>` parameters; JSON
+    /// `null` is rejected unless a host boundary decodes it against an
+    /// explicit `Option<T>` or `T?` target.
     ///
     /// Errors:
     /// * [`RuntimeError::NoMainSignature`] — the file lacks a
@@ -400,11 +408,11 @@ impl TreeWalkEvaluator {
     /// type — resolves identically through the scope chain.
     ///
     /// The body node carried by each `RootSchemaDecl` is a plain dict
-    /// literal (or `Enum<...>` type) with no `#schema` decorator of its
-    /// own; we lower it on demand using the same pure-fn the analyzer
-    /// uses (`relon_analyzer::lower_schema_pure`) and then build the
-    /// runtime `Value::Schema` via `build_schema_from_def`. This keeps
-    /// the field-form and decorator-form on a single lowering path.
+    /// literal, tuple body, or internal `#enum` body with no `#schema`
+    /// decorator of its own. We lower it on demand using the same pure-fn
+    /// the analyzer uses (`relon_analyzer::lower_schema_pure`) and then
+    /// build the runtime `Value::Schema` / `Value::EnumSchema` from the
+    /// resulting schema definition.
     fn seed_root_schemas(
         &self,
         decls: &[relon_analyzer::RootSchemaDecl],
@@ -442,7 +450,7 @@ impl TreeWalkEvaluator {
                 // bail with a runtime mirror so the host gets a
                 // consistent shape.
                 return Err(RuntimeError::TypeMismatch {
-                    expected: "schema body (Dict or Enum<...>)".to_string(),
+                    expected: "schema body (Dict, Tuple, or #enum body)".to_string(),
                     found: decl.schema_node.expr.kind().to_string(),
                     range: decl.directive_range,
                 });
@@ -556,7 +564,11 @@ impl TreeWalkEvaluator {
         }
 
         let mut val = match node.expr.as_ref() {
-            Expr::Null => Ok(Value::Null),
+            Expr::Missing => Err(RuntimeError::ValidationError(
+                "`null` is not a Relon value; use None with an Option<T> or T? target type"
+                    .to_string(),
+                node.range,
+            )),
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Int(i) => Ok(Value::Int(*i)),
             Expr::Float(f) => Ok(Value::Float(*f)),
@@ -963,6 +975,22 @@ impl TreeWalkEvaluator {
                                 return self.eval(result_node, &current_scope);
                             }
                         }
+                        Expr::VariantPattern {
+                            enum_path,
+                            variant,
+                            bindings,
+                        } => {
+                            if let Some(arm_scope) = self.match_variant_pattern_scope(
+                                &val,
+                                enum_path,
+                                variant,
+                                bindings,
+                                &current_scope,
+                                pattern_node.range,
+                            )? {
+                                return self.eval(result_node, &arm_scope);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -988,6 +1016,10 @@ impl TreeWalkEvaluator {
             }
             Expr::Type(t) => Ok(Value::Type(Box::new(t.clone()))),
             Expr::Wildcard => Ok(Value::Wildcard),
+            Expr::VariantPattern { .. } => Err(RuntimeError::UnsupportedOperator(
+                "match pattern cannot be evaluated as an expression".to_string(),
+                node.range,
+            )),
             Expr::VariantCtor {
                 enum_path,
                 variant,
@@ -1043,7 +1075,9 @@ impl TreeWalkEvaluator {
 
                 if let Value::Dict(ref mut d) = val {
                     let d = Arc::make_mut(d);
-                    d.brand = crate::builtin_decorators::brand_string_for(type_hint);
+                    if d.variant_of.is_none() {
+                        d.brand = crate::builtin_decorators::brand_string_for(type_hint);
+                    }
                 }
             }
         }
@@ -1052,8 +1086,8 @@ impl TreeWalkEvaluator {
     }
 
     /// Lower a single `#schema A Body` binding into a `Value::Schema`
-    /// (or `Value::EnumSchema` for `Enum<...>` bodies). Mirrors the
-    /// path the field-form `#schema X: { ... }` used to take in batch 2:
+    /// (or `Value::EnumSchema` for `#enum` bodies). Mirrors
+    /// the path the field-form `#schema X: { ... }` used to take in batch 2:
     /// invoke the analyzer's pure schema lowering, then call
     /// `build_schema_from_def` to bind predicates against the live
     /// scope.
@@ -1084,7 +1118,7 @@ impl TreeWalkEvaluator {
             relon_analyzer::lower_schema_pure(Some(name.to_string()), generics.to_vec(), body);
         let Some(def) = lowered else {
             return Err(RuntimeError::TypeMismatch {
-                expected: "schema body (Dict or Enum<...>)".to_string(),
+                expected: "schema body (Dict, Tuple, or #enum body)".to_string(),
                 found: body.expr.kind().to_string(),
                 range: body.range,
             });
@@ -1123,7 +1157,7 @@ impl TreeWalkEvaluator {
         node: &Node,
         current_scope: &mut Arc<Scope>,
     ) -> Result<Option<Value>, RuntimeError> {
-        use crate::decorator_names::{IMPORT, SCHEMA};
+        use crate::decorator_names::{ENUM, IMPORT, SCHEMA};
         use relon_parser::DirectiveBody;
         match directive.name.as_str() {
             IMPORT => {
@@ -1155,7 +1189,7 @@ impl TreeWalkEvaluator {
             // are seeded into the dict's own scope by `prepare_dict_scope`
             // once the body opens. Doing it here too would double-bind
             // and `&sibling` would resolve in the outer scope by mistake.
-            SCHEMA => match &directive.body {
+            SCHEMA | ENUM => match &directive.body {
                 DirectiveBody::NameBody { .. } => {}
                 DirectiveBody::Bare => {
                     if let Some(tree) = self.context.analyzed.as_ref() {
@@ -1603,6 +1637,71 @@ impl TreeWalkEvaluator {
         Ok(Value::variant_dict(map, variant.to_string(), name))
     }
 
+    fn pattern_payload_field_name(
+        dict: &relon_eval_api::value::ValueDict,
+        binding: &PatternBinding,
+        idx: usize,
+    ) -> String {
+        if let Some(field) = binding.field.clone() {
+            return field;
+        }
+        match (dict.variant_of.as_deref(), dict.brand.as_deref()) {
+            (Some("Option"), Some("Some")) => "value".to_string(),
+            (Some("Result"), Some("Ok")) => "value".to_string(),
+            (Some("Result"), Some("Err")) => "error".to_string(),
+            _ => idx.to_string(),
+        }
+    }
+
+    fn match_variant_pattern_scope(
+        &self,
+        value: &Value,
+        enum_path: &[String],
+        variant: &str,
+        bindings: &[PatternBinding],
+        scope: &Arc<Scope>,
+        range: TokenRange,
+    ) -> Result<Option<Arc<Scope>>, RuntimeError> {
+        let Value::Dict(dict) = value else {
+            return Ok(None);
+        };
+        if dict.brand.as_deref() != Some(variant) {
+            return Ok(None);
+        }
+        if !enum_path.is_empty() && dict.variant_of.as_deref() != Some(&enum_path.join(".")) {
+            return Ok(None);
+        }
+        if bindings.is_empty() {
+            return Ok(Some(Arc::clone(scope)));
+        }
+
+        let mut locals: HashMap<Arc<str>, Value> = HashMap::new();
+        for (idx, binding) in bindings.iter().enumerate() {
+            let Some(name) = binding.binding.as_ref() else {
+                continue;
+            };
+            let field = Self::pattern_payload_field_name(dict, binding, idx);
+            let Some(payload) = dict.map.get(field.as_str()) else {
+                return Err(RuntimeError::TypeMismatch {
+                    expected: format!("payload field `{field}` for variant `{variant}`"),
+                    found: "missing".to_string(),
+                    range,
+                });
+            };
+            if locals
+                .insert(Arc::<str>::from(name.as_str()), payload.clone())
+                .is_some()
+            {
+                return Err(RuntimeError::TypeMismatch {
+                    expected: format!("unique binding name in pattern `{variant}`"),
+                    found: format!("duplicate `{name}`"),
+                    range,
+                });
+            }
+        }
+        Ok(Some(scope.with_locals(locals)))
+    }
+
     pub(crate) fn call_function_by_value(
         &self,
         func: Value,
@@ -1853,6 +1952,12 @@ impl TreeWalkEvaluator {
         if let Some(result) = self.try_call_schema_method(path, &args, scope, range)? {
             return Ok(result);
         }
+        if let Some(result) = self.try_call_enum_tuple_variant(path, &args, scope, range)? {
+            return Ok(result);
+        }
+        if let Some(result) = self.try_call_prelude_variant(path, &args, scope, range)? {
+            return Ok(result);
+        }
         Err(RuntimeError::FunctionNotFound(
             path.iter()
                 .map(|k| k.to_string_key())
@@ -1860,6 +1965,166 @@ impl TreeWalkEvaluator {
                 .join("."),
             range,
         ))
+    }
+
+    fn try_call_enum_tuple_variant(
+        &self,
+        path: &[TokenKey],
+        args: &[EvaluatedArg],
+        scope: &Arc<Scope>,
+        range: TokenRange,
+    ) -> Result<Option<Value>, RuntimeError> {
+        if path.len() < 2 {
+            return Ok(None);
+        }
+        let mut segments = Vec::with_capacity(path.len());
+        for part in path {
+            let TokenKey::String(segment, _, _) = part else {
+                return Ok(None);
+            };
+            segments.push(segment.clone());
+        }
+        let variant = segments.last().cloned().unwrap_or_default();
+        let enum_path = &segments[..segments.len() - 1];
+        let Some(head) = enum_path.first() else {
+            return Ok(None);
+        };
+
+        let Some(mut current) = scope
+            .get_local(head)
+            .or_else(|| self.context.schemas.get(head).cloned())
+        else {
+            return Ok(None);
+        };
+        for seg in &enum_path[1..] {
+            let Value::Dict(d) = current else {
+                return Ok(None);
+            };
+            let Some(next) = d.map.get(seg.as_str()).cloned() else {
+                return Ok(None);
+            };
+            current = next;
+        }
+        let Value::EnumSchema(enum_schema) = current else {
+            return Ok(None);
+        };
+        let enum_name = if enum_schema.name.is_empty() {
+            enum_path.join(".")
+        } else {
+            enum_schema.name.clone()
+        };
+        let Some(variant_fields) = enum_schema.variants.get(&variant) else {
+            return Err(RuntimeError::TypeMismatch {
+                expected: format!("a variant of `{enum_name}`"),
+                found: format!("`{variant}`"),
+                range,
+            });
+        };
+        if variant_fields.is_empty() {
+            return Err(RuntimeError::TypeMismatch {
+                expected: format!("unit enum variant `{variant}` without `(...)`"),
+                found: format!("{} positional argument(s)", args.len()),
+                range,
+            });
+        }
+
+        let mut indexed_fields = Vec::with_capacity(variant_fields.len());
+        for (field_name, field_def) in variant_fields.iter() {
+            let Ok(index) = field_name.parse::<usize>() else {
+                return Ok(None);
+            };
+            indexed_fields.push((index, field_name, field_def));
+        }
+        indexed_fields.sort_by_key(|(index, _, _)| *index);
+        let tuple_shape = indexed_fields
+            .iter()
+            .enumerate()
+            .all(|(expected, (actual, _, _))| expected == *actual);
+        if !tuple_shape {
+            return Ok(None);
+        }
+        if args.iter().any(|arg| arg.name.is_some()) {
+            return Err(RuntimeError::TypeMismatch {
+                expected: "positional enum variant arguments".to_string(),
+                found: "named argument".to_string(),
+                range,
+            });
+        }
+        if args.len() != indexed_fields.len() {
+            return Err(RuntimeError::TypeMismatch {
+                expected: format!("{} positional argument(s)", indexed_fields.len()),
+                found: format!("{} positional argument(s)", args.len()),
+                range,
+            });
+        }
+
+        let mut map = BTreeMap::new();
+        for (idx, field_name, field_def) in indexed_fields {
+            let mut value = args[idx].value.clone();
+            if !is_type_variable(&field_def.type_hint, &enum_schema.generics) {
+                self.check_type(&mut value, &field_def.type_hint, scope, range)?;
+            }
+            map.insert(SmolStr::from(field_name.as_str()), value);
+        }
+        Ok(Some(Value::variant_dict(map, variant, enum_name)))
+    }
+
+    fn try_call_prelude_variant(
+        &self,
+        path: &[TokenKey],
+        args: &[EvaluatedArg],
+        scope: &Arc<Scope>,
+        range: TokenRange,
+    ) -> Result<Option<Value>, RuntimeError> {
+        enum Ctor {
+            OptionSome,
+            ResultOk,
+            ResultErr,
+        }
+
+        let ctor = match path {
+            [TokenKey::String(name, _, _)] if name == "Some" => Ctor::OptionSome,
+            [TokenKey::String(head, _, _), TokenKey::String(name, _, _)]
+                if head == "Option" && name == "Some" =>
+            {
+                Ctor::OptionSome
+            }
+            [TokenKey::String(name, _, _)] if name == "Ok" => Ctor::ResultOk,
+            [TokenKey::String(head, _, _), TokenKey::String(name, _, _)]
+                if head == "Result" && name == "Ok" =>
+            {
+                Ctor::ResultOk
+            }
+            [TokenKey::String(name, _, _)] if name == "Err" => Ctor::ResultErr,
+            [TokenKey::String(head, _, _), TokenKey::String(name, _, _)]
+                if head == "Result" && name == "Err" =>
+            {
+                Ctor::ResultErr
+            }
+            _ => return Ok(None),
+        };
+
+        if let Some(TokenKey::String(head, _, _)) = path.first() {
+            if scope.get_local(head).is_some() || scope.get_thunk(head).is_some() {
+                return Ok(None);
+            }
+        }
+
+        if args.len() != 1 || args[0].name.is_some() {
+            return Err(RuntimeError::TypeMismatch {
+                expected: "one positional argument".to_string(),
+                found: format!("{} argument(s)", args.len()),
+                range,
+            });
+        }
+
+        let payload = args[0].value.clone();
+        let value = match ctor {
+            Ctor::OptionSome => Value::option_some(payload),
+            Ctor::ResultOk => Value::result_ok(payload),
+            Ctor::ResultErr => Value::result_err(payload),
+        };
+        Ok(Some(value))
     }
 
     /// Dispatch an `Expr::FnCall` whose path looks like
@@ -2033,7 +2298,7 @@ impl TreeWalkEvaluator {
     ///     unwrapped the returned `Optional<V>` per the dynamic key's
     ///     `?` flag:
     ///       - `Some { value: v }` → `v`.
-    ///       - `None` → `Value::Null` when `is_optional`; otherwise a
+    ///       - `None` → the standard `None` value when `is_optional`; otherwise a
     ///         `VariableNotFound` matching the built-in dict / list
     ///         miss diagnostic.
     ///       - Anything else (non-Option-shaped return) is surfaced
@@ -2520,7 +2785,9 @@ impl TreeWalkEvaluator {
             {
                 let mut locals = scope.locals_for_write();
                 for dir in &node.directives {
-                    if dir.name != crate::decorator_names::SCHEMA {
+                    if dir.name != crate::decorator_names::SCHEMA
+                        && dir.name != crate::decorator_names::ENUM
+                    {
                         continue;
                     }
                     let relon_parser::DirectiveBody::NameBody { name, generics, .. } = &dir.body
@@ -2542,7 +2809,9 @@ impl TreeWalkEvaluator {
                 }
             }
             for dir in &node.directives {
-                if dir.name != crate::decorator_names::SCHEMA {
+                if dir.name != crate::decorator_names::SCHEMA
+                    && dir.name != crate::decorator_names::ENUM
+                {
                     continue;
                 }
                 let relon_parser::DirectiveBody::NameBody {
@@ -2575,7 +2844,7 @@ impl TreeWalkEvaluator {
                     has_schema_directive && matches!(value_node.expr.as_ref(), Expr::Dict(_));
                 let is_enum_schema = has_schema_directive
                     && matches!(value_node.expr.as_ref(),
-                        Expr::Type(t) if t.path.len() == 1 && t.path[0] == "Enum");
+                        Expr::Type(t) if t.path.len() == 1 && t.path[0] == relon_parser::INTERNAL_ENUM_TYPE_NAME);
 
                 if Self::is_logic_definition(value_node) || is_dict_schema || is_enum_schema {
                     let key_str = match key {
@@ -2928,7 +3197,6 @@ fn value_schema_tag(v: &Value) -> Option<String> {
         Value::String(_) => Some("String".to_string()),
         Value::List(_) => Some("List".to_string()),
         Value::Tuple(_) => Some("Tuple".to_string()),
-        Value::Null => Some("Null".to_string()),
         Value::Closure(_) | Value::Schema(_) | Value::EnumSchema(_) => None,
         Value::Type(_) | Value::Wildcard => None,
     }
@@ -2941,7 +3209,7 @@ fn value_schema_tag(v: &Value) -> Option<String> {
 /// The shape is `variant_dict(map, "Some" | "None", "Option")` — built
 /// by the prelude's `Option<T>` enum schema and the stdlib's
 /// [`option_value`] constructor. Wrapped success returns the inner
-/// `value`; a `None` result either becomes `Value::Null` (when the
+/// `value`; a `None` result either becomes the standard `None` value (when the
 /// caller used `a[i]?`) or surfaces as `VariableNotFound` (matching the
 /// existing dict / list miss diagnostic for `a[i]` without `?`).
 ///
@@ -2963,11 +3231,15 @@ pub(crate) fn unwrap_optional_for_index(
         if d.variant_of.as_deref() == Some("Option") {
             match d.brand.as_deref() {
                 Some("Some") => {
-                    return Ok(d.map.get("value").cloned().unwrap_or(Value::Null));
+                    return Ok(d
+                        .map
+                        .get("value")
+                        .cloned()
+                        .unwrap_or_else(Value::option_none));
                 }
                 Some("None") => {
                     return if is_optional {
-                        Ok(Value::Null)
+                        Ok(Value::option_none())
                     } else {
                         Err(RuntimeError::VariableNotFound(
                             display_name.to_string(),

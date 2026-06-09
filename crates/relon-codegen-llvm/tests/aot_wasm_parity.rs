@@ -390,7 +390,7 @@ fn run_buffer(
                 Decoded::Float(f64::from_le_bytes(out[off..off + 8].try_into().unwrap()))
             }
             EmittedFieldType::Bool => Decoded::Int(if out[off] != 0 { 1 } else { 0 }),
-            EmittedFieldType::Null => Decoded::Int(0),
+            EmittedFieldType::Unit => Decoded::Int(0),
             EmittedFieldType::String => {
                 let record_start = read_u32(&out, off) - out_ptr_us;
                 let len = read_u32(&out, record_start);

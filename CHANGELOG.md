@@ -486,38 +486,20 @@ change.
 ## [Earlier-Unreleased] — v1.8: Enum / Result first-class + host fn audit + cross-module + tuple-index
 
 v1.7 closed the user-source back-doors (`Any`, bare generics). v1.8
-sweeps the remaining surface: the `Enum<...>` slot's
-unconditionally-accept behaviour, generic substitution for sum-type
-schemas (chiefly `Result<T, E>` / `Option<T>`), host-supplied
-signatures that previously bypassed both v1.6 / v1.7 walks,
-cross-module `pkg.SchemaName` slot resolution, and structured
-positional access on tuples / lists (`pair.0` / `xs.1`).
+sweeps the remaining surface: removed exploratory enum type syntax,
+generic substitution for sum-type schemas (chiefly `Result<T, E>` /
+`Option<T>`), host-supplied signatures that previously bypassed both
+v1.6 / v1.7 walks, cross-module `pkg.SchemaName` slot resolution, and
+structured positional access on tuples / lists (`pair.0` / `xs.1`).
 
-### v1.8a: Enum<...> alternative-aware subsumption
+### v1.8a: Exploratory enum type syntax removed
 
-`InferredType::subsumes_with` for an `Enum<...>` slot used to return
-`true` for everything (`"Enum" => true`). v1.8 walks the
-alternatives and accepts only when at least one is statically
-compatible. Mirrors the runtime's `enum_alt_matches_cheaply` cascade:
-
-- Built-in primitive alternative (`Int`, `String`, `Bool`, …):
-  recurse into `subsumes_with`.
-- Bareword alternative without generics (parser-stripped string
-  literal `"up"` or schema name `Active`): treated as a `String`
-  candidate, since the runtime cheap-path matches both shapes
-  against `Value::String`.
-- Anything else: recurse into `subsumes_with`.
-
-`infer_from_type_node`'s `"Enum"` arm now lifts the slot to the
-**join** of all alternative value types (`Enum<"up", "down">` →
-`String`; `Enum<Int, Float>` → `Number`; `Enum<Int, String>` →
-`Any`), so closure parameters / typed bindings declared as enums
-get a precise upper bound instead of `Any`.
+Public sum types use Rust-like `#enum Status { Up, Down }` declarations. The old exploratory enum syntax is not a public schema or type form.
 
 ### v1.8b: Result<T, E> / variant-generic substitution
 
 When the slot is `Result<Int, String>` and the value is
-`Result.Ok { value: 42 }`, the analyzer now substitutes
+`Ok(42)`, the analyzer now substitutes
 `T -> Int, E -> String` into the variant's declared field types and
 recurses per body field — the same machinery the runtime already
 runs in `substitute_generics_in_schema`. A new
@@ -526,7 +508,7 @@ field_types)` from `tree.schemas`, plus a `seed_prelude_variants`
 pass that injects `Result<T, E>` / `Option<T>` so prelude types
 match the runtime's view.
 
-Previously the value `Result.Ok { value: "wrong" }` against
+Previously the value `Ok("wrong")` against
 `Result<Int, String>` was caught only at runtime; v1.8 catches it
 statically.
 
@@ -601,10 +583,10 @@ new `walk_path` arms:
 - `List<T>, Index(_)` → `T`. Bounds checks stay runtime's job
   (the literal length isn't tracked in `InferredType`).
 
-The runtime side already handled positional access on a
-`Value::List` (which is what tuples reduce to at runtime), so no
-evaluator changes were needed beyond the v1.7 `("Tuple", List)`
-arm in `schema.rs::check_type`.
+The runtime side now handles positional access on `Value::Tuple`;
+lists remain `Value::List`, and tuple/list only converge when they are
+projected to JSON arrays. The evaluator path no longer relies on the
+old v1.7 `("Tuple", List)` compatibility arm.
 
 ### Test surface
 
@@ -612,8 +594,8 @@ arm in `schema.rs::check_type`.
 
 - 11 fixture tests in `tests/v1_8_fixtures.rs::enum` + `::result`
   covering string-literal alts, heterogeneous alts, primitive
-  alts, list-in-enum-slot rejection, `Result.Ok` /
-  `Result.Err` correct & mistyped, custom `Pair<T, U>` sum-type
+  alts, list-in-enum-slot rejection, `Ok` / `Err` correct &
+  mistyped, custom `Pair<T, U>` sum-type
   variant-generic substitution.
 - 5 unit tests in `typecheck.rs` for the host fn audit (`Any`
   param / return / variadic tail, bare `List` param, clean-signature
@@ -672,7 +654,7 @@ representation for "fixed-length, mixed-element" data. Highlights:
 A new diagnostic `BareGenericContainer { type_name, context, range }`
 (Error severity, mode-agnostic — same status as v1.6's
 `ExplicitAnyForbidden`) fires for every user-written `TypeNode` whose
-single-segment head is `List` / `Dict` / `Closure` / `Fn` / `Enum`
+single-segment head is `List` / `Dict` / `Closure` / `Fn`
 and whose `generics` is empty. The check piggybacks on the existing
 `scan_typenode_for_any` walker so nested occurrences
 (`Dict<String, List>`, `List<Closure>`, …) are caught at every depth.
@@ -1089,8 +1071,8 @@ accepted, as long as it evaluates to a JSON value.
 ### v1.2: open root expression
 
 `parse_base` now accepts any expression at the document root, not
-just dict / list literals. Atomic literals (`42`, `"hello"`, `true`,
-`null`), arithmetic / pipe / ternary expressions, function calls,
+just dict / list literals. Atomic literals (`42`, `"hello"`, `true`), tuple/list/dict literals,
+arithmetic / pipe / ternary expressions, function calls,
 variant constructors (`Result.Ok { value: x }`), references, and the
 rest of the expression precedence chain are all valid roots.
 
@@ -1142,8 +1124,14 @@ schema table:
 
 ```relon
 // definitions live in the prelude — users don't write them
-#schema Result<T, E>: Enum<Ok { T value: * }, Err { E error: * }>
-#schema Option<T>: Enum<Some { T value: * }, None>
+#enum Result<T, E> {
+    Ok { value: T }
+    Err { error: E }
+}
+#enum Option<T> {
+    Some { value: T }
+    None
+}
 ```
 
 These are **value-level** types — used inside data, not as the
@@ -1335,10 +1323,10 @@ file-level marker are both **gone**. Calling `eval_root` on a
 Every `@`-form system attribute → `#`-form directive, e.g.:
 
 ```relon
-// Before
+// Before (legacy @-form syntax)
 @library
 {
-    @schema Order: Enum<Pending, Paid>,
+    @schema Order: { status: String },
     @import("./helpers.relon", spread=true)
     @input(req=Req)
     handler: ...
@@ -1346,7 +1334,7 @@ Every `@`-form system attribute → `#`-form directive, e.g.:
 
 // After
 #import * from "./helpers.relon"
-#schema Order Enum<Pending, Paid>
+#enum Order { Pending, Paid }
 #main(Req req)
 {
     handler: ...
@@ -1575,7 +1563,7 @@ across implementations.
 { "parts": string.split("a,b,c", ",") }
 
 // After:
-@import("std/string", as="string")
+#import string from "std/string"
 { "parts": string.split("a,b,c", ",") }
 ```
 
@@ -1585,7 +1573,7 @@ Every spec-mandated module (`std/list`, `std/string`, `std/dict`,
 
 #### 3. Language-level builtins clearly delineated
 
-Three names remain ambient (no `@import` required), pinned in spec
+Three names remain ambient (no `#import` required), pinned in spec
 §6.1: `len`, `range`, `type`. They are metadata operations on data
 structures themselves, available unconditionally on every conformant
 runtime.
@@ -1637,9 +1625,7 @@ ctx.register_fn_with_caps(
 * `is_valid_identifier` operator-precedence bug fixed (used to accept
   `"!!.bad"` because `chars.all(...) || s.contains('.')` short-circuited
   on any dot).
-* Heterogeneous `Enum` analyzer: now `return false` after pushing the
-  `HeterogeneousEnum` diagnostic so a half-tagged enum doesn't
-  pollute `tree.schemas`.
+* Removed the old exploratory enum analyzer path before it can enter `tree.schemas`.
 * TOCTOU double-lock on `loading_modules` collapsed into a single
   guard.
 * `loading_modules: Mutex<HashSet<String>>` → `Mutex<HashMap<String, usize>>`

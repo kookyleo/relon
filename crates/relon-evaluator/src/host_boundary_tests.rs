@@ -176,7 +176,7 @@ fn host_receives_capability_denied() {
     struct ReadsFs;
     impl RelonFunction for ReadsFs {
         fn call(&self, _args: NativeArgs, _range: TokenRange) -> Result<Value, RuntimeError> {
-            Ok(Value::Null)
+            Ok(Value::option_none())
         }
     }
 
@@ -366,7 +366,7 @@ fn host_receives_capability_denied_for_each_new_bit() {
     struct Stub;
     impl RelonFunction for Stub {
         fn call(&self, _args: NativeArgs, _range: TokenRange) -> Result<Value, RuntimeError> {
-            Ok(Value::Null)
+            Ok(Value::option_none())
         }
     }
 
@@ -439,7 +439,7 @@ fn capability_denied_reports_first_missing_bit() {
     struct Stub;
     impl RelonFunction for Stub {
         fn call(&self, _args: NativeArgs, _range: TokenRange) -> Result<Value, RuntimeError> {
-            Ok(Value::Null)
+            Ok(Value::option_none())
         }
     }
 

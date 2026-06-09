@@ -18,7 +18,7 @@
 use std::collections::HashSet;
 
 use relon_ir::lowering::cap::LOWERING_CAP_IDS;
-use relon_test_harness::ledger::LEDGER;
+use relon_test_harness::ledger::{Status, LEDGER};
 
 #[test]
 fn cap_ids_are_unique() {
@@ -38,6 +38,20 @@ fn ledger_ids_are_unique() {
             entry.id
         );
     }
+}
+
+#[test]
+fn ledger_cap_site_rows_are_all_capped() {
+    let non_capped: Vec<&str> = LEDGER
+        .iter()
+        .filter(|entry| entry.status != Status::Capped)
+        .map(|entry| entry.id)
+        .collect();
+
+    assert!(
+        non_capped.is_empty(),
+        "LEDGER rows must describe cap sites and therefore stay Capped; move covered constructs to SUPPORTED_SURFACE: {non_capped:?}"
+    );
 }
 
 #[test]

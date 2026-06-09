@@ -1,21 +1,22 @@
-//! Type-surface bans: `Any` (v1.6) and bare generics (v1.7).
+//! Type-surface bans: `Any` (v1.6), bare generics (v1.7),
+//! and removed/internal type names (`Null` / `Unit` / `Enum`).
 //!
 //! v1.5 still treated `Any` as a regular builtin type — users could
 //! write `Any payload: ...` or `#main(Any x)` and the analyzer would
 //! happily pass it through, defeating every other strict-mode
 //! guarantee downstream. v1.6 retires `Any` from the user-facing
 //! surface entirely; v1.7 closes the related back-door of bare
-//! generic containers (`List` / `Dict` / `Closure` / `Fn` / `Enum`
-//! without explicit type arguments, which used to silently expand to
-//! `<Any>` shapes); v1.8 extends both bans to host-supplied
+//! generic containers (`List` / `Dict` / `Closure` / `Fn` without explicit
+//! type arguments, which used to silently expand to `<Any>` shapes); v1.8
+//! extends both bans to host-supplied
 //! signatures via `audit_host_fn_signatures` in `lib.rs`.
 //!
 //! Every site where a user-written `TypeNode` appears routes through
 //! [`scan_typenode_for_any`], which walks the node tree (including
 //! nested generics) and pushes [`Diagnostic::ExplicitAnyForbidden`]
-//! for each single-segment `Any` token and
-//! [`Diagnostic::BareGenericContainer`] for each bare-generic
-//! container.
+//! for each single-segment `Any` token,
+//! [`Diagnostic::ReservedTypeName`] for each user-written `Null` / `Unit` / `Enum`,
+//! and [`Diagnostic::BareGenericContainer`] for each bare-generic container.
 //!
 //! Internal-only `Any` (the analyzer's `InferredType::Any`
 //! placeholder for "unknown" / "couldn't infer") is *not* affected.
@@ -45,8 +46,15 @@ pub(crate) fn scan_typenode_for_any(t: &TypeNode, context: &str, out: &mut Vec<D
             range: span_of(t.range),
         });
     }
+    if t.path.len() == 1 && matches!(t.path[0].as_str(), "Null" | "Unit" | "Enum") {
+        out.push(Diagnostic::ReservedTypeName {
+            type_name: t.path[0].clone(),
+            context: context.to_string(),
+            range: span_of(t.range),
+        });
+    }
     // v1.7: bare-generic check piggybacks on the same walk. Bare
-    // `List` / `Dict` / `Closure` / `Fn` / `Enum` (no generic args)
+    // `List` / `Dict` / `Closure` / `Fn` (no generic args)
     // is the back-door equivalent of writing `<Any>` everywhere — the
     // pre-v1.7 `infer_from_type_node` quietly turned them into
     // `List<Any>` / `Dict<Any, Any>` / `Fn(...) -> Any` / `Any`. By
@@ -54,7 +62,7 @@ pub(crate) fn scan_typenode_for_any(t: &TypeNode, context: &str, out: &mut Vec<D
     // forces an explicit type parameter at each occurrence.
     if t.path.len() == 1 && t.generics.is_empty() {
         let name = t.path[0].as_str();
-        if matches!(name, "List" | "Dict" | "Closure" | "Fn" | "Enum") {
+        if matches!(name, "List" | "Dict" | "Closure" | "Fn") {
             out.push(Diagnostic::BareGenericContainer {
                 type_name: name.to_string(),
                 context: context.to_string(),
@@ -87,6 +95,29 @@ mod tests {
         let mut out = Vec::new();
         scan_typenode_for_any(&type_node_simple("Int"), "test", &mut out);
         assert!(out.is_empty());
+    }
+
+    /// Removed/internal names are rejected as user-written type names.
+    #[test]
+    fn null_unit_and_enum_report_reserved_type_name() {
+        let mut out = Vec::new();
+        scan_typenode_for_any(&type_node_simple("Null"), "test", &mut out);
+        scan_typenode_for_any(&type_node_simple("Unit"), "test", &mut out);
+        scan_typenode_for_any(
+            &type_node_generic("Enum", vec![type_node_simple("Int")]),
+            "test",
+            &mut out,
+        );
+        assert_eq!(out.len(), 3);
+        assert!(
+            matches!(out[0], Diagnostic::ReservedTypeName { ref type_name, .. } if type_name == "Null")
+        );
+        assert!(
+            matches!(out[1], Diagnostic::ReservedTypeName { ref type_name, .. } if type_name == "Unit")
+        );
+        assert!(
+            matches!(out[2], Diagnostic::ReservedTypeName { ref type_name, .. } if type_name == "Enum")
+        );
     }
 
     /// `List<Any>` reports once on the inner.

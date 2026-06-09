@@ -29,11 +29,15 @@ use miette::Diagnostic as MietteDiagnostic;
 // `Context::sandboxed()` + `TreeWalkEvaluator::prepare_in_place`,
 // which the facade deliberately doesn't expose.
 use relon::{ResolverChainLoader, RuntimeError, Scope, Value};
-use relon_analyzer::{analyze_entry, Severity};
+use relon_analyzer::{
+    analyze_entry, format_type, substitute_generics_in_typenode, AnalyzedTree, EnumVariant,
+    MainSignature, SchemaDef, SchemaFieldDef, Severity,
+};
 use relon_evaluator::module::{ModuleResolver, ModuleSource, StdModuleResolver};
 use relon_evaluator::{Context, TreeWalkEvaluator};
-use relon_parser::{parse_document, parse_document_recovering, TokenRange};
+use relon_parser::{parse_document, parse_document_recovering, TokenRange, TypeNode};
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 // Re-imported below where `value.serialize(&serializer)` is invoked; the
 // `use serde::Serialize` already in scope satisfies the trait bound.
 use wasm_bindgen::prelude::*;
@@ -375,7 +379,7 @@ pub fn evaluate(sources: JsValue, entry: &str, args: JsValue) -> Result<JsValue,
 ///     JS object here, because object-shaped input would have to pass
 ///     through `serde_wasm_bindgen::from_value` and lose the Int/Float
 ///     distinction at the boundary.
-fn decode_args_json(value: JsValue) -> Result<Option<HashMap<String, Value>>, ErrorReport> {
+fn decode_args_json(value: JsValue) -> Result<Option<JsonValue>, ErrorReport> {
     if value.is_undefined() || value.is_null() {
         return Ok(None);
     }
@@ -393,14 +397,7 @@ fn decode_args_json(value: JsValue) -> Result<Option<HashMap<String, Value>>, Er
     let json: serde_json::Value = serde_json::from_str(trimmed)
         .map_err(|err| ErrorReport::invalid_input(format!("args is not valid JSON: {err}")))?;
     match json {
-        serde_json::Value::Object(_) => {
-            let map = serde_json::from_value(json).map_err(|err| {
-                ErrorReport::invalid_input(format!(
-                    "args must be a JSON object keyed by `#main(...)` parameter names: {err}"
-                ))
-            })?;
-            Ok(Some(map))
-        }
+        serde_json::Value::Object(_) => Ok(Some(json)),
         other => Err(ErrorReport::invalid_input(format!(
             "args: expected JSON object, got {}",
             type_name(&other)
@@ -408,10 +405,722 @@ fn decode_args_json(value: JsValue) -> Result<Option<HashMap<String, Value>>, Er
     }
 }
 
+fn parse_main_args_json_value(
+    args_json: JsonValue,
+    signature: &MainSignature,
+    tree: &AnalyzedTree,
+) -> Result<HashMap<String, Value>, String> {
+    let raw_args = match args_json {
+        JsonValue::Object(map) => map,
+        other => {
+            return Err(format!(
+                "args must be a JSON object keyed by `#main(...)` parameter names; got {}",
+                type_name(&other)
+            ));
+        }
+    };
+    let param_types: HashMap<&str, &TypeNode> = signature
+        .params
+        .iter()
+        .map(|param| (param.name.as_str(), &param.type_node))
+        .collect();
+    let mut args = HashMap::with_capacity(raw_args.len());
+    for (name, json) in raw_args {
+        let value = if let Some(type_hint) = param_types.get(name.as_str()) {
+            let type_hint = *type_hint;
+            decode_json_for_type(json, type_hint, tree).map_err(|e| {
+                format!(
+                    "args value for `{name}` cannot be decoded as {}: {e}",
+                    format_type(type_hint)
+                )
+            })?
+        } else {
+            targetless_json_to_value(json)?
+        };
+        args.insert(name, value);
+    }
+    Ok(args)
+}
+
+fn decode_json_for_type(
+    json: JsonValue,
+    type_hint: &TypeNode,
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    if type_hint.is_optional {
+        let mut inner_type = type_hint.clone();
+        inner_type.is_optional = false;
+        return decode_json_for_option(json, Some(&inner_type), tree);
+    }
+
+    if type_key(type_hint) == "Option" {
+        return decode_json_for_option(json, type_hint.generics.first(), tree);
+    }
+
+    if type_key(type_hint) == "Result" {
+        return decode_json_for_result(
+            json,
+            type_hint.generics.first(),
+            type_hint.generics.get(1),
+            tree,
+        );
+    }
+
+    if let Some(value) = decode_json_for_builtin_scalar(json.clone(), type_hint) {
+        return value;
+    }
+
+    match type_key(type_hint).as_str() {
+        "Tuple" => decode_json_array_as_tuple_or_targetless(json, &type_hint.generics, tree),
+        "List" => decode_json_array_as_list_or_targetless(json, type_hint.generics.first(), tree),
+        "Dict" => decode_json_object_as_dict_or_targetless(json, type_hint.generics.get(1), tree),
+        "Enum" => decode_json_for_enum(json, type_hint, tree),
+        _ => {
+            if let Some(def) = schema_def_for_type(type_hint, tree) {
+                if !def.variants.is_empty() {
+                    return decode_json_for_tagged_enum_schema(json, type_hint, def, tree);
+                }
+            }
+            if let Some(elements) = schema_tuple_elements_for_type(type_hint, tree) {
+                decode_json_array_as_tuple_or_targetless(json, &elements, tree)
+            } else if let Some(fields) = schema_fields_for_type(type_hint, tree) {
+                decode_json_object_as_schema_or_targetless(json, &fields, tree)
+            } else {
+                targetless_json_to_value(json)
+            }
+        }
+    }
+}
+
+fn decode_json_for_builtin_scalar(
+    json: JsonValue,
+    type_hint: &TypeNode,
+) -> Option<Result<Value, String>> {
+    match type_key(type_hint).as_str() {
+        "Any" => Some(targetless_json_to_value(json)),
+        "Bool" => Some(match json {
+            JsonValue::Bool(value) => Ok(Value::Bool(value)),
+            other => Err(format!("expected JSON bool, got {}", type_name(&other))),
+        }),
+        "Int" => Some(match json {
+            JsonValue::Number(value) => value
+                .as_i64()
+                .map(Value::Int)
+                .ok_or_else(|| "expected JSON integer in i64 range".to_string()),
+            other => Err(format!("expected JSON integer, got {}", type_name(&other))),
+        }),
+        "Float" => Some(match json {
+            JsonValue::Number(value) => value
+                .as_f64()
+                .map(|value| Value::Float(value.into()))
+                .ok_or_else(|| "expected finite JSON number".to_string()),
+            other => Err(format!("expected JSON number, got {}", type_name(&other))),
+        }),
+        "Number" => Some(match json {
+            JsonValue::Number(value) => {
+                if let Some(int) = value.as_i64() {
+                    Ok(Value::Int(int))
+                } else {
+                    value
+                        .as_f64()
+                        .map(|value| Value::Float(value.into()))
+                        .ok_or_else(|| "expected finite JSON number".to_string())
+                }
+            }
+            other => Err(format!("expected JSON number, got {}", type_name(&other))),
+        }),
+        "String" => Some(match json {
+            JsonValue::String(value) => Ok(Value::String(value.into())),
+            other => Err(format!("expected JSON string, got {}", type_name(&other))),
+        }),
+        _ => None,
+    }
+}
+
+fn decode_json_for_option(
+    json: JsonValue,
+    inner_type: Option<&TypeNode>,
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    match json {
+        JsonValue::Null => Ok(Value::option_none()),
+        JsonValue::String(name) if name == "None" => Ok(Value::option_none()),
+        JsonValue::Object(mut map) if map.len() == 1 && map.contains_key("None") => {
+            let payload = map.remove("None").expect("checked None payload");
+            match payload {
+                JsonValue::Null => Ok(Value::option_none()),
+                JsonValue::Object(obj) if obj.is_empty() => Ok(Value::option_none()),
+                _ => Err("Option.None expects null or an empty object payload".to_string()),
+            }
+        }
+        JsonValue::Object(mut map) if map.len() == 1 && map.contains_key("Some") => {
+            let payload = map.remove("Some").expect("checked Some payload");
+            decode_json_single_payload(payload, "value", inner_type, tree).map(Value::option_some)
+        }
+        other => {
+            decode_json_single_payload(other, "value", inner_type, tree).map(Value::option_some)
+        }
+    }
+}
+
+fn decode_json_for_result(
+    json: JsonValue,
+    ok_type: Option<&TypeNode>,
+    err_type: Option<&TypeNode>,
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    let JsonValue::Object(mut map) = json else {
+        return Err(
+            r#"Result<T, E> expects an externally tagged object: {"Ok": ...} or {"Err": ...}"#
+                .to_string(),
+        );
+    };
+    if map.len() != 1 {
+        return Err("Result<T, E> expects exactly one variant key: Ok or Err".to_string());
+    }
+    if let Some(payload) = map.remove("Ok") {
+        return decode_json_single_payload(payload, "value", ok_type, tree).map(Value::result_ok);
+    }
+    if let Some(payload) = map.remove("Err") {
+        return decode_json_single_payload(payload, "error", err_type, tree).map(Value::result_err);
+    }
+    let name = map.keys().next().cloned().unwrap_or_default();
+    Err(format!(
+        "object key `{name}` is not a Result variant; expected Ok or Err"
+    ))
+}
+
+fn decode_json_single_payload(
+    payload: JsonValue,
+    field_name: &str,
+    field_type: Option<&TypeNode>,
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    let Some(field_type) = field_type else {
+        return targetless_json_to_value(payload);
+    };
+    match decode_json_for_type(payload.clone(), field_type, tree) {
+        Ok(value) => Ok(value),
+        Err(direct_err) => match payload {
+            JsonValue::Object(mut map) if map.len() == 1 && map.contains_key(field_name) => {
+                let inner = map.remove(field_name).expect("checked payload field");
+                decode_json_for_type(inner, field_type, tree)
+            }
+            _ => Err(direct_err),
+        },
+    }
+}
+
+fn decode_json_array_as_tuple_or_targetless(
+    json: JsonValue,
+    element_types: &[TypeNode],
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    match json {
+        JsonValue::Array(items) => {
+            let mut values = Vec::with_capacity(items.len());
+            for (idx, item) in items.into_iter().enumerate() {
+                let value = match element_types.get(idx) {
+                    Some(slot_type) => decode_json_for_type(item, slot_type, tree)?,
+                    None => targetless_json_to_value(item)?,
+                };
+                values.push(value);
+            }
+            Ok(Value::tuple(values))
+        }
+        other => targetless_json_to_value(other),
+    }
+}
+
+fn decode_json_array_as_list_or_targetless(
+    json: JsonValue,
+    item_type: Option<&TypeNode>,
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    match json {
+        JsonValue::Array(items) => {
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                let value = match item_type {
+                    Some(item_type) => decode_json_for_type(item, item_type, tree)?,
+                    None => targetless_json_to_value(item)?,
+                };
+                values.push(value);
+            }
+            Ok(Value::list(values))
+        }
+        other => targetless_json_to_value(other),
+    }
+}
+
+fn decode_json_object_as_dict_or_targetless(
+    json: JsonValue,
+    value_type: Option<&TypeNode>,
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    match json {
+        JsonValue::Object(map) => {
+            let mut values = Vec::with_capacity(map.len());
+            for (key, item) in map {
+                let value = match value_type {
+                    Some(value_type) => decode_json_for_type(item, value_type, tree)?,
+                    None => targetless_json_to_value(item)?,
+                };
+                values.push((key, value));
+            }
+            Ok(Value::dict(values))
+        }
+        other => targetless_json_to_value(other),
+    }
+}
+
+fn decode_json_object_as_schema_or_targetless(
+    json: JsonValue,
+    field_types: &HashMap<String, TypeNode>,
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    match json {
+        JsonValue::Object(map) => {
+            let mut values = Vec::with_capacity(map.len());
+            for (key, item) in map {
+                let value = match field_types.get(&key) {
+                    Some(field_type) => decode_json_for_type(item, field_type, tree)?,
+                    None => targetless_json_to_value(item)?,
+                };
+                values.push((key, value));
+            }
+            Ok(Value::dict(values))
+        }
+        other => targetless_json_to_value(other),
+    }
+}
+
+fn decode_json_for_tagged_enum_schema(
+    json: JsonValue,
+    type_hint: &TypeNode,
+    def: &SchemaDef,
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    let enum_name = def.name.clone().unwrap_or_else(|| type_key(type_hint));
+
+    match json {
+        JsonValue::String(name) => decode_enum_variant_string(name, def, enum_name),
+        JsonValue::Object(map) => {
+            if map.len() != 1 {
+                return Err(format!(
+                    "enum `{enum_name}` expects an externally tagged object with exactly one variant key"
+                ));
+            }
+            let (name, payload) = map.into_iter().next().expect("len checked above");
+            let matching: Vec<_> = def
+                .variants
+                .iter()
+                .filter(|variant| variant.name == name)
+                .collect();
+            match matching.as_slice() {
+                [variant] => decode_externally_tagged_enum_variant_payload(
+                    payload, type_hint, def, variant, &enum_name, tree,
+                ),
+                [] => Err(format!(
+                    "object tag `{name}` does not name a variant of enum `{enum_name}`"
+                )),
+                _ => Err(format!(
+                    "object tag `{name}` is ambiguous for enum `{enum_name}`"
+                )),
+            }
+        }
+        other => targetless_json_to_value(other),
+    }
+}
+
+fn decode_enum_variant_string(
+    name: String,
+    def: &SchemaDef,
+    enum_name: String,
+) -> Result<Value, String> {
+    let matching: Vec<_> = def
+        .variants
+        .iter()
+        .filter(|variant| variant.name == name)
+        .collect();
+    match matching.as_slice() {
+        [variant] if variant.fields.is_empty() => Ok(Value::variant_dict(
+            Vec::<(String, Value)>::new(),
+            variant.name.clone(),
+            enum_name,
+        )),
+        [variant] => Err(format!(
+            "string `{}` names enum variant `{}` but that variant requires payload fields",
+            name, variant.name
+        )),
+        [] => Err(format!(
+            "string `{name}` does not name a unit variant of enum `{enum_name}`"
+        )),
+        _ => Err(format!(
+            "string `{name}` is ambiguous for enum `{enum_name}`"
+        )),
+    }
+}
+
+fn decode_externally_tagged_enum_variant_payload(
+    payload: JsonValue,
+    type_hint: &TypeNode,
+    def: &SchemaDef,
+    variant: &EnumVariant,
+    enum_name: &str,
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    if variant.fields.is_empty() {
+        return decode_externally_tagged_unit_variant_payload(payload, variant, enum_name);
+    }
+
+    if let Some(tuple_fields) = tuple_enum_variant_fields(variant) {
+        return decode_externally_tagged_tuple_variant_payload(
+            payload,
+            type_hint,
+            def,
+            variant,
+            enum_name,
+            tree,
+            &tuple_fields,
+        );
+    }
+
+    decode_externally_tagged_struct_variant_payload(
+        payload, type_hint, def, variant, enum_name, tree,
+    )
+}
+
+fn decode_externally_tagged_unit_variant_payload(
+    payload: JsonValue,
+    variant: &EnumVariant,
+    enum_name: &str,
+) -> Result<Value, String> {
+    match payload {
+        JsonValue::Object(map) if map.is_empty() => Ok(Value::variant_dict(
+            Vec::<(String, Value)>::new(),
+            variant.name.clone(),
+            enum_name.to_string(),
+        )),
+        other => Err(format!(
+            "variant `{}` is a unit variant; expected empty object payload, got {}",
+            variant.name,
+            type_name(&other)
+        )),
+    }
+}
+
+fn decode_externally_tagged_struct_variant_payload(
+    payload: JsonValue,
+    type_hint: &TypeNode,
+    def: &SchemaDef,
+    variant: &EnumVariant,
+    enum_name: &str,
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    let map = match payload {
+        JsonValue::Object(map) => map,
+        other => {
+            return Err(format!(
+                "variant `{}` expects object payload, got {}",
+                variant.name,
+                type_name(&other)
+            ));
+        }
+    };
+    let mut map = map;
+    let mut values = Vec::with_capacity(variant.fields.len());
+    for field in &variant.fields {
+        let item = map.remove(&field.name).ok_or_else(|| {
+            format!(
+                "enum variant `{}` is missing field `{}`",
+                variant.name, field.name
+            )
+        })?;
+        let field_type = variant_field_type(field, def, type_hint).ok_or_else(|| {
+            format!(
+                "enum variant `{}` field `{}` has no static type",
+                variant.name, field.name
+            )
+        })?;
+        values.push((
+            field.name.clone(),
+            decode_json_for_type(item, &field_type, tree)?,
+        ));
+    }
+    if !map.is_empty() {
+        let mut names: Vec<_> = map.keys().cloned().collect();
+        names.sort();
+        return Err(format!(
+            "enum variant `{}` received unknown field(s): {}",
+            variant.name,
+            names.join(", ")
+        ));
+    }
+    Ok(Value::variant_dict(
+        values,
+        variant.name.clone(),
+        enum_name.to_string(),
+    ))
+}
+
+fn decode_externally_tagged_tuple_variant_payload(
+    payload: JsonValue,
+    type_hint: &TypeNode,
+    def: &SchemaDef,
+    variant: &EnumVariant,
+    enum_name: &str,
+    tree: &AnalyzedTree,
+    fields: &[&SchemaFieldDef],
+) -> Result<Value, String> {
+    let items = match payload {
+        JsonValue::Array(items) => items,
+        other => {
+            return Err(format!(
+                "variant `{}` expects array payload, got {}",
+                variant.name,
+                type_name(&other)
+            ));
+        }
+    };
+    if items.len() != fields.len() {
+        return Err(format!(
+            "variant `{}` expects {} payload item(s), got {}",
+            variant.name,
+            fields.len(),
+            items.len()
+        ));
+    }
+
+    let mut values = Vec::with_capacity(items.len());
+    for (item, field) in items.into_iter().zip(fields.iter()) {
+        let value = match variant_field_type(field, def, type_hint) {
+            Some(field_type) => decode_json_for_type(item, &field_type, tree)?,
+            None => targetless_json_to_value(item)?,
+        };
+        values.push((field.name.clone(), value));
+    }
+    Ok(Value::variant_dict(
+        values,
+        variant.name.clone(),
+        enum_name.to_string(),
+    ))
+}
+
+fn tuple_enum_variant_fields(variant: &EnumVariant) -> Option<Vec<&SchemaFieldDef>> {
+    let mut indexed = Vec::with_capacity(variant.fields.len());
+    for field in &variant.fields {
+        let Ok(index) = field.name.parse::<usize>() else {
+            return None;
+        };
+        indexed.push((index, field));
+    }
+    indexed.sort_by_key(|(index, _)| *index);
+    indexed
+        .iter()
+        .enumerate()
+        .all(|(expected, (actual, _))| expected == *actual)
+        .then(|| indexed.into_iter().map(|(_, field)| field).collect())
+}
+
+fn variant_field_type(
+    field: &SchemaFieldDef,
+    def: &SchemaDef,
+    type_hint: &TypeNode,
+) -> Option<TypeNode> {
+    field
+        .type_hint
+        .as_ref()
+        .map(|field_type| substitute_schema_type(field_type, &def.generics, &type_hint.generics))
+}
+
+fn decode_json_for_enum(
+    json: JsonValue,
+    type_hint: &TypeNode,
+    tree: &AnalyzedTree,
+) -> Result<Value, String> {
+    let arity = match &json {
+        JsonValue::Array(items) => items.len(),
+        _ => return targetless_json_to_value(json),
+    };
+    let matching_tuple_alts: Vec<&TypeNode> = type_hint
+        .generics
+        .iter()
+        .filter(|alt| type_accepts_tuple_array(alt, arity, tree))
+        .collect();
+    if matching_tuple_alts.len() == 1 {
+        decode_json_for_type(json, matching_tuple_alts[0], tree)
+    } else {
+        targetless_json_to_value(json)
+    }
+}
+
+fn type_accepts_tuple_array(type_hint: &TypeNode, arity: usize, tree: &AnalyzedTree) -> bool {
+    if type_key(type_hint) == "Tuple" {
+        return type_hint.generics.len() == arity;
+    }
+    matches!(
+        schema_tuple_elements_for_type(type_hint, tree),
+        Some(elements) if elements.len() == arity
+    )
+}
+
+fn targetless_json_to_value(json: JsonValue) -> Result<Value, String> {
+    if json.is_null() {
+        return Err("JSON null needs an Option<T> or T? target type".to_string());
+    }
+    serde_json::from_value::<Value>(json).map_err(|e| format!("invalid JSON value: {e}"))
+}
+
+fn schema_tuple_elements_for_type(
+    type_hint: &TypeNode,
+    tree: &AnalyzedTree,
+) -> Option<Vec<TypeNode>> {
+    if let Some(def) = local_schema_def_for_type(type_hint, tree) {
+        if let Some(elements) = &def.tuple_elements {
+            return Some(substitute_schema_types(
+                elements,
+                &def.generics,
+                &type_hint.generics,
+            ));
+        }
+    }
+    let key = type_key(type_hint);
+    let imports = tree.workspace_import_index.as_ref()?;
+    let elements = imports.imported_tuple_schemas.get(&key)?;
+    let generics = imports
+        .imported_schema_generics
+        .get(&key)
+        .cloned()
+        .unwrap_or_default();
+    Some(substitute_schema_types(
+        elements,
+        &generics,
+        &type_hint.generics,
+    ))
+}
+
+fn schema_fields_for_type(
+    type_hint: &TypeNode,
+    tree: &AnalyzedTree,
+) -> Option<HashMap<String, TypeNode>> {
+    if let Some(def) = local_schema_def_for_type(type_hint, tree) {
+        return Some(substitute_schema_fields_from_def(def, &type_hint.generics));
+    }
+    let key = type_key(type_hint);
+    let imports = tree.workspace_import_index.as_ref()?;
+    let fields = imports.imported_schemas.get(&key)?;
+    let generics = imports
+        .imported_schema_generics
+        .get(&key)
+        .cloned()
+        .unwrap_or_default();
+    Some(substitute_schema_fields(
+        fields,
+        &generics,
+        &type_hint.generics,
+    ))
+}
+
+fn local_schema_def_for_type<'a>(
+    type_hint: &TypeNode,
+    tree: &'a AnalyzedTree,
+) -> Option<&'a SchemaDef> {
+    if type_hint.path.len() != 1 {
+        return None;
+    }
+    let name = &type_hint.path[0];
+    let decl = tree.root_schemas.iter().find(|decl| &decl.name == name)?;
+    tree.schemas.get(&decl.schema_node.id)
+}
+
+fn schema_def_for_type<'a>(type_hint: &TypeNode, tree: &'a AnalyzedTree) -> Option<&'a SchemaDef> {
+    if let Some(def) = local_schema_def_for_type(type_hint, tree) {
+        return Some(def);
+    }
+    let key = type_key(type_hint);
+    tree.workspace_import_index
+        .as_ref()?
+        .imported_schema_defs
+        .get(&key)
+}
+
+fn substitute_schema_fields_from_def(
+    def: &SchemaDef,
+    concrete_args: &[TypeNode],
+) -> HashMap<String, TypeNode> {
+    let fields = def.fields.iter().filter_map(|field| {
+        let type_hint = field.type_hint.as_ref()?;
+        Some((field.name.clone(), type_hint.clone()))
+    });
+    substitute_schema_fields_from_iter(fields, &def.generics, concrete_args)
+}
+
+fn substitute_schema_fields(
+    fields: &HashMap<String, TypeNode>,
+    generic_names: &[String],
+    concrete_args: &[TypeNode],
+) -> HashMap<String, TypeNode> {
+    substitute_schema_fields_from_iter(
+        fields
+            .iter()
+            .map(|(name, type_hint)| (name.clone(), type_hint.clone())),
+        generic_names,
+        concrete_args,
+    )
+}
+
+fn substitute_schema_fields_from_iter(
+    fields: impl Iterator<Item = (String, TypeNode)>,
+    generic_names: &[String],
+    concrete_args: &[TypeNode],
+) -> HashMap<String, TypeNode> {
+    fields
+        .map(|(name, type_hint)| {
+            (
+                name,
+                substitute_schema_type(&type_hint, generic_names, concrete_args),
+            )
+        })
+        .collect()
+}
+
+fn substitute_schema_types(
+    types: &[TypeNode],
+    generic_names: &[String],
+    concrete_args: &[TypeNode],
+) -> Vec<TypeNode> {
+    types
+        .iter()
+        .map(|type_hint| substitute_schema_type(type_hint, generic_names, concrete_args))
+        .collect()
+}
+
+fn substitute_schema_type(
+    type_hint: &TypeNode,
+    generic_names: &[String],
+    concrete_args: &[TypeNode],
+) -> TypeNode {
+    let subst: HashMap<String, TypeNode> = generic_names
+        .iter()
+        .cloned()
+        .zip(concrete_args.iter().cloned())
+        .collect();
+    if subst.is_empty() {
+        type_hint.clone()
+    } else {
+        substitute_generics_in_typenode(type_hint, &subst)
+    }
+}
+
+fn type_key(type_hint: &TypeNode) -> String {
+    type_hint.path.join(".")
+}
+
 fn evaluate_internal(
     sources: &HashMap<String, String>,
     entry: &str,
-    args: Option<HashMap<String, Value>>,
+    args: Option<JsonValue>,
 ) -> Result<serde_json::Value, ErrorReport> {
     let source = sources.get(entry).ok_or_else(|| {
         ErrorReport::invalid_input(format!(
@@ -453,6 +1162,24 @@ fn evaluate_internal(
     if workspace.has_errors() {
         return Err(workspace_to_report(&workspace));
     }
+
+    let args = match args {
+        Some(args_json) => {
+            let entry_tree = workspace.entry_tree().ok_or_else(|| {
+                ErrorReport::invalid_input("workspace analysis did not produce an entry tree")
+            })?;
+            let signature = entry_tree.main_signature.as_ref().ok_or_else(|| {
+                ErrorReport::invalid_input(
+                    "args were provided but the entry file has no `#main(...)` signature",
+                )
+            })?;
+            Some(
+                parse_main_args_json_value(args_json, signature, entry_tree)
+                    .map_err(|err| ErrorReport::invalid_input(format!("args: {err}")))?,
+            )
+        }
+        None => None,
+    };
 
     let entry_node = workspace
         .nodes
@@ -1500,6 +2227,262 @@ mod tests {
             serde_json::json!({
                 "greeting": "hi, world"
             })
+        );
+    }
+
+    #[test]
+    fn main_args_json_null_decodes_as_option_none_when_typed() {
+        let sources = single_file("#main(Option<Int> maybe) -> Option<Int>\nmaybe\n");
+        let value = evaluate_internal(
+            &sources,
+            "main.relon",
+            Some(serde_json::json!({ "maybe": null })),
+        )
+        .unwrap();
+        assert_eq!(value, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn main_args_targetless_json_null_is_rejected() {
+        let sources = single_file("#main(Int x) -> Int\nx\n");
+        let err = evaluate_internal(
+            &sources,
+            "main.relon",
+            Some(serde_json::json!({ "x": 1, "extra": null })),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::InvalidInput);
+        assert!(
+            err.message
+                .contains("JSON null needs an Option<T> or T? target type"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn main_args_targetless_nested_json_null_is_rejected() {
+        let sources = single_file("#main(Int x) -> Int\nx\n");
+        let err = evaluate_internal(
+            &sources,
+            "main.relon",
+            Some(serde_json::json!({ "x": 1, "extra": { "k": null } })),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::InvalidInput);
+        assert!(
+            err.message.contains("JSON null is not a Relon value")
+                || err
+                    .message
+                    .contains("JSON null needs an Option<T> or T? target type"),
+            "unexpected message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn main_args_decode_nested_tuple_list_and_option() {
+        let sources = single_file(
+            "#main(Tuple<Int, List<String>, Tuple<Bool, Option<Int>>> t) \
+             -> Tuple<Int, List<String>, Tuple<Bool, Option<Int>>>\n\
+             t\n",
+        );
+        let value = evaluate_internal(
+            &sources,
+            "main.relon",
+            Some(serde_json::json!({ "t": [7, ["a", "b"], [true, null]] })),
+        )
+        .unwrap();
+        assert_eq!(value, serde_json::json!([7, ["a", "b"], [true, null]]));
+    }
+
+    #[test]
+    fn evaluates_rust_like_tuple_enum_variant() {
+        let sources = single_file(
+            "#enum Packet { Pair(Int, String), Empty }
+Packet.Pair(7, \"x\")
+",
+        );
+        let value = evaluate_internal(&sources, "main.relon", None).unwrap();
+        assert_eq!(value, serde_json::json!({ "Pair": [7, "x"] }));
+    }
+
+    #[test]
+    fn main_args_decode_unit_enum_variant_from_string() {
+        let sources = single_file(
+            "#enum Stat { Up, Down }
+#main(Stat s) -> Stat
+s
+",
+        );
+        let value = evaluate_internal(
+            &sources,
+            "main.relon",
+            Some(serde_json::json!({ "s": "Up" })),
+        )
+        .unwrap();
+        assert_eq!(value, serde_json::json!({ "Up": {} }));
+    }
+
+    #[test]
+    fn main_args_decode_option_some_externally_tagged_payload() {
+        let sources = single_file(
+            "#main(Option<Int> x) -> Int
+             x match { Some(v): v + 1, None: 0 }
+",
+        );
+        let value = evaluate_internal(
+            &sources,
+            "main.relon",
+            Some(serde_json::json!({ "x": { "Some": { "value": 41 } } })),
+        )
+        .unwrap();
+        assert_eq!(value, serde_json::json!(42));
+    }
+
+    #[test]
+    fn main_args_decode_result_ok_externally_tagged_payload() {
+        let sources = single_file(
+            "#main(Result<Int, String> r) -> Int
+             r match { Ok(v): v + 1, Err(e): 0 }
+",
+        );
+        let value = evaluate_internal(
+            &sources,
+            "main.relon",
+            Some(serde_json::json!({ "r": { "Ok": { "value": 41 } } })),
+        )
+        .unwrap();
+        assert_eq!(value, serde_json::json!(42));
+    }
+
+    #[test]
+    fn main_args_decode_optional_shorthand_to_option_value() {
+        let sources = single_file(
+            "#main(Int? x) -> Int
+             x match { Some(v): v + 1, None: 0 }
+",
+        );
+        let some = evaluate_internal(&sources, "main.relon", Some(serde_json::json!({ "x": 41 })))
+            .unwrap();
+        assert_eq!(some, serde_json::json!(42));
+
+        let none = evaluate_internal(
+            &sources,
+            "main.relon",
+            Some(serde_json::json!({ "x": null })),
+        )
+        .unwrap();
+        assert_eq!(none, serde_json::json!(0));
+    }
+
+    #[test]
+    fn main_args_decode_externally_tagged_payload_enum_variants() {
+        let sources = single_file(
+            "#enum Msg { Email { address: String }, Pair(Int, String), Push }
+#main(Msg m) -> Msg
+m
+",
+        );
+
+        let email = evaluate_internal(
+            &sources,
+            "main.relon",
+            Some(serde_json::json!({ "m": { "Email": { "address": "a" } } })),
+        )
+        .unwrap();
+        assert_eq!(email, serde_json::json!({ "Email": { "address": "a" } }));
+
+        let pair = evaluate_internal(
+            &sources,
+            "main.relon",
+            Some(serde_json::json!({ "m": { "Pair": [1, "x"] } })),
+        )
+        .unwrap();
+        assert_eq!(pair, serde_json::json!({ "Pair": [1, "x"] }));
+
+        let push = evaluate_internal(
+            &sources,
+            "main.relon",
+            Some(serde_json::json!({ "m": "Push" })),
+        )
+        .unwrap();
+        assert_eq!(push, serde_json::json!({ "Push": {} }));
+    }
+
+    #[test]
+    fn main_args_decode_spread_imported_unit_enum_variant_from_string() {
+        let mut sources = HashMap::new();
+        sources.insert(
+            "main.relon".to_string(),
+            "#import * from \"./lib.relon\"
+#main(Stat s) -> Stat
+s
+"
+            .to_string(),
+        );
+        sources.insert(
+            "lib.relon".to_string(),
+            "#enum Stat { Up, Down }
+{}
+"
+            .to_string(),
+        );
+        let value = evaluate_internal(
+            &sources,
+            "main.relon",
+            Some(serde_json::json!({ "s": "Up" })),
+        )
+        .unwrap();
+        assert_eq!(value, serde_json::json!({ "Up": {} }));
+    }
+
+    #[test]
+    fn main_args_decode_alias_imported_unit_enum_variant_from_string() {
+        let mut sources = HashMap::new();
+        sources.insert(
+            "main.relon".to_string(),
+            "#import lib from \"./lib.relon\"
+#main(lib.Stat s) -> lib.Stat
+s
+"
+            .to_string(),
+        );
+        sources.insert(
+            "lib.relon".to_string(),
+            "#enum Stat { Up, Down }
+{}
+"
+            .to_string(),
+        );
+        let value = evaluate_internal(
+            &sources,
+            "main.relon",
+            Some(serde_json::json!({ "s": "Down" })),
+        )
+        .unwrap();
+        assert_eq!(value, serde_json::json!({ "Down": {} }));
+    }
+
+    #[test]
+    fn main_args_reject_payload_enum_variant_from_string() {
+        let sources = single_file(
+            "#enum Msg { Email { address: String }, Pair(Int, String), Push }
+#main(Msg m) -> String
+\"ok\"
+",
+        );
+        let err = evaluate_internal(
+            &sources,
+            "main.relon",
+            Some(serde_json::json!({ "m": "Email" })),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::InvalidInput);
+        assert!(
+            err.message.contains("requires payload fields"),
+            "unexpected message: {}",
+            err.message
         );
     }
 

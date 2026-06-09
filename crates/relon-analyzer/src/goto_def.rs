@@ -205,11 +205,12 @@ fn children(node: &Node) -> Vec<&Node> {
         }
         Expr::Closure { body, .. } => out.push(body),
         Expr::VariantCtor { body, .. } => out.push(body),
+        Expr::VariantPattern { .. } => {}
         Expr::Reference { .. }
         | Expr::Variable(_)
         | Expr::Type(_)
         | Expr::Wildcard
-        | Expr::Null
+        | Expr::Missing
         | Expr::Bool(_)
         | Expr::Int(_)
         | Expr::Float(_)

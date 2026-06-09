@@ -2480,6 +2480,174 @@ fn list_filter_body_typed(
     ]
 }
 
+/// Filter a pointer-array list (`List<Enum>`, `List<Option<_>>`,
+/// `List<Result<_, _>>`, `List<Schema>`, or nested pointer-list values).
+/// The closure receives each element handle as an arena-relative `I32` and
+/// the result is a new pointer-array list in scratch.
+fn list_pointer_filter_body() -> Vec<TaggedOp> {
+    const N: u32 = 0;
+    const I: u32 = 1;
+    const SRC_PAYLOAD: u32 = 2;
+    const DST_PAYLOAD: u32 = 3;
+    const NEW_BASE: u32 = 4;
+    const OUT_COUNT: u32 = 5;
+    const CUR_VAL: u32 = 6;
+    const SINK: u32 = 7;
+    vec![
+        tt(Op::LocalGet(0)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(4)),
+        tt(Op::LetGet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(4)),
+        tt(Op::Mul(IrType::I32)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::AllocScratchDyn),
+        tt(Op::LetSet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::LocalGet(0)),
+        tt(Op::ConstI32(4)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::LetSet {
+            idx: SRC_PAYLOAD,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(4)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::LetSet {
+            idx: DST_PAYLOAD,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: I,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: OUT_COUNT,
+            ty: IrType::I32,
+        }),
+        tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
+                result_ty: None,
+                body: vec![
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: N,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Ge(IrType::I32)),
+                    tt(Op::BrIf { label_depth: 1 }),
+                    tt(Op::LetGet {
+                        idx: SRC_PAYLOAD,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(4)),
+                    tt(Op::Mul(IrType::I32)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LoadI32AtAbsolute { offset: 0 }),
+                    tt(Op::LetSet {
+                        idx: CUR_VAL,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LocalGet(1)),
+                    tt(Op::LetGet {
+                        idx: CUR_VAL,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::CallClosure {
+                        param_tys: vec![IrType::I32],
+                        ret_ty: IrType::Bool,
+                    }),
+                    tt(Op::If {
+                        result_ty: IrType::I32,
+                        then_body: vec![
+                            tt(Op::LetGet {
+                                idx: DST_PAYLOAD,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::LetGet {
+                                idx: OUT_COUNT,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(4)),
+                            tt(Op::Mul(IrType::I32)),
+                            tt(Op::Add(IrType::I32)),
+                            tt(Op::LetGet {
+                                idx: CUR_VAL,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::StoreI32AtAbsolute { offset: 0 }),
+                            tt(Op::LetGet {
+                                idx: OUT_COUNT,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(1)),
+                            tt(Op::Add(IrType::I32)),
+                            tt(Op::LetSet {
+                                idx: OUT_COUNT,
+                                ty: IrType::I32,
+                            }),
+                            tt(Op::ConstI32(0)),
+                        ],
+                        else_body: vec![tt(Op::ConstI32(0))],
+                    }),
+                    tt(Op::LetSet {
+                        idx: SINK,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(1)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        tt(Op::LetGet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: OUT_COUNT,
+            ty: IrType::I32,
+        }),
+        tt(Op::StoreI32AtAbsolute { offset: 0 }),
+        tt(Op::LetGet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::Return),
+    ]
+}
+
 /// Shared fold body parameterised by the element / accumulator
 /// representation (Int -> `I64`, Float -> `F64`). The accumulator and
 /// each element share `acc_ty`; the closure is `(acc_ty, acc_ty) ->
@@ -2646,6 +2814,16 @@ pub(super) fn list_float_filter() -> StdlibFunction {
                 IrType::F64,
             )
         },
+    )
+}
+
+/// `list_list_filter(xs: ListList, f: Closure<I32 -> Bool>) -> ListList`.
+pub(super) fn list_list_filter() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_list_filter",
+        vec![IrType::ListList, IrType::Closure],
+        IrType::ListList,
+        list_pointer_filter_body,
     )
 }
 
@@ -2912,6 +3090,215 @@ pub(super) fn list_float_map_to_string() -> StdlibFunction {
                 IrType::F64,
                 8,
                 true,
+            )
+        },
+    )
+}
+
+/// Shared body for `map` forms whose closure returns a variant record
+/// pointer, for example `List<Int>.map((x) => Some(x))` or
+/// `List<Int>.map((x) => x > 0 ? Stat.Up : Stat.Down)`. The result is a
+/// 4-byte pointer-array list `[count][off_i]...`, matching the host
+/// buffer representation for `List<Option<T>>`, `List<Result<T, E>>`, and
+/// `List<CustomEnum>`.
+fn list_map_to_variant_list_body(
+    load_elem: fn(u32) -> Op,
+    param_ty: IrType,
+    src_stride: i32,
+    src_8aligned: bool,
+) -> Vec<TaggedOp> {
+    const N: u32 = 0;
+    const I: u32 = 1;
+    const SRC_PAYLOAD: u32 = 2;
+    const DST_PAYLOAD: u32 = 3;
+    const NEW_BASE: u32 = 4;
+    let src_payload_setup: Vec<TaggedOp> = if src_8aligned {
+        vec![
+            tt(Op::LocalGet(0)),
+            tt(Op::ConstI32(4 + 7)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::ConstI32(-8)),
+            tt(Op::BitAnd(IrType::I32)),
+            tt(Op::LetSet {
+                idx: SRC_PAYLOAD,
+                ty: IrType::I32,
+            }),
+        ]
+    } else {
+        vec![
+            tt(Op::LocalGet(0)),
+            tt(Op::ConstI32(4)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::LetSet {
+                idx: SRC_PAYLOAD,
+                ty: IrType::I32,
+            }),
+        ]
+    };
+    let mut body = vec![
+        tt(Op::LocalGet(0)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(8)),
+        tt(Op::LetGet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(4)),
+        tt(Op::Mul(IrType::I32)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::AllocScratchDyn),
+        tt(Op::ConstI32(3)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::ConstI32(-4)),
+        tt(Op::BitAnd(IrType::I32)),
+        tt(Op::LetSet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::LetGet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        tt(Op::StoreI32AtAbsolute { offset: 0 }),
+    ];
+    body.extend(src_payload_setup);
+    body.extend([
+        tt(Op::LetGet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(4)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::LetSet {
+            idx: DST_PAYLOAD,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: I,
+            ty: IrType::I32,
+        }),
+        tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
+                result_ty: None,
+                body: vec![
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: N,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Ge(IrType::I32)),
+                    tt(Op::BrIf { label_depth: 1 }),
+                    tt(Op::LetGet {
+                        idx: DST_PAYLOAD,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(4)),
+                    tt(Op::Mul(IrType::I32)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LocalGet(1)),
+                    tt(Op::LetGet {
+                        idx: SRC_PAYLOAD,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(src_stride)),
+                    tt(Op::Mul(IrType::I32)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(load_elem(0)),
+                    tt(Op::CallClosure {
+                        param_tys: vec![param_ty],
+                        ret_ty: IrType::I32,
+                    }),
+                    tt(Op::StoreI32AtAbsolute { offset: 0 }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(1)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        tt(Op::LetGet {
+            idx: NEW_BASE,
+            ty: IrType::I32,
+        }),
+        tt(Op::Return),
+    ]);
+    body
+}
+
+/// `list_int_map_to_variant_list(xs, f)` where `f: Int -> variant`.
+pub(super) fn list_int_map_to_variant_list() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_int_map_to_variant_list",
+        vec![IrType::ListInt, IrType::Closure],
+        IrType::ListList,
+        || {
+            list_map_to_variant_list_body(
+                |o| Op::LoadI64AtAbsolute { offset: o },
+                IrType::I64,
+                8,
+                true,
+            )
+        },
+    )
+}
+
+/// `list_float_map_to_variant_list(xs, f)` where `f: Float -> variant`.
+pub(super) fn list_float_map_to_variant_list() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_float_map_to_variant_list",
+        vec![IrType::ListFloat, IrType::Closure],
+        IrType::ListList,
+        || {
+            list_map_to_variant_list_body(
+                |o| Op::LoadF64AtAbsolute { offset: o },
+                IrType::F64,
+                8,
+                true,
+            )
+        },
+    )
+}
+
+/// `list_string_map_to_variant_list(xs, f)` where `f: String -> variant`.
+pub(super) fn list_string_map_to_variant_list() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_string_map_to_variant_list",
+        vec![IrType::ListString, IrType::Closure],
+        IrType::ListList,
+        || {
+            list_map_to_variant_list_body(
+                |o| Op::LoadI32AtAbsolute { offset: o },
+                IrType::String,
+                4,
+                false,
             )
         },
     )

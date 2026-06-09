@@ -46,7 +46,7 @@
   <text x="20" y="28" class="head-text">iam/policy.relon</text>
   <text x="360" y="28" text-anchor="end" class="head-tag">LIBRARY</text>
   <line x1="14" y1="42" x2="366" y2="42" class="divider"/>
-  <text x="20" y="74" class="code" xml:space="preserve"><tspan x="20" dy="0"><tspan class="kw">@library</tspan></tspan><tspan x="20" dy="1.5em">{</tspan><tspan x="20" dy="1.5em">  <tspan class="kw">@schema</tspan> Effect:</tspan><tspan x="20" dy="1.5em">    <tspan class="kw">Enum</tspan>&lt;Allow, Deny&gt;,</tspan><tspan x="20" dy="1.5em"></tspan><tspan x="20" dy="1.5em">  <tspan class="kw">@schema</tspan> Statement: {</tspan><tspan x="20" dy="1.5em">    Effect Effect: <tspan class="kw">*</tspan>,</tspan><tspan x="20" dy="1.5em">    [String] Action: <tspan class="kw">*</tspan>,</tspan><tspan x="20" dy="1.5em">    [String] Resource: <tspan class="kw">*</tspan>,</tspan><tspan x="20" dy="1.5em">  },</tspan><tspan x="20" dy="1.5em">  <tspan class="kw">@schema</tspan> Policy: {</tspan><tspan x="20" dy="1.5em">    String Version:</tspan><tspan x="20" dy="1.5em">      <tspan class="str">"2012-10-17"</tspan>,</tspan><tspan x="20" dy="1.5em">    [Statement] Statement: <tspan class="kw">*</tspan>,</tspan><tspan x="20" dy="1.5em">  }</tspan><tspan x="20" dy="1.5em">}</tspan></text>
+  <text x="20" y="74" class="code" xml:space="preserve"><tspan x="20" dy="0"><tspan class="kw">#enum</tspan> Effect {</tspan><tspan x="20" dy="1.5em">  Allow,</tspan><tspan x="20" dy="1.5em">  Deny,</tspan><tspan x="20" dy="1.5em">}</tspan><tspan x="20" dy="1.5em"></tspan><tspan x="20" dy="1.5em"><tspan class="kw">#schema</tspan> Statement {</tspan><tspan x="20" dy="1.5em">  Effect: Effect,</tspan><tspan x="20" dy="1.5em">  Action: List&lt;String&gt;,</tspan><tspan x="20" dy="1.5em">  Resource: List&lt;String&gt;,</tspan><tspan x="20" dy="1.5em">}</tspan><tspan x="20" dy="1.5em"><tspan class="kw">#schema</tspan> Policy {</tspan><tspan x="20" dy="1.5em">  Version: String,</tspan><tspan x="20" dy="1.5em">  Statement: List&lt;Statement&gt;,</tspan><tspan x="20" dy="1.5em">}</tspan></text>
 </g>
 
 <g transform="translate(450, 24)">
@@ -54,7 +54,7 @@
   <text x="20" y="28" class="head-text">policies/s3_readonly.relon</text>
   <text x="360" y="28" text-anchor="end" class="head-tag">ENTRY</text>
   <line x1="14" y1="42" x2="366" y2="42" class="divider"/>
-  <text x="20" y="74" class="code" xml:space="preserve"><tspan x="20" dy="0"><tspan class="kw">@import</tspan> <tspan class="str">"../iam/policy.relon"</tspan></tspan><tspan x="20" dy="3em">Policy s3_readonly: {</tspan><tspan x="20" dy="1.5em">  Statement: [{</tspan><tspan x="20" dy="1.5em">    Effect: Effect.Allow,</tspan><tspan x="20" dy="1.5em">    Action: [</tspan><tspan x="20" dy="1.5em">      <tspan class="str">"s3:GetObject"</tspan>,</tspan><tspan x="20" dy="1.5em">      <tspan class="str">"s3:ListBucket"</tspan>,</tspan><tspan x="20" dy="1.5em">    ],</tspan><tspan x="20" dy="1.5em">    Resource: [</tspan><tspan x="20" dy="1.5em">      <tspan class="str">"arn:aws:s3:::acme/*"</tspan>,</tspan><tspan x="20" dy="1.5em">    ],</tspan><tspan x="20" dy="1.5em">  }]</tspan><tspan x="20" dy="1.5em">}</tspan></text>
+  <text x="20" y="74" class="code" xml:space="preserve"><tspan x="20" dy="0"><tspan class="kw">#import</tspan> * from <tspan class="str">"../iam/policy.relon"</tspan></tspan><tspan x="20" dy="3em">Policy s3_readonly: {</tspan><tspan x="20" dy="1.5em">  Statement: [{</tspan><tspan x="20" dy="1.5em">    Effect: Effect.Allow,</tspan><tspan x="20" dy="1.5em">    Action: [</tspan><tspan x="20" dy="1.5em">      <tspan class="str">"s3:GetObject"</tspan>,</tspan><tspan x="20" dy="1.5em">      <tspan class="str">"s3:ListBucket"</tspan>,</tspan><tspan x="20" dy="1.5em">    ],</tspan><tspan x="20" dy="1.5em">    Resource: [</tspan><tspan x="20" dy="1.5em">      <tspan class="str">"arn:aws:s3:::acme/*"</tspan>,</tspan><tspan x="20" dy="1.5em">    ],</tspan><tspan x="20" dy="1.5em">  }]</tspan><tspan x="20" dy="1.5em">}</tspan></text>
 </g>
 
 <g transform="translate(876, 24)">
@@ -68,7 +68,7 @@
 <g>
   <path d="M 410 284 L 444 284" class="arrow"/>
   <path d="M 450 284 L 442 280 L 442 288 Z" class="arrow-head"/>
-  <text x="427" y="276" text-anchor="middle" class="arrow-label">@import</text>
+  <text x="427" y="276" text-anchor="middle" class="arrow-label">#import</text>
 </g>
 
 <g>

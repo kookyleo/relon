@@ -60,15 +60,15 @@ parallel workflows). It's advisory — never blocks.
   caps explicitly via `--trust` / `Capabilities::all_granted()`, and
   that grant is auditable code at the call site rather than an implicit
   trusted mode.
-- **Self-describing schemas**: `@schema`, sum-type tagged enums,
-  recursive contracts, branded values — type information travels with
-  the payload.
+- **Self-describing schemas**: `#schema` records and `#enum` tagged
+  enums, recursive contracts, branded values — type information travels
+  with the payload.
 - **Context-aware references**: `&root`, `&sibling`, `&prev`, `&next`
   let logic reference its surrounding data without hard-coded paths.
 - **Functional core**: arrow closures (`(x) => x + 1`) and method
   shorthands (`f(x): x + 1`), comprehensions, pipes, pattern match —
   pure expressions, no IO or side effects.
-- **Canonical std**: `@import("std/list", as="list")` is part of the
+- **Canonical std**: `#import list from "std/list"` is part of the
   language, not a host extension — scripts can rely on it without the
   embedder wiring anything up.
 

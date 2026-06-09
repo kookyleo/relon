@@ -39,9 +39,24 @@ let result = Evaluator::new(Arc::new(ctx))
 ```
 
 `serde_json::from_value::<Value>` 是无目标类型解码：JSON array 会解成
-`Value::List`。如果 `#main` 参数是 tuple，请直接构造
-`Value::tuple(...)`，或按 `#main` 签名做目标类型感知解码，让 array 形
-payload 进入 `Value::Tuple`。
+`Value::List`，JSON `null` 会被拒绝，因为 `null` 不是 Relon 值。直接写
+Rust host 时，如果 `#main` 参数是 tuple，请构造 `Value::tuple(...)`；如果
+参数是 enum，请构造 `Value::variant_dict(...)`，或按 `#main` 签名做目标
+类型感知解码。只有已知目标类型是 `Option<T>` 或 `T?` 时，JSON `null` 才会
+映射成 `None`；`T?` 的非 null 输入会解码成 `Some(value)`。
+
+CLI 的 `relon run --args '<json>'` 和 WASM playground 的 `#main(args)` 已读取
+入口签名：目标是 `Tuple<...>` 或 tuple schema 时，JSON array 会进入
+`Value::Tuple`；目标是 `List<T>` 时仍进入 `Value::List` 并按 list 元素类型
+校验；标量目标会拒绝不兼容的 JSON 形状；目标是 enum 时，JSON string 可以进入
+同名 unit variant，带 payload 的 variant 使用外部标签对象。例如
+`#enum Stat { Up, Down }` 的 `Stat` 参数可以用 `{ "s": "Up" }` 输入；
+`#enum Msg { Email { address: String }, Pair(Int, String) }` 可以用
+`{ "m": { "Email": { "address": "x@y.z" } } }` 或
+`{ "m": { "Pair": [7, "x"] } }` 输入。`Option<Int>` 可用 `null`、`41` 或
+`{ "x": { "Some": { "value": 41 } } }`；`Result<Int, String>` 可用
+`{ "r": { "Ok": { "value": 41 } } }` 或 `{ "r": { "Err": { "error": "bad" } } }`。带 payload 的
+variant 不从裸字符串解码。
 
 脚本端配上一个 `#main(...)` 签名，描述 host 必须推进来的形状：
 
@@ -70,7 +85,7 @@ host-pushed slot：
 > llvm-native / 编译版 wasm）的 buffer 协议现已支持结构化 `#main`
 > 入参，而不仅是标量。以下形态都与 tree-walk oracle 逐字节一致地流入：
 >
-> - 标量叶子（`Int` / `Float` / `Bool` / `Null`）；
+> - 标量叶子（`Int` / `Float` / `Bool`）；
 > - **`String`** 入参（如 host 读好、喂进来的文件内容）；
 > - **tuple schema** 入参，例如 `#schema IPv4 (Int, Int, Int, Int)`：
 >   宿主用 `Value::Tuple` 提供 payload，编译端按位置解码；
@@ -134,7 +149,7 @@ host-pushed slot：
 >   **同样支持**（F4，经同一 arena-绝对字段读取）；元素子记录自身再含
 >   嵌套 `List<Schema>` / `List<List<…>>` 字段者（如 `Team { name: String,
 >   members: List<Person>, tags: List<List<Int>> }`）**亦已支持，且递归到
->   任意深度**（F7）：就地子记录读取器经同一统一 list reader 递归，lowering
+>   任意深度**（F7）：就地子记录读取器经同一统一 list reader 递归，IR 转换
 >   准入对元素 schema 的字段类型递归判定，故元素 schema 内的嵌套对象数组与
 >   嵌套列表在任意嵌套深度上都逐字节等价解码；
 > - **深层嵌套 schema 字段链返回**（`#main(Outer o) -> List<String> =
@@ -172,7 +187,7 @@ host-pushed slot：
 >   返回形状（恒等、入参字段、深层字段链、对象字段）现已在任意深度上四方
 >   支持（F7）；tuple-return cap 在下面单列。
 > - 超出 scalar/literal 包络的 tuple 返回：嵌套 tuple 元素、
->   `List<...>` / `Null` tuple 元素，或 body 不是 tuple literal 的 tuple
+>   `List<...>` / `Option<...>` / `Result<...>` tuple 元素，或 body 不是 tuple literal 的 tuple
 >   return。这些在位置型 tuple-element 工作四方证明前仍是响亮 cap。
 >
 >   返回**含该类入参字段的对象** —— 无论对象是**匿名 `Dict`**

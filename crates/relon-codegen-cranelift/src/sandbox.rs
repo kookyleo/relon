@@ -967,7 +967,7 @@ impl SandboxState {
         match func.call(native_args, TokenRange::default()) {
             Ok(Value::Int(v)) => v,
             Ok(Value::Bool(b)) => i64::from(b),
-            Ok(Value::Null) => 0,
+            Ok(v) if v.is_option_none() => 0,
             Ok(_) | Err(_) => {
                 // Host-fn failure or a return shape outside the phase-4a
                 // scalar envelope. The host sees `RuntimeError::Unsupported`.

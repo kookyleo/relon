@@ -18,7 +18,7 @@
 //!
 //! The param / return Rust types follow the source's `#main` signature
 //! — the build.rs generator maps each accepted leaf type (`Int`,
-//! `Float`, `Bool`, `Null`, `String`, `List<Int>`) onto its Rust
+//! `Float`, `Bool`, `String`, `List<Int>`; internal unit slots) onto its Rust
 //! surface (`i64`, `f64`, `bool`, `()`, `&str` / `String`, `&[i64]` /
 //! `Vec<i64>`). This macro is signature-agnostic: it only stitches in
 //! the generated bindings file, whatever shape it carries.

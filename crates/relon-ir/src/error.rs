@@ -29,7 +29,7 @@ pub enum LoweringError {
     },
     /// A `#main` parameter or return type falls outside the structured
     /// buffer-protocol envelope the compiled backends decode. Supported
-    /// today: the scalar leaves (`Int` / `Float` / `Bool` / `Null` /
+    /// today: the scalar leaves (`Int` / `Float` / `Bool` / `Unit` /
     /// `String`), `List<scalar>`, `List<String>`, and user-`#schema`
     /// structs whose fields are any of those (scalar / `String` /
     /// `List<scalar>` / `List<String>` / `List<Schema>` /
@@ -266,7 +266,7 @@ pub enum LoweringError {
     /// Phase 10-a: a closure body references a captured value whose
     /// IR type the closure-conversion pass refuses to put into the
     /// captures struct. Reserved for types that have no static byte
-    /// layout (e.g. `Null`); the lowering pass surfaces this rather
+    /// layout (e.g. `Unit`); the lowering pass surfaces this rather
     /// than emitting a malformed scratch alloc.
     #[error(
         "closure capture `{name}` has unsupported type `{ty:?}` (Phase 10-a captures must be sized scalars or pointer slots)"

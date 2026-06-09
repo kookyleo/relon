@@ -122,11 +122,12 @@ fn children(node: &Node) -> Vec<&Node> {
         | Expr::Variable(_)
         | Expr::Type(_)
         | Expr::Wildcard
-        | Expr::Null
+        | Expr::Missing
         | Expr::Bool(_)
         | Expr::Int(_)
         | Expr::Float(_)
-        | Expr::String(_) => {}
+        | Expr::String(_)
+        | Expr::VariantPattern { .. } => {}
     }
     out
 }

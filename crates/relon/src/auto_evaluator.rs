@@ -345,7 +345,7 @@ impl Evaluator for AutoEvaluator {
 
     fn run_main(&self, args: HashMap<String, Value>) -> Result<Value, RuntimeError> {
         // v6-fix-D2 default-path: trivial scalar `#main` shapes
-        // (single Int/Float/Bool/Null/String parameter + literal /
+        // (single Int/Float/Bool/String parameter + literal /
         // arith body) skip the cranelift-AOT init entirely. The
         // tree-walker reaches the same answer in microseconds on
         // these shapes; the cranelift lower + JIT codegen cost
@@ -457,10 +457,10 @@ impl Evaluator for AutoEvaluator {
 ///   methods / closures via the import graph; we don't trace
 ///   transitively.
 /// * Every `#main` parameter type must be a single-segment builtin
-///   scalar (`Int` / `Float` / `Bool` / `Null` / `String`). Tuples,
+///   scalar (`Int` / `Float` / `Bool` / `String`). Tuples,
 ///   generics, lists, dicts, schemas, branded types — all disqualify.
 /// * The body expression's shape must be a literal (Int / Float /
-///   Bool / Null / String), a `Variable` reference, a `Reference`,
+///   Bool / String), a `Variable` reference, a `Reference`,
 ///   a `Unary` over a trivial leaf, a `Binary` whose both operands
 ///   are also trivial leaves (recursive), or a `Ternary` whose three
 ///   sub-nodes are trivial leaves. F-strings, fn calls, closures,
@@ -523,7 +523,7 @@ pub fn is_trivial_scalar_main_node(root: &relon_parser::Node) -> bool {
 
 /// Predicate over a `TypeNode` shape: single-segment, no generics,
 /// no `is_optional`, no `variant_fields`, head ∈
-/// {`Int`, `Float`, `Bool`, `Null`, `String`}. Used by
+/// {`Int`, `Float`, `Bool`, `String`}. Used by
 /// [`is_trivial_scalar_main`] to gate trivial-main classification on
 /// the parameter shape.
 fn is_scalar_builtin_type(t: &relon_parser::TypeNode) -> bool {
@@ -536,10 +536,7 @@ fn is_scalar_builtin_type(t: &relon_parser::TypeNode) -> bool {
     if !t.generics.is_empty() {
         return false;
     }
-    matches!(
-        t.path[0].as_str(),
-        "Int" | "Float" | "Bool" | "Null" | "String"
-    )
+    matches!(t.path[0].as_str(), "Int" | "Float" | "Bool" | "String")
 }
 
 /// Predicate over an expression body: returns `true` for the closed
@@ -549,10 +546,11 @@ fn is_scalar_builtin_type(t: &relon_parser::TypeNode) -> bool {
 fn is_trivial_body(expr: &Expr) -> bool {
     match expr {
         // Pure literal leaves — no environment touch.
-        Expr::Null | Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::String(_) => true,
+        Expr::Bool(_) | Expr::Int(_) | Expr::Float(_) | Expr::String(_) => true,
         // Single-segment variable read (e.g. `x` from `#main(Int x)`).
         // The arg-binding path looks the name up in the root scope
         // directly without any captured-env walk.
+        Expr::Missing => false,
         Expr::Variable(_) => true,
         // Cross-scope reference (`&sibling.foo`); the tree-walker's
         // scope chain handles it in O(depth) which is constant for a

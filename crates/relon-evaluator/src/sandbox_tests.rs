@@ -581,7 +581,7 @@ fn pure_fn_callable_under_sandbox() {
             args: crate::native_fn::NativeArgs,
             _range: relon_parser::TokenRange,
         ) -> Result<Value, RuntimeError> {
-            Ok(args.get(0).cloned().unwrap_or(Value::Null))
+            Ok(args.get(0).cloned().unwrap_or(Value::option_none()))
         }
     }
 

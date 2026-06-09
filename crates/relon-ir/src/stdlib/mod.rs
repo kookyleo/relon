@@ -320,12 +320,12 @@ mod glob_match_index_tests {
     /// math bodies at indices 47..51; Wave R8 appended the byte-level
     /// string ops (`len` / `ends_with` / `replace`) at indices 52..54;
     /// Wave R9 appended the Bool `is_uuid` validator at index 55; Wave R15
-    /// appended `split` -> List<String> at index 56 — all at the tail so
-    /// every position-pinned index above stays put.
-    /// Pinning the count catches accidental double-registrations.
+    /// appended `split` -> List<String> at index 56; enum-like list maps
+    /// append at 57..59 and pointer-array filter at 60. All are at the tail so every position-pinned index
+    /// above stays put. Pinning the count catches accidental double-registrations.
     #[test]
-    fn bundle_has_57_entries() {
-        assert_eq!(stdlib_function_count(), 57);
+    fn bundle_has_61_entries() {
+        assert_eq!(stdlib_function_count(), 61);
         assert_eq!(stdlib_function_index("glob_match"), Some(37));
         assert_eq!(stdlib_function_index("list_list_length"), Some(38));
         // Wave R3b tail appends (order-pinned wire format).
@@ -352,6 +352,20 @@ mod glob_match_index_tests {
         assert_eq!(stdlib_function_index("is_uuid"), Some(55));
         // Wave R15 tail append (`split` -> List<String>).
         assert_eq!(stdlib_function_index("split"), Some(56));
+        // Enum-like list-producing maps.
+        assert_eq!(
+            stdlib_function_index("list_int_map_to_variant_list"),
+            Some(57)
+        );
+        assert_eq!(
+            stdlib_function_index("list_float_map_to_variant_list"),
+            Some(58)
+        );
+        assert_eq!(
+            stdlib_function_index("list_string_map_to_variant_list"),
+            Some(59)
+        );
+        assert_eq!(stdlib_function_index("list_list_filter"), Some(60));
     }
 }
 

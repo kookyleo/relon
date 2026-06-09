@@ -283,8 +283,7 @@ available unconditionally:
   (`Int`).
 * `range(end)` / `range(start, end)` — half-open `Int` list.
 * `type(value)` — the value's type name (`"Int"`, `"Float"`,
-  `"String"`, `"Bool"`, `"List"`, `"Tuple"`, `"Dict"`, `"Closure"`,
-  `"Null"`).
+  `"String"`, `"Bool"`, `"List"`, `"Tuple"`, `"Dict"`, `"Closure"`).
 
 ### 6.2 std module catalog
 
@@ -295,7 +294,7 @@ available unconditionally:
 | `std/string` | `split`, `join`, `replace`, `upper`, `lower`, `contains` | String ops |
 | `std/math` | `abs`, `max`, `min`, `clamp` | Numeric ops |
 | `std/is` | `int`, `string`, `bool`, `float`, `list`, `dict`, `number`, `empty` | Type predicates |
-| `std/value` | `default` | Value guards (null-coalesce, …) |
+| `std/value` | `default` | Fallback for `None` |
 
 Each function's exact contract is defined by the reference
 implementation's `crates/relon-evaluator/src/std_relon/<name>.relon`
@@ -305,7 +304,7 @@ sources; those `.relon` files are themselves part of the spec
 > Beyond this catalog, the reference tree-walker registers an
 > additional JSON-Schema-parity wave (`sqrt`, `is_email`, `to_json`,
 > `trim`, `unique`, …) that exists **only** in the tree-walker — no
-> analyzer signatures, no compiled-backend lowering. See §6.7 for the
+> analyzer signatures, no compiled-backend IR conversion. See §6.7 for the
 > exact set and the tier caveat before depending on any of them.
 
 ### 6.3 `ensure.*` validators
@@ -318,8 +317,8 @@ will diverge.
 
 ### 6.4 Root expression — the document root may be any expression
 
-A `.relon` file evaluates to **one JSON value** — Object, Array,
-String, Number, Bool, or Null. The root **may be any expression**:
+A `.relon` file evaluates to **one Relon value** that can be projected to JSON — Object, Array,
+String, Number, Bool, or `None` as JSON null. The root **may be any expression**:
 dict / list / tuple literal, atomic literal, binary / ternary / pipe
 expression, function call, variant constructor, reference,
 where / match — provided the final value falls in the JSON type
@@ -334,8 +333,8 @@ n + 1                              // binary expression (in a #main entry)
 "hello"                            // string literal
 42                                 // integer
 true                               // bool
-null                               // null
-Result.Ok { value: order }         // variant constructor
+None                               // projects to JSON null
+Ok(order)                          // Result variant constructor
 range(0, 10)                       // function call
 @projector { ... }                 // decorated dict
 ```
@@ -358,7 +357,7 @@ today.
 > literals at the root. v1.2 widens this to any expression
 > (superset extension); legacy scripts are unaffected. This makes
 > `#main(Int n) -> Int` writeable as `n + 1` directly and
-> `#main(...) -> Result<T, E>` writeable as `Result.Ok { ... }`
+> `#main(...) -> Result<T, E>` writeable as `Ok(...)`
 > directly, no longer needing a `{ value: ... }` wrapper dict.
 
 ### 6.5 `#main(Type name, ...) [-> ReturnType]` — entry signature
@@ -503,7 +502,7 @@ Cross-mode (fire regardless of mode):
 | `UnknownReferenceType { name, path }` | path-tail walker has positive knowledge a step is broken: descend into an undeclared schema field (`o.unknown`), descend past a leaf type (`o.id.something`), or — under strict — descend into `Any` |
 | `DuplicateField` | spread contributes a key already declared on the dict, or two spreads contribute the same key |
 | `ExplicitAnyForbidden { context }` | v1.6: user wrote `Any` somewhere in source (including nested `List<Any>` / `Dict<String, Any>`). `Any` is retired from the user-facing surface in every mode |
-| `BareGenericContainer { type_name, context }` | v1.7: user wrote `List` / `Dict` / `Closure` / `Fn` / `Enum` without generic arguments |
+| `BareGenericContainer { type_name, context }` | v1.7: user wrote `List` / `Dict` / `Closure` / `Fn` without generic arguments |
 
 Strict-only (silent under `#relaxed`; the underlying information is
 *genuinely* missing rather than statically known):
@@ -596,7 +595,7 @@ in *every mode* (strict and non-strict alike) by reporting
   any depth
 
 Replacements: concrete types (`Int` / `String` / `Bool`), parameterized
-containers (`List<T>` / `Dict<String, V>`), `Enum<...>` for sum types,
+containers (`List<T>` / `Dict<String, V>`), Rust-like `#enum` declarations for sum types,
 or a custom `#schema`. The "I'll accept any shape" use case is
 expressed by declaring the schema explicitly — there is no
 all-purpose escape hatch any more.
@@ -667,7 +666,7 @@ Semantics:
   `((Int, Int), String)`.
 
 **Bare-generic ban**: v1.7 also closes the bare-generic shorthand for
-`List` / `Dict` / `Closure` / `Fn` / `Enum` (no generic arguments).
+`List` / `Dict` / `Closure` / `Fn` (no generic arguments).
 Pre-v1.7 they silently expanded to `List<Any>` / `Dict<Any, Any>` /
 `Fn(_, Any)` / etc. — the only remaining back-door for `Any` after
 v1.6's ban. The new `BareGenericContainer` diagnostic fires at every
@@ -694,20 +693,14 @@ After v1.7 closed the user-source back-doors (`Any`, bare generics),
 three positions still let things slip through statically. v1.8 closes
 all three:
 
-* **`Enum<...>` slot now alternative-aware**: previously
-  `subsumes_with` returned `true` unconditionally for an `Enum` head,
-  so `42` would happily land in `Enum<"up", "down">`. v1.8 walks the
-  alternatives and accepts only when at least one matches statically.
-  Bareword alternatives (parser strips quotes from `"up"`, leaving
-  `up`; same shape as a schema name `Active`) are treated as `String`
-  candidates, mirroring the runtime cheap-path.
+* **Public enum syntax is Rust-like `#enum`**: state and sum types use
+  declarations such as `#enum Stat { Up, Down }`.
 * **`Result<T, E>` / `Option<T>` generic substitution**: previously
-  `Result<Int, String> r: Result.Ok { value: "wrong" }` was caught
+  `Result<Int, String> r: Ok("wrong")` was caught
   only at runtime. v1.8 substitutes `T -> Int, E -> String` into the
   variant's declared field types and recurses into the body. Every
-  user-declared sum schema with generics rides the same code path
-  (`#schema Pair<T, U> Enum<Both { left: T, right: U }>` works the
-  same way). `Result` / `Option` variant shapes are injected via
+  user-declared Rust-like `#enum` schema with generics rides the same
+  code path. `Result` / `Option` variant shapes are injected via
   `seed_prelude_variants` so the analyzer's view matches the runtime.
 * **Host fn signature audit**: `audit_host_fn_signatures` runs
   `scan_typenode_for_any` over every `AnalyzeOptions::host_fn_signatures`
@@ -794,7 +787,7 @@ behave like the tree-walker. The set is:
 
 These are **tier-2 / tree-walker-only**. Treat them as
 reference-evaluator conveniences, not portable language surface,
-until they gain analyzer signatures and compiled-backend lowering.
+until they gain analyzer signatures and compiled-backend IR conversion.
 
 **There is no `#strict` directive.** Strict static inference is the
 analyzer's **default** — you do not opt *in* to it. The only opt-out
@@ -817,7 +810,7 @@ and `IPv4 ip` supports `ip.0` through `ip.3`.
 following appear in design discussion but are **not** working
 features; they are blockers, not capabilities:
 
-* `??` null-coalescing operator — not wired through end-to-end.
+* `??` Option fallback operator — not wired through end-to-end.
 * `&root` / `&uncle` references inside `reduce` — not resolvable
   end-to-end.
 

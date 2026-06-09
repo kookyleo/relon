@@ -288,7 +288,7 @@ impl<'a> Walker<'a> {
             Expr::Bool(_) => return Some("Bool".to_string()),
             Expr::String(_) => return Some("String".to_string()),
             Expr::List(_) => return Some("List".to_string()),
-            Expr::Null => return Some("Null".to_string()),
+            Expr::Missing => return None,
             _ => {}
         }
         // Fall through to the inference walker for everything else
@@ -301,14 +301,15 @@ impl<'a> Walker<'a> {
             // Genuinely unknown — `SpreadSourceTypeUnknown` covers it.
             InferredType::Any => None,
             // Anything else has a known, non-spreadable shape.
-            InferredType::Null => Some("Null".to_string()),
             InferredType::Bool => Some("Bool".to_string()),
             InferredType::Int => Some("Int".to_string()),
             InferredType::Float => Some("Float".to_string()),
             InferredType::Number => Some("Number".to_string()),
             InferredType::String => Some("String".to_string()),
             InferredType::List(_) => Some("List".to_string()),
-            InferredType::Variant(_, _) => Some("Variant".to_string()),
+            InferredType::Variant(_, _) | InferredType::VariantPayload(_, _, _) => {
+                Some("Variant".to_string())
+            }
             InferredType::Optional(_) => Some("Optional".to_string()),
             InferredType::Fn(_, _) => Some("Fn".to_string()),
             InferredType::Tuple(_) => Some("Tuple".to_string()),

@@ -126,7 +126,17 @@ pub(super) fn build_enum_index(tree: &AnalyzedTree) -> EnumIndex {
         let variants: Vec<String> = def.variants.iter().map(|v| v.name.clone()).collect();
         index.insert(name.clone(), variants);
     }
+    seed_prelude_enum_index(&mut index);
     index
+}
+
+fn seed_prelude_enum_index(index: &mut EnumIndex) {
+    index
+        .entry("Option".to_string())
+        .or_insert_with(|| vec!["None".to_string(), "Some".to_string()]);
+    index
+        .entry("Result".to_string())
+        .or_insert_with(|| vec!["Ok".to_string(), "Err".to_string()]);
 }
 
 pub(super) fn build_variant_field_index(tree: &AnalyzedTree) -> VariantFieldIndex {

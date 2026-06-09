@@ -24,10 +24,10 @@ pub enum Severity {
 
 #[derive(Debug, Clone, Error, MietteDiagnostic)]
 pub enum Diagnostic {
-    #[error("#schema body must be a Dict, Tuple, Enum, or Schema composition; got {found}")]
+    #[error("#schema body must be a Dict, Tuple, #enum body, or Schema composition; got {found}")]
     #[diagnostic(
         code(relon::analyze::schema_body_not_dict),
-        help("#schema expects `#schema Name {{ ... }}`, `#schema Name (...)`, `#schema Name Enum<...>`, or `#schema Name Base + {{ ... }}`.")
+        help("#schema expects `#schema Name {{ ... }}`, `#schema Name (...)`, `#enum Name {{ ... }}`, or `#schema Name Base + {{ ... }}`.")
     )]
     SchemaBodyNotDict {
         found: String,
@@ -109,16 +109,6 @@ pub enum Diagnostic {
         range: SourceSpan,
     },
 
-    #[error("Enum<...> mixes named variants with literal/type alternatives")]
-    #[diagnostic(
-        code(relon::analyze::heterogeneous_enum),
-        help("A tagged Enum's alternatives must all be named variants. Either remove the literal/type members or split into separate Enums.")
-    )]
-    HeterogeneousEnum {
-        #[label("inconsistent enum form")]
-        range: SourceSpan,
-    },
-
     #[error(
         "schema field `{field}`: cannot combine an explicit type prefix `{type_prefix}` with `#brand`"
     )]
@@ -191,12 +181,12 @@ pub enum Diagnostic {
     },
 
     #[error(
-        "root-level `#schema {name} : ...` body must be a Dict or `Enum<...>`, got {found_type}"
+        "root-level `#schema {name} : ...` body must be a Dict, Tuple, or #enum body, got {found_type}"
     )]
     #[diagnostic(
         code(relon::analyze::root_schema_invalid_value),
         help(
-            "The body of a root-level `#schema Name Body` directive must be the schema body itself — either a dict literal `{{ ... }}` or an `Enum<...>` type."
+            "The body of a root-level `#schema Name Body` directive must be the schema body itself: a dict literal `{{ ... }}`, tuple body `(...)`, or a Rust-like `#enum Name {{ ... }}` declaration."
         )
     )]
     RootSchemaInvalidValue {
@@ -567,7 +557,7 @@ pub enum Diagnostic {
     #[diagnostic(
         code(relon::analyze::explicit_any_forbidden),
         help(
-            "v1.6 retired `Any` from the user-facing surface. Use a concrete type (`Int`, `String`, ...), a parameterized container (`List<T>`, `Dict<String, V>`), an `Enum<...>` for sum types, or declare a `#schema` for structured payloads. If you genuinely need an opaque pass-through, define a single-field schema and pass it explicitly."
+            "v1.6 retired `Any` from the user-facing surface. Use a concrete type (`Int`, `String`, ...), a parameterized container (`List<T>`, `Dict<String, V>`), `#enum` for sum types, or declare a `#schema` for structured payloads. If you genuinely need an opaque pass-through, define a single-field schema and pass it explicitly."
         )
     )]
     ExplicitAnyForbidden {
@@ -576,6 +566,23 @@ pub enum Diagnostic {
         /// parameter`, `closure return type`, `typed binding`.
         context: String,
         #[label("`Any` is no longer accepted here")]
+        range: SourceSpan,
+    },
+
+    #[error("type name `{type_name}` is reserved and cannot be used here (`{context}`)")]
+    #[diagnostic(
+        code(relon::analyze::reserved_type_name),
+        help(
+            "Relon has no `Null` type or value. Use `Option<T>` / `T?` and `None` for absence; use `()` for the empty tuple instead of a user-written `Unit` type. Enum types are declared with `#enum Name ...`; the old generic `Enum` type form is not supported."
+        )
+    )]
+    ReservedTypeName {
+        /// Reserved type/schema name the user wrote (`Null`, `Unit`, or `Enum`).
+        type_name: String,
+        /// Where the token appeared, e.g. `#main parameter x` or
+        /// `#schema name`.
+        context: String,
+        #[label("reserved type name")]
         range: SourceSpan,
     },
 
@@ -627,12 +634,12 @@ pub enum Diagnostic {
     #[diagnostic(
         code(relon::analyze::bare_generic_container),
         help(
-            "v1.7 retires the bare-generic shorthand. Write `List<T>`, `Dict<K, V>`, or `Closure<...>` with explicit element / parameter / return types — bare `List` was equivalent to `List<Any>` and v1.6 already banned `Any` from the user surface. `Enum<...>` likewise needs at least one alternative."
+            "v1.7 retires the bare-generic shorthand. Write `List<T>`, `Dict<K, V>`, or `Closure<...>` with explicit element / parameter / return types — bare `List` was equivalent to `List<Any>` and v1.6 already banned `Any` from the user surface. bare `Closure` / `Fn` likewise need explicit parameters."
         )
     )]
     BareGenericContainer {
         /// The bare type name encountered (`List`, `Dict`, `Closure`,
-        /// `Fn`, `Enum`).
+        /// `Fn`).
         type_name: String,
         /// Same `context` shape as `ExplicitAnyForbidden` so
         /// diagnostics from both checks read uniformly.
@@ -679,7 +686,6 @@ impl Diagnostic {
             | Diagnostic::NonExhaustiveMatch { .. }
             | Diagnostic::UnknownVariant { .. }
             | Diagnostic::DuplicateMatchArm { .. }
-            | Diagnostic::HeterogeneousEnum { .. }
             | Diagnostic::SchemaFieldBrandConflict { .. }
             | Diagnostic::SchemaFieldBrandInvalidArg { .. }
             | Diagnostic::DuplicateMainDirective { .. }
@@ -737,7 +743,11 @@ impl Diagnostic {
             // more — the language has concrete types, parameterized
             // containers, enums, and schemas to cover the space.
             | Diagnostic::ExplicitAnyForbidden { .. }
-            // v1.7: bare `List` / `Dict` / `Closure` / `Fn` / `Enum`
+            // `Null` was removed from the language, `Unit` is only an
+            // internal Rust-side name for the empty tuple `()`, and `Enum`
+            // is not a type constructor; enum types use `#enum Name ...`.
+            | Diagnostic::ReservedTypeName { .. }
+            // v1.7: bare `List` / `Dict` / `Closure` / `Fn`
             // (no generic parameters) is equivalent to leaking `Any`
             // through the back door — Error severity in every mode.
             | Diagnostic::BareGenericContainer { .. }

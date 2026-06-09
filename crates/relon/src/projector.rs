@@ -38,7 +38,6 @@ impl Projector for JsonProjector {
 
     fn project(&self, value: &Value) -> Result<Self::Output, Self::Error> {
         match value {
-            Value::Null => Ok(serde_json::Value::Null),
             Value::Bool(b) => Ok(serde_json::Value::Bool(*b)),
             Value::Int(i) => Ok(serde_json::Value::Number((*i).into())),
             Value::Float(f) => {
@@ -56,30 +55,71 @@ impl Projector for JsonProjector {
                 Ok(serde_json::Value::Array(out))
             }
             Value::Dict(d) => {
-                let mut map = serde_json::Map::new();
-                for (key, val) in d.map.iter() {
-                    if matches!(
-                        val,
-                        Value::Closure(_)
-                            | Value::Schema(_)
-                            | Value::EnumSchema(_)
-                            | Value::Type(_)
-                            | Value::Wildcard
-                    ) {
-                        // These variants have no JSON analogue; silently
-                        // dropping them keeps internal helpers (closures
-                        // used as decorators, schemas defined for
-                        // validation) from polluting serialized output.
-                        continue;
-                    }
-                    map.insert(key.as_str().to_owned(), self.project(val)?);
+                if value.is_option_none() {
+                    return Ok(serde_json::Value::Null);
                 }
-                let inner = serde_json::Value::Object(map);
+                if let Some(inner) = value.option_some_value() {
+                    return self.project(inner);
+                }
+                let tuple_variant_len = if d.variant_of.is_some() && !d.map.is_empty() {
+                    let mut indexes = Vec::with_capacity(d.map.len());
+                    let mut tuple_like = true;
+                    for key in d.map.keys() {
+                        match key.as_str().parse::<usize>() {
+                            Ok(index) => indexes.push(index),
+                            Err(_) => {
+                                tuple_like = false;
+                                break;
+                            }
+                        }
+                    }
+                    if tuple_like {
+                        indexes.sort_unstable();
+                        indexes
+                            .iter()
+                            .enumerate()
+                            .all(|(expected, actual)| expected == *actual)
+                            .then_some(indexes.len())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let inner = if let Some(len) = tuple_variant_len {
+                    let mut out = Vec::with_capacity(len);
+                    for idx in 0..len {
+                        if let Some(value) = d.map.get(idx.to_string().as_str()) {
+                            out.push(self.project(value)?);
+                        }
+                    }
+                    serde_json::Value::Array(out)
+                } else {
+                    let mut map = serde_json::Map::new();
+                    for (key, val) in d.map.iter() {
+                        if matches!(
+                            val,
+                            Value::Closure(_)
+                                | Value::Schema(_)
+                                | Value::EnumSchema(_)
+                                | Value::Type(_)
+                                | Value::Wildcard
+                        ) {
+                            // These variants have no JSON analogue; silently
+                            // dropping them keeps internal helpers (closures
+                            // used as decorators, schemas defined for
+                            // validation) from polluting serialized output.
+                            continue;
+                        }
+                        map.insert(key.as_str().to_owned(), self.project(val)?);
+                    }
+                    serde_json::Value::Object(map)
+                };
                 // Externally-tagged sum-type variant: wrap as
-                // `{ VariantName: { ...fields... } }` only when the dict
-                // originated from a tagged-enum constructor. Plain
-                // branded dicts (`User x: { ... }`) keep their flat
-                // shape — the brand is purely a runtime tag.
+                // `{ VariantName: ...payload... }` only when the dict
+                // originated from a tagged-enum constructor. Struct variants
+                // use an object payload; tuple variants use an array payload.
                 if let (Some(_), Some(brand)) = (d.variant_of.as_ref(), d.brand.as_ref()) {
                     let mut wrapper = serde_json::Map::new();
                     wrapper.insert(brand.clone(), inner);

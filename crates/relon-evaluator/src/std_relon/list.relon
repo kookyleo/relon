@@ -12,6 +12,6 @@
     len(l): _len(l),
     first(l): l[0],
     last(l): l[_len(l) - 1],
-    compact(l): l | _list_filter((x) => x != null),
+    compact(l): l | _list_filter((x) => x != None),
     flatten(l): l | _list_reduce([], (acc, x) => acc + x)
 }

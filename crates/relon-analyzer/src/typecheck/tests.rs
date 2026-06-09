@@ -69,8 +69,8 @@ fn flags_static_type_mismatch_on_typed_field() {
 }
 
 #[test]
-fn allows_optional_null() {
-    let tree = analyze_str(r#"{ Int? port: null }"#);
+fn allows_optional_none() {
+    let tree = analyze_str(r#"{ Int? port: None }"#);
     let mismatches: Vec<_> = tree
         .diagnostics
         .iter()
@@ -99,8 +99,8 @@ fn flags_mismatch_inside_custom_schema_binding() {
 #[test]
 fn flags_non_exhaustive_match_on_sum_enum() {
     let tree = analyze_str(
-        r#"{
-            #schema N Enum<A { x: Int }, B { y: Int }, C>,
+        r#"#enum N { A { x: Int }, B { y: Int }, C }
+        {
             N v: N.A { x: 1 },
             out: v match {
                 A: 1,
@@ -128,10 +128,173 @@ fn flags_non_exhaustive_match_on_sum_enum() {
 }
 
 #[test]
+fn custom_enum_tuple_variant_call_list_item_is_inferrable_under_strict() {
+    let tree = analyze_str(
+        r#"#enum Packet { Pair(Int, String), Empty }
+        #main() -> List<Packet>
+        [Packet.Pair(7, "x"), Packet.Empty]
+        "#,
+    );
+    assert_eq!(
+        count(&tree, |d| matches!(
+            d,
+            Diagnostic::ExpressionTypeUnknown { .. }
+        )),
+        0,
+        "{:?}",
+        tree.diagnostics
+    );
+    assert_eq!(
+        count(&tree, |d| matches!(
+            d,
+            Diagnostic::StaticTypeMismatch { .. }
+        )),
+        0,
+        "{:?}",
+        tree.diagnostics
+    );
+}
+
+#[test]
+fn custom_enum_tuple_match_payload_pattern_bindings_are_typed() {
+    let tree = analyze_str(
+        r#"#enum Packet { Pair(Int, String), Empty }
+        #main(Packet p) -> Int
+        p match { Pair(n, *): n + 1, Empty: 0 }
+        "#,
+    );
+    assert_eq!(
+        count(&tree, |d| matches!(
+            d,
+            Diagnostic::ExpressionTypeUnknown { .. }
+                | Diagnostic::UnresolvedReference { .. }
+                | Diagnostic::StaticTypeMismatch { .. }
+                | Diagnostic::MainReturnTypeMismatch { .. }
+                | Diagnostic::UnknownReferenceType { .. }
+        )),
+        0,
+        "{:?}",
+        tree.diagnostics
+    );
+}
+
+#[test]
+fn custom_enum_struct_match_payload_pattern_bindings_are_typed() {
+    let tree = analyze_str(
+        r#"#enum Notification { Email { code: Int, subject: String }, Push }
+        #main(Notification msg) -> Int
+        msg match { Notification.Email { code, subject: * }: code + 1, Push: 0 }
+        "#,
+    );
+    assert_eq!(
+        count(&tree, |d| matches!(
+            d,
+            Diagnostic::ExpressionTypeUnknown { .. }
+                | Diagnostic::UnresolvedReference { .. }
+                | Diagnostic::StaticTypeMismatch { .. }
+                | Diagnostic::MainReturnTypeMismatch { .. }
+                | Diagnostic::UnknownReferenceType { .. }
+        )),
+        0,
+        "{:?}",
+        tree.diagnostics
+    );
+}
+
+#[test]
+fn custom_generic_enum_match_payload_pattern_bindings_are_typed() {
+    let tree = analyze_str(
+        r#"#enum Box<T> { Some(T), None }
+        #main(Box<Int> b) -> Int
+        b match { Some(n): n + 1, None: 0 }
+        "#,
+    );
+    assert_eq!(
+        count(&tree, |d| matches!(
+            d,
+            Diagnostic::ExpressionTypeUnknown { .. }
+                | Diagnostic::UnresolvedReference { .. }
+                | Diagnostic::StaticTypeMismatch { .. }
+                | Diagnostic::MainReturnTypeMismatch { .. }
+                | Diagnostic::UnknownReferenceType { .. }
+        )),
+        0,
+        "{:?}",
+        tree.diagnostics
+    );
+}
+
+#[test]
+fn option_match_payload_pattern_bindings_are_typed() {
+    let tree = analyze_str(
+        r#"#main(Option<Int> x) -> Int
+        x match { Some(v): v + 1, None: 0 }
+        "#,
+    );
+    assert_eq!(
+        count(&tree, |d| matches!(
+            d,
+            Diagnostic::ExpressionTypeUnknown { .. }
+                | Diagnostic::UnresolvedReference { .. }
+                | Diagnostic::StaticTypeMismatch { .. }
+                | Diagnostic::MainReturnTypeMismatch { .. }
+                | Diagnostic::UnknownReferenceType { .. }
+        )),
+        0,
+        "{:?}",
+        tree.diagnostics
+    );
+}
+
+#[test]
+fn optional_shorthand_match_payload_pattern_bindings_are_typed() {
+    let tree = analyze_str(
+        r#"#main(Int? x) -> Int
+        x match { Some(v): v + 1, None: 0 }
+        "#,
+    );
+    assert_eq!(
+        count(&tree, |d| matches!(
+            d,
+            Diagnostic::ExpressionTypeUnknown { .. }
+                | Diagnostic::UnresolvedReference { .. }
+                | Diagnostic::StaticTypeMismatch { .. }
+                | Diagnostic::MainReturnTypeMismatch { .. }
+                | Diagnostic::UnknownReferenceType { .. }
+        )),
+        0,
+        "{:?}",
+        tree.diagnostics
+    );
+}
+
+#[test]
+fn result_match_payload_pattern_bindings_are_typed() {
+    let tree = analyze_str(
+        r#"#main(Result<Int, String> r) -> Int
+        r match { Ok(v): v + 1, Err(e): 0 }
+        "#,
+    );
+    assert_eq!(
+        count(&tree, |d| matches!(
+            d,
+            Diagnostic::ExpressionTypeUnknown { .. }
+                | Diagnostic::UnresolvedReference { .. }
+                | Diagnostic::StaticTypeMismatch { .. }
+                | Diagnostic::MainReturnTypeMismatch { .. }
+                | Diagnostic::UnknownReferenceType { .. }
+        )),
+        0,
+        "{:?}",
+        tree.diagnostics
+    );
+}
+
+#[test]
 fn flags_unknown_variant_with_did_you_mean() {
     let tree = analyze_str(
-        r#"{
-            #schema N Enum<Email { x: Int }, SMS { y: Int }>,
+        r#"#enum N { Email { x: Int }, SMS { y: Int } }
+        {
             N v: N.Email { x: 1 },
             out: v match {
                 EMail: 1,
@@ -159,8 +322,8 @@ fn flags_unknown_variant_with_did_you_mean() {
 #[test]
 fn flags_duplicate_match_arm() {
     let tree = analyze_str(
-        r#"{
-            #schema N Enum<A { x: Int }, B { y: Int }>,
+        r#"#enum N { A { x: Int }, B { y: Int } }
+        {
             N v: N.A { x: 1 },
             out: v match {
                 A: 1,
@@ -181,8 +344,8 @@ fn flags_duplicate_match_arm() {
 #[test]
 fn wildcard_arm_satisfies_exhaustiveness() {
     let tree = analyze_str(
-        r#"{
-            #schema N Enum<A { x: Int }, B { y: Int }, C>,
+        r#"#enum N { A { x: Int }, B { y: Int }, C }
+        {
             N v: N.A { x: 1 },
             out: v match {
                 A: 1,
@@ -205,7 +368,7 @@ fn skips_exhaustiveness_when_type_uninferrable() {
     // exhaustiveness diagnostic should fire.
     let tree = analyze_str(
         r#"{
-            #schema N Enum<A { x: Int }, B { y: Int }>,
+            #enum N { A { x: Int }, B { y: Int } }
             mystery: 42,
             out: mystery match {
                 A: 1
@@ -445,8 +608,8 @@ fn does_not_flag_untyped_closure() {
 #[test]
 fn flags_match_arm_type_mismatch() {
     let tree = analyze_str(
-        r#"{
-            #schema N Enum<A { x: Int }, B { y: Int }>,
+        r#"#enum N { A { x: Int }, B { y: Int } }
+        {
             N v: N.A { x: 1 },
             out: v match {
                 A: 1,
@@ -467,8 +630,8 @@ fn flags_match_arm_type_mismatch() {
 #[test]
 fn does_not_flag_homogeneous_match_arms() {
     let tree = analyze_str(
-        r#"{
-            #schema N Enum<A { x: Int }, B { y: Int }>,
+        r#"#enum N { A { x: Int }, B { y: Int } }
+        {
             N v: N.A { x: 1 },
             out: v match {
                 A: 1,
@@ -1895,7 +2058,7 @@ fn v1_8_host_fn_signature_any_variadic_rejected() {
             name: "log".to_string(),
             generics: Vec::new(),
             params: Vec::new(),
-            return_type: type_node_simple("Null"),
+            return_type: type_node_simple("Bool"),
             variadic_tail: Some(type_node_simple("Any")),
         },
     );
@@ -2221,7 +2384,7 @@ fn v1_4_strict_typed_binding_inferrable_silent() {
 fn v1_4_strict_match_arm_uninferrable() {
     let tree = analyze_str(
         r#"
-        #schema Status Enum<"on", "off">
+        #enum Status { on, off }
         #main(Status s) -> Dict
         { result: s match { on: mystery_call(), off: 0 } }
         "#,
@@ -2240,7 +2403,7 @@ fn v1_4_strict_match_arm_uninferrable() {
 fn v1_4_strict_match_arms_inferrable_silent() {
     let tree = analyze_str(
         r#"
-        #schema Status Enum<"on", "off">
+        #enum Status { on, off }
         #main(Status s) -> Dict
         { result: s match { on: 1, off: 0 } }
         "#,
@@ -2775,6 +2938,32 @@ fn v1_6_ban_main_return_any() {
             if context.contains("#main return"))
     });
     assert!(n >= 1, "{:?}", tree.diagnostics);
+}
+
+/// Removed/internal names are not valid user-written type names.
+#[test]
+fn reserved_null_unit_and_enum_type_names_are_rejected() {
+    let tree = analyze_str(
+        r#"
+        #main(Null n, Enum<Int> e) -> Unit
+        { List<Null> xs: [] }
+        "#,
+    );
+    let nulls = count(
+        &tree,
+        |d| matches!(d, Diagnostic::ReservedTypeName { type_name, .. } if type_name == "Null"),
+    );
+    let units = count(
+        &tree,
+        |d| matches!(d, Diagnostic::ReservedTypeName { type_name, .. } if type_name == "Unit"),
+    );
+    let enums = count(
+        &tree,
+        |d| matches!(d, Diagnostic::ReservedTypeName { type_name, .. } if type_name == "Enum"),
+    );
+    assert!(nulls >= 2, "{:?}", tree.diagnostics);
+    assert!(units >= 1, "{:?}", tree.diagnostics);
+    assert!(enums >= 1, "{:?}", tree.diagnostics);
 }
 
 /// v1.6 reverse: a fully concrete program does NOT trigger

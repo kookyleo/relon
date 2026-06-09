@@ -63,6 +63,10 @@ pub(crate) struct RelocSlot {
     /// pointer-array list (`List<List<String>>`) be relocated to one level
     /// deeper than the `nested` schema cache alone could reach.
     list_elem: Option<PtrArrayElem>,
+    /// For a direct `Option<T>` / `Result<T, E>` pointer slot, the variant
+    /// type whose selected payload may itself contain pointer slots that must
+    /// be relocated after a paste / arena rebase.
+    variant: Option<TypeRepr>,
 }
 
 /// Recursive descriptor of one `PointerArray` list level's element, used
@@ -89,6 +93,10 @@ pub(crate) enum PtrArrayElem {
         /// a still-deeper `InnerList`).
         inner: Box<PtrArrayElem>,
     },
+    /// `List<Option<T>>` / `List<Result<T, E>>` elements: each entry points
+    /// at a variant record whose selected payload may recursively contain
+    /// pointers.
+    Variant(TypeRepr),
 }
 
 /// Build the recursive [`PtrArrayElem`] descriptor for a pointer-array
@@ -116,6 +124,9 @@ fn ptr_array_elem_for(element: &TypeRepr) -> Option<PtrArrayElem> {
                 inner: Box::new(inner_desc),
             })
         }
+        TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => {
+            Some(PtrArrayElem::Variant(element.clone()))
+        }
         // Inline-fixed scalar element: entry-pointer rebase only.
         _ => None,
     }
@@ -140,7 +151,7 @@ fn type_graph_align(ty: &TypeRepr) -> usize {
     match ty {
         // Inline-fixed scalar / String tail (`[len][utf8]`) — 4 suffices;
         // the record-prefix `pad_to(4)` already covers them.
-        TypeRepr::Null | TypeRepr::Bool | TypeRepr::Int | TypeRepr::Float | TypeRepr::String => 1,
+        TypeRepr::Unit | TypeRepr::Bool | TypeRepr::Int | TypeRepr::Float | TypeRepr::String => 1,
         TypeRepr::List { element } => match element.as_ref() {
             // `List<Int>` / `List<Float>` tail payload sits on an 8-byte
             // boundary; `List<Bool>` packs at 1.
@@ -158,8 +169,11 @@ fn type_graph_align(ty: &TypeRepr) -> usize {
             .map(|f| type_graph_align(&f.ty))
             .max()
             .unwrap_or(1),
-        // Composite leaves that never reach the buffer protocol.
-        TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Closure { .. } => 1,
+        TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => {
+            variant_record_align_runtime(ty)
+        }
+        // Closure values never reach the host-visible buffer protocol.
+        TypeRepr::Closure { .. } => 1,
     }
 }
 
@@ -176,6 +190,136 @@ fn schema_paste_align(layout: &OffsetTable, fields: &[Field]) -> usize {
         .max()
         .unwrap_or(1);
     layout.root_align.max(tail).max(1)
+}
+
+fn payload_slot_layout_runtime(ty: &TypeRepr) -> (usize, usize) {
+    match ty {
+        TypeRepr::Unit | TypeRepr::Bool => (1, 1),
+        TypeRepr::Int | TypeRepr::Float => (8, 8),
+        TypeRepr::String
+        | TypeRepr::List { .. }
+        | TypeRepr::Schema { .. }
+        | TypeRepr::Option { .. }
+        | TypeRepr::Result { .. }
+        | TypeRepr::Enum { .. }
+        | TypeRepr::Closure { .. } => (4, 4),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SelectedVariant {
+    name: String,
+    payload: Option<SelectedVariantPayload>,
+}
+
+#[derive(Debug, Clone)]
+struct SelectedVariantPayload {
+    ty: TypeRepr,
+    /// `Some(key)` for scalar-like single-field wrappers (`Option.Some`,
+    /// `Result.Ok`, `Result.Err`). `None` means the payload type is a schema
+    /// whose decoded field map is used directly for a custom enum variant.
+    key: Option<&'static str>,
+}
+
+fn variant_payload_types(ty: &TypeRepr) -> Vec<TypeRepr> {
+    match ty {
+        TypeRepr::Option { inner } => vec![inner.as_ref().clone()],
+        TypeRepr::Result { ok, err } => vec![ok.as_ref().clone(), err.as_ref().clone()],
+        TypeRepr::Enum { name, variants } => variants
+            .iter()
+            .filter_map(|variant| {
+                variant.payload_schema(name).map(|schema| TypeRepr::Schema {
+                    schema: Box::new(schema),
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn variant_record_align_runtime(ty: &TypeRepr) -> usize {
+    let mut align = 4usize;
+    for payload in variant_payload_types(ty) {
+        let (_, slot_align) = payload_slot_layout_runtime(&payload);
+        align = align.max(slot_align).max(type_graph_align(&payload));
+    }
+    align
+}
+
+fn variant_payload_slot_offset(record_start: usize, payload_ty: &TypeRepr) -> Option<usize> {
+    let (_, align) = payload_slot_layout_runtime(payload_ty);
+    let raw = record_start.checked_add(1)?;
+    if align <= 1 {
+        Some(raw)
+    } else {
+        raw.checked_next_multiple_of(align)
+    }
+}
+
+fn variant_selected_payload(ty: &TypeRepr, tag: u8) -> Result<SelectedVariant, &'static str> {
+    match ty {
+        TypeRepr::Option { inner } => match tag {
+            0 => Ok(SelectedVariant {
+                name: "None".to_string(),
+                payload: None,
+            }),
+            1 => Ok(SelectedVariant {
+                name: "Some".to_string(),
+                payload: Some(SelectedVariantPayload {
+                    ty: inner.as_ref().clone(),
+                    key: Some("value"),
+                }),
+            }),
+            _ => Err("invalid Option tag"),
+        },
+        TypeRepr::Result { ok, err } => match tag {
+            0 => Ok(SelectedVariant {
+                name: "Ok".to_string(),
+                payload: Some(SelectedVariantPayload {
+                    ty: ok.as_ref().clone(),
+                    key: Some("value"),
+                }),
+            }),
+            1 => Ok(SelectedVariant {
+                name: "Err".to_string(),
+                payload: Some(SelectedVariantPayload {
+                    ty: err.as_ref().clone(),
+                    key: Some("error"),
+                }),
+            }),
+            _ => Err("invalid Result tag"),
+        },
+        TypeRepr::Enum { name, variants } => {
+            let variant = variants
+                .iter()
+                .find(|variant| variant.tag == tag)
+                .ok_or("invalid enum tag")?;
+            Ok(SelectedVariant {
+                name: variant.name.clone(),
+                payload: variant
+                    .payload_schema(name)
+                    .map(|schema| SelectedVariantPayload {
+                        ty: TypeRepr::Schema {
+                            schema: Box::new(schema),
+                        },
+                        key: None,
+                    }),
+            })
+        }
+        _ => Err("expected variant record"),
+    }
+}
+
+fn list_payload_is_pointer_array(element: &TypeRepr) -> bool {
+    matches!(
+        element,
+        TypeRepr::String
+            | TypeRepr::Schema { .. }
+            | TypeRepr::List { .. }
+            | TypeRepr::Option { .. }
+            | TypeRepr::Result { .. }
+            | TypeRepr::Enum { .. }
+    )
 }
 
 /// Pre-computed relocation table for a [`BufferBuilder`]'s schema.
@@ -239,11 +383,18 @@ impl RelocLayout {
                 TypeRepr::List { element } => ptr_array_elem_for(element),
                 _ => None,
             });
+            let variant = declared.and_then(|f| match &f.ty {
+                TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => {
+                    Some(f.ty.clone())
+                }
+                _ => None,
+            });
             slots.push(RelocSlot {
                 offset: fo.offset,
                 list_element: fo.list_element,
                 nested,
                 list_elem,
+                variant,
             });
         }
         Arc::new(Self { slots })
@@ -393,13 +544,34 @@ impl<'a> BufferBuilder<'a> {
         Ok(())
     }
 
-    /// Mark `field_name` as `Null`. The slot is already zeroed by
+    /// Mark `field_name` as an internal unit slot. The slot is already zeroed by
     /// `new`, so this is a no-op beyond the type check — useful to
     /// surface a `TypeMismatch` early when the host accidentally
-    /// nulls a non-Null slot.
-    pub fn write_null(&mut self, field_name: &str) -> Result<(), BufferError> {
-        let (_, _, _) = self.locate(field_name, &TypeRepr::Null, "Null")?;
+    /// writes a unit marker to a non-unit slot.
+    pub fn write_unit(&mut self, field_name: &str) -> Result<(), BufferError> {
+        let (_, _, _) = self.locate(field_name, &TypeRepr::Unit, "Unit")?;
         Ok(())
+    }
+
+    /// Write any supported value shape into `field_name` using the declared
+    /// canonical type. This is the generic marshalling entry point used by
+    /// nested schemas, tuples, and the compiled backends for types that do not
+    /// have a dedicated `write_*` convenience method.
+    pub fn write_value(
+        &mut self,
+        field_name: &str,
+        ty: &TypeRepr,
+        value: &crate::value::Value,
+    ) -> Result<(), BufferError> {
+        let entry = self.find_entry(field_name)?.clone();
+        if !type_matches(&entry.ty, ty) {
+            return Err(BufferError::TypeMismatch {
+                name: field_name.to_string(),
+                declared: type_label(&entry.ty),
+                requested: type_label(ty),
+            });
+        }
+        self.write_value_slot(field_name, entry.offset, ty, value)
     }
 
     /// Write a UTF-8 string into `field_name`'s tail-area record.
@@ -1038,6 +1210,15 @@ impl<'a> BufferBuilder<'a> {
         Ok(())
     }
 
+    fn find_entry(&self, field_name: &str) -> Result<&FieldEntry, BufferError> {
+        self.field_index
+            .iter()
+            .find(|e| e.name == field_name)
+            .ok_or_else(|| BufferError::UnknownField {
+                name: field_name.to_string(),
+            })
+    }
+
     fn locate(
         &self,
         field_name: &str,
@@ -1137,6 +1318,172 @@ impl<'a> BufferBuilder<'a> {
         }
         self.bytes.extend_from_slice(payload);
         record_offset
+    }
+
+    fn write_value_slot(
+        &mut self,
+        name: &str,
+        slot_offset: usize,
+        ty: &TypeRepr,
+        value: &crate::value::Value,
+    ) -> Result<(), BufferError> {
+        use crate::value::Value;
+        match (ty, value) {
+            (TypeRepr::Int, Value::Int(v)) => {
+                self.bytes[slot_offset..slot_offset + 8].copy_from_slice(&v.to_le_bytes());
+                Ok(())
+            }
+            (TypeRepr::Float, Value::Float(v)) => {
+                self.bytes[slot_offset..slot_offset + 8]
+                    .copy_from_slice(&v.into_inner().to_le_bytes());
+                Ok(())
+            }
+            (TypeRepr::Float, Value::Int(v)) => {
+                self.bytes[slot_offset..slot_offset + 8]
+                    .copy_from_slice(&(*v as f64).to_le_bytes());
+                Ok(())
+            }
+            (TypeRepr::Bool, Value::Bool(v)) => {
+                self.bytes[slot_offset] = u8::from(*v);
+                Ok(())
+            }
+            (TypeRepr::Unit, v) if v.is_option_none() => Ok(()),
+            (TypeRepr::String, Value::String(s)) => {
+                let off = self.append_tail_record(4, s.len(), s.as_str().as_bytes());
+                self.write_pointer_slot(name, slot_offset, off)
+            }
+            (TypeRepr::List { element }, Value::List(items)) => {
+                let off = self.append_list_payload(element, items)?;
+                self.write_pointer_slot(name, slot_offset, off)
+            }
+            (TypeRepr::Schema { schema }, v) => {
+                let off = self.append_schema_value_payload(name, schema, v)?;
+                self.write_pointer_slot(name, slot_offset, off)
+            }
+            (TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. }, v) => {
+                let off = self.append_variant_record(name, ty, v)?;
+                self.write_pointer_slot(name, slot_offset, off)
+            }
+            (_, other) => Err(BufferError::TypeMismatch {
+                name: name.to_string(),
+                declared: type_label(ty),
+                requested: other.type_name(),
+            }),
+        }
+    }
+
+    fn write_pointer_slot(
+        &mut self,
+        name: &str,
+        slot_offset: usize,
+        target_offset: usize,
+    ) -> Result<(), BufferError> {
+        let ptr = u32::try_from(target_offset).map_err(|_| BufferError::ValueTooLarge {
+            name: name.to_string(),
+            len: target_offset,
+        })?;
+        self.bytes[slot_offset..slot_offset + 4].copy_from_slice(&ptr.to_le_bytes());
+        Ok(())
+    }
+
+    fn append_schema_value_payload(
+        &mut self,
+        name: &str,
+        schema: &Schema,
+        value: &crate::value::Value,
+    ) -> Result<usize, BufferError> {
+        use crate::value::Value;
+        let sub_layout =
+            SchemaLayout::offsets_for(schema).map_err(|_| BufferError::MalformedPayload {
+                name: name.to_string(),
+                reason: "nested schema field is not layoutable",
+            })?;
+        let mut child = BufferBuilder::new(&sub_layout, &schema.fields);
+        match value {
+            Value::Dict(dict) if !schema.is_tuple => {
+                write_schema_record_into_builder(&mut child, schema, dict)?;
+            }
+            Value::Tuple(items) if schema.is_tuple => {
+                write_tuple_record_into_builder(&mut child, schema, items)?;
+            }
+            other => {
+                return Err(BufferError::TypeMismatch {
+                    name: name.to_string(),
+                    declared: if schema.is_tuple { "Tuple" } else { "Schema" },
+                    requested: other.type_name(),
+                })
+            }
+        }
+        let align = schema_paste_align(&sub_layout, &schema.fields);
+        self.append_child_record_payload(name, child, align)
+    }
+
+    fn append_child_record_payload(
+        &mut self,
+        name: &str,
+        child: BufferBuilder<'_>,
+        requested_align: usize,
+    ) -> Result<usize, BufferError> {
+        let child_tail_align = child
+            .field_index
+            .iter()
+            .map(|fe| type_graph_align(&fe.ty))
+            .max()
+            .unwrap_or(1);
+        let child_align = child
+            .layout
+            .root_align
+            .max(requested_align)
+            .max(child_tail_align)
+            .max(1);
+        let (mut child_bytes, child_reloc) = child.into_parts();
+        self.pad_to(child_align);
+        let entry_offset = self.bytes.len();
+        let ptr = u32::try_from(entry_offset).map_err(|_| BufferError::ValueTooLarge {
+            name: name.to_string(),
+            len: entry_offset,
+        })?;
+        relocate_pointers(&mut child_bytes, &child_reloc, 0, ptr).map_err(|reason| {
+            BufferError::MalformedPayload {
+                name: name.to_string(),
+                reason,
+            }
+        })?;
+        self.bytes.extend_from_slice(&child_bytes);
+        Ok(entry_offset)
+    }
+
+    fn append_variant_record(
+        &mut self,
+        name: &str,
+        ty: &TypeRepr,
+        value: &crate::value::Value,
+    ) -> Result<usize, BufferError> {
+        let (tag, payload) = variant_payload_for_value(name, ty, value)?;
+        self.pad_to(variant_record_align_runtime(ty));
+        let record_offset = self.bytes.len();
+        self.bytes.push(tag);
+        if let Some((payload_ty, payload_value)) = payload {
+            let (slot_size, _) = payload_slot_layout_runtime(&payload_ty);
+            let slot_offset =
+                variant_payload_slot_offset(record_offset, &payload_ty).ok_or_else(|| {
+                    BufferError::MalformedPayload {
+                        name: name.to_string(),
+                        reason: "variant payload slot offset overflows usize",
+                    }
+                })?;
+            let slot_end = slot_offset.checked_add(slot_size).ok_or_else(|| {
+                BufferError::MalformedPayload {
+                    name: name.to_string(),
+                    reason: "variant payload slot end overflows usize",
+                }
+            })?;
+            if self.bytes.len() < slot_end {
+                self.bytes.resize(slot_end, 0);
+            }
+            self.write_value_slot(name, slot_offset, &payload_ty, payload_value)?;
+        }
+        Ok(record_offset)
     }
 
     /// Append a `List<element>` payload (a pointer-array `[len][off_i]…`
@@ -1336,10 +1683,31 @@ impl<'a> BufferBuilder<'a> {
                 }
                 Ok(header_offset)
             }
+            TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => {
+                self.pad_to(4);
+                let header_offset = self.bytes.len();
+                self.bytes.extend_from_slice(&(count as u32).to_le_bytes());
+                let entries_start = self.bytes.len();
+                self.bytes.resize(entries_start + count * 4, 0);
+                let mut offsets: Vec<u32> = Vec::with_capacity(count);
+                for (i, it) in items.iter().enumerate() {
+                    let entry_name = format!("<nested list>[{i}]");
+                    let off = self.append_variant_record(&entry_name, element, it)?;
+                    offsets.push(u32::try_from(off).map_err(|_| BufferError::ValueTooLarge {
+                        name: "<nested list>".to_string(),
+                        len: off,
+                    })?);
+                }
+                for (i, off) in offsets.iter().enumerate() {
+                    let dst = entries_start + i * 4;
+                    self.bytes[dst..dst + 4].copy_from_slice(&off.to_le_bytes());
+                }
+                Ok(header_offset)
+            }
             other => Err(BufferError::TypeMismatch {
                 name: "<nested list>".to_string(),
                 declared: type_label(other),
-                requested: "List<scalar/String/Schema/List>",
+                requested: "List<scalar/String/Schema/List/Option/Result>",
             }),
         }
     }
@@ -1470,6 +1838,10 @@ fn relocate_pointers(
         // rebased too — without recursion the wasm reader walking the
         // grand-child's String slot would fall off the parent buffer
         // by `paste_base` bytes.
+        if let Some(variant_ty) = slot.variant.as_ref() {
+            relocate_variant_record(bytes, original as usize, variant_ty, paste_base)?;
+            continue;
+        }
         match slot.list_element {
             // Phase 10-c: `List<String>` / `List<Schema>` payloads are
             // pointer arrays whose entries also reference tail-area
@@ -1558,11 +1930,82 @@ fn relocate_list_pointer_array(
                     paste_base,
                 )?;
             }
+            Some(PtrArrayElem::Variant(ty)) => {
+                relocate_variant_record(bytes, original as usize, ty, paste_base)?;
+            }
             Some(PtrArrayElem::String) | None => {}
         }
         cursor += 4;
     }
     Ok(())
+}
+
+fn relocate_variant_record(
+    bytes: &mut [u8],
+    record_start: usize,
+    ty: &TypeRepr,
+    paste_base: u32,
+) -> Result<(), &'static str> {
+    if record_start
+        .checked_add(1)
+        .map(|end| end > bytes.len())
+        .unwrap_or(true)
+    {
+        return Err("variant tag exceeds buffer end");
+    }
+    let tag = bytes[record_start];
+    let selected = variant_selected_payload(ty, tag)?;
+    let Some(payload) = selected.payload else {
+        return Ok(());
+    };
+    let payload_ty = payload.ty;
+    if !matches!(
+        payload_ty,
+        TypeRepr::String
+            | TypeRepr::List { .. }
+            | TypeRepr::Schema { .. }
+            | TypeRepr::Option { .. }
+            | TypeRepr::Result { .. }
+            | TypeRepr::Enum { .. }
+    ) {
+        return Ok(());
+    }
+    let slot_abs = variant_payload_slot_offset(record_start, &payload_ty)
+        .ok_or("variant payload slot offset overflows usize")?;
+    if slot_abs
+        .checked_add(4)
+        .map(|end| end > bytes.len())
+        .unwrap_or(true)
+    {
+        return Err("variant payload pointer slot exceeds buffer end");
+    }
+    let mut ptr_buf = [0u8; 4];
+    ptr_buf.copy_from_slice(&bytes[slot_abs..slot_abs + 4]);
+    let original = u32::from_le_bytes(ptr_buf);
+    let relocated = original
+        .checked_add(paste_base)
+        .ok_or("relocated variant payload pointer overflows u32")?;
+    bytes[slot_abs..slot_abs + 4].copy_from_slice(&relocated.to_le_bytes());
+    match &payload_ty {
+        TypeRepr::String => Ok(()),
+        TypeRepr::Schema { schema } => {
+            let layout = SchemaLayout::offsets_for(schema)
+                .map_err(|_| "variant schema payload is not layoutable")?;
+            let reloc = RelocLayout::build(&layout, &schema.fields);
+            relocate_pointers(bytes, &reloc, original as usize, paste_base)
+        }
+        TypeRepr::List { element } => {
+            if list_payload_is_pointer_array(element) {
+                let elem = ptr_array_elem_for(element);
+                relocate_list_pointer_array(bytes, original as usize, elem.as_ref(), paste_base)?;
+            }
+            Ok(())
+        }
+        TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => {
+            relocate_variant_record(bytes, original as usize, &payload_ty, paste_base)
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Marshal a nested `List<List<scalar>>` arg / schema field into
@@ -1798,58 +2241,121 @@ fn write_schema_field_into_builder(
     field: &Field,
     value: &crate::value::Value,
 ) -> Result<(), BufferError> {
-    use crate::value::Value;
-    let name = field.name.as_str();
-    match (&field.ty, value) {
-        (TypeRepr::Int, Value::Int(v)) => child.write_int(name, *v),
-        (TypeRepr::Float, Value::Float(v)) => child.write_float(name, v.into_inner()),
-        (TypeRepr::Float, Value::Int(v)) => child.write_float(name, *v as f64),
-        (TypeRepr::Bool, Value::Bool(v)) => child.write_bool(name, *v),
-        (TypeRepr::Null, Value::Null) => child.write_null(name),
-        (TypeRepr::String, Value::String(s)) => child.write_string(name, s.as_str()),
-        (TypeRepr::List { element }, Value::List(items)) => {
-            // Reuse the recursive list payload writer and patch the field
-            // slot, mirroring the dedicated `write_list_*` writers.
-            let slot_offset = child
-                .field_index
-                .iter()
-                .find(|e| e.name == name)
-                .map(|e| e.offset)
-                .ok_or_else(|| BufferError::UnknownField {
-                    name: name.to_string(),
-                })?;
-            let header = child.append_list_payload(element, items)?;
-            let ptr = u32::try_from(header).map_err(|_| BufferError::ValueTooLarge {
-                name: name.to_string(),
-                len: header,
-            })?;
-            child.bytes[slot_offset..slot_offset + 4].copy_from_slice(&ptr.to_le_bytes());
-            Ok(())
-        }
-        (TypeRepr::Schema { schema }, Value::Dict(sub)) if !schema.is_tuple => {
-            let sub_layout =
-                SchemaLayout::offsets_for(schema).map_err(|_| BufferError::MalformedPayload {
-                    name: name.to_string(),
-                    reason: "nested schema field is not layoutable",
-                })?;
-            let mut grandchild = child.sub_record(name, &sub_layout, &schema.fields)?;
-            write_schema_record_into_builder(&mut grandchild, schema, sub)?;
-            child.finish_sub_record(name, grandchild)
-        }
-        (TypeRepr::Schema { schema }, Value::Tuple(items)) if schema.is_tuple => {
-            let sub_layout =
-                SchemaLayout::offsets_for(schema).map_err(|_| BufferError::MalformedPayload {
-                    name: name.to_string(),
-                    reason: "nested tuple field is not layoutable",
-                })?;
-            let mut grandchild = child.sub_record(name, &sub_layout, &schema.fields)?;
-            write_tuple_record_into_builder(&mut grandchild, schema, items)?;
-            child.finish_sub_record(name, grandchild)
-        }
-        (_, other) => Err(BufferError::TypeMismatch {
+    child.write_value(field.name.as_str(), &field.ty, value)
+}
+
+/// `(discriminant, optional (payload type, payload value))` produced when
+/// matching a value against a variant slot.
+type VariantPayloadSlot<'a> = (u8, Option<(TypeRepr, &'a crate::value::Value)>);
+
+fn variant_payload_for_value<'a>(
+    name: &str,
+    ty: &'a TypeRepr,
+    value: &'a crate::value::Value,
+) -> Result<VariantPayloadSlot<'a>, BufferError> {
+    let crate::value::Value::Dict(dict) = value else {
+        return Err(BufferError::TypeMismatch {
             name: name.to_string(),
-            declared: type_label(&field.ty),
-            requested: other.type_name(),
+            declared: type_label(ty),
+            requested: value.type_name(),
+        });
+    };
+    match ty {
+        TypeRepr::Option { inner } => match (dict.variant_of.as_deref(), dict.brand.as_deref()) {
+            (Some("Option"), Some("None")) => Ok((0, None)),
+            (Some("Option"), Some("Some")) => {
+                let payload =
+                    dict.map
+                        .get("value")
+                        .ok_or_else(|| BufferError::MalformedPayload {
+                            name: name.to_string(),
+                            reason: "Option.Some is missing `value` payload",
+                        })?;
+                Ok((1, Some((inner.as_ref().clone(), payload))))
+            }
+            _ => Err(BufferError::TypeMismatch {
+                name: name.to_string(),
+                declared: "Option",
+                requested: value.type_name(),
+            }),
+        },
+        TypeRepr::Result { ok, err } => match (dict.variant_of.as_deref(), dict.brand.as_deref()) {
+            (Some("Result"), Some("Ok")) => {
+                let payload =
+                    dict.map
+                        .get("value")
+                        .ok_or_else(|| BufferError::MalformedPayload {
+                            name: name.to_string(),
+                            reason: "Result.Ok is missing `value` payload",
+                        })?;
+                Ok((0, Some((ok.as_ref().clone(), payload))))
+            }
+            (Some("Result"), Some("Err")) => {
+                let payload =
+                    dict.map
+                        .get("error")
+                        .ok_or_else(|| BufferError::MalformedPayload {
+                            name: name.to_string(),
+                            reason: "Result.Err is missing `error` payload",
+                        })?;
+                Ok((1, Some((err.as_ref().clone(), payload))))
+            }
+            _ => Err(BufferError::TypeMismatch {
+                name: name.to_string(),
+                declared: "Result",
+                requested: value.type_name(),
+            }),
+        },
+        TypeRepr::Enum {
+            name: enum_name,
+            variants,
+        } => {
+            let (Some(value_enum), Some(value_variant)) =
+                (dict.variant_of.as_deref(), dict.brand.as_deref())
+            else {
+                return Err(BufferError::TypeMismatch {
+                    name: name.to_string(),
+                    declared: "Enum",
+                    requested: value.type_name(),
+                });
+            };
+            if value_enum != enum_name {
+                return Err(BufferError::TypeMismatch {
+                    name: name.to_string(),
+                    declared: "Enum",
+                    requested: value.type_name(),
+                });
+            }
+            let variant = variants
+                .iter()
+                .find(|variant| variant.name == value_variant)
+                .ok_or_else(|| BufferError::MalformedPayload {
+                    name: name.to_string(),
+                    reason: "enum value carries an unknown variant",
+                })?;
+            if variant.fields.is_empty() {
+                if !dict.map.is_empty() {
+                    return Err(BufferError::MalformedPayload {
+                        name: name.to_string(),
+                        reason: "unit enum variant carries payload fields",
+                    });
+                }
+                return Ok((variant.tag, None));
+            }
+            let payload_ty = TypeRepr::Schema {
+                schema: Box::new(variant.payload_schema(enum_name).ok_or_else(|| {
+                    BufferError::MalformedPayload {
+                        name: name.to_string(),
+                        reason: "enum payload schema is missing",
+                    }
+                })?),
+            };
+            Ok((variant.tag, Some((payload_ty, value))))
+        }
+        _ => Err(BufferError::TypeMismatch {
+            name: name.to_string(),
+            declared: type_label(ty),
+            requested: value.type_name(),
         }),
     }
 }
@@ -1989,12 +2495,30 @@ impl<'a> BufferReader<'a> {
         Ok(self.bytes[offset] != 0)
     }
 
-    /// Confirm `field_name` is declared as `Null` and that the slot
-    /// is reachable. The byte value is unused (Null slots are
+    /// Confirm `field_name` is declared as an internal unit slot and that the slot
+    /// is reachable. The byte value is unused (Unit slots are
     /// tag-only), so this only validates the type label.
-    pub fn read_null(&self, field_name: &str) -> Result<(), BufferError> {
-        let (_, _, _) = self.locate(field_name, &TypeRepr::Null, "Null")?;
+    pub fn read_unit(&self, field_name: &str) -> Result<(), BufferError> {
+        let (_, _, _) = self.locate(field_name, &TypeRepr::Unit, "Unit")?;
         Ok(())
+    }
+
+    /// Read any supported value shape from `field_name` using its canonical
+    /// type. Mirrors [`BufferBuilder::write_value`].
+    pub fn read_value(
+        &self,
+        field_name: &str,
+        ty: &TypeRepr,
+    ) -> Result<crate::value::Value, BufferError> {
+        let entry = self.find_entry(field_name)?;
+        if !type_matches(&entry.ty, ty) {
+            return Err(BufferError::TypeMismatch {
+                name: field_name.to_string(),
+                declared: type_label(&entry.ty),
+                requested: type_label(ty),
+            });
+        }
+        self.read_field_at(entry.offset, ty)
     }
 
     /// Read a UTF-8 string from `field_name`. Follows the fixed-area
@@ -2600,10 +3124,19 @@ impl<'a> BufferReader<'a> {
                 }
                 Ok(out)
             }
+            TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => {
+                let (count, entries_start) = self.read_pointer_array_header(header_off)?;
+                let mut out = Vec::with_capacity(count);
+                for i in 0..count {
+                    let variant_base = self.read_entry_pointer(entries_start, i)?;
+                    out.push(self.read_variant_record_at(variant_base, element)?);
+                }
+                Ok(out)
+            }
             other => Err(BufferError::TypeMismatch {
                 name: "<in-place root>".to_string(),
                 declared: type_label(other),
-                requested: "List<scalar/String/Schema/List>",
+                requested: "List<scalar/String/Schema/List/Option/Result>",
             }),
         }
     }
@@ -2853,7 +3386,7 @@ impl<'a> BufferReader<'a> {
                 let b = read_inline(slot_abs, 1)?;
                 Ok(Value::Bool(b[0] != 0))
             }
-            TypeRepr::Null => Ok(Value::Null),
+            TypeRepr::Unit => Ok(Value::option_none()),
             TypeRepr::String => {
                 let ptr = self.read_slot_pointer(slot_abs)?;
                 Ok(Value::String(self.read_string_record_at(ptr)?.into()))
@@ -2873,10 +3406,104 @@ impl<'a> BufferReader<'a> {
                 let sub_base = self.read_slot_pointer(slot_abs)?;
                 self.read_record_at(sub_base, &sub_layout, schema)
             }
+            TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => {
+                let variant_base = self.read_slot_pointer(slot_abs)?;
+                self.read_variant_record_at(variant_base, ty)
+            }
             other => Err(BufferError::TypeMismatch {
                 name: "<sub-record field>".to_string(),
                 declared: type_label(other),
-                requested: "scalar/String/List/Schema",
+                requested: "scalar/String/List/Schema/Option/Result",
+            }),
+        }
+    }
+
+    fn read_variant_record_at(
+        &self,
+        record_off: usize,
+        ty: &TypeRepr,
+    ) -> Result<crate::value::Value, BufferError> {
+        use crate::smol_str::SmolStr;
+        use crate::value::Value;
+        if record_off
+            .checked_add(1)
+            .map(|end| end > self.bytes.len())
+            .unwrap_or(true)
+        {
+            return Err(BufferError::MalformedPayload {
+                name: "<variant>".to_string(),
+                reason: "variant tag exceeds buffer end",
+            });
+        }
+        let tag = self.bytes[record_off];
+        let selected =
+            variant_selected_payload(ty, tag).map_err(|reason| BufferError::MalformedPayload {
+                name: "<variant>".to_string(),
+                reason,
+            })?;
+        match ty {
+            TypeRepr::Option { .. } => {
+                match selected.payload {
+                    None => Ok(Value::option_none()),
+                    Some(payload) => {
+                        let slot = variant_payload_slot_offset(record_off, &payload.ty)
+                            .ok_or_else(|| BufferError::MalformedPayload {
+                                name: "<variant>".to_string(),
+                                reason: "variant payload slot offset overflows usize",
+                            })?;
+                        let value = self.read_field_at(slot, &payload.ty)?;
+                        Ok(Value::option_some(value))
+                    }
+                }
+            }
+            TypeRepr::Result { .. } => {
+                let Some(payload) = selected.payload else {
+                    return Err(BufferError::MalformedPayload {
+                        name: "<variant>".to_string(),
+                        reason: "Result variant has no payload",
+                    });
+                };
+                let slot =
+                    variant_payload_slot_offset(record_off, &payload.ty).ok_or_else(|| {
+                        BufferError::MalformedPayload {
+                            name: "<variant>".to_string(),
+                            reason: "variant payload slot offset overflows usize",
+                        }
+                    })?;
+                let value = self.read_field_at(slot, &payload.ty)?;
+                let mut map = std::collections::BTreeMap::new();
+                map.insert(SmolStr::from(payload.key.unwrap_or("value")), value);
+                Ok(Value::variant_dict(
+                    map,
+                    selected.name,
+                    "Result".to_string(),
+                ))
+            }
+            TypeRepr::Enum { name, .. } => {
+                let mut map = std::collections::BTreeMap::new();
+                if let Some(payload) = selected.payload {
+                    let slot =
+                        variant_payload_slot_offset(record_off, &payload.ty).ok_or_else(|| {
+                            BufferError::MalformedPayload {
+                                name: "<variant>".to_string(),
+                                reason: "variant payload slot offset overflows usize",
+                            }
+                        })?;
+                    let payload_value = self.read_field_at(slot, &payload.ty)?;
+                    let Value::Dict(dict) = payload_value else {
+                        return Err(BufferError::MalformedPayload {
+                            name: "<variant>".to_string(),
+                            reason: "enum payload did not decode to a record",
+                        });
+                    };
+                    map = dict.map.clone();
+                }
+                Ok(Value::variant_dict(map, selected.name, name.clone()))
+            }
+            other => Err(BufferError::TypeMismatch {
+                name: "<variant>".to_string(),
+                declared: type_label(other),
+                requested: "variant record",
             }),
         }
     }
@@ -3398,19 +4025,28 @@ fn type_matches(declared: &TypeRepr, requested: &TypeRepr) -> bool {
         (TypeRepr::Int, TypeRepr::Int)
         | (TypeRepr::Float, TypeRepr::Float)
         | (TypeRepr::Bool, TypeRepr::Bool)
-        | (TypeRepr::Null, TypeRepr::Null)
+        | (TypeRepr::Unit, TypeRepr::Unit)
         | (TypeRepr::String, TypeRepr::String) => true,
         (TypeRepr::List { element: d }, TypeRepr::List { element: r }) => {
-            match (d.as_ref(), r.as_ref()) {
-                (TypeRepr::Int, TypeRepr::Int)
-                | (TypeRepr::Float, TypeRepr::Float)
-                | (TypeRepr::Bool, TypeRepr::Bool)
-                | (TypeRepr::String, TypeRepr::String) => true,
-                (TypeRepr::Schema { schema: ds }, TypeRepr::Schema { schema: rs }) => ds == rs,
-                _ => false,
-            }
+            type_matches(d.as_ref(), r.as_ref())
+        }
+        (TypeRepr::Option { inner: d }, TypeRepr::Option { inner: r }) => {
+            type_matches(d.as_ref(), r.as_ref())
+        }
+        (TypeRepr::Result { ok: dok, err: derr }, TypeRepr::Result { ok: rok, err: rerr }) => {
+            type_matches(dok.as_ref(), rok.as_ref()) && type_matches(derr.as_ref(), rerr.as_ref())
         }
         (TypeRepr::Schema { schema: d }, TypeRepr::Schema { schema: r }) => d == r,
+        (
+            TypeRepr::Enum {
+                name: dn,
+                variants: dv,
+            },
+            TypeRepr::Enum {
+                name: rn,
+                variants: rv,
+            },
+        ) => dn == rn && dv == rv,
         _ => false,
     }
 }
@@ -3420,7 +4056,7 @@ fn type_matches(declared: &TypeRepr, requested: &TypeRepr) -> bool {
 /// formatted `TypeRepr::Int`.
 fn type_label(ty: &TypeRepr) -> &'static str {
     match ty {
-        TypeRepr::Null => "Null",
+        TypeRepr::Unit => "Unit",
         TypeRepr::Bool => "Bool",
         TypeRepr::Int => "Int",
         TypeRepr::Float => "Float",
@@ -3428,6 +4064,7 @@ fn type_label(ty: &TypeRepr) -> &'static str {
         TypeRepr::List { .. } => "List",
         TypeRepr::Option { .. } => "Option",
         TypeRepr::Result { .. } => "Result",
+        TypeRepr::Enum { .. } => "Enum",
         TypeRepr::Schema { .. } => "Schema",
         TypeRepr::Closure { .. } => "Closure",
     }
@@ -3438,6 +4075,7 @@ mod tests {
     use super::*;
     use crate::layout::SchemaLayout;
     use crate::schema_canonical::{Field, Schema};
+    use crate::value::Value;
 
     fn field(name: &str, ty: TypeRepr) -> Field {
         Field {
@@ -3445,6 +4083,169 @@ mod tests {
             ty,
             default: None,
         }
+    }
+
+    fn result_ok(value: Value) -> Value {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(crate::smol_str::SmolStr::from("value"), value);
+        Value::variant_dict(map, "Ok".to_string(), "Result".to_string())
+    }
+
+    fn result_err(value: Value) -> Value {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(crate::smol_str::SmolStr::from("error"), value);
+        Value::variant_dict(map, "Err".to_string(), "Result".to_string())
+    }
+
+    #[test]
+    fn option_and_result_fields_roundtrip_through_buffer_and_verifier() {
+        let schema = Schema {
+            name: "Variants".into(),
+            generics: vec![],
+            is_tuple: false,
+            fields: vec![
+                field(
+                    "maybe",
+                    TypeRepr::Option {
+                        inner: Box::new(TypeRepr::Int),
+                    },
+                ),
+                field(
+                    "res",
+                    TypeRepr::Result {
+                        ok: Box::new(TypeRepr::Int),
+                        err: Box::new(TypeRepr::String),
+                    },
+                ),
+                field(
+                    "ok",
+                    TypeRepr::Result {
+                        ok: Box::new(TypeRepr::Int),
+                        err: Box::new(TypeRepr::String),
+                    },
+                ),
+            ],
+        };
+        let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+        let mut builder = BufferBuilder::new(&layout, &schema.fields);
+        let maybe = Value::option_some(Value::Int(42));
+        let res = result_err(Value::String("bad".into()));
+        let ok = result_ok(Value::Int(7));
+        builder
+            .write_value("maybe", &schema.fields[0].ty, &maybe)
+            .expect("write option");
+        builder
+            .write_value("res", &schema.fields[1].ty, &res)
+            .expect("write result err");
+        builder
+            .write_value("ok", &schema.fields[2].ty, &ok)
+            .expect("write result ok");
+        let bytes = builder.finish();
+        crate::verifier::verify_record(
+            &bytes,
+            &layout,
+            &schema.fields,
+            0,
+            crate::verifier::Region::new(0, bytes.len()).unwrap(),
+        )
+        .expect("verify");
+        let reader = BufferReader::new(&layout, &schema.fields, &bytes).expect("reader");
+        assert_eq!(
+            reader.read_value("maybe", &schema.fields[0].ty).unwrap(),
+            maybe
+        );
+        assert_eq!(reader.read_value("res", &schema.fields[1].ty).unwrap(), res);
+    }
+
+    #[test]
+    fn option_string_inside_nested_schema_relocates_when_pasted() {
+        let inner = Schema {
+            name: "Inner".into(),
+            generics: vec![],
+            is_tuple: false,
+            fields: vec![field(
+                "maybe",
+                TypeRepr::Option {
+                    inner: Box::new(TypeRepr::String),
+                },
+            )],
+        };
+        let outer = Schema {
+            name: "Outer".into(),
+            generics: vec![],
+            is_tuple: false,
+            fields: vec![field(
+                "inner",
+                TypeRepr::Schema {
+                    schema: Box::new(inner.clone()),
+                },
+            )],
+        };
+        let layout = SchemaLayout::offsets_for(&outer).expect("layout");
+        let mut map = std::collections::BTreeMap::new();
+        let payload = Value::option_some(Value::String("hello".into()));
+        map.insert(crate::smol_str::SmolStr::from("maybe"), payload.clone());
+        let value = Value::branded_dict(map, Some("Inner".to_string()));
+        let mut builder = BufferBuilder::new(&layout, &outer.fields);
+        builder
+            .write_value("inner", &outer.fields[0].ty, &value)
+            .expect("write nested schema");
+        let bytes = builder.finish_arena_absolute(64).expect("arena rebase");
+        let mut arena = vec![0u8; 64];
+        arena.extend_from_slice(&bytes);
+        let reader = BufferReader::new_at_base(&layout, &outer.fields, &arena, 64).expect("reader");
+        let decoded = reader.read_value("inner", &outer.fields[0].ty).unwrap();
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn list_option_string_relocates_variant_entry_payloads() {
+        let schema = Schema {
+            name: "Rows".into(),
+            generics: vec![],
+            is_tuple: false,
+            fields: vec![field(
+                "xs",
+                TypeRepr::List {
+                    element: Box::new(TypeRepr::Option {
+                        inner: Box::new(TypeRepr::String),
+                    }),
+                },
+            )],
+        };
+        let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+        let value = Value::list(vec![
+            Value::option_some(Value::String("a".into())),
+            Value::option_none(),
+            Value::option_some(Value::String("bc".into())),
+        ]);
+        let mut builder = BufferBuilder::new(&layout, &schema.fields);
+        builder
+            .write_value("xs", &schema.fields[0].ty, &value)
+            .expect("write list option");
+        let bytes = builder.finish_arena_absolute(128).expect("arena rebase");
+        let mut arena = vec![0u8; 128];
+        arena.extend_from_slice(&bytes);
+        crate::verifier::verify_record_multi(
+            &arena,
+            &layout,
+            &schema.fields,
+            128,
+            crate::verifier::MultiRegion::new(
+                (0, 128),
+                (128, arena.len()),
+                (arena.len(), arena.len()),
+                (arena.len(), arena.len()),
+            )
+            .unwrap(),
+        )
+        .expect("verify arena absolute");
+        let reader =
+            BufferReader::new_at_base(&layout, &schema.fields, &arena, 128).expect("reader");
+        assert_eq!(
+            reader.read_value("xs", &schema.fields[0].ty).unwrap(),
+            value
+        );
     }
 
     fn int_schema() -> Schema {
@@ -3545,21 +4346,21 @@ mod tests {
     }
 
     #[test]
-    fn float_and_null_roundtrip() {
+    fn float_and_unit_roundtrip() {
         let schema = Schema {
             name: "Phys".into(),
             generics: vec![],
             is_tuple: false,
-            fields: vec![field("mass", TypeRepr::Float), field("nil", TypeRepr::Null)],
+            fields: vec![field("mass", TypeRepr::Float), field("nil", TypeRepr::Unit)],
         };
         let layout = SchemaLayout::offsets_for(&schema).expect("layout");
         let mut builder = BufferBuilder::new(&layout, &schema.fields);
         builder.write_float("mass", 1.5_f64).expect("write mass");
-        builder.write_null("nil").expect("write nil");
+        builder.write_unit("nil").expect("write nil");
         let bytes = builder.finish();
         let reader = BufferReader::new(&layout, &schema.fields, &bytes).expect("reader");
         assert_eq!(reader.read_float("mass").expect("read mass"), 1.5);
-        reader.read_null("nil").expect("read nil");
+        reader.read_unit("nil").expect("read nil");
     }
 
     #[test]

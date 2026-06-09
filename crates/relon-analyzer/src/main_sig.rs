@@ -181,10 +181,10 @@ fn unknown_type_diagnostic(t: &TypeNode, tree: &AnalyzedTree) -> Option<Diagnost
     // Single-segment: original v1 check (builtin / prelude / declared).
     if t.path.len() == 1 {
         let head = &t.path[0];
-        if is_builtin_type_name(head) {
+        if crate::schema::is_reserved_type_name(head) {
             return None;
         }
-        if matches!(head.as_str(), "Result" | "Option") {
+        if is_builtin_type_name(head) || matches!(head.as_str(), "Option" | "Result") {
             return None;
         }
         let known = tree

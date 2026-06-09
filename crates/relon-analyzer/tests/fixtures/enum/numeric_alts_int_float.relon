@@ -1,4 +1,0 @@
-// v1.8: `Enum<Int, Float>` — both alternatives are numeric. An
-// `Int` literal matches the first alternative.
-// EXPECTED: 0 × StaticTypeMismatch.
-{ Enum<Int, Float> n: 7 }

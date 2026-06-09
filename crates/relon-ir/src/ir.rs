@@ -26,7 +26,7 @@ use relon_parser::TokenRange;
 
 /// Scalar value type in v1.beta / Phase 2.c. Mirrors the wasm
 /// value-type subset the codegen pass emits — `Int` lowers to `I64`,
-/// `Float` lowers to `F64`, `Bool` and `Null` lower to `I32` (a single
+/// `Float` lowers to `F64`, `Bool` and `Unit` lower to `I32` (a single
 /// byte on the wire but loaded into an i32 wasm slot). Phase 2.c adds
 /// the variable-length leaves `String` / `ListInt` as i32 pointers on
 /// the wasm operand stack (the pointer points at the tail-area record
@@ -45,9 +45,9 @@ pub enum IrType {
     /// Boolean (Relon `Bool`). 1 byte on the wire, lifted to `i32` on
     /// the wasm operand stack via `i32.load8_u`.
     Bool,
-    /// Unit / `Null` placeholder. 1 byte on the wire (always `0`); the
+    /// Internal unit placeholder. 1 byte on the wire (always `0`); the
     /// codegen path emits `i32.const 0` rather than reading memory.
-    Null,
+    Unit,
     /// Pointer to a tail-area `[len: u32 LE][utf8 bytes]` record. The
     /// pointer is a wasm `i32` (relative to the linear memory base);
     /// the IR keeps a distinct tag so diagnostics + srcmap can tell a
@@ -114,7 +114,7 @@ pub enum IrType {
 
 impl IrType {
     /// Wasm operand-stack representation. `Int`/`Float` keep their
-    /// `i64`/`f64` shape; `Bool`/`Null`/`String`/`ListInt`/`Closure`
+    /// `i64`/`f64` shape; `Bool`/`Unit`/`String`/`ListInt`/`Closure`
     /// all occupy an `i32` slot (a 0/1 byte, a 0 tag, or a pointer).
     /// Used by the codegen vstack to compare across-branch frame
     /// types in `If`.
@@ -123,7 +123,7 @@ impl IrType {
             IrType::I64 | IrType::F64 => self,
             IrType::I32
             | IrType::Bool
-            | IrType::Null
+            | IrType::Unit
             | IrType::String
             | IrType::ListInt
             | IrType::ListFloat
@@ -176,7 +176,7 @@ impl IrType {
             IrType::I64 => Some("Int"),
             IrType::F64 => Some("Float"),
             IrType::Bool => Some("Bool"),
-            IrType::Null => Some("Null"),
+            IrType::Unit => Some("Unit"),
             IrType::String => Some("String"),
             // Coarsening: every concrete list element tag → "List".
             IrType::ListInt
@@ -503,7 +503,7 @@ pub enum Op {
     /// Stack: `[] -> [T]` where `T` is dictated by `ty`. Codegen emits
     /// `local.get $in_ptr; <load>.offset=N` — `i64.load` for `I64`,
     /// `f64.load` for `F64`, `i32.load8_u` for `Bool`, and a literal
-    /// `i32.const 0` for `Null` (no memory read needed for the unit
+    /// `i32.const 0` for `Unit` (no memory read needed for the unit
     /// placeholder).
     LoadField {
         /// Byte offset of the field inside the input buffer, supplied
@@ -724,7 +724,7 @@ pub enum Op {
     F64Unary(F64UnaryOp),
     /// Pop two operands of the tagged type, push the boolean result.
     /// Stack: `[T, T] -> [Bool]`. Lowers to `i64.eq` / `f64.eq` /
-    /// `i32.eq` depending on `T`'s wasm slot. `Null == Null` always
+    /// `i32.eq` depending on `T`'s wasm slot. `Unit == Unit` always
     /// emits `i32.const 1` (no operand consumed from memory).
     Eq(IrType),
     /// Pop two operands of the tagged type, push the negated boolean
@@ -732,7 +732,7 @@ pub enum Op {
     Ne(IrType),
     /// Pop two operands, push `lhs < rhs`. Stack: `[T, T] -> [Bool]`.
     /// Signed comparison for `I64`. Rejected at codegen for `Bool`
-    /// / `Null` / `String` / `ListInt` — those types have no defined
+    /// / `Unit` / `String` / `ListInt` — those types have no defined
     /// ordering relation at the wasm layer.
     Lt(IrType),
     /// Pop two operands, push `lhs <= rhs`. See [`Op::Lt`] for the
@@ -860,6 +860,14 @@ pub enum Op {
         /// recording the base.
         root_align: u32,
     },
+    /// Allocate a record in scratch and bind its arena-relative base offset
+    /// to a record local. Used by closure bodies that construct enum payload
+    /// records without an entry `out_ptr` local.
+    AllocScratchRecord {
+        record_local_idx: u32,
+        root_size: u32,
+        root_align: u32,
+    },
     /// Phase 3.b dict literal construction.
     ///
     /// Pop a value off the stack and store it into the in-construction
@@ -867,7 +875,7 @@ pub enum Op {
     /// the wasm store opcode:
     ///
     /// * `I64` / `F64` — pop scalar, `i64.store` / `f64.store`.
-    /// * `Bool` / `Null` — pop i32, `i32.store8`.
+    /// * `Bool` / `Unit` — pop i32, `i32.store8`.
     /// * `String` / `ListInt` — pop i32 (an out_ptr-relative offset
     ///   produced by [`Op::EmitTailRecordFromAbsoluteAddr`] or
     ///   [`Op::PushRecordBase`]), store as i32 via `i32.store`. The
@@ -881,6 +889,13 @@ pub enum Op {
         /// Field's IR type. Drives the wasm store-opcode selection.
         ty: IrType,
     },
+    /// Store into a scratch-allocated record. The record local already holds
+    /// an arena-relative base offset, so codegen does not add `out_ptr`.
+    StoreFieldAtRecordAbsolute {
+        record_local_idx: u32,
+        offset: u32,
+        ty: IrType,
+    },
     /// Phase 3.b dict literal construction.
     ///
     /// Push the current value of `$record_local` onto the wasm operand
@@ -891,6 +906,8 @@ pub enum Op {
         /// offset.
         record_local_idx: u32,
     },
+    /// Push a scratch-allocated record's arena-relative base offset.
+    PushRecordBaseAbsolute { record_local_idx: u32 },
     /// Phase 3.b dict literal construction.
     ///
     /// Pop an absolute wasm-memory address pointing at a
@@ -911,6 +928,35 @@ pub enum Op {
         /// 8 for ListInt).
         ty: IrType,
     },
+    /// Build an `Option` / `Result` variant record in the output tail
+    /// area and push its arena-absolute i32 offset. If `payload_ty` is
+    /// present, the payload value must already be on the operand stack;
+    /// the op pops it and stores it at `payload_offset`.
+    BuildVariantRecord {
+        tag: u8,
+        record_size: u32,
+        record_align: u32,
+        payload_offset: Option<u32>,
+        payload_ty: Option<IrType>,
+    },
+    /// Build an `Option` / `Result` / custom enum variant record in the
+    /// scratch region and push its arena-relative i32 offset. This is used
+    /// by closure bodies inside list-producing higher-order functions, where
+    /// there is an `ArenaState` but no entry `out_ptr` local.
+    BuildVariantRecordScratch {
+        tag: u8,
+        record_size: u32,
+        record_align: u32,
+        payload_offset: Option<u32>,
+        payload_ty: Option<IrType>,
+    },
+    /// Build a pointer-array list header in the output tail area from
+    /// already-materialised pointer values. Pops `len` i32 offsets in
+    /// source order, writes `[len: u32][off_0: u32]...`, and pushes the
+    /// arena-absolute i32 offset of the header. Used by source literals
+    /// such as `[Stat.Up, Stat.Down]` where each element is a variant
+    /// record built immediately before the list header.
+    BuildPointerList { len: u32 },
 
     /// Phase 4.a stdlib dispatch.
     ///
@@ -1800,6 +1846,7 @@ impl Op {
             // initial `out_ptr`) and unwind.
             Op::StoreField { .. }
             | Op::StoreFieldAtRecord { .. }
+            | Op::StoreFieldAtRecordAbsolute { .. }
             | Op::StoreI32AtAbsolute { .. }
             | Op::StoreI64AtAbsolute { .. }
             | Op::StoreI8AtAbsolute { .. }
@@ -1808,8 +1855,13 @@ impl Op {
             | Op::AllocScratchDyn
             | Op::AllocRootRecord { .. }
             | Op::AllocSubRecord { .. }
+            | Op::AllocScratchRecord { .. }
             | Op::PushRecordBase { .. }
+            | Op::PushRecordBaseAbsolute { .. }
             | Op::EmitTailRecordFromAbsoluteAddr { .. }
+            | Op::BuildVariantRecord { .. }
+            | Op::BuildVariantRecordScratch { .. }
+            | Op::BuildPointerList { .. }
             | Op::MemcpyAtAbsolute
             | Op::MakeClosure { .. } => RecoverableWrite,
 
@@ -1873,7 +1925,6 @@ mod type_name_oracle_tests {
             (Value::Int(0), IrType::I64),
             (Value::Float(OrderedFloat(0.0)), IrType::F64),
             (Value::Bool(true), IrType::Bool),
-            (Value::Null, IrType::Null),
             (Value::String("".into()), IrType::String),
             // Every list element tag coarsens to the same "List" oracle.
             (Value::list(vec![Value::Int(1)]), IrType::ListInt),

@@ -358,6 +358,14 @@ fn list(items: Vec<Value>) -> Value {
     Value::List(Arc::new(items))
 }
 
+fn enum_value(variant: &str, enum_name: &str, fields: Vec<(&str, Value)>) -> Value {
+    Value::variant_dict(
+        fields.into_iter().map(|(k, v)| (k.to_string(), v)),
+        variant.to_string(),
+        enum_name.to_string(),
+    )
+}
+
 fn iints(items: &[i64]) -> Value {
     Value::List(Arc::new(items.iter().map(|x| Value::Int(*x)).collect()))
 }
@@ -573,6 +581,64 @@ fn anon_dict_multi_cross_region_lists() {
     );
     m.insert("xs".to_string(), iints(&[10, -20, 30]));
     assert_four_way(SRC_MULTI_LIST, m);
+}
+
+const SRC_XS_ENUM_UNIT: &str = "#enum Stat { Up, Down }
+#main(List<Stat> xs) -> Dict
+{ xs: xs }";
+
+#[test]
+fn anon_dict_list_custom_enum_unit_field() {
+    assert_four_way(
+        SRC_XS_ENUM_UNIT,
+        args1(
+            "xs",
+            list(vec![
+                enum_value("Up", "Stat", vec![]),
+                enum_value("Down", "Stat", vec![]),
+            ]),
+        ),
+    );
+}
+
+const SRC_XS_ENUM_TUPLE: &str = "#enum Packet { Pair(Int, String), Empty }
+#main(List<Packet> xs) -> Dict
+{ xs: xs }";
+
+#[test]
+fn anon_dict_list_custom_enum_tuple_field() {
+    assert_four_way(
+        SRC_XS_ENUM_TUPLE,
+        args1(
+            "xs",
+            list(vec![
+                enum_value(
+                    "Pair",
+                    "Packet",
+                    vec![("0", Value::Int(7)), ("1", Value::String("x".into()))],
+                ),
+                enum_value("Empty", "Packet", vec![]),
+            ]),
+        ),
+    );
+}
+
+const SRC_ENUM_UNIT_LIST_LITERAL_FIELD: &str = "#enum Stat { Up, Down }
+#main() -> Dict
+{ xs: [Stat.Up, Stat.Down] }";
+
+#[test]
+fn anon_dict_list_custom_enum_unit_literal_field() {
+    assert_four_way(SRC_ENUM_UNIT_LIST_LITERAL_FIELD, HashMap::new());
+}
+
+const SRC_ENUM_TUPLE_LIST_LITERAL_FIELD: &str = r#"#enum Packet { Pair(Int, String), Empty }
+#main() -> Dict
+{ xs: [Packet.Pair(7, "x"), Packet.Empty] }"#;
+
+#[test]
+fn anon_dict_list_custom_enum_tuple_literal_field() {
+    assert_four_way(SRC_ENUM_TUPLE_LIST_LITERAL_FIELD, HashMap::new());
 }
 
 // ---- F3: cross-region branded-struct fields --------------------------

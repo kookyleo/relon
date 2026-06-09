@@ -49,6 +49,7 @@ fn directive_context_suggests_directive_names() {
     let items = complete_at(src, 0, 1);
     let names = labels_with_kind(&items, CompletionKind::Directive);
     assert!(names.contains(&"schema".to_string()), "{names:?}");
+    assert!(names.contains(&"enum".to_string()), "{names:?}");
     assert!(names.contains(&"main".to_string()), "{names:?}");
     let pragmas = labels_with_kind(&items, CompletionKind::Pragma);
     assert!(pragmas.contains(&"internal".to_string()), "{pragmas:?}");
@@ -106,6 +107,19 @@ fn bare_context_includes_schema_names() {
 }
 
 #[test]
+fn bare_context_includes_enum_names() {
+    let src = "#enum Stat { Up, Down }
+
+{
+    x: Stat.Up
+}
+";
+    let items = complete_at(src, 3, 7);
+    let schemas = labels_with_kind(&items, CompletionKind::Schema);
+    assert!(schemas.contains(&"Stat".to_string()), "{schemas:?}");
+}
+
+#[test]
 fn bare_context_does_not_offer_directive_names() {
     let src = "{\n    foo: 1\n}\n";
     let items = complete_at(src, 1, 10);
@@ -150,6 +164,7 @@ fn keywords_for_cursor_directive_works_without_parse() {
         .map(|i| i.label.clone())
         .collect();
     assert!(names.contains(&"schema".to_string()), "{names:?}");
+    assert!(names.contains(&"enum".to_string()), "{names:?}");
     assert!(names.contains(&"main".to_string()), "{names:?}");
     assert!(names.contains(&"import".to_string()), "{names:?}");
     let pragmas: Vec<String> = items
@@ -217,6 +232,7 @@ fn recovering_at_hash_surfaces_directive_names() {
     let items = complete_recovering(src, 0, 1);
     let dirs = labels_with_kind(&items, CompletionKind::Directive);
     assert!(dirs.contains(&"schema".to_string()), "{dirs:?}");
+    assert!(dirs.contains(&"enum".to_string()), "{dirs:?}");
     assert!(dirs.contains(&"import".to_string()), "{dirs:?}");
 }
 

@@ -133,6 +133,7 @@ pub fn typecheck(root: &Node, tree: &mut AnalyzedTree) {
         base_index,
         pipe_target_calls,
         closure_param_context: std::collections::HashMap::new(),
+        match_arm_locals: Vec::new(),
     };
     walker.visit(root);
 }
@@ -171,6 +172,10 @@ struct Walker<'a> {
         relon_parser::NodeId,
         std::collections::HashMap<String, relon_parser::TypeNode>,
     >,
+    /// Locals introduced only inside a concrete enum match arm. For
+    /// `msg match { Email: msg.address }`, the `Email` arm temporarily
+    /// treats `msg` as the `Notification.Email` payload record.
+    match_arm_locals: Vec<std::collections::HashMap<String, InferredType>>,
 }
 
 impl<'a> Walker<'a> {
@@ -481,8 +486,13 @@ impl<'a> Walker<'a> {
                 self.check_match_arm_types(node.range, expr, arms);
                 self.visit_internal(expr, None);
                 for (pat, body) in arms {
-                    self.visit_internal(pat, None);
-                    self.visit_internal(body, None);
+                    if let Some(locals) = self.match_arm_locals(expr, pat) {
+                        self.match_arm_locals.push(locals);
+                        self.visit_internal(body, None);
+                        self.match_arm_locals.pop();
+                    } else {
+                        self.visit_internal(body, None);
+                    }
                 }
             }
             Expr::Binary(op, left, right) => {
@@ -673,6 +683,10 @@ fn type_contains_any(t: &InferredType) -> bool {
             params.iter().any(type_contains_any) || type_contains_any(ret)
         }
         InferredType::Tuple(elems) => elems.iter().any(type_contains_any),
+        InferredType::VariantPayload(_, _, fields) => fields
+            .values()
+            .map(crate::infer::infer_from_type_node)
+            .any(|t| type_contains_any(&t)),
         _ => false,
     }
 }

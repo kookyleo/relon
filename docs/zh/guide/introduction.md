@@ -53,14 +53,13 @@ Relon 的设计假设有两类作者：
 **`platform/notify.relon`**（平台团队的库，无 `#main`）：
 
 ```relon
-{
-    // 通知通道：sum-type tagged enum
-    #schema Channel Enum<
-        Email { String address: *, String subject: * },
-        SMS   { String phone: * },
-        Push
-    >,
+#enum Channel {
+    Email { address: String, subject: String },
+    SMS { phone: String },
+    Push
+}
 
+{
     // 业务通用的「带主体的通知」契约 + 计算默认值
     #schema Notification {
         Channel via: *,

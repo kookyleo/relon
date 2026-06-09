@@ -35,7 +35,7 @@ use std::collections::HashMap;
 /// — there is no `SchemaDef` for built-ins, so a missing entry in
 /// `tree.schemas` is expected and not an error.
 const BUILTIN_TYPE_NAMES: &[&str] = &[
-    "String", "Int", "Float", "Bool", "Null", "List", "Dict", "Bytes", "Date", "Time", "DateTime",
+    "String", "Int", "Float", "Bool", "List", "Dict", "Bytes", "Date", "Time", "DateTime",
     "Duration", "Schema", "Any",
 ];
 

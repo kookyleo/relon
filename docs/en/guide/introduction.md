@@ -55,14 +55,13 @@ The example below uses `#schema`, sum-type tagged enums, computed defaults, and 
 **`platform/notify.relon`** (platform-team library, no `#main`):
 
 ```relon
-{
-    // Notification channel: sum-type tagged enum
-    #schema Channel Enum<
-        Email { String address: *, String subject: * },
-        SMS   { String phone: * },
-        Push
-    >,
+#enum Channel {
+    Email { address: String, subject: String },
+    SMS { phone: String },
+    Push
+}
 
+{
     // A general "notification with body" contract + computed default
     #schema Notification {
         Channel via: *,

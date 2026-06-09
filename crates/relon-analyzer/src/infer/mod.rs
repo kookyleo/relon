@@ -51,6 +51,101 @@ pub(crate) type SchemaBaseIndex = HashMap<String, Vec<String>>;
 /// `child`. Treats unknown intermediate names as a soft stop (returns
 /// false) — the caller already handles the `name == head` exact-match
 /// case before delegating here.
+fn prelude_unit_variant_type(path: &[TokenKey]) -> Option<InferredType> {
+    match path {
+        [TokenKey::String(name, _, _)] if name == "None" => Some(InferredType::Variant(
+            "Option".to_string(),
+            "None".to_string(),
+        )),
+        [TokenKey::String(head, _, _), TokenKey::String(variant, _, _)]
+            if head == "Option" && variant == "None" =>
+        {
+            Some(InferredType::Variant(
+                "Option".to_string(),
+                "None".to_string(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn prelude_call_variant_type(path: &[TokenKey]) -> Option<InferredType> {
+    match path {
+        [TokenKey::String(name, _, _)] if name == "Some" => Some(InferredType::Variant(
+            "Option".to_string(),
+            "Some".to_string(),
+        )),
+        [TokenKey::String(head, _, _), TokenKey::String(name, _, _)]
+            if head == "Option" && name == "Some" =>
+        {
+            Some(InferredType::Variant(
+                "Option".to_string(),
+                "Some".to_string(),
+            ))
+        }
+        [TokenKey::String(name, _, _)] if name == "Ok" => Some(InferredType::Variant(
+            "Result".to_string(),
+            "Ok".to_string(),
+        )),
+        [TokenKey::String(head, _, _), TokenKey::String(name, _, _)]
+            if head == "Result" && name == "Ok" =>
+        {
+            Some(InferredType::Variant(
+                "Result".to_string(),
+                "Ok".to_string(),
+            ))
+        }
+        [TokenKey::String(name, _, _)] if name == "Err" => Some(InferredType::Variant(
+            "Result".to_string(),
+            "Err".to_string(),
+        )),
+        [TokenKey::String(head, _, _), TokenKey::String(name, _, _)]
+            if head == "Result" && name == "Err" =>
+        {
+            Some(InferredType::Variant(
+                "Result".to_string(),
+                "Err".to_string(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn token_path_strings(path: &[TokenKey]) -> Option<Vec<String>> {
+    let mut out = Vec::with_capacity(path.len());
+    for seg in path {
+        match seg {
+            TokenKey::String(s, _, _) => out.push(s.clone()),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn user_enum_variant_type(path: &[TokenKey], scope: &TypeScope) -> Option<InferredType> {
+    let parts = token_path_strings(path)?;
+    if parts.len() < 2 {
+        return None;
+    }
+    let variant = parts.last()?.clone();
+    let enum_name = parts[..parts.len() - 1].join(".");
+    let tree = scope.tree?;
+    let local = tree
+        .schemas
+        .values()
+        .find(|def| def.name.as_deref() == Some(enum_name.as_str()));
+    let imported = tree
+        .workspace_import_index
+        .as_ref()
+        .and_then(|idx| idx.imported_schema_defs.get(&enum_name));
+    let def = local.or(imported)?;
+    if def.variants.iter().any(|v| v.name == variant) {
+        Some(InferredType::Variant(enum_name, variant))
+    } else {
+        None
+    }
+}
+
 fn schema_extends(idx: &SchemaBaseIndex, child: &str, target: &str) -> bool {
     use std::collections::HashSet;
     let mut visited: HashSet<String> = HashSet::new();
@@ -83,7 +178,6 @@ pub(crate) enum InferredType {
     /// used when an expression can't be classified or the slot's
     /// declared type is `Any`.
     Any,
-    Null,
     Bool,
     Int,
     Float,
@@ -102,8 +196,11 @@ pub(crate) enum InferredType {
     Schema(String),
     /// Tagged variant: `(enum_name, variant_name)`.
     Variant(String, String),
-    /// `T?`. The inner is the underlying type; a value of `Optional<T>`
-    /// matches either `T` or `Null`.
+    /// A match-arm narrowed enum value. The head is known to be one concrete
+    /// variant, and `fields` describes that variant's payload.
+    VariantPayload(String, String, HashMap<String, TypeNode>),
+    /// `T?`. The inner is the underlying type; absence is represented by
+    /// the standard `None` tagged value.
     Optional(Box<InferredType>),
     /// Closure / function with the given parameter types and return.
     /// Param types are `Any` when the user didn't annotate them.
@@ -120,7 +217,6 @@ impl InferredType {
     pub(crate) fn name(&self) -> String {
         match self {
             InferredType::Any => "Any".into(),
-            InferredType::Null => "Null".into(),
             InferredType::Bool => "Bool".into(),
             InferredType::Int => "Int".into(),
             InferredType::Float => "Float".into(),
@@ -129,7 +225,9 @@ impl InferredType {
             InferredType::List(inner) => format!("List<{}>", inner.name()),
             InferredType::Dict(v) => format!("Dict<String, {}>", v.name()),
             InferredType::Schema(s) => s.clone(),
-            InferredType::Variant(enum_name, v) => format!("{enum_name}.{v}"),
+            InferredType::Variant(enum_name, v) | InferredType::VariantPayload(enum_name, v, _) => {
+                format!("{enum_name}.{v}")
+            }
             InferredType::Optional(inner) => format!("{}?", inner.name()),
             InferredType::Fn(_, _) => "Closure".into(),
             InferredType::Tuple(elems) => {
@@ -179,12 +277,14 @@ impl InferredType {
         bases: Option<&SchemaBaseIndex>,
         imports: Option<&WorkspaceImportIndex>,
     ) -> bool {
-        // Shorthand: `Any` accepts anything; `T?` accepts `Null` or
-        // recursively-stripped `T`.
+        // Shorthand: `Any` accepts anything; `T?` accepts the standard
+        // `None` tagged value or recursively-stripped `T`.
         if let InferredType::Any = self {
             return true;
         }
-        if expected.is_optional && matches!(self, InferredType::Null) {
+        if expected.is_optional
+            && matches!(self, InferredType::Variant(enum_name, variant) if enum_name == "Option" && variant == "None")
+        {
             return true;
         }
         // v1.8 / v1.8e: `pkg.User` (two segments, alias resolved)
@@ -218,7 +318,6 @@ impl InferredType {
             "Float" => matches!(self, InferredType::Float),
             "Bool" => matches!(self, InferredType::Bool),
             "String" => matches!(self, InferredType::String),
-            "Null" => matches!(self, InferredType::Null),
             // v1.1: when the slot declares an element type
             // (`List<T>`, `Dict<String, T>`), recurse so a `List<Int>`
             // doesn't slip into a `List<String>` slot. A bare
@@ -239,27 +338,6 @@ impl InferredType {
                 _ => false,
             },
             "Closure" | "Fn" => matches!(self, InferredType::Fn(_, _)),
-            // v1.8: `Enum<alt1, alt2, ...>` slot. The value must
-            // satisfy at least one alternative. Alternatives come in
-            // three flavours: (i) built-in type (`Int`, `String`, …)
-            // or custom schema — we recurse into `subsumes_with`;
-            // (ii) bareword identifier — at the analyzer level we
-            // can't tell whether it's a string-literal alternative
-            // (parser strips quotes from `"up"` so `up` and a real
-            // bareword `Active` look identical) or a tagged-variant
-            // / schema reference. We treat any non-builtin bareword
-            // alternative as compatible with `String` values (the
-            // runtime's cheap path does the same), and recurse into
-            // `subsumes_with` for everything else.
-            "Enum" => {
-                if expected.generics.is_empty() {
-                    return true; // ban-bare catches this upstream
-                }
-                expected
-                    .generics
-                    .iter()
-                    .any(|alt| enum_alt_matches(self, alt, bases))
-            }
             // Tuple-typed slot. Only `(...)` tuple values can satisfy
             // it; `[...]` is a List and stays a List.
             "Tuple" => match self {
@@ -291,7 +369,8 @@ impl InferredType {
                             .map(|idx| schema_extends(idx, name, head))
                             .unwrap_or(false)
                 }
-                InferredType::Variant(enum_name, _) => enum_name == head,
+                InferredType::Variant(enum_name, _)
+                | InferredType::VariantPayload(enum_name, _, _) => enum_name == head,
                 // v1.8: structural-shape clearly distinct from a
                 // schema (which is always Dict-shaped at runtime).
                 // Primitives, lists, fns, tuples can never fit a
@@ -301,7 +380,6 @@ impl InferredType {
                 | InferredType::Number
                 | InferredType::Bool
                 | InferredType::String
-                | InferredType::Null
                 | InferredType::List(_)
                 | InferredType::Tuple(_)
                 | InferredType::Fn(_, _) => false,
@@ -325,13 +403,6 @@ impl InferredType {
             | (InferredType::Number, InferredType::Int)
             | (InferredType::Float, InferredType::Number)
             | (InferredType::Number, InferredType::Float) => InferredType::Number,
-            (InferredType::Null, InferredType::Optional(inner))
-            | (InferredType::Optional(inner), InferredType::Null) => {
-                InferredType::Optional(inner.clone())
-            }
-            (InferredType::Null, other) | (other, InferredType::Null) => {
-                InferredType::Optional(Box::new(other.clone()))
-            }
             (InferredType::List(la), InferredType::List(lb)) => {
                 InferredType::List(Box::new(Self::join(la, lb)))
             }
@@ -350,6 +421,13 @@ impl InferredType {
                 InferredType::Dict(Box::new(Self::join(va, vb)))
             }
             (InferredType::Variant(ea, _), InferredType::Variant(eb, _)) if ea == eb => {
+                InferredType::Schema(ea.clone())
+            }
+            (InferredType::VariantPayload(ea, _, _), InferredType::VariantPayload(eb, _, _))
+            | (InferredType::Variant(ea, _), InferredType::VariantPayload(eb, _, _))
+            | (InferredType::VariantPayload(ea, _, _), InferredType::Variant(eb, _))
+                if ea == eb =>
+            {
                 InferredType::Schema(ea.clone())
             }
             _ => InferredType::Any,
@@ -383,7 +461,6 @@ pub(crate) fn infer_from_type_node_with_imports(
     let base = match t.path.as_slice() {
         [single] => match single.as_str() {
             "Any" => InferredType::Any,
-            "Null" => InferredType::Null,
             "Bool" => InferredType::Bool,
             "Int" => InferredType::Int,
             "Float" => InferredType::Float,
@@ -424,25 +501,12 @@ pub(crate) fn infer_from_type_node_with_imports(
                 let elems: Vec<InferredType> = t.generics.iter().map(&recurse).collect();
                 InferredType::Tuple(elems)
             }
-            // v1.8: `Enum<alt1, alt2, ...>` lifts into the join of
-            // all alternatives so the value-side type is as precise
-            // as the alternatives allow:
-            //   - `Enum<"up", "down">` → all alts are `String`
-            //     literals, join is `String`.
-            //   - `Enum<Int, Float>` → join is `Number`.
-            //   - heterogeneous (`Enum<Int, String>`) → join is `Any`.
-            "Enum" if !t.generics.is_empty() => t
-                .generics
-                .iter()
-                .map(enum_alt_value_type)
-                .reduce(|acc, ty| InferredType::join(&acc, &ty))
-                .unwrap_or(InferredType::Any),
-            // v1.7: bare `Closure` / `Fn` / `Enum` reach this arm
+            // v1.7: bare `Closure` / `Fn` reach this arm
             // only if the source-level ban-bare walker hasn't fired
             // yet (analyzer pre-passes). Collapse to the internal
             // `Any` placeholder rather than fabricating a phony
             // schema — the diagnostic surfaces independently.
-            "Closure" | "Fn" | "Enum" => InferredType::Any,
+            "Closure" | "Fn" => InferredType::Any,
             other => InferredType::Schema(other.to_string()),
         },
         // v1.8 / v1.8e cross-module: `pkg.User` lifts to the
@@ -464,31 +528,6 @@ pub(crate) fn infer_from_type_node_with_imports(
     } else {
         base
     }
-}
-
-/// v1.8: classify a single `Enum<...>` alternative as the
-/// `InferredType` of any *value* that could match it. Used by
-/// `infer_from_type_node`'s `"Enum"` arm to compute a value-side
-/// upper bound for the whole enum slot.
-///
-/// The parser strips quotes from string-literal alternatives (so
-/// `Enum<"up", "down">` and `Enum<Active, Inactive>` both parse as
-/// `[TypeNode { path: ["up"|"Active"], ... }, ...]`). Without the
-/// schema index here we treat every single-segment bareword
-/// alternative that isn't a built-in primitive as a `String`
-/// candidate — matching the runtime's cheap-path policy in
-/// `enum_alt_matches_cheaply`.
-fn enum_alt_value_type(t: &TypeNode) -> InferredType {
-    if t.path.len() == 1 && t.generics.is_empty() {
-        let head = t.path[0].as_str();
-        if !is_known_builtin_alt(head) {
-            // Either a quoted string literal (parser-stripped) or a
-            // schema/variant bareword. Either way, runtime accepts
-            // String values via the cheap path.
-            return InferredType::String;
-        }
-    }
-    infer_from_type_node(t)
 }
 
 /// v1.8 cross-module: returns the qualified schema key
@@ -519,39 +558,8 @@ fn cross_module_schema(
 pub(super) fn is_known_builtin_alt(s: &str) -> bool {
     matches!(
         s,
-        "Any"
-            | "Null"
-            | "Bool"
-            | "Int"
-            | "Float"
-            | "Number"
-            | "String"
-            | "List"
-            | "Dict"
-            | "Closure"
-            | "Fn"
+        "Any" | "Bool" | "Int" | "Float" | "Number" | "String" | "List" | "Dict" | "Closure" | "Fn"
     )
-}
-
-/// v1.8: per-alternative subsumption for an `Enum<...>` slot.
-/// Mirrors the runtime's cheap-then-structural cascade. Returns
-/// `true` if the inferred value type `actual` is statically
-/// compatible with the alternative `alt`.
-fn enum_alt_matches(
-    actual: &InferredType,
-    alt: &TypeNode,
-    bases: Option<&SchemaBaseIndex>,
-) -> bool {
-    // Single-segment bareword without generics: either a built-in
-    // primitive or a string-literal / schema-name candidate.
-    if alt.path.len() == 1 && alt.generics.is_empty() {
-        let head = alt.path[0].as_str();
-        if !is_known_builtin_alt(head) {
-            // String-literal cheap path: only `String` values match.
-            return matches!(actual, InferredType::String);
-        }
-    }
-    actual.subsumes_with(alt, bases)
 }
 
 /// Lightweight scope used by inference. Mirrors `ScopeFrame` but only
@@ -814,6 +822,209 @@ fn infer_reference(
     infer_type(target, &child)
 }
 
+fn match_arm_locals(
+    scope: &TypeScope,
+    scrutinee: &Node,
+    pat: &Node,
+) -> Option<HashMap<String, InferredType>> {
+    let enum_name = match infer_type(scrutinee, scope)? {
+        InferredType::Schema(name) => name,
+        InferredType::Variant(name, _) => name,
+        InferredType::VariantPayload(name, _, _) => name,
+        InferredType::Optional(_) => "Option".to_string(),
+        _ => return None,
+    };
+    let variant_name = pattern_variant_name(pat)?;
+    let (generic_params, fields) = variant_payload_fields(scope, &enum_name, &variant_name)?;
+    let fields = if let Some(scrutinee_ty) = scrutinee_type_node(scope, scrutinee) {
+        let scrutinee_ty = normalize_optional_type_node(&scrutinee_ty);
+        let mut subst = HashMap::new();
+        for (i, param) in generic_params.iter().enumerate() {
+            if let Some(actual) = scrutinee_ty.generics.get(i) {
+                subst.insert(param.clone(), actual.clone());
+            }
+        }
+        if subst.is_empty() {
+            fields
+        } else {
+            fields
+                .into_iter()
+                .map(|(name, ty)| (name, substitute_generics_in_typenode(&ty, &subst)))
+                .collect()
+        }
+    } else {
+        fields
+    };
+
+    let mut locals = HashMap::new();
+    if let Some(binding) = single_variable_name(scrutinee) {
+        locals.insert(
+            binding,
+            InferredType::VariantPayload(enum_name, variant_name, fields.clone()),
+        );
+    }
+    if let Expr::VariantPattern { bindings, .. } = pat.expr.as_ref() {
+        let imports = scope.tree.and_then(|t| t.workspace_import_index.as_ref());
+        for (idx, binding) in bindings.iter().enumerate() {
+            let Some(name) = binding.binding.as_ref() else {
+                continue;
+            };
+            let field_name = binding
+                .field
+                .clone()
+                .or_else(|| positional_field_name(&fields, idx))
+                .unwrap_or_else(|| idx.to_string());
+            let ty = fields
+                .get(&field_name)
+                .map(|t| infer_from_type_node_with_imports(t, imports))
+                .unwrap_or(InferredType::Any);
+            locals.insert(name.clone(), ty);
+        }
+    }
+    Some(locals)
+}
+
+fn single_variable_name(node: &Node) -> Option<String> {
+    match node.expr.as_ref() {
+        Expr::Variable(path) => match path.as_slice() {
+            [TokenKey::String(name, _, _)] => Some(name.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn pattern_variant_name(node: &Node) -> Option<String> {
+    match node.expr.as_ref() {
+        Expr::Type(t) if t.path.len() == 1 => Some(t.path[0].clone()),
+        Expr::VariantPattern { variant, .. } => Some(variant.clone()),
+        _ => None,
+    }
+}
+
+fn prelude_variant_payload_fields(
+    enum_name: &str,
+    variant_name: &str,
+) -> Option<(Vec<String>, HashMap<String, TypeNode>)> {
+    match (enum_name, variant_name) {
+        ("Option", "Some") => {
+            let mut fields = HashMap::new();
+            fields.insert("value".to_string(), type_var("T"));
+            Some((vec!["T".to_string()], fields))
+        }
+        ("Option", "None") => Some((vec!["T".to_string()], HashMap::new())),
+        ("Result", "Ok") => {
+            let mut fields = HashMap::new();
+            fields.insert("value".to_string(), type_var("T"));
+            Some((vec!["T".to_string(), "E".to_string()], fields))
+        }
+        ("Result", "Err") => {
+            let mut fields = HashMap::new();
+            fields.insert("error".to_string(), type_var("E"));
+            Some((vec!["T".to_string(), "E".to_string()], fields))
+        }
+        _ => None,
+    }
+}
+
+fn type_var(name: &str) -> TypeNode {
+    TypeNode {
+        path: vec![name.to_string()],
+        generics: Vec::new(),
+        is_optional: false,
+        range: Default::default(),
+        variant_fields: None,
+        doc_comment: None,
+    }
+}
+
+fn positional_field_name(fields: &HashMap<String, TypeNode>, idx: usize) -> Option<String> {
+    let numeric = idx.to_string();
+    if fields.contains_key(&numeric) {
+        return Some(numeric);
+    }
+    if fields.len() == 1 {
+        return fields.keys().next().cloned();
+    }
+    None
+}
+
+fn scrutinee_type_node(scope: &TypeScope, scrutinee: &Node) -> Option<TypeNode> {
+    let binding = single_variable_name(scrutinee)?;
+    for frame in scope.frames.iter().rev() {
+        if let Some(ty) = frame.closure_param_types.get(&binding) {
+            return Some(ty.clone());
+        }
+    }
+    let tree = scope.tree?;
+    if let Some(sig) = tree.main_signature.as_ref() {
+        if let Some(param) = sig.params.iter().find(|p| p.name == binding) {
+            return Some(param.type_node.clone());
+        }
+    }
+    let resolved = tree.references.get(&scrutinee.id)?;
+    let target_node = tree.node_index.get(&resolved.target)?;
+    target_node.type_hint.clone()
+}
+
+fn normalize_optional_type_node(t: &TypeNode) -> TypeNode {
+    if !t.is_optional {
+        return t.clone();
+    }
+    let mut inner = t.clone();
+    inner.is_optional = false;
+    TypeNode {
+        path: vec!["Option".to_string()],
+        generics: vec![inner],
+        is_optional: false,
+        range: t.range,
+        variant_fields: None,
+        doc_comment: None,
+    }
+}
+
+fn substitute_generics_in_typenode(t: &TypeNode, subst: &HashMap<String, TypeNode>) -> TypeNode {
+    if t.path.len() == 1 && t.generics.is_empty() {
+        if let Some(replacement) = subst.get(&t.path[0]) {
+            let mut clone = replacement.clone();
+            clone.is_optional = clone.is_optional || t.is_optional;
+            return clone;
+        }
+    }
+    let mut out = t.clone();
+    out.generics = out
+        .generics
+        .iter()
+        .map(|g| substitute_generics_in_typenode(g, subst))
+        .collect();
+    out
+}
+
+fn variant_payload_fields(
+    scope: &TypeScope,
+    enum_name: &str,
+    variant_name: &str,
+) -> Option<(Vec<String>, HashMap<String, TypeNode>)> {
+    if let Some(fields) = prelude_variant_payload_fields(enum_name, variant_name) {
+        return Some(fields);
+    }
+    let tree = scope.tree?;
+    for def in tree.schemas.values() {
+        if def.name.as_deref() != Some(enum_name) {
+            continue;
+        }
+        let variant = def.variants.iter().find(|v| v.name == variant_name)?;
+        let mut fields = HashMap::new();
+        for field in &variant.fields {
+            if let Some(ty) = &field.type_hint {
+                fields.insert(field.name.clone(), ty.clone());
+            }
+        }
+        return Some((def.generics.clone(), fields));
+    }
+    None
+}
+
 /// Infer the static type of `node` under `scope`. Returns `None` for
 /// expressions whose result depends on runtime computation we can't
 /// statically classify (FnCall without a known signature, fully
@@ -821,7 +1032,7 @@ fn infer_reference(
 /// runtime", not as an error.
 pub(crate) fn infer_type(node: &Node, scope: &TypeScope) -> Option<InferredType> {
     match &*node.expr {
-        Expr::Null => Some(InferredType::Null),
+        Expr::Missing => None,
         Expr::Bool(_) => Some(InferredType::Bool),
         Expr::Int(_) => Some(InferredType::Int),
         Expr::Float(_) => Some(InferredType::Float),
@@ -920,7 +1131,9 @@ pub(crate) fn infer_type(node: &Node, scope: &TypeScope) -> Option<InferredType>
             }
             Some(joined)
         }
-        Expr::Variable(path) => infer_path_inferred(path, scope),
+        Expr::Variable(path) => prelude_unit_variant_type(path)
+            .or_else(|| user_enum_variant_type(path, scope))
+            .or_else(|| infer_path_inferred(path, scope)),
         Expr::Reference { base, path } => infer_reference(base, path, node, scope),
         Expr::Closure {
             params,
@@ -964,12 +1177,21 @@ pub(crate) fn infer_type(node: &Node, scope: &TypeScope) -> Option<InferredType>
             let head = enum_path.first()?;
             Some(InferredType::Variant(head.clone(), variant.clone()))
         }
-        Expr::Match { arms, .. } => {
-            // Match returns the join of arm bodies. If we can't infer
-            // any arm, defer to runtime by returning None.
+        Expr::VariantPattern { .. } => None,
+        Expr::Match { expr, arms } => {
+            // Match returns the join of arm bodies. When the scrutinee is a
+            // concrete enum variable and the pattern is a concrete variant,
+            // arm-local field access sees that variant's payload.
             let mut acc: Option<InferredType> = None;
-            for (_, body) in arms {
-                if let Some(t) = infer_type(body, scope) {
+            for (pat, body) in arms {
+                let scoped;
+                let body_scope = if let Some(locals) = match_arm_locals(scope, expr, pat) {
+                    scoped = scope.child_with_locals(locals);
+                    &scoped
+                } else {
+                    scope
+                };
+                if let Some(t) = infer_type(body, body_scope) {
                     acc = Some(match acc {
                         None => t,
                         Some(prev) => InferredType::join(&prev, &t),
@@ -1004,6 +1226,14 @@ pub(crate) fn infer_type(node: &Node, scope: &TypeScope) -> Option<InferredType>
             }
             if name_path.is_empty() {
                 return None;
+            }
+            if args.len() == 1 && args[0].name.is_none() {
+                if let Some(variant) = prelude_call_variant_type(path) {
+                    return Some(variant);
+                }
+            }
+            if let Some(variant) = user_enum_variant_type(path, scope) {
+                return Some(variant);
             }
             let tree = scope.tree?;
             // v1.5: try the path-aware lookup first so `alias.method`

@@ -422,6 +422,22 @@ pub(crate) fn walk_path(path: &[TokenKey], scope: &TypeScope) -> PathTailOutcome
             (InferredType::Dict(value_ty), WalkSeg::Name(_)) => {
                 current = *value_ty;
             }
+            (InferredType::VariantPayload(enum_name, variant_name, fields), seg) => {
+                let field_name = match seg {
+                    WalkSeg::Name(name) => name.clone(),
+                    WalkSeg::Index(i) => i.to_string(),
+                };
+                let Some(field_ty) = fields.get(&field_name) else {
+                    return PathTailOutcome::UnknownStep {
+                        at_segment,
+                        running_name: format!("{enum_name}.{variant_name}"),
+                    };
+                };
+                current = infer_from_type_node_with_imports(
+                    field_ty,
+                    scope.tree.and_then(|t| t.workspace_import_index.as_ref()),
+                );
+            }
             // v1.8: positional access on a Tuple. `pair.0` /
             // `pair.1` produce the i-th element's type; out-of-
             // range indices surface as `UnknownStep` so strict mode

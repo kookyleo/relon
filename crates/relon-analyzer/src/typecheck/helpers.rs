@@ -275,8 +275,12 @@ impl<'a> Walker<'a> {
     /// current scope stack + schema index. Lent to inference helpers
     /// while the walker holds a mutable borrow on `self.tree`.
     pub(super) fn build_type_scope(&self) -> TypeScope<'_> {
+        let mut locals = HashMap::new();
+        for layer in &self.match_arm_locals {
+            locals.extend(layer.iter().map(|(name, ty)| (name.clone(), ty.clone())));
+        }
         TypeScope {
-            locals: HashMap::new(),
+            locals,
             parent_locals: Vec::new(),
             schemas: Some(&self.schema_index),
             frames: self.scope_stack.iter().collect(),

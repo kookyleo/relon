@@ -65,10 +65,9 @@ it falls back (e.g. schemas not pre-lowered get lowered on demand via
 The execution order is fixed; each pass can read its predecessors'
 output:
 
-1. **`schema`**: recognize `#schema Name { ... }` /
-   `#schema Name: { ... }` / `#schema Name Enum<...>` and lower them
-   to `SchemaDef`. Tagged-enum sum-type variant lists are extracted
-   here too.
+1. **`schema`**: recognize `#schema Name { ... }`,
+   `#schema Name: { ... }`, and `#enum Name { ... }`, then convert
+   them to `SchemaDef`. Tagged enum variant lists are extracted here too.
 2. **`resolve`**: bind `Reference` / `Variable` nodes to target
    fields' `NodeId`. Conservative strategy: closure params and dict
    spreads mark the frame as dynamic; references aren't forcibly
@@ -81,7 +80,7 @@ output:
 5. **`typecheck`**: aggregate diagnostics —
    `UnresolvedReference`, `StaticTypeMismatch`,
    `NonExhaustiveMatch`, `UnknownVariant` (with did-you-mean),
-   `DuplicateMatchArm`, `HeterogeneousEnum`, `SchemaBodyNotDict`, …
+   `DuplicateMatchArm`, `SchemaBodyNotDict`, …
 
 Diagnostics have two levels: `Severity::Error` blocks evaluation;
 `Severity::Warning` is informational and the evaluator still runs.

@@ -127,13 +127,13 @@ impl<'a> Walker<'a> {
         // substitute the slot's generic args (`Result<Int, String>` →
         // `T -> Int, E -> String`), then recurse into each body field.
         if expected.path.len() == 1 {
+            let slot_name = &expected.path[0];
             if let Expr::VariantCtor {
                 enum_path,
                 variant,
                 body,
             } = &*value.expr
             {
-                let slot_name = &expected.path[0];
                 if enum_path.first().map(|s| s.as_str()) == Some(slot_name.as_str()) {
                     if let Some(variants) = self.variant_field_index.get(slot_name).cloned() {
                         if let Some((generic_params, fields)) = variants.get(variant).cloned() {
@@ -163,33 +163,88 @@ impl<'a> Walker<'a> {
                     }
                 }
             }
+
+            if let Expr::FnCall { path, args } = &*value.expr {
+                let variant_and_field =
+                    match (slot_name.as_str(), path.as_slice()) {
+                        ("Option", [TokenKey::String(name, _, _)]) if name == "Some" => {
+                            Some(("Some", "value"))
+                        }
+                        (
+                            "Option",
+                            [TokenKey::String(head, _, _), TokenKey::String(name, _, _)],
+                        ) if head == "Option" && name == "Some" => Some(("Some", "value")),
+                        ("Result", [TokenKey::String(name, _, _)]) if name == "Ok" => {
+                            Some(("Ok", "value"))
+                        }
+                        (
+                            "Result",
+                            [TokenKey::String(head, _, _), TokenKey::String(name, _, _)],
+                        ) if head == "Result" && name == "Ok" => Some(("Ok", "value")),
+                        ("Result", [TokenKey::String(name, _, _)]) if name == "Err" => {
+                            Some(("Err", "error"))
+                        }
+                        (
+                            "Result",
+                            [TokenKey::String(head, _, _), TokenKey::String(name, _, _)],
+                        ) if head == "Result" && name == "Err" => Some(("Err", "error")),
+                        _ => None,
+                    };
+                if let Some((variant, field_name_in_variant)) = variant_and_field {
+                    if let Some(arg) = args.first().filter(|_| args.len() == 1) {
+                        if arg.name.is_none() {
+                            if let Some(variants) = self.variant_field_index.get(slot_name).cloned()
+                            {
+                                if let Some((generic_params, fields)) =
+                                    variants.get(variant).cloned()
+                                {
+                                    let mut subst = HashMap::new();
+                                    for (i, gname) in generic_params.iter().enumerate() {
+                                        if let Some(arg_ty) = expected.generics.get(i) {
+                                            subst.insert(gname.clone(), arg_ty.clone());
+                                        }
+                                    }
+                                    if let Some(field_ty) = fields.get(field_name_in_variant) {
+                                        let resolved =
+                                            substitute_generics_in_typenode(field_ty, &subst);
+                                        self.check_typed_binding(
+                                            &resolved,
+                                            &arg.value,
+                                            &format!("{field_name}.{field_name_in_variant}"),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
         }
         match &*value.expr {
-            Expr::List(items) => {
-                if expected.path == vec!["List"] && expected.generics.len() == 1 {
-                    let inner_expected = &expected.generics[0];
-                    let spread_expected = TypeNode {
-                        path: vec!["List".to_string()],
-                        generics: vec![inner_expected.clone()],
-                        is_optional: false,
-                        range: expected.range,
-                        variant_fields: None,
-                        doc_comment: None,
-                    };
-                    for (i, item) in items.iter().enumerate() {
-                        if let Expr::Spread(inner) = &*item.expr {
-                            self.check_typed_binding(
-                                &spread_expected,
-                                inner,
-                                &format!("{}[{}]", field_name, i),
-                            );
-                        } else {
-                            self.check_typed_binding(
-                                inner_expected,
-                                item,
-                                &format!("{}[{}]", field_name, i),
-                            );
-                        }
+            Expr::List(items) if expected.path == vec!["List"] && expected.generics.len() == 1 => {
+                let inner_expected = &expected.generics[0];
+                let spread_expected = TypeNode {
+                    path: vec!["List".to_string()],
+                    generics: vec![inner_expected.clone()],
+                    is_optional: false,
+                    range: expected.range,
+                    variant_fields: None,
+                    doc_comment: None,
+                };
+                for (i, item) in items.iter().enumerate() {
+                    if let Expr::Spread(inner) = &*item.expr {
+                        self.check_typed_binding(
+                            &spread_expected,
+                            inner,
+                            &format!("{}[{}]", field_name, i),
+                        );
+                    } else {
+                        self.check_typed_binding(
+                            inner_expected,
+                            item,
+                            &format!("{}[{}]", field_name, i),
+                        );
                     }
                 }
             }
@@ -197,21 +252,18 @@ impl<'a> Walker<'a> {
             // case is a `Tuple<T1, T2, ...>` slot: check arity, then
             // recurse position-by-position. It is not a List: tuple
             // values only satisfy tuple-typed slots.
-            Expr::Tuple(items) => {
-                if expected.path == vec!["Tuple"] {
-                    if items.len() != expected.generics.len() {
-                        self.tree.diagnostics.push(Diagnostic::StaticTypeMismatch {
-                            field: field_name.to_string(),
-                            expected: format_type(expected),
-                            found: format!("tuple of {} element(s)", items.len()),
-                            range: span_of(value.range),
-                        });
-                        return;
-                    }
-                    for (i, (item, slot)) in items.iter().zip(expected.generics.iter()).enumerate()
-                    {
-                        self.check_typed_binding(slot, item, &format!("{}[{}]", field_name, i));
-                    }
+            Expr::Tuple(items) if expected.path == vec!["Tuple"] => {
+                if items.len() != expected.generics.len() {
+                    self.tree.diagnostics.push(Diagnostic::StaticTypeMismatch {
+                        field: field_name.to_string(),
+                        expected: format_type(expected),
+                        found: format!("tuple of {} element(s)", items.len()),
+                        range: span_of(value.range),
+                    });
+                    return;
+                }
+                for (i, (item, slot)) in items.iter().zip(expected.generics.iter()).enumerate() {
+                    self.check_typed_binding(slot, item, &format!("{}[{}]", field_name, i));
                 }
             }
             // Only the common `Dict<String, V>` shape is descended into;
