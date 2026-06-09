@@ -1603,6 +1603,48 @@ pub const LEDGER: &[LedgerEntry] = &[
         reason: "internal guard: bundled scalar-math (abs/floor/ceil/round/sqrt) metadata missing from registry",
     },
     LedgerEntry {
+        id: "try_lower_predicate_math.unknown_stdlib_method.1",
+        site: "lowering/peephole.rs::try_lower_predicate_math",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "internal guard: bundled multiple_of/in_range slot missing from registry",
+    },
+    LedgerEntry {
+        id: "try_lower_predicate_math.unknown_stdlib_method.2",
+        site: "lowering/peephole.rs::try_lower_predicate_math",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "internal guard: bundled multiple_of/in_range metadata missing from registry",
+    },
+    LedgerEntry {
+        id: "try_lower_size_in_range.string_charcount_capped",
+        site: "lowering/peephole.rs::try_lower_size_in_range",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "size_in_range on a String counts Unicode code points (chars().count()); needs the \
+                 UTF-8 decode seam LLVM-native / wasm do not lower (same seam as upper/title/nfd). \
+                 Capped loudly so the String never routes into the byte-length list body",
+    },
+    LedgerEntry {
+        id: "try_lower_size_in_range.unknown_stdlib_method.1",
+        site: "lowering/peephole.rs::try_lower_size_in_range",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "internal guard: bundled size_in_range/dict_size_in_range slot missing from registry",
+    },
+    LedgerEntry {
+        id: "try_lower_size_in_range.unknown_stdlib_method.2",
+        site: "lowering/peephole.rs::try_lower_size_in_range",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "internal guard: bundled size_in_range/dict_size_in_range metadata missing from registry",
+    },
+    LedgerEntry {
         id: "try_lower_list_filter.unknown_stdlib_method.1",
         site: "lowering/peephole.rs::try_lower_list_filter",
         category: Category::ExprShape,
@@ -2702,6 +2744,30 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         corpus: "r9_is_uuid_nonhex",
         status: Status::Covered,
         proof: "tree-walk + cranelift",
+    },
+    // ---- JSON-Schema numeric / size predicates (Int / Float / List
+    //      arms four-way; Float-mod & String-charcount arms stay capped) ----
+    SurfaceEntry {
+        construct: "multiple_of(Int, Int) -> Bool (zero-divisor short-circuits to false)",
+        wave: "JS",
+        corpus: "js_multiple_of_true",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift; wasm/llvm-native in aot_wasm_parity::js_multiple_of_*",
+    },
+    SurfaceEntry {
+        construct: "in_range(n, lo, hi) -> Bool (all-f64; Int args widened to f64)",
+        wave: "JS",
+        corpus: "js_in_range_int_inside",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift; wasm/llvm-native in aot_wasm_parity::js_in_range_*",
+    },
+    SurfaceEntry {
+        construct: "size_in_range(List<_>, lo, hi) -> Bool (element count from record header)",
+        wave: "JS",
+        corpus: "js_size_in_range_list_inside",
+        status: Status::Covered,
+        proof:
+            "tree-walk + cranelift; wasm/llvm-native in aot_wasm_parity::js_size_in_range_list_*",
     },
     // ---- Wave R15: `split(String, sep) -> List<String>` ----
     SurfaceEntry {

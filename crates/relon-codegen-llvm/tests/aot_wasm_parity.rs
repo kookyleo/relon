@@ -1788,3 +1788,103 @@ fn r9_is_uuid_nonhex_aligns_native_via_wasmtime() {
         false,
     );
 }
+
+// ===========================================================
+// JSON-Schema numeric / size predicates. Reuses the
+// `r8_check_bool` Bool driver. Covers the four-way arms:
+//   * `multiple_of(Int, Int)` — `d == 0 ? false : n % d == 0`
+//     (the `d == 0` guard gates the `Op::Mod(I64)`, so a zero
+//     divisor never traps).
+//   * `in_range(n, lo, hi)` — all-`F64` inclusive bound check
+//     (Int args widened to f64, matching the `to_f64_val` oracle).
+//   * `size_in_range(List<_>, lo, hi)` — element count from the
+//     `[len: u32 LE]` record header.
+// Capped arms (NOT here): Float `multiple_of` (`Op::Mod(F64)` has
+// no native cranelift / wasm remainder) and `size_in_range` on a
+// String (Unicode code-point count needs the UTF-8 decode seam).
+// ===========================================================
+
+#[test]
+fn js_multiple_of_true_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_mul_of_t",
+        "#main(Int n) -> Bool\nmultiple_of(12, 4)",
+        true,
+    );
+}
+
+#[test]
+fn js_multiple_of_false_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_mul_of_f",
+        "#main(Int n) -> Bool\nmultiple_of(13, 4)",
+        false,
+    );
+}
+
+#[test]
+fn js_multiple_of_zero_divisor_aligns_native_via_wasmtime() {
+    // d == 0 short-circuits to false WITHOUT evaluating `n % d`
+    // (which would trap on wasm / cranelift).
+    r8_check_bool(
+        "js_mul_of_z",
+        "#main(Int n) -> Bool\nmultiple_of(7, 0)",
+        false,
+    );
+}
+
+#[test]
+fn js_in_range_int_inside_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_inr_in",
+        "#main(Int n) -> Bool\nin_range(5, 1, 10)",
+        true,
+    );
+}
+
+#[test]
+fn js_in_range_int_edge_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_inr_edge",
+        "#main(Int n) -> Bool\nin_range(10, 1, 10)",
+        true,
+    );
+}
+
+#[test]
+fn js_in_range_int_outside_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_inr_out",
+        "#main(Int n) -> Bool\nin_range(11, 1, 10)",
+        false,
+    );
+}
+
+#[test]
+fn js_in_range_float_mix_aligns_native_via_wasmtime() {
+    // Mixed Int / Float args: the oracle widens every arg to f64, so
+    // the lowering peephole widens the Int bounds with ConvertI64ToF64.
+    r8_check_bool(
+        "js_inr_fmix",
+        "#main(Int n) -> Bool\nin_range(2.5, 1, 3)",
+        true,
+    );
+}
+
+#[test]
+fn js_size_in_range_list_inside_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_sir_in",
+        "#main(Int n) -> Bool\nsize_in_range([1, 2, 3], 1, 5)",
+        true,
+    );
+}
+
+#[test]
+fn js_size_in_range_list_outside_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_sir_out",
+        "#main(Int n) -> Bool\nsize_in_range([1, 2, 3, 4, 5, 6], 1, 5)",
+        false,
+    );
+}

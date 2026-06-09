@@ -37,7 +37,9 @@ use super::normalization::{
 };
 use super::signatures::StdlibFunction;
 use super::string_ops::{ends_with_string, len_string_to_int, replace_string, split_string};
-use super::validators::is_uuid_string;
+use super::validators::{
+    dict_size_in_range, in_range_float, is_uuid_string, multiple_of_int, size_in_range_list,
+};
 
 /// Return the ordered list of builtin stdlib functions. The order is
 /// part of the wire format — new entries must be **appended** so the
@@ -334,6 +336,38 @@ pub fn builtin_stdlib() -> &'static [StdlibFunction] {
             list_string_map_to_variant_list(),
             // Pointer-array list filter. Appended at index 60.
             list_list_filter(),
+            // JSON-Schema numeric / size predicates lowered four-way for
+            // their statically-decidable arms. Appended at the tail
+            // (indices 61..64) so every position-pinned index above stays
+            // put — existing-construct cranelift/llvm bytes are unchanged,
+            // so GENERATOR_VERSION does not move. The lowering peepholes
+            // (`try_lower_predicate_math` / `try_lower_size_in_range`)
+            // inspect the operand IR types and route to these bodies;
+            // unsupported arms cap loudly (no silent wrong value):
+            //   * `61` — `multiple_of(Int, Int) -> Bool` (`d == 0 ? false :
+            //             n % d == 0`; the `d == 0` guard gates the
+            //             `Op::Mod(I64)` so a zero divisor never traps).
+            //             Float arms stay capped: `Op::Mod(F64)` has no
+            //             native cranelift / wasm remainder and the
+            //             oracle's `fract().abs() < 1e-9` tolerance has no
+            //             four-way body.
+            //   * `62` — `in_range(n, lo, hi) -> Bool` (all-`F64`; the
+            //             oracle widens every arg to f64, so the peephole
+            //             widens any Int arg with `ConvertI64ToF64` first).
+            //   * `63` — `size_in_range(List<_>, lo, hi) -> Bool`
+            //             (`minItems` / `maxItems`; element count from the
+            //             shared `[len: u32 LE]` record header).
+            //   * `64` — `dict_size_in_range(Dict, lo, hi) -> Bool`
+            //             (`minProperties` / `maxProperties`; entry count
+            //             from the same header — shares the op-stream with
+            //             index 63). The `size_in_range` String arm stays
+            //             capped: the oracle counts Unicode code points
+            //             (`chars().count()`), which needs the UTF-8 decode
+            //             seam LLVM-native / wasm do not lower.
+            multiple_of_int(),
+            in_range_float(),
+            size_in_range_list(),
+            dict_size_in_range(),
         ]
     })
 }

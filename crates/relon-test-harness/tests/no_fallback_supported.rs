@@ -210,6 +210,37 @@ fn capped_validator_falls_back_cleanly() {
     assert_results_agree("capped is_email", "<inline>", &auto_result, &oracle_result);
 }
 
+/// Honesty pin for the JSON-Schema predicate arms that intentionally stay
+/// capped: a Float `multiple_of` (the `(Int, Float)` arm here — `Op::Mod(F64)`
+/// has no native cranelift / wasm remainder, and the oracle's
+/// `fract().abs() < 1e-9` tolerance has no four-way body) and a String
+/// `size_in_range` (the oracle counts Unicode code points via
+/// `chars().count()`, which needs the UTF-8 decode seam LLVM-native / wasm do
+/// not lower). Both must take the clean unsupported-shape fallback — never a
+/// silent wrong value — and still agree with the tree-walk oracle.
+#[test]
+fn capped_predicate_arms_fall_back_cleanly() {
+    for source in [
+        // Float multiple_of arm: 10 % 2.5 == 0 (oracle true), but the
+        // compiled backend declines the Float operand.
+        "#main() -> Bool\nmultiple_of(10, 2.5)",
+        // String size_in_range arm: "abc" has 3 code points (oracle true).
+        "#main() -> Bool\nsize_in_range(\"abc\", 1, 5)",
+    ] {
+        let auto = AutoEvaluator::new(source)
+            .unwrap_or_else(|e| panic!("auto setup unexpectedly failed for `{source}`: {e}"));
+        let auto_result = auto.run_main(HashMap::new());
+        let route = auto.last_dispatch_route();
+        assert_eq!(
+            route,
+            DispatchRoute::UnsupportedFallback,
+            "capped arm `{source}` should take the clean unsupported-shape fallback, got {route:?}"
+        );
+        let oracle_result = oracle(source, HashMap::new());
+        assert_results_agree("capped predicate arm", source, &auto_result, &oracle_result);
+    }
+}
+
 /// Compare an auto run against the tree-walk oracle. Both-ok ⇒ values must
 /// be bit-equal; both-err ⇒ accepted (both trapped); ok-vs-err ⇒ a hard
 /// divergence.

@@ -321,11 +321,14 @@ mod glob_match_index_tests {
     /// string ops (`len` / `ends_with` / `replace`) at indices 52..54;
     /// Wave R9 appended the Bool `is_uuid` validator at index 55; Wave R15
     /// appended `split` -> List<String> at index 56; enum-like list maps
-    /// append at 57..59 and pointer-array filter at 60. All are at the tail so every position-pinned index
-    /// above stays put. Pinning the count catches accidental double-registrations.
+    /// append at 57..59 and pointer-array filter at 60; the JSON-Schema
+    /// numeric / size predicates (`multiple_of` / `in_range` /
+    /// `size_in_range` / `dict_size_in_range`) append at 61..64. All are
+    /// at the tail so every position-pinned index above stays put. Pinning
+    /// the count catches accidental double-registrations.
     #[test]
-    fn bundle_has_61_entries() {
-        assert_eq!(stdlib_function_count(), 61);
+    fn bundle_has_65_entries() {
+        assert_eq!(stdlib_function_count(), 65);
         assert_eq!(stdlib_function_index("glob_match"), Some(37));
         assert_eq!(stdlib_function_index("list_list_length"), Some(38));
         // Wave R3b tail appends (order-pinned wire format).
@@ -366,6 +369,12 @@ mod glob_match_index_tests {
             Some(59)
         );
         assert_eq!(stdlib_function_index("list_list_filter"), Some(60));
+        // JSON-Schema numeric / size predicates (Int / Float / List / Dict
+        // arms; Float-mod & String-charcount arms stay capped).
+        assert_eq!(stdlib_function_index("multiple_of"), Some(61));
+        assert_eq!(stdlib_function_index("in_range"), Some(62));
+        assert_eq!(stdlib_function_index("size_in_range"), Some(63));
+        assert_eq!(stdlib_function_index("dict_size_in_range"), Some(64));
     }
 }
 
