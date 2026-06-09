@@ -156,6 +156,26 @@ fn two_ints(an: &str, av: i64, bn: &str, bv: i64) -> HashMap<String, Value> {
     m
 }
 
+/// `Extras { Int a }` argument for the dict-spread-into-schema case
+/// (`{ ...e, b: 9 } -> Out`). The spread source `e` is a schema value
+/// the compiled backend marshals through the input record.
+fn spread_extras_arg() -> HashMap<String, Value> {
+    let mut m = HashMap::new();
+    m.insert("e".to_string(), Value::dict(vec![("a", Value::Int(1))]));
+    m
+}
+
+/// `List<Int>` argument for the capped list-spread-over-a-parameter case
+/// (`[...a, 9]`). Tree-walk runs it; cranelift caps (non-literal source).
+fn spread_param_list_arg() -> HashMap<String, Value> {
+    let mut m = HashMap::new();
+    m.insert(
+        "a".to_string(),
+        Value::List(Arc::new(vec![Value::Int(1), Value::Int(2)])),
+    );
+    m
+}
+
 fn args_n_5() -> HashMap<String, Value> {
     one_int("n", 5)
 }
@@ -1448,44 +1468,66 @@ pub fn all_cases() -> Vec<CorpusCase> {
             tier: Tier::StdlibSimple,
             supported_by: TW_CR,
         },
-        // ---- Wave R12: spread (`...x`) — capped, by-design boundaries ----
+        // ---- Wave R12-lower: spread (`...x`) — two static forms lowered ----
         //
-        // Both spread forms are rejected before they reach the cranelift
-        // lowering pass, for two orthogonal reasons. They are registered
-        // `TW_ONLY` (the tree-walker is the only backend that runs them):
-        // the corpus ratchet then asserts cranelift *gracefully* caps
-        // rather than silently miscompiling.
-        //
-        // LIST spread `[...a, b, ...c]`: spread flattening only happens
-        // at runtime in the tree-walker (`eval.rs` `Expr::List` spread
-        // branch). Statically, spread elements keep the source's own list
-        // type, so a mixed spread/scalar literal is not a homogeneous
-        // `List<Int>`. With no declared return the entry type is
-        // `<missing>`, which the compiled backend's marshaller also
-        // rejects. Lifting this would change list/spread inference, not
-        // add a codegen lowering — out of scope for an IR-coverage wave.
+        // The two statically-tractable spread forms now lower on the
+        // compiled backends, byte-equal to the tree-walk oracle. The
+        // by-design boundaries (anonymous-`Dict` result, parameter / non-
+        // literal spread source) stay capped and are registered `TW_ONLY`
+        // so the ratchet asserts cranelift *gracefully* caps rather than
+        // silently miscompiling.
+
+        // LIST spread `[...a, b, ...c]` with a declared `List<Int>` return:
+        // each `...source` (a list literal) is statically flattened into
+        // its elements in order — matching the tree-walk `Expr::List`
+        // spread branch — then the flat sequence rides the same runtime
+        // scalar-list materialiser the computed-list path uses. `TW_CR`
+        // like every other `List<Int>` return (the bytecode VM rejects the
+        // entry shape; these aren't in the trace recipe catalogue). The
+        // llvm-native + wasm legs are proven in the dedicated
+        // `inplace_return_four_way` / `aot_wasm_parity` codegen tests.
         CorpusCase {
-            name: "r12_list_spread_capped",
-            source: "#main()\n[...[1, 2, 3], 4, ...[5, 6]]",
-            args_factory: no_args,
+            name: "r12_list_spread_into_return",
+            source: "#main(Int n) -> List<Int>\n[...[1, 2], n, ...[5, 6]]",
+            args_factory: || one_int("n", 3),
             tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        // DICT spread `{ ...src, k: v } -> Schema`: each field the schema-
+        // typed spread source contributes is lowered as a synthesised
+        // `src.field` access into the matching result-schema slot, plus the
+        // explicit `k: v` fields — reusing the branded-dict record path. The
+        // analyzer's `DuplicateField` detection rejects a key that both the
+        // spread and an explicit field (or two spreads) supply, so no later
+        // key silently overrides. `TW_CR` like the other branded dict
+        // returns; llvm-native + wasm proven in the codegen four-way tests.
+        CorpusCase {
+            name: "r12_dict_spread_into_schema",
+            source: "#schema Extras { Int a: * }\n#schema Out { Int a: *, Int b: * }\n\
+                      #main(Extras e) -> Out\n{ ...e, b: 9 }",
+            args_factory: spread_extras_arg,
+            tier: Tier::DictReturn,
+            supported_by: TW_CR,
+        },
+        // CAP — anonymous-`Dict` spread result `{ ...x } -> Dict<String,Int>`:
+        // needs a compiled `Dict`-as-value (the schema-only backends route
+        // objects through schema records; a free `Dict` is neither built nor
+        // returned). By-design cap; `TW_ONLY`.
+        CorpusCase {
+            name: "r12_dict_spread_anon_capped",
+            source: "#main(Int x) -> Dict<String, Int>\n{ ...{ a: 1 }, b: x }",
+            args_factory: || one_int("x", 2),
+            tier: Tier::DictReturn,
             supported_by: TW_ONLY,
         },
-        // DICT spread `{ ...base, k: v }`: blocked at the Dict-by-design
-        // gap (Wave R9: "unsupported expression Dict in lowering"). The
-        // compiled backends route objects through schema records and
-        // cannot construct or return a free `Dict` value at all, so the
-        // entry return type is `<missing>` and lowering caps before the
-        // spread is ever considered. Spread *override*
-        // (`{ ...{a:1}, a:2 }`) is a hard analyzer error
-        // (`duplicate field produced by spread`) in every backend — the
-        // language does not silently let later keys win. The no-override
-        // merge below runs on the tree-walker and caps on cranelift.
+        // CAP — list spread over a non-literal source `[...a, b]` (a is a
+        // parameter): the source's element count is not statically known, so
+        // the static flatten declines. By-design cap; `TW_ONLY`.
         CorpusCase {
-            name: "r12_dict_spread_capped",
-            source: "#main()\n{ ...{ a: 1, b: 2 }, c: 3 }",
-            args_factory: no_args,
-            tier: Tier::DictReturn,
+            name: "r12_list_spread_param_src_capped",
+            source: "#main(List<Int> a) -> List<Int>\n[...a, 9]",
+            args_factory: spread_param_list_arg,
+            tier: Tier::StdlibList,
             supported_by: TW_ONLY,
         },
     ]

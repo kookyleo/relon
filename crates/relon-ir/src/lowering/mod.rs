@@ -57,12 +57,13 @@ mod peephole;
 use closure::{lower_closure_as_value, lower_closure_as_value_with_expected_type};
 use peephole::{
     emit_list_float_literal_materialize, emit_list_int_literal_materialize,
-    emit_list_value_materialize, list_has_computed_element, list_is_float_shaped, match_bare_range,
-    match_materializable_outer_map, probe_expr_ir_ty, try_lower_len_filter_range,
-    try_lower_list_filter, try_lower_list_len, try_lower_list_map, try_lower_list_reduce,
-    try_lower_list_sum_range, try_lower_list_sum_value, try_lower_materialized_list_reduce,
-    try_lower_nested_range_map_reduce, try_lower_range_chain_len, try_lower_range_chain_reduce,
-    try_lower_range_value, try_lower_type_const,
+    emit_list_value_materialize, flatten_list_spread, list_has_computed_element, list_has_spread,
+    list_is_float_shaped, match_bare_range, match_materializable_outer_map, probe_expr_ir_ty,
+    try_lower_len_filter_range, try_lower_list_filter, try_lower_list_len, try_lower_list_map,
+    try_lower_list_reduce, try_lower_list_sum_range, try_lower_list_sum_value,
+    try_lower_materialized_list_reduce, try_lower_nested_range_map_reduce,
+    try_lower_range_chain_len, try_lower_range_chain_reduce, try_lower_range_value,
+    try_lower_type_const,
 };
 
 /// Per-function lowering state shared across the recursive walk.
@@ -3807,6 +3808,48 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
                         range,
                     }
                 ));
+            }
+            // Wave R12-lower: list spread `[...a, b, ...c]`. Statically
+            // flatten each `...source` (a list literal) into its elements
+            // in order — matching the tree-walk `Expr::List` spread branch
+            // (source elements concatenated in place, then the trailing
+            // elements) — then route the flat sequence through the same
+            // runtime scalar-list materialiser the computed-element path
+            // uses. A spread source that is not a list literal (a param /
+            // call / non-list) is not statically resolvable and caps loudly
+            // (`flatten_list_spread`). The flat element list is homogeneous
+            // (the analyzer enforced it), so the Int / Float materialiser
+            // accepts it byte-for-byte like a plain `[1, 2, n]`.
+            if list_has_spread(items) {
+                let flat = flatten_list_spread(items, range)?;
+                if flat.is_empty() {
+                    return Err(cap!(
+                        "lower_expr.unsupported_expr.spread_empty",
+                        LoweringError::UnsupportedExpr {
+                            kind:
+                                "List(spread flattened to empty — element type cannot be inferred)"
+                                    .to_string(),
+                            range,
+                        }
+                    ));
+                }
+                let elem_ty = probe_expr_ir_ty(&flat[0], ctx)?;
+                match elem_ty {
+                    IrType::F64 => return emit_list_float_literal_materialize(&flat, range, ctx),
+                    IrType::I64 => return emit_list_int_literal_materialize(&flat, range, ctx),
+                    other => {
+                        return Err(cap!(
+                            "lower_expr.unsupported_expr.spread_elem_ty",
+                            LoweringError::UnsupportedExpr {
+                                kind: format!(
+                                    "List(spread element of type {other:?} — only Float / Int \
+                                     spread list literals are materialised in the AOT envelope)"
+                                ),
+                                range,
+                            }
+                        ))
+                    }
+                }
             }
             // #359 (W20): a list literal with at least one *computed*
             // element (the per-step `step(s)` body `[s[0] + s[4]*dt, ..]`)
@@ -9943,6 +9986,135 @@ fn emit_variant_record_from_lowered_payload(
 ///      (either user-provided or schema default) and emit the
 ///      matching `StoreFieldAtRecord` op.
 ///
+/// Synthesise a `source.field` field-access node from a dict-spread
+/// source expression and a contributed field name. The source is
+/// expected to be a `Variable(path)`; the synthesised access appends a
+/// `String(field)` segment so it lowers through the existing
+/// [`lower_variable`] schema field-walk (`LoadFieldAtAbsolute` chain).
+/// The synthesised node carries the source's range so diagnostics point
+/// back at the spread site.
+fn synthesize_field_access(source: &Node, field: &str) -> Node {
+    let mut path = match source.expr.as_ref() {
+        Expr::Variable(segs) => segs.clone(),
+        // Non-`Variable` sources are rejected before this point by
+        // `spread_source_schema`; fall back to an empty path so the
+        // synthesised access loud-errors in `lower_variable` rather than
+        // silently mis-lowering.
+        _ => Vec::new(),
+    };
+    path.push(TokenKey::String(field.to_string(), source.range, false));
+    Node::new(Expr::Variable(path), source.range)
+}
+
+/// Resolve the canonical [`Schema`] of a dict-spread source expression so
+/// the fields it contributes are statically known. Only a
+/// **statically-resolvable schema value** is admitted: a `Variable(path)`
+/// whose root binds a schema-typed `#main` parameter / let / `self`,
+/// optionally walking trailing field segments into nested schema fields.
+///
+/// Anything else (a non-`Variable` source, a non-schema root, a dynamic /
+/// index segment, a field whose type is not itself a schema) is not
+/// statically flattenable on the compiled path and caps loudly — the
+/// silent-miscompile path is unreachable. This is the dict counterpart of
+/// the list-spread `flatten_list_spread` static guard.
+fn spread_source_schema(
+    source: &Node,
+    ctx: &LowerCtx<'_>,
+    range: TokenRange,
+) -> Result<Schema, LoweringError> {
+    let Expr::Variable(path) = source.expr.as_ref() else {
+        return Err(cap!(
+            "spread_source_schema.non_variable",
+            LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "Dict(spread source `{}` is not a statically-resolvable schema value — \
+                     compiled dict spread needs a schema-typed identifier source)",
+                    source.expr.kind()
+                ),
+                range,
+            }
+        ));
+    };
+    let mut segs = path.iter();
+    let head = match segs.next() {
+        Some(TokenKey::String(s, _, _)) => s.as_str(),
+        _ => {
+            return Err(cap!(
+                "spread_source_schema.non_string_head",
+                LoweringError::UnsupportedExpr {
+                    kind: "Dict(spread source root is not a bare identifier)".to_string(),
+                    range,
+                }
+            ));
+        }
+    };
+
+    // Resolve the root binding's canonical schema, mirroring the
+    // root-resolution order in `lower_variable` (self → let → method
+    // param → entry param).
+    let resolve_brand = |brand: Option<&str>| -> Option<Schema> {
+        brand
+            .and_then(|n| ctx.schema_resolver.resolve(n))
+            .and_then(|def| {
+                let mut stack: Vec<&str> = Vec::new();
+                canonical_schema_from_def(def, &ctx.schema_resolver, &mut stack, range).ok()
+            })
+    };
+    let mut current_schema: Option<Schema> = if let Some(self_b) = ctx.self_binding.as_ref() {
+        if head == "self" {
+            Some(self_b.schema.clone())
+        } else if let Some(b) = ctx.lets.iter().rev().find(|b| b.name == head) {
+            resolve_brand(b.schema_brand.as_deref())
+        } else if let Some(p) = ctx.method_params.iter().find(|p| p.name == head) {
+            p.schema.clone()
+        } else {
+            None
+        }
+    } else if let Some(b) = ctx.lets.iter().rev().find(|b| b.name == head) {
+        resolve_brand(b.schema_brand.as_deref())
+    } else {
+        ctx.params
+            .iter()
+            .find(|b| b.name == head)
+            .and_then(|b| b.schema.clone())
+    };
+
+    // Walk any trailing segments into nested schema fields.
+    for seg in segs {
+        let field_name = match seg {
+            TokenKey::String(s, _, _) => s.as_str(),
+            _ => {
+                return Err(cap!(
+                    "spread_source_schema.non_string_segment",
+                    LoweringError::UnsupportedExpr {
+                        kind: "Dict(spread source path has a non-field segment)".to_string(),
+                        range,
+                    }
+                ));
+            }
+        };
+        let next = current_schema
+            .as_ref()
+            .and_then(|s| s.fields.iter().find(|f| f.name == field_name))
+            .and_then(|f| match &f.ty {
+                TypeRepr::Schema { schema } => Some((**schema).clone()),
+                _ => None,
+            });
+        current_schema = next;
+    }
+
+    current_schema.ok_or_else(|| {
+        cap!(
+            "spread_source_schema.not_a_schema",
+            LoweringError::UnsupportedExpr {
+                kind: "Dict(spread source does not resolve to a statically-known schema value)"
+                    .to_string(),
+                range,
+            }
+        )
+    })
+}
+
 /// Nested branded dicts recurse via the same helper after allocating
 /// a fresh sub-record.
 fn lower_dict_into_record(
@@ -9966,9 +10138,53 @@ fn lower_dict_into_record(
         )
     })?;
 
-    // Build name → user-expr map. Reject duplicate keys.
-    let mut user_values: HashMap<String, &Node> = HashMap::new();
+    // Build name → user-expr map. Reject duplicate keys. Values are a
+    // `Cow`: an explicit `k: v` field borrows the source node; a field
+    // contributed by a `...source` spread is a synthesised
+    // `source.field` access (owned).
+    let mut user_values: HashMap<String, std::borrow::Cow<'_, Node>> = HashMap::new();
     for (key, value) in dict_pairs {
+        // Wave R12-lower: dict spread `{ ...source, k: v } -> Schema`.
+        // Each field the spread source contributes (and that the result
+        // schema declares) is lowered as a synthesised `source.field`
+        // access into the matching schema slot — matching the tree-walk
+        // `Expr::Dict` spread branch (the source's keys merge into the
+        // result; the analyzer already rejects duplicate keys via
+        // `DuplicateField`, so no later-key override is ever silently
+        // applied). The source must be a statically-resolvable schema
+        // value (a schema-typed param / let / `self`); anything else
+        // caps loudly in `spread_source_schema`.
+        if let TokenKey::Spread(_) = key {
+            let src_schema = spread_source_schema(value, ctx, range)?;
+            for src_field in &src_schema.fields {
+                // Only fields the result schema declares are merged. A
+                // source field absent from the result is dropped exactly
+                // as the tree-walk merge would (the result `Value::Dict`
+                // only keeps keys the schema validates) — but because the
+                // analyzer brands the result to `schema`, every source
+                // field the result keeps is one it declares; a source
+                // field the result does NOT declare is not a result key.
+                if !schema.fields.iter().any(|f| f.name == src_field.name) {
+                    continue;
+                }
+                let access = synthesize_field_access(value, &src_field.name);
+                if user_values
+                    .insert(src_field.name.clone(), std::borrow::Cow::Owned(access))
+                    .is_some()
+                {
+                    return Err(cap!(
+                        "lower_dict_into_record.duplicate_spread_field",
+                        LoweringError::UnsupportedFieldType {
+                            schema: schema.name.clone(),
+                            field: src_field.name.clone(),
+                            ty: "duplicate field produced by spread".to_string(),
+                            range,
+                        }
+                    ));
+                }
+            }
+            continue;
+        }
         let TokenKey::String(name, _, _) = key else {
             return Err(cap!(
                 "lower_dict_into_record.unsupported_expr.1",
@@ -9990,7 +10206,20 @@ fn lower_dict_into_record(
                 }
             ));
         }
-        user_values.insert(name.clone(), value);
+        if user_values
+            .insert(name.clone(), std::borrow::Cow::Borrowed(value))
+            .is_some()
+        {
+            return Err(cap!(
+                "lower_dict_into_record.duplicate_field",
+                LoweringError::UnsupportedFieldType {
+                    schema: schema.name.clone(),
+                    field: name.clone(),
+                    ty: "duplicate field".to_string(),
+                    range,
+                }
+            ));
+        }
     }
 
     let user_set: std::collections::HashSet<&str> =
@@ -10025,7 +10254,7 @@ fn lower_dict_into_record(
                     }
                 ));
             }
-            lower_dict_field_value(schema, idx, user_value, user_value.range, ctx)?;
+            lower_dict_field_value(schema, idx, user_value.as_ref(), user_value.range, ctx)?;
         } else {
             // Schema default. Re-bind `#main` params; let-scope is
             // shared with the surrounding body (defaults sit at the

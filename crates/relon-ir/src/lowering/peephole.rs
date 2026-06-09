@@ -3411,6 +3411,59 @@ pub(super) fn list_has_computed_element(items: &[Node]) -> bool {
     })
 }
 
+/// `true` when a list literal carries at least one `...source` spread
+/// element (`[...a, b]`). Spread elements lower to the runtime
+/// materialiser after a static flatten; a list with none keeps the
+/// existing const-pool / computed routing untouched.
+pub(super) fn list_has_spread(items: &[Node]) -> bool {
+    items.iter().any(|n| matches!(&*n.expr, Expr::Spread(_)))
+}
+
+/// Statically flatten a list literal's spread elements into a flat
+/// sequence of value nodes, matching the tree-walk `Expr::List` spread
+/// semantics: each `...source` contributes the source's elements in
+/// order, in place; non-spread elements pass through unchanged.
+///
+/// Only **statically-resolvable** spread sources are admitted: the
+/// source must itself be a list literal (`[...[1, 2], n]`). A spread
+/// over anything else (a parameter / a call / a non-list) is not
+/// statically flattenable on the compiled path — caps loudly so the
+/// silent-miscompile path is unreachable. A nested spread inside a
+/// spread source (`[...[...x]]`) is flattened recursively by the same
+/// rule. The returned nodes are cloned so the existing scalar-list
+/// materialisers (which take `&[Node]`) consume them unchanged.
+pub(super) fn flatten_list_spread(
+    items: &[Node],
+    range: TokenRange,
+) -> Result<Vec<Node>, LoweringError> {
+    let mut out: Vec<Node> = Vec::with_capacity(items.len());
+    for item in items {
+        match &*item.expr {
+            Expr::Spread(inner) => match &*inner.expr {
+                Expr::List(sub_items) => {
+                    let flattened = flatten_list_spread(sub_items, inner.range)?;
+                    out.extend(flattened);
+                }
+                other => {
+                    return Err(cap!(
+                        "flatten_list_spread.unsupported_spread_source",
+                        LoweringError::UnsupportedExpr {
+                            kind: format!(
+                                "List(spread source `{}` is not a statically-resolvable list \
+                                 literal — compiled spread flattening needs a list literal source)",
+                                other.kind()
+                            ),
+                            range,
+                        }
+                    ));
+                }
+            },
+            _ => out.push(item.clone()),
+        }
+    }
+    Ok(out)
+}
+
 /// #359 (W20): speculatively lower `node` against the live ctx, read
 /// the IR type it leaves on top of the vstack, then roll back every
 /// side effect (emitted ops, vstack entries, let-table pushes, the let

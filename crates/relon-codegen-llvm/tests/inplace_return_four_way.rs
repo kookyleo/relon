@@ -1657,3 +1657,86 @@ fn capped_shapes_decline_on_wasm_emit_not_silently() {
         );
     }
 }
+
+// ====================================================================
+// Wave R12-lower: spread (`...x`) — the two static forms, four-way
+// ====================================================================
+//
+// LIST spread `[...a, b, ...c] -> List<Int>` with literal spread sources
+// is statically flattened into the runtime scalar-list materialiser; the
+// result is a fixed-area `List<Int>` buffer return. DICT spread
+// `{ ...src, k: v } -> Schema` lowers each source field as a synthesised
+// `src.field` access into the matching result-schema slot. Both must be
+// bit-equal across tree-walk == llvm-native == wasm.
+
+const SRC_LIST_SPREAD: &str = "#main(Int n) -> List<Int>\n[...[1, 2], n, ...[5, 6]]";
+const SRC_LIST_SPREAD_FLOAT: &str = "#main(Float n) -> List<Float>\n[...[1.0, 2.0], n]";
+
+#[test]
+fn list_spread_basic() {
+    assert_four_way(SRC_LIST_SPREAD, args1("n", Value::Int(3)));
+}
+
+#[test]
+fn list_spread_negative_middle() {
+    assert_four_way(SRC_LIST_SPREAD, args1("n", Value::Int(-7)));
+}
+
+#[test]
+fn list_spread_empty_source() {
+    assert_four_way(
+        "#main(Int n) -> List<Int>\n[...[], n]",
+        args1("n", Value::Int(9)),
+    );
+}
+
+#[test]
+fn list_spread_nested() {
+    assert_four_way("#main() -> List<Int>\n[...[1], ...[2, 3]]", HashMap::new());
+}
+
+#[test]
+fn list_spread_float() {
+    assert_four_way(
+        SRC_LIST_SPREAD_FLOAT,
+        args1("n", Value::Float(OrderedFloat(3.5))),
+    );
+}
+
+const SRC_DICT_SPREAD: &str = "#schema Extras { Int a: * }\n\
+                               #schema Out { Int a: *, Int b: * }\n\
+                               #main(Extras e) -> Out\n{ ...e, b: 9 }";
+const SRC_DICT_SPREAD_MORE: &str = "#schema Src { Int a: *, Int b: * }\n\
+     #schema Out { Int a: *, Int b: *, Int c: * }\n\
+     #main(Src s) -> Out\n{ ...s, c: 7 }";
+const SRC_DICT_SPREAD_ORDER: &str = "#schema Src { Int a: *, Int b: * }\n\
+     #schema Out { Int a: *, Int b: *, Int c: * }\n\
+     #main(Src s) -> Out\n{ c: 7, ...s }";
+
+fn extras_arg() -> HashMap<String, Value> {
+    args1("e", Value::dict(vec![("a", Value::Int(1))]))
+}
+
+fn src_two_arg() -> HashMap<String, Value> {
+    args1(
+        "s",
+        Value::dict(vec![("a", Value::Int(1)), ("b", Value::Int(2))]),
+    )
+}
+
+#[test]
+fn dict_spread_into_schema() {
+    assert_four_way(SRC_DICT_SPREAD, extras_arg());
+}
+
+#[test]
+fn dict_spread_more_fields() {
+    assert_four_way(SRC_DICT_SPREAD_MORE, src_two_arg());
+}
+
+#[test]
+fn dict_spread_field_order_independent() {
+    // The explicit `c` field precedes the `...s` spread; the merged
+    // record is identical to the spread-first form (D2).
+    assert_four_way(SRC_DICT_SPREAD_ORDER, src_two_arg());
+}
