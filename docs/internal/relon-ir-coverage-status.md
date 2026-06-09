@@ -8,8 +8,8 @@
 > 截至 main `790d25da`(2026-06-09)。
 
 ## 已覆盖(编译四方 bit-equal,no-fallback 门已绿)
-`SUPPORTED_SURFACE`(49 构造,全 `Status::Covered`):算术/比较/三元/where、算术 trap parity、标量 stdlib(abs/min/max/length/is_empty)、上下文类型推断后的闭包(经 HOF)、comprehension(`List<Int>`,见进展更新里 `List<Float>`/`List<String>`-map 扩展)、pipe、f-string、range/map/filter/reduce(`List<Int>`/`List<Float>` + 跨类型数值 map + String 结果 map)、`type()` 常量折叠、严格 match 静态选臂 + no-match trap(`TrapKind::NoMatch`→TypeMismatch 四方)、标量 Float math(abs/floor/ceil/round 半偶/sqrt + Int-widen)、标量 string(len/ends_with/replace)、str concat 折叠(StrConcatN)、is_uuid、JSON-Schema 谓词(multiple_of Int 形 / in_range / size_in_range List 形)、字符串件(trim/trim_start/trim_end / is_email / is_uri / split→List<String>)、schema-rooted dict 返回、tuple(标量 return / `.N` 位置访问 / 参数投影)、backward `&sibling`/`&root` 标量字段引用(R10/R10b 严格)、字段 decorator desugar、spread(list 字面量源 / dict schema 源)。
-> enum/variant(Option/Result/custom enum)的编译链路是真四方,但用专门的 codegen 测试(`relon-codegen-llvm` 系列)证而非进 `SUPPORTED_SURFACE` 表,故不计入上述 49 构造数,见下「类别 C」。
+`SUPPORTED_SURFACE`(53 构造,全 `Status::Covered`):算术/比较/三元/where、算术 trap parity、标量 stdlib(abs/min/max/length/is_empty)、上下文类型推断后的闭包(经 HOF)、comprehension(`List<Int>`/`List<Float>`/`List<String>`-map + 元素变型 map)、pipe、f-string、range/map/filter/reduce(`List<Int>`/`List<Float>` + 跨类型数值 map + String 结果 map)、`type()` 常量折叠、严格 match 静态选臂 + no-match trap(`TrapKind::NoMatch`→TypeMismatch 四方)、标量 Float math(abs/floor/ceil/round 半偶/sqrt + Int-widen)、标量 string(len/ends_with/replace)、str concat 折叠(StrConcatN)、is_uuid、JSON-Schema 谓词(multiple_of Int 形 / in_range / size_in_range List 形)、字符串件(trim/trim_start/trim_end / is_email / is_uri / split→List<String>)、schema-rooted dict 返回、tuple(标量 return / `.N` 位置访问 / 参数投影)、backward `&sibling`/`&root` 标量字段引用(R10/R10b 严格)、字段 decorator desugar、spread(list 字面量源 / dict schema 源)。
+> enum/variant(Option/Result/custom enum)的编译链路是真四方,但用专门的 codegen 测试(`relon-codegen-llvm` 系列)证而非进 `SUPPORTED_SURFACE` 表,故不计入上述 53 构造数,见下「类别 C」。
 `no_fallback_over_supported_surface` 用 `AutoEvaluator::last_dispatch_route()` 钩子断言:每个 supported case 走编译路(Aot),绝不静默回退(trivial-scalar-main perf 路豁免、改断值相等)。`RELON_AUTO_FALLBACK_PANIC=1` 调试守卫令回退响亮。
 
 ## 进展更新(2026-06-07,loop 驱动)
@@ -35,7 +35,7 @@
 - ✅ **P2 标准库(两波)全部四方**:
   - 数值件:`multiple_of`(Int 形)、`in_range`、`size_in_range`(List 形)。诚实 cap:`multiple_of` Float 形(`Op::Mod(F64)` cranelift/wasm 无原生取余)、`size_in_range` String 形(数 Unicode 码点,撞解码缝——cap 实际可解,当前未编 body)。两者均响亮回退,不静默编错值。
   - 字符串件:`trim`/`trim_start`/`trim_end`(复用 R14 解码缝 + `__is_whitespace` + memcpy)、`is_email`/`is_uri`(纯字节扫描)——全部四方,零 cap。
-- 🔄 **comprehension 元素类型(P3-b,in-flight)**:`List<Int>` 已四方;`List<Float>`/`List<String>`-map 扩展中。本行最终状态待合并校准。
+- ✅ **comprehension 元素类型(P3-b `099d55dd`)**:`List<Int>`/`List<Float>`/`List<String>`-map 四方,含元素变型 map(Int→Float/String、Float→Int/String,按闭包返回类型探测 `list_*_map_to_*` wrapper)。诚实 cap:`List<String>` filter(无四方 String→Bool 谓词 body)、`List<Bool>` 源(无注册 wrapper)。
 - **`is_iso_date` 订正**:账本里它仍 cap,但属「body 未写」而非「IR 无 op」——`Op::Mod`/`Op::Div` 存在(#362),其算术本可 lower,只是当前没编译 body。
 
 - **design-free 工程件已基本做尽**。**剩余=两个真决策 + 设计边界内的诚实 cap**(下方"决策点")。
