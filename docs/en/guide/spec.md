@@ -302,10 +302,12 @@ sources; those `.relon` files are themselves part of the spec
 (reference behavior of the std modules).
 
 > Beyond this catalog, the reference tree-walker registers an
-> additional JSON-Schema-parity wave (`sqrt`, `is_email`, `to_json`,
-> `trim`, `unique`, …) that exists **only** in the tree-walker — no
-> analyzer signatures, no compiled-backend IR conversion. See §6.7 for the
-> exact set and the tier caveat before depending on any of them.
+> additional JSON-Schema-parity wave; much of it (`sqrt`, `is_email`,
+> `trim`, `split`, …) now lowers four-way, but a residue (`pow`,
+> `to_json`, `unique`, `starts_with`, …) still exists **only** in the
+> tree-walker — no analyzer signatures, no compiled-backend IR
+> conversion. See §6.7 for the exact split and the tier caveat before
+> depending on any of them.
 
 ### 6.3 `ensure.*` validators
 
@@ -765,29 +767,51 @@ This subsection records, without euphemism, which surface is
 implemented in which evaluation tier so authors do not write against
 a function or syntax that silently exists in only one backend.
 
+**Compiled four-way (tree-walk + Cranelift + LLVM-native + wasm,
+byte-equal).** The following stdlib helpers now lower into every
+compiled backend and are proven byte-identical against the
+tree-walk oracle (see the `SUPPORTED_SURFACE` ledger and the
+`no_fallback_over_supported_surface` proof):
+
+* numeric: `sqrt`, `round`, `floor`, `ceil` (scalar Float math, with
+  `sqrt` widening an `Int` argument); `multiple_of` (Int form),
+  `in_range`
+* format predicates: `is_uuid`, `is_email`, `is_uri`
+* string: `len`, `ends_with`, `replace`, `trim`, `trim_start`,
+  `trim_end`, `split`
+* list / size: `size_in_range` (List form, element count from the
+  record header)
+
+Two honest caps within that set: `multiple_of` on a Float argument
+(no native `%`/`Op::Mod(F64)` on Cranelift/wasm) and `size_in_range`
+on a String argument (counts Unicode code points, which needs the
+UTF-8 decode seam — solvable, but the body is not compiled yet)
+stay tree-walker-only and route to the interpreter loudly rather than
+silently miscompiling.
+
 **Tier-2 (tree-walker) only stdlib.** The tree-walker's free-fn
-registry holds ~76 `register_pure_fn` names
-(`crates/relon-evaluator/src/stdlib.rs`); within that surface a wave
-of JSON-Schema-parity helpers is registered **only in the
+registry holds ~77 `register_pure_fn` names
+(`crates/relon-evaluator/src/stdlib.rs`); the remainder of the
+JSON-Schema-parity wave is still registered **only in the
 tree-walker**. They have **no analyzer signatures** and are **absent
 from every compiled backend** (Cranelift / LLVM AOT, trace JIT).
 Calling them under a
 compiled backend, or relying on them to be statically typed, will not
 behave like the tree-walker. The set is:
 
-* numeric: `sqrt`, `pow`, `round`, `floor`, `ceil`, `multiple_of`,
-  `in_range`
-* format predicates: `is_email`, `is_uri`, `is_uuid`, `is_iso_date`,
-  `is_ipv4`, `is_ipv6`
-* string: `trim`, `trim_start`, `trim_end`, `starts_with`,
-  `ends_with`
+* numeric: `pow`
+* format predicates: `is_iso_date`, `is_ipv4`, `is_ipv6`
+* string: `starts_with`
 * list: `unique`, `count`, `every`, `some`
 * dict: `select_keys`, `omit_keys`
-* json / date: `to_json`, `parse_iso_date`, `size_in_range`
+* json / date: `to_json`, `parse_iso_date`
 
 These are **tier-2 / tree-walker-only**. Treat them as
 reference-evaluator conveniences, not portable language surface,
 until they gain analyzer signatures and compiled-backend IR conversion.
+(`is_iso_date` is a "body not written yet" case, not an IR limitation:
+`Op::Mod`/`Op::Div` do exist, so its arithmetic could lower — it simply
+has no compiled body today.)
 
 **There is no `#strict` directive.** Strict static inference is the
 analyzer's **default** — you do not opt *in* to it. The only opt-out
