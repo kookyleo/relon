@@ -1061,7 +1061,7 @@ fn test_schema_composition_mixins() {
         // This should fail because 'type' is missing (Base requirement)
         invalid_btn: { label: "Cancel" } match {
             Button: "VALID",
-            *: "INVALID"
+            _: "INVALID"
         }
     }"#,
     )
@@ -1328,7 +1328,7 @@ fn test_match_expression() {
         render: &sibling.data match {
             Image: "IMAGE",
             Text: "TEXT",
-            *: "UNKNOWN"
+            _: "UNKNOWN"
         }
     }"#,
     )
@@ -1423,7 +1423,7 @@ fn test_brand_decorator_validates_and_brands_dict() {
 
         kind: &sibling.w match {
             Weather: "is_weather",
-            *: "other"
+            _: "other"
         }
     }"#,
     )
@@ -2179,7 +2179,7 @@ fn enum_tuple_match_payload_pattern_binds_payload() {
         r#"#enum Packet { Pair(Int, String), Empty }
         {
             p: Packet.Pair(7, "x"),
-            out: p match { Pair(n, *): n + 1, Empty: 0 }
+            out: p match { Pair(n, _): n + 1, Empty: 0 }
         }"#,
     )
     .unwrap();
@@ -2193,7 +2193,7 @@ fn enum_struct_match_payload_pattern_binds_payload() {
         r#"#enum Notification { Email { code: Int, subject: String }, Push }
         {
             msg: Notification.Email { code: 41, subject: "hi" },
-            out: msg match { Notification.Email { code, subject: * }: code + 1, Push: 0 }
+            out: msg match { Notification.Email { code, subject: _ }: code + 1, Push: 0 }
         }"#,
     )
     .unwrap();

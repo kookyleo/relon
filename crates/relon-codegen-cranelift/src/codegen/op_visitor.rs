@@ -393,6 +393,11 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         let mapped = match kind {
             IrTrapKind::IndexOutOfBounds | IrTrapKind::EmptyList => TrapKind::BoundsViolation,
             IrTrapKind::InvalidUtf8 => TrapKind::Unreachable,
+            // The no-match `match` trap lifts to `RuntimeError::TypeMismatch`
+            // (`expected: "a matching arm"`), byte-aligned with the tree-walk
+            // oracle. Routes through the same `cond_trap` → `raise_trap`
+            // host-helper epilogue, so the wasm32 leg surfaces it identically.
+            IrTrapKind::NoMatch => TrapKind::NoMatch,
         };
         self.emit_trap(mapped)
     }

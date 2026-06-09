@@ -176,6 +176,16 @@ pub enum NativeTrap {
     /// `RuntimeError::Unsupported`. A distinct code from `HostFnMissing`
     /// only for post-mortem readability — both lift to `Unsupported`.
     HostFnError = 7,
+    /// A strict-mode `match` fell through every arm with no `_`
+    /// catch-all and no arm matched at runtime. Lifts to
+    /// `RuntimeError::TypeMismatch { expected: "a matching arm", .. }`,
+    /// byte-aligned (modulo range) with the tree-walk oracle and the
+    /// cranelift `TrapKind::NoMatch`. The LLVM `Op::Trap` path can't use
+    /// `llvm.trap` (a `ud2` SIGILL the host can't decode into a typed
+    /// error), so the no-match trap records this code in
+    /// `state.trap_code` + returns the negative sentinel, which
+    /// `run_buffer_main` already lifts via `runtime_error_from_code`.
+    NoMatch = 8,
 }
 
 impl NativeTrap {
@@ -189,6 +199,16 @@ impl NativeTrap {
             3 => RuntimeError::CapabilityDenied {
                 cap_bit: None,
                 reason: "llvm-aot: host-fn call denied by capability gate".to_string(),
+                range: TokenRange::default(),
+            },
+            8 => RuntimeError::TypeMismatch {
+                // Byte-aligned with the tree-walk oracle's `Expr::Match`
+                // no-match path and the cranelift `TrapKind::NoMatch`
+                // mapping. `found` cannot reproduce the oracle's
+                // value-dependent `format!("value {}", val)` from a static
+                // trap; it states the structural cause instead.
+                expected: "a matching arm".to_string(),
+                found: "no matching arm".to_string(),
                 range: TokenRange::default(),
             },
             _ => RuntimeError::Unsupported {

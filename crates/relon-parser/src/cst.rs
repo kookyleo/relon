@@ -1017,8 +1017,19 @@ impl<'a> Parser<'a> {
     ///   `Email { address, subject: s }`).
     fn parse_match_arm(&mut self) {
         self.open(SyntaxKind::MATCH_ARM);
-        if self.at(SyntaxKind::STAR) {
+        if self.at(SyntaxKind::UNDERSCORE) {
             self.open(SyntaxKind::WILDCARD);
+            self.bump();
+            self.close();
+        } else if self.at(SyntaxKind::STAR) {
+            // `*` is no longer the pattern wildcard — the catch-all arm
+            // is now written `_`. Keep the `*` lexeme inside a WILDCARD
+            // node (so recovery stays structured) but flag the precise
+            // migration so the diagnostic points at the new spelling.
+            self.open(SyntaxKind::WILDCARD);
+            self.error_at_current(
+                "`*` is no longer a match wildcard — use `_` for the catch-all arm",
+            );
             self.bump();
             self.close();
         } else if self.looks_like_match_payload_pattern() {
@@ -1073,7 +1084,12 @@ impl<'a> Parser<'a> {
         if self.at(SyntaxKind::L_PAREN) {
             self.bump();
             while !self.at(SyntaxKind::R_PAREN) && !self.at_end() {
-                if self.at(SyntaxKind::STAR) || self.at(SyntaxKind::IDENT) {
+                if self.at(SyntaxKind::UNDERSCORE) || self.at(SyntaxKind::IDENT) {
+                    self.bump();
+                } else if self.at(SyntaxKind::STAR) {
+                    self.error_at_current(
+                        "`*` is no longer a pattern wildcard — use `_` to ignore a payload slot",
+                    );
                     self.bump();
                 } else {
                     self.error_at_current("expected tuple pattern binding");
@@ -1090,7 +1106,12 @@ impl<'a> Parser<'a> {
                 if self.at(SyntaxKind::IDENT) {
                     self.bump();
                     if self.eat(SyntaxKind::COLON) {
-                        if self.at(SyntaxKind::STAR) || self.at(SyntaxKind::IDENT) {
+                        if self.at(SyntaxKind::UNDERSCORE) || self.at(SyntaxKind::IDENT) {
+                            self.bump();
+                        } else if self.at(SyntaxKind::STAR) {
+                            self.error_at_current(
+                                "`*` is no longer a pattern wildcard — use `_` to ignore a payload slot",
+                            );
                             self.bump();
                         } else {
                             self.error_at_current("expected struct pattern binding");
@@ -1937,7 +1958,12 @@ impl<'a> Parser<'a> {
         if self.peek_is_typed_param() {
             self.parse_type();
         }
-        if self.at(SyntaxKind::IDENT) {
+        // A bare `_` is a legal parameter name (the Rust-style
+        // ignore binding `(acc, _) => ...`). Since the lexer now emits
+        // `_` as `UNDERSCORE` rather than `IDENT`, accept it here too so
+        // a `_` parameter keeps parsing exactly as it did before the
+        // wildcard split.
+        if self.at(SyntaxKind::IDENT) || self.at(SyntaxKind::UNDERSCORE) {
             self.bump();
         } else {
             self.error_at_current("expected closure parameter name");
@@ -2716,7 +2742,7 @@ mod tests {
     #[test]
     fn match_expression_emits_match_node() {
         let parsed = parse_round_trip(
-            "{ render(item): item match { Image: \"i\", Text: \"t\", * : \"u\" } }",
+            "{ render(item): item match { Image: \"i\", Text: \"t\", _ : \"u\" } }",
         );
         assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
         let matches: Vec<_> = parsed
@@ -2731,6 +2757,50 @@ mod tests {
             .filter(|n| n.kind() == SyntaxKind::MATCH_ARM)
             .collect();
         assert_eq!(arms.len(), 3);
+    }
+
+    #[test]
+    fn underscore_match_catch_all_parses_clean() {
+        // The Rust-style `_` catch-all parses without errors and yields a
+        // WILDCARD pattern node (the same node `*` used to produce).
+        let parsed = parse_round_trip("{ render(item): item match { Image: \"i\", _: \"u\" } }");
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
+        let wildcards: Vec<_> = parsed
+            .syntax()
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::WILDCARD)
+            .collect();
+        assert_eq!(wildcards.len(), 1);
+    }
+
+    #[test]
+    fn star_in_match_arm_now_errors() {
+        // `*` is no longer the pattern wildcard — a match catch-all
+        // spelled `*` is a parse error pointing at the new `_` spelling.
+        let parsed = parse_round_trip("{ render(item): item match { Image: \"i\", *: \"u\" } }");
+        assert!(
+            parsed.has_errors(),
+            "`*` in a match arm must error (use `_`): {:?}",
+            parsed.errors
+        );
+        assert!(
+            parsed.errors.iter().any(|e| e.message.contains("`_`")),
+            "diagnostic should point at `_`: {:?}",
+            parsed.errors
+        );
+    }
+
+    #[test]
+    fn underscore_closure_param_parses_clean() {
+        // A bare `_` is a legal closure parameter name (the Rust-style
+        // ignore binding). The wildcard lexer split must NOT break it:
+        // `(acc, _) => acc` parses without errors.
+        let parsed = parse_round_trip("{ f(n): range(n).reduce(0, (acc, _) => acc) }");
+        assert!(
+            !parsed.has_errors(),
+            "`_` closure param must parse clean: {:?}",
+            parsed.errors
+        );
     }
 
     #[test]

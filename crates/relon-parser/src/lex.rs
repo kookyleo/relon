@@ -77,6 +77,14 @@ fn scan_one(source: &str, bytes: &[u8], idx: usize) -> (SyntaxKind, usize) {
     }
 
     // 5. Identifiers / numbers / single-char punct.
+    //
+    // A bare `_` (an underscore NOT followed by another identifier
+    // char) is the Rust-style pattern wildcard — lex it as its own
+    // `UNDERSCORE` token. `_foo` / `my_var` keep lexing as `IDENT`
+    // (the underscore is still an ident-start / ident-continue byte).
+    if b == b'_' && !bytes.get(idx + 1).copied().is_some_and(is_ident_continue) {
+        return (SyntaxKind::UNDERSCORE, idx + 1);
+    }
     if is_ident_start(b) {
         return (SyntaxKind::IDENT, scan_ident(bytes, idx));
     }
@@ -437,6 +445,29 @@ mod tests {
     #[test]
     fn identifiers_keywords_numbers() {
         assert_round_trip("foo bar_baz where match 0x1F 0b101 0o77 1_2 1.5 1e10 1.5e-2");
+    }
+
+    #[test]
+    fn bare_underscore_is_wildcard_token() {
+        // A bare `_` lexes as UNDERSCORE; `_foo` / `my_var` / `__` stay
+        // identifiers (the underscore is still an ident byte mid-word).
+        let tokens = lex("_ _foo my_var __ a_");
+        let kinds: Vec<SyntaxKind> = tokens
+            .iter()
+            .filter(|(k, _)| !k.is_trivia())
+            .map(|(k, _)| *k)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                SyntaxKind::UNDERSCORE,
+                SyntaxKind::IDENT,
+                SyntaxKind::IDENT,
+                SyntaxKind::IDENT,
+                SyntaxKind::IDENT,
+            ],
+        );
+        assert_round_trip("_ _foo my_var __ a_");
     }
 
     #[test]

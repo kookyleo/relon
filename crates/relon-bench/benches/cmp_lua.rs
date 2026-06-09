@@ -2114,7 +2114,7 @@ fn w20_expected() -> f64 {
 // * Source path: `w21_relon_src()` IS the production source — a
 //   `#main(Int n) -> Dict` body builds the two `#brand Image` /
 //   `#brand Text` items, the `classify(it)` closure runs `it match {
-//   Image: 1, Text: 2, *: 0 }` per iter, the reduce folds the per-
+//   Image: 1, Text: 2, _: 0 }` per iter, the reduce folds the per-
 //   iter classification into the running accumulator. Lua row uses
 //   the `__type` field convention to simulate the brand tag and a
 //   small `if / elseif / else` ladder (LuaJIT has no `match`); the
@@ -2201,7 +2201,7 @@ fn w21_relon_src() -> &'static str {
        classify(it): it match {\n\
          Image: 1,\n\
          Text: 2,\n\
-         *: 0\n\
+         _: 0\n\
        },\n\
        result: range(n).reduce(0, (acc, i) => acc + classify(items[i % 2]))\n\
      }"

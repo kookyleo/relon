@@ -1433,7 +1433,7 @@ pub fn all_cases() -> Vec<CorpusCase> {
         // matches; the wildcard never fires.
         CorpusCase {
             name: "r5_match_int_arm",
-            source: "#main(Int n) -> String\nn match { Int: \"int\", *: \"other\" }",
+            source: "#main(Int n) -> String\nn match { Int: \"int\", _: \"other\" }",
             args_factory: || one_int("n", 5),
             tier: Tier::StdlibSimple,
             supported_by: TW_CR,
@@ -1443,7 +1443,7 @@ pub fn all_cases() -> Vec<CorpusCase> {
         // return rides `TW_CR_BC` (bytecode handles Int return).
         CorpusCase {
             name: "r5_match_int_body_arith",
-            source: "#main(Int n) -> Int\nn match { Int: n * 2, *: 0 }",
+            source: "#main(Int n) -> Int\nn match { Int: n * 2, _: 0 }",
             args_factory: || one_int("n", 7),
             tier: Tier::StdlibSimple,
             supported_by: TW_CR_BC,
@@ -1451,7 +1451,7 @@ pub fn all_cases() -> Vec<CorpusCase> {
         // Source ordering: two arms both statically match; the FIRST wins.
         CorpusCase {
             name: "r5_match_ordering_first_wins",
-            source: "#main(Int n) -> String\nn match { Int: \"a\", Int: \"b\", *: \"c\" }",
+            source: "#main(Int n) -> String\nn match { Int: \"a\", Int: \"b\", _: \"c\" }",
             args_factory: || one_int("n", 3),
             tier: Tier::StdlibSimple,
             supported_by: TW_CR,
@@ -1461,10 +1461,24 @@ pub fn all_cases() -> Vec<CorpusCase> {
         // matches; the wildcard wins.
         CorpusCase {
             name: "r5_match_scalar_mismatch_falls_to_wildcard",
-            source: "#main(String s) -> String\ns match { Int: \"int\", *: \"other\" }",
+            source: "#main(String s) -> String\ns match { Int: \"int\", _: \"other\" }",
             args_factory: || {
                 HashMap::from([("s".to_string(), Value::String("hi".into()))])
             },
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        // No-match trap: a `String` scrutinee, the only arm `Int`
+        // provably never matches, and there is no `_` catch-all — so the
+        // match falls through every arm. The tree-walk oracle traps with
+        // `TypeMismatch { expected: "a matching arm" }`; the compiled
+        // backends lower a `TrapKind::NoMatch` that surfaces the same
+        // typed `RuntimeError::TypeMismatch`, byte-equivalent (modulo
+        // range) four-way.
+        CorpusCase {
+            name: "r5_match_no_arm_traps",
+            source: "#main(String s) -> String\ns match { Int: \"int\" }",
+            args_factory: || HashMap::from([("s".to_string(), Value::String("hi".into()))]),
             tier: Tier::StdlibSimple,
             supported_by: TW_CR,
         },

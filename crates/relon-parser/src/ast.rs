@@ -814,7 +814,7 @@ mod tests {
 
     #[test]
     fn match_arms() {
-        let p = parse_cst("{ f(x): x match { Int: 1, * : 0 } }");
+        let p = parse_cst("{ f(x): x match { Int: 1, _ : 0 } }");
         let doc = Document::cast(p.syntax()).unwrap();
         let dict = match doc.root_expr().unwrap() {
             Expr::Dict(d) => d,

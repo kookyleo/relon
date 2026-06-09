@@ -743,7 +743,7 @@ fn custom_enum_tuple_list_filter_payload_pattern_compiles() {
     assert_native_three_way(
         r#"#enum Packet { Pair(Int, String), Empty }
 #main(List<Packet> xs) -> List<Packet>
-xs.filter((Packet p) => p match { Pair(n, *): n > 0, Empty: false })"#,
+xs.filter((Packet p) => p match { Pair(n, _): n > 0, Empty: false })"#,
         args([("xs", input)]),
         expected,
     );
@@ -823,7 +823,7 @@ fn custom_enum_tuple_match_param_with_wildcard_compiles() {
     assert_native_three_way(
         "#enum Packet { Pair(Int, String), Empty }\n\
          #main(Packet p) -> Int\n\
-         p match { Empty: 0, *: 1 }",
+         p match { Empty: 0, _: 1 }",
         args([("p", input)]),
         Value::Int(1),
     );
@@ -871,7 +871,7 @@ fn custom_enum_tuple_match_payload_pattern_compiles() {
     assert_native_three_way(
         "#enum Packet { Pair(Int, String), Empty }\n\
          #main(Packet p) -> Int\n\
-         p match { Pair(n, *): n + 1, Empty: 0 }",
+         p match { Pair(n, _): n + 1, Empty: 0 }",
         args([("p", input)]),
         Value::Int(8),
     );
@@ -890,7 +890,7 @@ fn custom_enum_struct_match_payload_pattern_compiles() {
     assert_native_three_way(
         "#enum Notification { Email { code: Int, subject: String }, Push }\n\
          #main(Notification msg) -> Int\n\
-         msg match { Notification.Email { code, subject: * }: code + 1, Push: 0 }",
+         msg match { Notification.Email { code, subject: _ }: code + 1, Push: 0 }",
         args([("msg", input)]),
         Value::Int(42),
     );

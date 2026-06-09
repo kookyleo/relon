@@ -163,7 +163,20 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// still appear) have somewhere valid to land. Mirrors the
     /// post-`Return` / post-`Br` dummy-block pattern in `control.rs`.
     pub(crate) fn emit_trap(&mut self, kind: TrapKind) -> Result<(), LlvmError> {
-        let _ = kind;
+        // The no-match `match` trap must surface a *typed*
+        // `RuntimeError::TypeMismatch` (byte-aligned with the tree-walk
+        // oracle), which `llvm.trap` / `ud2` cannot do — a SIGILL aborts
+        // the process with no decodable cause. Route it through the same
+        // `state.trap_code` + negative-sentinel epilogue the `CheckCap`
+        // deny path uses; `run_buffer_main` lifts the recorded code via
+        // `NativeTrap::runtime_error_from_code`. Every other (stdlib-domain)
+        // trap keeps the unconditional `llvm.trap` it has always emitted.
+        if matches!(kind, TrapKind::NoMatch) {
+            self.emit_state_trap(NativeTrap::NoMatch, "Trap(NoMatch)")?;
+            let cont = self.ctx.append_basic_block(self.func, "after_trap_cont");
+            self.builder.position_at_end(cont);
+            return Ok(());
+        }
         self.emit_llvm_trap_call("Trap")?;
         self.builder
             .build_unreachable()

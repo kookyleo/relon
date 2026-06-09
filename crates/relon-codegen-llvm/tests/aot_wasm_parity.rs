@@ -537,7 +537,7 @@ const FAST: &[Fast] = &[
     // body is general codegen on the native + wasm legs.
     Fast {
         name: "r5_match_int_body_arith",
-        src: "#main(Int n) -> Int\nn match { Int: n * 2, *: 0 }",
+        src: "#main(Int n) -> Int\nn match { Int: n * 2, _: 0 }",
         args: &[7],
     },
 ];
@@ -722,7 +722,7 @@ fn r5_match_int_arm_aligns_native_via_wasmtime() {
         eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping r5 match int arm");
         return;
     }
-    let src = "#main(Int n) -> String\nn match { Int: \"int\", *: \"other\" }";
+    let src = "#main(Int n) -> String\nn match { Int: \"int\", _: \"other\" }";
     let n = 5i64;
     let want = match native_run(src, HashMap::from([("n".to_string(), Value::Int(n))])) {
         Value::String(s) => s,
@@ -749,7 +749,7 @@ fn r5_match_scalar_mismatch_aligns_native_via_wasmtime() {
         eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping r5 match scalar mismatch");
         return;
     }
-    let src = "#main(Int n) -> String\nn match { Float: \"f\", *: \"other\" }";
+    let src = "#main(Int n) -> String\nn match { Float: \"f\", _: \"other\" }";
     let n = 9i64;
     let want = match native_run(src, HashMap::from([("n".to_string(), Value::Int(n))])) {
         Value::String(s) => s,

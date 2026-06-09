@@ -4176,6 +4176,46 @@ struct RuntimeEnumMatchArm {
     range: TokenRange,
 }
 
+/// Build the body ops for a guaranteed no-match trap of result type
+/// `result_ty`: an `Op::Trap { NoMatch }` followed by a typed placeholder
+/// const. The trap makes the placeholder unreachable; it exists only so
+/// the type stack / wasm verifier see a value of the right type (mirrors
+/// the stdlib bounds-trap shape `Op::Trap` + typed const). Returns `None`
+/// for a result type with no scalar placeholder const, so the caller caps
+/// cleanly rather than miscompiling.
+fn no_match_trap_body_ops(
+    result_ty: IrType,
+    range: TokenRange,
+    ctx: &LowerCtx<'_>,
+) -> Option<Vec<TaggedOp>> {
+    let placeholder = match result_ty {
+        IrType::I64 => Op::ConstI64(0),
+        IrType::I32 => Op::ConstI32(0),
+        IrType::F64 => Op::ConstF64(OrderedFloat(0.0)),
+        IrType::Bool => Op::ConstBool(false),
+        IrType::String => {
+            let idx = ctx.const_intern.borrow_mut().strings.intern("");
+            Op::ConstString {
+                idx,
+                value: String::new(),
+            }
+        }
+        _ => return None,
+    };
+    Some(vec![
+        TaggedOp {
+            op: Op::Trap {
+                kind: TrapKind::NoMatch,
+            },
+            range,
+        },
+        TaggedOp {
+            op: placeholder,
+            range,
+        },
+    ])
+}
+
 fn enum_scrutinee_binding(scrutinee: &Node, ctx: &LowerCtx<'_>) -> Option<(String, TypeRepr)> {
     let Expr::Variable(path) = &*scrutinee.expr else {
         return None;
@@ -4628,7 +4668,7 @@ fn try_lower_runtime_enum_match(
     }
     if arms.is_empty() {
         return Err(cap!(
-            "lower_match.unsupported_expr.2",
+            "lower_match.empty_enum_match",
             LoweringError::UnsupportedExpr {
                 kind: "Match(enum with no arms)".to_string(),
                 range,
@@ -4710,19 +4750,9 @@ fn try_lower_runtime_enum_match(
 
     if lowered.is_empty() {
         return Err(cap!(
-            "lower_match.unsupported_expr.2",
+            "lower_match.empty_enum_match",
             LoweringError::UnsupportedExpr {
                 kind: "Match(enum with no lowerable arms)".to_string(),
-                range,
-            }
-        ));
-    }
-
-    if !has_wildcard && !all_tags.is_subset(&covered_tags) {
-        return Err(cap!(
-            "lower_match.unsupported_expr.2",
-            LoweringError::UnsupportedExpr {
-                kind: "Match(enum is not exhaustive and has no wildcard arm)".to_string(),
                 range,
             }
         ));
@@ -4741,6 +4771,35 @@ fn try_lower_runtime_enum_match(
             ));
         }
     }
+
+    // Non-exhaustive enum match with no `_` catch-all: every uncovered
+    // tag must trap at runtime exactly as the tree-walk oracle does
+    // (`TypeMismatch { expected: "a matching arm" }`). Append a synthetic
+    // trailing wildcard arm whose body is the `TrapKind::NoMatch` trap +
+    // a typed placeholder, so the dispatch chain's innermost `else`
+    // traps instead of silently returning a wrong arm's body.
+    if !has_wildcard && !all_tags.is_subset(&covered_tags) {
+        let Some(body_ops) = no_match_trap_body_ops(result_ty, range, ctx) else {
+            return Err(cap!(
+                "lower_match.no_match_trap_result_ty",
+                LoweringError::UnsupportedExpr {
+                    kind: format!(
+                        "Match(non-exhaustive enum, no-match trap placeholder unavailable for \
+                         result type {result_ty:?})"
+                    ),
+                    range,
+                }
+            ));
+        };
+        lowered.push(RuntimeEnumMatchArm {
+            tag: None,
+            body_ops,
+            body_ty: result_ty,
+            range,
+        });
+        has_wildcard = true;
+    }
+    let _ = has_wildcard;
 
     lower_expr(&scrutinee.expr, scrutinee.range, ctx)?;
     let scrut_ty = ctx.tstack.pop().ok_or_else(|| {
@@ -4847,23 +4906,65 @@ fn lower_match(
     }
 
     let Some(selected) = selected else {
-        // No arm statically matches: the oracle traps with
-        // `TypeMismatch { expected: "a matching arm" }`. There is no IR
-        // trap kind that surfaces as `RuntimeError::TypeMismatch` across
-        // cranelift / llvm / wasm today (the sandbox trap table has no
-        // TypeMismatch code), so emitting a guaranteed-trap here would
-        // surface a DIFFERENT RuntimeError than the oracle. Keep it
-        // capped rather than miscompile the trap shape.
-        return Err(cap!(
-            "lower_match.unsupported_expr.2",
-            LoweringError::UnsupportedExpr {
-                kind: format!(
-                    "Match(no arm statically matches scrutinee type {ty:?} brand {brand:?} — \
-                     no-match TypeMismatch trap not expressible cross-backend)"
-                ),
-                range,
-            }
-        ));
+        // No arm statically matches: the construct ALWAYS traps at
+        // runtime, exactly as the tree-walk oracle's `Expr::Match`
+        // no-match path does (`TypeMismatch { expected: "a matching
+        // arm" }`). `TrapKind::NoMatch` lifts to that same typed
+        // `RuntimeError::TypeMismatch` on every backend (cranelift /
+        // llvm / wasm), so we lower a guaranteed trap rather than cap.
+        //
+        // We need a typed value on the stack for the verifier's
+        // both-arms-typed / result-type contract even though the trap
+        // makes everything after it unreachable. The first arm's body
+        // type is the match's nominal result type; re-lowering that body
+        // after the trap yields a correctly-typed (dead) placeholder.
+        // Probe it first so a body we cannot lower caps cleanly instead
+        // of half-emitting.
+        let result_ty = probe_expr_ir_ty(&arms[0].1, ctx)?;
+
+        // Evaluate the scrutinee for value / trap / side-effect-ordering
+        // parity (its own traps fire here), then discard it.
+        lower_expr(&scrutinee.expr, scrutinee.range, ctx)?;
+        let scrut_ty = ctx.tstack.pop().ok_or_else(|| {
+            cap!(
+                "lower_match.unsupported_expr.3",
+                LoweringError::UnsupportedExpr {
+                    kind: "Match(scrutinee produced no value)".to_string(),
+                    range: scrutinee.range,
+                }
+            )
+        })?;
+        let discard_idx = ctx.next_let_idx;
+        ctx.next_let_idx += 1;
+        ctx.out.push(TaggedOp {
+            op: Op::LetSet {
+                idx: discard_idx,
+                ty: scrut_ty,
+            },
+            range: scrutinee.range,
+        });
+
+        // The guaranteed no-match trap.
+        ctx.out.push(TaggedOp {
+            op: Op::Trap {
+                kind: TrapKind::NoMatch,
+            },
+            range,
+        });
+
+        // Dead placeholder of the result type so the type stack / wasm
+        // verifier stay satisfied (mirrors the stdlib bounds-trap which
+        // emits `Op::Trap` followed by a typed const). Re-lower the first
+        // arm body; everything here is unreachable past the trap.
+        let body = &arms[0].1;
+        lower_expr(&body.expr, body.range, ctx)?;
+        let placeholder_ty = ctx.tstack.last().copied();
+        debug_assert_eq!(
+            placeholder_ty,
+            Some(result_ty),
+            "no-match placeholder type drifted from probe"
+        );
+        return Ok(());
     };
 
     // 4. Evaluate the scrutinee for value / trap / side-effect-ordering

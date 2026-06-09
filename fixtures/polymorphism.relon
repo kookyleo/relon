@@ -23,7 +23,7 @@
     render_item(item): item match {
         Image: "IMG(" + item.url + ")",
         Text: "TXT(" + item.content + ")",
-        *: "UNKNOWN"
+        _: "UNKNOWN"
     },
 
     display: [

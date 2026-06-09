@@ -1743,6 +1743,13 @@ pub enum TrapKind {
     /// modules with hand-crafted byte buffers; the variant ships so
     /// the diagnostic surface stays honest.
     InvalidUtf8,
+    /// A strict-mode `match` fell through every arm with no `_`
+    /// catch-all and no arm that matched at runtime. The tree-walk
+    /// oracle raises `RuntimeError::TypeMismatch { expected: "a
+    /// matching arm", .. }` here; this trap kind routes each backend's
+    /// trap path to that same typed error so the compiled no-match
+    /// surfaces identically rather than staying capped.
+    NoMatch,
 }
 
 /// Per-Op effect classification.

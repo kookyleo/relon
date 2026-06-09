@@ -1958,14 +1958,24 @@ pub const LEDGER: &[LedgerEntry] = &[
                  as a non-default escape hatch under the static-first decision",
     },
     LedgerEntry {
-        id: "lower_match.unsupported_expr.2",
-        site: "lowering/mod.rs::lower_match",
+        id: "lower_match.empty_enum_match",
+        site: "lowering/mod.rs::try_lower_runtime_enum_match",
         category: Category::ExprShape,
         status: Status::Capped,
         corpus: "",
-        reason: "no-match `match` would trap TypeMismatch; the sandbox trap table has no \
-                 TypeMismatch code, so no cranelift/llvm/wasm trap surfaces that RuntimeError \
-                 — capped (R6: not forced, would risk a wrong trap shape)",
+        reason: "runtime-enum `match` with zero arms / zero lowerable arms — a degenerate, \
+                 unreachable-by-the-analyzer shape with no body to dispatch to; capped",
+    },
+    LedgerEntry {
+        id: "lower_match.no_match_trap_result_ty",
+        site: "lowering/mod.rs::try_lower_runtime_enum_match",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "non-exhaustive runtime-enum `match` whose result type has no scalar \
+                 placeholder const for the no-match trap arm (e.g. a List/Dict-typed body); \
+                 the TrapKind::NoMatch trap needs a typed dead value and only scalars/String \
+                 have one today — capped for the exotic result type rather than miscompile",
     },
     LedgerEntry {
         id: "lower_match.unsupported_expr.3",
@@ -2590,6 +2600,14 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         corpus: "r5_match_scalar_mismatch_falls_to_wildcard",
         status: Status::Covered,
         proof: "tree-walk + cranelift (provably-never arm skipped, wildcard wins)",
+    },
+    SurfaceEntry {
+        construct: "strict match no-arm trap (TrapKind::NoMatch -> TypeMismatch)",
+        wave: "R6",
+        corpus: "r5_match_no_arm_traps",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift trap-equivalent; wasm/llvm-native surface the same \
+                 RuntimeError::TypeMismatch via TrapKind::NoMatch in match_no_arm_four_way",
     },
     // ---- Wave R7: scalar Float math ----
     SurfaceEntry {
