@@ -654,6 +654,7 @@ fn lower_module_into<M: CrModule>(
             entry_shape,
             locals: HashMap::new(),
             let_locals: HashMap::new(),
+            let_floor: relon_ir::ir::body_let_watermark(&entry.body),
             arg_values: &arg_values,
             stack: Vec::new(),
             ir,
@@ -801,6 +802,7 @@ fn lower_module_into<M: CrModule>(
                 entry_shape: EntryShape::LegacyI64Args,
                 locals: HashMap::new(),
                 let_locals: HashMap::new(),
+                let_floor: relon_ir::ir::body_let_watermark(&lambda.body),
                 arg_values: &lambda_arg_values,
                 stack: Vec::new(),
                 ir,
@@ -1058,6 +1060,17 @@ struct Codegen<'a, 'b> {
     locals: HashMap<u32, Variable>,
     /// `LetGet/LetSet` slot index -> cranelift `Variable`.
     let_locals: HashMap<u32, Variable>,
+    /// Static let-index floor for stdlib inline-frame windows: the
+    /// emitted body's [`relon_ir::ir::body_let_watermark`] (one past
+    /// the highest let index the body recursively touches).
+    /// `emit_call_stdlib` places each inline window at
+    /// `max(declared let_locals max + 1, let_floor)` so callee lets
+    /// never land on caller slots that are first bound *after* the
+    /// inlined call — `set_let` would silently reuse the Variable
+    /// declared with the callee's type and miscoerce (or panic on a
+    /// width mismatch). Raised past the callee's own watermark while
+    /// a frame is active so nested inlines stay collision-free.
+    let_floor: u32,
     arg_values: &'a [CValue],
     /// The IR's virtual operand stack, kept as live cranelift values
     /// so each `Add`/`Sub`/... pop maps to a typed `Value` directly.

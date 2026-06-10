@@ -119,21 +119,23 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         let exit_ty = ir_ty_to_cl(ret_ty)?;
         self.builder.append_block_param(exit_block, exit_ty);
 
-        // Capture the let_locals "next free slot" snapshot. Stdlib
-        // bodies don't typically declare let bindings, but the
-        // namespace separation is cheap and future-proofs the
-        // inlining once larger callees come online. We use the max
-        // currently-used index + 1; if the caller has no let
-        // bindings yet, the offset is 0 and the callee's `LetSet 0`
-        // maps to caller slot 0 — collision-free because no caller
-        // op has run yet that touches let_locals at this nesting.
+        // Pick a let_offset window past every caller let slot — both
+        // the ones already declared (lazy `let_locals` max) AND the
+        // static `let_floor` watermark covering lets the caller body
+        // binds only *after* this call. Inspecting `let_locals` alone
+        // is unsound: e.g. the runtime list-spread materialiser binds
+        // its source-handle / cursor lets after lowering a
+        // `range(n).map(...)` source; without the floor the callee
+        // window lands on those late slots and `set_let` silently
+        // reuses a Variable declared with the callee's type.
         let let_offset = self
             .let_locals
             .keys()
             .copied()
             .max()
             .map(|m| m + 1)
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(self.let_floor);
 
         // Push the inline frame and lower the callee body. We clone
         // the body out of the stdlib vector because `emit_body`
@@ -148,8 +150,14 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
             ret_ty,
             let_offset,
         });
+        // Raise the floor past the callee window for the duration of
+        // the inline emission so a nested stdlib inline allocates its
+        // own window above this one; restore on frame pop.
+        let saved_floor = self.let_floor;
+        self.let_floor = let_offset + relon_ir::ir::body_let_watermark(&body);
         let result = self.emit_body(&body);
         let frame = self.inline_frames.pop().expect("we just pushed one");
+        self.let_floor = saved_floor;
         result?;
 
         // Switch to the exit block; its block-param is the typed
