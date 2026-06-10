@@ -271,6 +271,22 @@ pub enum Diagnostic {
         range: SourceSpan,
     },
 
+    #[error("`#derive {constraint}` names an unknown constraint (known constraints: {known})")]
+    #[diagnostic(
+        code(relon::analyze::unknown_derive_constraint),
+        help(
+            "`#derive` only accepts the built-in constraint set; an unrecognized name would silently skip the witness shape check. Fix the spelling, or drop the pragma if this method isn't intended as a constraint witness."
+        )
+    )]
+    UnknownDeriveConstraint {
+        /// Constraint name as written in the `#derive C` pragma.
+        constraint: String,
+        /// Comma-separated list of the registered constraint names.
+        known: String,
+        #[label("unknown constraint `{constraint}`")]
+        range: SourceSpan,
+    },
+
     #[error(
         "`#derive {constraint}` witness `{method}` does not match the constraint's expected shape (expected `{expected_shape}`, found `{found_shape}`)"
     )]
@@ -717,6 +733,11 @@ impl Diagnostic {
             | Diagnostic::MethodNameConflict { .. }
             | Diagnostic::UnknownMethod { .. }
             | Diagnostic::PrivateMethodViolation { .. }
+            // Constraint names form a closed built-in set, so a
+            // `#derive` naming something outside it is statically
+            // provable wrong in every mode — same bucket as the
+            // witness-shape mismatch it would otherwise silently skip.
+            | Diagnostic::UnknownDeriveConstraint { .. }
             | Diagnostic::ConstraintWitnessShapeMismatch { .. }
             // Static type mismatches are derivable from source + schema
             // alone — the workhorse of Stage 1 hardening. Surface them

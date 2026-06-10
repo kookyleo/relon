@@ -221,6 +221,45 @@ fn derive_equatable_with_wrong_return_type_diagnoses() {
     );
 }
 
+#[test]
+fn derive_unknown_constraint_name_diagnoses() {
+    let tree = analyze_fixture("schema_methods/derive_unknown_constraint.relon");
+    let unknown: Vec<_> = tree
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(
+                d,
+                Diagnostic::UnknownDeriveConstraint { constraint, known, .. }
+                    if constraint == "Comparble" && known.contains("Comparable")
+            )
+        })
+        .collect();
+    assert_eq!(
+        unknown.len(),
+        1,
+        "expected UnknownDeriveConstraint on `Comparble`: {:?}",
+        tree.diagnostics
+    );
+    // The misspelled pragma must not also fire a shape mismatch — the
+    // unknown-name diagnostic owns the verdict.
+    let shape = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::ConstraintWitnessShapeMismatch { .. })
+    });
+    assert_eq!(shape, 0, "{:?}", tree.diagnostics);
+}
+
+#[test]
+fn derive_known_constraint_names_stay_silent() {
+    // Reverse guard for D2: every registered constraint name passes the
+    // closed-set check (shape mismatches are a separate diagnostic).
+    let tree = analyze_fixture("schema_methods/derive_equatable_ok.relon");
+    let unknown = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::UnknownDeriveConstraint { .. })
+    });
+    assert_eq!(unknown, 0, "{:?}", tree.diagnostics);
+}
+
 // ===================================================================
 // Phase C.6: shape checking for the four new constraint registry
 // entries (Iterable / Indexable / Addable / Subtractable / ...) —

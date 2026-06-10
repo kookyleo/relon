@@ -1,0 +1,13 @@
+// D2: `#derive Comparble` (typo of `Comparable`) names a constraint
+// outside the built-in registry. The analyzer must emit
+// `UnknownDeriveConstraint` instead of silently skipping the witness
+// shape check.
+#schema Money {
+    Int cents: *
+} with {
+    #derive Comparble
+    lt(other: Self) -> Bool: self.cents < other.cents
+}
+
+#main(Money m)
+{ Int v: m.cents }
