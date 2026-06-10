@@ -2651,7 +2651,7 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         wave: "base",
         corpus: "arith_chain",
         status: Status::Covered,
-        proof: "four-way (tree-walk + cranelift + trace-JIT + bytecode), FULL_SUPPORT",
+        proof: "four-way (tree-walk + cranelift + wasm + llvm-native), FULL_SUPPORT",
     },
     SurfaceEntry {
         construct: "Int comparison (== != < > <= >=)",

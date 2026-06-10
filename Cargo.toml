@@ -35,21 +35,18 @@ proptest = "1"
 # `relon-evaluator` so the browser playground does not link it.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 hex = "0.4"
-# P2-15: FxHashMap for trace-recorder + trace-jit hot lookups. The
-# `rustc-hash` hasher is unkeyed FNV-style — substantially faster than
-# the default SipHash for small integer keys like SsaVar / NodeId on
-# the trace-record / trace-install paths. Serde wire format is
-# unchanged (HashMap serialises as a sequence; the hasher is internal).
+# P2-15: FxHashMap for analyzer hot lookups. The `rustc-hash` hasher
+# is unkeyed FNV-style — substantially faster than the default SipHash
+# for small integer keys like NodeId. Serde wire format is unchanged
+# (HashMap serialises as a sequence; the hasher is internal).
 rustc-hash = "1.1"
-# P2-14: ArrayVec for inline small-vec storage on the trace-recorder
-# lowering hot path. `LowerOutcome::Emit` carries guards_before /
-# guards_after with at most 4 entries (StrConcatN cap), so a stack-
-# resident ArrayVec eliminates the per-op heap allocation the previous
-# `Vec<GuardKind>` shape paid.
+# P2-14: ArrayVec for inline small-vec storage on hot paths —
+# workspace-pinned version for any crate that needs a stack-resident
+# small vec instead of a per-op heap allocation.
 arrayvec = "0.7"
-# P2-12: ArcSwap for lock-free trace registry reads — `lookup_trace`
-# is on the trace dispatch hot path; an `Arc::clone` of the wrapper
-# replaces a reader-lock acquire on every call.
+# P2-12: ArcSwap for lock-free capability-vtable snapshots in the
+# cranelift backend's sandbox — a per-call `Guard::load_full()`
+# replaces a reader-lock acquire on every gated native call.
 arc-swap = "1"
 # P1-2: data-parallel parse + analyze for multi-module workspaces.
 # Cold-start of a 3+ module entry pays a serial `parse + analyze`
