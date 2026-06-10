@@ -35,7 +35,7 @@ Treat Relon as a small toolkit purpose-built for business configuration:
 - **JSON-like syntax**: it reads like JSON with expressions, directives, decorators, and references. People who already know JSON pick it up in minutes.
 - **Typed schemas**: `#schema` defines contracts, with sum-type tagged enums, recursive schemas, custom validation messages, and computed defaults.
 - **Host extensions**: register native functions and decorator plugins from Rust; ship shared schemas / helpers in `.relon`; tie the two sides together with `#import`.
-- **Sandboxed by default**: `Capabilities` control filesystem reads, evaluation budgets, value sizes, and native-fn allowlists.
+- **Sandboxed by default**: `Capabilities` control filesystem reads, evaluation budgets, and value sizes; native fns are admitted by the capability bits they declare on `NativeFnGate` — there is no by-name allowlist.
 
 ## Who writes what — the two-tier model
 
@@ -87,9 +87,19 @@ The example below uses `#schema`, sum-type tagged enums, computed defaults, and 
 Three lines of Rust on the host:
 
 ```rust
-let json = relon::json_from_file("app/main.relon")?;
+// The entry uses #import and must read a local file — it's the host's
+// own script, so use the *_trusted entry point.
+let json = relon::json_from_file_trusted("app/main.relon")?;
 println!("{}", serde_json::to_string_pretty(&json)?);
 ```
+
+> The default entry `json_from_file` is **sandboxed**: scripts hold
+> zero ambient privileges, so the `#import` here would be denied
+> filesystem access. That's why this example uses
+> `json_from_file_trusted` (host-owned scripts only); when running
+> untrusted scripts, stay on the sandboxed entry and grant the needed
+> `Capabilities` explicitly — see
+> [Sandbox & capabilities](./sandbox).
 
 Output (note that the `Email` layer is the externally-tagged sum-type form):
 
