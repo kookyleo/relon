@@ -9,14 +9,14 @@
 ## Three-layer architecture
 
 ```
-relon-parser  ──→  relon-analyzer  ──→  relon-evaluator
-   (AST)            (side-tables)         (tree-walk)
-                          │
-                          ▼
-                     relon-lsp
+relon-parser  ──→  relon-analyzer  ──┬─→  relon-evaluator (tree-walk)
+   (AST)            (side-tables)    │
+                          │          └─→  relon-ir ──→ relon-codegen-cranelift
+                          ▼                       └──→ relon-codegen-llvm
+                     relon-lsp                       (AOT compiled backends)
                   (IDE diagnostics / go-to / completion)
 
-facade crate: relon  —  exposes evaluate_source / json_from_* to hosts
+facade crate: relon  —  exposes from_str / json_from_* / EvaluatorBuilder (Backend::Auto dispatch)
 ```
 
 Each layer is a separate crate; downstream crates depend on upstream
@@ -25,9 +25,10 @@ ones one-way only.
 | Crate | Responsibility | Key exports |
 | --- | --- | --- |
 | `relon-parser` | Lex + parse → AST. Every `Node` carries a process-wide `NodeId` for cross-layer side-tables | `Node`, `Expr`, `TypeNode`, `Decorator`, `NodeId`, `parse_document` |
-| `relon-analyzer` | Four passes (schema / resolve / modules / typecheck) producing the `AnalyzedTree` side-table | `AnalyzedTree`, `SchemaDef`, `ResolvedRef`, `Diagnostic`, `analyze` |
+| `relon-analyzer` | Many passes (schema / extend / main_sig / modules / resolve / typecheck, …) producing the `AnalyzedTree` side-table | `AnalyzedTree`, `SchemaDef`, `ResolvedRef`, `Diagnostic`, `analyze` |
 | `relon-evaluator` | Tree-walk evaluation; carries `Context` / `Capabilities` / `Value` / built-in decorators / stdlib | `Context`, `Capabilities`, `Value`, `Evaluator`, `RuntimeError` |
-| `relon` (facade) | Stitches parse → analyze → eval; `Projector` controls JSON output shape | `evaluate_source`, `value_from_str`, `json_from_str`, `Error` |
+| `relon-ir` + `relon-codegen-cranelift` / `relon-codegen-llvm` | Lower AST + side-tables to IR, then AOT-compile to native machine code; bit-identical with tree-walk | IR module, per-backend entry points |
+| `relon` (facade) | Stitches parse → analyze → eval; `EvaluatorBuilder` selects the backend (default `Backend::Auto`); `Projector` controls JSON output shape | `from_str`, `value_from_str`, `json_from_str`, `EvaluatorBuilder`, `Error` |
 | `relon-lsp` | Synchronous lsp-server; reuses analyzer `Diagnostic` and side-tables | binary `relon-lsp` |
 
 ## Data flow
@@ -60,27 +61,58 @@ AST. The evaluator queries whatever it needs; if an entry is missing,
 it falls back (e.g. schemas not pre-lowered get lowered on demand via
 `lower_schema_pure`).
 
-## The analyzer's four passes
+The compiled backends run a parallel pipeline: the same AST +
+`AnalyzedTree` is lowered to IR by `relon-ir`, then compiled to
+native machine code by the cranelift / LLVM backends — all three
+backends share the sandbox semantics and produce bit-identical
+results.
 
-The execution order is fixed; each pass can read its predecessors'
-output:
+## The analyzer's pass pipeline
 
-1. **`schema`**: recognize `#schema Name { ... }`,
-   `#schema Name: { ... }`, and `#enum Name { ... }`, then convert
-   them to `SchemaDef`. Tagged enum variant lists are extracted here too.
-2. **`resolve`**: bind `Reference` / `Variable` nodes to target
-   fields' `NodeId`. Conservative strategy: closure params and dict
-   spreads mark the frame as dynamic; references aren't forcibly
-   flagged as errors.
-3. **`modules`**: scan top-level `#import ... from "..."` directives
-   and collect import edges.
-4. **`main_sig`**: recognize the root-level
-   `#main(Type name, ...) [-> ReturnType]` directive and build
-   `MainSignature`.
-5. **`typecheck`**: aggregate diagnostics —
+The execution order is fixed (entry point `analyze_with_options`);
+each pass can read its predecessors' output. Grouped by
+responsibility:
+
+1. **Host signature audit**: `audit_host_fn_signatures` — signatures
+   the host registered for its native fns go through the same `Any` /
+   bare-generic ban, so a misconfigured host integration surfaces
+   here.
+2. **Built-in carrier injection**: `inject_core_schemas` — installs
+   the built-in `String` / `List<T>` / `Dict<K, V>` / `Iter<T>`
+   method tables so `s.upper()` dispatches through the same path as
+   user-declared methods (skippable via
+   `AnalyzeOptions::skip_core_schemas` / CLI `--lite`).
+3. **Schema collection**: `collect_schemas` + `collect_root_schemas`
+   — recognize `#schema Name { ... }`, `#schema Name: { ... }`,
+   `#enum Name { ... }`, and root-level `#schema A Body` forms, and
+   convert them to `SchemaDef`. Tagged enum variant lists are
+   extracted here too.
+4. **Methods and constraints**: `collect_extends`
+   (`#extend X with { ... }`), duplicate-method / generic-shadowing
+   checks, `#derive` witness shape checking, Equatable /
+   JsonProjectable auto-derive, and method-signature-table
+   synthesis.
+5. **Entry and modules**: `collect_main` (root-level
+   `#main(Type name, ...) [-> ReturnType]` → `MainSignature`) and
+   `collect_imports` (collect `#import` edges for the workspace
+   pass).
+6. **Resolution and type checking**: `resolve_references` — bind
+   `Reference` / `Variable` nodes to target fields' `NodeId`, with
+   the conservative strategy that closure params and dict spreads
+   mark the frame as dynamic instead of forcing errors; then
+   `typecheck` + `check_main_return` — aggregate diagnostics:
    `UnresolvedReference`, `StaticTypeMismatch`,
    `NonExhaustiveMatch`, `UnknownVariant` (with did-you-mean),
-   `DuplicateMatchArm`, `SchemaBodyNotDict`, …
+   `DuplicateMatchArm`, `SchemaBodyNotDict`, … Callers can append
+   the optional static capability-reachability check
+   (`capability_check`, enabled by the compiled backends).
+
+There is also a **trivial-scalar-`#main` short-circuit pipeline**:
+when the source is classified as a trivial scalar `#main` shape,
+every pass except `collect_main` + `check_main_return` is provably a
+no-op, so the analyzer skips them wholesale and produces a
+side-table byte-for-byte equivalent to the full pipeline's output —
+this is part of `Backend::Auto`'s cold-start path.
 
 Diagnostics have two levels: `Severity::Error` blocks evaluation;
 `Severity::Warning` is informational and the evaluator still runs.
@@ -111,12 +143,14 @@ Diagnostics have two levels: `Severity::Error` blocks evaluation;
 
 ## Extension points
 
-The host can register four kinds of objects on `Context`, forming
+The host can register six kinds of objects on `Context`, forming
 Relon's plugin surface:
 
 | Interface | Use | Trait / type |
 | --- | --- | --- |
 | **Native fn** | Let `.relon` call a host-side function | `RelonFunction` + `Context::register_fn` / `register_pure_fn` |
+| **Native method** | Attach a host implementation to a method declared `#native` on a schema, dispatched by brand (`m.cents_value()`) | `RelonFunction` + `Context::register_method` / `register_pure_method` |
+| **Host schema** | Register a host-constructed schema by name for evaluation-time reference | `Context::register_schema` |
 | **Decorator plugin** | Author new decorators, plugged into `pre_eval` / `wrap` / `schema_field_meta` | `DecoratorPlugin` + `Context::register_decorator` |
 | **Module resolver** | Control `#import ... from "..."` (sandbox, virtual fs, registry) | `ModuleResolver` + `Context::prepend_module_resolver` |
 | **Projector** | Adjust JSON output shape (default `JsonProjector`) | `Projector` trait |
@@ -186,5 +220,12 @@ See [Sandbox & capabilities](./sandbox).
 - **Analyzer inference depth**: today the typechecker's "matched
   expression type inference" only covers Reference chains; more
   complex expressions are skipped.
-- **Performance layer**: bytecode IR + cranelift JIT is a long-term
-  goal, to be addressed once correctness and the ecosystem stabilize.
+- **Performance layer**: landed, no longer a long-term goal — the
+  Cranelift AOT and LLVM AOT compiled backends exist alongside
+  tree-walk, and `Backend::Auto` is the SDK default dispatch
+  (trivial-scalar short-circuit + lazy compilation + loud fallback
+  on unsupported shapes). What's still evolving is the cold-start
+  chain: the `.o` object cache is ready (written on every compile
+  and round-trip-verified on load), while executing that object
+  directly via dlopen is deferred to a later phase. See
+  [Performance & execution backends](./performance.md).

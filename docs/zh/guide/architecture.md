@@ -6,14 +6,14 @@
 ## 三层架构
 
 ```
-relon-parser  ──→  relon-analyzer  ──→  relon-evaluator
-   (AST)            (side-tables)         (tree-walk)
-                          │
-                          ▼
-                     relon-lsp
+relon-parser  ──→  relon-analyzer  ──┬─→  relon-evaluator (tree-walk)
+   (AST)            (side-tables)    │
+                          │          └─→  relon-ir ──→ relon-codegen-cranelift
+                          ▼                       └──→ relon-codegen-llvm
+                     relon-lsp                       (AOT 编译后端)
                   (IDE 诊断 / 跳转 / 补全)
 
-facade crate: relon  ——  对宿主暴露 evaluate_source / json_from_*
+facade crate: relon  ——  对宿主暴露 from_str / json_from_* / EvaluatorBuilder（Backend::Auto 选档）
 ```
 
 每一层都是独立 crate，下游单向依赖上游。
@@ -21,9 +21,10 @@ facade crate: relon  ——  对宿主暴露 evaluate_source / json_from_*
 | Crate | 职责 | 主要导出 |
 | --- | --- | --- |
 | `relon-parser` | 词法 + 语法 → AST。每个 `Node` 携带 process-wide `NodeId` 用于跨层 side-table | `Node`, `Expr`, `TypeNode`, `Decorator`, `NodeId`, `parse_document` |
-| `relon-analyzer` | 4 个 pass（schema / resolve / modules / typecheck）输出 `AnalyzedTree` 侧表 | `AnalyzedTree`, `SchemaDef`, `ResolvedRef`, `Diagnostic`, `analyze` |
+| `relon-analyzer` | 多个 pass（schema / extend / main_sig / modules / resolve / typecheck 等）输出 `AnalyzedTree` 侧表 | `AnalyzedTree`, `SchemaDef`, `ResolvedRef`, `Diagnostic`, `analyze` |
 | `relon-evaluator` | 树遍历求值，承载 `Context` / `Capabilities` / `Value` / 内建装饰器 / stdlib | `Context`, `Capabilities`, `Value`, `Evaluator`, `RuntimeError` |
-| `relon` (facade) | 拼装 parse → analyze → eval 全链路；`Projector` 控制 JSON 输出形态 | `evaluate_source`, `value_from_str`, `json_from_str`, `Error` |
+| `relon-ir` + `relon-codegen-cranelift` / `relon-codegen-llvm` | AST + 侧表 lowering 为 IR，再 AOT 编译为本机机器码；与 tree-walk 按位一致 | IR module、各编译后端入口 |
+| `relon` (facade) | 拼装 parse → analyze → eval 全链路；`EvaluatorBuilder` 选后端（默认 `Backend::Auto`）；`Projector` 控制 JSON 输出形态 | `from_str`, `value_from_str`, `json_from_str`, `EvaluatorBuilder`, `Error` |
 | `relon-lsp` | 同步 lsp-server，复用 analyzer 的 `Diagnostic` 与 side-tables | 二进制 `relon-lsp` |
 
 ## 数据流
@@ -53,15 +54,20 @@ plain JSON
 
 `AnalyzedTree` 是**只读的侧表**，不修改 AST。求值器需要哪一项就查哪一项；如果某一项缺失，evaluator 走 fallback（例如 schema 没预转换时按需调用 `lower_schema_pure`）。
 
-## Analyzer 的四个 pass
+编译后端走平行管线：同一份 AST + `AnalyzedTree` 经 `relon-ir` lowering 为 IR，再由 cranelift / LLVM 后端编译为本机机器码——三个后端共享沙箱语义，结果按位一致。
 
-执行顺序固定，下一 pass 可读上一 pass 的产物：
+## Analyzer 的 pass 流水线
 
-1. **`schema`**：识别 `#schema Name { ... }`、`#schema Name: { ... }`、`#enum Name { ... }`，转换为 `SchemaDef`。tagged enum 的 variant 列表也在这里抽取。
-2. **`resolve`**：把 `Reference` / `Variable` 节点绑定到目标字段的 `NodeId`。保守策略：闭包参数和 dict spread 标记 frame 为 dynamic，引用不强行报错。
-3. **`modules`**：扫描 `#import ... from "..."` 顶层指令，收集 import 边。
-4. **`main_sig`**：识别根级 `#main(Type name, ...) [-> ReturnType]` 指令，构建 `MainSignature`。
-5. **`typecheck`**：聚合诊断 —— `UnresolvedReference`、`StaticTypeMismatch`、`NonExhaustiveMatch`、`UnknownVariant`（带 did-you-mean）、`DuplicateMatchArm`、`SchemaBodyNotDict` 等。
+执行顺序固定（入口 `analyze_with_options`），后面的 pass 可读前面的产物。按职责分组：
+
+1. **宿主签名审计**：`audit_host_fn_signatures`——host 注册的原生函数签名同样要过 `Any` / 裸泛型禁令，配错的宿主集成在这里浮现。
+2. **内建载体注入**：`inject_core_schemas`——安装内建 `String` / `List<T>` / `Dict<K, V>` / `Iter<T>` 方法表，让 `s.upper()` 与用户自定义方法走同一条分派路径（可经 `AnalyzeOptions::skip_core_schemas` / CLI `--lite` 跳过）。
+3. **Schema 收集**：`collect_schemas` + `collect_root_schemas`——识别 `#schema Name { ... }`、`#schema Name: { ... }`、`#enum Name { ... }` 及根级 `#schema A Body` 形态，转换为 `SchemaDef`；tagged enum 的 variant 列表也在这里抽取。
+4. **方法与约束**：`collect_extends`（`#extend X with { ... }`）、方法重名 / 泛型遮蔽检查、`#derive` witness 形状检查、Equatable / JsonProjectable 自动派生、方法签名表合成。
+5. **入口与模块**：`collect_main`（根级 `#main(Type name, ...) [-> ReturnType]` → `MainSignature`）、`collect_imports`（收集 `#import` 边，供 workspace pass 消费）。
+6. **解析与类型检查**：`resolve_references`——把 `Reference` / `Variable` 节点绑定到目标字段的 `NodeId`，保守策略：闭包参数和 dict spread 标记 frame 为 dynamic，引用不强行报错；`typecheck` + `check_main_return`——聚合诊断：`UnresolvedReference`、`StaticTypeMismatch`、`NonExhaustiveMatch`、`UnknownVariant`（带 did-you-mean）、`DuplicateMatchArm`、`SchemaBodyNotDict` 等。调用方可再追加可选的静态权限可达性检查（`capability_check`，编译后端默认打开）。
+
+另有一条**平凡标量 `#main` 短路流水线**：当源码被判定为平凡标量 `#main` 形状时，除 `collect_main` + `check_main_return` 外其余 pass 可证为空操作，分析器整体跳过它们并产出与全流水线逐字节等价的侧表——这是 `Backend::Auto` 冷启动路径的一部分。
 
 诊断分两级：`Severity::Error` 阻断求值，`Severity::Warning` 仅提示，evaluator 仍会执行。
 
@@ -74,11 +80,13 @@ plain JSON
 
 ## 扩展点
 
-宿主可在 `Context` 上注册四类对象，构成 relon 的 plugin surface：
+宿主可在 `Context` 上注册六类对象，构成 relon 的 plugin surface：
 
 | 接口 | 用途 | trait / 类型 |
 | --- | --- | --- |
 | **Native fn** | 让 .relon 调宿主侧函数 | `RelonFunction` + `Context::register_fn` / `register_pure_fn` |
+| **Native method** | 给某个 schema 上声明为 `#native` 的方法挂宿主实现，按 brand 分派（`m.cents_value()`） | `RelonFunction` + `Context::register_method` / `register_pure_method` |
+| **Host schema** | 把宿主侧构造的 schema 按名注册进上下文，供求值时引用 | `Context::register_schema` |
 | **Decorator plugin** | 编写新装饰器，参与 `pre_eval` / `wrap` / `schema_field_meta` 三个钩子 | `DecoratorPlugin` + `Context::register_decorator` |
 | **Module resolver** | 控制 `#import ... from "..."` 的解析（沙箱、虚拟文件系统、注册表） | `ModuleResolver` + `Context::prepend_module_resolver` |
 | **Projector** | 调整 JSON 输出形态（默认 `JsonProjector`） | `Projector` trait |
@@ -111,4 +119,4 @@ plain JSON
 - **跨语言 host**：v1 路线图是 C ABI cdylib（JSON 进 JSON 出），v2 加 native-fn callback；v3 看需求做 PyO3 / napi-rs 封装。**不**做跨语言类型/装饰器注册。
 - **stdlib 厚度**：当前是 6 类约 30 个函数；`time` / `regex` / `path` / `base64` 在 roadmap 上。
 - **Analyzer 类型推导深度**：当前 typecheck 的「matched expr 类型推导」只覆盖 Reference 链，更复杂的表达式跳过。
-- **性能层**：bytecode IR + cranelift JIT 是「等正确性和生态稳定后才碰」的远期目标。
+- **性能层**：已落地，不再是远期目标——Cranelift AOT 与 LLVM AOT 两个编译后端与 tree-walk 并行存在，`Backend::Auto` 是 SDK 默认选档（平凡标量短路 + 惰性编译 + 不支持形状响亮回退）。仍在演进的是冷启动链路：`.o` 对象缓存已就绪（每次编译写入并回读校验），dlopen 直接执行该对象的路径推迟到后续阶段。详见 [性能与执行后端](./performance.md)。
