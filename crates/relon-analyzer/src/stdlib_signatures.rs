@@ -362,12 +362,13 @@ fn build() -> HashMap<String, FnSignature> {
     m.insert(k, v);
 
     // -- math intrinsics (Number-typed; no Any leak) --------------------
-    let (k, v) = sig(
-        "_math_abs",
-        vec![param("n", tn!(Number))],
-        tn!(Number),
-        None,
-    );
+    // `_math_abs` is Float-typed: the runtime native is the Float-only
+    // `f64::abs` branch — the Int branch (and the type dispatch) lives in
+    // `std_relon/math.relon`'s `abs`, which is what `abs(...)` and
+    // `math.abs(...)` resolve to. Keeping the signature in lock-step with
+    // the native means a typechecked `_math_abs(1)` can't pass analysis
+    // and then trap at runtime.
+    let (k, v) = sig("_math_abs", vec![param("n", tn!(Float))], tn!(Float), None);
     m.insert(k, v);
     let (k, v) = sig(
         "_math_max",

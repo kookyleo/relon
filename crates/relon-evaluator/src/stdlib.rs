@@ -1,5 +1,6 @@
 use crate::error::RuntimeError;
 use crate::native_fn::{NativeArgs, NativeFnCaps, RelonFunction};
+use crate::relon_sourced::{RelonSourcedFn, StdModule};
 use crate::value::{Value, ValueDict};
 use relon_eval_api::context::Context;
 use relon_eval_api::SmolStr;
@@ -24,7 +25,11 @@ pub fn register_to(ctx: &mut Context) {
     let list_map: Arc<dyn RelonFunction> = Arc::new(ListMap);
     let list_filter: Arc<dyn RelonFunction> = Arc::new(ListFilter);
     let list_reduce: Arc<dyn RelonFunction> = Arc::new(ListReduce);
-    let list_contains: Arc<dyn RelonFunction> = Arc::new(ListContains);
+    // `contains` is relon-sourced: the fold in `std_relon/list.relon`
+    // is the implementation (single source of truth); `_list_contains`
+    // and the `List.contains` method both dispatch to that closure.
+    let list_contains: Arc<dyn RelonFunction> =
+        Arc::new(RelonSourcedFn::new(StdModule::List, "contains"));
     ctx.register_pure_fn("_list_map", Arc::clone(&list_map));
     ctx.register_pure_fn("_list_filter", Arc::clone(&list_filter));
     ctx.register_pure_fn("_list_reduce", Arc::clone(&list_reduce));
@@ -83,11 +88,17 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_fn("_dict_values", Arc::clone(&dict_values));
     ctx.register_pure_fn("_dict_has_key", Arc::clone(&dict_has_key));
 
-    let math_abs: Arc<dyn RelonFunction> = Arc::new(MathAbs);
-    let math_max: Arc<dyn RelonFunction> = Arc::new(MathMax);
-    let math_min: Arc<dyn RelonFunction> = Arc::new(MathMin);
-    let math_clamp: Arc<dyn RelonFunction> = Arc::new(MathClamp);
-    ctx.register_pure_fn("_math_abs", Arc::clone(&math_abs));
+    // `min` / `max` / `clamp` / `abs` are relon-sourced: the ternaries
+    // in `std_relon/math.relon` are the implementation (single source
+    // of truth — the native twins were retired). `_math_abs` is the one
+    // remaining native, narrowed to the Float-only `f64::abs` branch
+    // the relon `abs` delegates to for non-Int input.
+    let math_abs: Arc<dyn RelonFunction> = Arc::new(RelonSourcedFn::new(StdModule::Math, "abs"));
+    let math_max: Arc<dyn RelonFunction> = Arc::new(RelonSourcedFn::new(StdModule::Math, "max"));
+    let math_min: Arc<dyn RelonFunction> = Arc::new(RelonSourcedFn::new(StdModule::Math, "min"));
+    let math_clamp: Arc<dyn RelonFunction> =
+        Arc::new(RelonSourcedFn::new(StdModule::Math, "clamp"));
+    ctx.register_pure_fn("_math_abs", Arc::new(MathAbsFloat));
     ctx.register_pure_fn("_math_max", Arc::clone(&math_max));
     ctx.register_pure_fn("_math_min", Arc::clone(&math_min));
     ctx.register_pure_fn("_math_clamp", Arc::clone(&math_clamp));
@@ -96,8 +107,8 @@ pub fn register_to(ctx: &mut Context) {
     // directly (mirroring the cranelift backend's stdlib free-fn
     // surface) don't surface `FunctionNotFound` against the tree-walker.
     // The relon-side wrapper modules at `std_relon/math.relon` keep
-    // working — `@import("std/math", as=math); math.abs(...)` reaches
-    // the same handlers via `_math_abs` etc.
+    // working — `@import("std/math", as=math); math.abs(...)` *is* the
+    // same closure these bare names dispatch to.
     ctx.register_pure_fn("abs", Arc::clone(&math_abs));
     ctx.register_pure_fn("max", Arc::clone(&math_max));
     ctx.register_pure_fn("min", Arc::clone(&math_min));
@@ -375,8 +386,17 @@ impl RelonFunction for ListReduce {
     }
 }
 
-struct MathAbs;
-impl RelonFunction for MathAbs {
+/// Float-only `f64::abs`, registered as `_math_abs`.
+///
+/// The Int branch (and the type dispatch) lives in
+/// `std_relon/math.relon`'s `abs` — the single source of truth the
+/// `abs` / module-member registrations point at. This native exists
+/// only because `f64::abs` clears the sign bit (`abs(-0.0) == 0.0`)
+/// where the relon ternary `x < 0 ? -x : x` would keep the `-0.0`.
+/// The retired polymorphic twin (`MathMax` / `MathMin` / `MathClamp` /
+/// Int-`MathAbs`) semantics are now the `math.relon` ternaries.
+struct MathAbsFloat;
+impl RelonFunction for MathAbsFloat {
     fn call(
         &self,
         args: NativeArgs,
@@ -385,10 +405,9 @@ impl RelonFunction for MathAbs {
         let args = args.into_positional();
         expect_arg_count(&args, 1, range)?;
         match &args[0] {
-            Value::Int(n) => Ok(Value::Int(n.abs())),
             Value::Float(f) => Ok(Value::Float(f.abs().into())),
             other => Err(RuntimeError::TypeMismatch {
-                expected: "Number".to_string(),
+                expected: "Float".to_string(),
                 found: other.type_name().to_string(),
                 range,
             }),
@@ -401,62 +420,6 @@ fn to_f64_val(v: &Value) -> f64 {
         Value::Int(n) => *n as f64,
         Value::Float(f) => f.0,
         _ => 0.0,
-    }
-}
-
-struct MathMax;
-impl RelonFunction for MathMax {
-    fn call(
-        &self,
-        args: NativeArgs,
-        range: relon_parser::TokenRange,
-    ) -> Result<Value, RuntimeError> {
-        let args = args.into_positional();
-        expect_arg_count(&args, 2, range)?;
-        Ok(if to_f64_val(&args[0]) > to_f64_val(&args[1]) {
-            args[0].clone()
-        } else {
-            args[1].clone()
-        })
-    }
-}
-
-struct MathMin;
-impl RelonFunction for MathMin {
-    fn call(
-        &self,
-        args: NativeArgs,
-        range: relon_parser::TokenRange,
-    ) -> Result<Value, RuntimeError> {
-        let args = args.into_positional();
-        expect_arg_count(&args, 2, range)?;
-        Ok(if to_f64_val(&args[0]) < to_f64_val(&args[1]) {
-            args[0].clone()
-        } else {
-            args[1].clone()
-        })
-    }
-}
-
-struct MathClamp;
-impl RelonFunction for MathClamp {
-    fn call(
-        &self,
-        args: NativeArgs,
-        range: relon_parser::TokenRange,
-    ) -> Result<Value, RuntimeError> {
-        let args = args.into_positional();
-        expect_arg_count(&args, 3, range)?;
-        let val = to_f64_val(&args[0]);
-        let min = to_f64_val(&args[1]);
-        let max = to_f64_val(&args[2]);
-        Ok(if val < min {
-            args[1].clone()
-        } else if val > max {
-            args[2].clone()
-        } else {
-            args[0].clone()
-        })
     }
 }
 
@@ -2012,31 +1975,6 @@ pub(crate) fn make_iter_value(caps: &dyn NativeFnCaps, kind: &str, source: Value
         Value::Int(caps.next_iter_id() as i64),
     );
     Value::branded_dict(map, Some(crate::iter_protocol::BRAND.to_string()))
-}
-
-struct ListContains;
-impl RelonFunction for ListContains {
-    fn call(
-        &self,
-        args: NativeArgs,
-        range: relon_parser::TokenRange,
-    ) -> Result<Value, RuntimeError> {
-        let caps = args.caps();
-        let args = args.positional.clone();
-        expect_arg_count(&args, 2, range)?;
-        let list = expect_list(&args[0], range)?;
-        // Tick per scanned element. Early-return on match is fine —
-        // we still charge for the elements actually compared, so a hit
-        // near the front stays cheap.
-        let needle = &args[1];
-        for item in list {
-            caps.tick(1, range)?;
-            if item == needle {
-                return Ok(Value::Bool(true));
-            }
-        }
-        Ok(Value::Bool(false))
-    }
 }
 
 fn expect_arg_count(

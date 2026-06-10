@@ -6,7 +6,13 @@
     map(l, f): _list_map(l, f),
     filter(l, f): _list_filter(l, f),
     reduce(l, i, f): _list_reduce(l, i, f),
-    contains(l, i): _list_contains(l, i),
+    // Implemented here (single source of truth — the evaluator's
+    // `_list_contains` registration dispatches to this closure).
+    // Equality is the language `==`, the same `Value` equality the
+    // retired native used: `NaN == NaN` and `-0.0 == 0.0` both hold,
+    // `1 == 1.0` does not. The fold scans the whole list (no
+    // early-exit); only the step count differs, never the result.
+    contains(l, i): l | _list_reduce(false, (acc, x) => acc || x == i),
     sum(l): l | _list_reduce(0, (acc, x) => acc + x),
     avg(l): sum(l) / _len(l),
     len(l): _len(l),

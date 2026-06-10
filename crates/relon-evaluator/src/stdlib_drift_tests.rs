@@ -234,6 +234,219 @@ fn tier2_treewalk_only_fixture_executes() {
     );
 }
 
+/// Boundary-semantics goldens for `min` / `max` / `clamp` / `abs` /
+/// `_list_contains`, pinned byte-for-byte ahead of the stdlib
+/// twin-retirement (native Rust struct vs `std_relon/*.relon` wrapper
+/// collapsing to a single relon-sourced implementation).
+///
+/// Every value below was captured from the tree-walker BEFORE the
+/// retirement; the retirement must keep each one identical. The cases
+/// deliberately cover the spots where Rust float intrinsics and relon
+/// branch semantics could diverge:
+///   * NaN through min / max / clamp (branch semantics: NaN compares
+///     false, so the *other* / fall-through operand wins — NOT the
+///     IEEE `fmin` / `fmax` NaN-suppression rule).
+///   * signed zero: `-0.0 < 0.0` is false, so min / max return whichever
+///     argument sits on the fall-through side, preserving its sign bit.
+///   * mixed Int / Float arguments return the ORIGINAL value (no
+///     numeric coercion of the winner).
+///   * `_list_contains` equality is `Value::eq` (OrderedFloat: NaN ==
+///     NaN is true, -0.0 == 0.0 is true) over an empty / hit / miss /
+///     cross-type matrix.
+fn assert_pinned(src: &str, expected_debug: &str) {
+    let value = tree_walk(src);
+    assert_eq!(
+        format!("{value:?}"),
+        expected_debug,
+        "boundary golden drifted for fixture: {src}"
+    );
+}
+
+/// Same pin, but the fixture needs a std module import; the expression
+/// is wrapped as `{{ "r": <expr> }}` and the golden compares the `r`
+/// member.
+fn assert_pinned_with_import(module: &str, src: &str, expected_debug: &str) {
+    let doc = format!("#import {module} from \"std/{module}\"\n{{ \"r\": {src} }}");
+    let value = tree_walk(&doc);
+    let Value::Dict(dict) = &value else {
+        panic!("module fixture must evaluate to a dict: {src}");
+    };
+    let r = dict.map.get("r").expect("fixture dict has `r`");
+    assert_eq!(
+        format!("{r:?}"),
+        expected_debug,
+        "boundary golden drifted for module fixture: {src}"
+    );
+}
+
+#[test]
+fn math_min_max_boundary_goldens_are_pinned() {
+    // Int / mixed / tie.
+    assert_pinned("min(1, 2)", "Int(1)");
+    assert_pinned("min(2, 1)", "Int(1)");
+    assert_pinned("min(7, 7)", "Int(7)");
+    assert_pinned("max(1, 2)", "Int(2)");
+    assert_pinned("max(2, 1)", "Int(2)");
+    assert_pinned("max(7, 7)", "Int(7)");
+    assert_pinned("min(1, 2.0)", "Int(1)");
+    assert_pinned("min(3, 2.0)", "Float(2.0)");
+    assert_pinned("max(1, 2.0)", "Float(2.0)");
+    // Signed zero: comparison is false for equal magnitudes, so the
+    // second argument falls through with its sign bit intact.
+    assert_pinned("min(-0.0, 0.0)", "Float(0.0)");
+    assert_pinned("min(0.0, -0.0)", "Float(-0.0)");
+    assert_pinned("max(-0.0, 0.0)", "Float(0.0)");
+    assert_pinned("max(0.0, -0.0)", "Float(-0.0)");
+    // NaN: `NaN < x` / `NaN > x` are false, so the second operand wins
+    // when NaN is first, and NaN itself falls through when second.
+    assert_pinned("min(sqrt(-1.0), 1.0)", "Float(1.0)");
+    assert_pinned("min(1.0, sqrt(-1.0))", "Float(NaN)");
+    assert_pinned("max(sqrt(-1.0), 1.0)", "Float(1.0)");
+    assert_pinned("max(1.0, sqrt(-1.0))", "Float(NaN)");
+    // Module-path form must agree with the bare form.
+    assert_pinned_with_import("math", "math.min(sqrt(-1.0), 1.0)", "Float(1.0)");
+    assert_pinned_with_import("math", "math.min(-0.0, 0.0)", "Float(0.0)");
+    assert_pinned_with_import("math", "math.max(1.0, sqrt(-1.0))", "Float(NaN)");
+}
+
+#[test]
+fn math_clamp_boundary_goldens_are_pinned() {
+    assert_pinned("clamp(5, 0, 10)", "Int(5)");
+    assert_pinned("clamp(-1, 0, 10)", "Int(0)");
+    assert_pinned("clamp(11, 0, 10)", "Int(10)");
+    // Inverted bounds: `v < lo` is checked first, so lo wins.
+    assert_pinned("clamp(5, 10, 0)", "Int(10)");
+    assert_pinned("clamp(5, 0.0, 10)", "Int(5)");
+    // Signed zero / NaN fall-through (NaN comparisons are all false,
+    // so a NaN value passes through unclamped).
+    assert_pinned("clamp(-0.0, 0.0, 1.0)", "Float(-0.0)");
+    assert_pinned("clamp(0.0, -0.0, 1.0)", "Float(0.0)");
+    assert_pinned("clamp(sqrt(-1.0), 0.0, 1.0)", "Float(NaN)");
+    assert_pinned("clamp(0.5, sqrt(-1.0), 1.0)", "Float(0.5)");
+    assert_pinned("clamp(2.0, 0.0, sqrt(-1.0))", "Float(2.0)");
+    assert_pinned_with_import("math", "math.clamp(sqrt(-1.0), 0.0, 1.0)", "Float(NaN)");
+    assert_pinned_with_import("math", "math.clamp(5, 10, 0)", "Int(10)");
+}
+
+#[test]
+fn math_abs_boundary_goldens_are_pinned() {
+    assert_pinned("abs(5)", "Int(5)");
+    assert_pinned("abs(-5)", "Int(5)");
+    assert_pinned("abs(0)", "Int(0)");
+    // Float abs clears the sign bit (f64::abs), including -0.0 -> 0.0.
+    assert_pinned("abs(-0.0)", "Float(0.0)");
+    assert_pinned("abs(-5.5)", "Float(5.5)");
+    assert_pinned("abs(sqrt(-1.0))", "Float(NaN)");
+    assert_pinned_with_import("math", "math.abs(-0.0)", "Float(0.0)");
+    assert_pinned_with_import("math", "math.abs(-7)", "Int(7)");
+}
+
+#[test]
+fn list_contains_boundary_goldens_are_pinned() {
+    assert_pinned("_list_contains([], 1)", "Bool(false)");
+    assert_pinned("_list_contains([1, 2, 3], 1)", "Bool(true)");
+    assert_pinned("_list_contains([1, 2, 3], 3)", "Bool(true)");
+    assert_pinned("_list_contains([1, 2, 3], 4)", "Bool(false)");
+    assert_pinned("_list_contains([\"a\", \"b\"], \"a\")", "Bool(true)");
+    // Cross-type: Int vs Float never compare equal under `Value::eq`.
+    assert_pinned("_list_contains([1], 1.0)", "Bool(false)");
+    assert_pinned("_list_contains([1.0], 1)", "Bool(false)");
+    assert_pinned("_list_contains([[1, 2], [3]], [1, 2])", "Bool(true)");
+    assert_pinned("_list_contains([true], true)", "Bool(true)");
+    // OrderedFloat equality: -0.0 == 0.0, NaN == NaN.
+    assert_pinned("_list_contains([-0.0], 0.0)", "Bool(true)");
+    assert_pinned("_list_contains([sqrt(-1.0)], sqrt(-1.0))", "Bool(true)");
+    assert_pinned_with_import("list", "list.contains([], 1)", "Bool(false)");
+    assert_pinned_with_import("list", "list.contains([1, 2], 2)", "Bool(true)");
+    assert_pinned_with_import("list", "list.contains([0.0], -0.0)", "Bool(true)");
+}
+
+/// Single-source guard for the retired stdlib twins.
+///
+/// `min` / `max` / `clamp` / Int-`abs` / `contains` used to exist twice:
+/// a native Rust `RelonFunction` *and* a delegating wrapper in
+/// `std_relon/*.relon`. After the retirement the `.relon` text is the
+/// only implementation (the registered names dispatch to it through
+/// `RelonSourcedFn`). This test fails if either side regresses:
+///   * the `.relon` wrapper goes back to delegating to a retired
+///     underscore intrinsic (twin reborn), or
+///   * `stdlib.rs` re-grows a native body for one of the retired names.
+#[test]
+fn retired_stdlib_twins_have_single_source() {
+    // Match the *call* form `_math_min(` so prose comments may still
+    // name the retired intrinsics.
+    let math = include_str!("std_relon/math.relon");
+    for retired_delegate in ["_math_min(", "_math_max(", "_math_clamp("] {
+        assert!(
+            !math.contains(retired_delegate),
+            "std_relon/math.relon must implement min/max/clamp itself, \
+             not delegate to retired native `{retired_delegate}...)`"
+        );
+    }
+    // `abs` keeps exactly one `_math_abs(` call: the Float branch of
+    // its type dispatch (the native is Float-only `f64::abs`).
+    assert_eq!(
+        math.matches("_math_abs(").count(),
+        1,
+        "std_relon/math.relon `abs` delegates to `_math_abs` only for \
+         the Float branch"
+    );
+
+    let list = include_str!("std_relon/list.relon");
+    assert!(
+        !list.contains("_list_contains("),
+        "std_relon/list.relon must implement `contains` itself (fold \
+         over _list_reduce), not delegate to a retired native"
+    );
+
+    let stdlib = include_str!("stdlib.rs");
+    for retired_native in [
+        "struct MathMin",
+        "struct MathMax",
+        "struct MathClamp",
+        "struct MathAbs;",
+        "struct ListContains",
+    ] {
+        assert!(
+            !stdlib.contains(retired_native),
+            "stdlib.rs re-grew retired native `{retired_native}` — the \
+             std_relon/*.relon implementation is the single source of truth"
+        );
+    }
+}
+
+/// Post-retirement semantics that intentionally CHANGED (degenerate
+/// inputs only — every well-typed result is pinned byte-for-byte by the
+/// `*_boundary_goldens_are_pinned` tests above):
+///   * `abs(i64::MIN)`: the retired native's `i64::abs` panicked in
+///     debug builds / wrapped in release; the relon `-x` is the
+///     evaluator's *checked* negation, so it now traps cleanly.
+///   * non-numeric `min` / `max` / `clamp` input: the retired natives'
+///     `to_f64_val` coerced non-numbers to `0.0` and returned a garbage
+///     operand (e.g. `min("a", "b")` -> `"b"`); the relon ternaries
+///     compare with the language `<` / `>`, which rejects non-numbers.
+#[test]
+fn retired_twin_degenerate_inputs_now_trap() {
+    let err = tree_walk_result("abs(-9223372036854775807 - 1)")
+        .expect_err("abs(i64::MIN) must trap as NumericOverflow");
+    assert!(
+        matches!(&err, RuntimeError::NumericOverflow(_)),
+        "expected NumericOverflow, got {err:?}"
+    );
+
+    for src in [
+        "min(\"a\", \"b\")",
+        "max(\"a\", \"b\")",
+        "clamp(\"m\", \"a\", \"z\")",
+    ] {
+        let err = tree_walk_result(src).expect_err("non-numeric comparison must trap");
+        assert!(
+            matches!(&err, RuntimeError::TypeMismatch { .. }),
+            "expected TypeMismatch for `{src}`, got {err:?}"
+        );
+    }
+}
+
 #[test]
 fn from_json_is_not_registered() {
     let err = tree_walk_result(r#"from_json("[1,2]")"#)
