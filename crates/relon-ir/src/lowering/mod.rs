@@ -4443,17 +4443,20 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
             // (the analyzer enforced it), so the Int / Float materialiser
             // accepts it byte-for-byte like a plain `[1, 2, n]`.
             if list_has_spread(items) {
-                // A single runtime (non-list-literal) spread source —
-                // `[a, ...xs, b]` with `xs` a `List<Int>` / `List<Float>`
-                // parameter or computed handle — is not statically
-                // flattenable (the source length is only known at
-                // runtime). Materialise it directly: alloc a scratch
-                // record, store the static scalars, `memory.copy` the
-                // source payload in place, and leave a scratch list handle
-                // on the same path the literal-source spread + map output
-                // use. Multiple runtime sources / non-scalar surrounding
-                // elements / list-literal sources fall through to the
-                // static flatten below (and its loud caps).
+                // Runtime (non-list-literal) spread sources —
+                // `[a, ...xs, b, ...ys, c]` with each source a
+                // `List<Int>` / `List<Float>` parameter or computed
+                // handle — are not statically flattenable (the source
+                // lengths are only known at runtime). Materialise them
+                // directly: alloc one scratch record sized from the
+                // summed source headers, then walk the scalar/source
+                // segments left to right (`memory.copy` per source,
+                // inline store per scalar), leaving a scratch list
+                // handle on the same path the literal-source spread +
+                // map output use. Non-scalar surrounding elements /
+                // list-literal sources mixed with runtime sources fall
+                // through to the static flatten below (and its loud
+                // caps).
                 if let Some(shape) = classify_runtime_spread(items) {
                     return emit_list_spread_runtime_materialize(&shape, range, ctx);
                 }
