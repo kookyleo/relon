@@ -149,6 +149,12 @@ fn one_int(name: &str, v: i64) -> HashMap<String, Value> {
     m
 }
 
+fn one_bool(name: &str, v: bool) -> HashMap<String, Value> {
+    let mut m = HashMap::new();
+    m.insert(name.to_string(), Value::Bool(v));
+    m
+}
+
 fn two_ints(an: &str, av: i64, bn: &str, bv: i64) -> HashMap<String, Value> {
     let mut m = HashMap::new();
     m.insert(an.to_string(), Value::Int(av));
@@ -651,6 +657,56 @@ pub fn all_cases() -> Vec<CorpusCase> {
             name: "fstring_mixed_parts",
             source: "#main(Int n) -> String\nf\"a${n}b${n}c\"",
             args_factory: args_n_5,
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        // Wave 1 (value→String): Bool interpolation / coercion-concat.
+        // The Bool operand is rendered through the shared value→String
+        // skeleton (`b ? "true" : "false"`, an `Op::If` selecting two
+        // `Op::ConstString` constants), byte-exact with the tree-walk
+        // oracle's `Value::Bool` `Display`. Both Bool values are covered
+        // so the `Op::If` arm selection is differentially guarded.
+        CorpusCase {
+            name: "fstring_bool_interp_true",
+            source: "#main(Bool b) -> String\nf\"v=${b}!\"",
+            args_factory: || one_bool("b", true),
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "fstring_bool_interp_false",
+            source: "#main(Bool b) -> String\nf\"v=${b}!\"",
+            args_factory: || one_bool("b", false),
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        // `String + Bool` coercion concat (RHS Bool, rendered in place).
+        CorpusCase {
+            name: "string_plus_bool_true",
+            source: "#main(Bool b) -> String\n\"flag=\" + b",
+            args_factory: || one_bool("b", true),
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "string_plus_bool_false",
+            source: "#main(Bool b) -> String\n\"flag=\" + b",
+            args_factory: || one_bool("b", false),
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        // `Bool + String` coercion concat (LHS Bool, buried-render path).
+        CorpusCase {
+            name: "bool_plus_string_true",
+            source: "#main(Bool b) -> String\nb + \"=flag\"",
+            args_factory: || one_bool("b", true),
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "bool_plus_string_false",
+            source: "#main(Bool b) -> String\nb + \"=flag\"",
+            args_factory: || one_bool("b", false),
             tier: Tier::StdlibMemory,
             supported_by: TW_CR,
         },

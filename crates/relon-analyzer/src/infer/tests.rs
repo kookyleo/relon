@@ -47,11 +47,20 @@ fn option_none_subsumes_optional_slot_only() {
 }
 
 #[test]
-fn binary_string_plus_int_is_invalid() {
-    assert!(binary_known_invalid(
+fn binary_string_plus_int_is_concat_not_invalid() {
+    // `Int + String` / `String + Int` is a coercion concat, not a
+    // static mismatch: the runtime renders the non-String operand via
+    // `Display` and `format!`-concats it (`arithmetic.rs`). Both
+    // operand orders are valid for `Add`.
+    assert!(!binary_known_invalid(
         Operator::Add,
         &InferredType::Int,
         &InferredType::String
+    ));
+    assert!(!binary_known_invalid(
+        Operator::Add,
+        &InferredType::String,
+        &InferredType::Int
     ));
 }
 

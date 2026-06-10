@@ -8796,6 +8796,42 @@ fn lower_binary(
             ctx.tstack.push(IrType::F64);
             return Ok(());
         }
+        // `String + non-String` / `non-String + String` coercion concat.
+        // The tree-walk oracle (`arithmetic.rs`) renders the non-String
+        // operand through `Display` and `format!`-concats it. We mirror
+        // that by rendering the non-String operand through the shared
+        // value→String skeleton and folding both String operands with a
+        // single `StrConcatN { 2 }` (byte-identical to the
+        // `String + String` concat path). Only `Add` reaches here for
+        // String operands (other arith ops were rejected upstream).
+        //
+        // Wave 1 supports a Bool non-String operand; Float / composite
+        // operands stay capped (the skeleton itself loud-caps them, so
+        // any unsupported side returns through the `?` below). The LHS
+        // ops still sit at the tail of `ctx.out` and the RHS ops are
+        // still detached in `rhs_ops`, so each side is rendered in its
+        // own stream before the two are concatenated in source order.
+        if lhs_ty != rhs_ty
+            && matches!(op, Operator::Add)
+            && (lhs_ty == IrType::String || rhs_ty == IrType::String)
+        {
+            // Render the LHS (ops already at the tail of `ctx.out`) to
+            // String. `lower_value_to_string` pushes a tstack tag we do
+            // not need here — pop it back off after each call.
+            lower_value_to_string(lhs_ty, lhs.range, ctx)?;
+            ctx.tstack.pop();
+            // Splice in the RHS stream, then render it to String too.
+            ctx.out.extend(rhs_ops);
+            lower_value_to_string(rhs_ty, rhs.range, ctx)?;
+            ctx.tstack.pop();
+            // Two String operands in source order → one concat alloc.
+            ctx.out.push(TaggedOp {
+                op: Op::StrConcatN { operand_count: 2 },
+                range,
+            });
+            ctx.tstack.push(IrType::String);
+            return Ok(());
+        }
         // Homogeneous path: re-attach the RHS stream verbatim and fall
         // through to the same-type checks below.
         ctx.out.extend(rhs_ops);
@@ -9006,6 +9042,94 @@ fn lower_fstring(
     Ok(())
 }
 
+/// Unified "value → String" dispatch skeleton.
+///
+/// The operand's ops are assumed already emitted at the tail of
+/// `ctx.out` with its IR type tag `value_ty` (its tstack entry has
+/// **already been popped** by the caller). This function appends the
+/// conversion ops that turn that operand into a single `String` value
+/// and leaves the result tag (`IrType::String`) pushed onto the stack.
+///
+/// Both f-string interpolation (`f"${x}"`) and `String + non-String`
+/// concat route through here so the rendered bytes stay identical
+/// across the two surfaces and across every backend.
+///
+/// Coverage (Wave 1):
+/// * `String` → identity (the operand already is the result).
+/// * `I64`    → reuse the existing `Op::IntToStr` (byte-exact with
+///   `i64` `Display`); routing through here must not change the bytes
+///   the previous direct `IntToStr` emission produced.
+/// * `Bool`   → render as `b ? "true" : "false"` using the existing
+///   `Op::If` + `Op::ConstString` ops (no new op), byte-exact with the
+///   tree-walk oracle's `Value::Bool` `Display`.
+/// * `F64`    → loud cap (deferred to Wave 2).
+/// * everything else (List / Dict / Schema / Null / …) → loud cap; we
+///   never silently render a wrong byte sequence.
+fn lower_value_to_string(
+    value_ty: IrType,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<(), LoweringError> {
+    match value_ty {
+        IrType::String => {
+            // Already a String — coercion is identity.
+            ctx.tstack.push(IrType::String);
+            Ok(())
+        }
+        IrType::I64 => {
+            // Int → base-10 decimal, byte-exact with `Display`.
+            ctx.out.push(TaggedOp {
+                op: Op::IntToStr,
+                range,
+            });
+            ctx.tstack.push(IrType::String);
+            Ok(())
+        }
+        IrType::Bool => {
+            // Bool → "true" / "false", byte-exact with the oracle's
+            // `Value::Bool` `Display`. Built from the existing `Op::If`
+            // (stack effect `[Bool] -> [String]`) selecting one of two
+            // interned `Op::ConstString` constants — no new op.
+            let true_idx = ctx.const_intern.borrow_mut().strings.intern("true");
+            let false_idx = ctx.const_intern.borrow_mut().strings.intern("false");
+            let then_body = vec![TaggedOp {
+                op: Op::ConstString {
+                    idx: true_idx,
+                    value: "true".to_string(),
+                },
+                range,
+            }];
+            let else_body = vec![TaggedOp {
+                op: Op::ConstString {
+                    idx: false_idx,
+                    value: "false".to_string(),
+                },
+                range,
+            }];
+            ctx.out.push(TaggedOp {
+                op: Op::If {
+                    result_ty: IrType::String,
+                    then_body,
+                    else_body,
+                },
+                range,
+            });
+            ctx.tstack.push(IrType::String);
+            Ok(())
+        }
+        other => Err(cap!(
+            "lower_expr.unsupported_expr.8",
+            LoweringError::UnsupportedExpr {
+                kind: format!(
+                    "value-to-String coercion of type {other:?} — only String / Int / \
+                     Bool have a byte-exact AOT coercion (Float / composite deferred)"
+                ),
+                range,
+            }
+        )),
+    }
+}
+
 /// Lower one f-string part to exactly one `String` operand on the stack.
 fn lower_fstring_part(
     part: &FStringPart,
@@ -9034,32 +9158,9 @@ fn lower_fstring_part(
                     range: node.range,
                 }
             ))?;
-            match ty {
-                IrType::String => {
-                    // Already a String — coercion is identity.
-                    ctx.tstack.push(IrType::String);
-                    Ok(())
-                }
-                IrType::I64 => {
-                    // Int → base-10 decimal, byte-exact with `Display`.
-                    ctx.out.push(TaggedOp {
-                        op: Op::IntToStr,
-                        range: node.range,
-                    });
-                    ctx.tstack.push(IrType::String);
-                    Ok(())
-                }
-                other => Err(cap!(
-                    "lower_expr.unsupported_expr.8",
-                    LoweringError::UnsupportedExpr {
-                        kind: format!(
-                            "FString(interpolation of type {other:?} — only String / Int \
-                             interpolations have a byte-exact AOT coercion)"
-                        ),
-                        range: node.range,
-                    }
-                )),
-            }
+            // Route every interpolation through the shared value→String
+            // skeleton so f-string and String-concat render identically.
+            lower_value_to_string(ty, node.range, ctx)
         }
     }
 }

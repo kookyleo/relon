@@ -1384,7 +1384,12 @@ pub(crate) fn binary_known_invalid(op: Operator, lt: &InferredType, rt: &Inferre
                 return false;
             }
             if op == Operator::Add {
-                if matches!(lt, InferredType::String) && matches!(rt, InferredType::String) {
+                // `String + X` / `X + String` is always valid for `Add`:
+                // the runtime (`arithmetic.rs`) renders the non-String
+                // operand through `Display` and `format!`-concats it, so
+                // any operand pairing with a String is a string concat,
+                // never a static mismatch.
+                if matches!(lt, InferredType::String) || matches!(rt, InferredType::String) {
                     return false;
                 }
                 if matches!(lt, InferredType::List(_)) && matches!(rt, InferredType::List(_)) {
@@ -1438,7 +1443,18 @@ fn infer_binary(op: Operator, lt: &InferredType, rt: &InferredType) -> Option<In
                     InferredType::Int | InferredType::Float | InferredType::Number,
                     InferredType::Int | InferredType::Float | InferredType::Number,
                 ) => Some(InferredType::Number),
-                (InferredType::String, InferredType::String) if op == Operator::Add => {
+                // `String + String` and `String + X` / `X + String`
+                // coercion-concat all yield String: the runtime renders
+                // the non-String operand via `Display` (`arithmetic.rs`).
+                // Inferring String here lets a `-> String` body that
+                // concatenates a non-String operand type-check; the
+                // compiled backends render the supported operand types
+                // (Int / Bool) and loud-cap the rest.
+                (lt_inner, rt_inner)
+                    if op == Operator::Add
+                        && (matches!(lt_inner, InferredType::String)
+                            || matches!(rt_inner, InferredType::String)) =>
+                {
                     Some(InferredType::String)
                 }
                 (InferredType::List(a), InferredType::List(b)) if op == Operator::Add => {

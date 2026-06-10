@@ -625,14 +625,15 @@ fn flags_binary_int_plus_string() {
     assert!(!mismatches.is_empty(), "{:?}", tree.diagnostics);
 }
 
-/// Stage 1.3 reverse: `Any` slot tolerates the same expression
-/// without producing the binary mismatch (the binding side accepts
-/// it, but the binary itself remains a known-bad combination —
-/// so we still expect the binary diagnostic). Encodes the rule
-/// "the typed binding is happy, but the binary is still wrong".
+/// Stage 1.3 reverse: a binary that *is* statically known-bad still
+/// reports even under an `Any` slot. `true + 1` (Bool + Int) has no
+/// runtime concat / arithmetic interpretation, so the binary itself is
+/// the offender regardless of the field type. (`Int + String` is no
+/// longer such a case — it is a coercion concat — so a genuinely
+/// ill-typed binary is used here instead.)
 #[test]
 fn binary_mismatch_independent_of_slot_type() {
-    let tree = analyze_str(r#"{ Any x: 1 + "hello" }"#);
+    let tree = analyze_str(r#"{ Any x: true + 1 }"#);
     // The slot accepts Any, so no slot-level mismatch — but the
     // binary itself is still ill-typed.
     let mismatches: Vec<_> = tree
@@ -788,7 +789,12 @@ fn fncall_assignment_is_silent() {
 /// diagnostic (from the binary check), never one from the slot.
 #[test]
 fn any_slot_does_not_add_slot_level_mismatch() {
-    let tree = analyze_str(r#"{ Any x: 1 + "y" }"#);
+    // `true + 1` is a genuinely ill-typed binary (no concat / arithmetic
+    // interpretation). `Int + String` is no longer such a case — it is a
+    // coercion concat — so a Bool + Int binary is used to keep exercising
+    // the "Any slot adds no slot-level mismatch, but the binary itself
+    // still reports" invariant.
+    let tree = analyze_str(r#"{ Any x: true + 1 }"#);
     let slot_mm: Vec<_> = tree
         .diagnostics
         .iter()
