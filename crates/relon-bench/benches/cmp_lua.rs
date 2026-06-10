@@ -1124,6 +1124,27 @@ const W11_LUA_SRC: &str = "print(1 + 1)";
 // We reuse the boundary calibrate row's shape (1M mlua calls to a
 // constant fn) for Lua; the Relon side uses the tree-walker because
 // trace-JIT tail numbers are already in `trace_jit_hot_loop`.
+//
+// **Measurement basis — the two LLVM rows are NOT the same quantity**
+// (panel fixation 2026-06-10; see
+// `docs/internal/perf-panel-w-series.md`). With a 1-op kernel the
+// per-call cost is dominated by whatever sits on the call edge, so
+// the canonical panel deliberately ships two rows with different
+// scopes — report them separately, never average or substitute one
+// for the other:
+// * `relon_llvm_aot` — generic buffer-protocol entry. Per-call cost
+//   INCLUDES the host-boundary marshalling: a fresh
+//   `HashMap<String, Value>` arg pack (`w12_relon_args` runs inside
+//   the timed loop), the args→buffer pack, the arena round-trip and
+//   the result unpack. On s90 that boundary work is ~195 ns of the
+//   ~197 ns row — the row measures "call a compiled Relon fn the
+//   generic way", not compute.
+// * `relon_llvm_aot_fast` — legacy-i64 fast entry. The scalar arg is
+//   extracted ONCE outside the timed loop; no HashMap, no buffer
+//   pack, no arena round-trip. Measures the compiled kernel plus a
+//   direct call edge (~2.9 ns on s90) — the honest comparator for
+//   the `rust_native` row's plain `fn(i64) -> i64` call (~4.8 ns),
+//   which also pays no marshalling.
 
 fn w12_relon_src() -> &'static str {
     // A trivial 1-op invoke to keep cost dominated by dispatch.
@@ -1385,6 +1406,20 @@ fn w15_expected() -> i64 {
 // (different algorithm, different constant factor); the row's name
 // `W16_quicksort` reflects the recursion shape, not the absent
 // concat splice.
+//
+// **Pass-count disclosure (2026-06-10)**: within the shared
+// recurrence the partition pass-count differs by row. The Relon
+// source pays THREE `_list_filter` walks per `sum_qs` call (one per
+// predicate, each materialising a worst-case-capacity list); the
+// Lua row partitions in ONE combined walk (`lt` / `gt` tables +
+// inline `eq_sum`). That asymmetry favours Lua (~3n vs n reads per
+// level), i.e. it is CONSERVATIVE for any "relon beats LuaJIT"
+// claim, so the Lua row is left as-is. The `rust_native` baseline
+// was algorithm-matched to the Relon three-pass shape on 2026-06-10
+// (see `rust_native_w16` doc-comment) because that row's job is the
+// opposite direction — "what would the SAME algorithm cost in
+// Rust" — and the old one-pass `Vec::new()` form both under-counted
+// reads and paid grow-reallocs the Relon arena never pays.
 //
 // **HONESTY checklist** (per `HONESTY_POLICY.md`):
 // * Source path: `w16_relon_src()` is the bench's production source.
@@ -3447,15 +3482,52 @@ fn rust_native_w15(n: i64) -> i64 {
     acc
 }
 
-/// W16 sum-via-partition baseline. Mirrors the Relon source's
-/// sum-via-partition recurrence (NOT in-place Lomuto/Hoare followed
-/// by a sum loop): each `sum_qs` call walks the input list three
-/// times (lt / eq / gt partitions), recurses on `lt` and `gt`, and
-/// folds `eq` into a scalar accumulator inline. The PRNG
-/// construction is `black_box`-ed so rustc can't constant-fold the
-/// array at compile time and book a literal sum.
+/// W16 sum-via-partition baseline — ALGORITHM-MATCHED to the Relon
+/// production source (fairness fix 2026-06-10).
+///
+/// The previous baseline did ONE combined pass per `sum_qs` call with
+/// two `Vec::new()` grow-as-you-go partitions (`lt` / `gt`) and an
+/// inline `eq_sum` fold. The Relon source does THREE independent
+/// `_list_filter` passes per call (one per `<` / `==` / `>`
+/// predicate), each materialising a worst-case-capacity list (the
+/// stdlib `list_int_filter` body allocates `8 + 8*n + 8` bytes up
+/// front before the pass — see
+/// `relon-ir/src/stdlib/defs.rs::list_int_filter_body`), and the
+/// `==` partition is materialised then summed by `list.sum` (NOT
+/// folded inline). Comparing the 3n-reads-per-level exact-capacity
+/// Relon shape against a n-reads-per-level grow-realloc Rust shape
+/// violated the "same algorithm" honesty question — the 0.515×
+/// "relon beats Rust" ratio measured against that baseline is VOID.
+///
+/// This baseline mirrors the Relon shape one-for-one:
+///   * `arr` built in two stages (`range(n)` materialise, then a
+///     `map` pass into a second list) — same as
+///     `range(n).map((i) => ...)`;
+///   * three full passes per `sum_qs` call, each materialising a
+///     `Vec::with_capacity(len)` partition (worst-case capacity, no
+///     grow reallocs — the same allocation-request shape the arena
+///     serves);
+///   * `eq` partition materialised, then summed in a separate walk;
+///   * recursion on the `lt` / `gt` partitions only.
+///
+/// Allocator note: Relon serves these per-call allocations from a
+/// scratch bump arena; Rust goes through the system allocator. That
+/// difference is part of each runtime and intentionally NOT papered
+/// over (we match the allocation requests, not the allocator).
+/// `black_box` on `n` keeps rustc from constant-folding the array.
 #[inline(never)]
 fn rust_native_w16(n: i64) -> i64 {
+    fn filter_to_vec(xs: &[i64], pred: impl Fn(i64) -> bool) -> Vec<i64> {
+        // Worst-case-capacity materialising filter — the Rust
+        // equivalent of one `_list_filter(xs, pred)` call.
+        let mut out: Vec<i64> = Vec::with_capacity(xs.len());
+        for &v in xs {
+            if pred(v) {
+                out.push(v);
+            }
+        }
+        out
+    }
     fn sum_qs(xs: Vec<i64>) -> i64 {
         let len = xs.len();
         if len == 0 {
@@ -3465,27 +3537,24 @@ fn rust_native_w16(n: i64) -> i64 {
             return xs[0];
         }
         let p = xs[0];
-        let mut lt: Vec<i64> = Vec::new();
-        let mut gt: Vec<i64> = Vec::new();
+        let lt = filter_to_vec(&xs, |v| v < p);
+        let eq = filter_to_vec(&xs, |v| v == p);
+        let gt = filter_to_vec(&xs, |v| v > p);
+        // `list.sum` over the materialised `==` partition.
         let mut eq_sum: i64 = 0;
-        for v in &xs {
-            if *v < p {
-                lt.push(*v);
-            } else if *v > p {
-                gt.push(*v);
-            } else {
-                eq_sum = eq_sum.wrapping_add(*v);
-            }
+        for &v in &eq {
+            eq_sum = eq_sum.wrapping_add(v);
         }
         sum_qs(lt).wrapping_add(eq_sum).wrapping_add(sum_qs(gt))
     }
     let n = black_box(n);
-    let mut arr: Vec<i64> = Vec::with_capacity(n as usize);
-    let mut i: i64 = 0;
-    while i < n {
-        arr.push((i.wrapping_mul(1103515245).wrapping_add(12345)) % 2048);
-        i += 1;
-    }
+    // Two-stage arr materialisation mirroring `range(n).map(...)`:
+    // the range list exists as a real buffer before the map pass.
+    let range: Vec<i64> = (0..n).collect();
+    let arr: Vec<i64> = range
+        .iter()
+        .map(|&i| (i.wrapping_mul(1103515245).wrapping_add(12345)) % 2048)
+        .collect();
     sum_qs(arr)
 }
 
