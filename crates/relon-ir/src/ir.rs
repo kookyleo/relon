@@ -296,6 +296,48 @@ pub struct TaggedOp {
     pub range: TokenRange,
 }
 
+/// Next-free let-local index for `body`: the maximum let index any
+/// op in the (recursively walked) op stream touches, plus one. `0`
+/// when the body binds no lets at all.
+///
+/// Backends that inline bundled-stdlib calls use this as the static
+/// floor for the inline frame's `let_offset` window. Picking the
+/// window from only the *currently declared* slots is unsound: the
+/// caller's lowering may bind further lets *after* the inlined call
+/// (e.g. the runtime list-spread materialiser binds source-handle
+/// and cursor lets after lowering a `range(n).map(...)` source), and
+/// those late slots would collide with the callee window — surfacing
+/// as a "let-slot N aliased" codegen error or a silently retyped
+/// slot. Scanning the whole body up front makes the window collision-
+/// free regardless of where in the stream the call sits.
+///
+/// Walked indices: `LetSet` / `LetGet` operands plus every
+/// `MakeClosure` capture's `let_idx`; recursion covers the nested
+/// bodies of `If` / `Block` / `Loop` (the only op variants carrying
+/// op streams).
+pub fn body_let_watermark(body: &[TaggedOp]) -> u32 {
+    let mut next_free = 0u32;
+    for tagged in body {
+        let op_max = match &tagged.op {
+            Op::LetSet { idx, .. } | Op::LetGet { idx, .. } => idx.saturating_add(1),
+            Op::MakeClosure { captures, .. } => captures
+                .iter()
+                .map(|c| c.let_idx.saturating_add(1))
+                .max()
+                .unwrap_or(0),
+            Op::If {
+                then_body,
+                else_body,
+                ..
+            } => body_let_watermark(then_body).max(body_let_watermark(else_body)),
+            Op::Block { body, .. } | Op::Loop { body, .. } => body_let_watermark(body),
+            _ => 0,
+        };
+        next_free = next_free.max(op_max);
+    }
+    next_free
+}
+
 /// Stack-machine ops. Each variant documents its stack effect.
 ///
 /// The binary arithmetic ops carry an [`IrType`] tag so the wasm

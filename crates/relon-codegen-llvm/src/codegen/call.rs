@@ -836,17 +836,22 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         }
         args.reverse();
 
-        // Pick a let_offset window past any active let slots so the
-        // callee's `LetSet 0` lands at `let_offset + 0` and never
-        // clashes with the caller's bindings. Cranelift uses
-        // `max(idx) + 1`; we do the same by inspecting `let_slots`.
+        // Pick a let_offset window past any caller let slot — both
+        // the ones already declared (lazy `let_slots` max) AND the
+        // static `let_floor` watermark covering lets the caller body
+        // binds only *after* this call. Inspecting `let_slots` alone
+        // is unsound: e.g. the runtime list-spread materialiser binds
+        // its source-handle / cursor lets after lowering a
+        // `range(n).map(...)` source, and the callee window would
+        // land on those late slots ("let-slot N aliased" error).
         let let_offset = self
             .let_slots
             .keys()
             .copied()
             .max()
             .map(|m| m + 1)
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(self.let_floor);
 
         // Alloca for the callee's return value. The callee's
         // `Op::Return` stores into this slot then jumps to `exit_bb`;
@@ -908,10 +913,17 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         };
         self.inline_frames.push(frame);
         let body = callee.body_owned();
+        // Raise the floor past the callee window for the duration of
+        // the inline emission so a nested stdlib inline (or any let
+        // the callee binds late) allocates its own window above this
+        // one; restore the caller's floor on frame pop.
+        let saved_floor = self.let_floor;
+        self.let_floor = let_offset + relon_ir::ir::body_let_watermark(&body);
         let result = self.lower_body(&body);
         // Always pop the frame before returning the error so the emit
         // state stays consistent on failure.
         self.inline_frames.pop();
+        self.let_floor = saved_floor;
         result?;
 
         // After the inline body finishes the current block has either

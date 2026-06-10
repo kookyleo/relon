@@ -3989,289 +3989,248 @@ pub(super) fn flatten_list_spread(
     Ok(out)
 }
 
-/// The shape of a list literal that carries exactly one runtime
-/// (non-list-literal) spread source, plus optional static scalar
-/// elements before and after it: `[a, b, ...xs, c]`. Borrowed from the
-/// caller's `items` slice; element nodes are the raw scalar nodes, the
-/// `source` node is the spread source expression (`xs`).
-pub(super) struct RuntimeSpreadShape<'a> {
-    /// Scalar element nodes that precede the runtime source.
-    pub prefix: Vec<&'a Node>,
-    /// The single runtime list source expression (`...xs` -> `xs`).
-    pub source: &'a Node,
-    /// Scalar element nodes that follow the runtime source.
-    pub suffix: Vec<&'a Node>,
+/// One segment of a runtime-spread list literal: either a run of
+/// consecutive static scalar literal elements or a single runtime
+/// (non-list-literal) spread source. Borrowed from the caller's
+/// `items` slice.
+pub(super) enum SpreadSegment<'a> {
+    /// Consecutive static scalar literal elements (`Int` / `Float`).
+    Scalars(Vec<&'a Node>),
+    /// One runtime list source expression (`...xs` -> `xs`).
+    Source(&'a Node),
 }
 
-/// Classify a spread-bearing list literal as the single-runtime-source
-/// shape `[scalars..., ...xs, scalars...]` (xs not a list literal, so the
-/// static flatten declines it). Returns `Some(shape)` only when:
-///   * there is exactly one spread element, and
-///   * its source is NOT a list literal (a list literal stays on the
-///     static-flatten path), and
+/// The shape of a list literal that carries one or more runtime
+/// (non-list-literal) spread sources, with optional static scalar
+/// elements interleaved: `[a, ...xs, b, ...ys, c]` is cut into the
+/// alternating segment sequence
+/// `[Scalars([a]), Source(xs), Scalars([b]), Source(ys), Scalars([c])]`.
+/// The number of sources is fixed at compile time, so the materialiser
+/// emits straight-line code — no loop over segments is needed.
+pub(super) struct RuntimeSpreadShape<'a> {
+    /// Alternating scalar runs and runtime sources, in literal order.
+    /// Contains at least one `Source`; two `Source`s may be adjacent
+    /// (`[...xs, ...ys]`), while `Scalars` runs are maximal (never
+    /// adjacent to another `Scalars`).
+    pub segments: Vec<SpreadSegment<'a>>,
+}
+
+/// Classify a spread-bearing list literal as the runtime-source shape
+/// `[scalars..., ...xs, scalars..., ...ys, ...]` (one or more runtime
+/// sources). Returns `Some(shape)` only when:
+///   * every spread source is NOT a list literal (a single list-literal
+///     source keeps the whole literal on the static-flatten path), and
 ///   * every non-spread element is a plain scalar literal
 ///     (`Int` / `Float`), which the runtime materialiser can store
-///     inline next to the copied source payload.
+///     inline next to the copied source payloads.
 ///
-/// Returns `None` for everything else (zero / multiple spreads, a
-/// list-literal spread source, or a non-scalar surrounding element),
-/// leaving the existing static-flatten / computed paths — and their
-/// loud caps — untouched.
+/// Returns `None` for everything else (zero spreads, a list-literal
+/// spread source, or a non-scalar surrounding element), leaving the
+/// existing static-flatten / computed paths — and their loud caps —
+/// untouched.
 pub(super) fn classify_runtime_spread(items: &[Node]) -> Option<RuntimeSpreadShape<'_>> {
-    let mut spread_idx: Option<usize> = None;
-    for (i, item) in items.iter().enumerate() {
-        if let Expr::Spread(inner) = &*item.expr {
-            // A list-literal source belongs to the static flatten path.
-            if matches!(&*inner.expr, Expr::List(_)) {
-                return None;
+    let mut segments: Vec<SpreadSegment<'_>> = Vec::new();
+    let mut has_source = false;
+    for item in items {
+        match &*item.expr {
+            Expr::Spread(inner) => {
+                // A list-literal source belongs to the static flatten
+                // path (and a mix of literal + runtime sources stays on
+                // it too, capping loudly at the runtime source).
+                if matches!(&*inner.expr, Expr::List(_)) {
+                    return None;
+                }
+                has_source = true;
+                segments.push(SpreadSegment::Source(inner));
             }
-            if spread_idx.is_some() {
-                // Multiple runtime sources need a loop-style length
-                // accumulation + multi-segment copy; capped this round.
-                return None;
+            // Surrounding elements must be plain scalar literals so the
+            // inline store path (Int -> i64 / Float -> f64) is byte-exact.
+            Expr::Int(_) | Expr::Float(_) => {
+                if let Some(SpreadSegment::Scalars(run)) = segments.last_mut() {
+                    run.push(item);
+                } else {
+                    segments.push(SpreadSegment::Scalars(vec![item]));
+                }
             }
-            spread_idx = Some(i);
+            _ => return None,
         }
     }
-    let split = spread_idx?;
-    // Surrounding elements must be plain scalar literals so the inline
-    // store path (Int -> i64 / Float -> f64) is byte-exact.
-    let is_scalar = |n: &Node| matches!(&*n.expr, Expr::Int(_) | Expr::Float(_));
-    let prefix: Vec<&Node> = items[..split].iter().collect();
-    let suffix: Vec<&Node> = items[split + 1..].iter().collect();
-    if !prefix.iter().all(|n| is_scalar(n)) || !suffix.iter().all(|n| is_scalar(n)) {
+    if !has_source {
         return None;
     }
-    let Expr::Spread(source) = &*items[split].expr else {
-        return None;
-    };
-    Some(RuntimeSpreadShape {
-        prefix,
-        source,
-        suffix,
-    })
+    Some(RuntimeSpreadShape { segments })
 }
 
-/// Materialise a list literal whose only spread source is a runtime
-/// `List<Int>` / `List<Float>` value (a parameter / a computed handle),
-/// surrounded by optional static scalar elements:
-/// `[a, ...xs, b]`. The result is a fresh scratch record with the same
-/// `[len:u32]`-header + 8-byte-stride payload layout the literal
-/// materialisers emit, so it flows through the existing scratch-list
-/// return path byte-for-byte like a `map` / comprehension output.
+/// Materialise a list literal whose spread sources are runtime
+/// `List<Int>` / `List<Float>` values (parameters / computed handles),
+/// with optional static scalar elements interleaved:
+/// `[a, ...xs, b, ...ys, c]`. The result is a fresh scratch record with
+/// the same `[len:u32]`-header + 8-byte-stride payload layout the
+/// literal materialisers emit, so it flows through the existing
+/// scratch-list return path byte-for-byte like a `map` / comprehension
+/// output.
 ///
-/// Layout walk (`is_float` only changes the element store op + the final
-/// handle tag; stride and header are identical):
-///   1. Lower `xs` -> source handle; read `src_count = i32.load(src)`.
-///   2. `total = prefix_count + src_count + suffix_count`.
+/// The source count is fixed at compile time, so the emission is
+/// straight-line — no loop. Layout walk (`is_float` only changes the
+/// element store op + the final handle tag; stride and header are
+/// identical):
+///   1. Lower every source in literal order -> handles; read each
+///      `src_count[k] = i32.load(src[k])` from the record header.
+///   2. `total = static_scalar_count + Σ src_count[k]`.
 ///   3. `base = AllocScratchDyn(8 + 8*total)`; store `total` header.
 ///   4. `payload = (base + 4 + 7) & -8`.
-///   5. Store prefix scalars at `payload + i*8`.
-///   6. `memory.copy(dst = payload + prefix_count*8,
-///       src = (src_base + 4 + 7) & -8, len = src_count*8)`.
-///   7. Store suffix scalars at `payload + (prefix_count + src_count + i)*8`
-///      (the runtime `src_count` makes the suffix address dynamic).
-///   8. Push `base` tagged `ListInt` / `ListFloat`.
+///   5. Walk the segments left to right keeping a write `cursor`
+///      (a let) plus a compile-time `static_off` byte offset:
+///        * a scalar stores at `cursor + static_off`, advancing
+///          `static_off` by 8;
+///        * a source `memory.copy`-s its payload to
+///          `cursor + static_off`, then folds the runtime length into
+///          a new cursor (`cursor += static_off + src_count*8`,
+///          `static_off = 0`) — the offset accumulation that replaces
+///          the prefix/suffix special case of the single-source form.
+///   6. Push `base` tagged `ListInt` / `ListFloat`.
 pub(super) fn emit_list_spread_runtime_materialize(
     shape: &RuntimeSpreadShape<'_>,
     range: TokenRange,
     ctx: &mut LowerCtx<'_>,
 ) -> Result<(), LoweringError> {
-    // Lower the runtime source first and pin its element shape from the
-    // handle type it leaves on the stack.
-    lower_expr(&shape.source.expr, shape.source.range, ctx)?;
-    let src_ty = ctx.tstack.last().copied().ok_or_else(|| {
-        cap!(
-            "emit_list_spread_runtime_materialize.unsupported_expr.1",
-            LoweringError::UnsupportedExpr {
-                kind: "list spread: runtime source produced no value".to_string(),
-                range: shape.source.range,
-            }
-        )
-    })?;
-    let is_float = match src_ty {
-        IrType::ListInt => false,
-        IrType::ListFloat => true,
-        other => {
+    // ---- 1. Lower every runtime source in literal order and pin the
+    // element shape from the first source's handle type. Scalars are
+    // pure literals, so hoisting the source evaluation ahead of the
+    // scalar stores is unobservable (matches the tree-walk order of
+    // effects: sources still evaluate left to right).
+    struct SourceSlot {
+        /// Let holding the source record handle (arena offset).
+        base_i: u32,
+        /// Let holding the source `[len]` header value (i32).
+        count_i: u32,
+    }
+    let mut sources: Vec<SourceSlot> = Vec::new();
+    let mut pinned_ty: Option<IrType> = None;
+    for seg in &shape.segments {
+        let SpreadSegment::Source(node) = seg else {
+            continue;
+        };
+        lower_expr(&node.expr, node.range, ctx)?;
+        let src_ty = ctx.tstack.last().copied().ok_or_else(|| {
+            cap!(
+                "emit_list_spread_runtime_materialize.unsupported_expr.1",
+                LoweringError::UnsupportedExpr {
+                    kind: "list spread: runtime source produced no value".to_string(),
+                    range: node.range,
+                }
+            )
+        })?;
+        if !matches!(src_ty, IrType::ListInt | IrType::ListFloat) {
             // List<String> / List<Schema> / List<List> spread sources need
             // the pointer-array materialiser, not the scalar copy; cap.
             return Err(cap!(
                 "emit_list_spread_runtime_materialize.unsupported_source_ty",
                 LoweringError::UnsupportedExpr {
                     kind: format!(
-                        "list spread: runtime source of type {other:?} is not a scalar \
+                        "list spread: runtime source of type {src_ty:?} is not a scalar \
                          List<Int> / List<Float> (only scalar list spread sources are \
                          materialised in the AOT envelope)"
                     ),
-                    range: shape.source.range,
+                    range: node.range,
                 }
             ));
         }
-    };
+        match pinned_ty {
+            None => pinned_ty = Some(src_ty),
+            Some(t) if t == src_ty => {}
+            Some(t) => {
+                // The analyzer enforces a homogeneous element type, so a
+                // List<Int> / List<Float> source mix here is a defensive
+                // cap, not a reachable user shape.
+                return Err(cap!(
+                    "emit_list_spread_runtime_materialize.mixed_source_ty",
+                    LoweringError::UnsupportedExpr {
+                        kind: format!(
+                            "list spread: runtime sources disagree on the element shape \
+                             ({t:?} vs {src_ty:?}); a spread list's sources must share one \
+                             scalar element type"
+                        ),
+                        range: node.range,
+                    }
+                ));
+            }
+        }
+        let base_i = ctx.next_let_idx;
+        let count_i = base_i + 1;
+        ctx.next_let_idx += 2;
+        // base = source handle (i32 arena offset).
+        emit_let_set(base_i, src_ty, range, ctx);
+        // count = i32.load(base) — the source record's `[len]` header.
+        emit_let_get(base_i, src_ty, range, ctx);
+        ctx.out.push(TaggedOp {
+            op: Op::LoadI32AtAbsolute { offset: 0 },
+            range,
+        });
+        ctx.tstack.pop();
+        ctx.tstack.push(IrType::I32);
+        emit_let_set(count_i, IrType::I32, range, ctx);
+        sources.push(SourceSlot { base_i, count_i });
+    }
+    let src_handle_ty = pinned_ty.expect("classify_runtime_spread guarantees >= 1 source");
+    let is_float = src_handle_ty == IrType::ListFloat;
     let elem_store = if is_float {
         Op::StoreF64AtAbsolute { offset: 0 }
     } else {
         Op::StoreI64AtAbsolute { offset: 0 }
     };
-    let handle_ty = if is_float {
-        IrType::ListFloat
-    } else {
-        IrType::ListInt
-    };
 
-    let prefix_count = i32::try_from(shape.prefix.len()).map_err(|_| {
-        cap!(
-            "emit_list_spread_runtime_materialize.unsupported_expr.prefix_overflow",
-            LoweringError::UnsupportedExpr {
-                kind: "list spread: prefix too long for i32 count".to_string(),
-                range,
-            }
-        )
-    })?;
-    let suffix_count = i32::try_from(shape.suffix.len()).map_err(|_| {
-        cap!(
-            "emit_list_spread_runtime_materialize.unsupported_expr.suffix_overflow",
-            LoweringError::UnsupportedExpr {
-                kind: "list spread: suffix too long for i32 count".to_string(),
-                range,
-            }
-        )
-    })?;
+    // Total static scalar element count across every scalar run; its
+    // byte form (count * 8) must fit i32 for the address arithmetic.
+    let static_count: usize = shape
+        .segments
+        .iter()
+        .map(|seg| match seg {
+            SpreadSegment::Scalars(run) => run.len(),
+            SpreadSegment::Source(_) => 0,
+        })
+        .sum();
+    let static_count = i32::try_from(static_count)
+        .ok()
+        .filter(|n| n.checked_mul(8).is_some())
+        .ok_or_else(|| {
+            cap!(
+                "emit_list_spread_runtime_materialize.unsupported_expr.static_count_overflow",
+                LoweringError::UnsupportedExpr {
+                    kind: "list spread: static scalar element count overflows i32".to_string(),
+                    range,
+                }
+            )
+        })?;
 
-    let src_base_i = ctx.next_let_idx;
-    let src_count_i = ctx.next_let_idx + 1;
-    let total_i = ctx.next_let_idx + 2;
-    let base_i = ctx.next_let_idx + 3;
-    let payload_i = ctx.next_let_idx + 4;
-    ctx.next_let_idx += 5;
+    let total_i = ctx.next_let_idx;
+    let base_i = ctx.next_let_idx + 1;
+    let payload_i = ctx.next_let_idx + 2;
+    ctx.next_let_idx += 3;
 
-    // src_base = source handle (i32).
-    ctx.out.push(TaggedOp {
-        op: Op::LetSet {
-            idx: src_base_i,
-            ty: src_ty,
-        },
-        range,
-    });
-    ctx.tstack.pop();
+    // ---- 2. total = static_count + Σ src_count[k].
+    emit_const_i32(static_count, range, ctx);
+    for slot in &sources {
+        emit_let_get(slot.count_i, IrType::I32, range, ctx);
+        emit_bin_i32(Op::Add(IrType::I32), range, ctx);
+    }
+    emit_let_set(total_i, IrType::I32, range, ctx);
 
-    // src_count = i32.load(src_base) — the source record's `[len]` header.
-    ctx.out.push(TaggedOp {
-        op: Op::LetGet {
-            idx: src_base_i,
-            ty: src_ty,
-        },
-        range,
-    });
-    ctx.tstack.push(src_ty);
-    ctx.out.push(TaggedOp {
-        op: Op::LoadI32AtAbsolute { offset: 0 },
-        range,
-    });
-    ctx.tstack.pop();
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::LetSet {
-            idx: src_count_i,
-            ty: IrType::I32,
-        },
-        range,
-    });
-    ctx.tstack.pop();
-
-    // total = prefix_count + src_count + suffix_count.
-    ctx.out.push(TaggedOp {
-        op: Op::ConstI32(prefix_count + suffix_count),
-        range,
-    });
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::LetGet {
-            idx: src_count_i,
-            ty: IrType::I32,
-        },
-        range,
-    });
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::Add(IrType::I32),
-        range,
-    });
-    ctx.tstack.pop();
-    ctx.tstack.pop();
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::LetSet {
-            idx: total_i,
-            ty: IrType::I32,
-        },
-        range,
-    });
-    ctx.tstack.pop();
-
-    // record_size = 8 + 8*total. base = AllocScratchDyn(size).
-    ctx.out.push(TaggedOp {
-        op: Op::ConstI32(8),
-        range,
-    });
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::ConstI32(8),
-        range,
-    });
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::LetGet {
-            idx: total_i,
-            ty: IrType::I32,
-        },
-        range,
-    });
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::Mul(IrType::I32),
-        range,
-    });
-    ctx.tstack.pop();
-    ctx.tstack.pop();
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::Add(IrType::I32),
-        range,
-    });
-    ctx.tstack.pop();
-    ctx.tstack.pop();
-    ctx.tstack.push(IrType::I32);
+    // ---- 3. record_size = 8 + 8*total. base = AllocScratchDyn(size).
+    emit_const_i32(8, range, ctx);
+    emit_const_i32(8, range, ctx);
+    emit_let_get(total_i, IrType::I32, range, ctx);
+    emit_bin_i32(Op::Mul(IrType::I32), range, ctx);
+    emit_bin_i32(Op::Add(IrType::I32), range, ctx);
     ctx.out.push(TaggedOp {
         op: Op::AllocScratchDyn,
         range,
     });
-    ctx.out.push(TaggedOp {
-        op: Op::LetSet {
-            idx: base_i,
-            ty: IrType::I32,
-        },
-        range,
-    });
-    ctx.tstack.pop();
+    emit_let_set(base_i, IrType::I32, range, ctx);
 
     // header: i32.store(base, total)
-    ctx.out.push(TaggedOp {
-        op: Op::LetGet {
-            idx: base_i,
-            ty: IrType::I32,
-        },
-        range,
-    });
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::LetGet {
-            idx: total_i,
-            ty: IrType::I32,
-        },
-        range,
-    });
-    ctx.tstack.push(IrType::I32);
+    emit_let_get(base_i, IrType::I32, range, ctx);
+    emit_let_get(total_i, IrType::I32, range, ctx);
     ctx.out.push(TaggedOp {
         op: Op::StoreI32AtAbsolute { offset: 0 },
         range,
@@ -4279,171 +4238,76 @@ pub(super) fn emit_list_spread_runtime_materialize(
     ctx.tstack.pop();
     ctx.tstack.pop();
 
-    // payload = (base + 4 + 7) & -8
+    // ---- 4. payload = (base + 4 + 7) & -8
     emit_aligned_payload(base_i, payload_i, range, ctx);
 
-    // Store prefix scalars at payload + i*8.
-    for (i, node) in shape.prefix.iter().enumerate() {
-        let byte_off = i32::try_from(i * 8).expect("prefix offset fits i32");
-        emit_scalar_element_store(payload_i, byte_off, node, is_float, &elem_store, range, ctx)?;
-    }
-
-    // memory.copy(dst, src, len): dst on top is `len`, pushed last.
-    //   dst = payload + prefix_count*8
-    ctx.out.push(TaggedOp {
-        op: Op::LetGet {
-            idx: payload_i,
-            ty: IrType::I32,
-        },
-        range,
-    });
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::ConstI32(prefix_count * 8),
-        range,
-    });
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::Add(IrType::I32),
-        range,
-    });
-    ctx.tstack.pop();
-    ctx.tstack.pop();
-    ctx.tstack.push(IrType::I32);
-    //   src = (src_base + 4 + 7) & -8
-    ctx.out.push(TaggedOp {
-        op: Op::LetGet {
-            idx: src_base_i,
-            ty: src_ty,
-        },
-        range,
-    });
-    ctx.tstack.push(src_ty);
-    ctx.out.push(TaggedOp {
-        op: Op::ConstI32(4 + 7),
-        range,
-    });
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::Add(IrType::I32),
-        range,
-    });
-    ctx.tstack.pop();
-    ctx.tstack.pop();
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::ConstI32(-8),
-        range,
-    });
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::BitAnd(IrType::I32),
-        range,
-    });
-    ctx.tstack.pop();
-    ctx.tstack.pop();
-    ctx.tstack.push(IrType::I32);
-    //   len = src_count*8
-    ctx.out.push(TaggedOp {
-        op: Op::LetGet {
-            idx: src_count_i,
-            ty: IrType::I32,
-        },
-        range,
-    });
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::ConstI32(8),
-        range,
-    });
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::Mul(IrType::I32),
-        range,
-    });
-    ctx.tstack.pop();
-    ctx.tstack.pop();
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::MemcpyAtAbsolute,
-        range,
-    });
-    // memory.copy: [dst, src, len] -> []
-    ctx.tstack.pop();
-    ctx.tstack.pop();
-    ctx.tstack.pop();
-
-    // Store suffix scalars at payload + (prefix_count + src_count + i)*8.
-    // The base index (prefix_count + src_count) is a runtime value, so the
-    // address is computed: addr = payload + (prefix_count + src_count)*8 + i*8.
-    for (i, node) in shape.suffix.iter().enumerate() {
-        // addr = payload + ((prefix_count + i) + src_count) * 8
-        ctx.out.push(TaggedOp {
-            op: Op::LetGet {
-                idx: payload_i,
-                ty: IrType::I32,
-            },
-            range,
-        });
-        ctx.tstack.push(IrType::I32);
-        // static_offset = (prefix_count + i)*8
-        let static_off = prefix_count
-            .checked_add(i32::try_from(i).expect("suffix index fits i32"))
-            .and_then(|n| n.checked_mul(8))
-            .ok_or_else(|| {
-                cap!(
-                    "emit_list_spread_runtime_materialize.unsupported_expr.suffix_off_overflow",
-                    LoweringError::UnsupportedExpr {
-                        kind: "list spread: suffix offset overflow".to_string(),
+    // ---- 5. Walk the segments left to right. `cursor_i` is the write
+    // address as of the last source copy (initially the payload base);
+    // `static_off` counts the scalar bytes stored since then, so every
+    // address is `cursor + static_off` with at most one runtime add.
+    let mut cursor_i = payload_i;
+    let mut static_off: i32 = 0;
+    let mut src_slots = sources.iter();
+    for seg in &shape.segments {
+        match seg {
+            SpreadSegment::Scalars(run) => {
+                for node in run {
+                    emit_scalar_element_store(
+                        cursor_i,
+                        static_off,
+                        node,
+                        is_float,
+                        &elem_store,
                         range,
-                    }
-                )
-            })?;
-        ctx.out.push(TaggedOp {
-            op: Op::ConstI32(static_off),
-            range,
-        });
-        ctx.tstack.push(IrType::I32);
-        ctx.out.push(TaggedOp {
-            op: Op::Add(IrType::I32),
-            range,
-        });
-        ctx.tstack.pop();
-        ctx.tstack.pop();
-        ctx.tstack.push(IrType::I32);
-        // + src_count*8
-        ctx.out.push(TaggedOp {
-            op: Op::LetGet {
-                idx: src_count_i,
-                ty: IrType::I32,
-            },
-            range,
-        });
-        ctx.tstack.push(IrType::I32);
-        ctx.out.push(TaggedOp {
-            op: Op::ConstI32(8),
-            range,
-        });
-        ctx.tstack.push(IrType::I32);
-        ctx.out.push(TaggedOp {
-            op: Op::Mul(IrType::I32),
-            range,
-        });
-        ctx.tstack.pop();
-        ctx.tstack.pop();
-        ctx.tstack.push(IrType::I32);
-        ctx.out.push(TaggedOp {
-            op: Op::Add(IrType::I32),
-            range,
-        });
-        ctx.tstack.pop();
-        ctx.tstack.pop();
-        ctx.tstack.push(IrType::I32);
-        // value = lowered scalar; store.
-        emit_scalar_element_value_store(node, is_float, &elem_store, range, ctx)?;
+                        ctx,
+                    )?;
+                    // `static_count * 8` fits i32 (checked above), so the
+                    // per-element accumulation cannot overflow.
+                    static_off += 8;
+                }
+            }
+            SpreadSegment::Source(_) => {
+                let slot = src_slots
+                    .next()
+                    .expect("segment walk and source slots stay in lockstep");
+                // memory.copy(dst, src, len): operands pushed in order.
+                //   dst = cursor + static_off
+                emit_let_get_plus_const(cursor_i, IrType::I32, static_off, range, ctx);
+                //   src = (src_base + 4 + 7) & -8 (skip header, align up)
+                emit_let_get_plus_const(slot.base_i, src_handle_ty, 4 + 7, range, ctx);
+                emit_const_i32(-8, range, ctx);
+                emit_bin_i32(Op::BitAnd(IrType::I32), range, ctx);
+                //   len = src_count * 8
+                emit_let_get(slot.count_i, IrType::I32, range, ctx);
+                emit_const_i32(8, range, ctx);
+                emit_bin_i32(Op::Mul(IrType::I32), range, ctx);
+                ctx.out.push(TaggedOp {
+                    op: Op::MemcpyAtAbsolute,
+                    range,
+                });
+                // memory.copy: [dst, src, len] -> []
+                ctx.tstack.pop();
+                ctx.tstack.pop();
+                ctx.tstack.pop();
+                // Fold the source's runtime length into a fresh cursor:
+                // cursor = cursor + static_off + src_count*8. Later
+                // segments then address relative to the new cursor.
+                let next_cursor_i = ctx.next_let_idx;
+                ctx.next_let_idx += 1;
+                emit_let_get_plus_const(cursor_i, IrType::I32, static_off, range, ctx);
+                emit_let_get(slot.count_i, IrType::I32, range, ctx);
+                emit_const_i32(8, range, ctx);
+                emit_bin_i32(Op::Mul(IrType::I32), range, ctx);
+                emit_bin_i32(Op::Add(IrType::I32), range, ctx);
+                emit_let_set(next_cursor_i, IrType::I32, range, ctx);
+                cursor_i = next_cursor_i;
+                static_off = 0;
+            }
+        }
     }
 
-    // Push the materialised list handle (base) tagged ListInt / ListFloat.
+    // ---- 6. Push the materialised list handle (base) tagged
+    // ListInt / ListFloat.
     ctx.out.push(TaggedOp {
         op: Op::LetGet {
             idx: base_i,
@@ -4451,60 +4315,78 @@ pub(super) fn emit_list_spread_runtime_materialize(
         },
         range,
     });
-    ctx.tstack.push(handle_ty);
+    ctx.tstack.push(src_handle_ty);
     Ok(())
+}
+
+/// Push `ConstI32(v)` and track the i32 on the type stack.
+fn emit_const_i32(v: i32, range: TokenRange, ctx: &mut LowerCtx<'_>) {
+    ctx.out.push(TaggedOp {
+        op: Op::ConstI32(v),
+        range,
+    });
+    ctx.tstack.push(IrType::I32);
+}
+
+/// Push `LetGet(idx)` typed `ty` and track it on the type stack.
+fn emit_let_get(idx: u32, ty: IrType, range: TokenRange, ctx: &mut LowerCtx<'_>) {
+    ctx.out.push(TaggedOp {
+        op: Op::LetGet { idx, ty },
+        range,
+    });
+    ctx.tstack.push(ty);
+}
+
+/// Pop the top of the stack into `LetSet(idx)` typed `ty`.
+fn emit_let_set(idx: u32, ty: IrType, range: TokenRange, ctx: &mut LowerCtx<'_>) {
+    ctx.out.push(TaggedOp {
+        op: Op::LetSet { idx, ty },
+        range,
+    });
+    ctx.tstack.pop();
+}
+
+/// Emit a binary i32 op (`Add` / `Mul` / `BitAnd`), consuming two
+/// operands and pushing the i32 result on the type stack.
+fn emit_bin_i32(op: Op, range: TokenRange, ctx: &mut LowerCtx<'_>) {
+    ctx.out.push(TaggedOp { op, range });
+    ctx.tstack.pop();
+    ctx.tstack.pop();
+    ctx.tstack.push(IrType::I32);
+}
+
+/// Push `LetGet(idx) + off` as an i32 address; the constant add is
+/// elided when `off == 0` (a scalar run / source copy that starts
+/// exactly at the cursor).
+fn emit_let_get_plus_const(
+    idx: u32,
+    ty: IrType,
+    off: i32,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) {
+    emit_let_get(idx, ty, range, ctx);
+    if off != 0 {
+        emit_const_i32(off, range, ctx);
+        emit_bin_i32(Op::Add(IrType::I32), range, ctx);
+    }
 }
 
 /// Emit `payload = (LetGet(base_i) + 4 + 7) & -8` into `LetSet(payload_i)`.
 /// The leading `+4` skips the `[len:u32]` header; `+7 & -8` rounds up to
 /// the 8-byte payload alignment the scalar list record layout uses.
 fn emit_aligned_payload(base_i: u32, payload_i: u32, range: TokenRange, ctx: &mut LowerCtx<'_>) {
-    ctx.out.push(TaggedOp {
-        op: Op::LetGet {
-            idx: base_i,
-            ty: IrType::I32,
-        },
-        range,
-    });
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::ConstI32(4 + 7),
-        range,
-    });
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::Add(IrType::I32),
-        range,
-    });
-    ctx.tstack.pop();
-    ctx.tstack.pop();
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::ConstI32(-8),
-        range,
-    });
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::BitAnd(IrType::I32),
-        range,
-    });
-    ctx.tstack.pop();
-    ctx.tstack.pop();
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::LetSet {
-            idx: payload_i,
-            ty: IrType::I32,
-        },
-        range,
-    });
-    ctx.tstack.pop();
+    emit_let_get_plus_const(base_i, IrType::I32, 4 + 7, range, ctx);
+    emit_const_i32(-8, range, ctx);
+    emit_bin_i32(Op::BitAnd(IrType::I32), range, ctx);
+    emit_let_set(payload_i, IrType::I32, range, ctx);
 }
 
-/// Store a static scalar element at `payload + byte_off`: push the
-/// address (`payload + byte_off`), then lower + store the value.
+/// Store a static scalar element at `cursor + byte_off`: push the
+/// address (the constant add elided at offset 0), then lower + store
+/// the value.
 fn emit_scalar_element_store(
-    payload_i: u32,
+    cursor_i: u32,
     byte_off: i32,
     node: &Node,
     is_float: bool,
@@ -4512,26 +4394,7 @@ fn emit_scalar_element_store(
     range: TokenRange,
     ctx: &mut LowerCtx<'_>,
 ) -> Result<(), LoweringError> {
-    ctx.out.push(TaggedOp {
-        op: Op::LetGet {
-            idx: payload_i,
-            ty: IrType::I32,
-        },
-        range,
-    });
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::ConstI32(byte_off),
-        range,
-    });
-    ctx.tstack.push(IrType::I32);
-    ctx.out.push(TaggedOp {
-        op: Op::Add(IrType::I32),
-        range,
-    });
-    ctx.tstack.pop();
-    ctx.tstack.pop();
-    ctx.tstack.push(IrType::I32);
+    emit_let_get_plus_const(cursor_i, IrType::I32, byte_off, range, ctx);
     emit_scalar_element_value_store(node, is_float, elem_store, range, ctx)
 }
 

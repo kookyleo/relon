@@ -202,18 +202,92 @@ fn spread_param_float_list_arg() -> HashMap<String, Value> {
     m
 }
 
-/// Two `List<Int>` arguments for the multi-runtime-source cap case
-/// (`[...a, ...b]`). Tree-walk runs it; cranelift caps (multi-source).
+/// Build a `List<Int>` value from a slice (spread-corpus helper).
+fn int_list(items: &[i64]) -> Value {
+    Value::List(Arc::new(items.iter().copied().map(Value::Int).collect()))
+}
+
+/// Two `List<Int>` arguments (`a`, `b`) for the multi-runtime-source
+/// spread cases (`[...a, ...b]` etc.). Compiled four-way.
 fn spread_two_list_args() -> HashMap<String, Value> {
+    let mut m = HashMap::new();
+    m.insert("a".to_string(), int_list(&[1, 2]));
+    m.insert("b".to_string(), int_list(&[3, 4]));
+    m
+}
+
+/// Two `List<Int>` arguments with the FIRST source empty.
+fn spread_two_list_args_first_empty() -> HashMap<String, Value> {
+    let mut m = HashMap::new();
+    m.insert("a".to_string(), int_list(&[]));
+    m.insert("b".to_string(), int_list(&[3, 4]));
+    m
+}
+
+/// Two `List<Int>` arguments with the SECOND source empty.
+fn spread_two_list_args_second_empty() -> HashMap<String, Value> {
+    let mut m = HashMap::new();
+    m.insert("a".to_string(), int_list(&[1, 2]));
+    m.insert("b".to_string(), int_list(&[]));
+    m
+}
+
+/// Two `List<Int>` arguments, both sources empty.
+fn spread_two_list_args_both_empty() -> HashMap<String, Value> {
+    let mut m = HashMap::new();
+    m.insert("a".to_string(), int_list(&[]));
+    m.insert("b".to_string(), int_list(&[]));
+    m
+}
+
+/// Three `List<Int>` arguments (`a`, `b`, `c`) for the three-source
+/// spread case `[...a, ...b, ...c]`.
+fn spread_three_list_args() -> HashMap<String, Value> {
+    let mut m = HashMap::new();
+    m.insert("a".to_string(), int_list(&[1, 2]));
+    m.insert("b".to_string(), int_list(&[3]));
+    m.insert("c".to_string(), int_list(&[4, 5, 6]));
+    m
+}
+
+/// Three `List<Int>` arguments with the MIDDLE source empty.
+fn spread_three_list_args_mid_empty() -> HashMap<String, Value> {
+    let mut m = HashMap::new();
+    m.insert("a".to_string(), int_list(&[1, 2]));
+    m.insert("b".to_string(), int_list(&[]));
+    m.insert("c".to_string(), int_list(&[4]));
+    m
+}
+
+/// Two `List<Float>` arguments carrying NaN / -0.0 payloads: the
+/// multi-source spread copies each source payload wholesale via
+/// memory.copy, so the differential's bit-level compare (`to_bits`)
+/// pins IEEE-754 byte fidelity across the splice.
+fn spread_two_float_list_args() -> HashMap<String, Value> {
     let mut m = HashMap::new();
     m.insert(
         "a".to_string(),
-        Value::List(Arc::new(vec![Value::Int(1), Value::Int(2)])),
+        Value::List(Arc::new(vec![
+            Value::Float(OrderedFloat(f64::NAN)),
+            Value::Float(OrderedFloat(-0.0)),
+        ])),
     );
     m.insert(
         "b".to_string(),
-        Value::List(Arc::new(vec![Value::Int(3), Value::Int(4)])),
+        Value::List(Arc::new(vec![
+            Value::Float(OrderedFloat(1.5)),
+            Value::Float(OrderedFloat(-2.25)),
+        ])),
     );
+    m
+}
+
+/// `List<Int>` + `Int` arguments for the non-literal-surrounding-element
+/// cap case (`[n, ...a]`). Tree-walk runs it; cranelift caps.
+fn spread_list_and_int_args() -> HashMap<String, Value> {
+    let mut m = HashMap::new();
+    m.insert("a".to_string(), int_list(&[1, 2, 3]));
+    m.insert("n".to_string(), Value::Int(7));
     m
 }
 
@@ -2224,14 +2298,97 @@ pub fn all_cases() -> Vec<CorpusCase> {
             tier: Tier::StdlibList,
             supported_by: TW_CR,
         },
-        // CAP — list spread over MORE THAN ONE runtime source `[...a, ...b]`:
-        // needs loop-style length accumulation + multi-segment copy, a step
-        // up in complexity. The single-source runtime path is compiled; the
-        // multi-source form is capped this round. `TW_ONLY`.
+        // ---- Wave SP: MULTI-source runtime list spread ----
+        //
+        // Two or more runtime (non-literal) sources, with static scalar
+        // literals optionally interleaved: each source's length is read
+        // from its record header, the total summed into one scratch
+        // record, and the segments written left to right with a runtime
+        // write cursor folded past each copied source payload.
+        //
+        // Two adjacent runtime sources `[...a, ...b]`.
         CorpusCase {
-            name: "r12_list_spread_multi_src_capped",
+            name: "r12_list_spread_two_src",
             source: "#main(List<Int> a, List<Int> b) -> List<Int>\n[...a, ...b]",
             args_factory: spread_two_list_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        // Three runtime sources `[...a, ...b, ...c]`.
+        CorpusCase {
+            name: "r12_list_spread_three_src",
+            source: "#main(List<Int> a, List<Int> b, List<Int> c) -> List<Int>\n[...a, ...b, ...c]",
+            args_factory: spread_three_list_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        // Static scalars interleaved with two sources `[1, ...a, 5, ...b, 9]`.
+        CorpusCase {
+            name: "r12_list_spread_multi_src_mixed",
+            source: "#main(List<Int> a, List<Int> b) -> List<Int>\n[1, ...a, 5, ...b, 9]",
+            args_factory: spread_two_list_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        // Adjacent sources between scalars `[1, ...a, ...b, 9]` (no
+        // scalar gap between the two copies).
+        CorpusCase {
+            name: "r12_list_spread_multi_src_adjacent_mid",
+            source: "#main(List<Int> a, List<Int> b) -> List<Int>\n[1, ...a, ...b, 9]",
+            args_factory: spread_two_list_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        // Empty-source edges: first / second / both empty (a 0-byte
+        // memory.copy must not shift the later segments).
+        CorpusCase {
+            name: "r12_list_spread_two_src_first_empty",
+            source: "#main(List<Int> a, List<Int> b) -> List<Int>\n[...a, ...b]",
+            args_factory: spread_two_list_args_first_empty,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r12_list_spread_two_src_second_empty",
+            source: "#main(List<Int> a, List<Int> b) -> List<Int>\n[...a, ...b, 9]",
+            args_factory: spread_two_list_args_second_empty,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "r12_list_spread_two_src_both_empty",
+            source: "#main(List<Int> a, List<Int> b) -> List<Int>\n[...a, ...b]",
+            args_factory: spread_two_list_args_both_empty,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        // Middle source empty among three `[...a, ...b, ...c]` (b = []).
+        CorpusCase {
+            name: "r12_list_spread_three_src_mid_empty",
+            source: "#main(List<Int> a, List<Int> b, List<Int> c) -> List<Int>\n[...a, ...b, ...c]",
+            args_factory: spread_three_list_args_mid_empty,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        // `List<Float>` multi-source with NaN / -0.0 payloads: the
+        // bit-level differential compare pins IEEE-754 byte fidelity of
+        // the wholesale payload copies.
+        CorpusCase {
+            name: "r12_list_spread_float_multi_src",
+            source: "#main(List<Float> a, List<Float> b) -> List<Float>\n[...a, 0.5, ...b]",
+            args_factory: spread_two_float_list_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        // CAP — a non-scalar-literal element around a runtime source
+        // `[n, ...a]` (`n` is a parameter, not a literal): the runtime
+        // materialiser admits only static Int/Float literal scalars
+        // between sources, so this falls back to the static flatten and
+        // caps loudly at the runtime source. `TW_ONLY`.
+        CorpusCase {
+            name: "r12_list_spread_computed_elem_capped",
+            source: "#main(List<Int> a, Int n) -> List<Int>\n[n, ...a]",
+            args_factory: spread_list_and_int_args,
             tier: Tier::StdlibList,
             supported_by: TW_ONLY,
         },

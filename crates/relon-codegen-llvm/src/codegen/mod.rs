@@ -1368,6 +1368,7 @@ fn emit_helper_body<'ctx>(
     // from the LLVM signature's return slot.
     emit.helper_ret_ty = Some(func.ret);
     emit.llvm_trap_fn = Some(declare_llvm_trap(ctx, module));
+    emit.let_floor = relon_ir::ir::body_let_watermark(&func.body);
     emit.lower_body(&func.body)?;
     Ok(())
 }
@@ -1473,6 +1474,7 @@ fn emit_lambda_body<'ctx>(
     emit.self_capture_offsets = self_capture_offsets.to_vec();
     emit.known_capture_offsets = known_capture_offsets.to_vec();
     emit.captures_ptr_param = Some(captures_ptr_param);
+    emit.let_floor = relon_ir::ir::body_let_watermark(&func.body);
     emit.lower_body(&func.body)?;
     Ok(())
 }
@@ -1574,6 +1576,7 @@ pub(crate) fn emit_fast_entry<'ctx>(
     // matching `FunctionValue`.
     emit.helper_table = Some(helper_table.clone());
     emit.closure_fn_table = closure_fn_table.to_vec();
+    emit.let_floor = relon_ir::ir::body_let_watermark(&func.body);
     emit.lower_body(&func.body)?;
 
     // The buffer-protocol IR ends with `Op::Return` which the fast
@@ -1679,6 +1682,7 @@ fn emit_legacy_entry_impl<'ctx>(
             declare_host_fn_direct(ctx, module, import);
         }
     }
+    emit.let_floor = relon_ir::ir::body_let_watermark(&func.body);
     emit.lower_body(&func.body)?;
 
     Ok(llvm_fn)
@@ -1915,6 +1919,7 @@ fn emit_buffer_entry_impl<'ctx, 'cp>(
             }
         }
     }
+    emit.let_floor = relon_ir::ir::body_let_watermark(&func.body);
     emit.lower_body(&func.body)?;
 
     Ok(llvm_fn)
@@ -1963,6 +1968,16 @@ pub(crate) struct Emit<'ctx, 'b, 'cp> {
     /// idx has at most one type at a time — the IR lowering pass
     /// guarantees no aliasing between idx's of different types.
     pub(crate) let_slots: std::collections::HashMap<u32, (PointerValue<'ctx>, IrType)>,
+    /// Static let-index floor for stdlib inline-frame windows: the
+    /// function body's [`relon_ir::ir::body_let_watermark`], i.e. one
+    /// past the highest let index the body (recursively) touches.
+    /// `emit_call_stdlib` places each inline window at
+    /// `max(declared-slots max + 1, let_floor)` so callee lets never
+    /// collide with caller lets that are first bound *after* the
+    /// inlined call. While a frame is active the floor is raised past
+    /// the callee body's own watermark (and restored on frame pop) so
+    /// nested inlines stay collision-free too.
+    pub(crate) let_floor: u32,
     /// LLVM param offset corresponding to `LocalGet(0)`. See
     /// [`Self::lookup_param`] — `param_base + idx` is the LLVM
     /// param index.
@@ -2377,6 +2392,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             state_ptr,
             stack: Vec::with_capacity(8),
             let_slots: std::collections::HashMap::new(),
+            let_floor: 0,
             param_base: 0,
             label_stack: Vec::new(),
             name_seq: 0,

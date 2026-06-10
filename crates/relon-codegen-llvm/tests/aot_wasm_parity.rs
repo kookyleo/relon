@@ -1286,6 +1286,45 @@ fn r12_list_spread_runtime_src_empty_aligns_native_via_wasmtime() {
     );
 }
 
+/// Wave SP — MULTI-source runtime spread with static scalars interleaved
+/// `[100, ...range(n), 200, ...range(n + 2), 300]`: two memory.copy
+/// segments, the second's destination folded past the first source's
+/// runtime length via the write cursor. Proves the llvm-native == wasm
+/// leg (tree-walk == cranelift proven in the corpus).
+#[test]
+fn r12_list_spread_multi_src_aligns_native_via_wasmtime() {
+    r3_list_parity(
+        "r12_list_spread_multi_src",
+        "relon_parity_r12_list_spread_multi_src",
+        "#main(Int n) -> List<Int>\n[100, ...range(n), 200, ...range(n + 2), 300]",
+        3,
+    );
+}
+
+/// Wave SP — two ADJACENT runtime sources `[...range(n), ...range(n + 1)]`
+/// (no scalar gap between the copies).
+#[test]
+fn r12_list_spread_multi_src_adjacent_aligns_native_via_wasmtime() {
+    r3_list_parity(
+        "r12_list_spread_multi_src_adjacent",
+        "relon_parity_r12_list_spread_multi_src_adjacent",
+        "#main(Int n) -> List<Int>\n[...range(n), ...range(n + 1)]",
+        2,
+    );
+}
+
+/// Wave SP — multi-source spread with the FIRST source empty (`n = 0`):
+/// a 0-byte memory.copy must not shift the later segments.
+#[test]
+fn r12_list_spread_multi_src_empty_aligns_native_via_wasmtime() {
+    r3_list_parity(
+        "r12_list_spread_multi_src_empty",
+        "relon_parity_r12_list_spread_multi_src_empty",
+        "#main(Int n) -> List<Int>\n[100, ...range(n), 200, ...range(n + 2), 300]",
+        0,
+    );
+}
+
 // ---------------------------------------------------------------------
 // `List<Float>` / `List<String>` element-list returns. Until now the
 // wasm parity harness only decoded `List<Int>`; every feature that
@@ -1446,6 +1485,20 @@ fn lf_spread_aligns_native_via_wasmtime() {
         "lf_spread",
         "#main(Int n) -> List<Float>\n[...[10.0, 20.0], 1.5]",
         1,
+    );
+}
+
+/// Wave SP — Float MULTI-source runtime spread whose first source carries
+/// `-0.0` (`sqrt(-0.0)`) and `NaN` (`sqrt` of a negative) payloads: the
+/// per-element bit compare pins IEEE-754 byte fidelity of both
+/// memory.copy segments across the splice.
+#[test]
+fn lf_spread_multi_runtime_aligns_native_via_wasmtime() {
+    list_float_parity(
+        "lf_spread_multi_runtime",
+        "#main(Int n) -> List<Float>\n[...range(n).map((Int x) => sqrt(0.0 - x * 1.0)), 9.5, \
+         ...range(n).map((Int x) => x * 0.5)]",
+        3,
     );
 }
 

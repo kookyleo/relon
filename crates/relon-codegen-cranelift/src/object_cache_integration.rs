@@ -93,7 +93,13 @@ use crate::sandbox::SandboxConfig;
 /// import) + bundled `every`/`some`/`unique` bodies. Objects emitted
 /// by 15 lack the `pow` ELF import and the new stdlib body indices,
 /// so the version bump self-invalidates them.
-pub const GENERATOR_VERSION: &str = "relon-codegen-cranelift v5-gamma 16";
+/// `v5-gamma 17` = stdlib inline let-window soundness fix: the
+/// inline frame's `let_offset` now also clears the caller body's
+/// static let watermark, so caller lets first bound *after* an
+/// inlined call no longer land inside the callee window. Objects
+/// emitted by 16 for sources hitting that collision could carry a
+/// silently width-coerced let slot; the bump self-invalidates them.
+pub const GENERATOR_VERSION: &str = "relon-codegen-cranelift v5-gamma 17";
 
 /// Filename suffix for the legacy IR cache (paired with the
 /// relon-object-cache `<hash>.relon-native-v1` blob).

@@ -1905,11 +1905,12 @@ pub const LEDGER: &[LedgerEntry] = &[
         site: "lowering/peephole.rs::flatten_list_spread",
         category: Category::ExprShape,
         status: Status::Capped,
-        corpus: "r12_list_spread_multi_src_capped",
-        reason: "list spread carries more than one runtime (non-literal) source \
-                 (`[...a, ...b]`); the single-source runtime path is materialised, but \
-                 multi-source needs loop-style length accumulation + multi-segment copy, \
-                 capped this round",
+        corpus: "r12_list_spread_computed_elem_capped",
+        reason: "list spread mixes a runtime (non-literal) source with a non-scalar-literal \
+                 surrounding element (`[n, ...a]`) or with a list-literal source \
+                 (`[...[1], ...a]`); the runtime materialiser admits static Int/Float \
+                 literal scalars around any number of runtime sources, everything else \
+                 falls back to the static flatten, which cannot resolve a runtime source",
     },
     LedgerEntry {
         id: "emit_list_spread_runtime_materialize.unsupported_expr.1",
@@ -1930,28 +1931,22 @@ pub const LEDGER: &[LedgerEntry] = &[
                  materialiser, not the scalar memory.copy path",
     },
     LedgerEntry {
-        id: "emit_list_spread_runtime_materialize.unsupported_expr.prefix_overflow",
+        id: "emit_list_spread_runtime_materialize.mixed_source_ty",
         site: "lowering/peephole.rs::emit_list_spread_runtime_materialize",
         category: Category::ExprShape,
         status: Status::Capped,
         corpus: "",
-        reason: "list spread prefix element count overflows i32",
+        reason: "runtime list spread sources disagree on the scalar element shape \
+                 (List<Int> vs List<Float>); the analyzer enforces a homogeneous element \
+                 type, so this is a defensive lowering cap",
     },
     LedgerEntry {
-        id: "emit_list_spread_runtime_materialize.unsupported_expr.suffix_overflow",
+        id: "emit_list_spread_runtime_materialize.unsupported_expr.static_count_overflow",
         site: "lowering/peephole.rs::emit_list_spread_runtime_materialize",
         category: Category::ExprShape,
         status: Status::Capped,
         corpus: "",
-        reason: "list spread suffix element count overflows i32",
-    },
-    LedgerEntry {
-        id: "emit_list_spread_runtime_materialize.unsupported_expr.suffix_off_overflow",
-        site: "lowering/peephole.rs::emit_list_spread_runtime_materialize",
-        category: Category::ExprShape,
-        status: Status::Capped,
-        corpus: "",
-        reason: "list spread suffix element byte offset overflows i32",
+        reason: "list spread static scalar element count overflows i32",
     },
     LedgerEntry {
         id: "emit_scalar_element_value_store.unsupported_expr.1",
@@ -3166,6 +3161,21 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
                 spliced via memory.copy into a fresh scratch record, static scalars stored inline; \
                 wasm + llvm-native legs proven in \
                 relon-codegen-llvm::aot_wasm_parity::r12_list_spread_runtime_src)",
+    },
+    SurfaceEntry {
+        construct: "list spread `[a, ...xs, b, ...ys, c] -> List<Int>/List<Float>` (MULTIPLE \
+                    runtime sources: List<scalar> parameters / computed handles, any number, \
+                    adjacent or with static Int/Float scalars interleaved, empty sources \
+                    included)",
+        wave: "SP",
+        corpus: "r12_list_spread_multi_src_mixed",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (TW_CR; per-source length read from the record header, \
+                total summed into one scratch record, segments written left to right with a \
+                runtime write cursor folded past each copied source payload; wasm + \
+                llvm-native legs proven in \
+                relon-codegen-llvm::aot_wasm_parity::r12_list_spread_multi_src and \
+                relon-codegen-llvm::inplace_return_four_way::list_spread_runtime_multi_*)",
     },
     SurfaceEntry {
         construct: "dict spread `{ ...src, k: v } -> Schema` (schema-typed source, static fields)",
