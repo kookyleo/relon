@@ -17,8 +17,8 @@
 // traps with NumericOverflow on `abs(i64::MIN)`.
 #relaxed
 {
-    abs(x): type(x) == "Int" ? (x < 0 ? -x : x) : _math_abs(x),
-    max(a, b): a > b ? a : b,
-    min(a, b): a < b ? a : b,
-    clamp(v, min, max): v < min ? min : (v > max ? max : v)
+    abs(x): type(x) == "Int" ? (x < 0 ? -x: x): _math_abs(x),
+    max(a, b): a > b ? a: b,
+    min(a, b): a < b ? a: b,
+    clamp(v, min, max): v < min ? min: (v > max ? max: v)
 }

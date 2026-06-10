@@ -103,24 +103,21 @@ impl RelonSourcedFn {
     }
 
     fn member_closure(&self, range: TokenRange) -> Result<Value, RuntimeError> {
-        let value = self
-            .module
-            .evaluated()
-            .as_ref()
-            .map_err(|message| RuntimeError::ModuleParseError {
-                path: self.module.path().to_string(),
-                message: message.clone(),
-                range: range.into(),
-            })?;
+        let value =
+            self.module
+                .evaluated()
+                .as_ref()
+                .map_err(|message| RuntimeError::ModuleParseError {
+                    path: self.module.path().to_string(),
+                    message: message.clone(),
+                    range: range.into(),
+                })?;
         let member = match value {
             Value::Dict(dict) => dict.map.get(self.member),
             _ => None,
         };
         member.cloned().ok_or_else(|| {
-            RuntimeError::FunctionNotFound(
-                format!("{}.{}", self.module.path(), self.member),
-                range,
-            )
+            RuntimeError::FunctionNotFound(format!("{}.{}", self.module.path(), self.member), range)
         })
     }
 }
