@@ -37,7 +37,7 @@
   - 字符串件:`trim`/`trim_start`/`trim_end`(复用 R14 解码缝 + `__is_whitespace` + memcpy)、`is_email`/`is_uri`(纯字节扫描)——全部四方,零 cap。
 - ✅ **comprehension 元素类型(P3-b `099d55dd`)**:`List<Int>`/`List<Float>`/`List<String>`-map 四方,含元素变型 map(Int→Float/String、Float→Int/String,按闭包返回类型探测 `list_*_map_to_*` wrapper)。诚实 cap:`List<String>` filter(无四方 String→Bool 谓词 body)、`List<Bool>` 源(无注册 wrapper)。
 - ✅ **forward reference(`d700bd3b`)**:`&sibling.<later>` / `&root.<later>`(引用源序更晚的兄弟/根标量字段)已四方——field-let 图改按引用边拓扑序发射(纯 backward 输入字节不变、GENERATOR_VERSION 未 bump);成环对齐 oracle `CircularReference` 响亮报错。诚实 cap:穿 `#main` 参数的 forward(oracle 丢 param scope 报 `variable_not_found`、编译路能算值→为避静默分歧响亮 cap)。
-- **`is_iso_date` 订正**:账本里它仍 cap,但属「body 未写」而非「IR 无 op」——`Op::Mod`/`Op::Div` 存在(#362),其算术本可 lower,只是当前没编译 body。
+- ✅ **`is_iso_date`(`05a3bb40`)**:已四方编译——纯字节形状 + 整数日期算术(闰年 `year%4/%100/%400` 用 `Op::Mod(I32)`),无 UTF-8 seam,与 oracle 逐字节匹配(闰年边界 2024/2023/1900/2000 全对)。先前「body 未写」已补上。`parse_iso_date`(返回 Dict)仍按 Dict-by-design cap。
 
 - **design-free 工程件已基本做尽**。**剩余=两个真决策 + 设计边界内的诚实 cap**(下方"决策点")。
 
