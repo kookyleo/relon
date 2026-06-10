@@ -57,7 +57,7 @@ See [Sandbox & capabilities](./sandbox) for details.
 
 ### C. Context-aware references
 
-- **Essence**: semantic paths like `&prev`, `&parent`, `&root` give
+- **Essence**: semantic paths like `&prev`, `&uncle`, `&root` give
   data "gravity".
 - **Pain point**: in deeply nested configs where fields depend on
   neighbors, manually maintaining indices and paths in JS is
@@ -80,34 +80,26 @@ See [Sandbox & capabilities](./sandbox) for details.
 | 7 | **Reactive (self-computing assets)** | Nested balance-sheet hierarchies recompute automatically |
 | 8 | **Edge (edge policy)** | IoT nodes update control policies on the fly |
 
-## 4. Benchmark insights
+## 4. Performance at a glance
 
-Stress-testing has validated Relon's profile as an embedded language:
+The [Performance](./performance) page is the authoritative source
+(including the test machine and methodology). Highlights:
 
-### A. Performance: microsecond response and functional acceleration
-
-- **Simple eval**: ~12.7 μs (warm state) — 80k requests per second.
-- **Heavy logic**: 1,000-iteration list computation in ~1.3 ms.
-- **Architecture upgrade**: a Core/Std split. Core (Rust) provides
+- **Three execution backends**: a tree-walk interpreter, Cranelift
+  AOT, and LLVM AOT; the default `Backend::Auto` dispatches
+  automatically — no manual selection needed.
+- **Scalar hot loops**: with matched target-cpu, LLVM AOT sits in the
+  ±2% parity band with native Rust, and the same benchmark panel runs
+  2.7×–17× faster than LuaJIT.
+- **Architecture**: a Core/Std split. Core (Rust) provides
   high-performance primitives (`_list_map`, `_list_reduce`, …); Std
   (Relon) provides elegant business wrappers. Native code can call
   Relon closures back, giving first-class functional support.
 
-### B. Footprint: under the megabyte threshold
-
-After tuning IR-level optimization (LTO + Opt-Z + Panic-Abort):
-
-- **Core library**: ~589 KB (>50% reduction).
-- **Full CLI**: ~898 KB (first time under 1 MB).
-- **WASM projection**: stripping CLI deps should drop us to ~250 KB,
-  on the order of Lua.
-
-> Note: actual WASM size pending CI landing.
-
 ## 5. Bottom line
 
-Relon balances **high performance**, **functional expressiveness**,
-and **sub-megabyte footprint**. It targets scenarios where you need
-to manage business logic as data and require auditable, deterministic
-execution. If a static config or your host's native scripting suffices,
-plain JSON / Lua / JS is the better fit.
+Relon balances **high performance** and **functional expressiveness**.
+It targets scenarios where you need to manage business logic as data
+and require auditable, deterministic execution. If a static config or
+your host's native scripting suffices, plain JSON / Lua / JS is the
+better fit.

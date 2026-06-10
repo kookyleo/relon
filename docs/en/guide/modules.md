@@ -92,6 +92,34 @@ namespace-form access also can't reach them
 > use the `#internal` directive. See
 > [Syntax basics](./syntax#field-visibility-—-internal).
 
+### Remote imports and integrity pins
+
+The `#import` path may also be a remote URL. A remote import is a
+network operation and must be explicitly authorized by the host
+(`--trust` on the CLI, or `Capabilities::network` when embedding);
+without it the import is rejected before any fetch with
+`RemoteImportDenied`, and a failed download reports
+`RemoteImportFailed`.
+
+Any `#import` (local or remote) may append an **integrity pin** after
+the path string, spelled `<algorithm>:"<hex digest>"`. The only
+supported algorithm today is `sha256`:
+
+```relon
+#import rules from "https://example.com/pricing.relon" sha256:"3f2a…c9"
+#import lib from "./lib.relon" sha256:"8d41…07"
+```
+
+Before loading the module body, the evaluator computes its digest and
+compares it against the pin: a mismatch reports `ImportHashMismatch`
+(a mismatch on the remote-resolution path reports
+`RemoteImportHashMismatch` — the two are kept distinct so operators
+can tell "the remote fetch returned an unexpected body" apart from
+"the evaluator was handed a module body that disagrees with its pin").
+An unrecognized algorithm name in the pin reports
+`ImportHashUnknownAlgorithm` — the evaluator never silently treats
+"can't verify" as "no pin".
+
 ## Entry programs vs libraries
 
 Relon has no file-level "library/entry" marker. Whether a file
@@ -143,10 +171,12 @@ args.insert(
 let result = evaluator.run_main(&scope, args)?;
 ```
 
-If the host tries to `eval_root` an entry program directly, it gets
+Calling `run_main` on a library file **without** `#main(...)` raises
 `NoMainSignature` — the error is caught at the boundary and never
-enters evaluation. Conversely, calling `run_main` on a library file
-without `#main` also raises `NoMainSignature`.
+enters evaluation. The other direction is **not** checked:
+`eval_root` on an entry program simply evaluates the root expression
+as usual; the `#main` parameters are just never bound, so referencing
+them fails as undefined names.
 
 ## Relative references
 
