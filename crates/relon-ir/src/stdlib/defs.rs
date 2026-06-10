@@ -1624,151 +1624,15 @@ pub(super) fn list_int_map() -> StdlibFunction {
         "list_int_map",
         vec![IrType::ListInt, IrType::Closure],
         IrType::ListInt,
-        list_int_map_body,
+        || {
+            list_map_body_typed(
+                |o| Op::LoadI64AtAbsolute { offset: o },
+                |o| Op::StoreI64AtAbsolute { offset: o },
+                IrType::I64,
+                IrType::I64,
+            )
+        },
     )
-}
-
-fn list_int_map_body() -> Vec<TaggedOp> {
-    const N: u32 = 0;
-    const I: u32 = 1;
-    const SRC_PAYLOAD: u32 = 2;
-    const DST_PAYLOAD: u32 = 3;
-    const NEW_BASE: u32 = 4;
-    vec![
-        // n = i32.load(xs, 0)
-        tt(Op::LocalGet(0)),
-        tt(Op::LoadI32AtAbsolute { offset: 0 }),
-        tt(Op::LetSet {
-            idx: N,
-            ty: IrType::I32,
-        }),
-        // record_size = 8 + 8*n + 8
-        tt(Op::ConstI32(16)),
-        tt(Op::LetGet {
-            idx: N,
-            ty: IrType::I32,
-        }),
-        tt(Op::ConstI32(8)),
-        tt(Op::Mul(IrType::I32)),
-        tt(Op::Add(IrType::I32)),
-        tt(Op::AllocScratchDyn),
-        tt(Op::LetSet {
-            idx: NEW_BASE,
-            ty: IrType::I32,
-        }),
-        // store header: i32.store(new_base, n)
-        tt(Op::LetGet {
-            idx: NEW_BASE,
-            ty: IrType::I32,
-        }),
-        tt(Op::LetGet {
-            idx: N,
-            ty: IrType::I32,
-        }),
-        tt(Op::StoreI32AtAbsolute { offset: 0 }),
-        // src_payload = (xs + 4 + 7) & -8
-        tt(Op::LocalGet(0)),
-        tt(Op::ConstI32(4 + 7)),
-        tt(Op::Add(IrType::I32)),
-        tt(Op::ConstI32(-8)),
-        tt(Op::BitAnd(IrType::I32)),
-        tt(Op::LetSet {
-            idx: SRC_PAYLOAD,
-            ty: IrType::I32,
-        }),
-        // dst_payload = (new_base + 4 + 7) & -8
-        tt(Op::LetGet {
-            idx: NEW_BASE,
-            ty: IrType::I32,
-        }),
-        tt(Op::ConstI32(4 + 7)),
-        tt(Op::Add(IrType::I32)),
-        tt(Op::ConstI32(-8)),
-        tt(Op::BitAnd(IrType::I32)),
-        tt(Op::LetSet {
-            idx: DST_PAYLOAD,
-            ty: IrType::I32,
-        }),
-        // i = 0
-        tt(Op::ConstI32(0)),
-        tt(Op::LetSet {
-            idx: I,
-            ty: IrType::I32,
-        }),
-        // block { loop { ... } }
-        tt(Op::Block {
-            result_ty: None,
-            body: vec![tt(Op::Loop {
-                result_ty: None,
-                body: vec![
-                    // exit when i >= n
-                    tt(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::LetGet {
-                        idx: N,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::Ge(IrType::I32)),
-                    tt(Op::BrIf { label_depth: 1 }),
-                    // dst_addr = dst_payload + i * 8 (pushed first
-                    // so the i64.store sees [addr, value] at end)
-                    tt(Op::LetGet {
-                        idx: DST_PAYLOAD,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::ConstI32(8)),
-                    tt(Op::Mul(IrType::I32)),
-                    tt(Op::Add(IrType::I32)),
-                    // push closure handle (param 1)
-                    tt(Op::LocalGet(1)),
-                    // push the source element: i64.load(src_payload + i*8)
-                    tt(Op::LetGet {
-                        idx: SRC_PAYLOAD,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::ConstI32(8)),
-                    tt(Op::Mul(IrType::I32)),
-                    tt(Op::Add(IrType::I32)),
-                    tt(Op::LoadI64AtAbsolute { offset: 0 }),
-                    // call_indirect via Op::CallClosure
-                    tt(Op::CallClosure {
-                        param_tys: vec![IrType::I64],
-                        ret_ty: IrType::I64,
-                    }),
-                    // i64.store: stack is [dst_addr, result_i64]
-                    tt(Op::StoreI64AtAbsolute { offset: 0 }),
-                    // i = i + 1
-                    tt(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::ConstI32(1)),
-                    tt(Op::Add(IrType::I32)),
-                    tt(Op::LetSet {
-                        idx: I,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::Br { label_depth: 0 }),
-                ],
-            })],
-        }),
-        // return new_base
-        tt(Op::LetGet {
-            idx: NEW_BASE,
-            ty: IrType::I32,
-        }),
-        tt(Op::Return),
-    ]
 }
 
 /// Phase 10-a body for `list_int_filter(xs: List<Int>, f: Closure) -> List<Int>`.
@@ -1800,199 +1664,15 @@ pub(super) fn list_int_filter() -> StdlibFunction {
         "list_int_filter",
         vec![IrType::ListInt, IrType::Closure],
         IrType::ListInt,
-        list_int_filter_body,
+        || {
+            list_filter_body_typed(
+                |o| Op::LoadI64AtAbsolute { offset: o },
+                |o| Op::StoreI64AtAbsolute { offset: o },
+                IrType::I64,
+                IrType::I64,
+            )
+        },
     )
-}
-
-fn list_int_filter_body() -> Vec<TaggedOp> {
-    const N: u32 = 0;
-    const I: u32 = 1;
-    const SRC_PAYLOAD: u32 = 2;
-    const DST_PAYLOAD: u32 = 3;
-    const NEW_BASE: u32 = 4;
-    const OUT_COUNT: u32 = 5;
-    const CUR_VAL: u32 = 6;
-    /// Dedicated sink local for the `If` sentinel i32 produced by
-    /// the filter's per-iteration predicate branch — keeps the loop
-    /// counter `I` from being clobbered by the sink. The wasm
-    /// `if (result i32) ... end` shape requires both arms to leave
-    /// a value behind; we route an `i32.const 0` sentinel through
-    /// the sink, then ignore it.
-    const SINK: u32 = 7;
-    vec![
-        tt(Op::LocalGet(0)),
-        tt(Op::LoadI32AtAbsolute { offset: 0 }),
-        tt(Op::LetSet {
-            idx: N,
-            ty: IrType::I32,
-        }),
-        // record_size = 8 + 8*n + 8
-        tt(Op::ConstI32(16)),
-        tt(Op::LetGet {
-            idx: N,
-            ty: IrType::I32,
-        }),
-        tt(Op::ConstI32(8)),
-        tt(Op::Mul(IrType::I32)),
-        tt(Op::Add(IrType::I32)),
-        tt(Op::AllocScratchDyn),
-        tt(Op::LetSet {
-            idx: NEW_BASE,
-            ty: IrType::I32,
-        }),
-        // src_payload = (xs + 4 + 7) & -8
-        tt(Op::LocalGet(0)),
-        tt(Op::ConstI32(4 + 7)),
-        tt(Op::Add(IrType::I32)),
-        tt(Op::ConstI32(-8)),
-        tt(Op::BitAnd(IrType::I32)),
-        tt(Op::LetSet {
-            idx: SRC_PAYLOAD,
-            ty: IrType::I32,
-        }),
-        // dst_payload = (new_base + 4 + 7) & -8
-        tt(Op::LetGet {
-            idx: NEW_BASE,
-            ty: IrType::I32,
-        }),
-        tt(Op::ConstI32(4 + 7)),
-        tt(Op::Add(IrType::I32)),
-        tt(Op::ConstI32(-8)),
-        tt(Op::BitAnd(IrType::I32)),
-        tt(Op::LetSet {
-            idx: DST_PAYLOAD,
-            ty: IrType::I32,
-        }),
-        // i = 0; out_count = 0
-        tt(Op::ConstI32(0)),
-        tt(Op::LetSet {
-            idx: I,
-            ty: IrType::I32,
-        }),
-        tt(Op::ConstI32(0)),
-        tt(Op::LetSet {
-            idx: OUT_COUNT,
-            ty: IrType::I32,
-        }),
-        tt(Op::Block {
-            result_ty: None,
-            body: vec![tt(Op::Loop {
-                result_ty: None,
-                body: vec![
-                    // exit when i >= n
-                    tt(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::LetGet {
-                        idx: N,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::Ge(IrType::I32)),
-                    tt(Op::BrIf { label_depth: 1 }),
-                    // cur_val = i64.load(src_payload + i*8)
-                    tt(Op::LetGet {
-                        idx: SRC_PAYLOAD,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::ConstI32(8)),
-                    tt(Op::Mul(IrType::I32)),
-                    tt(Op::Add(IrType::I32)),
-                    tt(Op::LoadI64AtAbsolute { offset: 0 }),
-                    tt(Op::LetSet {
-                        idx: CUR_VAL,
-                        ty: IrType::I64,
-                    }),
-                    // closure(cur_val) -> bool
-                    tt(Op::LocalGet(1)),
-                    tt(Op::LetGet {
-                        idx: CUR_VAL,
-                        ty: IrType::I64,
-                    }),
-                    tt(Op::CallClosure {
-                        param_tys: vec![IrType::I64],
-                        ret_ty: IrType::Bool,
-                    }),
-                    // if cond { dst[out_count] = cur_val; out_count++ }
-                    tt(Op::If {
-                        result_ty: IrType::I32,
-                        then_body: vec![
-                            // dst_addr = dst_payload + out_count*8
-                            tt(Op::LetGet {
-                                idx: DST_PAYLOAD,
-                                ty: IrType::I32,
-                            }),
-                            tt(Op::LetGet {
-                                idx: OUT_COUNT,
-                                ty: IrType::I32,
-                            }),
-                            tt(Op::ConstI32(8)),
-                            tt(Op::Mul(IrType::I32)),
-                            tt(Op::Add(IrType::I32)),
-                            tt(Op::LetGet {
-                                idx: CUR_VAL,
-                                ty: IrType::I64,
-                            }),
-                            tt(Op::StoreI64AtAbsolute { offset: 0 }),
-                            // out_count = out_count + 1
-                            tt(Op::LetGet {
-                                idx: OUT_COUNT,
-                                ty: IrType::I32,
-                            }),
-                            tt(Op::ConstI32(1)),
-                            tt(Op::Add(IrType::I32)),
-                            tt(Op::LetSet {
-                                idx: OUT_COUNT,
-                                ty: IrType::I32,
-                            }),
-                            // sentinel for the if's i32 result
-                            tt(Op::ConstI32(0)),
-                        ],
-                        else_body: vec![tt(Op::ConstI32(0))],
-                    }),
-                    // Sink the i32 placeholder produced by the If
-                    // into a dedicated local so the loop counter
-                    // stays intact.
-                    tt(Op::LetSet {
-                        idx: SINK,
-                        ty: IrType::I32,
-                    }),
-                    // i = i + 1
-                    tt(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::ConstI32(1)),
-                    tt(Op::Add(IrType::I32)),
-                    tt(Op::LetSet {
-                        idx: I,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::Br { label_depth: 0 }),
-                ],
-            })],
-        }),
-        // store header: i32.store(new_base, out_count)
-        tt(Op::LetGet {
-            idx: NEW_BASE,
-            ty: IrType::I32,
-        }),
-        tt(Op::LetGet {
-            idx: OUT_COUNT,
-            ty: IrType::I32,
-        }),
-        tt(Op::StoreI32AtAbsolute { offset: 0 }),
-        // return new_base
-        tt(Op::LetGet {
-            idx: NEW_BASE,
-            ty: IrType::I32,
-        }),
-        tt(Op::Return),
-    ]
 }
 
 /// Phase 10-a body for `list_int_fold(xs: List<Int>, init: Int, f: Closure) -> Int`.
@@ -2018,113 +1698,8 @@ pub(super) fn list_int_fold() -> StdlibFunction {
         "list_int_fold",
         vec![IrType::ListInt, IrType::I64, IrType::Closure],
         IrType::I64,
-        list_int_fold_body,
+        || list_fold_body_typed(|o| Op::LoadI64AtAbsolute { offset: o }, IrType::I64),
     )
-}
-
-fn list_int_fold_body() -> Vec<TaggedOp> {
-    const N: u32 = 0;
-    const I: u32 = 1;
-    const SRC_PAYLOAD: u32 = 2;
-    const ACC: u32 = 3;
-    vec![
-        // n = i32.load(xs, 0)
-        tt(Op::LocalGet(0)),
-        tt(Op::LoadI32AtAbsolute { offset: 0 }),
-        tt(Op::LetSet {
-            idx: N,
-            ty: IrType::I32,
-        }),
-        // src_payload = (xs + 4 + 7) & -8
-        tt(Op::LocalGet(0)),
-        tt(Op::ConstI32(4 + 7)),
-        tt(Op::Add(IrType::I32)),
-        tt(Op::ConstI32(-8)),
-        tt(Op::BitAnd(IrType::I32)),
-        tt(Op::LetSet {
-            idx: SRC_PAYLOAD,
-            ty: IrType::I32,
-        }),
-        // acc = init
-        tt(Op::LocalGet(1)),
-        tt(Op::LetSet {
-            idx: ACC,
-            ty: IrType::I64,
-        }),
-        // i = 0
-        tt(Op::ConstI32(0)),
-        tt(Op::LetSet {
-            idx: I,
-            ty: IrType::I32,
-        }),
-        tt(Op::Block {
-            result_ty: None,
-            body: vec![tt(Op::Loop {
-                result_ty: None,
-                body: vec![
-                    // exit when i >= n
-                    tt(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::LetGet {
-                        idx: N,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::Ge(IrType::I32)),
-                    tt(Op::BrIf { label_depth: 1 }),
-                    // push closure (param 2)
-                    tt(Op::LocalGet(2)),
-                    // push acc
-                    tt(Op::LetGet {
-                        idx: ACC,
-                        ty: IrType::I64,
-                    }),
-                    // push x = i64.load(src_payload + i*8)
-                    tt(Op::LetGet {
-                        idx: SRC_PAYLOAD,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::ConstI32(8)),
-                    tt(Op::Mul(IrType::I32)),
-                    tt(Op::Add(IrType::I32)),
-                    tt(Op::LoadI64AtAbsolute { offset: 0 }),
-                    // call closure
-                    tt(Op::CallClosure {
-                        param_tys: vec![IrType::I64, IrType::I64],
-                        ret_ty: IrType::I64,
-                    }),
-                    // acc = result
-                    tt(Op::LetSet {
-                        idx: ACC,
-                        ty: IrType::I64,
-                    }),
-                    // i = i + 1
-                    tt(Op::LetGet {
-                        idx: I,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::ConstI32(1)),
-                    tt(Op::Add(IrType::I32)),
-                    tt(Op::LetSet {
-                        idx: I,
-                        ty: IrType::I32,
-                    }),
-                    tt(Op::Br { label_depth: 0 }),
-                ],
-            })],
-        }),
-        // return acc
-        tt(Op::LetGet {
-            idx: ACC,
-            ty: IrType::I64,
-        }),
-        tt(Op::Return),
-    ]
 }
 
 // =====================================================================
@@ -2158,8 +1733,8 @@ fn list_int_fold_body() -> Vec<TaggedOp> {
 /// destination payload (`StoreI64AtAbsolute` for Int results,
 /// `StoreF64AtAbsolute` for Float results). `param_ty` / `ret_ty` tag
 /// the per-element `Op::CallClosure` so codegen routes the value
-/// through the right register class. Byte-identical in structure to
-/// [`list_int_map_body`].
+/// through the right register class. The `I64`/`I64` instantiation is
+/// the Phase 10-a [`list_int_map`] body.
 fn list_map_body_typed(
     load_elem: fn(u32) -> Op,
     store_elem: fn(u32) -> Op,
@@ -2303,8 +1878,13 @@ fn list_map_body_typed(
 
 /// Shared filter body parameterised by the element representation. The
 /// predicate closure always returns `Bool`; only the element load /
-/// store op and the closure param type vary. Byte-identical in
-/// structure to [`list_int_filter_body`].
+/// store op and the closure param type vary. The `I64` instantiation
+/// is the Phase 10-a [`list_int_filter`] body. The `SINK` local (slot
+/// 7) absorbs the `If` sentinel i32 produced by the per-iteration
+/// predicate branch so the loop counter stays intact: the wasm
+/// `if (result i32) ... end` shape requires both arms to leave a
+/// value behind, so an `i32.const 0` sentinel is routed through the
+/// sink, then ignored.
 fn list_filter_body_typed(
     load_elem: fn(u32) -> Op,
     store_elem: fn(u32) -> Op,
@@ -2651,7 +2231,8 @@ fn list_pointer_filter_body() -> Vec<TaggedOp> {
 /// Shared fold body parameterised by the element / accumulator
 /// representation (Int -> `I64`, Float -> `F64`). The accumulator and
 /// each element share `acc_ty`; the closure is `(acc_ty, acc_ty) ->
-/// acc_ty`. Byte-identical in structure to [`list_int_fold_body`].
+/// acc_ty`. The `I64` instantiation is the Phase 10-a
+/// [`list_int_fold`] body.
 fn list_fold_body_typed(load_elem: fn(u32) -> Op, acc_ty: IrType) -> Vec<TaggedOp> {
     const N: u32 = 0;
     const I: u32 = 1;
@@ -3723,4 +3304,52 @@ pub(super) fn pow_float() -> StdlibFunction {
             tt(Op::Return),
         ]
     })
+}
+
+#[cfg(test)]
+mod int_hof_typed_builder_tests {
+    use super::*;
+    use crate::stdlib::builtin_stdlib;
+
+    /// The bundled `list_int_map` / `list_int_filter` / `list_int_fold`
+    /// bodies (registry slots 13 / 14 / 15) must stay op-for-op equal
+    /// to the `I64` instantiations of the shared typed builders. The
+    /// handwritten Phase 10-a int bodies were deleted in favour of
+    /// these instantiations under a byte-identical guarantee; this
+    /// test pins that equivalence so the int slots cannot silently
+    /// fork from the typed shape again (a fork would also be a
+    /// cache-compatibility hazard: the slot bytes feed the object
+    /// cache without a GENERATOR_VERSION bump).
+    #[test]
+    fn int_hof_slots_match_typed_builder_i64_instantiations() {
+        let reg = builtin_stdlib();
+
+        assert_eq!(reg[13].name, "list_int_map");
+        assert_eq!(
+            reg[13].body(),
+            &list_map_body_typed(
+                |o| Op::LoadI64AtAbsolute { offset: o },
+                |o| Op::StoreI64AtAbsolute { offset: o },
+                IrType::I64,
+                IrType::I64,
+            )
+        );
+
+        assert_eq!(reg[14].name, "list_int_filter");
+        assert_eq!(
+            reg[14].body(),
+            &list_filter_body_typed(
+                |o| Op::LoadI64AtAbsolute { offset: o },
+                |o| Op::StoreI64AtAbsolute { offset: o },
+                IrType::I64,
+                IrType::I64,
+            )
+        );
+
+        assert_eq!(reg[15].name, "list_int_fold");
+        assert_eq!(
+            reg[15].body(),
+            &list_fold_body_typed(|o| Op::LoadI64AtAbsolute { offset: o }, IrType::I64)
+        );
+    }
 }

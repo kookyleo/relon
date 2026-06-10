@@ -6829,7 +6829,7 @@ fn lower_comprehension_as_type(
 ///
 /// Emits the inline payload addressing that mirrors the record layout
 /// the bundled `list_int_*` bodies write
-/// (`stdlib::defs::list_int_filter_body`): `[len: u32 LE][pad: u32]
+/// (`stdlib::defs::list_filter_body_typed`): `[len: u32 LE][pad: u32]
 /// [i64 elements...]`, payload aligned at `(base + 4 + 7) & -8`,
 /// element `i` at `payload + i*8`:
 ///
@@ -12589,7 +12589,7 @@ fn lower_variable(
     // The head pushed an `IrType::ListInt` arena handle (i32); the index
     // is read with inline payload addressing that mirrors the record
     // layout the bundled `list_int_*` bodies write
-    // (`stdlib::defs::list_int_filter_body`): `[len: u32 LE][pad: u32]
+    // (`stdlib::defs::list_filter_body_typed`): `[len: u32 LE][pad: u32]
     // [i64 elements...]`, payload at `(base + 4 + 7) & -8`, element `i`
     // at `payload + i*8`. The load is emitted WITHOUT a bounds branch —
     // every caller in scope (the W16 quicksort kernel) guards

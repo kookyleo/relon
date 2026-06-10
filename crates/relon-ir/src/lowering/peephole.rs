@@ -3484,7 +3484,7 @@ pub(super) fn match_bare_range(expr: &Expr) -> Option<&[relon_parser::CallArg]> 
 /// the vstack tagged `IrType::ListInt`.
 ///
 /// Record layout (must match the bundled stdlib contract — see
-/// `stdlib::defs::list_int_filter_body`): `[len: u32 LE][pad: u32
+/// `stdlib::defs::list_filter_body_typed`): `[len: u32 LE][pad: u32
 /// zero][i64 elements...]`, total `8 + 8*count` bytes, payload aligned
 /// at `(base + 4 + 7) & -8`.
 ///
@@ -4671,7 +4671,7 @@ fn emit_range_materialize(
 ) -> Result<(), LoweringError> {
     // Reserve let slots. `start` / `span` / `elem` ride as I64;
     // `count`, `base`, `payload`, `i` are all I32 (address arithmetic
-    // + the loop counter), mirroring `list_int_filter_body`. Each slot
+    // + the loop counter), mirroring `list_filter_body_typed`. Each slot
     // is single-typed for its whole lifetime — the LLVM emitter
     // rejects a let-slot reused under two IR types (`ensure_let_slot`
     // aliasing guard). `elem` is the running i64 element value (start
@@ -4792,7 +4792,7 @@ fn emit_range_materialize(
     ctx.tstack.pop();
 
     // record_size = 8 + 8*count  (i32 arithmetic; matches
-    // list_int_filter_body's `16 + 8*n` header sizing minus the
+    // list_filter_body_typed's `16 + 8*n` header sizing minus the
     // filter's extra slack — we size exactly to `count`).
     ctx.out.push(TaggedOp {
         op: Op::ConstI32(8),
