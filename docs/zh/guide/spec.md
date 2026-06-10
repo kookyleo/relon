@@ -657,7 +657,7 @@ tree-walker 里，会响亮地回退到解释器，而不是悄悄编错值。
 集合如下：
 
 * 数值：`pow`
-* 格式谓词：`is_iso_date`、`is_ipv4`、`is_ipv6`
+* 格式谓词：`is_ipv4`、`is_ipv6`
 * 字符串：`starts_with`
 * 列表：`unique`、`count`、`every`、`some`
 * 字典：`select_keys`、`omit_keys`
@@ -665,8 +665,9 @@ tree-walker 里，会响亮地回退到解释器，而不是悄悄编错值。
 
 它们是 **tier-2 / 仅 tree-walker**。在拿到 analyzer 签名与编译后端
 IR 转换之前，把它们当作参考求值器的便利函数，而非可移植的语言
-surface。（`is_iso_date` 属于「body 未写」而非「IR 无 op」：`Op::Mod`/
-`Op::Div` 是存在的，它的算术本可 lower，只是当前没有编译 body。）
+surface。（`is_ipv4` / `is_ipv6` 走 `core::net::Ipv*Addr::parse`，无
+wasm 可移植 body。日期校验 `is_iso_date` 现已四方编译：纯字节形状加
+整数日期算术，闰年判定走 `Op::Mod`。）
 
 **不存在 `#strict` 指令。** 严格静态推断是 analyzer 的**默认行为**——
 不需要 opt-in。唯一的 opt-out 是文件级 `#relaxed` 指令，`#unstrict`

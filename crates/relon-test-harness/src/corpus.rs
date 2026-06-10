@@ -1160,10 +1160,11 @@ pub fn all_cases() -> Vec<CorpusCase> {
         // Tree-walk == cranelift here; the wasm + llvm-native legs live in
         // `relon-codegen-llvm::aot_wasm_parity::r9_*`. Edges covered: valid
         // canonical UUID (lower / upper hex), wrong length, dash-position
-        // failure, and a non-hex byte. Sibling validators stay capped:
-        // `is_email` / `is_uri` (UTF-8 decode seam), `is_ipv4` / `is_ipv6`
-        // (`core::net` parser, no wasm body), `is_iso_date` (needs integer
-        // div/rem for the leap-year test, no `DivS` / `RemS` IR op).
+        // failure, and a non-hex byte. The ASCII-structured validators
+        // `is_email` / `is_uri` and the date validator `is_iso_date` are
+        // likewise compiled four-way (see the `js_is_email_*` / `js_is_uri_*`
+        // / `js_is_iso_date_*` cases below). Sibling validators stay capped:
+        // `is_ipv4` / `is_ipv6` (`core::net` parser, no wasm body).
         CorpusCase {
             name: "r9_is_uuid_valid",
             source: "#main() -> Bool\nis_uuid(\"12345678-1234-1234-1234-123456789012\")",
@@ -1435,6 +1436,92 @@ pub fn all_cases() -> Vec<CorpusCase> {
         CorpusCase {
             name: "js_is_uri_mailto",
             source: "#main() -> Bool\nis_uri(\"mailto:x@y.com\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        // ---- `is_iso_date(String) -> Bool` (RFC 3339 `YYYY-MM-DD`),
+        //      lowered four-way (byte-level shape + integer date arithmetic;
+        //      the leap-year test uses `Op::Mod(I32)` against non-zero
+        //      constant divisors). Tree-walk == cranelift here; the wasm +
+        //      llvm-native legs live in
+        //      `relon-codegen-llvm::aot_wasm_parity::js_is_iso_date_*`.
+        //      Edges: valid date, invalid month / day, the four leap-year
+        //      corners for 2/29 (2024 valid, 2023 / 1900 invalid, 2000
+        //      valid), wrong separator, wrong length, and a non-digit byte.
+        CorpusCase {
+            name: "js_is_iso_date_valid",
+            source: "#main() -> Bool\nis_iso_date(\"2020-01-15\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "js_is_iso_date_bad_month",
+            source: "#main() -> Bool\nis_iso_date(\"2020-13-01\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "js_is_iso_date_bad_day",
+            source: "#main() -> Bool\nis_iso_date(\"2020-04-31\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            // 2024 is a leap year (div by 4, not by 100) -> 2/29 valid.
+            name: "js_is_iso_date_leap_2024",
+            source: "#main() -> Bool\nis_iso_date(\"2024-02-29\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            // 2023 is not a leap year -> 2/29 invalid.
+            name: "js_is_iso_date_nonleap_2023",
+            source: "#main() -> Bool\nis_iso_date(\"2023-02-29\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            // 1900 is div by 100 but not by 400 -> not a leap year.
+            name: "js_is_iso_date_century_1900",
+            source: "#main() -> Bool\nis_iso_date(\"1900-02-29\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            // 2000 is div by 400 -> a leap year despite being a century.
+            name: "js_is_iso_date_century_2000",
+            source: "#main() -> Bool\nis_iso_date(\"2000-02-29\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            // Wrong separator at position 4 -> shape fails.
+            name: "js_is_iso_date_bad_sep",
+            source: "#main() -> Bool\nis_iso_date(\"2020/01/15\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            // Wrong length (9 bytes) -> rejected by the len guard.
+            name: "js_is_iso_date_bad_len",
+            source: "#main() -> Bool\nis_iso_date(\"2020-1-15\")",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            // Non-digit byte in the year field -> rejected (parse fails).
+            name: "js_is_iso_date_nondigit",
+            source: "#main() -> Bool\nis_iso_date(\"20x0-01-15\")",
             args_factory: no_args,
             tier: Tier::StdlibSimple,
             supported_by: TW_CR,

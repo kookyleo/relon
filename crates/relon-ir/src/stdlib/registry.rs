@@ -41,8 +41,8 @@ use super::string_ops::{
     trim_start_string, trim_string,
 };
 use super::validators::{
-    dict_size_in_range, in_range_float, is_email_string, is_uri_string, is_uuid_string,
-    multiple_of_int, size_in_range_list,
+    dict_size_in_range, in_range_float, is_email_string, is_iso_date_string, is_uri_string,
+    is_uuid_string, multiple_of_int, size_in_range_list,
 };
 
 /// Return the ordered list of builtin stdlib functions. The order is
@@ -390,11 +390,18 @@ pub fn builtin_stdlib() -> &'static [StdlibFunction] {
             //   * `69` — `is_uri(s) -> Bool` (scheme `:` non-empty-rest,
             //     ASCII scheme grammar). Both are purely byte-level (no UTF-8
             //     decode, no trap) — the same discipline `is_uuid` uses.
+            // Appended at the tail (index 70) so every position-pinned index
+            // above stays put — GENERATOR_VERSION does not move:
+            //   * `70` — `is_iso_date(s) -> Bool` (RFC 3339 `YYYY-MM-DD`:
+            //     byte-level shape + integer date arithmetic; the leap-year
+            //     test uses `Op::Mod(I32)` against non-zero constant divisors,
+            //     so a byte-exact four-way body is constructible).
             trim_string(),
             trim_start_string(),
             trim_end_string(),
             is_email_string(),
             is_uri_string(),
+            is_iso_date_string(),
         ]
     })
 }

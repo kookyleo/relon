@@ -800,7 +800,7 @@ compiled backend, or relying on them to be statically typed, will not
 behave like the tree-walker. The set is:
 
 * numeric: `pow`
-* format predicates: `is_iso_date`, `is_ipv4`, `is_ipv6`
+* format predicates: `is_ipv4`, `is_ipv6`
 * string: `starts_with`
 * list: `unique`, `count`, `every`, `some`
 * dict: `select_keys`, `omit_keys`
@@ -809,9 +809,10 @@ behave like the tree-walker. The set is:
 These are **tier-2 / tree-walker-only**. Treat them as
 reference-evaluator conveniences, not portable language surface,
 until they gain analyzer signatures and compiled-backend IR conversion.
-(`is_iso_date` is a "body not written yet" case, not an IR limitation:
-`Op::Mod`/`Op::Div` do exist, so its arithmetic could lower — it simply
-has no compiled body today.)
+(`is_ipv4` / `is_ipv6` route through `core::net::Ipv*Addr::parse`, which
+has no wasm-portable body. The date validator `is_iso_date` is now
+compiled four-way — byte-level shape plus integer date arithmetic, with
+the leap-year test over `Op::Mod`.)
 
 **There is no `#strict` directive.** Strict static inference is the
 analyzer's **default** — you do not opt *in* to it. The only opt-out

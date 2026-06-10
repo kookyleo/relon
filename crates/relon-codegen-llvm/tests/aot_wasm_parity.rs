@@ -2211,3 +2211,104 @@ fn js_is_uri_mailto_aligns_native_via_wasmtime() {
         true,
     );
 }
+
+// ===========================================================
+// `is_iso_date(String) -> Bool` (RFC 3339 `YYYY-MM-DD`). Reuses
+// the `r8_check_bool` Bool driver. Mirrors the `relon-test-harness`
+// corpus `js_is_iso_date_*` cases: valid date, invalid month / day,
+// the four leap-year corners for 2/29 (2024 valid, 2023 / 1900
+// invalid, 2000 valid), wrong separator, wrong length, non-digit.
+// The body is byte-level shape + integer date arithmetic; the
+// leap-year test uses `Op::Mod(I32)` against the non-zero constant
+// divisors 4 / 100 / 400, so the divisor-zero guard never fires.
+// ===========================================================
+
+#[test]
+fn js_is_iso_date_valid_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_isod_t",
+        "#main(Int n) -> Bool\nis_iso_date(\"2020-01-15\")",
+        true,
+    );
+}
+
+#[test]
+fn js_is_iso_date_bad_month_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_isod_mon",
+        "#main(Int n) -> Bool\nis_iso_date(\"2020-13-01\")",
+        false,
+    );
+}
+
+#[test]
+fn js_is_iso_date_bad_day_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_isod_day",
+        "#main(Int n) -> Bool\nis_iso_date(\"2020-04-31\")",
+        false,
+    );
+}
+
+#[test]
+fn js_is_iso_date_leap_2024_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_isod_l2024",
+        "#main(Int n) -> Bool\nis_iso_date(\"2024-02-29\")",
+        true,
+    );
+}
+
+#[test]
+fn js_is_iso_date_nonleap_2023_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_isod_2023",
+        "#main(Int n) -> Bool\nis_iso_date(\"2023-02-29\")",
+        false,
+    );
+}
+
+#[test]
+fn js_is_iso_date_century_1900_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_isod_1900",
+        "#main(Int n) -> Bool\nis_iso_date(\"1900-02-29\")",
+        false,
+    );
+}
+
+#[test]
+fn js_is_iso_date_century_2000_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_isod_2000",
+        "#main(Int n) -> Bool\nis_iso_date(\"2000-02-29\")",
+        true,
+    );
+}
+
+#[test]
+fn js_is_iso_date_bad_sep_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_isod_sep",
+        "#main(Int n) -> Bool\nis_iso_date(\"2020/01/15\")",
+        false,
+    );
+}
+
+#[test]
+fn js_is_iso_date_bad_len_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_isod_len",
+        "#main(Int n) -> Bool\nis_iso_date(\"2020-1-15\")",
+        false,
+    );
+}
+
+#[test]
+fn js_is_iso_date_nondigit_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "js_isod_nd",
+        "#main(Int n) -> Bool\nis_iso_date(\"20x0-01-15\")",
+        false,
+    );
+}

@@ -326,12 +326,13 @@ mod glob_match_index_tests {
     /// `size_in_range` / `dict_size_in_range`) append at 61..64; the
     /// whitespace-stripping String builders (`trim` / `trim_start` /
     /// `trim_end`) and the ASCII-structured validators (`is_email` /
-    /// `is_uri`) append at 65..69. All are at the tail so every
+    /// `is_uri`) append at 65..69; the RFC 3339 date validator
+    /// `is_iso_date` appends at 70. All are at the tail so every
     /// position-pinned index above stays put. Pinning the count catches
     /// accidental double-registrations.
     #[test]
-    fn bundle_has_70_entries() {
-        assert_eq!(stdlib_function_count(), 70);
+    fn bundle_has_71_entries() {
+        assert_eq!(stdlib_function_count(), 71);
         assert_eq!(stdlib_function_index("glob_match"), Some(37));
         assert_eq!(stdlib_function_index("list_list_length"), Some(38));
         // Wave R3b tail appends (order-pinned wire format).
@@ -384,6 +385,9 @@ mod glob_match_index_tests {
         assert_eq!(stdlib_function_index("trim_end"), Some(67));
         assert_eq!(stdlib_function_index("is_email"), Some(68));
         assert_eq!(stdlib_function_index("is_uri"), Some(69));
+        // RFC 3339 `YYYY-MM-DD` date validator (byte-level shape + integer
+        // date arithmetic; leap-year test over `Op::Mod(I32)`).
+        assert_eq!(stdlib_function_index("is_iso_date"), Some(70));
     }
 }
 

@@ -7,6 +7,12 @@
 //!     (`relon-evaluator/src/stdlib.rs::is_uuid_str`): length must be
 //!     exactly 36, positions 8/13/18/23 must be `-` (0x2D), every other
 //!     position must be an ASCII hex digit (`0-9` / `A-F` / `a-f`).
+//!   * `is_iso_date(s: String) -> Bool` — RFC 3339 full-date
+//!     `YYYY-MM-DD`. Byte-exact with `is_iso_date_str`: length `10`,
+//!     `-` at positions 4 / 7, digits elsewhere, `month` in `1..=12`,
+//!     `day` in range for the month (leap-year-aware for February via
+//!     `year % 4 / % 100 / % 400` over `Op::Mod(I32)` with non-zero
+//!     constant divisors, so the divisor-zero guard never fires).
 //!   * `multiple_of(n: Int, d: Int) -> Bool` — Int form of the JSON
 //!     Schema `multipleOf` predicate. Byte-exact with the tree-walk
 //!     `MultipleOf` oracle for the `(Int, Int)` arm: `d == 0` returns
@@ -35,10 +41,12 @@
 //!     do not lower (the same seam that keeps `upper` / `title` / `nfd`
 //!     at tree-walk + cranelift). Unlock this once the decode seam lands.
 //!
-//! The body is purely byte-level (record-header read + byte loads +
-//! integer compares + `BitAnd` / `Add` / `Sub` / `Mul`) — no UTF-8
-//! decode, no `Op::Trap`, no integer division/remainder — so it lowers
-//! four-way (tree-walk == cranelift == llvm-native == llvm-wasm).
+//! Every body is purely byte-level / integer arithmetic (record-header
+//! read + byte loads + integer compares + `BitAnd` / `Add` / `Sub` /
+//! `Mul`, plus `Op::Mod(I32)` against non-zero constant divisors for the
+//! `is_iso_date` leap-year test) — no UTF-8 decode, no `Op::Trap` — so
+//! every one lowers four-way (tree-walk == cranelift == llvm-native ==
+//! llvm-wasm).
 //!
 //! Sibling validators stay capped:
 //!   * `is_email` / `is_uri` iterate `s.chars()` (UTF-8 decode seam that
@@ -46,10 +54,6 @@
 //!     `title` / `nfd` at tree-walk + cranelift only).
 //!   * `is_ipv4` / `is_ipv6` route through `core::net::Ipv*Addr::parse`,
 //!     which has no wasm-portable body.
-//!   * `is_iso_date` needs integer division / remainder (the leap-year
-//!     `year % 4 / % 100 / % 400` test); the IR exposes no `DivS` /
-//!     `RemS` op, so a byte-exact four-way body is not constructible
-//!     without new ops + codegen (out of this wave's scope).
 //!
 //! Every body uses only existing `Op`s; the entry is appended at the
 //! tail of [`super::registry::builtin_stdlib`] so no position-pinned
@@ -1210,6 +1214,311 @@ fn is_email_string_body() -> Vec<TaggedOp> {
     }));
     body.push(tt(Op::ConstI32(0)));
     body.push(tt(Op::Ne(IrType::I32)));
+    body.push(tt(Op::Return));
+    body
+}
+
+/// `is_iso_date(s: String) -> Bool` — RFC 3339 full-date `YYYY-MM-DD`.
+///
+/// Mirrors `relon-evaluator/src/stdlib.rs::is_iso_date_str`:
+/// ```text
+/// if s.len() != 10 { return false }
+/// if s[4] != '-' || s[7] != '-' { return false }
+/// let (year, month, day) = (s[0..4], s[5..7], s[8..10]) parsed as u32
+///                          (each parse fails on a non-digit byte);
+/// if !(1..=12).contains(&month) || day < 1 { return false }
+/// let max_day = match month {
+///     1|3|5|7|8|10|12 => 31,
+///     4|6|9|11        => 30,
+///     2               => if leap { 29 } else { 28 },
+/// };
+/// day <= max_day
+/// ```
+/// where `leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0`.
+///
+/// The body is purely byte-level + integer arithmetic: the length guard
+/// gates the whole computation in an `Op::If` so every byte load runs
+/// only when `s.len() == 10` (offsets `0..10` are then in bounds), the
+/// `YYYY` / `MM` / `DD` fields are folded digit-by-digit (`(b - '0')`
+/// accumulated with `* 10`), and the leap-year test uses `Op::Mod(I32)`
+/// against the non-zero constant divisors `4` / `100` / `400` (so the
+/// divisor-zero guard never fires). No UTF-8 decode, no `Op::Trap` — so
+/// it lowers four-way (tree-walk == cranelift == llvm-native ==
+/// llvm-wasm), the same byte-level discipline `is_uuid` uses.
+///
+/// Branch-free: every per-field predicate is accumulated into `acc` via
+/// `BitAnd` rather than early-returning, so no `Br` crosses an `If`
+/// boundary. The arithmetic on the digit fields runs even when a field
+/// holds a non-digit byte (the value is then garbage), but the result is
+/// gated to `false` by the digit-class `acc` term, exactly as the
+/// oracle's `parse::<u32>()` fails on a non-digit and short-circuits.
+pub(super) fn is_iso_date_string() -> StdlibFunction {
+    StdlibFunction::new(
+        "is_iso_date",
+        vec![IrType::String],
+        IrType::Bool,
+        is_iso_date_string_body,
+    )
+}
+
+#[allow(clippy::vec_init_then_push)]
+fn is_iso_date_string_body() -> Vec<TaggedOp> {
+    const S_LEN: u32 = 0;
+    const YEAR: u32 = 1;
+    const MONTH: u32 = 2;
+    const DAY: u32 = 3;
+    const LEAP: u32 = 4;
+    const MAXDAY: u32 = 5;
+    const ACC: u32 = 6;
+
+    // Push the unsigned byte at constant offset `k` of the string payload
+    // (`s + 4 + k`). Only ever emitted inside the `s.len() == 10` branch,
+    // so `k` in `0..10` is always in bounds.
+    let load_byte_at = |k: i32| -> Vec<TaggedOp> {
+        vec![
+            tt(Op::LocalGet(0)),
+            tt(Op::ConstI32(4 + k)),
+            tt(Op::Add(IrType::I32)),
+            tt(Op::LoadI8UAtAbsolute { offset: 0 }),
+        ]
+    };
+    // Push `(byte_at(k) >= '0') & (byte_at(k) <= '9')` as a 0/1 i32.
+    let digit_ok_at = |k: i32| -> Vec<TaggedOp> {
+        let mut ops = load_byte_at(k);
+        ops.push(tt(Op::ConstI32(b'0' as i32)));
+        ops.push(tt(Op::Ge(IrType::I32)));
+        ops.extend(load_byte_at(k));
+        ops.push(tt(Op::ConstI32(b'9' as i32)));
+        ops.push(tt(Op::Le(IrType::I32)));
+        ops.push(tt(Op::BitAnd(IrType::I32)));
+        ops
+    };
+    // Push the numeric value of the digit at offset `k`: `byte_at(k) - '0'`.
+    let digit_val_at = |k: i32| -> Vec<TaggedOp> {
+        let mut ops = load_byte_at(k);
+        ops.push(tt(Op::ConstI32(b'0' as i32)));
+        ops.push(tt(Op::Sub(IrType::I32)));
+        ops
+    };
+    // Push `(month == m)` as a 0/1 i32.
+    let month_eq = |m: i32| -> Vec<TaggedOp> {
+        vec![
+            tt(Op::LetGet {
+                idx: MONTH,
+                ty: IrType::I32,
+            }),
+            tt(Op::ConstI32(m)),
+            tt(Op::Eq(IrType::I32)),
+        ]
+    };
+    // Push `(year % d) op 0` as a 0/1 i32 (`Eq` for `== 0`, `Ne` for `!= 0`).
+    let year_mod = |d: i32, eq_zero: bool| -> Vec<TaggedOp> {
+        vec![
+            tt(Op::LetGet {
+                idx: YEAR,
+                ty: IrType::I32,
+            }),
+            tt(Op::ConstI32(d)),
+            tt(Op::Mod(IrType::I32)),
+            tt(Op::ConstI32(0)),
+            tt(if eq_zero {
+                Op::Eq(IrType::I32)
+            } else {
+                Op::Ne(IrType::I32)
+            }),
+        ]
+    };
+
+    let mut body: Vec<TaggedOp> = Vec::new();
+    // s_len = load_i32(s, 0)
+    body.push(tt(Op::LocalGet(0)));
+    body.push(tt(Op::LoadI32AtAbsolute { offset: 0 }));
+    body.push(tt(Op::LetSet {
+        idx: S_LEN,
+        ty: IrType::I32,
+    }));
+    // if s_len != 10 { false } else { compute } -> Bool
+    body.push(tt(Op::LetGet {
+        idx: S_LEN,
+        ty: IrType::I32,
+    }));
+    body.push(tt(Op::ConstI32(10)));
+    body.push(tt(Op::Ne(IrType::I32)));
+
+    // ---- compute body (else branch; len is exactly 10) ----
+    let mut compute: Vec<TaggedOp> = Vec::new();
+    // acc = (s[4] == '-') & (s[7] == '-')
+    compute.extend(load_byte_at(4));
+    compute.push(tt(Op::ConstI32(b'-' as i32)));
+    compute.push(tt(Op::Eq(IrType::I32)));
+    compute.extend(load_byte_at(7));
+    compute.push(tt(Op::ConstI32(b'-' as i32)));
+    compute.push(tt(Op::Eq(IrType::I32)));
+    compute.push(tt(Op::BitAnd(IrType::I32)));
+    // & every YYYY / MM / DD byte is an ASCII digit (`parse::<u32>` fails
+    //   on a non-digit, so a non-digit short-circuits the oracle to false).
+    for k in [0, 1, 2, 3, 5, 6, 8, 9] {
+        compute.extend(digit_ok_at(k));
+        compute.push(tt(Op::BitAnd(IrType::I32)));
+    }
+    compute.push(tt(Op::LetSet {
+        idx: ACC,
+        ty: IrType::I32,
+    }));
+
+    // year = d0*1000 + d1*100 + d2*10 + d3
+    compute.extend(digit_val_at(0));
+    compute.push(tt(Op::ConstI32(1000)));
+    compute.push(tt(Op::Mul(IrType::I32)));
+    compute.extend(digit_val_at(1));
+    compute.push(tt(Op::ConstI32(100)));
+    compute.push(tt(Op::Mul(IrType::I32)));
+    compute.push(tt(Op::Add(IrType::I32)));
+    compute.extend(digit_val_at(2));
+    compute.push(tt(Op::ConstI32(10)));
+    compute.push(tt(Op::Mul(IrType::I32)));
+    compute.push(tt(Op::Add(IrType::I32)));
+    compute.extend(digit_val_at(3));
+    compute.push(tt(Op::Add(IrType::I32)));
+    compute.push(tt(Op::LetSet {
+        idx: YEAR,
+        ty: IrType::I32,
+    }));
+    // month = d5*10 + d6
+    compute.extend(digit_val_at(5));
+    compute.push(tt(Op::ConstI32(10)));
+    compute.push(tt(Op::Mul(IrType::I32)));
+    compute.extend(digit_val_at(6));
+    compute.push(tt(Op::Add(IrType::I32)));
+    compute.push(tt(Op::LetSet {
+        idx: MONTH,
+        ty: IrType::I32,
+    }));
+    // day = d8*10 + d9
+    compute.extend(digit_val_at(8));
+    compute.push(tt(Op::ConstI32(10)));
+    compute.push(tt(Op::Mul(IrType::I32)));
+    compute.extend(digit_val_at(9));
+    compute.push(tt(Op::Add(IrType::I32)));
+    compute.push(tt(Op::LetSet {
+        idx: DAY,
+        ty: IrType::I32,
+    }));
+
+    // acc &= (month >= 1) & (month <= 12) & (day >= 1)
+    compute.push(tt(Op::LetGet {
+        idx: ACC,
+        ty: IrType::I32,
+    }));
+    compute.push(tt(Op::LetGet {
+        idx: MONTH,
+        ty: IrType::I32,
+    }));
+    compute.push(tt(Op::ConstI32(1)));
+    compute.push(tt(Op::Ge(IrType::I32)));
+    compute.push(tt(Op::BitAnd(IrType::I32)));
+    compute.push(tt(Op::LetGet {
+        idx: MONTH,
+        ty: IrType::I32,
+    }));
+    compute.push(tt(Op::ConstI32(12)));
+    compute.push(tt(Op::Le(IrType::I32)));
+    compute.push(tt(Op::BitAnd(IrType::I32)));
+    compute.push(tt(Op::LetGet {
+        idx: DAY,
+        ty: IrType::I32,
+    }));
+    compute.push(tt(Op::ConstI32(1)));
+    compute.push(tt(Op::Ge(IrType::I32)));
+    compute.push(tt(Op::BitAnd(IrType::I32)));
+    compute.push(tt(Op::LetSet {
+        idx: ACC,
+        ty: IrType::I32,
+    }));
+
+    // leap = (year % 4 == 0 & year % 100 != 0) + (year % 400 == 0)
+    //   The two terms are mutually exclusive — `year % 400 == 0` implies
+    //   `year % 100 == 0`, which fails the first term — so the sum stays
+    //   in {0, 1}.
+    compute.extend(year_mod(4, true));
+    compute.extend(year_mod(100, false));
+    compute.push(tt(Op::BitAnd(IrType::I32)));
+    compute.extend(year_mod(400, true));
+    compute.push(tt(Op::Add(IrType::I32)));
+    compute.push(tt(Op::LetSet {
+        idx: LEAP,
+        ty: IrType::I32,
+    }));
+
+    // max_day = is31*31 + is30*30 + is_feb*(28 + leap)
+    //   The three month classes are disjoint, so exactly one term is
+    //   non-zero for an in-range month (and all zero for an out-of-range
+    //   month, which `acc` already rejects via the month bound check).
+    // is31 = sum of (month == m) for m in {1,3,5,7,8,10,12}
+    compute.extend(month_eq(1));
+    for m in [3, 5, 7, 8, 10, 12] {
+        compute.extend(month_eq(m));
+        compute.push(tt(Op::Add(IrType::I32)));
+    }
+    compute.push(tt(Op::ConstI32(31)));
+    compute.push(tt(Op::Mul(IrType::I32)));
+    // is30 = sum of (month == m) for m in {4,6,9,11}
+    compute.extend(month_eq(4));
+    for m in [6, 9, 11] {
+        compute.extend(month_eq(m));
+        compute.push(tt(Op::Add(IrType::I32)));
+    }
+    compute.push(tt(Op::ConstI32(30)));
+    compute.push(tt(Op::Mul(IrType::I32)));
+    compute.push(tt(Op::Add(IrType::I32)));
+    // is_feb * (28 + leap)
+    compute.extend(month_eq(2));
+    compute.push(tt(Op::ConstI32(28)));
+    compute.push(tt(Op::LetGet {
+        idx: LEAP,
+        ty: IrType::I32,
+    }));
+    compute.push(tt(Op::Add(IrType::I32)));
+    compute.push(tt(Op::Mul(IrType::I32)));
+    compute.push(tt(Op::Add(IrType::I32)));
+    compute.push(tt(Op::LetSet {
+        idx: MAXDAY,
+        ty: IrType::I32,
+    }));
+
+    // acc &= (day <= max_day)
+    compute.push(tt(Op::LetGet {
+        idx: ACC,
+        ty: IrType::I32,
+    }));
+    compute.push(tt(Op::LetGet {
+        idx: DAY,
+        ty: IrType::I32,
+    }));
+    compute.push(tt(Op::LetGet {
+        idx: MAXDAY,
+        ty: IrType::I32,
+    }));
+    compute.push(tt(Op::Le(IrType::I32)));
+    compute.push(tt(Op::BitAnd(IrType::I32)));
+    compute.push(tt(Op::LetSet {
+        idx: ACC,
+        ty: IrType::I32,
+    }));
+
+    // result = acc != 0
+    compute.push(tt(Op::LetGet {
+        idx: ACC,
+        ty: IrType::I32,
+    }));
+    compute.push(tt(Op::ConstI32(0)));
+    compute.push(tt(Op::Ne(IrType::I32)));
+
+    body.push(tt(Op::If {
+        result_ty: IrType::Bool,
+        then_body: vec![tt(Op::ConstBool(false))],
+        else_body: compute,
+    }));
     body.push(tt(Op::Return));
     body
 }
