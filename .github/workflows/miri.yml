@@ -1,0 +1,79 @@
+name: miri
+
+# Path-routed: miri only guards the pure-Rust unsafe surface in
+# `relon-eval-api` (SmolStr SSO layout + buffer/verifier raw-pointer
+# marshalling). Running it on every push is wasteful — most changes
+# (codegen / stdlib / lowering / docs) cannot affect that surface. This
+# workflow therefore triggers only when a change can plausibly reach the
+# unsafe code or its layout assumptions:
+#   * relon-eval-api      — the crate under test (its own unsafe + tests)
+#   * relon-cap           — shared leaf type crate; a #[repr]/size change
+#                           here can violate eval-api's layout assumptions
+#   * relon-parser / relon-analyzer — eval-api's direct deps; included so
+#                           an upstream type/layout change is still caught
+#   * Cargo.lock          — external dep version bumps (ordered-float / serde
+#                           etc.) that can shift a value layout
+#   * this workflow file
+# When it does run it uses the full proptest case count (no miri-only
+# reduction), so there is no fuzzing-density loss on the paths that matter.
+on:
+  push:
+    branches: [main]
+    paths: &miri-paths
+      - 'crates/relon-eval-api/**'
+      - 'crates/relon-cap/**'
+      - 'crates/relon-parser/**'
+      - 'crates/relon-analyzer/**'
+      - 'Cargo.lock'
+      - '.github/workflows/miri.yml'
+  pull_request:
+    paths: *miri-paths
+
+permissions:
+  contents: read
+
+jobs:
+  miri:
+    # F-1 per docs/internal/formalization-targets-2026-05-23.md:
+    # run cargo miri on every crate whose unsafe surface lives in
+    # pure Rust (no cranelift / FFI / mmap / target intrinsics).
+    # Catches UB regressions in the SmolStr SSO layout exercised by
+    # relon-eval-api.
+    #
+    # NOT covered: relon-codegen-cranelift (pulls cranelift / wasmtime
+    # whose generated nightly code currently uses unstable features
+    # the pinned miri rustc rejects), relon-wasm-bindings (browser
+    # target), relon-object-cache (dlopen / memfd FFI), and relon-ir's
+    # ascii_fold_simd (wasm32 +simd128 intrinsics). Those keep their
+    # stable-job coverage.
+    name: miri (unsafe modules)
+    runs-on: ubuntu-latest
+    # Full proptest density under miri (~10-100x slower than native) takes
+    # the better part of an hour; give it room since this job is rare.
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Free disk space
+        # The workspace links cranelift + wasmtime + LLVM 18; the runner's
+        # ~14 GB default free space can exhaust during link (manifesting as
+        # `No space left on device` or a `ld` SIGBUS/Bus-error). Drop the
+        # preinstalled toolchains we don't use to reclaim ~20-30 GB before
+        # cargo runs. Done before toolchain install so nothing we need is
+        # removed.
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h /
+      - name: Install nightly + miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: miri setup
+        run: cargo +nightly miri setup
+      - name: miri test (relon-eval-api)
+        run: cargo +nightly miri test -p relon-eval-api
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation

@@ -82,53 +82,6 @@ jobs:
       - name: cargo build (workspace, all targets)
         run: cargo build --workspace --all-targets
 
-  miri:
-    # F-1 per docs/internal/formalization-targets-2026-05-23.md:
-    # run cargo miri on every crate whose unsafe surface lives in
-    # pure Rust (no cranelift / FFI / mmap / target intrinsics).
-    # Catches UB regressions in the SmolStr SSO layout exercised by
-    # relon-eval-api.
-    #
-    # NOT covered: relon-codegen-cranelift (pulls cranelift / wasmtime
-    # whose generated nightly code currently uses unstable features
-    # the pinned miri rustc rejects), relon-wasm-bindings (browser
-    # target), relon-object-cache (dlopen / memfd FFI), and relon-ir's
-    # ascii_fold_simd (wasm32 +simd128 intrinsics). Those keep their
-    # stable-job coverage.
-    #
-    # The retired trace-JIT / bytecode crates (relon-trace-abi,
-    # relon-trace-jit, relon-trace-recorder, relon-bytecode) were
-    # deleted in 62bf6805; their miri steps were dropped with them.
-    name: miri (unsafe modules)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Free disk space
-        # The workspace links cranelift + wasmtime + LLVM 18; the runner's
-        # ~14 GB default free space can exhaust during link (manifesting as
-        # `No space left on device` or a `ld` SIGBUS/Bus-error). Drop the
-        # preinstalled toolchains we don't use to reclaim ~20-30 GB before
-        # cargo runs. Done before toolchain install so nothing we need is
-        # removed.
-        run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
-          df -h /
-      - name: Install nightly + miri
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: miri
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
-      - name: miri setup
-        run: cargo +nightly miri setup
-      - name: miri test (relon-eval-api)
-        run: cargo +nightly miri test -p relon-eval-api
-        env:
-          MIRIFLAGS: -Zmiri-disable-isolation
-
   # The kani job (F-2 bounds proofs) was removed: its only proof target
   # was relon-trace-jit/src/runtime/proofs.rs, deleted with the retired
   # trace-JIT crate in 62bf6805. No #[cfg(kani)] proofs remain in the

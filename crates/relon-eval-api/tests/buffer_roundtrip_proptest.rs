@@ -415,10 +415,7 @@ fn list_list_float_strat() -> impl Strategy<Value = Value> {
 fn _value_dict_marker(_: &ValueDict) {}
 
 proptest! {
-    // miri runs ~10-100x slower; keep every proptest function exercising
-    // the buffer/verifier unsafe paths under miri, but shrink the random
-    // case count so the job stays well under its timeout.
-    #![proptest_config(ProptestConfig::with_cases(if cfg!(miri) { 8 } else { 256 }))]
+    #![proptest_config(ProptestConfig::with_cases(256))]
 
     #[test]
     fn roundtrip_scalar_int(v in int_strat()) {
@@ -648,10 +645,7 @@ fn xr_servers_strat() -> impl Strategy<Value = Vec<(String, i64)>> {
 }
 
 proptest! {
-    // miri runs ~10-100x slower; keep every proptest function exercising
-    // the buffer/verifier unsafe paths under miri, but shrink the random
-    // case count so the job stays well under its timeout.
-    #![proptest_config(ProptestConfig::with_cases(if cfg!(miri) { 8 } else { 256 }))]
+    #![proptest_config(ProptestConfig::with_cases(256))]
 
     /// A legal cross-region `Dict { servers: List<Cfg>, n }` arena must
     /// verify clean under the multi-region map for the whole value space.
