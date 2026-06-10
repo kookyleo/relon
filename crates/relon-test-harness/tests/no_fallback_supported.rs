@@ -182,42 +182,38 @@ fn no_fallback_over_supported_surface() {
 /// slower, and they keep falling back (the production behaviour Wave R6
 /// does NOT change for genuinely-Capped shapes).
 ///
-/// `is_iso_date` is a stable example of a genuinely-capped validator: the
-/// leap-year test (`year % 4 / % 100 / % 400`) needs integer division /
-/// remainder the IR exposes no op for, so it is recorded Capped (it is NOT
-/// on [`SUPPORTED_SURFACE`]) and the cranelift backend declines the
-/// `#main` shape, so `auto` falls back. (`is_email` / `is_uri` USED to be
-/// the example here, but both are now compiled four-way — they validate
-/// ASCII structure byte-by-byte with no UTF-8 decode and no remainder.)
+/// `is_ipv4` is a stable example of a genuinely-capped validator: it
+/// routes through `core::net::Ipv4Addr::parse`, which has no
+/// wasm-portable body, so it is recorded Capped (it is NOT on
+/// [`SUPPORTED_SURFACE`]) and the cranelift backend declines the `#main`
+/// shape, so `auto` falls back. (`is_email` / `is_uri` USED to be the
+/// example here — both are now compiled four-way over byte-level ASCII
+/// structure — and `is_iso_date` was the most recent capped example, now
+/// compiled four-way too: its leap-year test uses `Op::Mod(I32)` against
+/// non-zero constant divisors, with no UTF-8 decode and no trap.)
 #[test]
 fn capped_validator_falls_back_cleanly() {
-    let source = "#main() -> Bool\nis_iso_date(\"2020-02-29\")";
-    let auto = AutoEvaluator::new(source).unwrap_or_else(|e| {
-        panic!("auto setup unexpectedly failed for capped is_iso_date case: {e}")
-    });
+    let source = "#main() -> Bool\nis_ipv4(\"192.168.0.1\")";
+    let auto = AutoEvaluator::new(source)
+        .unwrap_or_else(|e| panic!("auto setup unexpectedly failed for capped is_ipv4 case: {e}"));
 
     let auto_result = auto.run_main(HashMap::new());
     let route = auto.last_dispatch_route();
 
     // The expected, correct outcome: a clean capability fallback — NOT a
     // hard error and NOT a silent wrong value. (If a future lowering wave
-    // teaches the compiled backend `is_iso_date`, this becomes `Aot`; flip
+    // teaches the compiled backend `is_ipv4`, this becomes `Aot`; flip
     // it to SUPPORTED_SURFACE then. Until then, fallback is the honest
     // state.)
     assert_eq!(
         route,
         DispatchRoute::UnsupportedFallback,
-        "capped is_iso_date case should take the clean unsupported-shape fallback, got {route:?}"
+        "capped is_ipv4 case should take the clean unsupported-shape fallback, got {route:?}"
     );
 
     // The fallback value must still match the oracle bit-for-bit.
     let oracle_result = oracle(source, HashMap::new());
-    assert_results_agree(
-        "capped is_iso_date",
-        "<inline>",
-        &auto_result,
-        &oracle_result,
-    );
+    assert_results_agree("capped is_ipv4", "<inline>", &auto_result, &oracle_result);
 }
 
 /// Honesty pin for the JSON-Schema predicate arms that intentionally stay

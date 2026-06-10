@@ -2856,6 +2856,15 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         status: Status::Covered,
         proof: "tree-walk + cranelift; wasm/llvm-native in aot_wasm_parity::js_is_uri_*",
     },
+    SurfaceEntry {
+        construct: "is_iso_date(String) -> Bool (RFC 3339 YYYY-MM-DD: byte-level shape + \
+                    integer date arithmetic; leap-year test over Op::Mod(I32) with non-zero \
+                    constant divisors)",
+        wave: "JS",
+        corpus: "js_is_iso_date_valid",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift; wasm/llvm-native in aot_wasm_parity::js_is_iso_date_*",
+    },
     // ---- Wave R15: `split(String, sep) -> List<String>` ----
     SurfaceEntry {
         construct: "String split on non-empty literal separator (List<String>, \
