@@ -1767,6 +1767,65 @@ fn list_spread_float() {
     );
 }
 
+// Wave SP: MULTI-source RUNTIME spread `[1, ...a, 5, ...b, 9]` — the
+// source lengths are only known at runtime, so each source payload is
+// memory.copy-d behind a runtime write cursor. Must stay bit-equal
+// across tree-walk == llvm-native == wasm (cranelift leg proven in the
+// corpus differential).
+
+const SRC_LIST_SPREAD_RUNTIME_MULTI: &str =
+    "#main(List<Int> a, List<Int> b) -> List<Int>\n[1, ...a, 5, ...b, 9]";
+
+fn two_int_lists(a: &[i64], b: &[i64]) -> HashMap<String, Value> {
+    let mk = |items: &[i64]| Value::List(Arc::new(items.iter().copied().map(Value::Int).collect()));
+    HashMap::from([("a".to_string(), mk(a)), ("b".to_string(), mk(b))])
+}
+
+#[test]
+fn list_spread_runtime_multi_mixed() {
+    assert_four_way(
+        SRC_LIST_SPREAD_RUNTIME_MULTI,
+        two_int_lists(&[10, 20], &[30]),
+    );
+}
+
+#[test]
+fn list_spread_runtime_multi_adjacent() {
+    assert_four_way(
+        "#main(List<Int> a, List<Int> b) -> List<Int>\n[...a, ...b]",
+        two_int_lists(&[1, 2], &[3, 4]),
+    );
+}
+
+#[test]
+fn list_spread_runtime_multi_first_empty() {
+    assert_four_way(SRC_LIST_SPREAD_RUNTIME_MULTI, two_int_lists(&[], &[30, 40]));
+}
+
+#[test]
+fn list_spread_runtime_multi_both_empty() {
+    assert_four_way(SRC_LIST_SPREAD_RUNTIME_MULTI, two_int_lists(&[], &[]));
+}
+
+#[test]
+fn list_spread_runtime_multi_float() {
+    let mk = |items: &[f64]| {
+        Value::List(Arc::new(
+            items
+                .iter()
+                .map(|f| Value::Float(OrderedFloat(*f)))
+                .collect(),
+        ))
+    };
+    assert_four_way(
+        "#main(List<Float> a, List<Float> b) -> List<Float>\n[...a, 0.5, ...b]",
+        HashMap::from([
+            ("a".to_string(), mk(&[f64::NAN, -0.0])),
+            ("b".to_string(), mk(&[1.5, -2.25])),
+        ]),
+    );
+}
+
 const SRC_DICT_SPREAD: &str = "#schema Extras { Int a: * }\n\
                                #schema Out { Int a: *, Int b: * }\n\
                                #main(Extras e) -> Out\n{ ...e, b: 9 }";
