@@ -41,12 +41,13 @@
 
 - ✅ **值→String 统一分发 Wave A(`ebe82085`)**:lowering 新增 `lower_value_to_string(ir_ty)` 单点分发器,f-string 插值与 `String + 非String` 拼接两个消费方统一接入——String 恒等、I64 走既有 `Op::IntToStr`(字节不变,GENERATOR_VERSION 未 bump)、**Bool 编译落地**(`Op::If` 选 "true"/"false" 常量串,无新 op),F64 与复合类型响亮 cap。配套 analyzer 修正:oracle 本就接受 `String + 任意`/`任意 + String` 为拼接(arithmetic.rs 双侧 arm),analyzer 此前把 `String + Bool` 静态拒掉属不自洽,现对齐。aot_wasm_parity 111(fstring_bool / string_plus_bool / bool_plus_string 四方)。**Wave B 已落地(`4e5cf3eb`)**:见下条。
 - ✅ **Float→String 渲染 Wave B(`4e5cf3eb`)**:新 `Op::FloatToStr`,三后端共用同一 Rust leaf(`relon-ir::float_str::format_f64_display` = oracle 同一条 `format!("{v}")` Display 路径,构造性字节一致):cranelift 走 vtable 槽 5(COUNT 5→6,**GENERATOR_VERSION "v5-gamma 14"→"15"**,768B scratch);LLVM-native 走 `add_global_mapping` extern(rs-shims staticlib 自含副本);wasm 走 `(import "env" "relon_llvm_f64_to_str")` + parity linker `func_wrap` 同一函数。f64 跨 FFI 以 i64 位模式传递,无浮点 ABI 假设。边界电池四方:`1.0→"1"`、`-0.0→"-0"`、NaN/±inf、subnormal -5e-324(327 字符)、1e300。**旗舰封口**:pricing `@currency("USD") display: price` 四方 `"USD 567.34"`(concat-coercible 仅限推断 String 参数;显式 `(String s)` 标注仍拒标量实参,守卫测试在)。复合类型值→String 仍响亮 cap(Display 语义未定义)。
-- **design-free 工程件已基本做尽**。**剩余=两个真决策 + 设计边界内的诚实 cap**(下方"决策点")。
+- **design-free 工程件已基本做尽**。**剩余=设计边界内的诚实 cap**(决策点已全部裁决,见下)。
 
-## 决策点(需用户拍板,loop 已停在此)
-1. **spread/list-producing expression**:当前 `[]` 与 `()` 已分开；要继续编译 spread，需要补 IR 中 list-producing expression 的构造与转发路径。要不要动?
-2. **Dict 编译值支持**:VariantCtor(变体值=branded Dict)、dict.keys/values/merge、dict 字面量——全部 gated 在"Dict 作编译值"上,而这当前是**by-design cap**(analyzer 走 schema 不走 Dict)。要不要逆转这条边界、建 Dict 编译支持(大工程)?还是维持 schema-only、Dict 永久 cap?
-3. 或:**宣告静态覆盖收尾**——no-fallback 门已绿,剩余皆设计边界内诚实 cap(#relaxed 真动态 / &prev/&next / regex / net-parse / Dict-by-design / spread-as-Tuple)。
+## 决策点(已全部裁决,2026-06-10)
+1. **spread/list-producing expression**:✅ 已做——list 字面量源 + dict schema 源(R12)+ 单运行期列表源(`e8787c29`)。多源 `[...xs,...ys]` 低用量后置。
+2. **Dict 编译值支持**:❌ **维持 by-design cap 不立项**——真实语料匿名 Dict 作值=1、dict 操作调用=0;且大半早已建好(anon-Dict-return/`#brand Dict`),真剩硬 cap 只「Dict 作 #main 入参」(需求 0)。schema-only 是主路。
+3. **Schema/EnumSchema/Type 作一等运行期值**:❌ **维持 cap 不立项**(2026-06-10 勘探)——语料 16 处全 showcase(workflow.relon 状态机 + brand.relon 演示)、真实业务 0;oracle 语义面本就极小(Schema==Schema 恒 false、`#[serde(skip)]` 禁序列化、不可跨函数传、Display 只吐 `<schema>`),它是类型检查的内部载体不是数据值;编译化 100% 耦合已否掉的 Dict 编译值 + closure-across-boundary,成本远超收益(收益≈0)。
+4. **静态覆盖宣告收尾**:no-fallback 门已绿,SUPPORTED_SURFACE 62,剩余皆设计边界内诚实 cap(#relaxed 真动态 / &prev/&next 等 references 尾巴 / regex / net-parse / Dict-by-design / 复合类型→String)。后续轴:tree-walk-only stdlib 尾巴(pow/unique/count/every/some/select_keys/omit_keys/to_json/parse_iso_date)与 perf 轴(W16-W19,需 go/no-go)。
 
 ## 未展开工作(诚实记录,分三类)
 
