@@ -906,6 +906,44 @@ fn r3_range_map_aligns_native_via_wasmtime() {
     );
 }
 
+/// Wave R12 — list spread over a single RUNTIME source `[100, ...range(n), 200]`:
+/// the source length is only known at runtime, so the materialiser allocs a
+/// scratch record, stores the static scalars inline, and `memory.copy`-s the
+/// source payload in place. Proves the llvm-native == wasm leg for the
+/// runtime-source spread (tree-walk == cranelift proven in the corpus).
+#[test]
+fn r12_list_spread_runtime_src_aligns_native_via_wasmtime() {
+    r3_list_parity(
+        "r12_list_spread_runtime_src",
+        "relon_parity_r12_list_spread_runtime_src",
+        "#main(Int n) -> List<Int>\n[100, ...range(n), 200]",
+        3,
+    );
+}
+
+/// Wave R12 — runtime-source spread with a leading scalar only `[7, ...range(n)]`.
+#[test]
+fn r12_list_spread_runtime_src_prefix_aligns_native_via_wasmtime() {
+    r3_list_parity(
+        "r12_list_spread_runtime_src_prefix",
+        "relon_parity_r12_list_spread_runtime_src_prefix",
+        "#main(Int n) -> List<Int>\n[7, ...range(n)]",
+        4,
+    );
+}
+
+/// Wave R12 — runtime-source spread, empty source edge `[100, ...range(0), 200]`
+/// (memory.copy of 0 bytes). Exercised at `n = 0`.
+#[test]
+fn r12_list_spread_runtime_src_empty_aligns_native_via_wasmtime() {
+    r3_list_parity(
+        "r12_list_spread_runtime_src_empty",
+        "relon_parity_r12_list_spread_runtime_src_empty",
+        "#main(Int n) -> List<Int>\n[100, ...range(n), 200]",
+        0,
+    );
+}
+
 /// Wave R3 — `range(n).filter((x) => x > 1)` (general filter predicate).
 #[test]
 fn r3_range_filter_aligns_native_via_wasmtime() {
