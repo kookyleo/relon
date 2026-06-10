@@ -3492,7 +3492,7 @@ fn rust_native_w15(n: i64) -> i64 {
 /// predicate), each materialising a worst-case-capacity list (the
 /// stdlib `list_int_filter` body allocates `8 + 8*n + 8` bytes up
 /// front before the pass — see
-/// `relon-ir/src/stdlib/defs.rs::list_int_filter_body`), and the
+/// `relon-ir/src/stdlib/defs.rs::list_filter_body_typed`), and the
 /// `==` partition is materialised then summed by `list.sum` (NOT
 /// folded inline). Comparing the 3n-reads-per-level exact-capacity
 /// Relon shape against a n-reads-per-level grow-realloc Rust shape
