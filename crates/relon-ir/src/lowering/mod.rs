@@ -1704,7 +1704,11 @@ fn anon_dict_return_plan(
         // let-binding.
         let is_internal = node_marked_internal(value);
         match &*value.expr {
-            Expr::Closure { params, .. } => {
+            Expr::Closure {
+                params,
+                return_type,
+                body,
+            } => {
                 // A closure value can never cross the host boundary, so
                 // it is only legal as an internal helper binding. A
                 // non-`#internal` closure field would otherwise be
@@ -1721,24 +1725,13 @@ fn anon_dict_return_plan(
                         }
                     ));
                 }
-                // Default each unannotated param to I64; honor a
-                // `(k: Bool) =>` style annotation when the user
-                // supplied one.
-                let mut param_irts: Vec<IrType> = Vec::with_capacity(params.len());
-                for p in params {
-                    let irt = p
-                        .type_hint
-                        .as_ref()
-                        .and_then(type_node_to_canonical)
-                        .and_then(|r| type_repr_to_ir_type(&r).ok())
-                        .unwrap_or(IrType::I64);
-                    param_irts.push(irt);
-                }
-                // Ret type today defaults to I64 (W7 fib returns Int).
-                // Future Phase D scope: derive from body inference or
-                // user annotation. Acceptable for the production W7
-                // surface (`(k) => k < 2 ? k : fib(k-1) + fib(k-2)`).
-                let ret_ty = IrType::I64;
+                // Read the real `(param_tys, ret_ty)` from the type
+                // system: explicit param / return annotations first,
+                // then a conservative String-concat body inference, then
+                // the historical I64 default (W7 fib). See
+                // `plan_anon_dict_closure_sig`.
+                let (param_irts, ret_ty) =
+                    plan_anon_dict_closure_sig(params, return_type.as_ref(), &body.expr);
                 closure_field_sigs.insert(name.as_str(), (param_irts.clone(), ret_ty));
                 fields_by_decl[decl_idx] = Some(AnonDictField::Closure {
                     name: name.clone(),
@@ -7823,6 +7816,139 @@ fn check_stdlib_arg(
         ));
     }
     Ok(())
+}
+
+/// Determine an anon-Dict-return field closure's `(param_tys, ret_ty)`
+/// IR signature, reading the real type rather than defaulting both to
+/// I64. The priority is:
+///
+///   1. **Explicit annotation.** A leading-type field form
+///      (`String fmt(s): ...`) or a `-> Ret` arrow stamps the closure's
+///      `return_type`; a `(p: T)` param annotation stamps the param's
+///      `type_hint`. Both are honoured when present.
+///   2. **Conservative body inference (String concat only).** When no
+///      explicit return type is given and the body is an unambiguous
+///      `String + String + ...` concatenation chain — a left-leaning
+///      `+` spine whose leaves are all String literals or this closure's
+///      own params, with at least one String-literal leaf to prove the
+///      `+` is concat (not arithmetic) — every unannotated param that
+///      appears as a leaf is typed `String` and the return type is
+///      `String`. The decorated value reaches the body through such a
+///      param (value-first desugar), so this is what lets a
+///      `@fmt(...)`-style String-result decorator field compile. A
+///      numeric `+` (no String leaf, e.g. the W7 `add(v, n): v + n`
+///      helper) is NOT matched, so its bytes are unchanged.
+///   3. **I64 default.** Anything else keeps the historical behaviour:
+///      unannotated params and an unannotated return both default to
+///      I64 (the W7 `fib` Int surface).
+///
+/// Float-valued concat operands (e.g. the `examples/pricing.relon`
+/// `currency(symbol, val)` whose value-first `symbol` is a `Float`
+/// price) are deliberately NOT typed here: there is no `Float -> String`
+/// coercion op on the compiled path, so the call-site arg-type check
+/// caps such a field loudly rather than mis-compiling it.
+fn plan_anon_dict_closure_sig(
+    params: &[ClosureParam],
+    return_type: Option<&TypeNode>,
+    body: &Expr,
+) -> (Vec<IrType>, IrType) {
+    // Explicit param annotations first (honoured when present; the
+    // anon-Dict surface can't yet *write* one, but the read is correct
+    // and forward-compatible). Unannotated params start as I64.
+    let mut param_irts: Vec<IrType> = params
+        .iter()
+        .map(|p| {
+            p.type_hint
+                .as_ref()
+                .and_then(type_node_to_canonical)
+                .and_then(|r| type_repr_to_ir_type(&r).ok())
+                .unwrap_or(IrType::I64)
+        })
+        .collect();
+
+    let explicit_ret = return_type
+        .and_then(type_node_to_canonical)
+        .and_then(|r| type_repr_to_ir_type(&r).ok());
+
+    // String-concat detection: collect the leaves of a left-leaning `+`
+    // spine and require every leaf to be a String literal or one of this
+    // closure's params, with at least one String literal present.
+    if is_string_concat_body(body, params) {
+        // Type every unannotated param that the body uses as a concat
+        // leaf as String; leave annotated params and unused params as
+        // they were. The conservative walk only descends `+` nodes, so a
+        // param appearing under a numeric subexpression won't reach here
+        // (the whole body would already have been rejected).
+        for (i, p) in params.iter().enumerate() {
+            if p.type_hint.is_none() && string_concat_uses_param(body, &p.name) {
+                param_irts[i] = IrType::String;
+            }
+        }
+        // Honour an explicit String annotation; if the annotation
+        // disagrees with the inferred String concat, fall back to the
+        // explicit annotation (the user wrote it on purpose) — the
+        // call-site / body type-check then surfaces any real conflict.
+        let ret_ty = explicit_ret.unwrap_or(IrType::String);
+        return (param_irts, ret_ty);
+    }
+
+    // Not a String concat: keep the historical I64 default unless an
+    // explicit return annotation says otherwise.
+    let ret_ty = explicit_ret.unwrap_or(IrType::I64);
+    (param_irts, ret_ty)
+}
+
+/// True when `expr` is an unambiguous `String + String + ...` concat
+/// chain: a left-leaning `Operator::Add` spine whose every leaf is a
+/// String literal or a name in `params`, with at least one String
+/// literal leaf (so a purely numeric `v + n` is rejected). Any other
+/// leaf shape — a numeric literal, an arithmetic subexpression, a
+/// non-param variable, a call — disqualifies the whole body.
+fn is_string_concat_body(expr: &Expr, params: &[ClosureParam]) -> bool {
+    let mut saw_string_literal = false;
+    if !string_concat_leaves_ok(expr, params, &mut saw_string_literal) {
+        return false;
+    }
+    saw_string_literal
+}
+
+/// Recursive leaf check for [`is_string_concat_body`]; sets
+/// `saw_string_literal` when a `String` literal leaf is encountered.
+fn string_concat_leaves_ok(
+    expr: &Expr,
+    params: &[ClosureParam],
+    saw_string_literal: &mut bool,
+) -> bool {
+    match expr {
+        Expr::Binary(Operator::Add, lhs, rhs) => {
+            string_concat_leaves_ok(&lhs.expr, params, saw_string_literal)
+                && string_concat_leaves_ok(&rhs.expr, params, saw_string_literal)
+        }
+        Expr::String(_) => {
+            *saw_string_literal = true;
+            true
+        }
+        Expr::Variable(path) => {
+            matches!(path.as_slice(), [TokenKey::String(name, _, _)]
+                if params.iter().any(|p| &p.name == name))
+        }
+        _ => false,
+    }
+}
+
+/// True when `name` appears as a bare-variable leaf inside the `+` spine
+/// of `expr`. Used to decide which unannotated params a String-concat
+/// body forces to `String`.
+fn string_concat_uses_param(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Binary(Operator::Add, lhs, rhs) => {
+            string_concat_uses_param(&lhs.expr, name) || string_concat_uses_param(&rhs.expr, name)
+        }
+        Expr::Variable(path) => {
+            matches!(path.as_slice(), [TokenKey::String(n, _, _)] if n == name)
+        }
+        _ => false,
+    }
 }
 
 /// AOT-4: infer the IR return type of a where-bound helper closure
@@ -14071,6 +14197,57 @@ mod w7_closure_boundary_tests {
         assert_eq!(
             call_count, 1,
             "expected the entry to emit CallClosure once for `result: fib(n)`, got {call_count}"
+        );
+    }
+
+    /// A `#internal wrap(v): "<" + v + ">"` field closure's signature is
+    /// read from its String-concat body (not defaulted to I64): the
+    /// `@wrap()`-decorated field lowers to `Op::CallClosure` with a
+    /// `String` return type, and the String-result field is marshalled
+    /// onto the return surface. Pre-fix the hardwired `ret_ty = I64`
+    /// classified the field as Int and the `String + String` body failed
+    /// to lower (`unsupported operator Add`).
+    #[test]
+    fn anon_dict_string_concat_decorator_returns_string() {
+        let src = "#relaxed\n#main(Int n) -> Dict\n\
+                   { #internal\n wrap(v): \"<\" + v + \">\",\n \
+                   @wrap()\n out: \"hi\" }";
+        let module = try_lower(src).expect("String-concat field decorator lowers");
+        let entry_idx = module.entry_func_index.expect("entry func");
+        let entry = &module.funcs[entry_idx];
+        // The decorated `out` field calls `wrap` via a closure whose
+        // return type is String (the concat body), not the old I64.
+        let string_ret_call = entry.body.iter().any(|t| {
+            matches!(
+                &t.op,
+                Op::CallClosure { ret_ty, param_tys }
+                    if *ret_ty == IrType::String
+                        && param_tys.as_slice() == [IrType::String]
+            )
+        });
+        assert!(
+            string_ret_call,
+            "expected a CallClosure {{ [String] -> String }} for the @wrap field, \
+             body ops: {:?}",
+            entry.body.iter().map(|t| &t.op).collect::<Vec<_>>()
+        );
+    }
+
+    /// Honest cap: the `examples/pricing.relon` Float-valued currency
+    /// shape — `currency(symbol, val): symbol + " " + val` decorating a
+    /// `Float` field — has no `Float -> String` coercion op on the
+    /// compiled path, so it must cap loudly rather than mis-compile.
+    /// The String-concat body inference types `symbol` as `String`, and
+    /// the call-site arg-type check then rejects the `Float` value.
+    #[test]
+    fn anon_dict_float_string_concat_decorator_caps() {
+        let src = "#relaxed\n#main(Float price) -> Dict\n\
+                   { #internal\n currency(symbol, val): symbol + \" \" + val,\n \
+                   @currency(\"USD\")\n display: price }";
+        let err = try_lower(src).expect_err("Float -> String concat must cap loudly");
+        assert!(
+            matches!(err, LoweringError::StdlibArgTypeMismatch { .. }),
+            "expected a loud StdlibArgTypeMismatch cap for the Float concat operand, got {err:?}"
         );
     }
 

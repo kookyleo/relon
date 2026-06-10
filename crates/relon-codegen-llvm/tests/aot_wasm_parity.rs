@@ -1867,6 +1867,61 @@ fn r11_field_decorator_aligns_native_via_wasmtime() {
     assert_eq!(out.get("x"), Some(&Decoded::Int(want_x)), "r11 field x");
 }
 
+/// Wave R11 — String-result field decorator on the anon-Dict-return
+/// path. The `#internal wrap(v): "<" + v + ">"` closure's `(param, ret)`
+/// signature is read from the type system rather than defaulting to I64:
+/// the body is an unambiguous `String + String + String` concat (it has
+/// String-literal leaves), so `plan_anon_dict_closure_sig` types the
+/// `v` param and the return as `String`. The decorated field
+/// `@wrap() out: "hi"` value-first-desugars to `wrap("hi")` and lowers
+/// through `Op::CallClosure { [String] -> String }` + the existing R8
+/// `Op::StrConcatN` String-tail-record return path. Verified byte-equal
+/// on the wasm32 leg against the LLVM native oracle (itself aligned to
+/// tree-walk + cranelift). The Float-valued concat shape — the
+/// `examples/pricing.relon` `currency(symbol, val)` whose value-first
+/// `symbol` is a `Float` price — stays a loud cap (no `Float -> String`
+/// coercion op on the compiled path); see the lowering unit test
+/// `anon_dict_float_string_concat_decorator_caps`.
+#[test]
+fn r11_string_result_decorator_aligns_native_via_wasmtime() {
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping r11 string-result decorator");
+        return;
+    }
+    let src = "#relaxed\n#main(Int n) -> Dict\n\
+               { #internal\n wrap(v): \"<\" + v + \">\",\n \
+               @wrap()\n out: \"hi\" }";
+    let dict = match native_run(src, HashMap::from([("n".to_string(), Value::Int(0))])) {
+        Value::Dict(d) => d,
+        other => panic!("native expected Dict, got {other:?}"),
+    };
+    let want_out = match dict.map.get("out") {
+        Some(Value::String(s)) => s.to_string(),
+        other => panic!("out not String: {other:?}"),
+    };
+    // Oracle sanity: wrap("hi") = "<hi>".
+    assert_eq!(want_out, "<hi>", "r11 string-result oracle drifted");
+
+    let (bytes, info) = build("r11_string_result_decorator", src);
+    assert!(
+        matches!(info.shape, relon_codegen_llvm::EmittedEntryShape::Buffer),
+        "r11 string-result expected Buffer shape, got {:?}",
+        info.shape
+    );
+    let in_record = pack_single_int(&info, 0);
+    let out = run_buffer(
+        &bytes,
+        "relon_parity_r11_string_result_decorator",
+        &info,
+        &in_record,
+    );
+    assert_eq!(
+        out.get("out"),
+        Some(&Decoded::Str(want_out)),
+        "r11 string-result wasm field != native oracle"
+    );
+}
+
 /// W5-P3 — `d[k]` dict-get probe runs on wasm32. A `#main` dict body
 /// binds `#internal d` (an `Op::ConstDict` arena record) and the
 /// `result` Int field probes it with a `ConstString` key. This proves
