@@ -513,6 +513,14 @@ pub const LEDGER: &[LedgerEntry] = &[
         reason: "#main param/return type outside the buffer-protocol decode envelope",
     },
     LedgerEntry {
+        id: "type_repr_to_ir_type_dict.unsupported_type_in_main",
+        site: "lowering/mod.rs::type_repr_to_ir_type_dict",
+        category: Category::MainSignatureType,
+        status: Status::Capped,
+        corpus: "",
+        reason: "dict/record field List<…> element outside the buffer-protocol decode envelope",
+    },
+    LedgerEntry {
         id: "lower_expr.unsupported_expr.1",
         site: "lowering/mod.rs::lower_expr",
         category: Category::ExprShape,

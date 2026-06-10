@@ -9271,7 +9271,7 @@ fn lower_ternary_as_type(
         ));
     }
 
-    let expected_ty = type_repr_to_ir_type_dict(expected);
+    let expected_ty = type_repr_to_ir_type_dict(expected)?;
     if then_ty != expected_ty {
         return Err(cap!(
             "lower_ternary_as_type.unsupported_expr.branch_type",
@@ -10057,21 +10057,31 @@ fn check_field_default_refs_resolvable(
 /// field context. Reuses [`type_repr_to_ir_type`] for the strict
 /// subset (base types + `List<base>`) and extends with the cases
 /// only dict fields can carry: nested branded `Schema { .. }` rides a
-/// pointer slot, and `Option` / `Result` fold to i32 too. Hand-
-/// crafted ill-formed schemas (where the layout pass would normally
-/// reject) get a silent `IrType::ListInt` fallback to keep the
-/// lowering total.
-fn type_repr_to_ir_type_dict(t: &TypeRepr) -> IrType {
+/// pointer slot, and `Option` / `Result` fold to i32 too. An
+/// unsupported `List<…>` element (one the strict mapper already
+/// rejects) is reported loudly rather than silently collapsed to
+/// `IrType::ListInt` — a mistyped list slot must cap at the lowering
+/// boundary, not decode as a list of integers on the host side.
+fn type_repr_to_ir_type_dict(t: &TypeRepr) -> Result<IrType, LoweringError> {
     if let Ok(ty) = type_repr_to_ir_type(t) {
-        return ty;
+        return Ok(ty);
     }
     match t {
         TypeRepr::Schema { .. }
         | TypeRepr::Option { .. }
         | TypeRepr::Result { .. }
-        | TypeRepr::Enum { .. } => IrType::I32,
-        TypeRepr::List { .. } => IrType::ListInt,
-        _ => IrType::I32,
+        | TypeRepr::Enum { .. } => Ok(IrType::I32),
+        // A `List<…>` reaching here failed the strict mapper, i.e. its
+        // element type is outside the supported lattice. Reject loudly
+        // — mirror `type_repr_to_ir_type` — instead of pretending it is
+        // a `List<Int>`.
+        other => Err(cap!(
+            "type_repr_to_ir_type_dict.unsupported_type_in_main",
+            LoweringError::UnsupportedTypeInMain {
+                type_name: format!("{other:?}"),
+                range: TokenRange::default(),
+            }
+        )),
     }
 }
 
@@ -10809,7 +10819,7 @@ fn lower_variant_call_as_type(
         lower_dict_field_value(schema, idx, &arg.value, arg.value.range, ctx)?;
         let canonical_field = &schema.fields[idx];
         let layout_field = &layout.fields[idx];
-        let ir_ty = type_repr_to_ir_type_dict(&canonical_field.ty);
+        let ir_ty = type_repr_to_ir_type_dict(&canonical_field.ty)?;
         let store_ty = match layout_field.kind {
             FieldKind::Inline { .. } => ir_ty,
             FieldKind::PointerIndirect { .. } => IrType::I32,
@@ -10823,7 +10833,12 @@ fn lower_variant_call_as_type(
                 }
             )
         })?;
-        if top.wasm_slot() != store_ty.wasm_slot() {
+        // Host-visible field-store boundary: compare the full IrType,
+        // not the collapsed wasm slot. The host decodes the slot per the
+        // schema's declared type, so a String / List* / Dict mistagged
+        // onto a differently-typed slot must cap here rather than slip
+        // through on a shared i32 slot.
+        if top != store_ty {
             return Err(cap!(
                 "lower_tuple_return.unsupported_expr",
                 LoweringError::UnsupportedExpr {
@@ -10958,7 +10973,7 @@ fn emit_variant_record_from_lowered_payload(
 ) -> Result<(), LoweringError> {
     let record_align = variant_record_alignment_for_lowering(expected)?;
     let (payload_offset, payload_ir_ty, record_size) = if let Some(payload_ty) = payload_ty {
-        let expected_ir = type_repr_to_ir_type_dict(payload_ty);
+        let expected_ir = type_repr_to_ir_type_dict(payload_ty)?;
         let top = ctx.tstack.pop().ok_or_else(|| {
             cap!(
                 "emit_standard_variant_record.empty_payload_stack",
@@ -11322,7 +11337,7 @@ fn lower_dict_into_record(
         }
         // Stack now holds the field's value (with type matching the
         // canonical Field). Emit the StoreFieldAtRecord.
-        let ir_ty = type_repr_to_ir_type_dict(&canonical_field.ty);
+        let ir_ty = type_repr_to_ir_type_dict(&canonical_field.ty)?;
         let store_ty = match layout_field.kind {
             FieldKind::Inline { .. } => ir_ty,
             // Pointer-indirect fields all store as an i32 pointer.
@@ -11340,7 +11355,12 @@ fn lower_dict_into_record(
                 }
             )
         })?;
-        if top.wasm_slot() != store_ty.wasm_slot() {
+        // Host-visible field-store boundary: compare the full IrType,
+        // not the collapsed wasm slot. The host decodes the slot per the
+        // schema's declared type, so a String / List* / Dict mistagged
+        // onto a differently-typed slot must cap here rather than slip
+        // through on a shared i32 slot.
+        if top != store_ty {
             return Err(cap!(
                 "lower_dict_into_record.unsupported_field_type.2",
                 LoweringError::UnsupportedFieldType {
@@ -11497,7 +11517,7 @@ fn lower_plain_dict_into_record(
             ));
         }
         lower_dict_field_value(schema, idx, user_value, user_value.range, ctx)?;
-        let ir_ty = type_repr_to_ir_type_dict(&canonical_field.ty);
+        let ir_ty = type_repr_to_ir_type_dict(&canonical_field.ty)?;
         let store_ty = match layout_field.kind {
             FieldKind::Inline { .. } => ir_ty,
             FieldKind::PointerIndirect { .. } => IrType::I32,
@@ -11514,7 +11534,12 @@ fn lower_plain_dict_into_record(
                 }
             )
         })?;
-        if top.wasm_slot() != store_ty.wasm_slot() {
+        // Host-visible field-store boundary: compare the full IrType,
+        // not the collapsed wasm slot. The host decodes the slot per the
+        // schema's declared type, so a String / List* / Dict mistagged
+        // onto a differently-typed slot must cap here rather than slip
+        // through on a shared i32 slot.
+        if top != store_ty {
             return Err(cap!(
                 "lower_plain_dict_into_record.unsupported_field_type.4",
                 LoweringError::UnsupportedFieldType {
@@ -11560,7 +11585,7 @@ fn lower_tuple_into_record(
 
         lower_dict_field_value(tuple_schema, idx, element, element.range, ctx)?;
 
-        let ir_ty = type_repr_to_ir_type_dict(&canonical_field.ty);
+        let ir_ty = type_repr_to_ir_type_dict(&canonical_field.ty)?;
         let store_ty = match layout_field.kind {
             FieldKind::Inline { .. } => ir_ty,
             FieldKind::PointerIndirect { .. } => IrType::I32,
@@ -11574,7 +11599,12 @@ fn lower_tuple_into_record(
                 }
             )
         })?;
-        if top.wasm_slot() != store_ty.wasm_slot() {
+        // Host-visible field-store boundary: compare the full IrType,
+        // not the collapsed wasm slot. The host decodes the slot per the
+        // schema's declared type, so a String / List* / Dict mistagged
+        // onto a differently-typed slot must cap here rather than slip
+        // through on a shared i32 slot.
+        if top != store_ty {
             return Err(cap!(
                 "lower_tuple_return.unsupported_expr",
                 LoweringError::UnsupportedExpr {
@@ -11695,7 +11725,7 @@ fn lower_dict_field_value(
                             range,
                         }
                     ))?;
-                    let expected_ir = type_repr_to_ir_type_dict(&canonical.ty);
+                    let expected_ir = type_repr_to_ir_type_dict(&canonical.ty)?;
                     if popped != expected_ir {
                         return Err(cap!(
                             "lower_dict_field_value.unsupported_field_type.1",
@@ -12092,7 +12122,7 @@ fn lower_enum_payload_path(
             ));
         }
         let payload_slot_offset = variant_payload_offset_for_lowering(&payload.ty)? as u32;
-        let field_ir = type_repr_to_ir_type_dict(&payload.ty);
+        let field_ir = type_repr_to_ir_type_dict(&payload.ty)?;
         ctx.out.push(TaggedOp {
             op: direct_payload_load_op(field_ir, payload_slot_offset),
             range,
@@ -12154,7 +12184,7 @@ fn lower_enum_payload_path(
                 }
             )
         })?;
-    let field_ir = type_repr_to_ir_type_dict(&field_meta.ty);
+    let field_ir = type_repr_to_ir_type_dict(&field_meta.ty)?;
     ctx.out.push(TaggedOp {
         op: Op::LoadI32AtAbsolute {
             offset: payload_slot_offset,
@@ -12597,7 +12627,7 @@ fn lower_variable(
                 }
             ));
         }
-        let field_ir = type_repr_to_ir_type_dict(&field_meta.ty);
+        let field_ir = type_repr_to_ir_type_dict(&field_meta.ty)?;
         ctx.out.push(TaggedOp {
             op: Op::LoadFieldAtAbsolute {
                 offset: layout_field.offset as u32,
