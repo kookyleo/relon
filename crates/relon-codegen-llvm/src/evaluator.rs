@@ -758,6 +758,9 @@ impl LlvmAotEvaluator {
             .get_function(crate::str_helpers::RELON_LLVM_STR_CONTAINS_ARENA_SYMBOL)
             .is_some()
             || module
+                .get_function(crate::str_helpers::RELON_LLVM_F64_TO_STR_SYMBOL)
+                .is_some()
+            || module
                 .get_function(crate::state::RELON_LLVM_CALL_NATIVE_SYMBOL)
                 .is_some();
         let force_default_mcjit = std::env::var_os("RELON_LLVM_FORCE_DEFAULT_MCJIT").is_some();
@@ -797,6 +800,15 @@ impl LlvmAotEvaluator {
                 &shim_fn,
                 crate::str_helpers::relon_llvm_str_contains_arena_addr(),
             );
+        }
+
+        // Wave B: same constraint for the float-render shim — the
+        // `Op::FloatToStr` lowering declares `relon_llvm_f64_to_str`
+        // as an external function whose body lives in this dylib's
+        // `.text`. No-op when the module never rendered a Float.
+        if let Some(shim_fn) = module.get_function(crate::str_helpers::RELON_LLVM_F64_TO_STR_SYMBOL)
+        {
+            engine.add_global_mapping(&shim_fn, crate::str_helpers::relon_llvm_f64_to_str_addr());
         }
 
         // Phase 0b: map the native-dispatch helper symbol to its host
@@ -2455,10 +2467,12 @@ pub struct EmitObjectInfo {
     /// dispatch. Empty under [`EmittedEntryShape::FastInt`] (the fast
     /// path doesn't touch the const pool).
     pub const_data: Vec<u8>,
-    /// `true` when the emitted body references the
-    /// `relon_llvm_str_contains_arena` host shim. Build.rs uses this
-    /// to decide whether to add the `relon-rs-shims` staticlib to
-    /// the linker invocation.
+    /// `true` when the emitted body references a host shim that lives
+    /// in the `relon-rs-shims` staticlib (`relon_llvm_str_contains_arena`
+    /// or Wave B's `relon_llvm_f64_to_str`). Build.rs uses this to
+    /// decide whether to add that staticlib to the linker invocation.
+    /// The historical name predates the second shim; semantically it
+    /// means "needs the rs-shims staticlib".
     pub references_str_contains_shim: bool,
 }
 
@@ -2860,16 +2874,20 @@ impl LlvmAotEvaluator {
                     }
                 }
 
-                // Detect whether the emitted module references the
-                // `relon_llvm_str_contains_arena` host shim — drives
-                // build.rs's decision to add the `relon-rs-shims`
-                // staticlib to the linker invocation. We check by
-                // name lookup against the LLVM module since the emit
-                // pass declares the extern lazily on first
-                // `Op::Call { contains }` site.
+                // Detect whether the emitted module references any
+                // host shim that lives in the `relon-rs-shims`
+                // staticlib (`relon_llvm_str_contains_arena`, Wave B's
+                // `relon_llvm_f64_to_str`) — drives build.rs's decision
+                // to add that staticlib to the linker invocation. We
+                // check by name lookup against the LLVM module since
+                // the emit pass declares each extern lazily on its
+                // first call site.
                 let needs_shim = module
                     .get_function(RELON_LLVM_STR_CONTAINS_ARENA_SYMBOL)
-                    .is_some();
+                    .is_some()
+                    || module
+                        .get_function(crate::str_helpers::RELON_LLVM_F64_TO_STR_SYMBOL)
+                        .is_some();
                 (EmittedEntryShape::Buffer, needs_shim)
             }
         };

@@ -2750,6 +2750,49 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
                 relon-codegen-llvm::aot_wasm_parity::{string_plus_bool,bool_plus_string}\
                 _aligns_native_via_wasmtime (both Bool values, both operand orders)",
     },
+    // ---- Wave B: unified value→String skeleton, Float leg ----
+    // `Op::FloatToStr` routes every compiled backend through ONE Rust
+    // Display byte producer (relon_ir::float_str::format_f64_display —
+    // the tree-walk oracle's `Value::Float` `format!` path): cranelift
+    // via vtable slot `RelonF64ToStr`, llvm-native via
+    // `add_global_mapping(relon_llvm_f64_to_str)`, wasm32 via the same
+    // fn `func_wrap`ped as an `env` import. `1.0 → "1"`, `-0.0 → "-0"`,
+    // `NaN` / `inf` / `-inf`, 327-char subnormal expansion — equal by
+    // construction.
+    SurfaceEntry {
+        construct: "Float value→String render (f-string interpolation, Op::FloatToStr)",
+        wave: "WB",
+        corpus: "wave_b_fstring_float_typical",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (TW_CR, 9-value boundary battery incl. -0.0 / NaN / \
+                ±inf / 5e-324 / 1e300); wasm + llvm-native legs proven four-way in \
+                relon-codegen-llvm::aot_wasm_parity::\
+                wave_b_fstring_float_battery_aligns_native_via_wasmtime (same battery)",
+    },
+    SurfaceEntry {
+        construct: "String + Float / Float + String coercion concat (render-then-StrConcatN)",
+        wave: "WB",
+        corpus: "string_plus_float_typical",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (TW_CR, both operand orders); wasm + llvm-native legs \
+                proven four-way in relon-codegen-llvm::aot_wasm_parity::\
+                wave_b_concat_{string_float,float_string}_battery_aligns_native_via_wasmtime \
+                (full boundary battery, both operand orders)",
+    },
+    SurfaceEntry {
+        construct: "Float-valued field decorator with String-concat body (@currency(\"USD\") \
+                    display: price → currency(price, \"USD\"); concat-coercible param mask \
+                    renders the scalar arg via Op::FloatToStr at the call edge)",
+        wave: "WB",
+        corpus: "wave_b_currency_decorator",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (TW_CR, display == \"USD 567.34\"); wasm + llvm-native \
+                legs proven four-way in relon-codegen-llvm::aot_wasm_parity::\
+                wave_b_currency_decorator_aligns_native_via_wasmtime; lowering shape asserted \
+                by relon-ir::lowering::tests::anon_dict_float_string_concat_decorator_lowers; \
+                explicitly-annotated String params keep rejecting scalar args \
+                (relon-ir::lowering::tests::annotated_string_param_rejects_float_arg)",
+    },
     // ---- Wave R3: range / map / filter / reduce / comprehension (Int) ----
     SurfaceEntry {
         construct: "range(n) as materialised List<Int>",
@@ -3074,15 +3117,16 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         construct: "String-result field decorator (@deco() k: v where deco's body is a \
                     pure `String + String + ...` concat — closure (param, ret) signature \
                     read as String from the body, value-first-desugared call lowers through \
-                    `Op::CallClosure { [String] -> String }` + `Op::StrConcatN`). Float-valued \
-                    concat operands have no `Float -> String` coercion op and cap loudly.",
+                    `Op::CallClosure { [String] -> String }` + `Op::StrConcatN`). Wave B \
+                    unsealed Float/Int/Bool-valued concat operands via Op::FloatToStr + the \
+                    concat-coercible param mask (see the WB decorator row).",
         wave: "R11",
         corpus: "r11_string_result_decorator",
         status: Status::Covered,
         proof: "tree-walk + cranelift (TW_CR; wasm + llvm-native legs proven in \
                 relon-codegen-llvm::aot_wasm_parity::r11_string_result_decorator; the \
-                Float-concat cap is asserted by \
-                relon-ir::lowering::tests::anon_dict_float_string_concat_decorator_caps)",
+                Float-concat decorator lowering is asserted by \
+                relon-ir::lowering::tests::anon_dict_float_string_concat_decorator_lowers)",
     },
     // ---- Wave R12-lower: spread (`...x`), the two static forms ----
     SurfaceEntry {

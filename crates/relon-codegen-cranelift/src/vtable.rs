@@ -50,11 +50,14 @@ use crate::sandbox::SandboxState;
 ///
 /// Layout (offset in bytes assumes 8-byte pointers):
 ///
-/// | Slot | Offset | Symbol referenced                |
-/// |------|--------|----------------------------------|
-/// |  0   |   0    | `SandboxState::now_helper`       |
-/// |  1   |   8    | `SandboxState::raise_trap`       |
-/// |  2   |  16    | `SandboxState::cap_lookup`       |
+/// | Slot | Offset | Symbol referenced                          |
+/// |------|--------|--------------------------------------------|
+/// |  0   |   0    | `SandboxState::now_helper`                 |
+/// |  1   |   8    | `SandboxState::raise_trap`                 |
+/// |  2   |  16    | `SandboxState::cap_lookup`                 |
+/// |  3   |  24    | `glob_helper::relon_glob_match_helper`     |
+/// |  4   |  32    | `SandboxState::call_native`                |
+/// |  5   |  40    | `f64_to_str_helper::relon_f64_to_str_helper` |
 ///
 /// The closure-table dispatch (`Op::CallClosure`) does **not** go
 /// through this vtable: it loads the host fn pointer from the
@@ -91,13 +94,28 @@ pub enum VtableSlot {
     /// `Arc<dyn RelonFunction>` registered at `import_idx`, packs the
     /// scalar args, and invokes it. See [`SandboxState::call_native`].
     RelonCallNative = 4,
+    /// Wave B (Float rendering): `extern "C" fn(state: *const
+    /// SandboxState, bits: i64, dest_off: i32) -> i32`.
+    ///
+    /// `Op::FloatToStr` leaf helper. `bits` is the IEEE-754 bit
+    /// pattern of the `f64` to render (the codegen bitcasts the CLIF
+    /// `F64` value into an `I64` register at the call edge); `dest_off`
+    /// is the arena-relative offset of a pre-allocated scratch record
+    /// of `relon_ir::float_str::FLOAT_TO_STR_RECORD_SIZE` bytes. The
+    /// helper writes a `[len: u32 LE][utf8 payload]` String record at
+    /// the offset using `relon_ir::float_str::format_f64_display` —
+    /// the exact Rust `Display` bytes the tree-walk oracle emits —
+    /// and returns the payload length, or `-1` on a bounds violation
+    /// (the codegen traps on a negative return, never reads a
+    /// half-written record).
+    RelonF64ToStr = 5,
 }
 
 impl VtableSlot {
     /// Number of slots reserved in the vtable. Bumping this requires
     /// a `GENERATOR_VERSION` bump in `object_cache_integration` so
     /// older cache files self-invalidate.
-    pub const COUNT: u32 = 5;
+    pub const COUNT: u32 = 6;
 
     /// Byte offset of this slot inside the vtable. Each slot is one
     /// host pointer (8 bytes on x86_64-linux, which is v5-γ's only
@@ -148,16 +166,19 @@ pub unsafe fn populate_vtable(vtable_ptr: *mut u8) {
         *slots.add(VtableSlot::RelonGlobMatch as usize) =
             crate::glob_helper::relon_glob_match_helper as *const u8;
         *slots.add(VtableSlot::RelonCallNative as usize) = SandboxState::call_native as *const u8;
+        *slots.add(VtableSlot::RelonF64ToStr as usize) =
+            crate::f64_to_str_helper::relon_f64_to_str_helper as *const u8;
     }
     tracing::trace!(
         target: "relon::vtable",
-        "populated vtable at {:p}: now={:p} raise_trap={:p} cap_lookup={:p} glob_match={:p} call_native={:p}",
+        "populated vtable at {:p}: now={:p} raise_trap={:p} cap_lookup={:p} glob_match={:p} call_native={:p} f64_to_str={:p}",
         vtable_ptr,
         SandboxState::now_helper as *const u8,
         SandboxState::raise_trap as *const u8,
         SandboxState::cap_lookup as *const u8,
         crate::glob_helper::relon_glob_match_helper as *const u8,
         SandboxState::call_native as *const u8,
+        crate::f64_to_str_helper::relon_f64_to_str_helper as *const u8,
     );
 }
 
@@ -172,6 +193,7 @@ mod tests {
         assert_eq!(VtableSlot::RelonCapLookup.offset_bytes(), 16);
         assert_eq!(VtableSlot::RelonGlobMatch.offset_bytes(), 24);
         assert_eq!(VtableSlot::RelonCallNative.offset_bytes(), 32);
+        assert_eq!(VtableSlot::RelonF64ToStr.offset_bytes(), 40);
     }
 
     #[test]
@@ -184,6 +206,7 @@ mod tests {
             VtableSlot::RelonCapLookup,
             VtableSlot::RelonGlobMatch,
             VtableSlot::RelonCallNative,
+            VtableSlot::RelonF64ToStr,
         ];
         assert_eq!(variants.len() as u32, VtableSlot::COUNT);
     }
@@ -213,6 +236,7 @@ mod tests {
             assert!(!(*slots.add(2)).is_null(), "RelonCapLookup slot");
             assert!(!(*slots.add(3)).is_null(), "RelonGlobMatch slot");
             assert!(!(*slots.add(4)).is_null(), "RelonCallNative slot");
+            assert!(!(*slots.add(5)).is_null(), "RelonF64ToStr slot");
         }
     }
 }

@@ -3065,6 +3065,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             Op::AllocScratchDyn => self.emit_alloc_scratch_dyn(&ip_hint)?,
             Op::StrConcatN { operand_count } => self.emit_str_concat_n(&ip_hint, *operand_count)?,
             Op::IntToStr => self.emit_int_to_str(&ip_hint)?,
+            Op::FloatToStr => self.emit_float_to_str(&ip_hint)?,
 
             // ---- Phase E.1 + E.2 call dispatch ----
             // stdlib indices (#278) route through the bundled-body

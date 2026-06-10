@@ -18,10 +18,11 @@ use tempfile::tempdir;
 
 #[test]
 fn vtable_layout_matches_slot_count() {
-    // 5 active slots × 8-byte pointer = 40 bytes used; the reserved
+    // 6 active slots × 8-byte pointer = 48 bytes used; the reserved
     // section is 32 slots so we have headroom for new helpers. Slot 4
-    // is the `#native` host-fn dispatch helper (`RelonCallNative`).
-    assert_eq!(VtableSlot::COUNT, 5);
+    // is the `#native` host-fn dispatch helper (`RelonCallNative`);
+    // slot 5 is the Wave B Float Display renderer (`RelonF64ToStr`).
+    assert_eq!(VtableSlot::COUNT, 6);
     let active_bytes: usize = VtableSlot::COUNT as usize * 8;
     assert!(VTABLE_BYTES >= active_bytes);
     assert_eq!(VtableSlot::RelonNow.offset_bytes(), 0);
@@ -29,6 +30,7 @@ fn vtable_layout_matches_slot_count() {
     assert_eq!(VtableSlot::RelonCapLookup.offset_bytes(), 16);
     assert_eq!(VtableSlot::RelonGlobMatch.offset_bytes(), 24);
     assert_eq!(VtableSlot::RelonCallNative.offset_bytes(), 32);
+    assert_eq!(VtableSlot::RelonF64ToStr.offset_bytes(), 40);
     assert_eq!(VTABLE_SYMBOL, "__relon_capability_vtable");
 }
 
@@ -43,6 +45,7 @@ fn populate_vtable_yields_three_non_null_pointers() {
         assert!(!(*slots.add(2)).is_null(), "RelonCapLookup slot");
         assert!(!(*slots.add(3)).is_null(), "RelonGlobMatch slot");
         assert!(!(*slots.add(4)).is_null(), "RelonCallNative slot");
+        assert!(!(*slots.add(5)).is_null(), "RelonF64ToStr slot");
     }
 }
 

@@ -155,6 +155,12 @@ fn one_bool(name: &str, v: bool) -> HashMap<String, Value> {
     m
 }
 
+fn one_float(name: &str, v: f64) -> HashMap<String, Value> {
+    let mut m = HashMap::new();
+    m.insert(name.to_string(), Value::Float(OrderedFloat(v)));
+    m
+}
+
 fn two_ints(an: &str, av: i64, bn: &str, bv: i64) -> HashMap<String, Value> {
     let mut m = HashMap::new();
     m.insert(an.to_string(), Value::Int(av));
@@ -708,6 +714,124 @@ pub fn all_cases() -> Vec<CorpusCase> {
             source: "#main(Bool b) -> String\nb + \"=flag\"",
             args_factory: || one_bool("b", false),
             tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        // Wave B (value→String): Float interpolation / coercion-concat.
+        // The Float operand lowers through `Op::FloatToStr`, whose every
+        // compiled leg calls the SAME Rust leaf helper
+        // (`relon_ir::float_str::format_f64_display` — the `format!`
+        // Display path the tree-walk oracle's `Value::Float` uses), so
+        // `1.0 → "1"`, `-0.0 → "-0"`, `NaN` / `inf` / `-inf`, `1e300`,
+        // and the 327-char `5e-324` subnormal expansion are byte-equal
+        // by construction. Differential battery covers both consumer
+        // paths (f-string + both concat orders); the llvm-native + wasm
+        // legs ride `aot_wasm_parity::wave_b_*`. Same `TW_CR` claim as
+        // every other String-returning row (bytecode rejects the shape,
+        // trace recipe absent).
+        CorpusCase {
+            name: "wave_b_fstring_float_typical",
+            source: "#main(Float x) -> String\nf\"v=${x}\"",
+            args_factory: || one_float("x", 567.34),
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "wave_b_fstring_float_integral",
+            source: "#main(Float x) -> String\nf\"v=${x}\"",
+            args_factory: || one_float("x", 1.0),
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "wave_b_fstring_float_neg_zero",
+            source: "#main(Float x) -> String\nf\"v=${x}\"",
+            args_factory: || one_float("x", -0.0),
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "wave_b_fstring_float_tenth",
+            source: "#main(Float x) -> String\nf\"v=${x}\"",
+            args_factory: || one_float("x", 0.1),
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "wave_b_fstring_float_huge",
+            source: "#main(Float x) -> String\nf\"v=${x}\"",
+            args_factory: || one_float("x", 1e300),
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "wave_b_fstring_float_subnormal",
+            source: "#main(Float x) -> String\nf\"v=${x}\"",
+            args_factory: || one_float("x", 5e-324),
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "wave_b_fstring_float_nan",
+            source: "#main(Float x) -> String\nf\"v=${x}\"",
+            args_factory: || one_float("x", f64::NAN),
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "wave_b_fstring_float_inf",
+            source: "#main(Float x) -> String\nf\"v=${x}\"",
+            args_factory: || one_float("x", f64::INFINITY),
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "wave_b_fstring_float_neg_inf",
+            source: "#main(Float x) -> String\nf\"v=${x}\"",
+            args_factory: || one_float("x", f64::NEG_INFINITY),
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        // `String + Float` coercion concat (RHS Float, rendered in place).
+        CorpusCase {
+            name: "string_plus_float_typical",
+            source: "#main(Float x) -> String\n\"v=\" + x",
+            args_factory: || one_float("x", 567.34),
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "string_plus_float_neg_zero",
+            source: "#main(Float x) -> String\n\"v=\" + x",
+            args_factory: || one_float("x", -0.0),
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        // `Float + String` coercion concat (LHS Float, buried-render path).
+        CorpusCase {
+            name: "float_plus_string_typical",
+            source: "#main(Float x) -> String\nx + \" usd\"",
+            args_factory: || one_float("x", 567.34),
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "float_plus_string_integral",
+            source: "#main(Float x) -> String\nx + \" usd\"",
+            args_factory: || one_float("x", 1.0),
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR,
+        },
+        // Wave B flagship: pricing-style `@currency` field decorator over
+        // a `Float` price. Value-first desugar (`currency(price, "USD")`)
+        // + the concat-coercible param mask render the Float arg through
+        // `Op::FloatToStr` at the call edge → `display == "USD 567.34"`.
+        CorpusCase {
+            name: "wave_b_currency_decorator",
+            source: "#relaxed\n#main(Float price) -> Dict\n\
+                     { #internal\n currency(val, sym): sym + \" \" + val,\n \
+                     @currency(\"USD\")\n display: price }",
+            args_factory: || one_float("price", 567.34),
+            tier: Tier::DictReturn,
             supported_by: TW_CR,
         },
         // ---- StdlibCaseFold ----

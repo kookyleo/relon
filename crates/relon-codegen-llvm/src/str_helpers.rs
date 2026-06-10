@@ -353,6 +353,87 @@ pub fn relon_llvm_str_contains_arena_addr() -> usize {
 /// the `#[no_mangle]` attribute on [`relon_llvm_str_contains_arena`].
 pub const RELON_LLVM_STR_CONTAINS_ARENA_SYMBOL: &str = "relon_llvm_str_contains_arena";
 
+/// Wave B host shim: render an `f64` (passed as raw IEEE-754 bits so no
+/// float ABI assumptions cross the FFI edge) into an arena String record
+/// at `dest`, using the exact same Rust `Display` byte producer the
+/// tree-walk oracle uses (`relon_ir::float_str::format_f64_display` —
+/// `format!("{v}")` semantics: `1.0 → "1"`, `-0.0 → "-0"`, NaN / ±inf
+/// spelled `NaN` / `inf` / `-inf`, subnormals in full decimal expansion).
+///
+/// ## ABI
+///
+/// ```text
+/// extern "C" fn relon_llvm_f64_to_str(
+///     bits: i64,        // f64::to_bits of the value, reinterpreted i64
+///     dest: *mut u8,    // arena_base + record_off; record is
+///                       // FLOAT_TO_STR_RECORD_SIZE bytes
+/// ) -> i32              // payload byte length, or -1 on failure
+/// ```
+///
+/// On success the shim writes `[len: u32 LE][utf8 payload]` at `dest`
+/// and returns the payload length. The emitter reserves
+/// `relon_ir::float_str::FLOAT_TO_STR_RECORD_SIZE` (768) bytes per
+/// record via the scratch bump allocator, which exceeds the worst-case
+/// Display payload (`-5e-324` → 327 bytes; hard cap
+/// `FLOAT_TO_STR_MAX_PAYLOAD` = 352) plus the 4-byte header, so the
+/// in-record formatting can never spill. A `-1` return (null `dest`, or
+/// payload exceeding the cap — both unreachable by construction) is
+/// trapped loudly by the emitter rather than producing a corrupt record.
+///
+/// No inline cache: unlike `str.contains` (stable const-pool pointer
+/// pairs on the hot bench rows), float-to-string inputs are arbitrary
+/// bit patterns with no pointer identity to key on, and the format cost
+/// is small relative to the FFI edge.
+///
+/// # Safety
+///
+/// `dest` must be either null or valid for writes of
+/// `FLOAT_TO_STR_RECORD_SIZE` bytes. The emitter passes
+/// `arena_base + offset` where the offset came from the scratch bump
+/// allocator's bounds-checked reservation, so the record always lies
+/// inside the live arena.
+#[no_mangle]
+pub unsafe extern "C" fn relon_llvm_f64_to_str(bits: i64, dest: *mut u8) -> i32 {
+    use relon_ir::float_str::{format_f64_display, FLOAT_TO_STR_MAX_PAYLOAD};
+    if dest.is_null() {
+        return -1;
+    }
+    let mut payload = [0u8; FLOAT_TO_STR_MAX_PAYLOAD];
+    let len = match format_f64_display(bits as u64, &mut payload) {
+        Some(len) => len,
+        None => return -1,
+    };
+    // SAFETY: caller guarantees `dest` is valid for
+    // FLOAT_TO_STR_RECORD_SIZE (768) writes; `4 + FLOAT_TO_STR_MAX_PAYLOAD
+    // <= FLOAT_TO_STR_RECORD_SIZE` is statically asserted in
+    // `relon_ir::float_str`, so header + payload always fit.
+    // `write_unaligned` because arena records only guarantee 4-byte
+    // alignment relative to a base that may sit at any byte offset of
+    // the host buffer.
+    unsafe {
+        core::ptr::write_unaligned(dest.cast::<u32>(), len as u32);
+        core::ptr::copy_nonoverlapping(payload.as_ptr(), dest.add(4), len);
+    }
+    len as i32
+}
+
+/// Address of [`relon_llvm_f64_to_str`] as a `usize`, suitable for
+/// `engine.add_global_mapping`. Two-step cast for the same
+/// `function_casts_as_integer` reason as
+/// [`relon_llvm_str_contains_arena_addr`].
+#[inline]
+pub fn relon_llvm_f64_to_str_addr() -> usize {
+    relon_llvm_f64_to_str as *const () as usize
+}
+
+/// Stable symbol name the LLVM module declares the float-render shim
+/// under. Mirrors the `#[no_mangle]` attribute on
+/// [`relon_llvm_f64_to_str`]. On the wasm32 leg the same name appears
+/// as `(import "env" "relon_llvm_f64_to_str" ...)` and the host
+/// satisfies it by `func_wrap`-ing the same Rust fn, so all compiled
+/// backends share one Display byte producer by construction.
+pub const RELON_LLVM_F64_TO_STR_SYMBOL: &str = "relon_llvm_f64_to_str";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,5 +610,63 @@ mod tests {
         // return the original 1, not the stale `0` from the second
         // call.
         assert_eq!(r3, 1);
+    }
+
+    /// Render `v` through the f64 shim into a fresh record buffer and
+    /// hand back the decoded payload string.
+    fn shim_render_f64(v: f64) -> String {
+        let mut record = vec![0u8; relon_ir::float_str::FLOAT_TO_STR_RECORD_SIZE as usize];
+        // SAFETY: `record` is FLOAT_TO_STR_RECORD_SIZE bytes, satisfying
+        // the shim's dest contract.
+        let len = unsafe { relon_llvm_f64_to_str(v.to_bits() as i64, record.as_mut_ptr()) };
+        assert!(len >= 0, "shim failed for {v}");
+        let header = u32::from_le_bytes(record[0..4].try_into().unwrap());
+        assert_eq!(header as i32, len, "header length must match return value");
+        String::from_utf8(record[4..4 + len as usize].to_vec()).unwrap()
+    }
+
+    /// Float boundary battery: the shim must produce the exact bytes of
+    /// Rust's `Display` (`format!("{v}")`), which is the tree-walk
+    /// oracle's `Value::Float` rendering.
+    #[test]
+    fn f64_shim_matches_display_battery() {
+        for v in [
+            1.0,
+            -0.0,
+            0.0,
+            0.1,
+            567.34,
+            1e300,
+            5e-324,
+            -5e-324,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+        ] {
+            assert_eq!(shim_render_f64(v), format!("{v}"), "bytes drift for {v:?}");
+        }
+        assert_eq!(shim_render_f64(1.0), "1");
+        assert_eq!(shim_render_f64(-0.0), "-0");
+        assert_eq!(shim_render_f64(f64::NAN), "NaN");
+        assert_eq!(shim_render_f64(f64::INFINITY), "inf");
+        assert_eq!(shim_render_f64(f64::NEG_INFINITY), "-inf");
+        // Subnormal worst case: 327-char decimal expansion fits the record.
+        assert_eq!(shim_render_f64(-5e-324).len(), 327);
+    }
+
+    #[test]
+    fn f64_shim_null_dest_returns_negative() {
+        let r = unsafe { relon_llvm_f64_to_str(1.0f64.to_bits() as i64, core::ptr::null_mut()) };
+        assert_eq!(r, -1);
+    }
+
+    #[test]
+    fn f64_addr_helper_is_stable() {
+        let a = relon_llvm_f64_to_str_addr();
+        let b = relon_llvm_f64_to_str_addr();
+        assert_eq!(a, b);
+        assert!(a != 0);
     }
 }

@@ -165,6 +165,18 @@ struct LowerCtx<'a> {
     /// The signature is the **user-visible** surface (no implicit
     /// captures_ptr) — same convention as `Op::CallClosure`.
     closure_let_signatures: HashMap<u32, (Vec<IrType>, IrType)>,
+    /// Wave B (Float rendering): per-let-idx mask of closure params
+    /// whose `String` type came from the anon-Dict String-concat body
+    /// inference (see [`plan_anon_dict_closure_sig`]) rather than an
+    /// explicit annotation. Such a param is only ever used as a
+    /// concat leaf inside the body, so
+    /// [`try_lower_local_closure_call`] may render a scalar argument
+    /// (Int / Bool / Float) to `String` *before* the call — byte-
+    /// identical to the tree-walk oracle, which renders the value at
+    /// the `+` inside the body via the same `Display`. Absent entries
+    /// mean "no coercible params" (the where-binding closure path
+    /// never infers String-from-concat).
+    closure_concat_coercible: HashMap<u32, Vec<bool>>,
     /// #359 (W20 container perf): per-let-idx compile-time scalar
     /// constant value for where-bound scalar literals (`soft: 0.1`,
     /// `dt: 0.01`, `m0: 1.0`, ...). Recorded by [`lower_where`] when a
@@ -371,6 +383,7 @@ impl<'a> LowerCtx<'a> {
             variant_records_in_scratch: false,
             lambda_table: Rc::new(RefCell::new(Vec::new())),
             closure_let_signatures: HashMap::new(),
+            closure_concat_coercible: HashMap::new(),
             const_let_values: HashMap::new(),
             native_imports,
         }
@@ -405,6 +418,7 @@ impl<'a> LowerCtx<'a> {
             variant_records_in_scratch: false,
             lambda_table: Rc::new(RefCell::new(Vec::new())),
             closure_let_signatures: HashMap::new(),
+            closure_concat_coercible: HashMap::new(),
             const_let_values: HashMap::new(),
             native_imports,
         }
@@ -1424,6 +1438,11 @@ enum AnonDictField {
         name: String,
         param_tys: Vec<IrType>,
         ret_ty: IrType,
+        /// Per-param mask: `true` when the param's `String` type came
+        /// from the concat-body inference (not an annotation), so a
+        /// call site may render a scalar argument to `String` first —
+        /// see [`plan_anon_dict_closure_sig`].
+        concat_coercible: Vec<bool>,
     },
     /// Source-level field whose value is a normal expression (the
     /// "host-visible" surface). Stored into the root record at the
@@ -1730,13 +1749,14 @@ fn anon_dict_return_plan(
                 // then a conservative String-concat body inference, then
                 // the historical I64 default (W7 fib). See
                 // `plan_anon_dict_closure_sig`.
-                let (param_irts, ret_ty) =
+                let (param_irts, ret_ty, concat_coercible) =
                     plan_anon_dict_closure_sig(params, return_type.as_ref(), &body.expr);
                 closure_field_sigs.insert(name.as_str(), (param_irts.clone(), ret_ty));
                 fields_by_decl[decl_idx] = Some(AnonDictField::Closure {
                     name: name.clone(),
                     param_tys: param_irts,
                     ret_ty,
+                    concat_coercible,
                 });
             }
             Expr::Dict(inner_pairs) => {
@@ -3001,6 +3021,7 @@ fn lower_anon_dict_body(
                 name,
                 param_tys,
                 ret_ty,
+                concat_coercible,
             } => {
                 let value = user_values.get(name.as_str()).copied().ok_or_else(|| {
                     cap!(
@@ -3029,6 +3050,10 @@ fn lower_anon_dict_body(
                 });
                 ctx.closure_let_signatures
                     .insert(let_idx, (param_tys.clone(), *ret_ty));
+                if concat_coercible.iter().any(|&c| c) {
+                    ctx.closure_concat_coercible
+                        .insert(let_idx, concat_coercible.clone());
+                }
 
                 // Lower the closure body — pushes `IrType::Closure` on
                 // top of the vstack and appends the lambda to
@@ -5701,6 +5726,30 @@ fn try_lower_local_closure_call(
             )
         })?;
         if got.wasm_slot() != expected.wasm_slot() {
+            // Wave B: a param typed `String` by the concat-body
+            // inference (never by an explicit annotation) is only ever
+            // used as a concat leaf inside the body, so rendering a
+            // scalar argument to `String` *before* the call is
+            // byte-identical to the tree-walk oracle, which renders
+            // the value at the `+` inside the body via the same
+            // `Display`. This is what admits the
+            // `examples/pricing.relon` Float-valued `@currency` shape
+            // (`@currency("USD") display: price` ⇒
+            // `currency(price, "USD")` with a String-concat body).
+            let coercible = expected == IrType::String
+                && matches!(got, IrType::I64 | IrType::F64 | IrType::Bool)
+                && ctx
+                    .closure_concat_coercible
+                    .get(&binding.idx)
+                    .and_then(|mask| mask.get(i).copied())
+                    .unwrap_or(false);
+            if coercible {
+                // `lower_value_to_string` expects the operand tag
+                // already popped (it is — `got` above) and pushes the
+                // result `String` tag itself.
+                lower_value_to_string(got, call_arg.value.range, ctx)?;
+                continue;
+            }
             return Err(cap!(
                 "try_lower_local_closure_call.stdlib_arg_type_mismatch",
                 LoweringError::StdlibArgTypeMismatch {
@@ -7842,16 +7891,22 @@ fn check_stdlib_arg(
 ///      unannotated params and an unannotated return both default to
 ///      I64 (the W7 `fib` Int surface).
 ///
-/// Float-valued concat operands (e.g. the `examples/pricing.relon`
-/// `currency(symbol, val)` whose value-first `symbol` is a `Float`
-/// price) are deliberately NOT typed here: there is no `Float -> String`
-/// coercion op on the compiled path, so the call-site arg-type check
-/// caps such a field loudly rather than mis-compiling it.
+/// The returned `concat_coercible` mask marks the params that were
+/// typed `String` **by the concat-body inference** (case 2) rather
+/// than by an explicit annotation. The String-concat body shape
+/// guarantees such a param is used *only* as a concat leaf, so a
+/// call site may render a scalar argument (Int / Bool / Float) to
+/// `String` before the call and produce byte-identical output to the
+/// tree-walk oracle (which renders the value at the `+` inside the
+/// body via the same `Display`). `try_lower_local_closure_call`
+/// consults the mask to admit the `examples/pricing.relon`
+/// Float-valued `@currency` shape; explicitly-annotated `String`
+/// params are never coerced (the mask stays `false` for them).
 fn plan_anon_dict_closure_sig(
     params: &[ClosureParam],
     return_type: Option<&TypeNode>,
     body: &Expr,
-) -> (Vec<IrType>, IrType) {
+) -> (Vec<IrType>, IrType, Vec<bool>) {
     // Explicit param annotations first (honoured when present; the
     // anon-Dict surface can't yet *write* one, but the read is correct
     // and forward-compatible). Unannotated params start as I64.
@@ -7879,9 +7934,11 @@ fn plan_anon_dict_closure_sig(
         // they were. The conservative walk only descends `+` nodes, so a
         // param appearing under a numeric subexpression won't reach here
         // (the whole body would already have been rejected).
+        let mut concat_coercible = vec![false; params.len()];
         for (i, p) in params.iter().enumerate() {
             if p.type_hint.is_none() && string_concat_uses_param(body, &p.name) {
                 param_irts[i] = IrType::String;
+                concat_coercible[i] = true;
             }
         }
         // Honour an explicit String annotation; if the annotation
@@ -7889,13 +7946,14 @@ fn plan_anon_dict_closure_sig(
         // explicit annotation (the user wrote it on purpose) — the
         // call-site / body type-check then surfaces any real conflict.
         let ret_ty = explicit_ret.unwrap_or(IrType::String);
-        return (param_irts, ret_ty);
+        return (param_irts, ret_ty, concat_coercible);
     }
 
     // Not a String concat: keep the historical I64 default unless an
     // explicit return annotation says otherwise.
     let ret_ty = explicit_ret.unwrap_or(IrType::I64);
-    (param_irts, ret_ty)
+    let coercible = vec![false; params.len()];
+    (param_irts, ret_ty, coercible)
 }
 
 /// True when `expr` is an unambiguous `String + String + ...` concat
@@ -8805,9 +8863,10 @@ fn lower_binary(
         // `String + String` concat path). Only `Add` reaches here for
         // String operands (other arith ops were rejected upstream).
         //
-        // Wave 1 supports a Bool non-String operand; Float / composite
-        // operands stay capped (the skeleton itself loud-caps them, so
-        // any unsupported side returns through the `?` below). The LHS
+        // Int / Bool / Float non-String operands are supported;
+        // composite operands stay capped (the skeleton itself
+        // loud-caps them, so any unsupported side returns through the
+        // `?` below). The LHS
         // ops still sit at the tail of `ctx.out` and the RHS ops are
         // still detached in `rhs_ops`, so each side is rendered in its
         // own stream before the two are concatenated in source order.
@@ -9054,7 +9113,7 @@ fn lower_fstring(
 /// concat route through here so the rendered bytes stay identical
 /// across the two surfaces and across every backend.
 ///
-/// Coverage (Wave 1):
+/// Coverage:
 /// * `String` → identity (the operand already is the result).
 /// * `I64`    → reuse the existing `Op::IntToStr` (byte-exact with
 ///   `i64` `Display`); routing through here must not change the bytes
@@ -9062,7 +9121,10 @@ fn lower_fstring(
 /// * `Bool`   → render as `b ? "true" : "false"` using the existing
 ///   `Op::If` + `Op::ConstString` ops (no new op), byte-exact with the
 ///   tree-walk oracle's `Value::Bool` `Display`.
-/// * `F64`    → loud cap (deferred to Wave 2).
+/// * `F64`    → `Op::FloatToStr` (Wave B). Byte-exact with the
+///   oracle's `Value::Float` `Display` because every compiled backend
+///   renders through the same Rust leaf helper
+///   (`relon_ir::float_str::format_f64_display`).
 /// * everything else (List / Dict / Schema / Null / …) → loud cap; we
 ///   never silently render a wrong byte sequence.
 fn lower_value_to_string(
@@ -9117,12 +9179,23 @@ fn lower_value_to_string(
             ctx.tstack.push(IrType::String);
             Ok(())
         }
+        IrType::F64 => {
+            // Float → decimal rendering, byte-exact with the oracle's
+            // `f64` `Display` (all compiled backends call the same
+            // Rust leaf helper — see `Op::FloatToStr`).
+            ctx.out.push(TaggedOp {
+                op: Op::FloatToStr,
+                range,
+            });
+            ctx.tstack.push(IrType::String);
+            Ok(())
+        }
         other => Err(cap!(
             "lower_expr.unsupported_expr.8",
             LoweringError::UnsupportedExpr {
                 kind: format!(
                     "value-to-String coercion of type {other:?} — only String / Int / \
-                     Bool have a byte-exact AOT coercion (Float / composite deferred)"
+                     Bool / Float have a byte-exact AOT coercion (composite deferred)"
                 ),
                 range,
             }
@@ -14364,21 +14437,51 @@ mod w7_closure_boundary_tests {
         );
     }
 
-    /// Honest cap: the `examples/pricing.relon` Float-valued currency
-    /// shape — `currency(symbol, val): symbol + " " + val` decorating a
-    /// `Float` field — has no `Float -> String` coercion op on the
-    /// compiled path, so it must cap loudly rather than mis-compile.
-    /// The String-concat body inference types `symbol` as `String`, and
-    /// the call-site arg-type check then rejects the `Float` value.
+    /// Wave B: the `examples/pricing.relon` Float-valued currency shape
+    /// — `currency(symbol, val): symbol + " " + val` decorating a
+    /// `Float` field — now lowers. The String-concat body inference
+    /// types both params as `String` (concat-coercible), and the
+    /// call-site renders the Float value through `Op::FloatToStr`
+    /// before the `Op::CallClosure { [String, String] -> String }`,
+    /// byte-identical to the tree-walk oracle (which renders the Float
+    /// at the `+` inside the body via the same `Display`).
     #[test]
-    fn anon_dict_float_string_concat_decorator_caps() {
+    fn anon_dict_float_string_concat_decorator_lowers() {
         let src = "#relaxed\n#main(Float price) -> Dict\n\
                    { #internal\n currency(symbol, val): symbol + \" \" + val,\n \
                    @currency(\"USD\")\n display: price }";
-        let err = try_lower(src).expect_err("Float -> String concat must cap loudly");
+        let module = try_lower(src).expect("Float-valued String-concat decorator lowers");
+        let entry_idx = module.entry_func_index.expect("entry func");
+        let entry = &module.funcs[entry_idx];
+        let has_float_to_str = entry.body.iter().any(|t| matches!(&t.op, Op::FloatToStr));
+        let string_ret_call = entry.body.iter().any(|t| {
+            matches!(
+                &t.op,
+                Op::CallClosure { ret_ty, param_tys }
+                    if *ret_ty == IrType::String
+                        && param_tys.as_slice() == [IrType::String, IrType::String]
+            )
+        });
+        assert!(
+            has_float_to_str && string_ret_call,
+            "expected Op::FloatToStr + CallClosure {{ [String, String] -> String }}, \
+             body ops: {:?}",
+            entry.body.iter().map(|t| &t.op).collect::<Vec<_>>()
+        );
+    }
+
+    /// Honesty guard for the concat-coercible mask: an explicitly
+    /// `String`-annotated closure param is never call-site coerced, so
+    /// passing a Float to it still caps loudly.
+    #[test]
+    fn annotated_string_param_rejects_float_arg() {
+        let src = "#relaxed\n#main(Float price) -> Dict\n\
+                   { #internal\n tag: (String s) => \"<\" + s + \">\",\n \
+                   display: tag(price) }";
+        let err = try_lower(src).expect_err("annotated String param must reject Float");
         assert!(
             matches!(err, LoweringError::StdlibArgTypeMismatch { .. }),
-            "expected a loud StdlibArgTypeMismatch cap for the Float concat operand, got {err:?}"
+            "expected a loud StdlibArgTypeMismatch for the annotated param, got {err:?}"
         );
     }
 

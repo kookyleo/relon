@@ -116,6 +116,22 @@ pub(super) fn make_call_native_signature(pointer_ty: cranelift_codegen::ir::Type
     sig
 }
 
+/// Build the cranelift signature for the `RelonF64ToStr` vtable slot:
+/// `extern "C" fn(state: *const SandboxState, bits: i64, dest_off:
+/// i32) -> i32`. `bits` carries the IEEE-754 bit pattern of the `f64`
+/// to render (bitcast at the call edge); `dest_off` is the
+/// arena-relative offset of the pre-allocated scratch record the
+/// helper fills with `[len: u32 LE][utf8 payload]`; the i32 return is
+/// the payload length, negative on failure (the codegen traps on it).
+pub(super) fn make_f64_to_str_signature(pointer_ty: cranelift_codegen::ir::Type) -> Signature {
+    let mut sig = Signature::new(CallConv::SystemV);
+    sig.params.push(AbiParam::new(pointer_ty)); // state
+    sig.params.push(AbiParam::new(I64)); // f64 bit pattern
+    sig.params.push(AbiParam::new(I32)); // dest record offset
+    sig.returns.push(AbiParam::new(I32)); // payload len / -1
+    sig
+}
+
 /// Build the cranelift signature for the libc `fmod` libcall:
 /// `extern "C" fn(a: f64, b: f64) -> f64` (the SysV C ABI). The
 /// cranelift backend has no native float-remainder instruction (x86

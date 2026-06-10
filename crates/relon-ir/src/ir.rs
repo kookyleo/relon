@@ -660,6 +660,30 @@ pub enum Op {
     /// self-contained: no external itoa libcall, so the wasm leg needs
     /// no extra import.
     IntToStr,
+    /// Wave B (Float rendering) — convert an `F64` value to its decimal
+    /// `String` record. Stack: `[F64] -> [String]`.
+    ///
+    /// Produced by the unified value→String dispatch
+    /// (`lower_value_to_string`) for f-string interpolation of a
+    /// `Float` and for `String + Float` / `Float + String` concat. The
+    /// rendering is byte-exact with the tree-walker's
+    /// `write!(result, "{}", Value::Float(f))` — i.e. Rust's `f64`
+    /// `Display`: shortest round-trip decimal, positional only (never
+    /// scientific), `1.0 → "1"`, `-0.0 → "-0"`, `NaN` / `inf` /
+    /// `-inf` verbatim, and the subnormal extreme `-5e-324` renders
+    /// all 327 chars.
+    ///
+    /// Unlike [`Op::IntToStr`] the rendering is NOT re-implemented
+    /// per backend: every compiled backend calls the **same Rust leaf
+    /// helper** built on `relon_ir::float_str::format_f64_display`
+    /// (cranelift via the capability-vtable slot `RelonF64ToStr`,
+    /// LLVM-native via an `add_global_mapping` extern shim, LLVM-wasm
+    /// via an `(import "env" "relon_llvm_f64_to_str" ...)` the host
+    /// satisfies with the identical function), so a Display-algorithm
+    /// drift between backends is impossible by construction. The
+    /// result lands in a fresh `[len: u32 LE][utf8]` scratch-arena
+    /// record (same layout as [`Op::StrConcatN`]).
+    FloatToStr,
     /// Pop two operands of the tagged type, push their difference.
     Sub(IrType),
     /// Pop two operands of the tagged type, push their product.
@@ -1789,6 +1813,7 @@ impl Op {
             | Op::Add(_)
             | Op::StrConcatN { .. }
             | Op::IntToStr
+            | Op::FloatToStr
             | Op::Sub(_)
             | Op::Mul(_)
             | Op::Div(_)
