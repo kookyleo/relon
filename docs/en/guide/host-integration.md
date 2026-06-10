@@ -15,15 +15,14 @@ external data enter Relon?
 
 The recommended pattern is **push** — the host completes all I/O
 **before** evaluation, materializes the data into `Value`, and pushes
-it via `Evaluator::run_main(scope, args)`. The script declares the
+it via `run_main(args)`. The script declares the
 expected shape via `#main(...)`. The whole thing stays a pure
 function `(source, args) → output`:
 
 ```rust
 // Recommended: push-style, #main entry program
 use std::collections::HashMap;
-use std::sync::Arc;
-use relon_evaluator::{Context, Evaluator, Scope, Value};
+use relon::{Backend, EvaluatorBuilder, TrustLevel, Value};
 
 let user_data = http_client.get(&format!("/api/user/{user_id}")).await?;
 let posts_data = db.query_user_posts(user_id).await?;
@@ -32,16 +31,16 @@ let posts_data = db.query_user_posts(user_id).await?;
 let user_value: Value = serde_json::from_value(user_data)?;
 let posts_value: Value = serde_json::from_value(posts_data)?;
 
-let analyzed = relon_analyzer::analyze(&parsed_node);
-let mut ctx = Context::sandboxed().with_root(parsed_node);
-ctx.analyzed = Some(Arc::new(analyzed));
+let evaluator = EvaluatorBuilder::from_str(source)
+    .backend(Backend::Auto)          // the default; auto-dispatches between interpreter and AOT
+    .trust(TrustLevel::Sandboxed)    // the default; spell the trust posture out
+    .build()?;
 
 let mut args = HashMap::new();
 args.insert("user".to_string(), user_value);
 args.insert("posts".to_string(), posts_value);
 
-let result = Evaluator::new(Arc::new(ctx))
-    .run_main(&Arc::new(Scope::default()), args)?;
+let result = evaluator.run_main(args)?;
 ```
 
 `serde_json::from_value::<Value>` is targetless: JSON arrays decode as
@@ -364,7 +363,7 @@ return position.
 Host code:
 
 ```rust
-match evaluator.run_main(&scope, args) {
+match evaluator.run_main(args) {
     Ok(value) => /* value is the Json described by ReturnType */,
     Err(e)    => /* validation / eval / capability error */,
 }
@@ -438,8 +437,8 @@ Whether a file declares `#main(...)` decides **how it's used**:
 
 | Declaration | Usage | Entry evaluation |
 | --- | --- | --- |
-| `#main(...)` | Entry program | `Evaluator::run_main(scope, args)`; calling `eval_root` directly raises `NoMainSignature` |
-| No `#main` | Pure-data / shared-schema library | `Evaluator::eval_root(scope)` works; the file may also be `#import`-ed |
+| `#main(...)` | Entry program | Push args via `run_main(args)`; `eval_root` does **not** check for `#main` — it evaluates the root expression as usual, with the parameters unbound (referencing them fails as undefined names) |
+| No `#main` | Pure-data / shared-schema library | `eval_root(scope)` works; the file may also be `#import`-ed; calling `run_main` on it raises `NoMainSignature` |
 
 Library files don't need `#main` when imported — `#import` only takes
 their exports. Benefits:
@@ -468,7 +467,8 @@ let json = relon::json_from_str(r#"{ host: "localhost", port: 8080 }"#)?;
 
 > The top-level `relon::*` API takes the "no-`#main` library / data
 > file" fast path (calls `eval_root` internally). To run an entry
-> program with `#main(...)`, use `Evaluator::run_main(...)` directly.
+> program with `#main(...)`, build with `EvaluatorBuilder` and call
+> `run_main(args)`.
 
 Want a strongly typed Rust struct instead? Use serde:
 
@@ -501,14 +501,55 @@ let cfg: ServerConfig = relon::from_file("config/app.relon")?;
 | `project_with(&projector, &value) -> P::Output` | Project an already-evaluated `Value` through a custom `Projector` |
 | `project_from_str(src, &projector) -> P::Output` | Parse + eval + project in one shot |
 
-## What `Context` is
+Every evaluating entry point above runs in the **sandboxed posture**
+(filesystem `#import` denied, gated native fns blocked). Each has a
+matching `*_trusted` variant — `from_str_trusted` /
+`from_file_trusted` / `json_from_str_trusted` /
+`json_from_file_trusted` / `value_from_str_trusted` /
+`value_from_file_trusted` / `project_from_str_trusted` — that
+evaluates in the trusted posture (equivalent to
+`TrustLevel::Trusted`: filesystem `#import` allowed), intended
+**only** for host-owned scripts.
 
-When you use the top-level `relon::*` API, `Context` is constructed
-internally. To register native functions, decorators, custom module
-resolvers, or capabilities, build `Context` directly:
+### `EvaluatorBuilder`: pick a backend, a trust posture, host fns
+
+When you need more control than "one line to JSON" (choosing the
+execution backend, running a `#main` entry, registering native fns),
+use the facade's `EvaluatorBuilder`:
 
 ```rust
-use relon_evaluator::{Context, Evaluator, Scope};
+use relon::{Backend, EvaluatorBuilder, TrustLevel};
+
+let evaluator = EvaluatorBuilder::from_str(source)   // or from_file(path)
+    .backend(Backend::Auto)        // Auto (default) / TreeWalk / CraneliftAot / LlvmAot
+    .trust(TrustLevel::Sandboxed)  // Sandboxed (default) / Trusted
+    .register_pure_native_fn("app_version", Arc::new(AppVersion))
+    .build()?;                     // -> Box<dyn relon::Evaluator>
+
+let json_value = evaluator.eval_root(&Arc::new(relon::Scope::default()))?;
+// or, for an entry program: evaluator.run_main(args)?
+```
+
+- `Backend::Auto` (the default) short-circuits trivial scalar `#main`
+  programs to the tree-walker, lazily compiles everything else with
+  cranelift AOT, and falls back loudly to the tree-walker for shapes
+  the compiler doesn't support — see [Performance](./performance).
+- `register_native_fn(name, gate, fn)` / `register_pure_native_fn`
+  are only meaningful for tree-walker-backed builds
+  (`Backend::TreeWalk` and the tree-walk side of `Auto`); building
+  under `CraneliftAot` with staged fns fails loudly with
+  `BackendError::UnsupportedFeature`.
+
+## What `Context` is
+
+When you use the top-level `relon::*` API or `EvaluatorBuilder`,
+`Context` is constructed internally. To register decorators, custom
+module resolvers, or adjust capability knobs one by one, build
+`Context` directly and hand it to the concrete backend type
+`TreeWalkEvaluator` (`Evaluator` is the trait all backends share):
+
+```rust
+use relon_evaluator::{Context, Scope, TreeWalkEvaluator};
 use relon_parser::parse_document;
 use std::sync::Arc;
 
@@ -517,7 +558,8 @@ let mut ctx = Context::sandboxed().with_root(node);
 
 // (register functions / decorators / swap module resolver here)
 
-let value = Evaluator::new(Arc::new(ctx)).eval_root(&Arc::new(Scope::default()))?;
+let value = TreeWalkEvaluator::new(Arc::new(ctx))
+    .eval_root(&Arc::new(Scope::default()))?;
 ```
 
 `Context` holds:
@@ -539,7 +581,7 @@ let value = Evaluator::new(Arc::new(ctx)).eval_root(&Arc::new(Scope::default()))
 > Historical note: early versions provided
 > `Context.input: Option<Value>` and `with_input(value)` as a push
 > entry; both have been **removed** — push is now uniformly
-> `Evaluator::run_main(scope, args)`. An even earlier
+> `run_main(args)`. An even earlier
 > `Context.globals: HashMap<String, Value>` general-purpose injection
 > point was also removed: mixing semantics in one map scattered the
 > failure modes. Today there's a single entry point + `#main`
@@ -567,7 +609,7 @@ struct AppVersion;
 
 impl RelonFunction for AppVersion {
     fn call(&self, _args: NativeArgs, _range: TokenRange) -> Result<Value, RuntimeError> {
-        Ok(Value::String(env!("CARGO_PKG_VERSION").to_string()))
+        Ok(Value::String(env!("CARGO_PKG_VERSION").into()))
     }
 }
 
@@ -611,7 +653,7 @@ struct ReadSecret;
 impl RelonFunction for ReadSecret {
     fn call(&self, _args: NativeArgs, _range: TokenRange) -> Result<Value, RuntimeError> {
         let secret = std::fs::read_to_string("/etc/myapp/secret").unwrap_or_default();
-        Ok(Value::String(secret))
+        Ok(Value::String(secret.into()))
     }
 }
 
@@ -763,6 +805,48 @@ let json = relon::project_from_str(source, &InternallyTaggedJson)?;
 > not an escape hatch out of JSON. Relon's output always lands in
 > JSON — that's a hard constraint. If you want YAML / TOML / XML,
 > that's another tool's job (e.g. Pkl).
+
+## Build-time AOT: `include_relon!` and relon-rs-*
+
+Beyond runtime embedding, you can compile `.relon` sources into
+relocatable object files at **build time** and link them into your
+Rust binary — `#main` becomes an ordinary Rust function call, with no
+parse / eval cost at runtime. Three crates are involved:
+
+- **`relon-rs-build`** — the build.rs-side `Compiler`, which compiles
+  each `.relon` source into one ELF object file (exporting a single
+  extern symbol) plus one generated binding `.rs`;
+- **`relon-rs-macro`** — the `include_relon!` proc-macro that
+  stitches the matching binding into your source file;
+- **`relon-rs-shims`** — the runtime host shims (`SandboxState`, the
+  buffer-protocol entry, string operators, …).
+
+```rust
+// build.rs
+fn main() {
+    let out_dir = std::env::var_os("OUT_DIR").unwrap();
+    relon_rs_build::Compiler::new()
+        .source("src/foo.relon")
+        .emit_all(&out_dir)
+        .unwrap();
+}
+```
+
+```rust
+// src/main.rs
+relon_rs_macro::include_relon!("src/foo.relon");
+// or aliased: relon_rs_macro::include_relon!("src/foo.relon" as compute);
+
+fn main() {
+    let state = relon_rs_shims::SandboxState::default();
+    println!("{}", foo::main(&state, 42)); // #main(Int n) -> Int
+}
+```
+
+The accepted leaf types for `#main` parameters and the return slot
+are currently `Int` / `Float` / `Bool` / `String` / `List<Int>` (the
+authoritative list is `relon-rs-build`'s `rust_type_for` table). See
+`crates/relon-rs-demo` for an end-to-end example.
 
 ## Error types
 

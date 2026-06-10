@@ -126,7 +126,7 @@ Relon has no file-level "library/entry" marker. Whether a file
 declares `#main(...)` decides **how it's used**:
 
 - The file **has** `#main(...)`: it's an entry program. The host must
-  push arguments via `Evaluator::run_main(scope, args)` for it to
+  push arguments via `run_main(args)` for it to
   evaluate. `#import`-ing it as a library is also allowed (the args
   aren't used; only its exports).
 - The file **lacks** `#main(...)`: it's a "contractless" pure-data /
@@ -168,7 +168,7 @@ args.insert(
     "notice".to_string(),
     /* host-pushed Value::Dict */ notice_value,
 );
-let result = evaluator.run_main(&scope, args)?;
+let result = evaluator.run_main(args)?;
 ```
 
 Calling `run_main` on a library file **without** `#main(...)` raises

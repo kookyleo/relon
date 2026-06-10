@@ -110,7 +110,7 @@ Relon 没有「文件级别 library/entry 标记」这一概念。是否有 `#ma
 签名决定了文件**怎么用**：
 
 - 文件**有** `#main(...)`：是入口程序。宿主必须通过
-  `Evaluator::run_main(scope, args)` 推入参数才能跑出结果。直接当
+  `run_main(args)` 推入参数才能跑出结果。直接当
   库 `#import` 也允许（参数不会被使用，只取它的导出）。
 - 文件**没有** `#main(...)`：是「无契约」的纯数据 / 库文件。既可以
   被 `#import` 当模块用，也可以被宿主直接 `eval_root` 求值得到一份
@@ -151,7 +151,7 @@ args.insert(
     "notice".to_string(),
     /* host 推入的 Value::Dict */ notice_value,
 );
-let result = evaluator.run_main(&scope, args)?;
+let result = evaluator.run_main(args)?;
 ```
 
 对**没有** `#main(...)` 的库文件调用 `run_main`，会得到

@@ -77,7 +77,8 @@ lines you don't want.
 
 ## `Capabilities` fields
 
-The full struct (`crates/relon-evaluator/src/eval.rs::Capabilities`):
+The full struct (defined in `crates/relon-cap/src/lib.rs`,
+re-exported through `relon_evaluator` / `relon_eval_api`):
 
 ```rust
 #[non_exhaustive]
@@ -173,8 +174,7 @@ strict CPU control, add a wall-clock timer on the host side (see
 
 ### `max_value_elements: Option<usize>`
 
-The `_bytes` part of the name leaves room for future extension; the
-**current measurement is "Value element count"** — a list or tuple's
+The **measurement is "Value element count"** — a list or tuple's
 element count, or a dict's key/value pair count. Check points cover
 every language-level entry where a list / tuple / dict is produced:
 
@@ -290,17 +290,26 @@ fn run_user_rule(
         Arc::new(CurrentUserId(current_user.to_string())),
     );
 
-    // Evaluate
+    // Evaluate (the concrete backend type is TreeWalkEvaluator;
+    // `Evaluator` is the trait)
     let node = parse_document(rule_src)
         .map_err(|e| RuntimeError::IoError(e.to_string()))?;
     let ctx = ctx.with_root(node);
     let scope = Arc::new(relon_evaluator::Scope::default());
-    let value = relon_evaluator::Evaluator::new(&ctx).eval_root(&scope)?;
+    let value =
+        relon_evaluator::TreeWalkEvaluator::new(Arc::new(ctx)).eval_root(&scope)?;
 
     // Project to JSON (details elided — see host-integration)
     Ok(relon::JsonProjector.project(&value).expect("…"))
 }
 ```
+
+> For typical embedding scenarios that don't need per-knob capability
+> control, prefer the `relon` facade's `EvaluatorBuilder`
+> (`from_str` / `trust(TrustLevel::…)` / `backend(Backend::Auto)` /
+> `build()`); see [Host integration](./host-integration). This page's
+> example demonstrates the fine-grained `Context` / `Capabilities`
+> control surface.
 
 In this setup, the user script:
 
