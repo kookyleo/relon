@@ -69,7 +69,8 @@ ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
 
 ## `Capabilities` 字段
 
-完整结构（`crates/relon-evaluator/src/eval.rs::Capabilities`）：
+完整结构（定义在 `crates/relon-cap/src/lib.rs`，经
+`relon_evaluator` / `relon_eval_api` 再导出）：
 
 ```rust
 #[non_exhaustive]
@@ -158,8 +159,8 @@ CPU 时间——一次 dispatch 内部如果调了一个慢的内置算子（比
 
 ### `max_value_elements: Option<usize>`
 
-字段名带 `_bytes` 是为了未来扩展，**当前的实测维度是「Value 的元素
-数」**——一个 list / tuple 的元素个数，或一个 dict 的键值对数。检查点覆盖
+**度量维度是「Value 的元素数」**——一个 list / tuple 的元素个数，
+或一个 dict 的键值对数。检查点覆盖
 所有「语言层面」产生 list / tuple / dict 的入口：
 
 - 字面量构造（`[...]` / `(...)` / `{ k: v }`）；
@@ -265,17 +266,24 @@ fn run_user_rule(
         Arc::new(CurrentUserId(current_user.to_string())),
     );
 
-    // 求值
+    // 求值（具体后端类型是 TreeWalkEvaluator；`Evaluator` 是 trait）
     let node = parse_document(rule_src)
         .map_err(|e| RuntimeError::IoError(e.to_string()))?;
     let ctx = ctx.with_root(node);
     let scope = Arc::new(relon_evaluator::Scope::default());
-    let value = relon_evaluator::Evaluator::new(&ctx).eval_root(&scope)?;
+    let value =
+        relon_evaluator::TreeWalkEvaluator::new(Arc::new(ctx)).eval_root(&scope)?;
 
     // 投影成 JSON（细节略，参考 host-integration）
     Ok(relon::JsonProjector.project(&value).expect("…"))
 }
 ```
+
+> 不需要逐项调能力旋钮的典型嵌入场景，推荐改用 `relon` facade 的
+> `EvaluatorBuilder`（`from_str` / `trust(TrustLevel::…)` /
+> `backend(Backend::Auto)` / `build()`），详见
+> [嵌入宿主](./host-integration.md)。本页示例展示的是细粒度
+> `Context` / `Capabilities` 控制面。
 
 这套设置下，用户脚本：
 

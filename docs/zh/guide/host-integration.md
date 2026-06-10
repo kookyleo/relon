@@ -9,15 +9,14 @@ Relon 不是「装好就跑」的独立程序——它是一个 **Rust 可嵌入
 在动手集成之前，先确定一件**架构决策**：外部数据怎么进 Relon？
 
 Relon 推荐的范式是 **push**——宿主在求值**之前**完成所有 I/O，把数
-据净化成 `Value` 注入 `Evaluator::run_main(scope, args)`；脚本通过
+据净化成 `Value` 注入 `run_main(args)`；脚本通过
 `#main(...)` 签名声明它**期望**的形状；整体保持纯函数
 `(source, args) → output`：
 
 ```rust
 // ✅ 推荐：push-style，#main 入口程序
 use std::collections::HashMap;
-use std::sync::Arc;
-use relon_evaluator::{Context, Evaluator, Scope, Value};
+use relon::{Backend, EvaluatorBuilder, TrustLevel, Value};
 
 let user_data = http_client.get(&format!("/api/user/{user_id}")).await?;
 let posts_data = db.query_user_posts(user_id).await?;
@@ -26,16 +25,16 @@ let posts_data = db.query_user_posts(user_id).await?;
 let user_value: Value = serde_json::from_value(user_data)?;
 let posts_value: Value = serde_json::from_value(posts_data)?;
 
-let analyzed = relon_analyzer::analyze(&parsed_node);
-let mut ctx = Context::sandboxed().with_root(parsed_node);
-ctx.analyzed = Some(Arc::new(analyzed));
+let evaluator = EvaluatorBuilder::from_str(source)
+    .backend(Backend::Auto)          // 默认值；自动在解释器与 AOT 间分派
+    .trust(TrustLevel::Sandboxed)    // 默认值；显式写出信任姿态
+    .build()?;
 
 let mut args = HashMap::new();
 args.insert("user".to_string(), user_value);
 args.insert("posts".to_string(), posts_value);
 
-let result = Evaluator::new(Arc::new(ctx))
-    .run_main(&Arc::new(Scope::default()), args)?;
+let result = evaluator.run_main(args)?;
 ```
 
 `serde_json::from_value::<Value>` 是无目标类型解码：JSON array 会解成
@@ -291,7 +290,7 @@ Relon 内置的 `Result<T, E>` / `Option<T>` 是**值层**概念（建模数据
 宿主代码侧：
 
 ```rust
-match evaluator.run_main(&scope, args) {
+match evaluator.run_main(args) {
     Ok(value) => /* value 是 ReturnType 描述的 Json */,
     Err(e)    => /* 校验/求值/能力错误 */,
 }
@@ -355,8 +354,8 @@ ctx.register_fn("http.get",
 
 | 声明 | 用法 | 入口求值 |
 | --- | --- | --- |
-| `#main(...)` | 入口程序 | `Evaluator::run_main(scope, args)`；缺签名时直接 `eval_root` 会报 `NoMainSignature` |
-| 无 `#main` | 纯数据库 / 共享 schema 库 | `Evaluator::eval_root(scope)` 直接求值；同时也可被 `#import` |
+| `#main(...)` | 入口程序 | `run_main(args)` 推参求值；`eval_root` **不做** `#main` 检查——会直接求值根表达式，形参未绑定，引用即报未定义名 |
+| 无 `#main` | 纯数据库 / 共享 schema 库 | `eval_root(scope)` 直接求值；同时也可被 `#import`；对它调用 `run_main` 报 `NoMainSignature` |
 
 库文件被 `#import` 时不需要 `#main`——`#import` 只取它的导出。这条
 设计的好处：
@@ -381,8 +380,8 @@ let json = relon::json_from_str(r#"{ host: "localhost", port: 8080 }"#)?;
 ```
 
 > 顶层 `relon::*` API 走的是「无 `#main` 库 / 数据文件」的快路径
-> （内部调 `eval_root`）。要跑带 `#main(...)` 的入口程序，请直接用
-> `Evaluator::run_main(...)`。
+> （内部调 `eval_root`）。要跑带 `#main(...)` 的入口程序，请用
+> `EvaluatorBuilder` 构建后调 `run_main(args)`。
 
 想直接拿到一个反序列化好的强类型结构？走 serde：
 
@@ -414,12 +413,46 @@ let cfg: ServerConfig = relon::from_file("config/app.relon")?;
 | `project_with(&projector, &value) -> P::Output` | 用自定义 `Projector` 处理已经求值的 `Value` |
 | `project_from_str(src, &projector) -> P::Output` | parse + eval + 投影一气呵成 |
 
-## `Context` 是什么
+上表的每个求值入口都是**沙箱姿态**（filesystem `#import` 默认拒
+绝、门控 native fn 不放行）。每个都有对应的 `*_trusted` 变体——
+`from_str_trusted` / `from_file_trusted` / `json_from_str_trusted` /
+`json_from_file_trusted` / `value_from_str_trusted` /
+`value_from_file_trusted` / `project_from_str_trusted`——以受信任姿
+态求值（等价于 `TrustLevel::Trusted`：filesystem `#import` 放行），
+**只**用于宿主自有脚本。
 
-走 `relon::*` 顶层 API 时，`Context` 在内部被构造好。如果你需要注册原生函数、装饰器、自定义模块解析或 capability，就要直接构造 `Context`：
+### `EvaluatorBuilder`：选后端、选信任姿态、注册宿主函数
+
+需要超出「一行拿 JSON」的控制（选执行后端、跑 `#main` 入口、注册
+native fn）时，用 facade 的 `EvaluatorBuilder`：
 
 ```rust
-use relon_evaluator::{Context, Evaluator, Scope};
+use relon::{Backend, EvaluatorBuilder, TrustLevel};
+
+let evaluator = EvaluatorBuilder::from_str(source)   // 或 from_file(path)
+    .backend(Backend::Auto)        // Auto（默认）/ TreeWalk / CraneliftAot / LlvmAot
+    .trust(TrustLevel::Sandboxed)  // Sandboxed（默认）/ Trusted
+    .register_pure_native_fn("app_version", Arc::new(AppVersion))
+    .build()?;                     // -> Box<dyn relon::Evaluator>
+
+let json_value = evaluator.eval_root(&Arc::new(relon::Scope::default()))?;
+// 或入口程序：evaluator.run_main(args)?
+```
+
+- `Backend::Auto`（默认）会对平凡标量 `#main` 走 tree-walk 短路，
+  其余形状惰性走 cranelift AOT，编译不支持的形状响亮回退 tree-walk
+  ——详见 [性能](./performance.md)。
+- `register_native_fn(name, gate, fn)` / `register_pure_native_fn`
+  只在 tree-walk 承载的构建（`Backend::TreeWalk` 及 `Auto` 的
+  tree-walk 侧）有意义；在 `CraneliftAot` 下构建会以
+  `BackendError::UnsupportedFeature` 响亮失败。
+
+## `Context` 是什么
+
+走 `relon::*` 顶层 API 或 `EvaluatorBuilder` 时，`Context` 在内部被构造好。如果你需要注册装饰器、自定义模块解析或逐项调 capability 旋钮，就要直接构造 `Context`，再交给具体后端类型 `TreeWalkEvaluator`（`Evaluator` 是各后端共用的 trait）：
+
+```rust
+use relon_evaluator::{Context, Scope, TreeWalkEvaluator};
 use relon_parser::parse_document;
 use std::sync::Arc;
 
@@ -428,7 +461,8 @@ let mut ctx = Context::sandboxed().with_root(node);
 
 // （在这里注册函数 / 装饰器 / 替换 module resolver）
 
-let value = Evaluator::new(Arc::new(ctx)).eval_root(&Arc::new(Scope::default()))?;
+let value = TreeWalkEvaluator::new(Arc::new(ctx))
+    .eval_root(&Arc::new(Scope::default()))?;
 ```
 
 `Context` 持有：
@@ -442,7 +476,7 @@ let value = Evaluator::new(Arc::new(ctx)).eval_root(&Arc::new(Scope::default()))
 
 > 历史说明：早期版本提供 `Context.input: Option<Value>` 和
 > `with_input(value)` 作为 push 入口，已**移除**——push 现在统一走
-> `Evaluator::run_main(scope, args)`。再之前的 `Context.globals:
+> `run_main(args)`。再之前的 `Context.globals:
 > HashMap<String, Value>` 通用注入点也已移除：多种语义混在一个 map
 > 里会让破壳点散布；现在是单一入口 + `#main` 契约。
 
@@ -467,7 +501,7 @@ struct AppVersion;
 
 impl RelonFunction for AppVersion {
     fn call(&self, _args: NativeArgs, _range: TokenRange) -> Result<Value, RuntimeError> {
-        Ok(Value::String(env!("CARGO_PKG_VERSION").to_string()))
+        Ok(Value::String(env!("CARGO_PKG_VERSION").into()))
     }
 }
 
@@ -507,7 +541,7 @@ struct ReadSecret;
 impl RelonFunction for ReadSecret {
     fn call(&self, _args: NativeArgs, _range: TokenRange) -> Result<Value, RuntimeError> {
         let secret = std::fs::read_to_string("/etc/myapp/secret").unwrap_or_default();
-        Ok(Value::String(secret))
+        Ok(Value::String(secret.into()))
     }
 }
 
@@ -628,6 +662,46 @@ let json = relon::project_from_str(source, &InternallyTaggedJson)?;
 ```
 
 > **注意范围**：`Projector` 是「JSON 形状的微调旋钮」，不是「跳出 JSON 的逃生通道」。Relon 的输出永远要落到 JSON 上——这是它的硬约束。如果你想生成 YAML/TOML/XML，那是另一种工具的领域（比如 Pkl）。
+
+## 构建期 AOT：`include_relon!` 与 relon-rs-*
+
+除了运行时嵌入，还可以在 **构建期** 把 `.relon` 编译成可重定位目标
+文件，链接进你的 Rust 二进制——`#main` 变成一个普通的 Rust 函数调
+用，运行期不再有解析 / 求值开销。涉及三个 crate：
+
+- **`relon-rs-build`** —— build.rs 侧的 `Compiler`，把每个 `.relon`
+  源编成一个 ELF 目标文件（导出单个 extern 符号）+ 一个生成的
+  binding `.rs`；
+- **`relon-rs-macro`** —— `include_relon!` 过程宏，把对应 binding
+  缝进你的源文件；
+- **`relon-rs-shims`** —— 运行期 host shim（`SandboxState`、buffer
+  协议入口、字符串算子等）。
+
+```rust
+// build.rs
+fn main() {
+    let out_dir = std::env::var_os("OUT_DIR").unwrap();
+    relon_rs_build::Compiler::new()
+        .source("src/foo.relon")
+        .emit_all(&out_dir)
+        .unwrap();
+}
+```
+
+```rust
+// src/main.rs
+relon_rs_macro::include_relon!("src/foo.relon");
+// 或起别名：relon_rs_macro::include_relon!("src/foo.relon" as compute);
+
+fn main() {
+    let state = relon_rs_shims::SandboxState::default();
+    println!("{}", foo::main(&state, 42)); // #main(Int n) -> Int
+}
+```
+
+当前接受的 `#main` 参数 / 返回叶子类型是 `Int` / `Float` / `Bool` /
+`String` / `List<Int>`（权威清单是 `relon-rs-build` 的
+`rust_type_for` 表）。端到端示例见 `crates/relon-rs-demo`。
 
 ## 错误类型
 

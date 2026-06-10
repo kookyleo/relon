@@ -69,8 +69,9 @@ NOT allow a single name to exist in both `@`-form and `#`-form.
 | `#name ...` | **Directive** — declaration / structure / metadata | Built-in only; fixed set; not user-extensible |
 
 The complete v1 directive set: `#main(...)`, `#schema X Body`,
-`#import ... from "..."`, `#internal`, `#default`, `#expect`,
-`#msg`, `#error`, `#brand X`.
+`#enum X { ... }`, `#import ... from "..."`, `#internal`, `#default`,
+`#expect`, `#msg`, `#error`, `#brand X`, `#relaxed` (synonym
+`#unstrict`), `#derive`, `#no_auto_derive`, `#native`, `#extend`.
 
 The complete v1 built-in decorator set: `@value(...)`. Any other
 `@name(...)` is parsed as "look up `name` in the current scope; pass
@@ -105,9 +106,11 @@ audited against this rule:
 
 Known v1 gaps (tracked under the staging roadmap): expression-level
 type inference covers only literals; closure-body reference
-resolution still leans runtime; there's no static reachability
-analysis for capabilities. These gaps are scheduled for staged
-hardening.
+resolution still leans runtime. These gaps are scheduled for staged
+hardening. (Static reachability analysis for capabilities has
+landed: the analyzer's `capability_check` emits a
+`CapabilityRequired` diagnostic at every call site of a gated
+native fn.)
 
 ## 2. Determinism contract
 
@@ -139,7 +142,10 @@ sorting are forbidden.
   * In sorts, `NaN` is greater than every non-NaN.
 * Float arithmetic obeys IEEE-754; fast-math, automatic FMA fusing,
   and compile-time constant folding that changes rounding are
-  forbidden.
+  forbidden. **One explicit exception**: a zero divisor (including
+  Float `0.0` / `-0.0`) raises `DivisionByZero` instead of producing
+  IEEE-754 `±inf` / `NaN` — a deliberate spec choice so division by
+  zero fails loudly on every backend.
 * Integer arithmetic on `i64` is checked: `+`, `-`, `*`, `/`, `%`,
   and unary `-` must raise `NumericOverflow` whenever the result
   would exceed `i64`'s representable range. The spec forbids wrap,
@@ -151,7 +157,10 @@ sorting are forbidden.
   Unicode codepoint.
 * String operations like `string.split` are **byte-based** (matching
   Rust's `String::split`). For grapheme-cluster operations the host
-  must expose a native function explicitly.
+  must expose a native function explicitly. **One divergence from
+  Rust**: the `split` separator must not be empty — an empty
+  separator raises `UnsupportedOperator` instead of splitting at
+  every char boundary like Rust's `str::split("")`.
 
 ### 2.5 Invisible environment
 
@@ -181,9 +190,9 @@ An implementation MUST accept every source the reference parser
 accepts and reject every source it rejects. The grammar corpus is
 defined by `fixtures/`, `examples/`, and `crates/relon-parser/tests/`.
 
-### 3.1 The five directive shapes
+### 3.1 The six directive shapes
 
-Every `#name ...` directive matches one of five fixed shapes. The
+Every `#name ...` directive matches one of six fixed shapes. The
 shape is determined by the directive name (looked up in a parser
 table) and is not user-extensible:
 
@@ -192,6 +201,7 @@ table) and is not user-extensible:
 | Bare | `#name` | `#internal` | Field flag |
 | Value | `#name <expr>` | `#default 0`, `#expect "must be ≥0"`, `#brand Color` | Metadata / value transform |
 | NameBody | `#name <ident> <body>` | `#schema User { String name: * }` | Named declaration (no colon) |
+| Enum | `#enum Name { Variant, ... }` | `#enum Stat { Up, Down }` | Rust-like enum declaration |
 | Import | `#import <bindspec> from "<path>"` | `#import * from "std/list"` | Import |
 | Main | `#main(Type name, ...) [-> ReturnType]` | `#main(User u, Cart cart) -> Order` | Entry signature |
 
@@ -266,7 +276,17 @@ Implementations MUST use these stable tags:
 | `MissingMainArg` | Host did not push a value for a declared `#main` parameter |
 | `UnexpectedMainArg` | Host pushed an arg name not in the `#main` signature |
 | `MainArgTypeMismatch` | Pushed value doesn't match the declared parameter type |
+| `MainReturnTypeMismatch` | Root expression's value doesn't match the declared `#main` `-> ReturnType` |
 | `UnsupportedOperator` | Invalid operation or type combination |
+| `ValidationError` | Schema validation failed (`ensure.*` / `#expect` not satisfied) |
+| `DivisionByZero` | Divisor is zero (including Float `0.0` / `-0.0`, see §2.3) |
+| `CircularReference` | Reference evaluation forms a cycle (e.g. mutually dependent `&sibling`) |
+| `InvalidIdentifier` | A name produced at a dynamic-key-like position is not a valid identifier |
+| `IndexOutOfBounds` | Out-of-range index / `substring` access |
+| `EmptyList` | An operation that needs a non-empty list (e.g. `xs.max()`) received an empty one |
+| `Unsupported` | The selected execution backend does not support the construct (loud, never a silent fallback) |
+| `RemoteImportFailed` / `RemoteImportDenied` / `RemoteImportHashMismatch` | Remote `#import` fetch failed / not granted / integrity pin mismatch |
+| `ImportHashMismatch` / `ImportHashUnknownAlgorithm` / `ImportHashInvalidHex` | `#import` integrity pin verification failed / unknown algorithm / invalid hex |
 
 ## 6. Standard library (spec-mandated)
 
@@ -283,7 +303,10 @@ available unconditionally:
   (`Int`).
 * `range(end)` / `range(start, end)` — half-open `Int` list.
 * `type(value)` — the value's type name (`"Int"`, `"Float"`,
-  `"String"`, `"Bool"`, `"List"`, `"Tuple"`, `"Dict"`, `"Closure"`).
+  `"String"`, `"Bool"`, `"List"`, `"Tuple"`, `"Dict"`, `"Closure"`;
+  internal value shapes additionally yield `"Schema"`,
+  `"EnumSchema"`, `"Type"`, `"Wildcard"` — those four are not
+  JSON-projectable and never appear in normal script data flow).
 
 ### 6.2 std module catalog
 
@@ -291,7 +314,7 @@ available unconditionally:
 |---|---|---|
 | `std/list` | `map`, `filter`, `reduce`, `contains`, `sum`, `avg`, `len`, `first`, `last`, `compact`, `flatten` | Functional list ops |
 | `std/dict` | `merge`, `keys`, `values`, `has_key` | Dict meta ops |
-| `std/string` | `split`, `join`, `replace`, `upper`, `lower`, `contains` | String ops |
+| `std/string` | `split`, `join`, `replace`, `upper`, `lower`, `contains`, `glob_match` | String ops |
 | `std/math` | `abs`, `max`, `min`, `clamp` | Numeric ops |
 | `std/is` | `int`, `string`, `bool`, `float`, `list`, `dict`, `number`, `empty` | Type predicates |
 | `std/value` | `default` | Fallback for `None` |
@@ -302,9 +325,11 @@ sources; those `.relon` files are themselves part of the spec
 (reference behavior of the std modules).
 
 > Beyond this catalog, the reference tree-walker registers an
-> additional JSON-Schema-parity wave; much of it (`sqrt`, `is_email`,
-> `trim`, `split`, …) now lowers four-way, but a residue (`pow`,
-> `to_json`, `unique`, `starts_with`, …) still exists **only** in the
+> additional JSON-Schema-parity wave; much of it (`sqrt`, `pow`,
+> `unique`, `every` / `some`, `is_email`, `trim`, `split`, …) now
+> lowers four-way, but a residue (`to_json`, the free-fn form of
+> `starts_with`, `select_keys` / `omit_keys`, `parse_iso_date`,
+> `is_ipv4` / `is_ipv6`, `matches`) still exists **only** in the
 > tree-walker — no analyzer signatures, no compiled-backend IR
 > conversion. See §6.7 for the exact split and the tier caveat before
 > depending on any of them.
@@ -350,10 +375,11 @@ full expression chain.
 the user evaluates the root to one of these, host-side projectors
 (e.g. the built-in `JsonProjector`) report errors
 (`UnsupportedClosure` / `UnsupportedSchema`). On the static side,
-declaring a non-JSON `ReturnType` (e.g. `Closure`, `Schema`) on
-`#main(...) -> ReturnType` causes the analyzer's
-`check_main_return` to emit `MainReturnTypeMismatch` as it does
-today.
+writing bare `Closure` as the `#main(...) -> ReturnType` is caught
+first by `BareGenericContainer` (the v1.7 bare-generic ban); an
+undeclared type name reports `UnknownTypeName`; and a body whose
+static type disagrees with the declaration makes the analyzer's
+`check_main_return` emit `MainReturnTypeMismatch`.
 
 > Historical note: spec v1.0 / v1.1 allowed only dict / list
 > literals at the root. v1.2 widens this to any expression
@@ -443,9 +469,11 @@ n + 1
    root scope's locals by parameter name** — scripts access them
    directly as `req`, `user`, etc., not via an `input.` prefix.
 5. **No `#main(...)`** in the file: calling `run_main` raises
-   `NoMainSignature`. Conversely, calling `eval_root` on a `#main`
-   file (treating it as a library) also raises `NoMainSignature`
-   — edge cases are caught at the boundary.
+   `NoMainSignature` — the edge case is caught at the boundary.
+   `eval_root` does **not** perform this check: calling `eval_root`
+   on a `#main` file simply evaluates the root expression (the
+   parameters are unbound, so referencing them surfaces as an
+   undefined-name error).
 6. **Cross-file `#main` aggregation** (i.e., `#main(...)` in
    imported libraries also affects the entry's contract) is out of
    scope for v1 — only the entry file's `#main(...)` is validated.
@@ -636,6 +664,14 @@ swallowed by `Any`).
 None of these reach source code, diagnostics, or documentation
 examples — `Any` is gone from the user-facing surface.
 
+**Context-inference exemption for closure parameters under strict
+mode (R1)**: an unannotated closure parameter is *not* unconditionally
+an error — when the **call site's signature** pins the parameter's
+type (e.g. `x` in `xs.map((x) => ...)` is derived from `map`'s
+`Closure<T, U>` slot plus generic unification), the parameter counts
+as statically derivable and `ClosureParamTypeMissing` is suppressed.
+Only parameters that context cannot pin still fire.
+
 **v1.7: Tuple types + bare-generic ban**
 
 Through v1.6, square-bracket literals carried two roles: homogeneous
@@ -674,7 +710,17 @@ Pre-v1.7 they silently expanded to `List<Any>` / `Dict<Any, Any>` /
 v1.6's ban. The new `BareGenericContainer` diagnostic fires at every
 TypeNode site (source code, `#main` parameters, closure parameters,
 schema fields, nested generic slots); the only fix is to write the
-explicit type arguments.
+explicit type arguments. (`Enum` is not on this list: like `Null` /
+`Unit` it is a **reserved type name** — writing it in a type
+position reports `ReservedTypeName`, unrelated to the bare-generic
+ban; model the data with a concrete `#enum` declaration instead.)
+
+**The single exemption (W7)**: `#main(...) -> Dict` paired with a
+**dict-literal body** is exempt from the bare-`Dict` return-type
+`BareGenericContainer` diagnostic — the return schema is synthesized
+per-field from the body, so the shape is well-defined and no
+`Dict<Any, Any>` back-door opens. The ban still fires unchanged for
+parameter positions and nested generic slots.
 
 ```relon
 { List items: [1, 2, 3] }              // BareGenericContainer
@@ -801,18 +847,18 @@ wasm object emitter rejects it loudly; the equivalent Buffer-entry
 source is verified four-way).
 
 **Tier-2 (tree-walker) only stdlib.** The tree-walker's free-fn
-registry holds ~77 `register_pure_fn` names
+registry holds ~76 `register_pure_fn` names
 (`crates/relon-evaluator/src/stdlib.rs`); the remainder of the
 JSON-Schema-parity wave is still registered **only in the
 tree-walker**. They have **no analyzer signatures** and are **absent
-from every compiled backend** (Cranelift / LLVM AOT, trace JIT).
+from every compiled backend** (Cranelift / LLVM-native / wasm).
 Calling them under a
 compiled backend, or relying on them to be statically typed, will not
 behave like the tree-walker. The set is:
 
 * format predicates: `is_ipv4`, `is_ipv6`
 * string: `starts_with` (free-fn form; the method form has a
-  compiled registry slot)
+  compiled registry slot), `matches` (regex-engine cap)
 * dict: `select_keys`, `omit_keys`
 * json / date: `to_json`, `parse_iso_date`
 
@@ -821,9 +867,10 @@ These are **tier-2 / tree-walker-only**, and that is an
 `omit_keys` / `parse_iso_date` return a Dict (compiled Dict values
 were adjudicated out of scope); `to_json` is composite → String
 (likewise adjudicated); `is_ipv4` / `is_ipv6` route through
-`core::net::Ipv*Addr::parse`, which has no wasm-portable body (an
-engine / seam cap). Treat them as reference-evaluator conveniences,
-not portable language surface.
+`core::net::Ipv*Addr::parse` and `matches` depends on a regex
+engine — neither has a wasm-portable body (engine / seam caps).
+Treat them as reference-evaluator conveniences, not portable
+language surface.
 
 **There is no `#strict` directive.** Strict static inference is the
 analyzer's **default** — you do not opt *in* to it. The only opt-out

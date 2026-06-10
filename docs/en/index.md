@@ -20,7 +20,7 @@ features:
   - title: Deterministic by design
     details: "Same source + same input → byte-identical output. Dict iteration is `BTreeMap`-ordered, floats are IEEE-754 `f64`, the environment is opaque to the script. Replay, hash, cache evaluation freely — running the same `.relon` twice cannot diverge."
   - title: Sandboxed by default — no escape hatch
-    details: "Scripts hold zero ambient privileges. `Capabilities` explicitly grant filesystem reads, step budgets, value-size watermarks, and per-function allowlists. There is no \"trusted mode\" the script can fall back to without the host's consent."
+    details: "Scripts hold zero ambient privileges. `Capabilities` explicitly grant filesystem reads, step budgets, value-size watermarks, and capability-bit gates on native fns. There is no \"trusted mode\" the script can fall back to without the host's consent."
   - title: Self-describing type contracts
     details: "`#schema`, sum-type tagged enums, recursive schemas, branded values, computed defaults — type information travels with the payload. Receivers validate without out-of-band documentation."
   - title: Context-aware references

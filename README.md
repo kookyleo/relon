@@ -55,7 +55,8 @@ parallel workflows). It's advisory — never blocks.
 
 - **Sandboxed by default**: a script declares the capabilities it needs
   (`reads_fs` / `writes_fs` / `network` / `reads_clock` / `reads_env` /
-  `uses_rng`, plus allow-listed native fns); the host grants them.
+  `uses_rng`; native fns are gated by the same capability bits); the
+  host grants them.
   Scripts can't elevate themselves; the host can choose to grant all
   caps explicitly via `--trust` / `Capabilities::all_granted()`, and
   that grant is auditable code at the call site rather than an implicit
@@ -98,20 +99,22 @@ parallel workflows). It's advisory — never blocks.
 
 ## 🏗 Project Structure
 - `crates/relon-parser`: Rowan-backed lexer/parser, CST, and legacy AST lowering.
-- `crates/relon-analyzer`: Semantic-analysis layer (schema desugar, name resolution, diagnostics).
-- `crates/relon-ir`: Lowered IR consumed by the bytecode VM, native backend, and trace recorder.
-- `crates/relon-eval-api`: Shared types + the `Evaluator` trait both backends implement.
-- `crates/relon-evaluator`: Tree-walking interpreter (default backend) + standard library.
-- `crates/relon-bytecode`: Stack bytecode compiler/VM and trace-dispatch bridge.
-- `crates/relon-codegen-cranelift`: Cranelift native AOT/JIT backend, sandbox glue, and trace install pipeline.
+- `crates/relon-analyzer`: Semantic-analysis layer (schema desugar, name resolution, type checking, diagnostics).
+- `crates/relon-eval-api`: Shared types + the `Evaluator` trait every backend implements.
+- `crates/relon-cap`: Zero-dependency capability data types (`Capabilities`, `NativeFnGate`).
+- `crates/relon-evaluator`: Tree-walking interpreter (full-surface reference backend) + standard library.
+- `crates/relon-ir`: Lowered IR consumed by the compiled backends.
+- `crates/relon-codegen-cranelift`: Cranelift native AOT backend + sandbox glue.
+- `crates/relon-codegen-llvm`: LLVM native AOT backend.
 - `crates/relon-object-cache`, `crates/relon-object-link`: Native object cache, HMAC integrity, memfd/dlopen loader, and ET_REL linking support.
-- `crates/relon-trace-abi`, `crates/relon-trace-recorder`, `crates/relon-trace-jit`,
-  `crates/relon-trace-emitter`: Trace IR, recorder, optimizer/runtime helpers, and Cranelift emitter.
-- `crates/relon`: Public API facade (`evaluate_source`, `json_from_*`, `Projector`, `new_evaluator`).
+- `crates/relon`: Public API facade (`from_str` / `json_from_*` / `value_from_*` and their `*_trusted` variants, `EvaluatorBuilder` with `Backend::Auto` as the default dispatch, `Projector`, `new_evaluator`).
+- `crates/relon-rs-build`, `crates/relon-rs-macro`, `crates/relon-rs-shims`, `crates/relon-rs-demo`: Build-time AOT — compile `.relon` from `build.rs`, bind via `include_relon!`, runtime ABI shims, and a working demo.
 - `crates/relon-cli`: Command-line tool.
 - `crates/relon-fmt`: Formatter / syntax checker.
 - `crates/relon-lsp`: Language Server (parse + analyze + diagnostics).
-- `crates/relon-test-harness`: Cross-backend differential and recorded-loop integration tests.
+- `crates/relon-test-harness`: Cross-backend differential integration tests.
 - `crates/relon-bench`: Internal micro-benchmark harness (not published).
+- `crates/relon-unicode`: Unicode tables, algorithms, and the glob matcher shared by the evaluator and codegen backends.
+- `crates/relon-util`: Leaf utility helpers shared across crates.
 - `crates/relon-wasm-bindings`: Browser-side wasm bindings for the playground.
 - `examples/`, `fixtures/`: Demo / golden files.

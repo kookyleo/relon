@@ -75,7 +75,7 @@ to keep going; under `#relaxed` it accepts the dynamic fallback.
 | Spread source's type is unknown (untyped closure param, untyped binding) and no `<T>` hint | `spread_source_type_unknown` |
 | Dynamic dict key without a `<T>` hint (`{ [k]: v }`) | `dynamic_key_type_unknown` |
 | Free identifier with no binding (`nowhere`, when no spread / import could supply it) | `unknown_reference_type` (escalated from the cross-mode `unresolved_reference` warning) |
-| Closure parameter has no type annotation (`(n) => n + 1`) | `closure_param_type_missing` |
+| Closure parameter has no type annotation (`(n) => n + 1`) *and* the call site's signature can't pin its type — pinnable params are exempt (e.g. `x` in `xs.map((x) => ...)` is derived from `map`'s signature and doesn't fire) | `closure_param_type_missing` |
 | Closure body's return type can't be derived (no `-> ReturnType`, body lands on `Any`) | `closure_return_type_unknown` |
 | Native fn call where the host registered the name but no signature | `native_fn_signature_missing` |
 | Generic "expression type unknown" — opaque expression in a typed slot | `expression_type_unknown` |

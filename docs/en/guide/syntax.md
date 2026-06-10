@@ -12,7 +12,7 @@ Relon supports JSON-shaped primitives except JSON `null`; absence is represented
 {
     "string": "Hello, Relon!",
     "raw_string": r#"This is a raw string where \n is literal"#,
-    "template": f"The number is {10 * 2}", // f-string interpolation
+    "template": f"The number is ${10 * 2}", // f-string interpolation (only `${...}` interpolates; bare `{}` is literal text)
 
     "integer": 42,
     "float": 3.14159,
@@ -217,9 +217,11 @@ Ok(o)
 `Closure` / `Schema` / `Type` are not JSON values. If the root
 expression evaluates to one of these, the host-side projector (e.g.
 the built-in `JsonProjector`) reports an error
-(`UnsupportedClosure` / `UnsupportedSchema`). Declaring
-`#main(...) -> ReturnType` as a non-JSON type makes the analyzer emit
-`MainReturnTypeMismatch` per the standard type-check rules.
+(`UnsupportedClosure` / `UnsupportedSchema`). On the static side,
+writing bare `Closure` as the `#main(...) -> ReturnType` is caught
+first by `BareGenericContainer`, an undeclared type name reports
+`UnknownTypeName`, and a body whose static type disagrees with the
+declaration makes the analyzer emit `MainReturnTypeMismatch`.
 
 ## `@` vs `#` — decorators vs directives
 
@@ -232,7 +234,7 @@ namespaces:
   last positional argument of `my_fn`). Decorator stacks apply
   bottom-up: `@a @b v ≡ a(b(v))`.
 - `#name ...` — **directive**: declaration / structure / metadata.
-  The full set is `#main(...)`, `#schema X Body`,
+  The full set is `#main(...)`, `#schema X Body`, `#enum X { ... }`,
   `#import ... from "..."`, `#internal`, `#default`, `#expect`,
   `#msg`, `#error`, `#brand X`, `#relaxed` (synonym `#unstrict`),
   `#derive`, `#no_auto_derive`, `#native`, and `#extend`. Directive
@@ -316,10 +318,16 @@ typehint syntax, and `Dict<K, V>` generics, see spec §6.6.
 
 Relon supports the standard arithmetic (`+`, `-`, `*`, `/`, `%`) and
 comparison / logical operators (`>`, `<`, `>=`, `<=`, `==`, `!=`,
-`&&`, `||`). You can also use the ternary operator for conditionals:
+`&&`, `||`), plus unary negation `!`. You can also use the ternary
+operator for conditionals:
 
 ```relon
 {
-    "status": status_code == 200 ? "OK" : "Error"
+    "status": status_code == 200 ? "OK" : "Error",
+    "inactive": !is_active
 }
 ```
+
+There is also the pipe operator `|` — it feeds the left-hand value as
+the first argument of the call on the right:
+`xs | map((x) => x * 2)` is equivalent to `map(xs, (x) => x * 2)`.

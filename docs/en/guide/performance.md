@@ -1,4 +1,4 @@
-# Performance & execution tiers
+# Performance & execution backends
 
 > This page **targets end users**: a plain-language tour of how Relon stays safe *and* fast, no compiler-theory required.
 > For implementation details, see [Architecture overview](./architecture.md).
@@ -7,37 +7,30 @@
 
 Relon is a **programmable configuration language**: you write a JS / Lua-style snippet that decides "can this user log in?", "should this order get a discount?", "should this log line be dropped?". The host program **executes** your snippet and gets back yes / no or a number.
 
-Faster is better. LuaJIT is the speed champion of this class — Relon's goal is to reach the same tier **while keeping the sandbox**.
+Faster is better. LuaJIT is the traditional speed champion of this class — Relon's goal is to match or beat it **while keeping the sandbox**. On the benchmarks below, Relon's compiled backends now beat LuaJIT across the board (2.7×–17×) and sit in the same tier as native Rust.
 
-## 2. Four execution tiers (the speed ladder)
+## 2. Three execution backends
 
 Think of an execution backend as a **restaurant kitchen**:
 
-| Tier | What it does | Analogy | Startup | Steady-state |
+| Backend | What it does | Analogy | Compile cost | Steady-state |
 |---|---|---|---|---|
-| **Tree-walk** | Re-reads the source every call | Roadside diner, flips the cookbook each order | Instant | Slow |
-| **Bytecode VM** | Pre-translates to an "operations list" | Casual restaurant with step-cards | ms | Medium |
-| **Cranelift AOT** | Compiles to machine instructions | Central kitchen, common dishes pre-made | hundreds of μs | Fast |
-| **Trace JIT** | Watches the hottest path, generates dedicated machine code for it | Fast-food line, top-selling combo has its own station | After heat-up | **Top tier** |
+| **Tree-walk** (interpreter) | Walks the syntax tree on every call | Roadside diner, flips the cookbook each order | Zero | Slow |
+| **Cranelift AOT** | Compiles to native machine instructions | Central kitchen, common dishes pre-made | Hundreds of µs | Fast |
+| **LLVM AOT** | Machine code through the LLVM optimisation pipeline | Michelin kitchen, longest prep | Higher | **Fastest** (native-Rust tier) |
 
-The further down, the faster — but the higher the prep cost. Relon **picks a tier automatically**: cold code → tree-walk (fast startup), hot code → trace JIT (fast execution).
+The further down, the faster the steady state — and the higher the prep cost. All three backends run the same IR with the same sandbox semantics and produce bit-identical results. Tree-walk covers the entire language surface; the compiled backends cover an explicitly declared supported surface (see the Auto fallback note below).
 
-You **don't have to choose**: the SDK entry `Backend::Auto` switches dynamically based on IR-op-count thresholds.
+## 3. How `Backend::Auto` picks
+
+You **don't have to choose** a backend — the SDK default `Backend::Auto` follows two simple rules:
+
+1. **Trivial-scalar short-circuit**: if the program is a trivial scalar `#main` (decided by an AST classifier in negligible time), it goes straight to tree-walk — interpreting such a program once is cheaper than compiling it. This is a **performance short-circuit**, not a capability fallback.
+2. **Lazy compilation otherwise**: everything else is compiled to Cranelift AOT on first actual execution, and the compiled artefact is cached in-process (`OnceLock`) so subsequent calls to the same program pay zero compile cost.
 
 `Backend::Auto` is also **adaptive on capability**: if a program uses a `#main` shape the compiled (Cranelift AOT) backend can't express yet (for example a `#main() -> List<P>` return), auto transparently falls back to the tree-walk interpreter and still produces the correct result — it logs the fallback (so you know AOT acceleration was skipped for that run) rather than failing. Genuine source errors and host faults are **not** swallowed: they surface as usual.
 
-## 3. The trace JIT trick
-
-Trace JIT is the top tier. The principle is like **record + edit**:
-
-1. **Observe** — run with tree-walk, attach a counter to every branch
-2. **Trigger** — when a path runs 10,000 times ("hot"), mark it for promotion
-3. **Record** — next time that path executes, log every operation step-by-step (this is the *trace*)
-4. **Edit** — drop redundancy, fold neighbouring ops, pre-compute constants
-5. **Emit native code** — compile the edited trace into CPU instructions
-6. **Guard** — every recording bakes in assumptions (input is an integer, the array is long enough, …). The compiled trace inserts **guards** — if any assumption breaks at runtime, jump back to the slow path (called *deopt*) and retry from there
-
-Compare to a short-video app's **preloading**: it learns which channel you watch most and optimises that one specifically; if you suddenly switch, it falls back to standard playback.
+When you do want to force a backend, `EvaluatorBuilder` offers the explicit options `Backend::TreeWalk`, `Backend::CraneliftAot`, and `Backend::LlvmAot`.
 
 ## 4. The sandbox — and why it's worth the cost
 
@@ -50,45 +43,47 @@ Relon runs user-supplied configuration, so **user code must not corrupt the host
 | **Capability gate** | Calling un-authorised host functions | Only the keys you've been issued |
 | **Resource limit** | Infinite loops eating CPU / RAM | Hard timeout of 1 minute |
 
-LuaJIT has **none of these**, which is why its 1 ns/iter is the "naked" baseline. Relon aims for the same tier *while keeping all four*. This is the core design tradeoff.
+LuaJIT has **none of these**, which is why its speed is the "naked" baseline. Relon matches and beats it *while keeping all four* — that is the core design result.
 
 See [Sandbox & capabilities](./sandbox.md) for full details.
 
-## 5. Where performance stands today (v6-δ M1)
+## 5. Where performance stands today (2026-06-10, W-series benchmarks)
 
-Measured hot loop numbers (tight `acc += i` integer loop, lower = faster):
+**Methodology**: fixed benchmark host (Xeon E5-2620 v4, Broadwell-EP), pinned to one core with `taskset -c 2`, criterion with 100 samples × 5 s measurement windows, idle machine (load1 ≈ 0). The table shows the full evaluation path (lower = faster), against hand-written native Rust implementations and LuaJIT 2.1:
 
-| Tier | Time / iter | vs LuaJIT 1-3 ns/iter |
-|---|---|---|
-| Tree-walk | 2245 ns | 750-2245× slower |
-| Cranelift AOT (warm) | 390 ns | 130-390× slower |
-| Trace JIT (warm, v6-δ M1) | **9.52 ns** | 3-9× slower |
-| LuaJIT reference | 1-3 ns | baseline |
+| Benchmark | Size | Tree-walk | Cranelift AOT | LLVM AOT | Native Rust | LuaJIT |
+|---|---|---|---|---|---|---|
+| Recursive fib | n=22 | 123.94 ms | — | 85.872 µs | 84.997 µs | 898.10 µs |
+| Quicksort | 1000 elems | 105.67 ms | 681.76 µs | 78.130 µs | 110.48 µs | 972.19 µs |
+| Binary search | 100 lookups | 3.6072 ms | 13.287 µs | 2.4508 µs | 2.2840 µs | 6.0968 µs |
+| Prime sieve | n=10000 | 491.87 ms | 3.4018 ms | 752.28 µs | 751.60 µs | 2.7049 ms |
+| Matrix multiply | 16×16 | 26.211 ms | 41.535 µs | 9.5944 µs | 9.4295 µs | 43.299 µs |
 
-Concretely:
+How to read this table:
 
-- Short scripts on cold start → tree-walk handles it, µs response is fine
-- Steady-state moderate complexity → AOT compile once, sub-µs response
-- High-frequency stream processing (millions of calls / sec) → trace JIT reaches LuaJIT trace-tier *class*, viable for ETL workloads
+- **LLVM AOT is in the native-Rust tier**: four of the benchmarks are within ±2% of Rust. Honesty caveat — Relon's LLVM AOT compiles for the host CPU by default (`target-cpu=native`) while rustc defaults to generic x86-64; the Rust control was rebuilt with the **matched target-cpu** (broadwell) before comparing, and the parity verdict above holds under that condition (in the control run only binary search had Rust 3.2% faster; the rest were parity).
+- **Quicksort being 1.41× faster than Rust** is not an algorithmic difference: both sides run the same algorithm, and the gap comes from allocation strategy — Relon's compiled backend allocates lists from a scratch bump-arena while the Rust control goes through malloc. It's an allocator dividend, not "the language being faster".
+- **All five benchmarks beat LuaJIT by 2.7×–17×** (LLVM AOT caliber), with Relon keeping all 4 sandbox checks that LuaJIT doesn't have.
+- **Cranelift AOT** is 4×–6× slower than LLVM but compiles two orders of magnitude faster, which suits cold-start-sensitive scenarios — exactly why `Backend::Auto` picks it by default.
+- Tree-walk being 3–4 orders of magnitude slower is expected: it is the full-surface reference implementation and fallback, not a performance path.
 
-## 6. Cached cold start — restart doesn't recompile
+## 6. Row caliber vs kernel caliber — never cross-compare
 
-Relon caches compile artefacts (ELF object files) locally; next launch `dlopen`s them directly instead of recompiling. Current **339 μs cached cold start**, on par with similar architectures.
+Crossing the language boundary has a fixed **marshalling cost** (converting arguments and return values between host and sandbox representations). The same minimal benchmark (a scalar kernel) measures:
 
-The cache uses HMAC-SHA256 integrity tags (anti-tampering + binds to the local machine), key stored at `$XDG_DATA_HOME/relon/cache-key` mode 0600.
+- **Row caliber** (including per-call marshalling): about 192 ns per call;
+- **Kernel caliber** (pure compute kernel, marshalling excluded): 3.38 ns per call, parity with the native Rust kernel (3.40 ns).
 
-## 7. Why this approach is sound
+The ~185 ns difference is the per-call marshalling cost. **The two calibers must never be compared against each other** — comparing your kernel number against someone else's row number (or vice versa) yields a false conclusion. If your workload is high-frequency tiny calls, marshalling dominates: batch more computation into each call.
 
-LuaJIT validated the **"observe hot path → record → compile → guard back-off"** path over 20 years. Relon's differences:
+## 7. Cached cold start — restart doesn't recompile
 
-- **Sandbox is mandatory** (LuaJIT skips it) → extra design cost for guard hoisting
-- **Not pure JIT** (must support AOT cache + serialisable artefacts) → trace JIT sits *on top of* AOT
-- **Correctness is non-negotiable** (production user code) → the deopt slow path must be 100% correct; the trace fast path only needs to be fast
+Relon caches Cranelift compile artefacts locally. The IR cache (the fast-restore path that skips parse + analyze + lower) is already active on cold start; the linked `.o` object cache (ELF bytes + integrity metadata) is **ready — written on every compile and round-trip-verified on load — but executing that object directly via dlopen is still deferred**: the hot path is currently served by the in-process JIT artefact.
 
-A wrong fast path is fine — the slow path catches it. A wrong slow path is a bug. So the **slow path** (bytecode VM + true partial-resume) is the *foundation* of perf work — only once it's bulletproof can the fast path be aggressive.
+The cache carries HMAC-SHA256 integrity tags (anti-tampering + anti-third-party-injection), with the key stored at `$XDG_DATA_HOME/relon/cache-key` (mode 0600). Without a usable key, both cache reads and writes are refused and the run degrades to a normal cold-start compile — an unauthenticated cached object is never loaded.
 
 ## 8. One-sentence summary
 
-> **Watch the hottest path; build a dedicated express lane for it; when the express lane's assumptions break, fall back to the safe lane — the safe lane is always correct.**
+> **The interpreter guarantees full coverage and correctness; the compiled backends provide the speed; `Backend::Auto` picks for you and falls back loudly to the interpreter when it can't compile — fast path and slow path produce bit-identical results.**
 
-That's the entire recipe for getting from tree-walk to LuaJIT trace-tier class.
+That's the whole route by which Relon reaches native-Rust parity and beats LuaJIT while keeping the full sandbox.

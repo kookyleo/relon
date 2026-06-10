@@ -80,7 +80,8 @@ pub enum BackendKind {
     /// Trace-JIT tier — installed on top of cranelift IR; the
     /// harness's synth-recipe catalogue stands in for a real recorder.
     TraceJit,
-    /// Bytecode VM (`Backend::Bytecode`).
+    /// Bytecode VM — harness-internal legacy tier label; there is no
+    /// corresponding `Backend::*` variant.
     Bytecode,
 }
 

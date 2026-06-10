@@ -81,13 +81,36 @@
 > 饰器形式。两者都已**完全取消**，请改用 `#internal` 指令。详见
 > [`syntax.md`](./syntax.md#字段可见性-internal)。
 
+### 远程导入与完整性钉 (Integrity Pin)
+
+`#import` 的路径也可以是远程 URL。远程导入是网络操作，必须由宿主显
+式授权（CLI 加 `--trust`，或嵌入侧授予 `Capabilities::network`）；
+未授权时在 fetch 之前就报 `RemoteImportDenied`，下载失败则报
+`RemoteImportFailed`。
+
+任何 `#import`（本地或远程）都可以在路径字符串之后追加一枚**完整性
+钉**，语法为 `<算法>:"<十六进制摘要>"`，当前支持的算法只有
+`sha256`：
+
+```relon
+#import rules from "https://example.com/pricing.relon" sha256:"3f2a…c9"
+#import lib from "./lib.relon" sha256:"8d41…07"
+```
+
+求值器在加载模块体之前先计算其摘要并与钉比对：摘要不符时报
+`ImportHashMismatch`（远程解析链路上的不符则报
+`RemoteImportHashMismatch`，两个错误分开，便于区分「远程取回的内容
+不对」与「交给求值器的模块体与钉不符」）；钉里写了不认识的算法名会
+报 `ImportHashUnknownAlgorithm`——求值器绝不把「无法校验」静默当作
+「没有钉」。
+
 ## 入口程序与库
 
 Relon 没有「文件级别 library/entry 标记」这一概念。是否有 `#main(...)`
 签名决定了文件**怎么用**：
 
 - 文件**有** `#main(...)`：是入口程序。宿主必须通过
-  `Evaluator::run_main(scope, args)` 推入参数才能跑出结果。直接当
+  `run_main(args)` 推入参数才能跑出结果。直接当
   库 `#import` 也允许（参数不会被使用，只取它的导出）。
 - 文件**没有** `#main(...)`：是「无契约」的纯数据 / 库文件。既可以
   被 `#import` 当模块用，也可以被宿主直接 `eval_root` 求值得到一份
@@ -128,12 +151,14 @@ args.insert(
     "notice".to_string(),
     /* host 推入的 Value::Dict */ notice_value,
 );
-let result = evaluator.run_main(&scope, args)?;
+let result = evaluator.run_main(args)?;
 ```
 
-宿主试图把入口程序当库直接 `eval_root`，会得到 `NoMainSignature` 错
-误——错误立即在边界截住，绝不会进入求值流程。反之，库文件没有
-`#main` 时调用 `run_main` 也是同样的错误。
+对**没有** `#main(...)` 的库文件调用 `run_main`，会得到
+`NoMainSignature` 错误——错误立即在边界截住，绝不会进入求值流程。
+反方向 `eval_root` **不做**这项检查：对入口程序直接 `eval_root` 会
+照常求值根表达式，只是 `#main` 形参没有绑定，引用它们会按未定义名
+报错。
 
 ## 相对引用 (Relative References)
 
