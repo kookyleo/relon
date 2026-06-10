@@ -2731,6 +2731,25 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         status: Status::Covered,
         proof: "tree-walk + cranelift (String return; bytecode/trace exclude String entry)",
     },
+    // ---- Wave 1: unified value→String skeleton, Bool leg ----
+    SurfaceEntry {
+        construct: "Bool value→String render (f-string interpolation, b ? \"true\" : \"false\")",
+        wave: "W1",
+        corpus: "fstring_bool_interp_true",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (TW_CR); wasm + llvm-native legs proven four-way in \
+                relon-codegen-llvm::aot_wasm_parity::fstring_bool_interp_aligns_native_via_wasmtime \
+                (both Bool values)",
+    },
+    SurfaceEntry {
+        construct: "String + Bool / Bool + String coercion concat (render-then-StrConcatN)",
+        wave: "W1",
+        corpus: "string_plus_bool_true",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (TW_CR); wasm + llvm-native legs proven four-way in \
+                relon-codegen-llvm::aot_wasm_parity::{string_plus_bool,bool_plus_string}\
+                _aligns_native_via_wasmtime (both Bool values, both operand orders)",
+    },
     // ---- Wave R3: range / map / filter / reduce / comprehension (Int) ----
     SurfaceEntry {
         construct: "range(n) as materialised List<Int>",

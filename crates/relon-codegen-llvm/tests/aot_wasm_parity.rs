@@ -778,6 +778,17 @@ fn pack_single_int(info: &EmitObjectInfo, value: i64) -> Vec<u8> {
     rec
 }
 
+/// Wave 1 (value→String): pack a single `Bool` `#main` param into its
+/// declared fixed-area slot as a single non-zero / zero byte (the buffer
+/// protocol rides Bool as one byte, same as the wasm i32 slot truncated
+/// on store).
+fn pack_single_bool(info: &EmitObjectInfo, value: bool) -> Vec<u8> {
+    let mut rec = vec![0u8; info.main_root_size as usize];
+    let off = info.main_fields[0].offset as usize;
+    rec[off] = u8::from(value);
+    rec
+}
+
 fn native_run(src: &str, args: HashMap<String, Value>) -> Value {
     let ev = LlvmAotEvaluator::from_source(src).expect("native from_source");
     ev.run_main(args).expect("native run_main")
@@ -1005,6 +1016,104 @@ fn fstring_mixed_parts_aligns_native_via_wasmtime() {
     match out.get("value") {
         Some(Decoded::Str(s)) => assert_eq!(*s, want, "f-string mixed wasm != native"),
         other => panic!("f-string mixed decoded {other:?}"),
+    }
+}
+
+/// Wave 1 (value→String) — f-string with a Bool interpolation
+/// (`f"v=${b}!"`) → String. The Bool is rendered through the shared
+/// value→String skeleton (`b ? "true" : "false"`, an `Op::If` selecting
+/// two `Op::ConstString` constants) and joined via `Op::StrConcatN`.
+/// Both Bool values are checked byte-exact against the native `run_main`
+/// oracle on the LLVM native + wasm32 legs.
+#[test]
+fn fstring_bool_interp_aligns_native_via_wasmtime() {
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping f-string bool interp");
+        return;
+    }
+    let src = "#main(Bool b) -> String\nf\"v=${b}!\"";
+    let (bytes, info) = build("fstring_bool", src);
+    for b in [true, false] {
+        let want = match native_run(src, HashMap::from([("b".to_string(), Value::Bool(b))])) {
+            Value::String(s) => s,
+            other => panic!("native expected String, got {other:?}"),
+        };
+        assert_eq!(
+            want,
+            format!("v={b}!"),
+            "native f-string bool oracle drifted"
+        );
+        let in_record = pack_single_bool(&info, b);
+        let out = run_buffer(&bytes, "relon_parity_fstring_bool", &info, &in_record);
+        match out.get("value") {
+            Some(Decoded::Str(s)) => assert_eq!(*s, want, "f-string bool wasm != native (b={b})"),
+            other => panic!("f-string bool decoded {other:?}"),
+        }
+    }
+}
+
+/// Wave 1 (value→String) — `String + Bool` coercion concat
+/// (`"flag=" + b`) → String. The Bool operand is rendered through the
+/// shared value→String skeleton and folded with the String literal via
+/// `Op::StrConcatN { 2 }`, matching the tree-walk oracle's `format!`
+/// concat. Verified byte-exact on the LLVM native + wasm32 legs for both
+/// Bool values.
+#[test]
+fn string_plus_bool_aligns_native_via_wasmtime() {
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping string+bool concat");
+        return;
+    }
+    let src = "#main(Bool b) -> String\n\"flag=\" + b";
+    let (bytes, info) = build("string_plus_bool", src);
+    for b in [true, false] {
+        let want = match native_run(src, HashMap::from([("b".to_string(), Value::Bool(b))])) {
+            Value::String(s) => s,
+            other => panic!("native expected String, got {other:?}"),
+        };
+        assert_eq!(
+            want,
+            format!("flag={b}"),
+            "native string+bool oracle drifted"
+        );
+        let in_record = pack_single_bool(&info, b);
+        let out = run_buffer(&bytes, "relon_parity_string_plus_bool", &info, &in_record);
+        match out.get("value") {
+            Some(Decoded::Str(s)) => assert_eq!(*s, want, "string+bool wasm != native (b={b})"),
+            other => panic!("string+bool decoded {other:?}"),
+        }
+    }
+}
+
+/// Wave 1 (value→String) — `Bool + String` coercion concat (`b +
+/// "=flag"`) → String. The buried-LHS render path: the Bool operand's
+/// ops sit before the String literal, so the skeleton renders it in its
+/// own stream before the `Op::StrConcatN { 2 }`. Byte-exact on the LLVM
+/// native + wasm32 legs for both Bool values.
+#[test]
+fn bool_plus_string_aligns_native_via_wasmtime() {
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping bool+string concat");
+        return;
+    }
+    let src = "#main(Bool b) -> String\nb + \"=flag\"";
+    let (bytes, info) = build("bool_plus_string", src);
+    for b in [true, false] {
+        let want = match native_run(src, HashMap::from([("b".to_string(), Value::Bool(b))])) {
+            Value::String(s) => s,
+            other => panic!("native expected String, got {other:?}"),
+        };
+        assert_eq!(
+            want,
+            format!("{b}=flag"),
+            "native bool+string oracle drifted"
+        );
+        let in_record = pack_single_bool(&info, b);
+        let out = run_buffer(&bytes, "relon_parity_bool_plus_string", &info, &in_record);
+        match out.get("value") {
+            Some(Decoded::Str(s)) => assert_eq!(*s, want, "bool+string wasm != native (b={b})"),
+            other => panic!("bool+string decoded {other:?}"),
+        }
     }
 }
 
