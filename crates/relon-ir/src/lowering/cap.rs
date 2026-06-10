@@ -105,6 +105,7 @@ pub const LOWERING_CAP_IDS: &[&str] = &[
     "lower_anon_dict_body.unsupported_expr.8",
     "type_repr_to_ir_type.unsupported_type_in_main.1",
     "type_repr_to_ir_type.unsupported_type_in_main.2",
+    "type_repr_to_ir_type_dict.unsupported_type_in_main",
     "lower_expr.unsupported_expr.1",
     "lower_expr.unsupported_expr.2",
     "lower_expr.unsupported_expr.3",
