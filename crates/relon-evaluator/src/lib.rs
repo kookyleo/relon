@@ -18,6 +18,7 @@ pub mod module;
 pub mod native_fn;
 pub mod prelude;
 pub mod reference;
+pub(crate) mod relon_sourced;
 pub mod schema;
 pub mod scope;
 pub mod stdlib;

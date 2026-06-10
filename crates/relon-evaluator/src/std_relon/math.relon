@@ -1,10 +1,24 @@
 // Standard library: math helpers. `#relaxed` so the polymorphic
-// numeric parameters stay untyped at the source — the underlying
-// host fns own the typing rules.
+// numeric parameters stay untyped at the source.
+//
+// `min` / `max` / `clamp` and the Int branch of `abs` are *implemented*
+// here — this file is their single source of truth; the evaluator's
+// `RelonSourcedFn` shims dispatch the registered names (`min`,
+// `_math_min`, ...) to these closures. Semantics are branch-based, not
+// IEEE min/max: a NaN comparison is false, so `max(NaN, x)` yields `x`
+// while `max(x, NaN)` yields `NaN` — byte-identical to the retired
+// native twins. `clamp` is a direct ternary chain on purpose: writing
+// it as `min(max(v, lo), hi)` would return `lo` for a NaN input
+// instead of propagating the NaN.
+//
+// Only `abs` keeps a host fn: `_math_abs` is the Float-only `f64::abs`
+// (sign-bit clear, so `abs(-0.0)` is `0.0` — `x < 0 ? -x : x` would
+// keep the `-0.0`). The Int branch is the checked negation below, which
+// traps with NumericOverflow on `abs(i64::MIN)`.
 #relaxed
 {
-    abs(x): _math_abs(x),
-    max(a, b): _math_max(a, b),
-    min(a, b): _math_min(a, b),
-    clamp(v, min, max): _math_clamp(v, min, max)
+    abs(x): type(x) == "Int" ? (x < 0 ? -x : x) : _math_abs(x),
+    max(a, b): a > b ? a : b,
+    min(a, b): a < b ? a : b,
+    clamp(v, min, max): v < min ? min : (v > max ? max : v)
 }
