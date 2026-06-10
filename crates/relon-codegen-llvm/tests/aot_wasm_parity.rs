@@ -243,6 +243,8 @@ enum Decoded {
     Float(f64),
     Str(String),
     ListInt(Vec<i64>),
+    ListFloat(Vec<f64>),
+    ListString(Vec<String>),
 }
 
 /// Drive a buffer-protocol entry in wasmtime with a full arena laid out
@@ -263,6 +265,102 @@ fn run_buffer(
     info: &EmitObjectInfo,
     in_record: &[u8],
 ) -> HashMap<String, Decoded> {
+    let (out, out_ptr) = run_buffer_raw(bytes, entry, info, in_record);
+
+    // Decode each return field at its fixed-area offset. F1 stores every
+    // pointer slot as an **arena-absolute** offset (the unified slot
+    // convention `BufferReader` now walks over the whole arena); the tail
+    // records still live in out_buf, so we rebase an absolute slot value
+    // by `- out_ptr` to index into the `out` (out_buf) slice.
+    let read_u32 = |buf: &[u8], at: usize| -> usize {
+        u32::from_le_bytes(buf[at..at + 4].try_into().unwrap()) as usize
+    };
+    let out_ptr_us = out_ptr as usize;
+    let mut decoded = HashMap::new();
+    for f in &info.return_fields {
+        let off = f.offset as usize;
+        let val = match f.ty {
+            EmittedFieldType::Int => {
+                Decoded::Int(i64::from_le_bytes(out[off..off + 8].try_into().unwrap()))
+            }
+            EmittedFieldType::Float => {
+                Decoded::Float(f64::from_le_bytes(out[off..off + 8].try_into().unwrap()))
+            }
+            EmittedFieldType::Bool => Decoded::Int(if out[off] != 0 { 1 } else { 0 }),
+            EmittedFieldType::Unit => Decoded::Int(0),
+            EmittedFieldType::String => {
+                let record_start = read_u32(&out, off) - out_ptr_us;
+                let len = read_u32(&out, record_start);
+                let payload = record_start + 4;
+                let s = std::str::from_utf8(&out[payload..payload + len])
+                    .expect("utf8 tail payload")
+                    .to_string();
+                Decoded::Str(s)
+            }
+            EmittedFieldType::ListInt => {
+                let record_start = read_u32(&out, off) - out_ptr_us;
+                let count = read_u32(&out, record_start);
+                // List payload pads the start up to 8 (tail_alignment).
+                let raw = record_start + 4;
+                let payload = (raw + 7) & !7usize;
+                let mut v = Vec::with_capacity(count);
+                let mut cur = payload;
+                for _ in 0..count {
+                    v.push(i64::from_le_bytes(out[cur..cur + 8].try_into().unwrap()));
+                    cur += 8;
+                }
+                Decoded::ListInt(v)
+            }
+        };
+        decoded.insert(f.name.clone(), val);
+    }
+    decoded
+}
+
+/// Run a buffer-protocol entry in wasmtime and return the raw out region
+/// (`out_buf`: fixed root + tail) together with the arena-relative
+/// `out_ptr`. Asserts a non-negative `bytes_written` (the fixed-area /
+/// tail-cursor return ABI). This is the shared run core behind
+/// [`run_buffer`]; tests that decode return shapes the binding-marshalling
+/// table doesn't yet erase into [`EmittedFieldType`] (e.g. a `List<Float>`
+/// or a static `List<String>` copied into out_buf, whose `return_fields`
+/// come back empty on the wasm32 target) drive this directly and decode
+/// the slot themselves via the `decode_list_*` helpers.
+fn run_buffer_raw(
+    bytes: &[u8],
+    entry: &str,
+    info: &EmitObjectInfo,
+    in_record: &[u8],
+) -> (Vec<u8>, u32) {
+    let (arena, _arena_abs, out_ptr, bytes_written) =
+        run_buffer_arena(bytes, entry, info, in_record);
+    assert!(
+        bytes_written >= 0,
+        "run_buffer_raw: negative bytes_written {bytes_written} (in-place sentinel return; \
+         use run_buffer_arena + the sentinel path)"
+    );
+    // `arena` is read from the arena base, so `arena[i]` is arena-relative
+    // offset `i`. Slice the out region (arena-relative offset `out_ptr` to
+    // the arena end) so existing decoders index it relative to its start,
+    // rebasing arena-absolute slots by `- out_ptr`.
+    let out = arena[out_ptr as usize..].to_vec();
+    (out, out_ptr)
+}
+
+/// Run a buffer-protocol entry in wasmtime and return the WHOLE arena
+/// (`[const | in | out | scratch]`), the arena's absolute linear-memory
+/// base, the arena-relative `out_ptr`, and the raw `bytes_written` the
+/// entry returned. A **negative** `bytes_written` is the in-place
+/// region-walk sentinel `-(root_abs + 1)` (the entry returns a value that
+/// lives in `scratch` / `in` rather than a copy in `out_buf`), so the
+/// caller must read it from the full arena at `root_abs`; see
+/// `decode_list_string_return` / `decode_list_float_return`.
+fn run_buffer_arena(
+    bytes: &[u8],
+    entry: &str,
+    info: &EmitObjectInfo,
+    in_record: &[u8],
+) -> (Vec<u8>, u32, u32, i32) {
     use wasmtime::{Engine, Extern, Module, Store, Val};
 
     // ArenaState layout (mirrors aot_wasm.rs): arena_base i64 @0,
@@ -361,63 +459,151 @@ fn run_buffer(
         Val::I32(v) => v,
         other => panic!("expected i32 bytes_written, got {other:?}"),
     };
-    assert!(bytes_written >= 0, "negative bytes_written {bytes_written}");
 
-    // Read the whole out region (root + tail) so tail records resolve.
-    let read_len = out_cap as usize;
-    let mut out = vec![0u8; read_len];
+    // Read the whole arena (`[const | in | out | scratch]`). The out-buf
+    // (positive `bytes_written`) decoders slice from `arena_abs + out_ptr`;
+    // the in-place-sentinel (negative) decoders index the whole arena at
+    // the arena-absolute `root_abs`, exactly as the native host does.
+    let mut arena = vec![0u8; arena_bytes as usize];
     memory
-        .read(&store, (arena_abs + out_ptr) as usize, &mut out)
-        .expect("read out region");
+        .read(&store, arena_abs as usize, &mut arena)
+        .expect("read arena");
 
-    // Decode each return field at its fixed-area offset. F1 stores every
-    // pointer slot as an **arena-absolute** offset (the unified slot
-    // convention `BufferReader` now walks over the whole arena); the tail
-    // records still live in out_buf, so we rebase an absolute slot value
-    // by `- out_ptr` to index into the `out` (out_buf) slice.
-    let read_u32 = |buf: &[u8], at: usize| -> usize {
-        u32::from_le_bytes(buf[at..at + 4].try_into().unwrap()) as usize
-    };
-    let out_ptr_us = out_ptr as usize;
-    let mut decoded = HashMap::new();
-    for f in &info.return_fields {
-        let off = f.offset as usize;
-        let val = match f.ty {
-            EmittedFieldType::Int => {
-                Decoded::Int(i64::from_le_bytes(out[off..off + 8].try_into().unwrap()))
-            }
-            EmittedFieldType::Float => {
-                Decoded::Float(f64::from_le_bytes(out[off..off + 8].try_into().unwrap()))
-            }
-            EmittedFieldType::Bool => Decoded::Int(if out[off] != 0 { 1 } else { 0 }),
-            EmittedFieldType::Unit => Decoded::Int(0),
-            EmittedFieldType::String => {
-                let record_start = read_u32(&out, off) - out_ptr_us;
-                let len = read_u32(&out, record_start);
-                let payload = record_start + 4;
-                let s = std::str::from_utf8(&out[payload..payload + len])
-                    .expect("utf8 tail payload")
-                    .to_string();
-                Decoded::Str(s)
-            }
-            EmittedFieldType::ListInt => {
-                let record_start = read_u32(&out, off) - out_ptr_us;
-                let count = read_u32(&out, record_start);
-                // List payload pads the start up to 8 (tail_alignment).
-                let raw = record_start + 4;
-                let payload = (raw + 7) & !7usize;
-                let mut v = Vec::with_capacity(count);
-                let mut cur = payload;
-                for _ in 0..count {
-                    v.push(i64::from_le_bytes(out[cur..cur + 8].try_into().unwrap()));
-                    cur += 8;
-                }
-                Decoded::ListInt(v)
-            }
-        };
-        decoded.insert(f.name.clone(), val);
+    (arena, arena_abs, out_ptr, bytes_written)
+}
+
+/// Read a little-endian `u32` from `buf` at `at`, panicking (verifier-
+/// style) if the 4-byte window runs past the decoded region.
+fn read_u32_checked(buf: &[u8], at: usize, what: &str) -> usize {
+    assert!(
+        at + 4 <= buf.len(),
+        "{what}: u32 read at {at} exceeds out region len {}",
+        buf.len()
+    );
+    u32::from_le_bytes(buf[at..at + 4].try_into().unwrap()) as usize
+}
+
+/// Rebase an arena-absolute pointer `abs` into an index in a `buf` slice
+/// whose index 0 sits at arena offset `base`. Verifier-style: panics if
+/// the pointer falls below the slice start.
+fn rebase(abs: usize, base: usize, what: &str) -> usize {
+    assert!(abs >= base, "{what}: ptr {abs} below slice base {base}");
+    abs - base
+}
+
+/// Decode a `List<Float>` pointer-array record whose header sits at
+/// arena-absolute `header_abs`. Layout is byte-identical to `List<Int>`
+/// (the `ListFloat` arm of `emit_tail_record_from_absolute` / the
+/// const-pool `add_list_float` blob): a `[len: u32 LE][pad to 8][f64 LE …]`
+/// record, with the f64 elements on an 8-byte boundary. `buf` is the
+/// decoded region and `base` is the arena offset of `buf[0]` (so an
+/// arena-absolute pointer `p` indexes at `p - base`). Verifier-style
+/// bounds checks panic rather than read out of range.
+fn decode_list_float_at(buf: &[u8], base: usize, header_abs: usize) -> Vec<f64> {
+    let record_start = rebase(header_abs, base, "list<float> header");
+    let count = read_u32_checked(buf, record_start, "list<float> count");
+    // Payload pads the start up to 8 (tail_alignment), same as List<Int>.
+    let payload = (record_start + 4 + 7) & !7usize;
+    assert!(
+        payload + count * 8 <= buf.len(),
+        "list<float> payload [{payload}..{}] exceeds region {}",
+        payload + count * 8,
+        buf.len()
+    );
+    let mut v = Vec::with_capacity(count);
+    let mut cur = payload;
+    for _ in 0..count {
+        v.push(f64::from_le_bytes(buf[cur..cur + 8].try_into().unwrap()));
+        cur += 8;
     }
-    decoded
+    v
+}
+
+/// Decode a `List<String>` pointer-array record whose header sits at
+/// arena-absolute `header_abs`. The wire format (produced by
+/// `copy_list_string_block` on the out-buf path and by the in-place
+/// region-walk path, byte-identical to `BufferBuilder::write_list_string`)
+/// is a header `[count: u32 LE][off_0 …off_(count-1)]`, where each `off_i`
+/// is an **arena-absolute** offset to a `[len: u32 LE][utf8 bytes]` String
+/// record.
+/// `buf` is the decoded region and `base` is the arena offset of `buf[0]`.
+/// Verifier-style bounds checks panic on any pointer / length that escapes
+/// the region; UTF-8 is validated.
+fn decode_list_string_at(buf: &[u8], base: usize, header_abs: usize) -> Vec<String> {
+    let header_start = rebase(header_abs, base, "list<string> header");
+    let count = read_u32_checked(buf, header_start, "list<string> count");
+    let entries_start = header_start + 4;
+    assert!(
+        entries_start + count * 4 <= buf.len(),
+        "list<string> entry array [{entries_start}..{}] exceeds region {}",
+        entries_start + count * 4,
+        buf.len()
+    );
+    let mut v = Vec::with_capacity(count);
+    for i in 0..count {
+        let entry_abs = read_u32_checked(buf, entries_start + i * 4, "list<string> entry ptr");
+        let rec_start = rebase(entry_abs, base, "list<string> entry");
+        let len = read_u32_checked(buf, rec_start, "list<string> entry len");
+        let payload = rec_start + 4;
+        assert!(
+            payload + len <= buf.len(),
+            "list<string> entry[{i}] payload [{payload}..{}] exceeds region {}",
+            payload + len,
+            buf.len()
+        );
+        let s = std::str::from_utf8(&buf[payload..payload + len])
+            .expect("list<string> entry utf8")
+            .to_string();
+        v.push(s);
+    }
+    v
+}
+
+/// Drive a `List<Float>` return and decode it byte-equal off the wasm
+/// leg, transparently handling both return ABIs: a **non-negative**
+/// `bytes_written` (the value was copied into out_buf, so the fixed slot
+/// at offset 0 points to the record there) and the **negative** in-place
+/// sentinel `-(root_abs + 1)` (the record lives in `scratch` / `in`; we
+/// read it from the whole arena at `root_abs`). Mirrors the native host's
+/// `decode_buffer_return` split.
+fn decode_list_float_return(
+    bytes: &[u8],
+    entry: &str,
+    info: &EmitObjectInfo,
+    in_record: &[u8],
+) -> Vec<f64> {
+    let (arena, _arena_abs, out_ptr, bw) = run_buffer_arena(bytes, entry, info, in_record);
+    // Both ABIs resolve to an arena-absolute header offset, decoded against
+    // the WHOLE arena (base 0). For a negative `bw` the header offset is
+    // the `root_abs` recovered from the sentinel; for a non-negative `bw`
+    // it is the arena-absolute pointer in the fixed-area return slot at
+    // arena-relative offset `out_ptr`.
+    let header_abs = if bw < 0 {
+        (-(bw as i64) - 1) as usize
+    } else {
+        // `arena` is read from the arena base, so the fixed-area return
+        // slot sits at arena-relative offset `out_ptr`.
+        read_u32_checked(&arena, out_ptr as usize, "list<float> slot")
+    };
+    decode_list_float_at(&arena, 0, header_abs)
+}
+
+/// Drive a `List<String>` return and decode it byte-equal off the wasm
+/// leg, handling both the out-buf (non-negative `bytes_written`) and
+/// in-place-sentinel (negative) return ABIs, mirroring the native host.
+fn decode_list_string_return(
+    bytes: &[u8],
+    entry: &str,
+    info: &EmitObjectInfo,
+    in_record: &[u8],
+) -> Vec<String> {
+    let (arena, _arena_abs, out_ptr, bw) = run_buffer_arena(bytes, entry, info, in_record);
+    let header_abs = if bw < 0 {
+        (-(bw as i64) - 1) as usize
+    } else {
+        read_u32_checked(&arena, out_ptr as usize, "list<string> slot")
+    };
+    decode_list_string_at(&arena, 0, header_abs)
 }
 
 // ---------------------------------------------------------------------
@@ -940,6 +1126,274 @@ fn r12_list_spread_runtime_src_empty_aligns_native_via_wasmtime() {
         "r12_list_spread_runtime_src_empty",
         "relon_parity_r12_list_spread_runtime_src_empty",
         "#main(Int n) -> List<Int>\n[100, ...range(n), 200]",
+        0,
+    );
+}
+
+// ---------------------------------------------------------------------
+// `List<Float>` / `List<String>` element-list returns. Until now the
+// wasm parity harness only decoded `List<Int>`; every feature that
+// produces a `List<Float>` (Float math, comprehensions, Int->Float map,
+// Float spread) or a `List<String>` (`split`, String-map, String
+// comprehension) was only verified on the `List<Int>`-shaped corpus, so
+// the wasm leg of these returns was never byte-decoded. The
+// `decode_list_float` / `decode_list_string` helpers close that gap.
+//
+// These returns map to `None` in `emitted_field_type_for` (the
+// binding-marshalling table the `Native` target enforces), so on the
+// wasm32 target `return_fields` comes back empty (the wasm host walks the
+// full `BufferSchema`, not these erased descriptors — see the
+// `descriptors_strict` comment in `evaluator.rs`). The single
+// `Ret { value: T }` slot therefore sits at fixed-area offset 0, which we
+// decode directly out of the raw out region. Native LLVM-AOT `run_main`
+// is the oracle (itself bit-aligned to tree-walk + cranelift).
+// ---------------------------------------------------------------------
+
+/// Build `src` (single `Int n` param returning `List<Float>`), take the
+/// native LLVM `run_main` list as the oracle, then assert the wasm32 leg
+/// decodes byte-equal (IEEE-754 bit pattern per element, so NaN / ±0.0
+/// edges stay exact). The return slot is the single `value` field at
+/// fixed-area offset 0.
+fn list_float_parity(name: &str, src: &str, n: i64) {
+    let want: Vec<f64> = match native_run(src, HashMap::from([("n".to_string(), Value::Int(n))])) {
+        Value::List(items) => items
+            .iter()
+            .map(|v| match v {
+                Value::Float(f) => f.into_inner(),
+                Value::Int(i) => *i as f64,
+                other => panic!("[{name}] non-float list element {other:?}"),
+            })
+            .collect(),
+        other => panic!("[{name}] native expected List, got {other:?}"),
+    };
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping {name} wasm leg");
+        return;
+    }
+    let (bytes, info) = build(name, src);
+    assert!(matches!(
+        info.shape,
+        relon_codegen_llvm::EmittedEntryShape::Buffer
+    ));
+    assert!(
+        info.return_has_tail,
+        "[{name}] List<Float> return needs tail"
+    );
+    let in_record = pack_single_int(&info, n);
+    let got = decode_list_float_return(&bytes, &format!("relon_parity_{name}"), &info, &in_record);
+    let decoded = Decoded::ListFloat(got);
+    let Decoded::ListFloat(got) = &decoded else {
+        unreachable!()
+    };
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "[{name}] List<Float> length wasm != native"
+    );
+    // Compare the IEEE-754 bit pattern per element so NaN / ±0.0 edges
+    // stay exact (plain f64 `PartialEq` would gloss over them).
+    for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+        assert_eq!(
+            g.to_bits(),
+            w.to_bits(),
+            "[{name}] List<Float>[{i}] wasm {g} bits != native {w}"
+        );
+    }
+}
+
+/// Build `src` returning `List<String>`, take the native LLVM `run_main`
+/// list as the oracle, then assert the wasm32 leg decodes byte-equal. The
+/// `#main` param defaults to `Int n`; a const driver passes `n` straight
+/// through. The return slot is the single `value` field at offset 0.
+fn list_string_parity(name: &str, src: &str, n: i64) {
+    let want: Vec<String> = match native_run(src, HashMap::from([("n".to_string(), Value::Int(n))]))
+    {
+        Value::List(items) => items
+            .iter()
+            .map(|v| match v {
+                Value::String(s) => s.to_string(),
+                other => panic!("[{name}] non-string list element {other:?}"),
+            })
+            .collect(),
+        other => panic!("[{name}] native expected List, got {other:?}"),
+    };
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping {name} wasm leg");
+        return;
+    }
+    let (bytes, info) = build(name, src);
+    assert!(matches!(
+        info.shape,
+        relon_codegen_llvm::EmittedEntryShape::Buffer
+    ));
+    assert!(
+        info.return_has_tail,
+        "[{name}] List<String> return needs tail"
+    );
+    let in_record = pack_single_int(&info, n);
+    let got = decode_list_string_return(&bytes, &format!("relon_parity_{name}"), &info, &in_record);
+    assert_eq!(
+        Decoded::ListString(got),
+        Decoded::ListString(want),
+        "[{name}] List<String> wasm != native"
+    );
+}
+
+// ----- List<Float> features -----
+
+/// Const `List<Float>` literal return.
+#[test]
+fn lf_const_list_aligns_native_via_wasmtime() {
+    list_float_parity(
+        "lf_const",
+        "#main(Int n) -> List<Float>\n[1.5, 2.5, 3.5]",
+        1,
+    );
+}
+
+/// Float math producing a list: `range(n).map((Int x) => x * 2.0)`
+/// (Int->Float map, F64 multiply per element).
+#[test]
+fn lf_range_map_scale_aligns_native_via_wasmtime() {
+    list_float_parity(
+        "lf_range_map_scale",
+        "#import list from \"std/list\"\n#main(Int n) -> List<Float>\n\
+         range(n).map((Int x) => x * 2.0)",
+        5,
+    );
+}
+
+/// Int->Float map via the free `_list_map` intrinsic form.
+#[test]
+fn lf_list_map_free_aligns_native_via_wasmtime() {
+    list_float_parity(
+        "lf_list_map_free",
+        "#main(Int n) -> List<Float>\n_list_map(range(n), (Int x) => x * 1.0)",
+        4,
+    );
+}
+
+/// Float comprehension `[x * 0.5 for x in range(n)]` (desugars onto map).
+#[test]
+fn lf_comprehension_aligns_native_via_wasmtime() {
+    list_float_parity(
+        "lf_comprehension",
+        "#main(Int n) -> List<Float>\n[x * 0.5 for x in range(n)]",
+        4,
+    );
+}
+
+/// Float spread `[...xs, 1.5]` over a const `List<Float>` source.
+#[test]
+fn lf_spread_aligns_native_via_wasmtime() {
+    list_float_parity(
+        "lf_spread",
+        "#main(Int n) -> List<Float>\n[...[10.0, 20.0], 1.5]",
+        1,
+    );
+}
+
+/// Empty Float list edge (`range(0).map(...)` → `[]`).
+#[test]
+fn lf_empty_aligns_native_via_wasmtime() {
+    list_float_parity(
+        "lf_empty",
+        "#main(Int n) -> List<Float>\nrange(n).map((Int x) => x * 2.0)",
+        0,
+    );
+}
+
+/// Single-element Float list edge.
+#[test]
+fn lf_single_aligns_native_via_wasmtime() {
+    list_float_parity(
+        "lf_single",
+        "#main(Int n) -> List<Float>\nrange(n).map((Int x) => x * 2.0)",
+        1,
+    );
+}
+
+// ----- List<String> features -----
+
+/// Const `List<String>` literal return.
+#[test]
+fn ls_const_list_aligns_native_via_wasmtime() {
+    list_string_parity(
+        "ls_const",
+        "#main(Int n) -> List<String>\n[\"a\", \"bb\", \"ccc\"]",
+        1,
+    );
+}
+
+/// `split` producing a `List<String>`.
+#[test]
+fn ls_split_aligns_native_via_wasmtime() {
+    list_string_parity(
+        "ls_split",
+        "#main(Int n) -> List<String>\n\"a,b,c,dd\".split(\",\")",
+        1,
+    );
+}
+
+/// `split` with a trailing empty segment (`"a,,c,"` → `["a","","c",""]`).
+#[test]
+fn ls_split_empty_segments_aligns_native_via_wasmtime() {
+    list_string_parity(
+        "ls_split_empty",
+        "#main(Int n) -> List<String>\n\"a,,c,\".split(\",\")",
+        1,
+    );
+}
+
+/// `List<String>`-producing map: each element maps to a const String.
+#[test]
+fn ls_map_const_aligns_native_via_wasmtime() {
+    list_string_parity(
+        "ls_map_const",
+        "#import list from \"std/list\"\n#main(Int n) -> List<String>\n\
+         range(n).map((Int x) => \"item\")",
+        3,
+    );
+}
+
+/// String comprehension `["s" for x in range(n)]` (desugars onto map).
+#[test]
+fn ls_comprehension_aligns_native_via_wasmtime() {
+    list_string_parity(
+        "ls_comprehension",
+        "#main(Int n) -> List<String>\n[\"s\" for x in range(n)]",
+        4,
+    );
+}
+
+/// `List<String>` carrying an empty string, a multi-byte (CJK) string,
+/// and a long string — exercises per-entry length / UTF-8 / alignment
+/// edges in the pointer-array decode. The CJK literal is written as
+/// escapes (U+4E2D U+6587) so the source stays ASCII while the runtime
+/// String is multi-byte UTF-8.
+#[test]
+fn ls_mixed_widths_aligns_native_via_wasmtime() {
+    list_string_parity(
+        "ls_mixed_widths",
+        "#main(Int n) -> List<String>\n\
+         [\"\", \"\u{4e2d}\u{6587}\", \"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG\", \"x\"]",
+        1,
+    );
+}
+
+/// Single-element `List<String>` edge.
+#[test]
+fn ls_single_aligns_native_via_wasmtime() {
+    list_string_parity("ls_single", "#main(Int n) -> List<String>\n[\"only\"]", 1);
+}
+
+/// Empty `List<String>` edge (`range(0)`-driven map → `[]`).
+#[test]
+fn ls_empty_aligns_native_via_wasmtime() {
+    list_string_parity(
+        "ls_empty",
+        "#import list from \"std/list\"\n#main(Int n) -> List<String>\n\
+         range(n).map((Int x) => \"item\")",
         0,
     );
 }
