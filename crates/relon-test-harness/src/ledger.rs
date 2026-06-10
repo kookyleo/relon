@@ -1701,6 +1701,22 @@ pub const LEDGER: &[LedgerEntry] = &[
         reason: "expression shape has no IR/codegen lowering path yet",
     },
     LedgerEntry {
+        id: "try_lower_list_unique.unknown_stdlib_method.1",
+        site: "lowering/peephole.rs::try_lower_list_unique",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "internal guard: bundled list_int_unique/list_float_unique slot missing from registry",
+    },
+    LedgerEntry {
+        id: "try_lower_list_unique.unknown_stdlib_method.2",
+        site: "lowering/peephole.rs::try_lower_list_unique",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "internal guard: bundled list_int_unique/list_float_unique metadata missing from registry",
+    },
+    LedgerEntry {
         id: "emit_list_int_hof_call.unknown_stdlib_method.1",
         site: "lowering/peephole.rs::emit_list_int_hof_call",
         category: Category::ExprShape,
@@ -3160,5 +3176,59 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
                 `src.field` access into the matching schema slot; wasm + llvm-native legs proven \
                 in relon-codegen-llvm::inplace_return_four_way::dict_spread_* and \
                 relon-codegen-llvm::aot_wasm_parity::r12_dict_spread)",
+    },
+    // ---- Stdlib tail wave: the last five tree-walk-only stdlib fns ----
+    SurfaceEntry {
+        construct: "pow(a, b) -> Float (libm pow on every leg, IEEE-754; Int operands widen)",
+        wave: "ST",
+        corpus: "st_pow_float",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (TW_CR; wasm + llvm-native legs proven in \
+                relon-codegen-llvm::aot_wasm_parity::st_pow_* incl. int-widen / neg-exp / \
+                overflow-to-inf)",
+    },
+    SurfaceEntry {
+        construct: "count(xs) -> Int (record-header length read, any list element type)",
+        wave: "ST",
+        corpus: "st_count_list",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (TW_CR; wasm + llvm-native legs proven in \
+                relon-codegen-llvm::aot_wasm_parity::st_count_*). The count-empty FastInt \
+                shape (`count(range(0))`, no buffer operand) is not directly driven on the \
+                wasm leg: object emit rejects it loudly (AllocScratch outside \
+                buffer-protocol entry shape) instead of miscompiling, and the wasm leg is \
+                verified through the equivalent Buffer-entry source \
+                `count([1, 2].filter(..))`; a pre-existing entry-shape driving limitation, \
+                not a new miscompile",
+    },
+    SurfaceEntry {
+        construct: "every(xs, pred) -> Bool (short-circuit loop, List<Int>/List<Float>; \
+                    empty list vacuously true)",
+        wave: "ST",
+        corpus: "st_every_true",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (TW_CR; wasm + llvm-native legs proven in \
+                relon-codegen-llvm::aot_wasm_parity::st_every_* incl. the short-circuit \
+                proof that stops before a trapping predicate)",
+    },
+    SurfaceEntry {
+        construct: "some(xs, pred) -> Bool (short-circuit loop, List<Int>/List<Float>; \
+                    empty list false)",
+        wave: "ST",
+        corpus: "st_some_true",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (TW_CR; wasm + llvm-native legs proven in \
+                relon-codegen-llvm::aot_wasm_parity::st_some_* incl. the short-circuit \
+                proof that stops before a trapping predicate)",
+    },
+    SurfaceEntry {
+        construct: "unique(xs) -> Bool (O(N^2) i<j scan, List<Int>/List<Float>; \
+                    OrderedFloat equality: NaN==NaN and -0.0==0.0 are duplicates)",
+        wave: "ST",
+        corpus: "st_unique_dup",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (TW_CR; wasm + llvm-native legs proven in \
+                relon-codegen-llvm::aot_wasm_parity::st_unique_* incl. the NaN-dup and \
+                neg-zero-dup float cases; List<String>/List<Bool> stay capped)",
     },
 ];

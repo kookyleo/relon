@@ -1532,6 +1532,68 @@ pub(super) fn try_lower_list_len(
     Ok(Some(()))
 }
 
+/// Stdlib tail wave: `count(xs)` free call — the tree-walk `ListCount`
+/// oracle is the plain element count (`xs.len() as i64`), so this is
+/// [`try_lower_list_len`] generalised to EVERY list IR type: all list
+/// records (and strings / dicts) share the leading `[len: u32 LE]`
+/// count prefix, so `Op::ReadStringLen` (widened to `I64`) recovers
+/// the count for any of them. The argument is lowered speculatively;
+/// a non-list result (the oracle's `expect_list` error arm — including
+/// `String` / `Dict`, which the oracle rejects) rolls back so the
+/// generic dispatch caps it loudly (`count` has no bundled body, so
+/// `stdlib_function_index` misses). `count` is registered ONLY as a
+/// free fn in the evaluator — the method form (`xs.count()`) stays
+/// byte-equal with the oracle's `function_not_found` through the
+/// method-table miss.
+pub(super) fn try_lower_list_count(
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    if path.len() != 1 || args.len() != 1 || args[0].name.is_some() {
+        return Ok(None);
+    }
+    if !matches!(&path[0], TokenKey::String(s, _, _) if s == "count") {
+        return Ok(None);
+    }
+    let saved_out = std::mem::take(&mut ctx.out);
+    let saved_stack = std::mem::take(&mut ctx.tstack);
+    let saved_next_let = ctx.next_let_idx;
+    let saved_lambda_len = ctx.lambda_table.borrow().len();
+    let lower_res = lower_expr(&args[0].value.expr, args[0].value.range, ctx);
+    let produced = ctx.tstack.last().copied();
+    let is_list = matches!(
+        produced,
+        Some(
+            IrType::ListInt
+                | IrType::ListFloat
+                | IrType::ListBool
+                | IrType::ListString
+                | IrType::ListSchema
+                | IrType::ListList
+        )
+    );
+    if lower_res.is_err() || !is_list {
+        ctx.out = saved_out;
+        ctx.tstack = saved_stack;
+        ctx.next_let_idx = saved_next_let;
+        ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+        return Ok(None);
+    }
+    let arg_stream = std::mem::replace(&mut ctx.out, saved_out);
+    ctx.out.extend(arg_stream);
+    let arg_stack = std::mem::replace(&mut ctx.tstack, saved_stack);
+    ctx.tstack.extend(arg_stack);
+    ctx.out.push(TaggedOp {
+        op: Op::ReadStringLen,
+        range,
+    });
+    ctx.tstack.pop(); // list handle
+    ctx.tstack.push(IrType::I64);
+    Ok(Some(()))
+}
+
 /// Wave R7: scalar-returning Float math stdlib — `abs` / `floor` /
 /// `ceil` / `round` / `sqrt` as free calls (`floor(x)`) or methods
 /// (`x.floor()`). These cap on the compiled backends through the generic
@@ -1554,9 +1616,10 @@ pub(super) fn try_lower_list_len(
 ///
 /// Returns `Ok(Some(()))` on a committed lowering, `Ok(None)` when the
 /// shape does not match (caller falls through to the generic dispatch,
-/// which caps loudly for unsupported operand types). `pow` is
-/// deliberately NOT handled — it needs a `pow` libcall with no native
-/// wasm instruction, so it stays capped.
+/// which caps loudly for unsupported operand types). `pow` is handled
+/// by [`try_lower_predicate_math`] (it shares `in_range`'s
+/// widen-every-arg-to-f64 discipline), lowering to `Op::F64Pow` whose
+/// `pow` libcall is bridged per backend.
 pub(super) fn try_lower_scalar_math(
     method_name: &str,
     receiver_segments: &[TokenKey],
@@ -1667,13 +1730,13 @@ pub(super) fn try_lower_scalar_math(
     Ok(Some(()))
 }
 
-/// JSON-Schema numeric predicates `multiple_of(n, d)` and
-/// `in_range(n, lo, hi)` as free calls. Both have a polymorphic numeric
-/// domain (Int / Float mixes) that the generic `stdlib_function_index`
-/// path cannot select by name alone, so — like [`try_lower_scalar_math`]
-/// — this peephole lowers the arguments speculatively, inspects their IR
-/// types, and routes to the body whose semantics match the tree-walk
-/// oracle:
+/// JSON-Schema numeric predicates `multiple_of(n, d)` /
+/// `in_range(n, lo, hi)` plus `pow(a, b)` as free calls. All have a
+/// polymorphic numeric domain (Int / Float mixes) that the generic
+/// `stdlib_function_index` path cannot select by name alone, so — like
+/// [`try_lower_scalar_math`] — this peephole lowers the arguments
+/// speculatively, inspects their IR types, and routes to the body whose
+/// semantics match the tree-walk oracle:
 ///
 ///   * `multiple_of(Int, Int)` → bundled `multiple_of` body (index 61;
 ///     `d == 0 ? false : n % d == 0`). Any Float operand returns
@@ -1685,6 +1748,15 @@ pub(super) fn try_lower_scalar_math(
 ///     oracle widens every argument to f64 (`to_f64_val`), so any `I64`
 ///     operand is widened here with `Op::ConvertI64ToF64` before the
 ///     call; the body itself is all-`F64`. Four-way clean.
+///   * `pow(a, b)` → bundled `pow` body (index 77; `Op::F64Pow` =
+///     `f64::powf`, never traps). Same per-operand `to_f64_val`
+///     widening as `in_range` — the oracle is
+///     `to_f64_val(a).powf(to_f64_val(b))`. A non-numeric operand
+///     rolls back; the generic dispatch then finds the all-`F64` `pow`
+///     body and caps the argument loudly (`StdlibArgTypeMismatch`) —
+///     the oracle's `to_f64_val` non-numeric→`0.0` coercion is a
+///     degenerate arm with no compiled surface, kept capped rather
+///     than approximated.
 ///
 /// Returns `Ok(Some(()))` on a committed lowering, `Ok(None)` when the
 /// shape does not match (caller falls through to the generic dispatch,
@@ -1696,21 +1768,23 @@ pub(super) fn try_lower_predicate_math(
     range: TokenRange,
     ctx: &mut LowerCtx<'_>,
 ) -> Result<Option<()>, LoweringError> {
-    // Free-call form only — both are registered solely as free fns in the
-    // tree-walk evaluator (never methods), so a method form (`n.in_range(...)`)
-    // must stay byte-equal with the oracle's `function_not_found`.
+    // Free-call form only — all three are registered solely as free fns in
+    // the tree-walk evaluator (never methods), so a method form
+    // (`n.in_range(...)` / `x.pow(y)`) must stay byte-equal with the
+    // oracle's `function_not_found`.
     if !receiver_segments.is_empty() {
         return Ok(None);
     }
     let expected_arity = match method_name {
         "multiple_of" => 2usize,
         "in_range" => 3usize,
+        "pow" => 2usize,
         _ => return Ok(None),
     };
     if args.len() != expected_arity || args.iter().any(|a| a.name.is_some()) {
         return Ok(None);
     }
-    let widen_to_f64 = method_name == "in_range";
+    let widen_to_f64 = matches!(method_name, "in_range" | "pow");
 
     // Speculatively lower every argument into a scratch stream so a
     // non-numeric / failed lowering rolls back cleanly. For `in_range`,
@@ -2053,6 +2127,185 @@ pub(super) fn try_lower_list_filter(
         range,
     });
     ctx.tstack.push(filter_ret);
+    Ok(Some(()))
+}
+
+/// Stdlib tail wave: `every(xs, p)` / `some(xs, p)` free calls — the
+/// short-circuiting quantifiers over a `List<Int>` / `List<Float>`
+/// source with an `(elem) -> Bool` predicate closure (the same
+/// predicate surface as `filter`). The list source is lowered
+/// speculatively and rolled back on an unsupported type so the generic
+/// dispatch caps it loudly (`every` / `some` have no bundled body
+/// under those names, so `stdlib_function_index` misses — this keeps
+/// `List<String>` / `List<Bool>` / pointer-array sources, where no
+/// `String -> Bool` predicate or four-way `Eq` exists, honestly
+/// capped). A predicate body that does not type-check as
+/// `(elem) -> Bool` is a loud lowering error (same discipline as
+/// `filter`); the oracle's runtime `TypeMismatch` for a non-Bool
+/// predicate result has no silent compiled approximation.
+///
+/// The method forms (`xs.every(p)` / `xs.some(p)`) route through
+/// `stdlib_method_index` + `stdlib_closure_arg_signature` like
+/// `fold` / `reduce` and never reach this peephole.
+pub(super) fn try_lower_list_pred(
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    if path.len() != 1 || args.len() != 2 || args.iter().any(|a| a.name.is_some()) {
+        return Ok(None);
+    }
+    let is_every = match &path[0] {
+        TokenKey::String(s, _, _) if s == "every" => true,
+        TokenKey::String(s, _, _) if s == "some" => false,
+        _ => return Ok(None),
+    };
+    // Second arg must be a single-param closure literal.
+    let Expr::Closure { params, .. } = &*args[1].value.expr else {
+        return Ok(None);
+    };
+    if params.len() != 1 {
+        return Ok(None);
+    }
+    // Speculatively lower the list source; roll back on a non-list /
+    // unsupported-element result so dispatch can fall through.
+    let saved_out = std::mem::take(&mut ctx.out);
+    let saved_stack = std::mem::take(&mut ctx.tstack);
+    let saved_next_let = ctx.next_let_idx;
+    let saved_lambda_len = ctx.lambda_table.borrow().len();
+    let lower_res = lower_expr(&args[0].value.expr, args[0].value.range, ctx);
+    let produced = ctx.tstack.last().copied();
+    let builtin = match (lower_res.is_ok(), produced) {
+        (true, Some(IrType::ListInt)) => {
+            if is_every {
+                "list_int_every"
+            } else {
+                "list_int_some"
+            }
+        }
+        (true, Some(IrType::ListFloat)) => {
+            if is_every {
+                "list_float_every"
+            } else {
+                "list_float_some"
+            }
+        }
+        _ => {
+            ctx.out = saved_out;
+            ctx.tstack = saved_stack;
+            ctx.next_let_idx = saved_next_let;
+            ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+            return Ok(None);
+        }
+    };
+    // Commit the source stream onto the outer ctx.
+    let arg_stream = std::mem::replace(&mut ctx.out, saved_out);
+    ctx.out.extend(arg_stream);
+    let arg_stack = std::mem::replace(&mut ctx.tstack, saved_stack);
+    ctx.tstack.extend(arg_stack);
+
+    // Lower the predicate closure (`(elem) -> Bool`) from the single
+    // side-table source of truth, then emit the bundled-body call.
+    let (param_tys_c, ret_ty_c) = stdlib_closure_arg_signature(builtin, 1).ok_or_else(|| {
+        cap!(
+            "emit_list_int_hof_call.unsupported_expr",
+            LoweringError::UnsupportedExpr {
+                kind: format!("{builtin} closure signature missing"),
+                range,
+            }
+        )
+    })?;
+    lower_closure_as_value(
+        &args[1].value.expr,
+        args[1].value.range,
+        &param_tys_c,
+        ret_ty_c,
+        ctx,
+    )?;
+    finish_list_hof(builtin, range, ctx)
+}
+
+/// Stdlib tail wave: `unique(xs)` free call — JSON Schema
+/// `uniqueItems` over a `List<Int>` / `List<Float>` source (O(N²)
+/// pairwise scan, `false` on the first `i < j` equal pair). The source
+/// is lowered speculatively and rolled back on an unsupported type so
+/// the generic dispatch caps it loudly (`unique` has no bundled body
+/// under that name) — `List<String>` and the pointer-array list shapes
+/// stay capped: no four-way `String` `Eq`, and structural equality on
+/// variant / nested-list records has no compiled surface. Float
+/// equality is OrderedFloat on every backend (`NaN == NaN` true,
+/// `-0.0 == 0.0` true), byte-identical to the oracle's `Value`
+/// `PartialEq` — see `list_unique_body_typed`.
+///
+/// The method form (`xs.unique()`) routes through
+/// `stdlib_method_index` and never reaches this peephole.
+pub(super) fn try_lower_list_unique(
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    if path.len() != 1 || args.len() != 1 || args[0].name.is_some() {
+        return Ok(None);
+    }
+    if !matches!(&path[0], TokenKey::String(s, _, _) if s == "unique") {
+        return Ok(None);
+    }
+    let saved_out = std::mem::take(&mut ctx.out);
+    let saved_stack = std::mem::take(&mut ctx.tstack);
+    let saved_next_let = ctx.next_let_idx;
+    let saved_lambda_len = ctx.lambda_table.borrow().len();
+    let lower_res = lower_expr(&args[0].value.expr, args[0].value.range, ctx);
+    let produced = ctx.tstack.last().copied();
+    let builtin = match (lower_res.is_ok(), produced) {
+        (true, Some(IrType::ListInt)) => "list_int_unique",
+        (true, Some(IrType::ListFloat)) => "list_float_unique",
+        _ => {
+            ctx.out = saved_out;
+            ctx.tstack = saved_stack;
+            ctx.next_let_idx = saved_next_let;
+            ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+            return Ok(None);
+        }
+    };
+    // Commit the source stream onto the outer ctx and emit the call.
+    let arg_stream = std::mem::replace(&mut ctx.out, saved_out);
+    ctx.out.extend(arg_stream);
+    let arg_stack = std::mem::replace(&mut ctx.tstack, saved_stack);
+    ctx.tstack.extend(arg_stack);
+
+    let fn_index = stdlib_function_index(builtin).ok_or_else(|| {
+        cap!(
+            "try_lower_list_unique.unknown_stdlib_method.1",
+            LoweringError::UnknownStdlibMethod {
+                name: builtin.to_string(),
+                arity: 1,
+                range,
+            }
+        )
+    })?;
+    let meta = builtin_stdlib().get(fn_index as usize).ok_or_else(|| {
+        cap!(
+            "try_lower_list_unique.unknown_stdlib_method.2",
+            LoweringError::UnknownStdlibMethod {
+                name: builtin.to_string(),
+                arity: 1,
+                range,
+            }
+        )
+    })?;
+    ctx.tstack.pop(); // source list handle
+    ctx.out.push(TaggedOp {
+        op: Op::Call {
+            fn_index,
+            arg_count: 1,
+            param_tys: meta.params.clone(),
+            ret_ty: meta.ret,
+        },
+        range,
+    });
+    ctx.tstack.push(meta.ret);
     Ok(Some(()))
 }
 

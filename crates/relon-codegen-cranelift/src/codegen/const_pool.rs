@@ -636,6 +636,9 @@ impl OpVisitor for ConstPool {
     fn visit_f64_unary(&mut self, _: F64UnaryOp) -> Result<(), CraneliftError> {
         Ok(())
     }
+    fn visit_f64_pow(&mut self) -> Result<(), CraneliftError> {
+        Ok(())
+    }
     fn visit_eq(&mut self, _: IrType) -> Result<(), CraneliftError> {
         Ok(())
     }

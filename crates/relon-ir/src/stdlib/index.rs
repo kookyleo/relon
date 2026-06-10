@@ -172,6 +172,22 @@ pub fn stdlib_method_index(receiver_ty: IrType, name: &str) -> Option<u32> {
         (IrType::ListSchema, "length") => stdlib_function_index("list_schema_length"),
         (IrType::ListList, "length") => stdlib_function_index("list_list_length"),
         (IrType::ListList, "filter") => stdlib_function_index("list_list_filter"),
+        // Stdlib tail wave: `xs.every(p)` / `xs.some(p)` / `xs.unique()`
+        // method forms (the evaluator registers all three on `List` —
+        // see `relon_evaluator::stdlib`; `count` / `pow` are free-fn
+        // only, so they are intentionally absent here to keep the
+        // four-way surface in lock-step with the oracle's
+        // `function_not_found`). The closure arg routes through
+        // `stdlib_closure_arg_signature` below; `List<String>` /
+        // `List<Bool>` / pointer-array receivers miss this table and
+        // cap loudly (no four-way String `Eq` / `String -> Bool`
+        // predicate surface).
+        (IrType::ListInt, "every") => stdlib_function_index("list_int_every"),
+        (IrType::ListInt, "some") => stdlib_function_index("list_int_some"),
+        (IrType::ListInt, "unique") => stdlib_function_index("list_int_unique"),
+        (IrType::ListFloat, "every") => stdlib_function_index("list_float_every"),
+        (IrType::ListFloat, "some") => stdlib_function_index("list_float_some"),
+        (IrType::ListFloat, "unique") => stdlib_function_index("list_float_unique"),
         _ => None,
     }
 }
@@ -217,6 +233,12 @@ pub fn stdlib_closure_arg_signature(name: &str, arg_idx: u32) -> Option<(Vec<IrT
         ("list_string_map", 1) => Some((vec![IrType::String], IrType::String)),
         ("list_int_map_to_string", 1) => Some((vec![IrType::I64], IrType::String)),
         ("list_float_map_to_string", 1) => Some((vec![IrType::F64], IrType::String)),
+        // Stdlib tail wave: `every` / `some` predicates — `(elem) -> Bool`,
+        // the same surface as the matching `filter` predicate.
+        ("list_int_every", 1) => Some((vec![IrType::I64], IrType::Bool)),
+        ("list_int_some", 1) => Some((vec![IrType::I64], IrType::Bool)),
+        ("list_float_every", 1) => Some((vec![IrType::F64], IrType::Bool)),
+        ("list_float_some", 1) => Some((vec![IrType::F64], IrType::Bool)),
         ("list_int_map_to_variant_list", 1) => Some((vec![IrType::I64], IrType::I32)),
         ("list_float_map_to_variant_list", 1) => Some((vec![IrType::F64], IrType::I32)),
         ("list_string_map_to_variant_list", 1) => Some((vec![IrType::String], IrType::I32)),

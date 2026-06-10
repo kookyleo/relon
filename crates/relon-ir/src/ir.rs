@@ -746,6 +746,21 @@ pub enum Op {
     /// See [`F64UnaryOp`] for the per-variant intrinsic + oracle
     /// semantics.
     F64Unary(F64UnaryOp),
+    /// Stdlib tail wave: IEEE-754 float power. Pop `[exp, base]` (two
+    /// `F64`-typed values, exponent on top), push the `F64`-typed
+    /// `base.powf(exp)` result. Stack: `[F64, F64] -> [F64]`.
+    ///
+    /// Matches the tree-walk `pow` oracle exactly
+    /// (`to_f64_val(a).powf(to_f64_val(b))` — never traps; negative /
+    /// zero exponents and overflow follow `f64::powf`, i.e. the C `pow`
+    /// contract). Backend lowering: cranelift calls the module-declared
+    /// external `pow` symbol (the JIT pins it to a Rust `a.powf(b)`
+    /// shim, the object path binds it to libm at `dlopen`); LLVM emits
+    /// the `llvm.pow.f64` intrinsic (native MCJIT resolves the
+    /// resulting `pow` libcall in-process; wasm32 leaves it as an `env`
+    /// import the host binds to `f64::powf`). All four legs land on the
+    /// same host libm/`powf`, so the result is bit-identical.
+    F64Pow,
     /// Pop two operands of the tagged type, push the boolean result.
     /// Stack: `[T, T] -> [Bool]`. Lowers to `i64.eq` / `f64.eq` /
     /// `i32.eq` depending on `T`'s wasm slot. `Unit == Unit` always
@@ -1822,6 +1837,7 @@ impl Op {
             | Op::ConvertI64ToF64
             | Op::F64ToI64Sat
             | Op::F64Unary(_)
+            | Op::F64Pow
             | Op::Eq(_)
             | Op::Ne(_)
             | Op::Lt(_)

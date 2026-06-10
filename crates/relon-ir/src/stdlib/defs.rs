@@ -3303,3 +3303,424 @@ pub(super) fn list_string_map_to_variant_list() -> StdlibFunction {
         },
     )
 }
+
+/// Stdlib tail wave: shared `every` / `some` body parameterised by the
+/// element representation and the quantifier polarity. The predicate
+/// closure always returns `Bool`; only the element load op and the
+/// closure param type vary. Mirrors the tree-walk `ListEvery` /
+/// `ListSome` oracles exactly:
+///
+///   * `every` — `RESULT` starts at `1`; the first `false` predicate
+///     sets it to `0` and breaks (no later element is visited, so a
+///     predicate that would trap past the short-circuit point never
+///     runs — trap parity with the oracle's early `return`). Empty
+///     list falls straight out with `1` (vacuous truth).
+///   * `some` — `RESULT` starts at `0`; the first `true` predicate
+///     sets it to `1` and breaks. Empty list yields `0`.
+///
+/// Loop skeleton (header read, payload alignment, 8-byte element
+/// slots, `CallClosure` per element) is byte-identical in structure to
+/// [`list_filter_body_typed`] minus the destination list.
+fn list_pred_body_typed(
+    load_elem: fn(u32) -> Op,
+    param_ty: IrType,
+    is_every: bool,
+) -> Vec<TaggedOp> {
+    const N: u32 = 0;
+    const I: u32 = 1;
+    const SRC_PAYLOAD: u32 = 2;
+    const CUR_VAL: u32 = 3;
+    const RESULT: u32 = 4;
+    let cur_val_ty = param_ty;
+    // Per-element decision: pop the predicate's Bool, update `RESULT`
+    // on the short-circuiting arm, and leave a break flag (`1` = stop
+    // scanning) as the `If` result.
+    let (then_body, else_body) = if is_every {
+        (
+            // Predicate true — keep scanning.
+            vec![tt(Op::ConstI32(0))],
+            // Predicate false — RESULT = 0, break.
+            vec![
+                tt(Op::ConstI32(0)),
+                tt(Op::LetSet {
+                    idx: RESULT,
+                    ty: IrType::I32,
+                }),
+                tt(Op::ConstI32(1)),
+            ],
+        )
+    } else {
+        (
+            // Predicate true — RESULT = 1, break.
+            vec![
+                tt(Op::ConstI32(1)),
+                tt(Op::LetSet {
+                    idx: RESULT,
+                    ty: IrType::I32,
+                }),
+                tt(Op::ConstI32(1)),
+            ],
+            // Predicate false — keep scanning.
+            vec![tt(Op::ConstI32(0))],
+        )
+    };
+    vec![
+        tt(Op::LocalGet(0)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        tt(Op::LocalGet(0)),
+        tt(Op::ConstI32(4 + 7)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::ConstI32(-8)),
+        tt(Op::BitAnd(IrType::I32)),
+        tt(Op::LetSet {
+            idx: SRC_PAYLOAD,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: I,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(if is_every { 1 } else { 0 })),
+        tt(Op::LetSet {
+            idx: RESULT,
+            ty: IrType::I32,
+        }),
+        tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
+                result_ty: None,
+                body: vec![
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: N,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Ge(IrType::I32)),
+                    tt(Op::BrIf { label_depth: 1 }),
+                    // cur_val = load(src_payload + i*8)
+                    tt(Op::LetGet {
+                        idx: SRC_PAYLOAD,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(8)),
+                    tt(Op::Mul(IrType::I32)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(load_elem(0)),
+                    tt(Op::LetSet {
+                        idx: CUR_VAL,
+                        ty: cur_val_ty,
+                    }),
+                    // closure(cur_val) -> bool
+                    tt(Op::LocalGet(1)),
+                    tt(Op::LetGet {
+                        idx: CUR_VAL,
+                        ty: cur_val_ty,
+                    }),
+                    tt(Op::CallClosure {
+                        param_tys: vec![param_ty],
+                        ret_ty: IrType::Bool,
+                    }),
+                    tt(Op::If {
+                        result_ty: IrType::I32,
+                        then_body,
+                        else_body,
+                    }),
+                    // Break flag from the `If` — short-circuit out of
+                    // the scan when the quantifier is decided.
+                    tt(Op::BrIf { label_depth: 1 }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(1)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        // RESULT != 0 → Bool.
+        tt(Op::LetGet {
+            idx: RESULT,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(0)),
+        tt(Op::Ne(IrType::I32)),
+        tt(Op::Return),
+    ]
+}
+
+/// `list_int_every(xs: List<Int>, f: Closure<I64 -> Bool>) -> Bool`.
+pub(super) fn list_int_every() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_int_every",
+        vec![IrType::ListInt, IrType::Closure],
+        IrType::Bool,
+        || list_pred_body_typed(|o| Op::LoadI64AtAbsolute { offset: o }, IrType::I64, true),
+    )
+}
+
+/// `list_int_some(xs: List<Int>, f: Closure<I64 -> Bool>) -> Bool`.
+pub(super) fn list_int_some() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_int_some",
+        vec![IrType::ListInt, IrType::Closure],
+        IrType::Bool,
+        || list_pred_body_typed(|o| Op::LoadI64AtAbsolute { offset: o }, IrType::I64, false),
+    )
+}
+
+/// `list_float_every(xs: List<Float>, f: Closure<F64 -> Bool>) -> Bool`.
+pub(super) fn list_float_every() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_float_every",
+        vec![IrType::ListFloat, IrType::Closure],
+        IrType::Bool,
+        || list_pred_body_typed(|o| Op::LoadF64AtAbsolute { offset: o }, IrType::F64, true),
+    )
+}
+
+/// `list_float_some(xs: List<Float>, f: Closure<F64 -> Bool>) -> Bool`.
+pub(super) fn list_float_some() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_float_some",
+        vec![IrType::ListFloat, IrType::Closure],
+        IrType::Bool,
+        || list_pred_body_typed(|o| Op::LoadF64AtAbsolute { offset: o }, IrType::F64, false),
+    )
+}
+
+/// Stdlib tail wave: shared `unique` body parameterised by the element
+/// representation. Mirrors the tree-walk `ListUnique` oracle (JSON
+/// Schema `uniqueItems`) exactly: an O(N²) pairwise scan over `i < j`
+/// that returns `false` on the first equal pair, `true` otherwise
+/// (empty / single-element lists are trivially unique).
+///
+/// Equality is `Op::Eq(elem_ty)`. For `F64` elements both compiled
+/// backends implement OrderedFloat equality
+/// (`eq = OEQ(a,b) | (isnan(a) & isnan(b))` — `NaN == NaN` is true,
+/// `-0.0 == 0.0` is true), byte-identical to the oracle's
+/// `Value::Float(OrderedFloat)` `PartialEq`.
+fn list_unique_body_typed(load_elem: fn(u32) -> Op, elem_ty: IrType) -> Vec<TaggedOp> {
+    const N: u32 = 0;
+    const I: u32 = 1;
+    const J: u32 = 2;
+    const SRC_PAYLOAD: u32 = 3;
+    const CUR_VAL: u32 = 4;
+    const RESULT: u32 = 5;
+    vec![
+        tt(Op::LocalGet(0)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        tt(Op::LetSet {
+            idx: N,
+            ty: IrType::I32,
+        }),
+        tt(Op::LocalGet(0)),
+        tt(Op::ConstI32(4 + 7)),
+        tt(Op::Add(IrType::I32)),
+        tt(Op::ConstI32(-8)),
+        tt(Op::BitAnd(IrType::I32)),
+        tt(Op::LetSet {
+            idx: SRC_PAYLOAD,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(0)),
+        tt(Op::LetSet {
+            idx: I,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(1)),
+        tt(Op::LetSet {
+            idx: RESULT,
+            ty: IrType::I32,
+        }),
+        tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
+                // Outer scan over `i`.
+                result_ty: None,
+                body: vec![
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: N,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Ge(IrType::I32)),
+                    tt(Op::BrIf { label_depth: 1 }),
+                    // cur_val = load(src_payload + i*8)
+                    tt(Op::LetGet {
+                        idx: SRC_PAYLOAD,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(8)),
+                    tt(Op::Mul(IrType::I32)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(load_elem(0)),
+                    tt(Op::LetSet {
+                        idx: CUR_VAL,
+                        ty: elem_ty,
+                    }),
+                    // j = i + 1
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(1)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: J,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Block {
+                        result_ty: None,
+                        body: vec![tt(Op::Loop {
+                            // Inner scan over `j` in `(i, n)`.
+                            result_ty: None,
+                            body: vec![
+                                tt(Op::LetGet {
+                                    idx: J,
+                                    ty: IrType::I32,
+                                }),
+                                tt(Op::LetGet {
+                                    idx: N,
+                                    ty: IrType::I32,
+                                }),
+                                tt(Op::Ge(IrType::I32)),
+                                tt(Op::BrIf { label_depth: 1 }),
+                                // elem[j] == cur_val ?
+                                tt(Op::LetGet {
+                                    idx: SRC_PAYLOAD,
+                                    ty: IrType::I32,
+                                }),
+                                tt(Op::LetGet {
+                                    idx: J,
+                                    ty: IrType::I32,
+                                }),
+                                tt(Op::ConstI32(8)),
+                                tt(Op::Mul(IrType::I32)),
+                                tt(Op::Add(IrType::I32)),
+                                tt(load_elem(0)),
+                                tt(Op::LetGet {
+                                    idx: CUR_VAL,
+                                    ty: elem_ty,
+                                }),
+                                tt(Op::Eq(elem_ty)),
+                                tt(Op::If {
+                                    result_ty: IrType::I32,
+                                    // Duplicate pair — RESULT = 0, break flag.
+                                    then_body: vec![
+                                        tt(Op::ConstI32(0)),
+                                        tt(Op::LetSet {
+                                            idx: RESULT,
+                                            ty: IrType::I32,
+                                        }),
+                                        tt(Op::ConstI32(1)),
+                                    ],
+                                    else_body: vec![tt(Op::ConstI32(0))],
+                                }),
+                                // Full break: clear both loops (depths
+                                // from here — 0: inner Loop, 1: inner
+                                // Block, 2: outer Loop, 3: outer Block).
+                                tt(Op::BrIf { label_depth: 3 }),
+                                tt(Op::LetGet {
+                                    idx: J,
+                                    ty: IrType::I32,
+                                }),
+                                tt(Op::ConstI32(1)),
+                                tt(Op::Add(IrType::I32)),
+                                tt(Op::LetSet {
+                                    idx: J,
+                                    ty: IrType::I32,
+                                }),
+                                tt(Op::Br { label_depth: 0 }),
+                            ],
+                        })],
+                    }),
+                    tt(Op::LetGet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::ConstI32(1)),
+                    tt(Op::Add(IrType::I32)),
+                    tt(Op::LetSet {
+                        idx: I,
+                        ty: IrType::I32,
+                    }),
+                    tt(Op::Br { label_depth: 0 }),
+                ],
+            })],
+        }),
+        // RESULT != 0 → Bool.
+        tt(Op::LetGet {
+            idx: RESULT,
+            ty: IrType::I32,
+        }),
+        tt(Op::ConstI32(0)),
+        tt(Op::Ne(IrType::I32)),
+        tt(Op::Return),
+    ]
+}
+
+/// `list_int_unique(xs: List<Int>) -> Bool`.
+pub(super) fn list_int_unique() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_int_unique",
+        vec![IrType::ListInt],
+        IrType::Bool,
+        || list_unique_body_typed(|o| Op::LoadI64AtAbsolute { offset: o }, IrType::I64),
+    )
+}
+
+/// `list_float_unique(xs: List<Float>) -> Bool`. Float equality is the
+/// OrderedFloat contract (`NaN == NaN` true, `-0.0 == 0.0` true) on
+/// every backend — see [`list_unique_body_typed`].
+pub(super) fn list_float_unique() -> StdlibFunction {
+    StdlibFunction::new(
+        "list_float_unique",
+        vec![IrType::ListFloat],
+        IrType::Bool,
+        || list_unique_body_typed(|o| Op::LoadF64AtAbsolute { offset: o }, IrType::F64),
+    )
+}
+
+/// `pow(base: Float, exp: Float) -> Float` — `f64::powf`, matching the
+/// tree-walk `MathPow` oracle (`to_f64_val(a).powf(to_f64_val(b))`;
+/// never traps — negative / zero exponents and overflow→`inf` follow
+/// the C `pow` contract). The lowering peephole widens any `Int`
+/// argument with `Op::ConvertI64ToF64` first, matching the oracle's
+/// per-operand `to_f64_val` coercion, so the body only ever sees `F64`
+/// operands. Non-numeric arguments stay capped (the oracle's
+/// `to_f64_val` coerces them to `0.0`, a degenerate arm with no
+/// compiled surface).
+pub(super) fn pow_float() -> StdlibFunction {
+    StdlibFunction::new("pow", vec![IrType::F64, IrType::F64], IrType::F64, || {
+        vec![
+            tt(Op::LocalGet(0)),
+            tt(Op::LocalGet(1)),
+            tt(Op::F64Pow),
+            tt(Op::Return),
+        ]
+    })
+}

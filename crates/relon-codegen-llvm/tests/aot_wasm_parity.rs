@@ -243,6 +243,19 @@ fn linker_with_multi3(engine: &wasmtime::Engine) -> wasmtime::Linker<()> {
             },
         )
         .expect("register relon_llvm_f64_to_str");
+
+    // `Op::F64Pow` lowers to the `llvm.pow.f64` intrinsic, which the
+    // wasm32 backend turns into a libm `pow` libcall — an undefined
+    // extern that survives `wasm-ld --allow-undefined` as an `env`
+    // import. Satisfy it with Rust's `f64::powf`, which calls the very
+    // same libm `pow` the native MCJIT leg resolves in-process and the
+    // cranelift legs bind via JIT symbol / dlopen — identical bits on
+    // every leg by construction. Pure scalar fn: no memory access.
+    linker
+        .func_wrap("env", "pow", |base: f64, exp: f64| -> f64 {
+            base.powf(exp)
+        })
+        .expect("register pow");
     linker
 }
 
@@ -2315,8 +2328,11 @@ fn w5_full_dict_probe_aligns_native_via_wasmtime() {
 // so the wasm leg decodes the result directly (the same path the R3b
 // `r3b_float_reduce` Float-scalar return uses). Native LLVM-AOT is the
 // oracle; the corresponding tree-walk == cranelift legs are proven in
-// the `relon-test-harness` corpus (`r7_*`). `pow` is intentionally not
-// here — it needs a `pow` libcall with no native wasm instruction.
+// the `relon-test-harness` corpus (`r7_*`). `pow` joined in the
+// stdlib tail wave via `Op::F64Pow`: the wasm32 leg lowers
+// `llvm.pow.f64` to an undefined `pow` env import that
+// `linker_with_multi3` binds to `f64::powf` (see the registration
+// comment there).
 // ===========================================================
 
 /// Shared driver: build `src` (single `Float x` param returning an Int
@@ -3144,5 +3160,186 @@ fn wave_b_currency_decorator_aligns_native_via_wasmtime() {
         out.get("display"),
         Some(&Decoded::Str(want_display)),
         "wave_b currency wasm field != native oracle"
+    );
+}
+
+// ===========================================================
+// Stdlib tail wave (ST) — pow / count / every / some / unique on
+// wasm32.
+//
+// The last five tree-walk-only stdlib functions, compiled four-way.
+// Native LLVM-AOT is the oracle here; the tree-walk == cranelift legs
+// are proven in the `relon-test-harness` corpus (`st_*`).
+//
+// * `pow` — `Op::F64Pow` = `llvm.pow.f64`, which the wasm32 backend
+//   lowers to the `env.pow` import `linker_with_multi3` binds to
+//   `f64::powf` (the same libm `pow` every other leg calls). Float
+//   results compare by IEEE-754 bit pattern (`r7_check_float`), so
+//   the overflow→inf edge stays exact.
+// * `count` — record-header length read; Int scalar result.
+// * `every` / `some` — bundled short-circuit predicate loops; the
+//   short-circuit cases put a would-trap predicate (div-by-zero)
+//   PAST the deciding element, proving the loop stops byte-equal
+//   with the oracle.
+// * `unique` — bundled O(N²) scan; the Float edges (NaN dup via
+//   `inf - inf`, -0.0 == 0.0 dup) exercise the `Eq(F64)`
+//   (OEQ | both-NaN) equality that matches the oracle's
+//   OrderedFloat semantics.
+// ===========================================================
+
+#[test]
+fn st_pow_aligns_native_via_wasmtime() {
+    r7_check_float("st_pow", "#main(Float x) -> Float\npow(x, 10.0)", 2.0);
+}
+
+#[test]
+fn st_pow_int_widen_aligns_native_via_wasmtime() {
+    // Int operands widen per-operand before `Op::F64Pow` (the oracle's
+    // `to_f64_val` Int promotion); the Float param is discarded.
+    r7_check_float(
+        "st_pow_int_widen",
+        "#main(Float x) -> Float\npow(2, 10)",
+        1.0,
+    );
+}
+
+#[test]
+fn st_pow_neg_exp_aligns_native_via_wasmtime() {
+    // 2^-2 = 0.25 — negative exponents follow IEEE-754, no trap.
+    r7_check_float(
+        "st_pow_neg_exp",
+        "#main(Float x) -> Float\npow(x, 0.0 - 2.0)",
+        2.0,
+    );
+}
+
+#[test]
+fn st_pow_overflow_inf_aligns_native_via_wasmtime() {
+    // 10^400 overflows to inf — bit-compared via `r7_check_float`.
+    r7_check_float(
+        "st_pow_overflow_inf",
+        "#main(Float x) -> Float\npow(10.0, x)",
+        400.0,
+    );
+}
+
+#[test]
+fn st_count_aligns_native_via_wasmtime() {
+    r8_check_int("st_count", "#main(Int n) -> Int\ncount([1, 2, 3])", 3);
+}
+
+#[test]
+fn st_count_empty_aligns_native_via_wasmtime() {
+    // `count(range(0))` lowers to a FastInt-shaped entry whose body
+    // carries `Op::AllocScratchDyn`; wasm object emit rejects that
+    // combination loudly ("AllocScratch outside buffer-protocol entry
+    // shape"), so the empty-count wasm leg is driven through an
+    // equivalent Buffer-entry source instead: the `[1, 2]` literal
+    // (ConstListInt) forces the buffer protocol, and the filter leaves
+    // the list empty. The FastInt shape itself stays covered by the
+    // tree-walk == cranelift corpus leg (`st_count_empty`).
+    r8_check_int(
+        "st_count_empty",
+        "#main(Int n) -> Int\ncount([1, 2].filter((Int x) => x > 5))",
+        0,
+    );
+}
+
+#[test]
+fn st_every_true_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "st_every_true",
+        "#main(Int n) -> Bool\nevery([2, 4, 6], (Int x) => x % 2 == 0)",
+        true,
+    );
+}
+
+#[test]
+fn st_every_short_circuit_aligns_native_via_wasmtime() {
+    // pred(1) = `10/1 > 100` = false stops the scan; pred(0) would
+    // div-by-zero trap if the loop kept going.
+    r8_check_bool(
+        "st_every_short_circuit",
+        "#main(Int n) -> Bool\nevery([1, 0], (Int x) => 10 / x > 100)",
+        false,
+    );
+}
+
+#[test]
+fn st_every_empty_vacuous_true_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "st_every_empty",
+        "#main(Int n) -> Bool\nevery(range(0), (Int x) => x > 100)",
+        true,
+    );
+}
+
+#[test]
+fn st_some_true_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "st_some_true",
+        "#main(Int n) -> Bool\nsome([1, 3, 4], (Int x) => x % 2 == 0)",
+        true,
+    );
+}
+
+#[test]
+fn st_some_short_circuit_aligns_native_via_wasmtime() {
+    // pred(1) = `10/1 < 100` = true stops the scan; pred(0) would
+    // div-by-zero trap if the loop kept going.
+    r8_check_bool(
+        "st_some_short_circuit",
+        "#main(Int n) -> Bool\nsome([1, 0], (Int x) => 10 / x < 100)",
+        true,
+    );
+}
+
+#[test]
+fn st_some_empty_false_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "st_some_empty",
+        "#main(Int n) -> Bool\nsome(range(0), (Int x) => x > 100)",
+        false,
+    );
+}
+
+#[test]
+fn st_unique_true_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "st_unique_true",
+        "#main(Int n) -> Bool\nunique([1, 2, 3])",
+        true,
+    );
+}
+
+#[test]
+fn st_unique_dup_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "st_unique_dup",
+        "#main(Int n) -> Bool\nunique([1, 2, 1])",
+        false,
+    );
+}
+
+#[test]
+fn st_unique_float_nan_dup_aligns_native_via_wasmtime() {
+    // `inf - inf` = NaN (no trap; Float overflow saturates). Two NaNs
+    // are a DUPLICATE under the oracle's OrderedFloat equality; the
+    // compiled `Eq(F64)` (OEQ | both-unordered) agrees.
+    r8_check_bool(
+        "st_unique_nan_dup",
+        "#main(Int n) -> Bool\nunique([(1.0e308 * 10.0) - (1.0e308 * 10.0), \
+         (1.0e308 * 10.0) - (1.0e308 * 10.0)])",
+        false,
+    );
+}
+
+#[test]
+fn st_unique_float_neg_zero_dup_aligns_native_via_wasmtime() {
+    // -0.0 == 0.0 per IEEE-754 — a DUPLICATE on every leg.
+    r8_check_bool(
+        "st_unique_neg_zero_dup",
+        "#main(Int n) -> Bool\nunique([(0.0 - 1.0) * 0.0, 0.0])",
+        false,
     );
 }
