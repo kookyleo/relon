@@ -149,3 +149,14 @@ path = "benches/string_stdlib.rs"
 [[bin]]
 name = "bench_stats"
 path = "src/bin/bench_stats.rs"
+
+# Perf-panel kernel-vs-row separation harness (2026-06-10): drives one
+# W-series workload through one path (LLVM buffer entry / LLVM
+# legacy-i64 fast entry / rust_native kernel) in a bare loop so
+# `perf stat` profiles the measured path without criterion harness
+# cycles or unrelated rows. Sources + rust kernels kept in sync with
+# `benches/cmp_lua.rs`. See `docs/internal/perf-panel-w-series.md`.
+[[bin]]
+name = "w_kernel_loop"
+path = "src/bin/w_kernel_loop.rs"
+required-features = ["llvm-aot"]
