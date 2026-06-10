@@ -774,20 +774,31 @@ tree-walk oracle (see the `SUPPORTED_SURFACE` ledger and the
 `no_fallback_over_supported_surface` proof):
 
 * numeric: `sqrt`, `round`, `floor`, `ceil` (scalar Float math, with
-  `sqrt` widening an `Int` argument); `multiple_of` (Int form),
+  `sqrt` widening an `Int` argument); `pow` (with Int widening,
+  negative exponents, overflow to `inf`); `multiple_of` (Int form),
   `in_range`
-* format predicates: `is_uuid`, `is_email`, `is_uri`
+* format predicates: `is_uuid`, `is_email`, `is_uri`, `is_iso_date`
 * string: `len`, `ends_with`, `replace`, `trim`, `trim_start`,
   `trim_end`, `split`
 * list / size: `size_in_range` (List form, element count from the
-  record header)
+  record header); `count` (record-header length read, any element
+  type); `every` / `some` (short-circuit predicate loops over
+  `List<Int>` / `List<Float>`; an empty list is vacuously true /
+  false respectively); `unique` (O(N²) i<j scan over
+  `List<Int>` / `List<Float>`; float equality uses OrderedFloat
+  semantics — `NaN == NaN` and `-0.0 == 0.0` both count as
+  duplicates)
 
-Two honest caps within that set: `multiple_of` on a Float argument
-(no native `%`/`Op::Mod(F64)` on Cranelift/wasm) and `size_in_range`
-on a String argument (counts Unicode code points, which needs the
-UTF-8 decode seam — solvable, but the body is not compiled yet)
-stay tree-walker-only and route to the interpreter loudly rather than
-silently miscompiling.
+Honest caps within that set (each routes to the interpreter loudly
+or refuses to compile loudly, never silently miscompiles):
+`multiple_of` on a Float argument (no native `%`/`Op::Mod(F64)` on
+Cranelift/wasm); `size_in_range` on a String argument (counts
+Unicode code points, which needs the UTF-8 decode seam — solvable,
+but the body is not compiled yet); `every` / `some` / `unique` over
+`List<String>` / `List<Bool>` elements; and the count-empty FastInt
+entry shape for `count` (`count(range(0))`, no buffer operand — the
+wasm object emitter rejects it loudly; the equivalent Buffer-entry
+source is verified four-way).
 
 **Tier-2 (tree-walker) only stdlib.** The tree-walker's free-fn
 registry holds ~77 `register_pure_fn` names
@@ -799,20 +810,20 @@ Calling them under a
 compiled backend, or relying on them to be statically typed, will not
 behave like the tree-walker. The set is:
 
-* numeric: `pow`
 * format predicates: `is_ipv4`, `is_ipv6`
-* string: `starts_with`
-* list: `unique`, `count`, `every`, `some`
+* string: `starts_with` (free-fn form; the method form has a
+  compiled registry slot)
 * dict: `select_keys`, `omit_keys`
 * json / date: `to_json`, `parse_iso_date`
 
-These are **tier-2 / tree-walker-only**. Treat them as
-reference-evaluator conveniences, not portable language surface,
-until they gain analyzer signatures and compiled-backend IR conversion.
-(`is_ipv4` / `is_ipv6` route through `core::net::Ipv*Addr::parse`, which
-has no wasm-portable body. The date validator `is_iso_date` is now
-compiled four-way — byte-level shape plus integer date arithmetic, with
-the leap-year test over `Op::Mod`.)
+These are **tier-2 / tree-walker-only**, and that is an
+**adjudicated design boundary**, not a backlog: `select_keys` /
+`omit_keys` / `parse_iso_date` return a Dict (compiled Dict values
+were adjudicated out of scope); `to_json` is composite → String
+(likewise adjudicated); `is_ipv4` / `is_ipv6` route through
+`core::net::Ipv*Addr::parse`, which has no wasm-portable body (an
+engine / seam cap). Treat them as reference-evaluator conveniences,
+not portable language surface.
 
 **There is no `#strict` directive.** Strict static inference is the
 analyzer's **default** — you do not opt *in* to it. The only opt-out
