@@ -1228,8 +1228,8 @@ pub fn all_cases() -> Vec<CorpusCase> {
         //      Float/Int return is established four-way (incl. wasm) in
         //      `aot_wasm_parity::r7_*`; the bytecode / trace tiers keep
         //      their Float-scalar exclusion (mirrors the R3b float rows).
-        //      `pow` stays capped — it needs a `pow` libcall with no
-        //      native wasm instruction.
+        //      `pow` joined in the stdlib tail wave via `Op::F64Pow`
+        //      (libm `pow` on every leg) — see the `st_pow_*` cases.
         CorpusCase {
             name: "r7_abs_float",
             source: "#main() -> Float\nabs(0.0 - 5.5)",
@@ -2234,6 +2234,263 @@ pub fn all_cases() -> Vec<CorpusCase> {
             args_factory: spread_two_list_args,
             tier: Tier::StdlibList,
             supported_by: TW_ONLY,
+        },
+        // ---- Stdlib tail wave (ST): pow / count / every / some / unique ----
+        //
+        // The last five tree-walk-only stdlib functions, compiled four-way.
+        // Tree-walk == cranelift here; the wasm + llvm-native legs live in
+        // `relon-codegen-llvm::aot_wasm_parity::st_*`.
+        //
+        // * `pow(a, b)` — `Op::F64Pow` = a libm `pow` call on every leg
+        //   (cranelift JIT symbol / ELF import, LLVM `llvm.pow.f64`
+        //   intrinsic, wasm `env.pow` import), bit-identical to the oracle
+        //   `to_f64_val(a).powf(to_f64_val(b))`. Never traps: negative /
+        //   zero exponents and overflow follow IEEE-754 (`inf` / NaN).
+        //   Int operands widen per-operand (`ConvertI64ToF64` = the
+        //   oracle's `as f64`). Non-numeric operands stay capped (the
+        //   oracle's silent `0.0` coercion arm is NOT reproduced).
+        // * `count(xs)` — record-header length read (`Op::ReadStringLen`),
+        //   any list element type.
+        // * `every` / `some` — bundled short-circuit predicate loops over
+        //   List<Int> / List<Float>; same closure surface as `filter`.
+        //   Empty list: `every` true (vacuous), `some` false. The
+        //   short-circuit cases prove the loop stops BEFORE a predicate
+        //   that would trap (div-by-zero past the deciding element).
+        // * `unique(xs)` — bundled O(N²) i<j scan over List<Int> /
+        //   List<Float>. `Eq(F64)` on the compiled legs (OEQ | both-NaN)
+        //   matches the oracle's `OrderedFloat` equality exactly, so
+        //   NaN == NaN (dup) and -0.0 == 0.0 (dup) hold four-way.
+        //   List<String> / List<Bool> stay capped (no four-way String
+        //   equality body).
+        CorpusCase {
+            name: "st_pow_float",
+            source: "#main() -> Float\npow(2.0, 10.0)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "st_pow_int_widen",
+            source: "#main() -> Float\npow(2, 10)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "st_pow_zero_exp",
+            source: "#main() -> Float\npow(5.5, 0)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "st_pow_neg_exp",
+            source: "#main() -> Float\npow(2.0, 0.0 - 2.0)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        // Overflow saturates to `inf` (IEEE-754) — never a trap.
+        CorpusCase {
+            name: "st_pow_overflow_inf",
+            source: "#main() -> Float\npow(10.0, 400.0)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        // `0.0 ^ -1` = `inf` per IEEE-754 `pow` — NOT a division trap.
+        CorpusCase {
+            name: "st_pow_zero_base_neg_exp",
+            source: "#main() -> Float\npow(0.0, 0.0 - 1.0)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "st_count_list",
+            source: "#main() -> Int\ncount([1, 2, 3])",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "st_count_single",
+            source: "#main() -> Int\ncount([42])",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "st_count_empty",
+            source: "#main() -> Int\ncount(range(0))",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "st_count_float_list",
+            source: "#main() -> Int\ncount([1.5, 2.5])",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "st_every_true",
+            source: "#main() -> Bool\nevery([2, 4, 6], (Int x) => x % 2 == 0)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "st_every_false",
+            source: "#main() -> Bool\nevery([2, 3, 6], (Int x) => x % 2 == 0)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        // Empty list — vacuously true, predicate never runs.
+        CorpusCase {
+            name: "st_every_empty_vacuous_true",
+            source: "#main() -> Bool\nevery(range(0), (Int x) => x > 100)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        // Short-circuit proof: pred(1) = `10/1 > 100` = false stops the
+        // scan; pred(0) would div-by-zero trap if the loop kept going.
+        CorpusCase {
+            name: "st_every_short_circuit",
+            source: "#main() -> Bool\nevery([1, 0], (Int x) => 10 / x > 100)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        // Method form (`xs.every(p)`) routes through the stdlib method
+        // index onto the same bundled body.
+        CorpusCase {
+            name: "st_every_method_form",
+            source: "#main() -> Bool\n[2, 4].every((Int x) => x > 1)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "st_every_float",
+            source: "#main() -> Bool\nevery([1.5, 2.5], (Float x) => x > 1.0)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "st_some_true",
+            source: "#main() -> Bool\nsome([1, 3, 4], (Int x) => x % 2 == 0)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "st_some_false",
+            source: "#main() -> Bool\nsome([1, 3, 5], (Int x) => x % 2 == 0)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        // Empty list — false, predicate never runs.
+        CorpusCase {
+            name: "st_some_empty_false",
+            source: "#main() -> Bool\nsome(range(0), (Int x) => x > 100)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        // Short-circuit proof: pred(1) = `10/1 < 100` = true stops the
+        // scan; pred(0) would div-by-zero trap if the loop kept going.
+        CorpusCase {
+            name: "st_some_short_circuit",
+            source: "#main() -> Bool\nsome([1, 0], (Int x) => 10 / x < 100)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "st_some_method_form",
+            source: "#main() -> Bool\n[1, 2].some((Int x) => x > 1)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "st_some_float",
+            source: "#main() -> Bool\nsome([0.5, 2.5], (Float x) => x > 1.0)",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "st_unique_true",
+            source: "#main() -> Bool\nunique([1, 2, 3])",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "st_unique_dup",
+            source: "#main() -> Bool\nunique([1, 2, 1])",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "st_unique_single",
+            source: "#main() -> Bool\nunique([7])",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "st_unique_empty",
+            source: "#main() -> Bool\nunique(range(0))",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "st_unique_float_true",
+            source: "#main() -> Bool\nunique([1.5, 2.5])",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        // NaN == NaN under the oracle's OrderedFloat equality — two NaNs
+        // are a DUPLICATE. `inf - inf` produces NaN without trapping
+        // (Float overflow saturates to inf per IEEE-754, no trap; only a
+        // zero divisor traps); the compiled `Eq(F64)` (OEQ |
+        // both-unordered) matches the oracle exactly.
+        CorpusCase {
+            name: "st_unique_float_nan_dup",
+            source: "#main() -> Bool\nunique([(1.0e308 * 10.0) - (1.0e308 * 10.0), \
+                     (1.0e308 * 10.0) - (1.0e308 * 10.0)])",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        // -0.0 == 0.0 under IEEE-754 / OrderedFloat — a DUPLICATE.
+        // `(0.0 - 1.0) * 0.0` produces -0.0 without unary-minus syntax.
+        CorpusCase {
+            name: "st_unique_float_neg_zero_dup",
+            source: "#main() -> Bool\nunique([(0.0 - 1.0) * 0.0, 0.0])",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
+        },
+        // Method form (`xs.unique()`) routes through the stdlib method
+        // index onto the same bundled body.
+        CorpusCase {
+            name: "st_unique_method_form",
+            source: "#main() -> Bool\n[1, 2, 2].unique()",
+            args_factory: no_args,
+            tier: Tier::StdlibSimple,
+            supported_by: TW_CR,
         },
     ]
 }

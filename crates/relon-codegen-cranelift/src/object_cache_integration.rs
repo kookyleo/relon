@@ -89,7 +89,11 @@ use crate::sandbox::SandboxConfig;
 /// `VtableSlot::RelonF64ToStr` slot (`VtableSlot::COUNT` 5 → 6) +
 /// `Op::FloatToStr` lowering. The vtable layout grew, so cache files
 /// emitted by 14 would call through an unpopulated slot.
-pub const GENERATOR_VERSION: &str = "relon-codegen-cranelift v5-gamma 15";
+/// `v5-gamma 16` = stdlib tail wave: new `Op::F64Pow` (libm `pow`
+/// import) + bundled `every`/`some`/`unique` bodies. Objects emitted
+/// by 15 lack the `pow` ELF import and the new stdlib body indices,
+/// so the version bump self-invalidates them.
+pub const GENERATOR_VERSION: &str = "relon-codegen-cranelift v5-gamma 16";
 
 /// Filename suffix for the legacy IR cache (paired with the
 /// relon-object-cache `<hash>.relon-native-v1` blob).

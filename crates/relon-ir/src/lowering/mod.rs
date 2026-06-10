@@ -60,11 +60,11 @@ use peephole::{
     emit_list_int_literal_materialize, emit_list_spread_runtime_materialize,
     emit_list_value_materialize, flatten_list_spread, list_has_computed_element, list_has_spread,
     list_is_float_shaped, match_bare_range, match_materializable_outer_map, probe_expr_ir_ty,
-    try_lower_len_filter_range, try_lower_list_filter, try_lower_list_len, try_lower_list_map,
-    try_lower_list_reduce, try_lower_list_sum_range, try_lower_list_sum_value,
-    try_lower_materialized_list_reduce, try_lower_nested_range_map_reduce,
-    try_lower_range_chain_len, try_lower_range_chain_reduce, try_lower_range_value,
-    try_lower_type_const,
+    try_lower_len_filter_range, try_lower_list_count, try_lower_list_filter, try_lower_list_len,
+    try_lower_list_map, try_lower_list_pred, try_lower_list_reduce, try_lower_list_sum_range,
+    try_lower_list_sum_value, try_lower_list_unique, try_lower_materialized_list_reduce,
+    try_lower_nested_range_map_reduce, try_lower_range_chain_len, try_lower_range_chain_reduce,
+    try_lower_range_value, try_lower_type_const,
 };
 
 /// Per-function lowering state shared across the recursive walk.
@@ -5949,7 +5949,26 @@ fn lower_fn_call(
     if let Some(()) = try_lower_list_len(path, args, range, ctx)? {
         return Ok(());
     }
+    // Stdlib tail wave: `count(xs)` — the oracle's plain element count
+    // (`xs.len() as i64`) over ANY list shape; same `ReadStringLen`
+    // lowering as `_len` but accepting every list IR type (all records
+    // share the `[len: u32 LE]` count prefix). Non-list arguments roll
+    // back and cap loudly through the generic dispatch.
+    if let Some(()) = try_lower_list_count(path, args, range, ctx)? {
+        return Ok(());
+    }
     if let Some(()) = try_lower_list_filter(path, args, range, ctx)? {
+        return Ok(());
+    }
+    // Stdlib tail wave: short-circuiting quantifiers `every(xs, p)` /
+    // `some(xs, p)` and the `uniqueItems` scan `unique(xs)` over
+    // `List<Int>` / `List<Float>` sources. Unsupported sources roll
+    // back and cap loudly through the generic dispatch (no bundled
+    // body is registered under the surface names).
+    if let Some(()) = try_lower_list_pred(path, args, range, ctx)? {
+        return Ok(());
+    }
+    if let Some(()) = try_lower_list_unique(path, args, range, ctx)? {
         return Ok(());
     }
     // Wave R3: general `_list_map(xs, f)` — materialise / resolve the

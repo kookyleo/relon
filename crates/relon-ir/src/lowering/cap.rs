@@ -252,6 +252,8 @@ pub const LOWERING_CAP_IDS: &[&str] = &[
     "try_lower_list_filter.unknown_stdlib_method.1",
     "try_lower_list_filter.unknown_stdlib_method.2",
     "try_lower_list_filter.unsupported_expr",
+    "try_lower_list_unique.unknown_stdlib_method.1",
+    "try_lower_list_unique.unknown_stdlib_method.2",
     "emit_list_int_hof_call.unknown_stdlib_method.1",
     "emit_list_int_hof_call.unknown_stdlib_method.2",
     "emit_list_int_hof_call.unsupported_expr",

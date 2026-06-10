@@ -270,6 +270,9 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
     fn visit_f64_unary(&mut self, op: F64UnaryOp) -> Result<(), CraneliftError> {
         self.emit_f64_unary(op)
     }
+    fn visit_f64_pow(&mut self) -> Result<(), CraneliftError> {
+        self.emit_pow_f64()
+    }
 
     // Comparison.
     fn visit_eq(&mut self, ty: IrType) -> Result<(), CraneliftError> {

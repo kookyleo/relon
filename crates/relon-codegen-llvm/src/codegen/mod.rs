@@ -2895,6 +2895,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             Op::ConvertI64ToF64 => self.emit_convert_i64_to_f64(&ip_hint)?,
             Op::F64ToI64Sat => self.emit_f64_to_i64_sat(&ip_hint)?,
             Op::F64Unary(op) => self.emit_f64_unary(&ip_hint, *op)?,
+            Op::F64Pow => self.emit_f64_pow(&ip_hint)?,
 
             // ---- comparisons ----
             Op::Eq(ty) => self.emit_cmp(&ip_hint, *ty, IntPredicate::EQ)?,

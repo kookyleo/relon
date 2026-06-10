@@ -155,6 +155,10 @@ pub trait OpVisitor {
     /// Wave R7: unary IEEE-754 float intrinsic (`Op::F64Unary`). Pop one
     /// `F64`-typed value, push the `F64`-typed result.
     fn visit_f64_unary(&mut self, op: F64UnaryOp) -> Result<Self::Output, Self::Error>;
+    /// Stdlib tail wave: IEEE-754 float power (`Op::F64Pow`). Pop
+    /// `[exp, base]` (two `F64`-typed values, exponent on top), push
+    /// the `F64`-typed `base.powf(exp)` result.
+    fn visit_f64_pow(&mut self) -> Result<Self::Output, Self::Error>;
 
     // Comparison.
     fn visit_eq(&mut self, ty: IrType) -> Result<Self::Output, Self::Error>;
@@ -377,6 +381,7 @@ pub fn walk_op<V: OpVisitor>(op: &Op, visitor: &mut V) -> Result<V::Output, V::E
         Op::ConvertI64ToF64 => visitor.visit_convert_i64_to_f64(),
         Op::F64ToI64Sat => visitor.visit_f64_to_i64_sat(),
         Op::F64Unary(op) => visitor.visit_f64_unary(*op),
+        Op::F64Pow => visitor.visit_f64_pow(),
         Op::Eq(ty) => visitor.visit_eq(*ty),
         Op::Ne(ty) => visitor.visit_ne(*ty),
         Op::Lt(ty) => visitor.visit_lt(*ty),
@@ -698,6 +703,11 @@ mod tests {
         fn visit_f64_unary(&mut self, _: F64UnaryOp) -> Result<(), ()> {
             self.calls += 1;
             self.last = "F64Unary";
+            Ok(())
+        }
+        fn visit_f64_pow(&mut self) -> Result<(), ()> {
+            self.calls += 1;
+            self.last = "F64Pow";
             Ok(())
         }
         fn visit_eq(&mut self, _: IrType) -> Result<(), ()> {

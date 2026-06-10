@@ -64,7 +64,7 @@ use const_pool::ConstPool;
 use guard::{
     declare_vtable_data, emit_indirect_host_call, make_call_native_signature,
     make_cap_lookup_signature, make_f64_to_str_signature, make_fmod_signature,
-    make_glob_match_signature, make_now_signature, make_raise_trap_signature,
+    make_glob_match_signature, make_now_signature, make_pow_signature, make_raise_trap_signature,
 };
 
 /// Output of a successful compile: a JIT module plus the entry's
@@ -143,6 +143,18 @@ pub enum EntryShape {
 /// not by linker name.
 extern "C" fn relon_fmod(a: f64, b: f64) -> f64 {
     a % b
+}
+
+/// `extern "C"` shim the JIT path registers as the `pow` symbol so
+/// `Op::F64Pow` resolves to Rust's `f64::powf` rather than whatever
+/// libm `pow` `dlsym` would otherwise pick up. `f64::powf` IS the libm
+/// `pow` on every supported target, and it is the exact operation the
+/// tree-walker oracle runs (`to_f64_val(a).powf(to_f64_val(b))`) —
+/// guaranteeing a bit-identical result. Same naming contract as
+/// [`relon_fmod`]: the JIT binds the symbol by explicit address, not
+/// by linker name.
+extern "C" fn relon_pow(a: f64, b: f64) -> f64 {
+    a.powf(b)
 }
 
 /// IR param signature that triggers [`EntryShape::BufferProtocol`].
@@ -276,6 +288,10 @@ pub fn compile_module_with(
     // oracle (`a.as_f64() % b.as_f64()`) rather than depending on which
     // libc `fmod` `dlsym(RTLD_DEFAULT, ...)` happens to find.
     jit_builder.symbol("fmod", relon_fmod as *const u8);
+    // Same for the `pow` external symbol referenced by `Op::F64Pow`
+    // lowering: pin it to Rust's `f64::powf` (the tree-walk oracle's
+    // exact operation) rather than a `dlsym`-found libm `pow`.
+    jit_builder.symbol("pow", relon_pow as *const u8);
     let mut module = JITModule::new(jit_builder);
 
     let LoweredArtifacts {
@@ -480,6 +496,14 @@ fn lower_module_into<M: CrModule>(
         .declare_function("fmod", Linkage::Import, &make_fmod_signature())
         .map_err(|e| CraneliftError::ModuleDefine(format!("declare fmod: {e}")))?;
 
+    // `Op::F64Pow` lowers to a libm `pow` call — same external-symbol
+    // discipline as `fmod` above (JIT pins the symbol to a Rust
+    // `f64::powf` shim; the cranelift-object path leaves it as an
+    // undefined ELF import bound to process libm at `dlopen`).
+    let pow_func_id = module
+        .declare_function("pow", Linkage::Import, &make_pow_signature())
+        .map_err(|e| CraneliftError::ModuleDefine(format!("declare pow: {e}")))?;
+
     // Build the entry signature. The exact shape depends on
     // `entry_shape`: legacy IR carries `I64...` user args, while the
     // buffer-protocol IR carries the four wasm handshake i32 slots +
@@ -598,6 +622,8 @@ fn lower_module_into<M: CrModule>(
         // `Op::Mod(F64)` — cranelift drops the dead FuncRef and never
         // looks up the symbol.
         let fmod_func_ref = module.declare_func_in_func(fmod_func_id, builder.func);
+        // Same for the libm `pow` import backing `Op::F64Pow`.
+        let pow_func_ref = module.declare_func_in_func(pow_func_id, builder.func);
 
         // Pre-allocate the trap block + a block param that carries
         // the i64 trap code. Every guard branches here with its
@@ -622,6 +648,7 @@ fn lower_module_into<M: CrModule>(
             call_native_sig_ref,
             f64_to_str_sig_ref,
             fmod_func_ref,
+            pow_func_ref,
             pointer_ty,
             frontend_config: module.target_config(),
             entry_shape,
@@ -734,6 +761,8 @@ fn lower_module_into<M: CrModule>(
             // predicate (e.g. a `filter` lambda) may contain a Float
             // `%`. Dead-stripped when unreferenced.
             let fmod_func_ref = module.declare_func_in_func(fmod_func_id, builder.func);
+            // Same for the libm `pow` import backing `Op::F64Pow`.
+            let pow_func_ref = module.declare_func_in_func(pow_func_id, builder.func);
 
             let trap_block = builder.create_block();
             builder.append_block_param(trap_block, I64);
@@ -760,6 +789,7 @@ fn lower_module_into<M: CrModule>(
                 call_native_sig_ref,
                 f64_to_str_sig_ref,
                 fmod_func_ref,
+                pow_func_ref,
                 pointer_ty,
                 frontend_config: module.target_config(),
                 // Lambdas use the LegacyI64Args entry shape for
@@ -1010,6 +1040,11 @@ struct Codegen<'a, 'b> {
     /// direct `call(fmod_func_ref, [a, b])` to lower
     /// `Op::Mod(IrType::F64)` — cranelift has no native `frem`.
     fmod_func_ref: FuncRef,
+    /// `FuncRef` for the libm `pow` external function, imported into
+    /// the current function body. [`Self::emit_pow_f64`] emits a
+    /// direct `call(pow_func_ref, [a, b])` to lower `Op::F64Pow` —
+    /// cranelift has no native float-power instruction.
+    pow_func_ref: FuncRef,
     pointer_ty: cranelift_codegen::ir::Type,
     /// Target frontend config (pointer width / default call conv).
     /// Threaded through so helpers that call `call_memcpy` get the

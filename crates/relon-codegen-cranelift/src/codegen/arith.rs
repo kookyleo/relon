@@ -281,6 +281,26 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         Ok(())
     }
 
+    /// `Op::F64Pow` — pop `[exp, base]` and push `base.powf(exp)` via a
+    /// libm `pow` call. Cranelift has no native float-power instruction
+    /// (LLVM itself lowers `llvm.pow.f64` to this same `pow` libcall),
+    /// so the lowering mirrors [`Self::emit_mod_f64`]'s `fmod` call —
+    /// minus the divisor guard, because the tree-walk oracle
+    /// (`to_f64_val(a).powf(to_f64_val(b))`) never traps: `0.0^-1` is
+    /// `inf`, NaN propagates, overflow saturates to `inf`. The JIT path
+    /// pins the `pow` symbol to a Rust `a.powf(b)` shim
+    /// (`compile_module_with`); the cranelift-object path binds it to
+    /// process libm at `dlopen` — the same `pow` that `f64::powf`
+    /// calls, so all paths are bit-identical.
+    pub(super) fn emit_pow_f64(&mut self) -> Result<(), CraneliftError> {
+        let b = self.pop()?;
+        let a = self.pop()?;
+        let call = self.builder.ins().call(self.pow_func_ref, &[a, b]);
+        let r = self.builder.inst_results(call)[0];
+        self.push(r);
+        Ok(())
+    }
+
     /// `Op::ConvertI64ToF64` (#359) — pop one `I64` cranelift value and
     /// push its `fcvt_from_sint` (`sitofp`) widening as a native `F64`.
     /// Mirrors the tree-walker's `NumericValue::as_f64()` Int promotion

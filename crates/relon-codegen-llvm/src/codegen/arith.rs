@@ -243,6 +243,61 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         Ok(())
     }
 
+    /// `Op::F64Pow` — pop `[exp, base]` operand-stack i64 bits, cast both
+    /// to `double`, call the `llvm.pow.f64` intrinsic, and push the
+    /// result back as i64 bits. Never traps — the tree-walk oracle
+    /// (`to_f64_val(a).powf(to_f64_val(b))`) returns `inf` / NaN per
+    /// IEEE-754 rather than raising. The native MCJIT path resolves the
+    /// intrinsic's `pow` libcall against process libm in-process (the
+    /// same `pow` that Rust's `f64::powf` calls); the wasm32 path lowers
+    /// it to an undefined `pow` env import the host binds to
+    /// `f64::powf` — identical bits on all legs.
+    pub(crate) fn emit_f64_pow(&mut self, ip_hint: &str) -> Result<(), LlvmError> {
+        let exp_bits = self.pop_int(ip_hint)?;
+        let base_bits = self.pop_int(ip_hint)?;
+        let f64_t = self.ctx.f64_type();
+        let base = self
+            .builder
+            .build_bit_cast(base_bits, f64_t, &self.next_name("fpow_a"))
+            .map_err(|e| LlvmError::Codegen(format!("F64Pow base bitcast: {e}")))?
+            .into_float_value();
+        let exp = self
+            .builder
+            .build_bit_cast(exp_bits, f64_t, &self.next_name("fpow_b"))
+            .map_err(|e| LlvmError::Codegen(format!("F64Pow exp bitcast: {e}")))?
+            .into_float_value();
+        // `llvm.pow.f64 : (double, double) -> double`.
+        let intr = {
+            let name = "llvm.pow.f64";
+            if let Some(g) = self.module.get_function(name) {
+                g
+            } else {
+                let fn_ty = f64_t.fn_type(&[f64_t.into(), f64_t.into()], false);
+                self.module.add_function(name, fn_ty, None)
+            }
+        };
+        let args: [BasicMetadataValueEnum; 2] = [base.into(), exp.into()];
+        let call_site = self
+            .builder
+            .build_call(intr, &args, &self.next_name("fpow"))
+            .map_err(|e| LlvmError::Codegen(format!("F64Pow call: {e}")))?;
+        let rf = match call_site.try_as_basic_value() {
+            inkwell::values::ValueKind::Basic(inkwell::values::BasicValueEnum::FloatValue(v)) => v,
+            other => {
+                return Err(LlvmError::Codegen(format!(
+                    "F64Pow: intrinsic returned {other:?}, expected double"
+                )));
+            }
+        };
+        let out_bits = self
+            .builder
+            .build_bit_cast(rf, self.ctx.i64_type(), &self.next_name("fpow_bits"))
+            .map_err(|e| LlvmError::Codegen(format!("F64Pow result bitcast: {e}")))?
+            .into_int_value();
+        self.push(out_bits, IrType::F64);
+        Ok(())
+    }
+
     /// AOT-1: lower an `F64` binary op. `a` / `b` are the operand-stack
     /// i64 bit patterns; we bit-cast to `double`, run the matching
     /// `build_float_*`, and bit-cast the result back to i64 bits so the

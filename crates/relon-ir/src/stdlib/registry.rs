@@ -24,12 +24,14 @@ use super::case_fold::{
 use super::defs::{
     abs_float, abs_int, ceil_float_to_int, concat_string_string, contains_string,
     floor_float_to_int, glob_match_string, is_empty_string, length_string_to_int, list_bool_length,
-    list_float_filter, list_float_fold, list_float_length, list_float_map, list_float_map_to_int,
-    list_float_map_to_string, list_float_map_to_variant_list, list_int_filter, list_int_fold,
+    list_float_every, list_float_filter, list_float_fold, list_float_length, list_float_map,
+    list_float_map_to_int, list_float_map_to_string, list_float_map_to_variant_list,
+    list_float_some, list_float_unique, list_int_every, list_int_filter, list_int_fold,
     list_int_length_to_int, list_int_map, list_int_map_to_float, list_int_map_to_string,
-    list_int_map_to_variant_list, list_int_max, list_int_sum, list_list_filter, list_list_length,
-    list_schema_length, list_string_length, list_string_map, list_string_map_to_variant_list,
-    max_int, min_int, round_float_to_int, sqrt_float, starts_with_string, substring_string,
+    list_int_map_to_variant_list, list_int_max, list_int_some, list_int_sum, list_int_unique,
+    list_list_filter, list_list_length, list_schema_length, list_string_length, list_string_map,
+    list_string_map_to_variant_list, max_int, min_int, pow_float, round_float_to_int, sqrt_float,
+    starts_with_string, substring_string,
 };
 use super::normalization::{
     ccc_lookup_helper, compose_lookup_helper, decomp_lookup_helper, nfc_string, nfd_string,
@@ -251,9 +253,9 @@ pub fn builtin_stdlib() -> &'static [StdlibFunction] {
             //   * `49` — `ceil(Float) -> Int`         (`f64::ceil as i64`).
             //   * `50` — `round(Float) -> Int`        (`f64::round_ties_even as i64`).
             //   * `51` — `sqrt(Float) -> Float`       (`f64::sqrt`; NaN on neg).
-            // `pow` stays capped: it needs a `pow` libcall, which has no
-            // native wasm instruction, so four-way byte-equality is not
-            // established here (see the cap note in the scalar-math peephole).
+            // `pow` joined later (index 77): the `pow` libcall is bridged
+            // per backend — cranelift external symbol, LLVM `llvm.pow.f64`,
+            // wasm `env` import — so four-way byte-equality holds.
             abs_float(),
             floor_float_to_int(),
             ceil_float_to_int(),
@@ -402,6 +404,45 @@ pub fn builtin_stdlib() -> &'static [StdlibFunction] {
             is_email_string(),
             is_uri_string(),
             is_iso_date_string(),
+            // Stdlib tail wave: the last five tree-walk-only stdlib
+            // functions (`every` / `some` / `unique` / `pow`; `count` is a
+            // pure peephole over the shared `[len: u32 LE]` record header
+            // and needs no bundled body). Appended at the tail (indices
+            // 71..77) so every position-pinned index above stays put. The
+            // bodies reuse existing constructs (`CallClosure`, typed
+            // loads, `Eq`, nested `Block`/`Loop`) — but this wave also
+            // introduces `Op::F64Pow` for index 77, which DOES move
+            // GENERATOR_VERSION (see
+            // `relon-codegen-cranelift::object_cache_integration`).
+            //   * `71` — `list_int_every(List<Int>, Closure<I64 -> Bool>)
+            //             -> Bool` (short-circuit on first `false`;
+            //             empty → `true`).
+            //   * `72` — `list_int_some(List<Int>, Closure<I64 -> Bool>)
+            //             -> Bool` (short-circuit on first `true`;
+            //             empty → `false`).
+            //   * `73` — `list_float_every(List<Float>, ...) -> Bool`.
+            //   * `74` — `list_float_some(List<Float>, ...) -> Bool`.
+            //   * `75` — `list_int_unique(List<Int>) -> Bool` (JSON Schema
+            //             `uniqueItems`: O(N²) pairwise scan, `false` on
+            //             the first `i < j` equal pair).
+            //   * `76` — `list_float_unique(List<Float>) -> Bool` (Float
+            //             equality is OrderedFloat on every backend —
+            //             `NaN == NaN` true, `-0.0 == 0.0` true — matching
+            //             the oracle's `Value::Float` `PartialEq`).
+            //   * `77` — `pow(Float, Float) -> Float` (`f64::powf` via
+            //             `Op::F64Pow`; the peephole widens Int args with
+            //             `ConvertI64ToF64`, matching the oracle's
+            //             per-operand `to_f64_val`). `List<String>` /
+            //             `List<Bool>` / pointer-array `every` / `some` /
+            //             `unique` shapes stay capped (no four-way String
+            //             `Eq` / no `String -> Bool` predicate surface).
+            list_int_every(),
+            list_int_some(),
+            list_float_every(),
+            list_float_some(),
+            list_int_unique(),
+            list_float_unique(),
+            pow_float(),
         ]
     })
 }

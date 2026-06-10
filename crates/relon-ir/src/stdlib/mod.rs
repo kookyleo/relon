@@ -327,12 +327,13 @@ mod glob_match_index_tests {
     /// whitespace-stripping String builders (`trim` / `trim_start` /
     /// `trim_end`) and the ASCII-structured validators (`is_email` /
     /// `is_uri`) append at 65..69; the RFC 3339 date validator
-    /// `is_iso_date` appends at 70. All are at the tail so every
-    /// position-pinned index above stays put. Pinning the count catches
-    /// accidental double-registrations.
+    /// `is_iso_date` appends at 70; the stdlib tail wave (`every` /
+    /// `some` / `unique` predicate loops + `pow`) appends at 71..77.
+    /// All are at the tail so every position-pinned index above stays
+    /// put. Pinning the count catches accidental double-registrations.
     #[test]
-    fn bundle_has_71_entries() {
-        assert_eq!(stdlib_function_count(), 71);
+    fn bundle_has_78_entries() {
+        assert_eq!(stdlib_function_count(), 78);
         assert_eq!(stdlib_function_index("glob_match"), Some(37));
         assert_eq!(stdlib_function_index("list_list_length"), Some(38));
         // Wave R3b tail appends (order-pinned wire format).
@@ -388,6 +389,15 @@ mod glob_match_index_tests {
         // RFC 3339 `YYYY-MM-DD` date validator (byte-level shape + integer
         // date arithmetic; leap-year test over `Op::Mod(I32)`).
         assert_eq!(stdlib_function_index("is_iso_date"), Some(70));
+        // Stdlib tail wave: short-circuit predicate loops, uniqueItems
+        // scans, and the libm-backed `pow` (`Op::F64Pow`).
+        assert_eq!(stdlib_function_index("list_int_every"), Some(71));
+        assert_eq!(stdlib_function_index("list_int_some"), Some(72));
+        assert_eq!(stdlib_function_index("list_float_every"), Some(73));
+        assert_eq!(stdlib_function_index("list_float_some"), Some(74));
+        assert_eq!(stdlib_function_index("list_int_unique"), Some(75));
+        assert_eq!(stdlib_function_index("list_float_unique"), Some(76));
+        assert_eq!(stdlib_function_index("pow"), Some(77));
     }
 }
 

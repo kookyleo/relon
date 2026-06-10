@@ -151,6 +151,25 @@ pub(super) fn make_fmod_signature() -> Signature {
     sig
 }
 
+/// Build the cranelift signature for the libm `pow` libcall:
+/// `extern "C" fn(base: f64, exp: f64) -> f64` (the SysV C ABI). The
+/// cranelift backend has no native float-power instruction (LLVM
+/// itself lowers `llvm.pow.f64` to this same `pow` libcall), so
+/// `Op::F64Pow` lowers to a call against this signature. The JIT path
+/// resolves the `pow` symbol to a Rust `a.powf(b)` shim (see
+/// `compile_module_with`) so the result is bit-identical to the
+/// tree-walker's `to_f64_val(a).powf(to_f64_val(b))`; the
+/// cranelift-object path leaves `pow` as an undefined ELF import the
+/// dynamic linker binds to the process libm at `dlopen` (the same
+/// `pow` that `f64::powf` calls, identical bits).
+pub(super) fn make_pow_signature() -> Signature {
+    let mut sig = Signature::new(CallConv::SystemV);
+    sig.params.push(AbiParam::new(F64));
+    sig.params.push(AbiParam::new(F64));
+    sig.returns.push(AbiParam::new(F64));
+    sig
+}
+
 /// Declare the `__relon_capability_vtable` data symbol on the given
 /// module. Reserves [`VTABLE_BYTES`] of zero-initialised space so the
 /// host can populate the slots post-finalize (JIT) or post-dlopen
