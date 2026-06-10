@@ -361,6 +361,92 @@ fn list_contains_boundary_goldens_are_pinned() {
     assert_pinned_with_import("list", "list.contains([0.0], -0.0)", "Bool(true)");
 }
 
+/// Single-source guard for the retired stdlib twins.
+///
+/// `min` / `max` / `clamp` / Int-`abs` / `contains` used to exist twice:
+/// a native Rust `RelonFunction` *and* a delegating wrapper in
+/// `std_relon/*.relon`. After the retirement the `.relon` text is the
+/// only implementation (the registered names dispatch to it through
+/// `RelonSourcedFn`). This test fails if either side regresses:
+///   * the `.relon` wrapper goes back to delegating to a retired
+///     underscore intrinsic (twin reborn), or
+///   * `stdlib.rs` re-grows a native body for one of the retired names.
+#[test]
+fn retired_stdlib_twins_have_single_source() {
+    // Match the *call* form `_math_min(` so prose comments may still
+    // name the retired intrinsics.
+    let math = include_str!("std_relon/math.relon");
+    for retired_delegate in ["_math_min(", "_math_max(", "_math_clamp("] {
+        assert!(
+            !math.contains(retired_delegate),
+            "std_relon/math.relon must implement min/max/clamp itself, \
+             not delegate to retired native `{retired_delegate}...)`"
+        );
+    }
+    // `abs` keeps exactly one `_math_abs(` call: the Float branch of
+    // its type dispatch (the native is Float-only `f64::abs`).
+    assert_eq!(
+        math.matches("_math_abs(").count(),
+        1,
+        "std_relon/math.relon `abs` delegates to `_math_abs` only for \
+         the Float branch"
+    );
+
+    let list = include_str!("std_relon/list.relon");
+    assert!(
+        !list.contains("_list_contains("),
+        "std_relon/list.relon must implement `contains` itself (fold \
+         over _list_reduce), not delegate to a retired native"
+    );
+
+    let stdlib = include_str!("stdlib.rs");
+    for retired_native in [
+        "struct MathMin",
+        "struct MathMax",
+        "struct MathClamp",
+        "struct MathAbs;",
+        "struct ListContains",
+    ] {
+        assert!(
+            !stdlib.contains(retired_native),
+            "stdlib.rs re-grew retired native `{retired_native}` — the \
+             std_relon/*.relon implementation is the single source of truth"
+        );
+    }
+}
+
+/// Post-retirement semantics that intentionally CHANGED (degenerate
+/// inputs only — every well-typed result is pinned byte-for-byte by the
+/// `*_boundary_goldens_are_pinned` tests above):
+///   * `abs(i64::MIN)`: the retired native's `i64::abs` panicked in
+///     debug builds / wrapped in release; the relon `-x` is the
+///     evaluator's *checked* negation, so it now traps cleanly.
+///   * non-numeric `min` / `max` / `clamp` input: the retired natives'
+///     `to_f64_val` coerced non-numbers to `0.0` and returned a garbage
+///     operand (e.g. `min("a", "b")` -> `"b"`); the relon ternaries
+///     compare with the language `<` / `>`, which rejects non-numbers.
+#[test]
+fn retired_twin_degenerate_inputs_now_trap() {
+    let err = tree_walk_result("abs(-9223372036854775807 - 1)")
+        .expect_err("abs(i64::MIN) must trap as NumericOverflow");
+    assert!(
+        matches!(&err, RuntimeError::NumericOverflow(_)),
+        "expected NumericOverflow, got {err:?}"
+    );
+
+    for src in [
+        "min(\"a\", \"b\")",
+        "max(\"a\", \"b\")",
+        "clamp(\"m\", \"a\", \"z\")",
+    ] {
+        let err = tree_walk_result(src).expect_err("non-numeric comparison must trap");
+        assert!(
+            matches!(&err, RuntimeError::TypeMismatch { .. }),
+            "expected TypeMismatch for `{src}`, got {err:?}"
+        );
+    }
+}
+
 #[test]
 fn from_json_is_not_registered() {
     let err = tree_walk_result(r#"from_json("[1,2]")"#)
