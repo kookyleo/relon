@@ -36,6 +36,7 @@
   - 数值件:`multiple_of`(Int 形)、`in_range`、`size_in_range`(List 形)。诚实 cap:`multiple_of` Float 形(`Op::Mod(F64)` cranelift/wasm 无原生取余)、`size_in_range` String 形(数 Unicode 码点,撞解码缝——cap 实际可解,当前未编 body)。两者均响亮回退,不静默编错值。
   - 字符串件:`trim`/`trim_start`/`trim_end`(复用 R14 解码缝 + `__is_whitespace` + memcpy)、`is_email`/`is_uri`(纯字节扫描)——全部四方,零 cap。
 - ✅ **comprehension 元素类型(P3-b `099d55dd`)**:`List<Int>`/`List<Float>`/`List<String>`-map 四方,含元素变型 map(Int→Float/String、Float→Int/String,按闭包返回类型探测 `list_*_map_to_*` wrapper)。诚实 cap:`List<String>` filter(无四方 String→Bool 谓词 body)、`List<Bool>` 源(无注册 wrapper)。
+- ✅ **forward reference(`d700bd3b`)**:`&sibling.<later>` / `&root.<later>`(引用源序更晚的兄弟/根标量字段)已四方——field-let 图改按引用边拓扑序发射(纯 backward 输入字节不变、GENERATOR_VERSION 未 bump);成环对齐 oracle `CircularReference` 响亮报错。诚实 cap:穿 `#main` 参数的 forward(oracle 丢 param scope 报 `variable_not_found`、编译路能算值→为避静默分歧响亮 cap)。
 - **`is_iso_date` 订正**:账本里它仍 cap,但属「body 未写」而非「IR 无 op」——`Op::Mod`/`Op::Div` 存在(#362),其算术本可 lower,只是当前没编译 body。
 
 - **design-free 工程件已基本做尽**。**剩余=两个真决策 + 设计边界内的诚实 cap**(下方"决策点")。
@@ -50,7 +51,7 @@
 ### 类别 A:解释器有、relon-IR 编译路未 lower(= 真"尚未在 relon-ir 实现",auto 回退解释器)
 | 构造 | 解释器证据 | 编译路现状 | 备注 |
 |---|---|---|---|
-| references `&root/&sibling/&prev/&next` | `eval.rs` `Expr::Reference`(~755);pricing.relon 用 16 处 | **backward `&sibling`/`&root` 标量已四方(R10/R10b 严格)** | 仍 cap:forward ref、dynamic key、multi-segment、`&uncle/&prev/&next/&this/&index`。最高价值(配置高频) |
+| references `&root/&sibling/&prev/&next` | `eval.rs` `Expr::Reference`(~755);pricing.relon 用 16 处 | **backward + forward `&sibling`/`&root` 标量已四方(R10/R10b 严格 + forward `d700bd3b`)** | 仍 cap:dynamic key、multi-segment、`&uncle/&prev/&next/&this/&index`、穿 #main 参数的 forward(oracle 丢 param scope→诚实 cap)。`&prev/&next/&index` 卡 list-context 循环 codegen、`&uncle`/multi-segment 卡嵌套 Dict 编译 |
 | spread `...x` | `eval.rs` `Expr::Spread`(~681) | **已编两静态形(R12):list 字面量源 → `List<Int>`、dict schema 源 → `Schema`** | 仍 cap:非字面量/非 schema 源、运行期形状未知 |
 | enum variant 构造/返回/参数 | `Expr::VariantCtor` / `BuildVariantRecord` | 基础路径已接通；`List<Enum>` 参数原样返回、源码 `List<Enum>` 字面量返回、`map`/`filter`/comprehension 产出 `List<Enum>` / `List<Option>` / `List<Result>`、匿名 `Dict` 字段转发和源码字面量字段、参数 `match` 分派、payload 字段/索引访问、tuple/struct payload pattern 解构、泛型 custom enum，以及 tuple/list/Option/Result 嵌套 payload 已覆盖；no-match trap 已四方(`TrapKind::NoMatch`)；动态 brand-dispatch 已显式拒绝(强制 `#enum`) | 剩余缺口主要是 spread 与更多 list-producing source 形状 |
 | decorator `@foo(...)` | tree-walk(pricing 用 `@currency`) | **已编 scalar-Int(R11),desugar `@deco(args) k: v ≡ deco(v, args)`,stacked 自底向上** | 仍 cap:builtin `@`-decorator、named arg、multi-segment、String 结果、branded `-> Schema` 字段上的 decorator |
