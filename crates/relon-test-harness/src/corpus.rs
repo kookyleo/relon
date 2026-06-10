@@ -1803,6 +1803,24 @@ pub fn all_cases() -> Vec<CorpusCase> {
             tier: Tier::DictReturn,
             supported_by: TW_CR,
         },
+        // String-result field decorator. The `#internal wrap(v)` body is
+        // an unambiguous `String + String + String` concat (it carries
+        // String-literal leaves), so the closure's `(param, ret)`
+        // signature is read as `[String] -> String` rather than the old
+        // hardwired I64; the `@wrap()`-decorated field value-first-
+        // desugars to `wrap("hi")` and lowers through
+        // `Op::CallClosure { [String] -> String }` + the R8
+        // `Op::StrConcatN` String-tail return path. `String` Dict field
+        // ⇒ `TW_CR`. Verified four-way (wasm + llvm-native legs in
+        // `relon-codegen-llvm::aot_wasm_parity::r11_string_result_decorator`).
+        CorpusCase {
+            name: "r11_string_result_decorator",
+            source: "#relaxed\n#main(Int n) -> Dict\n\
+                     { #internal\n wrap(v): \"<\" + v + \">\",\n @wrap()\n out: \"hi\" }",
+            args_factory: || one_int("n", 0),
+            tier: Tier::DictReturn,
+            supported_by: TW_CR,
+        },
         // A builtin `@`-decorator (`@value`) has no compiled call form;
         // it caps loudly in `desugar_field_decorators` and `auto` falls
         // back to the tree-walk interpreter. Tree-walk only — the

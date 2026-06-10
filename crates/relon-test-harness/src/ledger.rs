@@ -3043,6 +3043,20 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         proof: "tree-walk + cranelift (TW_CR; wasm + llvm-native legs proven in \
                 relon-codegen-llvm::aot_wasm_parity::r11_field_decorator)",
     },
+    SurfaceEntry {
+        construct: "String-result field decorator (@deco() k: v where deco's body is a \
+                    pure `String + String + ...` concat — closure (param, ret) signature \
+                    read as String from the body, value-first-desugared call lowers through \
+                    `Op::CallClosure { [String] -> String }` + `Op::StrConcatN`). Float-valued \
+                    concat operands have no `Float -> String` coercion op and cap loudly.",
+        wave: "R11",
+        corpus: "r11_string_result_decorator",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (TW_CR; wasm + llvm-native legs proven in \
+                relon-codegen-llvm::aot_wasm_parity::r11_string_result_decorator; the \
+                Float-concat cap is asserted by \
+                relon-ir::lowering::tests::anon_dict_float_string_concat_decorator_caps)",
+    },
     // ---- Wave R12-lower: spread (`...x`), the two static forms ----
     SurfaceEntry {
         construct: "list spread `[...a, b, ...c] -> List<Int>` (literal sources, static flatten)",
