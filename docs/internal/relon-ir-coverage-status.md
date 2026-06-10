@@ -48,7 +48,7 @@
 1. **spread/list-producing expression**:✅ 已做——list 字面量源 + dict schema 源(R12)+ 单运行期列表源(`e8787c29`)。多源 `[...xs,...ys]` 低用量后置。
 2. **Dict 编译值支持**:❌ **维持 by-design cap 不立项**——真实语料匿名 Dict 作值=1、dict 操作调用=0;且大半早已建好(anon-Dict-return/`#brand Dict`),真剩硬 cap 只「Dict 作 #main 入参」(需求 0)。schema-only 是主路。
 3. **Schema/EnumSchema/Type 作一等运行期值**:❌ **维持 cap 不立项**(2026-06-10 勘探)——语料 16 处全 showcase(workflow.relon 状态机 + brand.relon 演示)、真实业务 0;oracle 语义面本就极小(Schema==Schema 恒 false、`#[serde(skip)]` 禁序列化、不可跨函数传、Display 只吐 `<schema>`),它是类型检查的内部载体不是数据值;编译化 100% 耦合已否掉的 Dict 编译值 + closure-across-boundary,成本远超收益(收益≈0)。
-4. **静态覆盖宣告收尾**:no-fallback 门已绿,SUPPORTED_SURFACE 67,剩余皆设计边界内诚实 cap(#relaxed 真动态 / &prev/&next 等 references 尾巴 / regex / net-parse / Dict-by-design / 复合类型→String)。stdlib 尾巴的 design-free 部分(pow/count/every/some/unique)已四方(ST 波 `6fb7aed8`);剩余 tree-walk-only stdlib 全部撞既有设计 cap:select_keys/omit_keys/parse_iso_date(返回 Dict=Dict-by-design)、to_json(复合类型→String)、is_ipv4/6 与 regex(引擎/seam)。perf 轴 W16-W19 收尾另见 perf-panel 文档。
+4. **静态覆盖宣告收尾**:no-fallback 门已绿,SUPPORTED_SURFACE 67,剩余皆设计边界内诚实 cap(#relaxed 真动态 / &prev/&next 等 references 尾巴 / regex / net-parse / Dict-by-design / 复合类型→String)。stdlib 尾巴的 design-free 部分(pow/count/every/some/unique)已四方(ST 波 `6fb7aed8`);剩余 tree-walk-only stdlib 全部撞既有设计 cap:select_keys/omit_keys/parse_iso_date(返回 Dict=Dict-by-design)、to_json(复合类型→String)、is_ipv4/6 与 regex(引擎/seam)。perf 轴 W16-W19 收尾已固化于 `docs/internal/perf-panel-w-series.md`(2026-06-10 s90 实测:µs 级 W7/W17/W18/W19 与 native Rust ±2% 平价、W16 公平基线后仍 1.41× 快(分配器归因)、全部快于 LuaJIT 2.7×–17×;唯一回退 W12-fast 已定位 culprit `7a908521` 未修)。
 
 ## 未展开工作(诚实记录,分三类)
 
