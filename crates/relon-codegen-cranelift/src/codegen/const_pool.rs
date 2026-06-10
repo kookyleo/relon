@@ -609,6 +609,9 @@ impl OpVisitor for ConstPool {
     fn visit_int_to_str(&mut self) -> Result<(), CraneliftError> {
         Ok(())
     }
+    fn visit_float_to_str(&mut self) -> Result<(), CraneliftError> {
+        Ok(())
+    }
     fn visit_sub(&mut self, _: IrType) -> Result<(), CraneliftError> {
         Ok(())
     }

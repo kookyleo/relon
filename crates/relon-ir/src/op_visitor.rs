@@ -132,6 +132,12 @@ pub trait OpVisitor {
     /// decimal `String` record. Byte-exact with the tree-walker's
     /// `Display` rendering of `Value::Int`.
     fn visit_int_to_str(&mut self) -> Result<Self::Output, Self::Error>;
+    /// Wave B (Float rendering) — pop one `F64`, push its decimal
+    /// `String` record. Byte-exact with the tree-walker's `Display`
+    /// rendering of `Value::Float`; all compiled backends route the
+    /// formatting through the same Rust leaf helper
+    /// (`relon_ir::float_str::format_f64_display`).
+    fn visit_float_to_str(&mut self) -> Result<Self::Output, Self::Error>;
     fn visit_sub(&mut self, ty: IrType) -> Result<Self::Output, Self::Error>;
     fn visit_mul(&mut self, ty: IrType) -> Result<Self::Output, Self::Error>;
     fn visit_div(&mut self, ty: IrType) -> Result<Self::Output, Self::Error>;
@@ -362,6 +368,7 @@ pub fn walk_op<V: OpVisitor>(op: &Op, visitor: &mut V) -> Result<V::Output, V::E
         Op::Add(ty) => visitor.visit_add(*ty),
         Op::StrConcatN { operand_count } => visitor.visit_str_concat_n(*operand_count),
         Op::IntToStr => visitor.visit_int_to_str(),
+        Op::FloatToStr => visitor.visit_float_to_str(),
         Op::Sub(ty) => visitor.visit_sub(*ty),
         Op::Mul(ty) => visitor.visit_mul(*ty),
         Op::Div(ty) => visitor.visit_div(*ty),
@@ -646,6 +653,11 @@ mod tests {
         fn visit_int_to_str(&mut self) -> Result<(), ()> {
             self.calls += 1;
             self.last = "IntToStr";
+            Ok(())
+        }
+        fn visit_float_to_str(&mut self) -> Result<(), ()> {
+            self.calls += 1;
+            self.last = "FloatToStr";
             Ok(())
         }
         fn visit_sub(&mut self, _: IrType) -> Result<(), ()> {

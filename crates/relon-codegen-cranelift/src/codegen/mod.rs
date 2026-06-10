@@ -63,8 +63,8 @@ mod record;
 use const_pool::ConstPool;
 use guard::{
     declare_vtable_data, emit_indirect_host_call, make_call_native_signature,
-    make_cap_lookup_signature, make_fmod_signature, make_glob_match_signature, make_now_signature,
-    make_raise_trap_signature,
+    make_cap_lookup_signature, make_f64_to_str_signature, make_fmod_signature,
+    make_glob_match_signature, make_now_signature, make_raise_trap_signature,
 };
 
 /// Output of a successful compile: a JIT module plus the entry's
@@ -466,6 +466,7 @@ fn lower_module_into<M: CrModule>(
     let cap_lookup_sig = make_cap_lookup_signature(module.target_config().pointer_type());
     let glob_match_sig = make_glob_match_signature(module.target_config().pointer_type());
     let call_native_sig = make_call_native_signature(module.target_config().pointer_type());
+    let f64_to_str_sig = make_f64_to_str_signature(module.target_config().pointer_type());
 
     // `Op::Mod(IrType::F64)` lowers to a libc `fmod` call — cranelift
     // has no native float-remainder instruction. Declare the external
@@ -591,6 +592,7 @@ fn lower_module_into<M: CrModule>(
         let cap_lookup_sig_ref = builder.import_signature(cap_lookup_sig.clone());
         let glob_match_sig_ref = builder.import_signature(glob_match_sig.clone());
         let call_native_sig_ref = builder.import_signature(call_native_sig.clone());
+        let f64_to_str_sig_ref = builder.import_signature(f64_to_str_sig.clone());
         // Import the `fmod` FuncRef into this body so `emit_mod_f64`
         // can emit a direct call. Unreferenced when the body has no
         // `Op::Mod(F64)` — cranelift drops the dead FuncRef and never
@@ -618,6 +620,7 @@ fn lower_module_into<M: CrModule>(
             cap_lookup_sig_ref,
             glob_match_sig_ref,
             call_native_sig_ref,
+            f64_to_str_sig_ref,
             fmod_func_ref,
             pointer_ty,
             frontend_config: module.target_config(),
@@ -726,6 +729,7 @@ fn lower_module_into<M: CrModule>(
             let cap_lookup_sig_ref = builder.import_signature(cap_lookup_sig.clone());
             let glob_match_sig_ref = builder.import_signature(glob_match_sig.clone());
             let call_native_sig_ref = builder.import_signature(call_native_sig.clone());
+            let f64_to_str_sig_ref = builder.import_signature(f64_to_str_sig.clone());
             // Import `fmod` into the lambda body too — a closure
             // predicate (e.g. a `filter` lambda) may contain a Float
             // `%`. Dead-stripped when unreferenced.
@@ -754,6 +758,7 @@ fn lower_module_into<M: CrModule>(
                 cap_lookup_sig_ref,
                 glob_match_sig_ref,
                 call_native_sig_ref,
+                f64_to_str_sig_ref,
                 fmod_func_ref,
                 pointer_ty,
                 frontend_config: module.target_config(),
@@ -995,6 +1000,11 @@ struct Codegen<'a, 'b> {
     /// source-lowered `Op::CallNative { cap_bit: NO_CAPABILITY_BIT }` to
     /// the `Arc<dyn RelonFunction>` registered at `import_idx`.
     call_native_sig_ref: SigRef,
+    /// Pre-built cranelift signature for `relon_f64_to_str_helper`
+    /// (`extern "C" fn(state, bits: i64, dest_off: i32) -> i32`).
+    /// Used by [`Self::emit_float_to_str`] to render an `F64` through
+    /// the shared Rust `Display` leaf (`Op::FloatToStr`).
+    f64_to_str_sig_ref: SigRef,
     /// `FuncRef` for the libc `fmod` external function, imported into
     /// the current function body. [`Self::emit_mod_f64`] emits a
     /// direct `call(fmod_func_ref, [a, b])` to lower
@@ -1214,6 +1224,7 @@ impl<'a, 'b> Codegen<'a, 'b> {
             VtableSlot::RelonCapLookup => self.cap_lookup_sig_ref,
             VtableSlot::RelonGlobMatch => self.glob_match_sig_ref,
             VtableSlot::RelonCallNative => self.call_native_sig_ref,
+            VtableSlot::RelonF64ToStr => self.f64_to_str_sig_ref,
         };
         emit_indirect_host_call(
             self.builder,

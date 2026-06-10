@@ -83,7 +83,10 @@ mod evaluator;
 mod mcjit_mm;
 mod sandbox;
 mod state;
-mod str_helpers;
+// `pub` so the wasm parity harness can `func_wrap` the exact same
+// `relon_llvm_f64_to_str` Rust fn the native MCJIT leg maps — one
+// Display byte producer across backends by construction.
+pub mod str_helpers;
 mod vtable;
 mod wasi_host;
 pub mod wasm_link;

@@ -34,7 +34,8 @@
 
 use crate::state::{relon_llvm_call_native_addr, RELON_LLVM_CALL_NATIVE_SYMBOL};
 use crate::str_helpers::{
-    relon_llvm_str_contains_arena_addr, RELON_LLVM_STR_CONTAINS_ARENA_SYMBOL,
+    relon_llvm_f64_to_str_addr, relon_llvm_str_contains_arena_addr, RELON_LLVM_F64_TO_STR_SYMBOL,
+    RELON_LLVM_STR_CONTAINS_ARENA_SYMBOL,
 };
 
 /// One slot per host helper the LLVM codegen indirects through, in the
@@ -45,6 +46,7 @@ use crate::str_helpers::{
 /// |------|-------------------------------|--------------------------------------|
 /// |  0   | `RelonGlobMatch` (slot 3)     | `relon_llvm_str_contains_arena`      |
 /// |  1   | `RelonCallNative` (slot 4)    | `relon_llvm_call_native`             |
+/// |  2   | `RelonF64ToStr` (slot 5)      | `relon_llvm_f64_to_str`              |
 ///
 /// cranelift's slots 0..=2 (`RelonNow` / `RelonRaiseTrap` /
 /// `RelonCapLookup`) have no LLVM counterpart: the LLVM gate is an
@@ -67,18 +69,26 @@ pub enum VtableSlot {
     /// dispatch; the LLVM mirror of cranelift's `RelonCallNative`. See
     /// [`crate::state::relon_llvm_call_native`].
     RelonCallNative = 1,
+    /// `extern "C" fn(bits: i64, dest: *mut u8) -> i32`. Wave B float
+    /// Display renderer; the LLVM mirror of cranelift's
+    /// `RelonF64ToStr`. Declared lazily on the first `Op::FloatToStr`
+    /// site. See [`crate::str_helpers::relon_llvm_f64_to_str`].
+    RelonF64ToStr = 2,
 }
 
 impl VtableSlot {
     /// Number of slots the LLVM emitter can declare. Mirrors cranelift's
     /// `VtableSlot::COUNT`; bumping it needs a matching variant + a
     /// `populate_global_mappings` arm.
-    pub const COUNT: u32 = 2;
+    pub const COUNT: u32 = 3;
 
     /// All slots, in declaration order. Used by [`populate_global_mappings`]
     /// and the parity tests.
-    pub const ALL: [VtableSlot; Self::COUNT as usize] =
-        [VtableSlot::RelonStrContains, VtableSlot::RelonCallNative];
+    pub const ALL: [VtableSlot; Self::COUNT as usize] = [
+        VtableSlot::RelonStrContains,
+        VtableSlot::RelonCallNative,
+        VtableSlot::RelonF64ToStr,
+    ];
 
     /// Stable symbol name the emitted LLVM module declares this helper
     /// under. The host binds it via `add_global_mapping` (JIT) or the
@@ -87,6 +97,7 @@ impl VtableSlot {
         match self {
             VtableSlot::RelonStrContains => RELON_LLVM_STR_CONTAINS_ARENA_SYMBOL,
             VtableSlot::RelonCallNative => RELON_LLVM_CALL_NATIVE_SYMBOL,
+            VtableSlot::RelonF64ToStr => RELON_LLVM_F64_TO_STR_SYMBOL,
         }
     }
 
@@ -98,6 +109,7 @@ impl VtableSlot {
         match self {
             VtableSlot::RelonStrContains => relon_llvm_str_contains_arena_addr(),
             VtableSlot::RelonCallNative => relon_llvm_call_native_addr(),
+            VtableSlot::RelonF64ToStr => relon_llvm_f64_to_str_addr(),
         }
     }
 }
@@ -122,6 +134,10 @@ pub fn populate_global_mappings() -> [(&'static str, usize); VtableSlot::COUNT a
             VtableSlot::RelonCallNative.symbol(),
             VtableSlot::RelonCallNative.host_addr(),
         ),
+        (
+            VtableSlot::RelonF64ToStr.symbol(),
+            VtableSlot::RelonF64ToStr.host_addr(),
+        ),
     ]
 }
 
@@ -138,6 +154,7 @@ mod tests {
     fn slot_indices_are_distinct_and_packed() {
         assert_eq!(VtableSlot::RelonStrContains as u32, 0);
         assert_eq!(VtableSlot::RelonCallNative as u32, 1);
+        assert_eq!(VtableSlot::RelonF64ToStr as u32, 2);
     }
 
     #[test]
@@ -149,6 +166,10 @@ mod tests {
         assert_eq!(
             VtableSlot::RelonCallNative.symbol(),
             RELON_LLVM_CALL_NATIVE_SYMBOL
+        );
+        assert_eq!(
+            VtableSlot::RelonF64ToStr.symbol(),
+            RELON_LLVM_F64_TO_STR_SYMBOL
         );
     }
 
@@ -170,7 +191,9 @@ mod tests {
             assert!(!sym.is_empty(), "symbol name must be non-empty");
             assert_ne!(addr, 0, "host addr must be non-null for {sym}");
         }
-        // The two slots map to distinct symbols.
+        // Every slot maps to a distinct symbol.
         assert_ne!(mappings[0].0, mappings[1].0);
+        assert_ne!(mappings[0].0, mappings[2].0);
+        assert_ne!(mappings[1].0, mappings[2].0);
     }
 }

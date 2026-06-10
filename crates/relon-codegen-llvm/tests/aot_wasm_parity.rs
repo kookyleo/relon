@@ -209,6 +209,40 @@ fn linker_with_multi3(engine: &wasmtime::Engine) -> wasmtime::Linker<()> {
             },
         )
         .expect("register memchr");
+
+    // Wave B `Op::FloatToStr` lowers to a call against the
+    // `relon_llvm_f64_to_str` host shim; on wasm32 the unresolved extern
+    // survives `wasm-ld --allow-undefined` as an `env` import. Satisfy
+    // it by invoking THE SAME Rust fn the native MCJIT leg maps via
+    // `add_global_mapping` against a host-side staging record, then
+    // copying the `[len: u32 LE][payload]` bytes into linear memory at
+    // `dest` — one Display byte producer for every backend by
+    // construction. Returns the payload length (the emitted code traps
+    // on a negative return).
+    linker
+        .func_wrap(
+            "env",
+            "relon_llvm_f64_to_str",
+            |mut caller: Caller<'_, ()>, bits: i64, dest: i32| -> i32 {
+                use relon_codegen_llvm::str_helpers::relon_llvm_f64_to_str;
+                use relon_ir::float_str::FLOAT_TO_STR_RECORD_SIZE;
+                let mem = match caller.get_export("memory") {
+                    Some(Extern::Memory(m)) => m,
+                    _ => panic!("relon_llvm_f64_to_str needs an exported `memory`"),
+                };
+                let mut record = vec![0u8; FLOAT_TO_STR_RECORD_SIZE as usize];
+                // SAFETY: `record` is FLOAT_TO_STR_RECORD_SIZE bytes —
+                // exactly the dest contract the shim documents.
+                let len = unsafe { relon_llvm_f64_to_str(bits, record.as_mut_ptr()) };
+                if len < 0 {
+                    return len;
+                }
+                mem.write(&mut caller, dest as usize, &record[..4 + len as usize])
+                    .expect("relon_llvm_f64_to_str store");
+                len
+            },
+        )
+        .expect("register relon_llvm_f64_to_str");
     linker
 }
 
@@ -1986,11 +2020,12 @@ fn r11_field_decorator_aligns_native_via_wasmtime() {
 /// through `Op::CallClosure { [String] -> String }` + the existing R8
 /// `Op::StrConcatN` String-tail-record return path. Verified byte-equal
 /// on the wasm32 leg against the LLVM native oracle (itself aligned to
-/// tree-walk + cranelift). The Float-valued concat shape — the
-/// `examples/pricing.relon` `currency(symbol, val)` whose value-first
-/// `symbol` is a `Float` price — stays a loud cap (no `Float -> String`
-/// coercion op on the compiled path); see the lowering unit test
-/// `anon_dict_float_string_concat_decorator_caps`.
+/// tree-walk + cranelift). Wave B unsealed the Float-valued concat
+/// shape — the `examples/pricing.relon` `currency(symbol, val)` whose
+/// value-first `symbol` is a `Float` price — via `Op::FloatToStr` +
+/// the concat-coercible param mask; see the lowering unit test
+/// `anon_dict_float_string_concat_decorator_lowers` and the four-way
+/// `wave_b_currency_decorator_aligns_native_via_wasmtime` below.
 #[test]
 fn r11_string_result_decorator_aligns_native_via_wasmtime() {
     if !wasm_ld_available() {
@@ -2966,5 +3001,148 @@ fn js_is_iso_date_nondigit_aligns_native_via_wasmtime() {
         "js_isod_nd",
         "#main(Int n) -> Bool\nis_iso_date(\"20x0-01-15\")",
         false,
+    );
+}
+
+// ===========================================================
+// Wave B — Float → String rendering on the compiled backends.
+//
+// `Op::FloatToStr` routes every leg through ONE Rust Display byte
+// producer (`relon_ir::float_str::format_f64_display`): the native
+// MCJIT leg maps the `relon_llvm_f64_to_str` extern via
+// `add_global_mapping`, the wasm32 leg satisfies the same symbol as an
+// `env` import wrapping the same fn (see `linker_with_multi3`), and
+// cranelift calls it through vtable slot `RelonF64ToStr` — so
+// `1.0 → "1"`, `-0.0 → "-0"`, `NaN` / `inf` / `-inf`, and the 327-char
+// subnormal expansion agree with the tree-walk oracle by construction.
+// Native LLVM-AOT is the in-file oracle; the tree-walk == cranelift
+// legs run in the `relon-test-harness` corpus (`wave_b_*`).
+// ===========================================================
+
+/// Float boundary battery shared by every Wave B consumer-path test:
+/// integral-valued (`1.0 → "1"`), negative zero (`"-0"`), a classic
+/// shortest-round-trip decimal (`0.1`), the pricing flagship value
+/// (`567.34`), a huge magnitude (`1e300`), the smallest subnormal
+/// (`5e-324`, 327-char Display in the negative), and the non-finite
+/// edges (`NaN` / `±inf`).
+const WAVE_B_FLOAT_BATTERY: [f64; 9] = [
+    1.0,
+    -0.0,
+    0.1,
+    567.34,
+    1e300,
+    5e-324,
+    f64::NAN,
+    f64::INFINITY,
+    f64::NEG_INFINITY,
+];
+
+/// Shared driver: build `src` (single `Float x` param returning a
+/// String), then for every battery value compare the wasm32 leg's
+/// decoded String byte-for-byte against the native LLVM oracle.
+fn wave_b_check_string_battery(name: &str, src: &str) {
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping {name}");
+        return;
+    }
+    let (bytes, info) = build(name, src);
+    assert!(
+        matches!(info.shape, relon_codegen_llvm::EmittedEntryShape::Buffer),
+        "[{name}] expected Buffer shape, got {:?}",
+        info.shape
+    );
+    for (i, &x) in WAVE_B_FLOAT_BATTERY.iter().enumerate() {
+        let want = match native_run(
+            src,
+            HashMap::from([("x".to_string(), Value::Float(x.into()))]),
+        ) {
+            Value::String(s) => s,
+            other => panic!("[{name}] #{i} native expected String, got {other:?}"),
+        };
+        let in_record = pack_single_float(&info, x);
+        let out = run_buffer(&bytes, &format!("relon_parity_{name}"), &info, &in_record);
+        match out.get("value") {
+            Some(Decoded::Str(s)) => {
+                assert_eq!(*s, want, "[{name}] #{i} x={x:?} wasm String != native")
+            }
+            other => panic!("[{name}] #{i} decoded {other:?}"),
+        }
+    }
+}
+
+/// Wave B consumer path 1 — f-string interpolation of a Float
+/// (`f"v=${x}"`). Exercises `Op::FloatToStr` feeding `Op::StrConcatN`.
+#[test]
+fn wave_b_fstring_float_battery_aligns_native_via_wasmtime() {
+    // Oracle drift pin: integral Float renders bare ("1", not "1.0").
+    let want = match native_run(
+        "#main(Float x) -> String\nf\"v=${x}\"",
+        HashMap::from([("x".to_string(), Value::Float(1.0.into()))]),
+    ) {
+        Value::String(s) => s,
+        other => panic!("oracle pin expected String, got {other:?}"),
+    };
+    assert_eq!(want, "v=1", "tree-walk Display contract drifted");
+    wave_b_check_string_battery(
+        "wave_b_fstring_float",
+        "#main(Float x) -> String\nf\"v=${x}\"",
+    );
+}
+
+/// Wave B consumer path 2 — `String + Float` concat (`"v=" + x`).
+#[test]
+fn wave_b_concat_string_float_battery_aligns_native_via_wasmtime() {
+    wave_b_check_string_battery("wave_b_concat_sf", "#main(Float x) -> String\n\"v=\" + x");
+}
+
+/// Wave B consumer path 2 (mirrored) — `Float + String` concat
+/// (`x + " usd"`).
+#[test]
+fn wave_b_concat_float_string_battery_aligns_native_via_wasmtime() {
+    wave_b_check_string_battery("wave_b_concat_fs", "#main(Float x) -> String\nx + \" usd\"");
+}
+
+/// Wave B flagship — the pricing-style `@currency` field decorator over
+/// a `Float` price. Value-first desugar turns `@currency("USD")
+/// display: price` into `currency(price, "USD")`; the concat-coercible
+/// param mask renders the Float arg through `Op::FloatToStr` at the
+/// call edge (byte-identical to the oracle rendering at the `+` inside
+/// the body), so the four-way output is `"USD 567.34"`.
+#[test]
+fn wave_b_currency_decorator_aligns_native_via_wasmtime() {
+    if !wasm_ld_available() {
+        eprintln!("aot_wasm_parity: wasm-ld unavailable; skipping wave_b currency decorator");
+        return;
+    }
+    let src = "#relaxed\n#main(Float price) -> Dict\n\
+               { #internal\n currency(val, sym): sym + \" \" + val,\n \
+               @currency(\"USD\")\n display: price }";
+    let price = 567.34f64;
+    let dict = match native_run(
+        src,
+        HashMap::from([("price".to_string(), Value::Float(price.into()))]),
+    ) {
+        Value::Dict(d) => d,
+        other => panic!("native expected Dict, got {other:?}"),
+    };
+    let want_display = match dict.map.get("display") {
+        Some(Value::String(s)) => s.to_string(),
+        other => panic!("display not String: {other:?}"),
+    };
+    // Oracle sanity: currency(567.34, "USD") = "USD 567.34".
+    assert_eq!(want_display, "USD 567.34", "wave_b flagship oracle drifted");
+
+    let (bytes, info) = build("wave_b_currency", src);
+    assert!(
+        matches!(info.shape, relon_codegen_llvm::EmittedEntryShape::Buffer),
+        "wave_b currency expected Buffer shape, got {:?}",
+        info.shape
+    );
+    let in_record = pack_single_float(&info, price);
+    let out = run_buffer(&bytes, "relon_parity_wave_b_currency", &info, &in_record);
+    assert_eq!(
+        out.get("display"),
+        Some(&Decoded::Str(want_display)),
+        "wave_b currency wasm field != native oracle"
     );
 }

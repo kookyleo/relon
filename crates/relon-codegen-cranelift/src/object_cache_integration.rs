@@ -85,7 +85,11 @@ use crate::sandbox::SandboxConfig;
 /// `Linkage::Import` references). Cache files from stage 1 are
 /// emitted against the stub `relon_main_entry` and would deadlock
 /// the dlopen-exec path; the version bump self-invalidates them.
-pub const GENERATOR_VERSION: &str = "relon-codegen-cranelift v5-gamma 14";
+/// `v5-gamma 15` = Wave B Float rendering: new
+/// `VtableSlot::RelonF64ToStr` slot (`VtableSlot::COUNT` 5 → 6) +
+/// `Op::FloatToStr` lowering. The vtable layout grew, so cache files
+/// emitted by 14 would call through an unpopulated slot.
+pub const GENERATOR_VERSION: &str = "relon-codegen-cranelift v5-gamma 15";
 
 /// Filename suffix for the legacy IR cache (paired with the
 /// relon-object-cache `<hash>.relon-native-v1` blob).

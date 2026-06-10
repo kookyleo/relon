@@ -3,12 +3,13 @@
 //!
 //! ## What lives here
 //!
-//! Today this module provides exactly one symbol:
+//! Two symbols:
 //! [`relon_llvm_str_contains_arena`] — the F.1 fast path the LLVM
-//! emitter routes `Op::Call { contains }` through. The emitted body
-//! declares the symbol with `Linkage::External`; the static linker
-//! resolves it against this crate's compiled `.rlib` when the build
-//! script advertises us as a link target.
+//! emitter routes `Op::Call { contains }` through — and
+//! [`relon_llvm_f64_to_str`] — the Wave B `Op::FloatToStr` renderer.
+//! The emitted body declares each symbol with `Linkage::External`; the
+//! static linker resolves them against this crate's compiled `.rlib`
+//! when the build script advertises us as a link target.
 //!
 //! ## Why not re-export from `relon-codegen-llvm`?
 //!
@@ -168,6 +169,87 @@ fn compute_contains(h_bytes: &[u8], n_bytes: &[u8]) -> i32 {
     i32::from(h_str.contains(n_str))
 }
 
+/// Maximum Display payload the f64 renderer accepts. Mirrors
+/// `relon_ir::float_str::FLOAT_TO_STR_MAX_PAYLOAD` (this crate must not
+/// depend on `relon-ir`, so the constant is duplicated; the LLVM-side
+/// crate statically asserts the worst real case — the 327-char Display
+/// of `-5e-324` — fits with margin).
+const F64_TO_STR_MAX_PAYLOAD: usize = 352;
+
+/// Wave B host shim: render an `f64` (passed as raw IEEE-754 bits) into
+/// an arena String record at `dest` using Rust's `Display` formatting —
+/// byte-identical to the tree-walk oracle's `Value::Float` rendering
+/// and to `relon-codegen-llvm::str_helpers::relon_llvm_f64_to_str`
+/// (same `format!("{v}")` Display path, duplicated here so the
+/// consuming binary never links `inkwell` / `llvm-sys`).
+///
+/// ## ABI
+///
+/// ```text
+/// extern "C" fn relon_llvm_f64_to_str(
+///     bits: i64,        // f64::to_bits of the value
+///     dest: *mut u8,    // arena_base + record_off (768-byte record)
+/// ) -> i32              // payload byte length, or -1 on failure
+/// ```
+///
+/// On success writes `[len: u32 LE][utf8 payload]` at `dest` and
+/// returns the payload length. Returns `-1` on a null `dest` or a
+/// payload exceeding [`F64_TO_STR_MAX_PAYLOAD`] (unreachable for real
+/// IEEE-754 doubles); the emitted code traps loudly on a negative
+/// return instead of consuming a corrupt record.
+///
+/// # Safety
+///
+/// `dest` must be either null or valid for writes of 768 bytes (the
+/// emitter reserves a `FLOAT_TO_STR_RECORD_SIZE` scratch record).
+#[no_mangle]
+pub unsafe extern "C" fn relon_llvm_f64_to_str(bits: i64, dest: *mut u8) -> i32 {
+    use core::fmt::Write as _;
+
+    /// `fmt::Write` over a fixed byte slice that fails (instead of
+    /// truncating) when the formatted output would overflow. Mirrors
+    /// `relon_ir::float_str::SliceWriter`.
+    struct SliceWriter<'a> {
+        buf: &'a mut [u8],
+        len: usize,
+    }
+    impl core::fmt::Write for SliceWriter<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let bytes = s.as_bytes();
+            let end = self.len.checked_add(bytes.len()).ok_or(core::fmt::Error)?;
+            if end > self.buf.len() {
+                return Err(core::fmt::Error);
+            }
+            self.buf[self.len..end].copy_from_slice(bytes);
+            self.len = end;
+            Ok(())
+        }
+    }
+
+    if dest.is_null() {
+        return -1;
+    }
+    let v = f64::from_bits(bits as u64);
+    let mut payload = [0u8; F64_TO_STR_MAX_PAYLOAD];
+    let mut w = SliceWriter {
+        buf: &mut payload,
+        len: 0,
+    };
+    if write!(w, "{v}").is_err() {
+        return -1;
+    }
+    let len = w.len;
+    // SAFETY: caller guarantees `dest` is valid for 768 writes;
+    // `4 + F64_TO_STR_MAX_PAYLOAD` (356) fits well inside that record.
+    // `write_unaligned` because arena records only guarantee 4-byte
+    // alignment relative to an arbitrarily-based host buffer.
+    unsafe {
+        core::ptr::write_unaligned(dest.cast::<u32>(), len as u32);
+        core::ptr::copy_nonoverlapping(payload.as_ptr(), dest.add(4), len);
+    }
+    len as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,5 +332,43 @@ mod tests {
         let n_ptr = unsafe { buf.as_ptr().add(n_off) };
         let r = unsafe { relon_llvm_str_contains_arena(h_ptr, n_ptr) };
         assert_eq!(r, 1);
+    }
+
+    fn f64_shim_render(v: f64) -> String {
+        let mut record = vec![0u8; 768];
+        let len = unsafe { relon_llvm_f64_to_str(v.to_bits() as i64, record.as_mut_ptr()) };
+        assert!(len >= 0, "shim failed for {v}");
+        let header = u32::from_le_bytes(record[0..4].try_into().unwrap());
+        assert_eq!(header as i32, len);
+        String::from_utf8(record[4..4 + len as usize].to_vec()).unwrap()
+    }
+
+    /// Must match Rust `Display` (the tree-walk oracle) byte-for-byte —
+    /// same battery the LLVM-side shim's tests assert.
+    #[test]
+    fn f64_shim_matches_display_battery() {
+        for v in [
+            1.0,
+            -0.0,
+            0.1,
+            567.34,
+            1e300,
+            5e-324,
+            -5e-324,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert_eq!(f64_shim_render(v), format!("{v}"), "drift for {v:?}");
+        }
+        assert_eq!(f64_shim_render(1.0), "1");
+        assert_eq!(f64_shim_render(-0.0), "-0");
+        assert_eq!(f64_shim_render(-5e-324).len(), 327);
+    }
+
+    #[test]
+    fn f64_shim_null_dest_returns_negative() {
+        let r = unsafe { relon_llvm_f64_to_str(1.0f64.to_bits() as i64, core::ptr::null_mut()) };
+        assert_eq!(r, -1);
     }
 }

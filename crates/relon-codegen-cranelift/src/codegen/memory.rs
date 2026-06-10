@@ -554,4 +554,54 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
         self.push(base_off);
         Ok(())
     }
+
+    /// Lower `Op::FloatToStr` — pop one `F64`, materialise its decimal
+    /// `String` record in the scratch arena, push the record offset.
+    ///
+    /// Unlike [`Self::emit_int_to_str`] the rendering is not inlined:
+    /// Rust's `f64` `Display` (shortest round-trip decimal) is far too
+    /// large to transcribe as CLIF ops, and byte-exactness with the
+    /// tree-walk oracle demands the *same* algorithm. The codegen
+    /// therefore bitcasts the F64 value to its i64 bit pattern,
+    /// pre-allocates a fixed-size scratch record
+    /// (`FLOAT_TO_STR_RECORD_SIZE`, a 4-byte multiple so the scratch
+    /// cursor stays record-aligned; the header stores the exact
+    /// payload length), and calls the
+    /// [`crate::vtable::VtableSlot::RelonF64ToStr`] host helper, which
+    /// writes `[len: u32 LE][utf8 payload]` via the shared
+    /// `relon_ir::float_str::format_f64_display` core. A negative
+    /// return (defence-in-depth bounds refusal inside the helper)
+    /// traps as a bounds violation — a half-written record is never
+    /// observable.
+    pub(super) fn emit_float_to_str(&mut self) -> Result<(), CraneliftError> {
+        use relon_ir::float_str::FLOAT_TO_STR_RECORD_SIZE;
+
+        let v = self.pop()?;
+        // F64 value -> raw IEEE-754 bits in an i64 register (the
+        // helper ABI carries the float as bits so no float-ABI
+        // assumptions leak across the FFI edge).
+        let bits = self.builder.ins().bitcast(I64, MemFlags::new(), v);
+
+        // Fixed-size allocation: simpler than a digits-count pre-pass
+        // (the payload length is only known after formatting) and
+        // already 4-aligned. The header stores the exact length, so
+        // the slack bytes are never read.
+        self.emit_alloc_scratch_static(FLOAT_TO_STR_RECORD_SIZE)?;
+        let base_off = self.pop()?;
+
+        let inst = self.emit_host_fn_call(
+            crate::vtable::VtableSlot::RelonF64ToStr,
+            &[self.state_ptr, bits, base_off],
+        );
+        let written = self.builder.inst_results(inst)[0];
+        let zero32 = self.builder.ins().iconst(I32, 0);
+        let failed = self
+            .builder
+            .ins()
+            .icmp(IntCC::SignedLessThan, written, zero32);
+        self.cond_trap(failed, TrapKind::BoundsViolation);
+
+        self.push(base_off);
+        Ok(())
+    }
 }

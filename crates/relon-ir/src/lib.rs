@@ -26,6 +26,7 @@
 
 pub mod effect;
 pub mod error;
+pub mod float_str;
 pub mod frontend;
 pub mod intern;
 pub mod ir;

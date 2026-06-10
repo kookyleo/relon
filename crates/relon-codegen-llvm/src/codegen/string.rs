@@ -975,4 +975,114 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         self.push(base_off, IrType::String);
         Ok(())
     }
+
+    /// Idempotent declaration of the
+    /// [`crate::str_helpers::relon_llvm_f64_to_str`] extern. Signature:
+    /// `i32 fn(i64 bits, ptr dest)`. On the native leg the symbol is
+    /// resolved through `engine.add_global_mapping`; on the wasm32 leg
+    /// the unresolved extern survives `wasm-ld --allow-undefined` as
+    /// `(import "env" "relon_llvm_f64_to_str" ...)` and the host
+    /// `func_wrap`s the same Rust fn — one Display byte producer for
+    /// every compiled backend.
+    pub(crate) fn declare_f64_to_str_extern(&self) -> FunctionValue<'ctx> {
+        let sym = crate::str_helpers::RELON_LLVM_F64_TO_STR_SYMBOL;
+        if let Some(f) = self.module.get_function(sym) {
+            return f;
+        }
+        let i32_t = self.ctx.i32_type();
+        let i64_t = self.ctx.i64_type();
+        let ptr_t = self.ctx.ptr_type(AddressSpace::default());
+        let fn_ty = i32_t.fn_type(&[i64_t.into(), ptr_t.into()], false);
+        self.module
+            .add_function(sym, fn_ty, Some(Linkage::External))
+    }
+
+    /// Lower `Op::FloatToStr` — pop one `F64` (riding the virtual stack
+    /// as raw IEEE-754 bits in an i64, per the AOT-1 convention),
+    /// materialise its Rust-`Display` `String` record in the scratch
+    /// arena via the [`crate::str_helpers::relon_llvm_f64_to_str`] host
+    /// shim, push the i32 record offset. The shim defers to
+    /// `relon_ir::float_str::format_f64_display` — the exact `format!`
+    /// path the tree-walk oracle's `Value::Float` Display uses — so the
+    /// bytes are equal by construction (`1.0 → "1"`, `-0.0 → "-0"`,
+    /// `NaN` / `inf` / `-inf`, full subnormal expansion).
+    ///
+    /// Unlike `IntToStr` (open-coded digit loop, no import) this leg
+    /// costs a host call: float Display is grisu/ryū-class shortest-
+    /// round-trip formatting, far too large to transcribe per-backend
+    /// without inviting byte drift. The wasm leg pays one `env` import.
+    ///
+    /// A negative shim return (null dest / payload over the cap — both
+    /// unreachable by construction since the record is a bounds-checked
+    /// scratch reservation of `FLOAT_TO_STR_RECORD_SIZE` bytes) traps
+    /// loudly instead of pushing a corrupt record, mirroring
+    /// cranelift's `emit_float_to_str` bounds trap.
+    pub(crate) fn emit_float_to_str(&mut self, ip_hint: &str) -> Result<(), LlvmError> {
+        use relon_ir::float_str::FLOAT_TO_STR_RECORD_SIZE;
+        let cg = |e: inkwell::builder::BuilderError, what: &str| {
+            LlvmError::Codegen(format!("FloatToStr {what}: {e}"))
+        };
+        // F64 rides the virtual stack as bit-cast i64 — exactly the i64
+        // lane the shim's `bits: i64` parameter expects. No fpext /
+        // bitcast needed at the call edge.
+        let bits = self.pop_int(ip_hint)?;
+
+        // Fixed-size record: worst-case Display payload (327 bytes for
+        // -5e-324) + header fits 768 with margin; statically asserted
+        // in `relon_ir::float_str`.
+        self.emit_alloc_scratch_static(FLOAT_TO_STR_RECORD_SIZE)?;
+        let base_off = self.pop_int(ip_hint)?;
+        let dest_ptr = self.arena_addr_i32(base_off)?;
+
+        let shim = self.declare_f64_to_str_extern();
+        let call_name = self.next_name("f64_to_str");
+        let call_site = self
+            .builder
+            .build_call(
+                shim,
+                &[
+                    BasicMetadataValueEnum::IntValue(bits),
+                    BasicMetadataValueEnum::PointerValue(dest_ptr),
+                ],
+                &call_name,
+            )
+            .map_err(|e| cg(e, "call"))?;
+        let ret_val = match call_site.try_as_basic_value() {
+            inkwell::values::ValueKind::Basic(v) => v,
+            inkwell::values::ValueKind::Instruction(_) => {
+                return Err(LlvmError::Codegen(
+                    "relon_llvm_f64_to_str returned void; expected i32".into(),
+                ));
+            }
+        };
+        let written = match ret_val {
+            BasicValueEnum::IntValue(v) => v,
+            other => {
+                return Err(LlvmError::Codegen(format!(
+                    "relon_llvm_f64_to_str returned non-int {other:?}"
+                )));
+            }
+        };
+
+        // written < 0 → loud trap (never a silent corrupt record).
+        let zero32 = self.ctx.i32_type().const_int(0, false);
+        let failed = self
+            .builder
+            .build_int_compare(IntPredicate::SLT, written, zero32, "f2s_failed")
+            .map_err(|e| cg(e, "fail cmp"))?;
+        let trap_bb = self.ctx.append_basic_block(self.func, "f2s_trap");
+        let cont_bb = self.ctx.append_basic_block(self.func, "f2s_ok");
+        self.builder
+            .build_conditional_branch(failed, trap_bb, cont_bb)
+            .map_err(|e| cg(e, "fail branch"))?;
+        self.builder.position_at_end(trap_bb);
+        self.emit_llvm_trap_call("FloatToStr")?;
+        self.builder
+            .build_unreachable()
+            .map_err(|e| cg(e, "trap unreachable"))?;
+        self.builder.position_at_end(cont_bb);
+
+        self.push(base_off, IrType::String);
+        Ok(())
+    }
 }

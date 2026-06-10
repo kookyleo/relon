@@ -207,6 +207,10 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
         self.emit_int_to_str()
     }
 
+    fn visit_float_to_str(&mut self) -> Result<(), CraneliftError> {
+        self.emit_float_to_str()
+    }
+
     fn visit_sub(&mut self, ty: IrType) -> Result<(), CraneliftError> {
         match ty {
             IrType::I64 => self.emit_sub_i64(),
