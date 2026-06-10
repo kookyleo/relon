@@ -165,13 +165,42 @@ fn spread_extras_arg() -> HashMap<String, Value> {
     m
 }
 
-/// `List<Int>` argument for the capped list-spread-over-a-parameter case
-/// (`[...a, 9]`). Tree-walk runs it; cranelift caps (non-literal source).
+/// `List<Int>` argument for the runtime-source list-spread cases
+/// (`[...a, 9]` etc.). Now compiled four-way (single runtime source).
 fn spread_param_list_arg() -> HashMap<String, Value> {
     let mut m = HashMap::new();
     m.insert(
         "a".to_string(),
         Value::List(Arc::new(vec![Value::Int(1), Value::Int(2)])),
+    );
+    m
+}
+
+/// `List<Float>` argument for the runtime-source Float spread case
+/// (`[1.5, ...a, 2.5]`).
+fn spread_param_float_list_arg() -> HashMap<String, Value> {
+    let mut m = HashMap::new();
+    m.insert(
+        "a".to_string(),
+        Value::List(Arc::new(vec![
+            Value::Float(OrderedFloat(3.5)),
+            Value::Float(OrderedFloat(4.5)),
+        ])),
+    );
+    m
+}
+
+/// Two `List<Int>` arguments for the multi-runtime-source cap case
+/// (`[...a, ...b]`). Tree-walk runs it; cranelift caps (multi-source).
+fn spread_two_list_args() -> HashMap<String, Value> {
+    let mut m = HashMap::new();
+    m.insert(
+        "a".to_string(),
+        Value::List(Arc::new(vec![Value::Int(1), Value::Int(2)])),
+    );
+    m.insert(
+        "b".to_string(),
+        Value::List(Arc::new(vec![Value::Int(3), Value::Int(4)])),
     );
     m
 }
@@ -1959,13 +1988,52 @@ pub fn all_cases() -> Vec<CorpusCase> {
             tier: Tier::DictReturn,
             supported_by: TW_ONLY,
         },
-        // CAP — list spread over a non-literal source `[...a, b]` (a is a
-        // parameter): the source's element count is not statically known, so
-        // the static flatten declines. By-design cap; `TW_ONLY`.
+        // List spread over a single RUNTIME source `[...a, 9]` (a is a
+        // `List<Int>` parameter): the source length is only known at
+        // runtime, so the static flatten declines — instead a scratch
+        // record is allocated, the trailing scalar stored inline, and the
+        // source payload `memory.copy`-d in place. Same scratch-list return
+        // path the literal-source spread + map output use.
         CorpusCase {
-            name: "r12_list_spread_param_src_capped",
+            name: "r12_list_spread_param_src",
             source: "#main(List<Int> a) -> List<Int>\n[...a, 9]",
             args_factory: spread_param_list_arg,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        // Runtime source with a leading scalar `[7, ...a]`.
+        CorpusCase {
+            name: "r12_list_spread_param_src_prefix",
+            source: "#main(List<Int> a) -> List<Int>\n[7, ...a]",
+            args_factory: spread_param_list_arg,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        // Runtime source with scalars on both sides `[1, ...a, 8, 9]`.
+        CorpusCase {
+            name: "r12_list_spread_param_src_both",
+            source: "#main(List<Int> a) -> List<Int>\n[1, ...a, 8, 9]",
+            args_factory: spread_param_list_arg,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        // `List<Float>` runtime source `[1.5, ...a, 2.5]` (8-byte stride,
+        // same header + memory.copy mechanism).
+        CorpusCase {
+            name: "r12_list_spread_param_src_float",
+            source: "#main(List<Float> a) -> List<Float>\n[1.5, ...a, 2.5]",
+            args_factory: spread_param_float_list_arg,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        // CAP — list spread over MORE THAN ONE runtime source `[...a, ...b]`:
+        // needs loop-style length accumulation + multi-segment copy, a step
+        // up in complexity. The single-source runtime path is compiled; the
+        // multi-source form is capped this round. `TW_ONLY`.
+        CorpusCase {
+            name: "r12_list_spread_multi_src_capped",
+            source: "#main(List<Int> a, List<Int> b) -> List<Int>\n[...a, ...b]",
+            args_factory: spread_two_list_args,
             tier: Tier::StdlibList,
             supported_by: TW_ONLY,
         },

@@ -1881,9 +1881,77 @@ pub const LEDGER: &[LedgerEntry] = &[
         site: "lowering/peephole.rs::flatten_list_spread",
         category: Category::ExprShape,
         status: Status::Capped,
-        corpus: "r12_list_spread_param_src_capped",
-        reason: "list spread source is not a statically-resolvable list literal (a parameter / \
-                 call); the flat element count is not known at compile time",
+        corpus: "r12_list_spread_multi_src_capped",
+        reason: "list spread carries more than one runtime (non-literal) source \
+                 (`[...a, ...b]`); the single-source runtime path is materialised, but \
+                 multi-source needs loop-style length accumulation + multi-segment copy, \
+                 capped this round",
+    },
+    LedgerEntry {
+        id: "emit_list_spread_runtime_materialize.unsupported_expr.1",
+        site: "lowering/peephole.rs::emit_list_spread_runtime_materialize",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "runtime list spread source produced no value during lowering",
+    },
+    LedgerEntry {
+        id: "emit_list_spread_runtime_materialize.unsupported_source_ty",
+        site: "lowering/peephole.rs::emit_list_spread_runtime_materialize",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "runtime list spread source is not a scalar List<Int>/List<Float>; \
+                 List<String>/List<Schema>/List<List> sources need the pointer-array \
+                 materialiser, not the scalar memory.copy path",
+    },
+    LedgerEntry {
+        id: "emit_list_spread_runtime_materialize.unsupported_expr.prefix_overflow",
+        site: "lowering/peephole.rs::emit_list_spread_runtime_materialize",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "list spread prefix element count overflows i32",
+    },
+    LedgerEntry {
+        id: "emit_list_spread_runtime_materialize.unsupported_expr.suffix_overflow",
+        site: "lowering/peephole.rs::emit_list_spread_runtime_materialize",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "list spread suffix element count overflows i32",
+    },
+    LedgerEntry {
+        id: "emit_list_spread_runtime_materialize.unsupported_expr.suffix_off_overflow",
+        site: "lowering/peephole.rs::emit_list_spread_runtime_materialize",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "list spread suffix element byte offset overflows i32",
+    },
+    LedgerEntry {
+        id: "emit_scalar_element_value_store.unsupported_expr.1",
+        site: "lowering/peephole.rs::emit_scalar_element_value_store",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "list spread scalar element produced no value during lowering",
+    },
+    LedgerEntry {
+        id: "emit_scalar_element_value_store.unsupported_expr.2",
+        site: "lowering/peephole.rs::emit_scalar_element_value_store",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "list spread Float scalar element lowered to a non-Float/Int type",
+    },
+    LedgerEntry {
+        id: "emit_scalar_element_value_store.unsupported_expr.3",
+        site: "lowering/peephole.rs::emit_scalar_element_value_store",
+        category: Category::ExprShape,
+        status: Status::Capped,
+        corpus: "",
+        reason: "list spread Int scalar element lowered to a non-Int type",
     },
     LedgerEntry {
         id: "emit_list_value_materialize.unsupported_expr.1",
@@ -2985,6 +3053,18 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
                 scalar-list materialiser; wasm + llvm-native legs proven in \
                 relon-codegen-llvm::inplace_return_four_way::list_spread_* and \
                 relon-codegen-llvm::aot_wasm_parity::r12_list_spread)",
+    },
+    SurfaceEntry {
+        construct: "list spread `[a, ...xs, b] -> List<Int>/List<Float>` (single RUNTIME source: \
+                    a List<scalar> parameter / computed handle, with optional static scalars on \
+                    either side)",
+        wave: "R12",
+        corpus: "r12_list_spread_param_src",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift (TW_CR; source length read from the record header, payload \
+                spliced via memory.copy into a fresh scratch record, static scalars stored inline; \
+                wasm + llvm-native legs proven in \
+                relon-codegen-llvm::aot_wasm_parity::r12_list_spread_runtime_src)",
     },
     SurfaceEntry {
         construct: "dict spread `{ ...src, k: v } -> Schema` (schema-typed source, static fields)",

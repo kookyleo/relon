@@ -56,7 +56,8 @@ mod peephole;
 
 use closure::{lower_closure_as_value, lower_closure_as_value_with_expected_type};
 use peephole::{
-    emit_list_float_literal_materialize, emit_list_int_literal_materialize,
+    classify_runtime_spread, emit_list_float_literal_materialize,
+    emit_list_int_literal_materialize, emit_list_spread_runtime_materialize,
     emit_list_value_materialize, flatten_list_spread, list_has_computed_element, list_has_spread,
     list_is_float_shaped, match_bare_range, match_materializable_outer_map, probe_expr_ir_ty,
     try_lower_len_filter_range, try_lower_list_filter, try_lower_list_len, try_lower_list_map,
@@ -4424,6 +4425,20 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
             // (the analyzer enforced it), so the Int / Float materialiser
             // accepts it byte-for-byte like a plain `[1, 2, n]`.
             if list_has_spread(items) {
+                // A single runtime (non-list-literal) spread source —
+                // `[a, ...xs, b]` with `xs` a `List<Int>` / `List<Float>`
+                // parameter or computed handle — is not statically
+                // flattenable (the source length is only known at
+                // runtime). Materialise it directly: alloc a scratch
+                // record, store the static scalars, `memory.copy` the
+                // source payload in place, and leave a scratch list handle
+                // on the same path the literal-source spread + map output
+                // use. Multiple runtime sources / non-scalar surrounding
+                // elements / list-literal sources fall through to the
+                // static flatten below (and its loud caps).
+                if let Some(shape) = classify_runtime_spread(items) {
+                    return emit_list_spread_runtime_materialize(&shape, range, ctx);
+                }
                 let flat = flatten_list_spread(items, range)?;
                 if flat.is_empty() {
                     return Err(cap!(
