@@ -194,7 +194,18 @@ pub struct LlvmAotEvaluator {
     /// args match the eligible shape. Length equals the fast-entry
     /// arity (matches `buffer_schema.main_schema.fields.len()` when
     /// every field is `Int`).
-    fast_path_arity: Option<usize>,
+    ///
+    /// Stored as a bare `usize`, not `Option<usize>`: the single
+    /// resolution site in `from_ir_inner_world` assigns it together
+    /// with `fast_entry_ptr` from one tuple, so "ptr present, arity
+    /// absent" is unrepresentable by construction. Only meaningful
+    /// while `jit.fast_entry_ptr` is `Some` (it is `0` and never read
+    /// otherwise — both readers gate on the pointer first). Keeping
+    /// the per-call dispatch free of an `Option` unwrap matters: a
+    /// panicking `expect` here once pushed `run_main_legacy_i64_fast`
+    /// past the LTO inline-cost threshold, de-inlining it from bench
+    /// loops and costing the W12 kernel 2.7x per call.
+    fast_path_arity: usize,
     /// Phase E.1: const-data bytes the IR's `Op::ConstString` /
     /// `Op::ConstList*` records reference through arena-relative i32
     /// offsets. The host copies this blob into the arena prefix at
@@ -831,12 +842,19 @@ impl LlvmAotEvaluator {
         // module exported one. Resolution failure here is *not* an
         // emit-side bug — the symbol simply wasn't emitted (or was
         // rolled back) — so we treat it as "no fast path" silently.
+        //
+        // Pairing invariant: this is the *only* assignment of the
+        // `fast_entry_ptr`/`fast_path_arity` pair. Both arms set the
+        // two together, so a live pointer always carries the profile's
+        // real arity and the `(Some ptr, missing arity)` state cannot
+        // exist — the hot dispatch reads the arity without any
+        // `Option` check or panic path.
         let (fast_entry_ptr, fast_path_arity) = match (&fast_profile, &fast_emit_diagnostic) {
             (Some(profile), None) => match engine.get_function_address(ENTRY_SYMBOL_FAST) {
-                Ok(ptr) => (Some(ptr), Some(profile.arg_offsets.len())),
-                Err(_) => (None, None),
+                Ok(ptr) => (Some(ptr), profile.arg_offsets.len()),
+                Err(_) => (None, 0),
             },
-            _ => (None, None),
+            _ => (None, 0),
         };
         // Stash the fast-emit diagnostic (if any) into the IR dump so
         // post-mortem tests can assert on it without needing a
@@ -1013,7 +1031,7 @@ impl LlvmAotEvaluator {
     /// Matches `arity()` for source-driven entries that qualify; `None`
     /// when the source falls back to the buffer-only path.
     pub fn fast_path_arity(&self) -> Option<usize> {
-        self.fast_path_arity
+        self.jit.fast_entry_ptr.map(|_| self.fast_path_arity)
     }
 
     /// Phase L codegen-quality debug helper: raw address of the typed
@@ -1066,13 +1084,14 @@ impl LlvmAotEvaluator {
                     "llvm-aot: fast entry not available; source not Int-only or fast-emit failed"
                         .into(),
             })?;
-        // Construction invariant (see the `(Some, None)` arm at the
-        // `fast_entry_ptr`/`fast_path_arity` resolution site): the two
-        // fields are always populated together, so a live
-        // `fast_entry_ptr` guarantees a live `fast_path_arity`.
-        let arity = self
-            .fast_path_arity
-            .expect("fast_entry_ptr is Some, so fast_path_arity must be Some by construction");
+        // Pairing invariant (single assignment site in
+        // `from_ir_inner_world`): `fast_path_arity` is always set
+        // together with `fast_entry_ptr`, so a live pointer means the
+        // bare-`usize` arity is the profile's real value — no `Option`
+        // unwrap, no panic landing pad on the per-call path. (An
+        // `expect` here once de-inlined this function under fat LTO
+        // and regressed the W12 kernel from 3.55ns to 9.46ns/call.)
+        let arity = self.fast_path_arity;
         if args.len() != arity {
             return Err(RuntimeError::Unsupported {
                 reason: format!(
@@ -1152,12 +1171,11 @@ impl LlvmAotEvaluator {
         if self.jit.fast_entry_ptr.is_none() {
             return Ok(None);
         }
-        // Construction invariant: `fast_entry_ptr` and `fast_path_arity`
-        // are always populated together, so reaching here (entry ptr is
-        // Some) guarantees the arity is Some as well.
-        let arity = self
-            .fast_path_arity
-            .expect("fast_entry_ptr is Some, so fast_path_arity must be Some by construction");
+        // Pairing invariant: `fast_path_arity` is assigned together
+        // with `fast_entry_ptr` at the single resolution site, so
+        // reaching here (entry ptr is Some) means the bare-`usize`
+        // arity is live — no `Option` unwrap on the dispatch path.
+        let arity = self.fast_path_arity;
         if arity != self.param_names.len() {
             // Schema arity mismatch — shouldn't happen if
             // `build_fast_path_profile` agreed, but be defensive.
