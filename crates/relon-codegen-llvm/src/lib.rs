@@ -109,7 +109,7 @@ pub mod wasm_link;
 /// key, stale machine code from an older generator will be silently
 /// loaded and executed against new host-side decode assumptions — a
 /// silent-wrong-result / memory-safety footgun. See
-/// `docs/internal/capability-and-trust-model.md` for the recorded
+/// `docs/internal/adr/capability-and-trust-model.md` for the recorded
 /// rationale.
 pub const GENERATOR_VERSION: &str = "relon-codegen-llvm v0 (no object cache yet)";
 

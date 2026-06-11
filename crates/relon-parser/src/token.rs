@@ -157,7 +157,7 @@ pub enum DirectiveBody {
     ///
     /// `methods` and `schema_no_auto_derives` carry the optional
     /// `with { ... }` extension block (Phase A of the trait-bound /
-    /// schema-method system; see `docs/internal/type-constraints-spec.md`).
+    /// schema-method system; see `docs/internal/archive/type-constraints-spec.md`).
     /// Both are empty when no `with` block follows the body.
     NameBody {
         name: String,

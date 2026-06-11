@@ -1,5 +1,5 @@
 //! Kernel-vs-row separation harness for the W-series perf panel
-//! (2026-06-10; see `docs/internal/perf-panel-w-series.md`).
+//! (2026-06-10; see `docs/internal/reports/perf-panel-w-series.md`).
 //!
 //! The criterion `cmp_lua` rows time `run_main(args_factory())` per
 //! call — for the LLVM rows that includes the per-call host-boundary

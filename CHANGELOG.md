@@ -59,8 +59,8 @@ references entry without needing the cross-module path.
 
 
 
-Phases A.1 / B / C / D-API of the design recorded in
-[`docs/internal/schema-rooted-model-2026-05-11.md`](./docs/internal/schema-rooted-model-2026-05-11.md):
+Phases A.1 / B / C / D-API of the schema-rooted call-model design
+(maintainer-internal design note, 2026-05-11):
 
 ### Language: `with { ... }` blocks and `#extend` (parser)
 

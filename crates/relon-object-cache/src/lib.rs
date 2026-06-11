@@ -26,7 +26,7 @@
 //! - [`error`] — the public [`CacheError`] / [`LoaderError`] /
 //!   [`HmacError`] enums.
 //!
-//! See `docs/internal/v5-gamma-cranelift-object-cache-design.md` for
+//! See `docs/internal/adr/v5-gamma-cranelift-object-cache-design.md` for
 //! the full file-format and threat-model rationale.
 
 #![deny(unsafe_op_in_unsafe_fn)]

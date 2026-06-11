@@ -1,6 +1,0 @@
-# Open follow-up subagents — task → subagent id mapping
-# task_id subagent_id description
-263 ac7bd80cf86a96e80 JitEvaluator tier escalation
-264 aa3344a984890fba4 IR lowering surface expansion
-265 a6a6320d59534ed46 Deopt PC alignment fix
-266 a90a674a865cc7ddc W5 variance RCA

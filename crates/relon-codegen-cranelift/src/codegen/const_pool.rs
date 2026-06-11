@@ -859,7 +859,7 @@ mod tests {
     /// `emit_tail_record_from_absolute` in `codegen/record.rs` all
     /// hard-code the 4-byte header. Migration to the 12-byte
     /// `[len_with_ascii_flag][hash:u64][payload]` plan documented in
-    /// `docs/internal/review-improvement-169-conststring-wire-full-2026-05-22.md`
+    /// `docs/internal/archive/review-improvement-169-conststring-wire-full-2026-05-22.md`
     /// must flip every site atomically — this test fires the second
     /// the producer drifts so the partial-coverage silent-corruption
     /// regression (#164 baseline) cannot recur.

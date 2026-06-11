@@ -66,7 +66,7 @@ pub struct CorpusCase {
 // ---- Support-claim tables ----------------------------------------------------
 //
 // Per-backend lists are recomputed by walking the live harness once
-// (see `docs/internal/review-improvement-180-harness-ratchet-…`).
+// (see `docs/internal/archive/review-improvement-180-harness-ratchet-…`).
 // Tree-walk is the reference impl; the only cases excluded from
 // tree-walk's claim are ones the AST evaluator legitimately reports
 // `FunctionNotFound` on (none today — the `TreeWalkMissingStdlibSurface`

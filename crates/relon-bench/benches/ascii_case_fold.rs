@@ -22,7 +22,7 @@
 //!   to a scalar loop that LLVM autovectorises. This bench runs on
 //!   the native host (x86_64) so the autovec path is what's exercised
 //!   here; the wasm32 measurements live in
-//!   `docs/internal/wasm-bench-report-2026-05-16.md` appendix A.24.
+//!   `docs/internal/reports/wasm-bench-report-2026-05-16.md` appendix A.24.
 //!
 //! Both rows produce byte-identical output on the inputs used here
 //! (the corpus generator emits printable ASCII only). The wins come

@@ -1,0 +1,5 @@
+# Keep clippy suggestions within the workspace MSRV (Cargo.toml
+# `rust-version`). Without this, a newer local toolchain (pinned
+# 1.95.0 in rust-toolchain.toml) may suggest APIs that fail the
+# CI `msrv build (1.92)` job.
+msrv = "1.92"

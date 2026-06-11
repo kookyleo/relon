@@ -4,7 +4,7 @@
 //! IR module itself plus the sandbox-config flags. `from_cache`
 //! re-runs the cranelift codegen pipeline against the cached IR. The
 //! benefit over `from_source` is that we skip the parse + analyze +
-//! lower passes; benchmarks in `docs/internal/wasm-bench-report-...`
+//! lower passes; benchmarks in `docs/internal/reports/wasm-bench-report-...`
 //! consistently show those passes dominate cold-start for simple
 //! programs.
 //!

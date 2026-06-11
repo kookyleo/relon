@@ -1,6 +1,6 @@
 //! Static field-offset table for the host <-> wasm binary handshake.
 //!
-//! Spec: `docs/internal/wasm-binary-layout-v1-2026-05-16.md`,
+//! Spec: `docs/internal/adr/wasm-binary-layout-v1-2026-05-16.md`,
 //! "basic type layout" + "slot alignment rule" sections.
 //!
 //! v1 scope (Phase 2.a / 2.b / 2.c):

@@ -29,15 +29,14 @@ cargo run -p relon-cli -- run fixtures/modules/main.relon --trust
 ```
 
 ### Local Validation
-Run the full test suite and strict lint gate before shipping changes:
+Run the full CI gate (fmt, build, clippy, tests, fixture formatting)
+with one command before shipping changes:
 ```bash
-cargo test
-cargo clippy --workspace --all-targets -- -D warnings
-cargo run -q -p relon-fmt -- --check fixtures/*.relon fixtures/modules/*.relon fixtures/errors/*.relon examples/*.relon
+./scripts/verify.sh
 ```
 
-CI on GitHub Actions enforces the same four checks on every PR, plus
-a separate `cargo build` job against the pinned MSRV (`1.92`) so
+CI on GitHub Actions enforces the same checks on every PR, plus a
+separate `cargo build` job against the pinned MSRV (`1.92`) so
 toolchain drift surfaces early.
 
 See [`SECURITY.md`](./SECURITY.md) for the sandbox threat model and
@@ -120,4 +119,6 @@ parallel workflows). It's advisory — never blocks.
 - `crates/relon-unicode`: Unicode tables, algorithms, and the glob matcher shared by the evaluator and codegen backends.
 - `crates/relon-util`: Leaf utility helpers shared across crates.
 - `crates/relon-wasm-bindings`: Browser-side wasm bindings for the playground.
-- `examples/`, `fixtures/`: Demo / golden files.
+- `examples/`: User-facing `.relon` showcases (run them with the CLI).
+- `fixtures/`: Cross-backend test corpus + golden outputs (test inputs, not docs).
+- `scripts/`: Maintainer utilities — `verify.sh` local green-gate, git hooks, bench helpers.

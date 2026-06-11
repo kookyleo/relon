@@ -1,6 +1,6 @@
 //! Typesafe writer + reader for the host <-> wasm binary handshake.
 //!
-//! Spec: `docs/internal/wasm-binary-layout-v1-2026-05-16.md`.
+//! Spec: `docs/internal/adr/wasm-binary-layout-v1-2026-05-16.md`.
 //!
 //! [`BufferBuilder`] writes scalar fields by name into a pre-allocated
 //! byte buffer sized by a [`crate::layout::OffsetTable`]; [`BufferReader`]
@@ -4386,7 +4386,7 @@ mod tests {
     /// `decode_pointer_header` in `read_string`) all hard-code the
     /// `[len:u32 LE][payload]` shape. Flipping to the 12-byte
     /// `[len_with_ascii_flag:u32 LE][hash:u64 LE][payload]` planned
-    /// by `docs/internal/review-improvement-169-conststring-wire-full-2026-05-22.md`
+    /// by `docs/internal/archive/review-improvement-169-conststring-wire-full-2026-05-22.md`
     /// must update producer + every consumer atomically; this test
     /// fires the moment the producer side drifts so the migrant cannot
     /// silently land a partial revision.

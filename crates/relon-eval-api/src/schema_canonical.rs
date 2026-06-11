@@ -8,7 +8,7 @@
 //! cryptographic strength is irrelevant; what matters is that host
 //! and codegen compute the **same** hash from the **same** schema.
 //!
-//! Spec: `docs/internal/wasm-srcmap-section-v1-2026-05-16.md`,
+//! Spec: `docs/internal/adr/wasm-srcmap-section-v1-2026-05-16.md`,
 //! "canonical #main schema" section.
 //!
 //! The canonical form is intentionally narrower than the runtime

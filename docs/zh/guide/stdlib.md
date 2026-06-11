@@ -40,7 +40,7 @@ Relon 语言**没有**任何 effectful builtin —— 没有 `clock()`、`random
 
 宿主若需要暴露某个 effectful 操作,通过它自己注册并门控(带能力位)的
 `#native` 函数显式做到 —— 这是宿主自己的、可审计的逃生舱,而非语言
-builtin。理由见 [ADR](https://github.com/kookyleo/relon/blob/main/docs/internal/adr-effectful-io-builtins-2026-06-04.md),
+builtin。这保证语言本身始终是纯函数 —— 同输入必同输出、可缓存可重放;
 能力模型见 [沙箱与权限](./sandbox.md)。
 
 ## std/list

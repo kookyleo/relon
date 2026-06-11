@@ -20,7 +20,7 @@
 //! Scope is intentionally in-file only. The analyzer's reference table
 //! is forward-only and scoped to one module — there is no cross-module
 //! symbol → usages index in `WorkspaceTree` yet. Cross-file references
-//! remain deferred (see `docs/internal/roadmap.md`).
+//! remain deferred (see `docs/internal/archive/roadmap.md`).
 
 use crate::position::token_range;
 use crate::server::DocumentEntry;

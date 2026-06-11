@@ -1,7 +1,7 @@
 //! v6-λ-2 + λ-3 (2026-05-19): Relon vs LuaJIT paired-workload bench.
 //!
 //! Implements the 12 adversarial workloads from
-//! `docs/internal/relon-vs-luajit-rigorous-plan.md` §3, each carrying a
+//! `docs/internal/archive/relon-vs-luajit-rigorous-plan.md` §3, each carrying a
 //! Relon source + an equivalent Lua 5.1 source. Every measurement closure
 //! still obeys the v6-λ-0 6-trap hardening contract (black_box × ≥ 2,
 //! 10k warmup before the timed region via [`timed_with_warmup`],
@@ -1127,7 +1127,7 @@ const W11_LUA_SRC: &str = "print(1 + 1)";
 //
 // **Measurement basis — the two LLVM rows are NOT the same quantity**
 // (panel fixation 2026-06-10; see
-// `docs/internal/perf-panel-w-series.md`). With a 1-op kernel the
+// `docs/internal/reports/perf-panel-w-series.md`). With a 1-op kernel the
 // per-call cost is dominated by whatever sits on the call edge, so
 // the canonical panel deliberately ships two rows with different
 // scopes — report them separately, never average or substitute one
@@ -2464,7 +2464,7 @@ const W24_N: i64 = 10_000;
 
 fn w24_relon_src() -> &'static str {
     // Production source: spec form straight from §1 W24 of
-    // `docs/internal/tier4-plan-2026-05-29.md`. The comprehension
+    // `docs/internal/archive/tier4-plan-2026-05-29.md`. The comprehension
     // node materialises the filtered + mapped list; `list.sum`
     // reduces it. `#import list from "std/list"` brings the `sum`
     // method into scope (same import the W1 / W2 / W6 sources use).
@@ -2572,7 +2572,7 @@ const W25_N: i64 = 10_000;
 
 fn w25_relon_src() -> &'static str {
     // Production source: spec form straight from §1 W25 of
-    // `docs/internal/tier4-plan-2026-05-29.md`. The pipe operator
+    // `docs/internal/archive/tier4-plan-2026-05-29.md`. The pipe operator
     // threads each stage's output into the next stage's first
     // argument. `list.sum()` with no explicit arg takes the piped
     // input. `#import list from "std/list"` brings the methods in.

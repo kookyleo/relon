@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # v6-λ-machine (2026-05-19): bring the host into "quiescent" state before
-# the Relon vs LuaJIT bench round. Mirrors `docs/internal/relon-vs-luajit-
+# the Relon vs LuaJIT bench round. Mirrors `docs/internal/archive/relon-vs-luajit-
 # rigorous-plan.md` §6.
 #
 # Usage:

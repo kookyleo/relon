@@ -42,3 +42,8 @@ tmp/
 perf.data
 perf.data.old
 .claude/worktrees/
+
+# Maintainer-internal working docs (ADRs, perf/stage reports, archive).
+# Local-only since 2026-06-11: process notes, not public contract.
+# Layout and rationale: docs/internal/README.md.
+docs/internal/

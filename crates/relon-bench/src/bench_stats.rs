@@ -5,7 +5,7 @@
 //! `mean`, `median`, `std_dev`, `slope`, but no per-sample tail. Tail
 //! events (trace deopt, allocator scavenge, page fault, NMI) are what
 //! the Relon-vs-LuaJIT honest comparison cares about (D5 — p99 tail
-//! latency, see `docs/internal/relon-vs-luajit-rigorous-plan.md` §1).
+//! latency, see `docs/internal/archive/relon-vs-luajit-rigorous-plan.md` §1).
 //!
 //! ## File layout we read
 //!

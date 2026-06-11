@@ -4,7 +4,7 @@
 //! by the LuaJIT comparison bench rounds (`trace_jit_hot_loop` and the
 //! upcoming `cmp_lua` group).
 //!
-//! Mirrors `docs/internal/relon-vs-luajit-rigorous-plan.md` §6. The companion
+//! Mirrors `docs/internal/archive/relon-vs-luajit-rigorous-plan.md` §6. The companion
 //! script `scripts/bench_quiescence.sh` performs the *privileged* setup
 //! (cpu governor / no_turbo / perf-stat noise); this module verifies the
 //! outcome at bench startup so a forgotten setup doesn't silently bias

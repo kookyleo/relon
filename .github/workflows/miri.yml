@@ -34,7 +34,7 @@ permissions:
 
 jobs:
   miri:
-    # F-1 per docs/internal/formalization-targets-2026-05-23.md:
+    # F-1 per docs/internal/adr/formalization-targets-2026-05-23.md:
     # run cargo miri on every crate whose unsafe surface lives in
     # pure Rust (no cranelift / FFI / mmap / target intrinsics).
     # Catches UB regressions in the SmolStr SSO layout exercised by

@@ -101,7 +101,7 @@ path = "benches/cranelift_aot_vs_tree_walk.rs"
 
 # v6-lambda-2/3 (2026-05-19): Relon vs LuaJIT 12-workload paired bench.
 # Implements the 12 adversarial workloads from
-# `docs/internal/relon-vs-luajit-rigorous-plan.md` §3, with a Relon source
+# `docs/internal/archive/relon-vs-luajit-rigorous-plan.md` §3, with a Relon source
 # + an equivalent Lua 5.1 source per workload. Same 6-trap hardening as
 # `trace_jit_hot_loop`. Run via
 # `cargo bench --bench cmp_lua` then post-process via `bench_stats`.
@@ -115,7 +115,7 @@ path = "benches/cmp_lua.rs"
 # `char::to_uppercase` / `to_lowercase` baseline across 100 B / 1 KB /
 # 10 KB ASCII inputs and Upper / Lower / Title modes. Native bench
 # runs exercise the autovec scalar path; wasm32 + simd128 numbers
-# live in `docs/internal/wasm-bench-report-2026-05-16.md` appendix
+# live in `docs/internal/reports/wasm-bench-report-2026-05-16.md` appendix
 # A.24. Run via `cargo bench -p relon-bench --bench ascii_case_fold`.
 [[bench]]
 name = "ascii_case_fold"
@@ -155,7 +155,7 @@ path = "src/bin/bench_stats.rs"
 # legacy-i64 fast entry / rust_native kernel) in a bare loop so
 # `perf stat` profiles the measured path without criterion harness
 # cycles or unrelated rows. Sources + rust kernels kept in sync with
-# `benches/cmp_lua.rs`. See `docs/internal/perf-panel-w-series.md`.
+# `benches/cmp_lua.rs`. See `docs/internal/reports/perf-panel-w-series.md`.
 [[bin]]
 name = "w_kernel_loop"
 path = "src/bin/w_kernel_loop.rs"

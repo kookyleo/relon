@@ -596,7 +596,7 @@ pub enum Op {
     /// keeps lowering `d[k]` through the tree-walker's
     /// `try_index_method` dispatch, so this variant is currently
     /// reachable only via the trace-recorder unit tests + future
-    /// analyzer wiring (see docs/internal/v6-fix-d8-... §7.1). The
+    /// analyzer wiring (see docs/internal/archive/v6-fix-d8-... §7.1). The
     /// codegen.rs catch-all surfaces it as `unsupported op` until that
     /// wiring lands, matching how `Op::CallNative` widens
     /// incrementally.

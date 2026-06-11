@@ -58,7 +58,7 @@
 //!     codepoint-level walker; the ASCII fast path covers the v1
 //!     surface.
 //!
-//! See `docs/internal/wasm-backend-design-draft.md` Section 4 for the
+//! See `docs/internal/archive/wasm-backend-design-draft.md` Section 4 for the
 //! bundling rationale.
 //!
 //! ## File layout (review-improvement P3, 2026-05-21)

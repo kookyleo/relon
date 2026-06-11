@@ -46,9 +46,10 @@ contents, a directory listing, file metadata, an environment variable) is
 
 A host that needs to expose an effectful operation does so explicitly via a
 `#native` function it registers (and gates with a capability bit) — that is
-the host's own, audited escape hatch, not a language builtin. See
-[the ADR](https://github.com/kookyleo/relon/blob/main/docs/internal/adr-effectful-io-builtins-2026-06-04.md) for the
-rationale and [Sandbox & capabilities](./sandbox) for the capability model.
+the host's own, audited escape hatch, not a language builtin. This keeps
+the language itself a pure function — same input, same output, cacheable
+and replayable. See [Sandbox & capabilities](./sandbox) for the
+capability model.
 
 ## std/list
 
