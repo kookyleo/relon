@@ -2767,9 +2767,7 @@ fn comprehension_tuple_source_rejected() {
         { out: [x * 10 for x in (1, 2, 3)] }
         "#,
     );
-    let ni = count(&tree, |d| {
-        matches!(d, Diagnostic::NonIterableSource { .. })
-    });
+    let ni = count(&tree, |d| matches!(d, Diagnostic::NonIterableSource { .. }));
     let il = count(&tree, |d| {
         matches!(d, Diagnostic::ExpressionTypeUnknown { .. })
     });
@@ -2786,9 +2784,7 @@ fn comprehension_tuple_source_rejected_relaxed() {
         { out: [x * 10 for x in (1, 2, 3)] }
         "#,
     );
-    let ni = count(&tree, |d| {
-        matches!(d, Diagnostic::NonIterableSource { .. })
-    });
+    let ni = count(&tree, |d| matches!(d, Diagnostic::NonIterableSource { .. }));
     assert_eq!(ni, 1, "{:?}", tree.diagnostics);
 }
 
@@ -2804,9 +2800,7 @@ fn comprehension_list_and_range_sources_silent() {
         }
         "#,
     );
-    let ni = count(&tree, |d| {
-        matches!(d, Diagnostic::NonIterableSource { .. })
-    });
+    let ni = count(&tree, |d| matches!(d, Diagnostic::NonIterableSource { .. }));
     assert_eq!(ni, 0, "{:?}", tree.diagnostics);
 }
 
