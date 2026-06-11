@@ -387,6 +387,34 @@ pub enum Diagnostic {
         range: SourceSpan,
     },
 
+    #[error("function `{fn_name}` has no parameter named `{arg_name}`")]
+    #[diagnostic(
+        code(relon::analyze::fn_call_unknown_named_arg),
+        help(
+            "Named arguments must match a declared parameter name; the runtime rejects names outside the signature. Fix the spelling or pass the value positionally."
+        )
+    )]
+    FnCallUnknownNamedArg {
+        fn_name: String,
+        arg_name: String,
+        #[label("no such parameter")]
+        range: SourceSpan,
+    },
+
+    #[error("parameter `{param_name}` of `{fn_name}` is bound more than once")]
+    #[diagnostic(
+        code(relon::analyze::fn_call_duplicate_arg_binding),
+        help(
+            "A parameter can be bound by at most one argument. This call binds it twice — either positionally and by name, or by two named arguments. Drop one of the bindings."
+        )
+    )]
+    FnCallDuplicateArgBinding {
+        fn_name: String,
+        param_name: String,
+        #[label("already bound")]
+        range: SourceSpan,
+    },
+
     #[error(
         "native function `{fn_name}` requires capability `{capability}`, but it isn't granted"
     )]
@@ -749,6 +777,12 @@ impl Diagnostic {
             | Diagnostic::MainReturnTypeMismatch { .. }
             | Diagnostic::FnCallArgCountMismatch { .. }
             | Diagnostic::FnCallArgTypeMismatch { .. }
+            // Named-argument binding errors mirror the runtime's
+            // closure-binding verdicts (`eval_closure`): an unknown
+            // parameter name or a twice-bound parameter is a hard
+            // runtime error, so it's statically provable in every mode.
+            | Diagnostic::FnCallUnknownNamedArg { .. }
+            | Diagnostic::FnCallDuplicateArgBinding { .. }
             // Stage 4: capability errors are derivable from source +
             // host_fn_gates + caps alone — surface as Error so the
             // evaluator never reaches the gated call.
