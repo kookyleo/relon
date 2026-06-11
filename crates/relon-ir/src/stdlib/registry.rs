@@ -29,10 +29,9 @@ use super::defs::{
     list_float_some, list_float_unique, list_int_every, list_int_filter, list_int_fold,
     list_int_length_to_int, list_int_map, list_int_map_to_float, list_int_map_to_string,
     list_int_map_to_variant_list, list_int_max, list_int_min, list_int_some, list_int_sum,
-    list_int_unique,
-    list_list_filter, list_list_length, list_schema_length, list_string_length, list_string_map,
-    list_string_map_to_variant_list, max_int, min_int, pow_float, round_float_to_int, sqrt_float,
-    starts_with_string, substring_string,
+    list_int_unique, list_list_filter, list_list_length, list_schema_length, list_string_length,
+    list_string_map, list_string_map_to_variant_list, max_int, min_int, pow_float,
+    round_float_to_int, sqrt_float, starts_with_string, substring_string,
 };
 use super::normalization::{
     ccc_lookup_helper, compose_lookup_helper, decomp_lookup_helper, nfc_string, nfd_string,
