@@ -405,6 +405,10 @@ impl<'a, 'b> OpVisitor for Codegen<'a, 'b> {
             // oracle. Routes through the same `cond_trap` → `raise_trap`
             // host-helper epilogue, so the wasm32 leg surfaces it identically.
             IrTrapKind::NoMatch => TrapKind::NoMatch,
+            // Checked-reduction overflow (`list_int_sum`'s guard) lifts
+            // to `RuntimeError::NumericOverflow`, the same typed error
+            // the checked `Op::Add(I64)` arithmetic raises.
+            IrTrapKind::NumericOverflow => TrapKind::NumericOverflow,
         };
         self.emit_trap(mapped)
     }

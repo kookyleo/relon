@@ -99,7 +99,13 @@ use crate::sandbox::SandboxConfig;
 /// inlined call no longer land inside the callee window. Objects
 /// emitted by 16 for sources hitting that collision could carry a
 /// silently width-coerced let slot; the bump self-invalidates them.
-pub const GENERATOR_VERSION: &str = "relon-codegen-cranelift v5-gamma 17";
+/// `v5-gamma 18` = checked `list_int_sum` + new `list_int_min`: the
+/// bundled `list_int_sum` body gained a per-iteration overflow guard
+/// (`TrapKind::NumericOverflow`, aligning `xs.sum()` with the checked
+/// `+` oracle instead of wrapping) and the registry tail gained
+/// `list_int_min`. Objects emitted by 17 carry the old wrapping sum
+/// body and lack the new stdlib index; the bump self-invalidates them.
+pub const GENERATOR_VERSION: &str = "relon-codegen-cranelift v5-gamma 18";
 
 /// Filename suffix for the legacy IR cache (paired with the
 /// relon-object-cache `<hash>.relon-native-v1` blob).

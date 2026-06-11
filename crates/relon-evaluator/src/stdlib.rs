@@ -2193,6 +2193,14 @@ impl RelonFunction for StringStartsWith {
 
 /// `xs.sum()` over a `List<Int>`. Float lists return `Float`; mixed
 /// lists fall through to a TypeMismatch.
+///
+/// Int summation is *checked*: the first overflowing partial sum (in
+/// element order) raises `NumericOverflow`, exactly like the `+`
+/// operator and the `std/list` reduce-based `sum`. This used to be
+/// the language's only silently-wrapping Int arithmetic — a spec
+/// violation (§2.3 mandates checked i64) fixed alongside the bundled
+/// `list_int_sum` compiled body, which traps `NumericOverflow` at the
+/// same partial sum.
 struct ListSum;
 impl RelonFunction for ListSum {
     fn call(
@@ -2227,7 +2235,9 @@ impl RelonFunction for ListSum {
             let mut acc: i64 = 0;
             for v in list {
                 if let Value::Int(x) = v {
-                    acc = acc.wrapping_add(*x);
+                    acc = acc
+                        .checked_add(*x)
+                        .ok_or(RuntimeError::NumericOverflow(range))?;
                 }
             }
             Ok(Value::Int(acc))

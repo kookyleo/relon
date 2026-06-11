@@ -65,7 +65,9 @@ use super::validators::{
 ///     traps as `IndexOutOfBounds` when the slice walks past the
 ///     receiver).
 ///   * `10` — `starts_with(String, String) -> Bool` (Phase 4.c-2).
-///   * `11` — `list_int_sum(List<Int>) -> Int` (Phase 4.c-2).
+///   * `11` — `list_int_sum(List<Int>) -> Int` (Phase 4.c-2; checked
+///     summation — traps as `NumericOverflow` on the first
+///     overflowing partial sum, matching the `+` operator).
 ///   * `12` — `list_int_max(List<Int>) -> Int` (Phase 4.c-2; traps
 ///     as `EmptyList` on a zero-length receiver).
 ///   * `13` — `list_int_map(List<Int>, Closure<Int -> Int>) -> List<Int>`

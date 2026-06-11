@@ -177,6 +177,17 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             self.builder.position_at_end(cont);
             return Ok(());
         }
+        // Checked-reduction overflow (`list_int_sum`'s per-iteration
+        // guard) must lift to a typed `RuntimeError::NumericOverflow`,
+        // byte-aligned with the tree-walk oracle's checked `+` and
+        // cranelift's `TrapKind::NumericOverflow` — same state-trap
+        // route as `NoMatch`.
+        if matches!(kind, TrapKind::NumericOverflow) {
+            self.emit_state_trap(NativeTrap::NumericOverflow, "Trap(NumericOverflow)")?;
+            let cont = self.ctx.append_basic_block(self.func, "after_trap_cont");
+            self.builder.position_at_end(cont);
+            return Ok(());
+        }
         self.emit_llvm_trap_call("Trap")?;
         self.builder
             .build_unreachable()

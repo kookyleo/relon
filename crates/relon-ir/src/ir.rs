@@ -1500,8 +1500,10 @@ pub enum Op {
     /// codegen helpers.
     Trap {
         /// Tag the codegen records in `relon.uctab` for this trap.
-        /// Restricted to [`TrapKind::IndexOutOfBounds`] and
-        /// [`TrapKind::EmptyList`] in this phase.
+        /// Stdlib bodies emit [`TrapKind::IndexOutOfBounds`],
+        /// [`TrapKind::EmptyList`], [`TrapKind::InvalidUtf8`] and
+        /// [`TrapKind::NumericOverflow`]; the `match` no-arm lowering
+        /// emits [`TrapKind::NoMatch`].
         kind: TrapKind,
     },
 
@@ -1831,6 +1833,12 @@ pub enum TrapKind {
     /// trap path to that same typed error so the compiled no-match
     /// surfaces identically rather than staying capped.
     NoMatch,
+    /// A checked Int reduction overflowed i64 (`list_int_sum`'s
+    /// per-iteration guard). Routes each backend's trap path to the
+    /// tree-walk oracle's `RuntimeError::NumericOverflow` so the
+    /// compiled overflow surfaces identically to the `+` operator's
+    /// checked-arithmetic trap instead of silently wrapping.
+    NumericOverflow,
 }
 
 /// Per-Op effect classification.

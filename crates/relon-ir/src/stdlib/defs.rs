@@ -1316,11 +1316,25 @@ fn contains_string_body() -> Vec<TaggedOp> {
 /// We replicate the host's `align_up(xs + 4, 8)` rule via the bit
 /// trick `(xs + 4 + 7) & -8`, computed once before the loop.
 ///
+/// Overflow discipline: the summation is *checked* — before each
+/// `acc + val` a compare guard raises
+/// [`TrapKind::NumericOverflow`] iff the addition would overflow
+/// i64 (`val >= 0 ? acc > MAX - val : acc < MIN - val`; the `MAX -
+/// val` / `MIN - val` subtractions cannot themselves overflow on
+/// those operand signs). This keeps every backend byte-aligned with
+/// the tree-walk oracle's checked `+` semantics: the guard traps at
+/// the same partial sum on cranelift (whose `Op::Add(I64)` is also
+/// checked) and on LLVM-native / wasm (whose `Op::Add(I64)` wraps),
+/// so the subsequent add never overflows anywhere.
+///
 /// Locals:
 ///   * 0 — `n:       I32` (element count)
 ///   * 1 — `i:       I32`
 ///   * 2 — `acc:     I64` (running sum)
 ///   * 3 — `payload: I32` (absolute address of element 0)
+///   * 4 — `val:     I64` (per-iter element, read once for the
+///     guard + the add)
+///   * 5 — `sink:    I32` (placeholder sink for the guard `If`)
 pub(super) fn list_int_sum() -> StdlibFunction {
     StdlibFunction::new(
         "list_int_sum",
@@ -1335,6 +1349,8 @@ fn list_int_sum_body() -> Vec<TaggedOp> {
     const I: u32 = 1;
     const ACC: u32 = 2;
     const PAYLOAD: u32 = 3;
+    const VAL: u32 = 4;
+    const SINK: u32 = 5;
     vec![
         // n = load_i32(xs, 0)
         tt(Op::LocalGet(0)),
@@ -1381,11 +1397,7 @@ fn list_int_sum_body() -> Vec<TaggedOp> {
                     }),
                     tt(Op::Ge(IrType::I32)),
                     tt(Op::BrIf { label_depth: 1 }),
-                    // acc += i64.load(payload + i * 8)
-                    tt(Op::LetGet {
-                        idx: ACC,
-                        ty: IrType::I64,
-                    }),
+                    // val = i64.load(payload + i * 8)
                     tt(Op::LetGet {
                         idx: PAYLOAD,
                         ty: IrType::I32,
@@ -1398,6 +1410,88 @@ fn list_int_sum_body() -> Vec<TaggedOp> {
                     tt(Op::Mul(IrType::I32)),
                     tt(Op::Add(IrType::I32)),
                     tt(Op::LoadI64AtAbsolute { offset: 0 }),
+                    tt(Op::LetSet {
+                        idx: VAL,
+                        ty: IrType::I64,
+                    }),
+                    // Checked-add guard: trap NumericOverflow iff
+                    // `acc + val` would overflow i64. Split on the sign
+                    // of `val` so each comparison's subtraction is
+                    // itself overflow-free:
+                    //   val >= 0 ⇒ overflow iff acc > MAX - val
+                    //   val <  0 ⇒ overflow iff acc < MIN - val
+                    tt(Op::LetGet {
+                        idx: VAL,
+                        ty: IrType::I64,
+                    }),
+                    tt(Op::ConstI64(0)),
+                    tt(Op::Ge(IrType::I64)),
+                    tt(Op::If {
+                        result_ty: IrType::I32,
+                        then_body: vec![
+                            // acc > i64::MAX - val ?
+                            tt(Op::LetGet {
+                                idx: ACC,
+                                ty: IrType::I64,
+                            }),
+                            tt(Op::ConstI64(i64::MAX)),
+                            tt(Op::LetGet {
+                                idx: VAL,
+                                ty: IrType::I64,
+                            }),
+                            tt(Op::Sub(IrType::I64)),
+                            tt(Op::Gt(IrType::I64)),
+                            tt(Op::If {
+                                result_ty: IrType::I32,
+                                then_body: vec![
+                                    tt(Op::Trap {
+                                        kind: TrapKind::NumericOverflow,
+                                    }),
+                                    tt(Op::ConstI32(0)),
+                                ],
+                                else_body: vec![tt(Op::ConstI32(0))],
+                            }),
+                        ],
+                        else_body: vec![
+                            // acc < i64::MIN - val ?
+                            tt(Op::LetGet {
+                                idx: ACC,
+                                ty: IrType::I64,
+                            }),
+                            tt(Op::ConstI64(i64::MIN)),
+                            tt(Op::LetGet {
+                                idx: VAL,
+                                ty: IrType::I64,
+                            }),
+                            tt(Op::Sub(IrType::I64)),
+                            tt(Op::Lt(IrType::I64)),
+                            tt(Op::If {
+                                result_ty: IrType::I32,
+                                then_body: vec![
+                                    tt(Op::Trap {
+                                        kind: TrapKind::NumericOverflow,
+                                    }),
+                                    tt(Op::ConstI32(0)),
+                                ],
+                                else_body: vec![tt(Op::ConstI32(0))],
+                            }),
+                        ],
+                    }),
+                    // Sink the i32 placeholder produced by the guard If.
+                    tt(Op::LetSet {
+                        idx: SINK,
+                        ty: IrType::I32,
+                    }),
+                    // acc += val (guard proved this cannot overflow on
+                    // any backend, checked or wrapping)
+                    tt(Op::LetGet {
+                        idx: ACC,
+                        ty: IrType::I64,
+                    }),
+                    tt(Op::LetGet {
+                        idx: VAL,
+                        ty: IrType::I64,
+                    }),
                     tt(Op::Add(IrType::I64)),
                     tt(Op::LetSet {
                         idx: ACC,

@@ -49,15 +49,16 @@ pub enum FusedPattern<'a> {
     /// ```text
     /// acc: i64 = 0
     /// for i in start..end {        // empty when start >= end
-    ///     acc = acc.wrapping_add(i)
+    ///     acc = acc.checked_add(i)?   // NumericOverflow on overflow
     /// }
     /// result = Int(acc)
     /// ```
     ///
     /// This is a *fusion* (drop the intermediate `Vec<Value>` allocation), not
     /// a closed-form substitution: the same additions happen in the same order
-    /// with the same wrapping-overflow behaviour as
-    /// `[start, .., end-1].sum()`. `start` defaults to `0` for the one-arg
+    /// with the same checked-overflow behaviour as
+    /// `[start, .., end-1].sum()` — the first overflowing partial sum raises
+    /// `NumericOverflow`. `start` defaults to `0` for the one-arg
     /// `range(end)` form.
     RangeSum {
         /// `start` argument node when `range(start, end)`; `None` for the
