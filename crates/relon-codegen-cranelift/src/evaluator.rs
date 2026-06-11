@@ -381,20 +381,31 @@ impl AotEvaluator {
         Self::from_ir_inner(ir_module, sandbox_cfg, param_names, Some(buffer_schema))
     }
 
-    /// v5-γ: validate an on-disk cache pair against `source` and
-    /// reconstruct an evaluator. Returns `Ok(None)` on a clean miss
-    /// (cache absent, integrity failure, metadata mismatch).
+    /// v5-γ stage 2: validate an on-disk cache triple against `source`
+    /// and reconstruct a **dlopen-executing** evaluator — a cached cold
+    /// start skips parse + analyze + lower + cranelift codegen entirely
+    /// and runs the linked ET_DYN directly. Returns `Ok(None)` on a
+    /// clean miss (cache absent, integrity failure, metadata mismatch).
     ///
-    /// Until the codegen-helper-call vtable indirection lands (see
-    /// `object_cache_integration` module docs), the reconstructed
-    /// evaluator still drives parse + analyze + lower + JIT in
-    /// memory. The cache files are validated end-to-end (HMAC +
-    /// integrity + metadata) so a corrupt or mismatched cache is
-    /// detected and removed; the production hot path then writes a
-    /// fresh pair. The dlopen-execution shortcut activates in a
-    /// follow-up phase once cranelift codegen routes
-    /// `relon_now` / `relon_raise_trap` / `relon_cap_lookup` through
-    /// a `__relon_capability_vtable` indirection.
+    /// The load chain is fail-closed at every stage; any failure
+    /// surfaces as a `warn!` + `Ok(None)` so the caller falls back to
+    /// the in-process compile path and program behaviour is unchanged:
+    ///
+    /// 1. **HMAC first** — `try_load_from_cache` opens the object blob
+    ///    with `IntegrityMode::HmacRequired`; a missing key or a failed
+    ///    tag verification means the bytes are never dlopen'd.
+    /// 2. **Version / metadata** — `GENERATOR_VERSION` feeds both the
+    ///    cache-key filename and the HMAC-covered metadata trailer; a
+    ///    mismatch counts as a miss and the stale files are removed so
+    ///    the next compile overwrites them.
+    /// 3. **Schema sidecar** — HMAC-bound to the verified object hash;
+    ///    a swapped or tampered sidecar invalidates the whole triple.
+    /// 4. **dlopen + dlsym** — memfd + `/proc/self/fd` load; a missing
+    ///    `run_main` / vtable / closure symbol invalidates the triple.
+    /// 5. **Vtable populate** — host helper pointers are written into
+    ///    the dlopen'd `__relon_capability_vtable` before the first
+    ///    call, so the cached code shares the exact helper +
+    ///    marshalling surface the in-process JIT path uses.
     pub fn from_cache_dir(source: &str, cache_dir: &Path) -> Result<Option<Self>, CraneliftError> {
         let sandbox_cfg = SandboxConfig::default();
         let source_hash = cache_int::compute_source_hash(source, &sandbox_cfg);
@@ -545,7 +556,22 @@ impl AotEvaluator {
 
         let evaluator =
             Self::from_loaded_object(loaded_object, entry_ptr, schema_entry, closure_table)?;
+        tracing::debug!(
+            target: "relon::object_cache",
+            "cache hit: executing dlopen'd cached object (entry arity {}, {} closure symbol(s))",
+            evaluator.entry_arity,
+            evaluator.closure_table.len()
+        );
         Ok(Some(evaluator))
+    }
+
+    /// Observability: `true` when this evaluator's entry executes
+    /// machine code dlopen'd from the on-disk object cache rather than
+    /// a freshly JIT-compiled in-process module. Tests use this to
+    /// assert a cache hit genuinely took the dlopen-execution path
+    /// instead of silently rebuilding from source.
+    pub fn is_dlopen_backed(&self) -> bool {
+        matches!(self._module, EntryBacking::Dlopen(_))
     }
 
     /// Drop all three cache files (object + IR + schema). Used when

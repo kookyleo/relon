@@ -78,9 +78,9 @@ The ~185 ns difference is the per-call marshalling cost. **The two calibers must
 
 ## 7. Cached cold start — restart doesn't recompile
 
-Relon caches Cranelift compile artefacts locally. The IR cache (the fast-restore path that skips parse + analyze + lower) is already active on cold start; the linked `.o` object cache (ELF bytes + integrity metadata) is **ready — written on every compile and round-trip-verified on load — but executing that object directly via dlopen is still deferred**: the hot path is currently served by the in-process JIT artefact.
+Relon caches Cranelift compile artefacts locally. The IR cache (the fast-restore path that skips parse + analyze + lower) is active on cold start, and the linked `.o` object cache (ELF bytes + integrity metadata) is **executed directly via dlopen**: a second cold start of the same source hits the cache and runs the chain *HMAC verify → generator-version match → dlopen load → symbol resolution → execute*, skipping parse + analyze + lower + codegen entirely. If any stage fails (corrupted file, version drift, missing symbol), the stale entry is invalidated with a loud log line and the run falls back to in-process compilation — program behaviour is unchanged, and a cache-hit run produces bit-identical results to a fresh compile.
 
-The cache carries HMAC-SHA256 integrity tags (anti-tampering + anti-third-party-injection), with the key stored at `$XDG_DATA_HOME/relon/cache-key` (mode 0600). Without a usable key, both cache reads and writes are refused and the run degrades to a normal cold-start compile — an unauthenticated cached object is never loaded.
+The cache carries HMAC-SHA256 integrity tags (anti-tampering + anti-third-party-injection), with the key stored at `$XDG_DATA_HOME/relon/cache-key` (mode 0600). HMAC verification always runs **before** dlopen — an object that fails authentication is never loaded. Without a usable key, both cache reads and writes are refused and the run degrades to a normal cold-start compile. A generator-version mismatch (the compiler changed since the cache was written) is treated as a miss: the entry is recompiled and overwritten.
 
 ## 8. One-sentence summary
 
