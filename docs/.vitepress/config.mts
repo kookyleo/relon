@@ -81,6 +81,7 @@ export default defineConfig({
             items: [
               { text: '嵌入宿主', link: '/zh/guide/host-integration' },
               { text: '沙箱与权限', link: '/zh/guide/sandbox' },
+              { text: 'Playground 与 wasm 绑定', link: '/zh/guide/playground' },
             ]
           },
           {
@@ -139,6 +140,7 @@ export default defineConfig({
             items: [
               { text: 'Host integration', link: '/en/guide/host-integration' },
               { text: 'Sandbox & capabilities', link: '/en/guide/sandbox' },
+              { text: 'Playground & wasm bindings', link: '/en/guide/playground' },
             ]
           },
           {
