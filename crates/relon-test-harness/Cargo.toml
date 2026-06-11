@@ -22,10 +22,6 @@ llvm-aot = ["relon/llvm-aot"]
 # Tree-walk reference evaluator + shared Value / RuntimeError surface.
 relon = { workspace = true, features = ["cranelift-aot"] }
 relon-eval-api = { workspace = true }
-relon-parser = { workspace = true }
-relon-analyzer = { workspace = true }
-relon-evaluator = { workspace = true }
-relon-ir = { workspace = true }
 
 thiserror = { workspace = true }
 serde_json = { workspace = true }
@@ -34,7 +30,12 @@ serde_json = { workspace = true }
 ordered-float = { workspace = true }
 
 [dev-dependencies]
-relon-parser = { workspace = true }
+# Integration tests reach below the facade: `ledger_completeness`
+# audits `relon_ir::lowering::cap::LOWERING_CAP_IDS`; the HOF
+# four-way tests drive analyzer + evaluator directly.
+relon-analyzer = { workspace = true }
+relon-evaluator = { workspace = true }
+relon-ir = { workspace = true }
 # v5-γ tests isolate the on-disk cache to a tempfile-rooted directory
 # so concurrent cargo-test threads cannot stomp on each other.
 tempfile = "3"

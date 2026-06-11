@@ -48,12 +48,7 @@
 //! with the corpus at "arith / cmp / control flow" tier; future
 //! tranches widen it.
 
-// Cannot `#![forbid(unsafe_code)]` here because the v6-γ M4 trace-JIT
-// driver in `three_way` needs to call the `__relon_jump_to_recorder`
-// host helper and invoke JIT-emitted traces through raw fn pointers.
-// The `unsafe` blocks are confined to that one module; the rest of
-// the harness stays unsafe-free.
-#![deny(unsafe_op_in_unsafe_fn)]
+#![forbid(unsafe_code)]
 
 use std::collections::HashMap;
 
@@ -62,27 +57,19 @@ use relon_eval_api::{Evaluator, RuntimeError, Value};
 
 pub mod corpus;
 pub mod ledger;
-pub mod three_way;
+pub mod two_way;
 
 /// Backend tier identifiers used by the corpus support-claim ratchet.
 ///
-/// Distinct from [`Backend`] because the trace-JIT runs as an extra
-/// tier on top of the cranelift IR pipeline rather than a standalone
-/// `Backend::*` variant; the harness still needs to express "case X
-/// claims trace-JIT support" so a regression to
-/// `TraceJitNotApplicable` is caught.
+/// Distinct from [`Backend`] so the claim lists stay decoupled from
+/// the facade enum (which also carries feature-gated variants like
+/// LLVM-AOT that the corpus ratchet does not track).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackendKind {
     /// Reference tree-walking interpreter (`Backend::TreeWalk`).
     TreeWalk,
     /// Cranelift-AOT (`Backend::CraneliftAot`).
     CraneliftAot,
-    /// Trace-JIT tier — installed on top of cranelift IR; the
-    /// harness's synth-recipe catalogue stands in for a real recorder.
-    TraceJit,
-    /// Bytecode VM — harness-internal legacy tier label; there is no
-    /// corresponding `Backend::*` variant.
-    Bytecode,
 }
 
 impl BackendKind {
@@ -91,8 +78,6 @@ impl BackendKind {
         match self {
             BackendKind::TreeWalk => "tree_walk",
             BackendKind::CraneliftAot => "cranelift_aot",
-            BackendKind::TraceJit => "trace_jit",
-            BackendKind::Bytecode => "bytecode",
         }
     }
 }
@@ -124,11 +109,11 @@ impl std::fmt::Display for RatchetViolation {
 }
 
 /// Ratchet utilities — turn the soft-pass variants of [`DiffOutcome`]
-/// / [`three_way::ThreeWayResult`] into hard failures when a backend
+/// / [`two_way::TwoWayResult`] into hard failures when a backend
 /// in `claim` claimed to support the case but bounced anyway.
 pub mod ratchet {
     use super::{BackendKind, DiffOutcome, RatchetViolation};
-    use crate::three_way::ThreeWayResult;
+    use crate::two_way::TwoWayResult;
 
     /// True iff `claim` lists `backend` as a supporter for the case.
     fn claims(claim: &[BackendKind], backend: BackendKind) -> bool {
@@ -184,31 +169,25 @@ pub mod ratchet {
         }
     }
 
-    /// Validate a three-way [`ThreeWayResult`] against the claim list.
-    /// Returns the first violation (callers running the whole corpus
-    /// should collect violations across all cases before failing).
-    pub fn check_three_way(
+    /// Validate a value-carrying [`TwoWayResult`] against the claim
+    /// list. Returns the first violation (callers running the whole
+    /// corpus should collect violations across all cases before
+    /// failing).
+    pub fn check_two_way_result(
         case_name: &str,
-        outcome: &ThreeWayResult,
+        outcome: &TwoWayResult,
         claim: &[BackendKind],
     ) -> Option<RatchetViolation> {
         match outcome {
-            ThreeWayResult::AllAgree(_) | ThreeWayResult::AllTrap => None,
-            ThreeWayResult::TraceJitNotApplicable { reason, .. } => {
-                if claims(claim, BackendKind::TraceJit) {
-                    Some(make_violation(case_name, BackendKind::TraceJit, reason))
-                } else {
-                    None
-                }
-            }
-            ThreeWayResult::CraneliftUnsupported { reason, .. } => {
+            TwoWayResult::Agree(_) | TwoWayResult::BothTrap => None,
+            TwoWayResult::CraneliftUnsupported { reason, .. } => {
                 if claims(claim, BackendKind::CraneliftAot) {
                     Some(make_violation(case_name, BackendKind::CraneliftAot, reason))
                 } else {
                     None
                 }
             }
-            ThreeWayResult::TreeWalkMissingStdlibSurface {
+            TwoWayResult::TreeWalkMissingStdlibSurface {
                 tree_walk_error, ..
             } => {
                 if claims(claim, BackendKind::TreeWalk) {
@@ -221,7 +200,7 @@ pub mod ratchet {
                     None
                 }
             }
-            ThreeWayResult::Mismatch { .. } => {
+            TwoWayResult::Mismatch { .. } => {
                 // Mismatch is a hard correctness bug — not a ratchet
                 // violation. The driver test asserts mismatches==0
                 // separately; we don't double-count here.
