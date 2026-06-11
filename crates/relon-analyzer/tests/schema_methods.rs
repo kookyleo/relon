@@ -221,6 +221,45 @@ fn derive_equatable_with_wrong_return_type_diagnoses() {
     );
 }
 
+#[test]
+fn derive_unknown_constraint_name_diagnoses() {
+    let tree = analyze_fixture("schema_methods/derive_unknown_constraint.relon");
+    let unknown: Vec<_> = tree
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(
+                d,
+                Diagnostic::UnknownDeriveConstraint { constraint, known, .. }
+                    if constraint == "Comparble" && known.contains("Comparable")
+            )
+        })
+        .collect();
+    assert_eq!(
+        unknown.len(),
+        1,
+        "expected UnknownDeriveConstraint on `Comparble`: {:?}",
+        tree.diagnostics
+    );
+    // The misspelled pragma must not also fire a shape mismatch — the
+    // unknown-name diagnostic owns the verdict.
+    let shape = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::ConstraintWitnessShapeMismatch { .. })
+    });
+    assert_eq!(shape, 0, "{:?}", tree.diagnostics);
+}
+
+#[test]
+fn derive_known_constraint_names_stay_silent() {
+    // Reverse guard for D2: every registered constraint name passes the
+    // closed-set check (shape mismatches are a separate diagnostic).
+    let tree = analyze_fixture("schema_methods/derive_equatable_ok.relon");
+    let unknown = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::UnknownDeriveConstraint { .. })
+    });
+    assert_eq!(unknown, 0, "{:?}", tree.diagnostics);
+}
+
 // ===================================================================
 // Phase C.6: shape checking for the four new constraint registry
 // entries (Iterable / Indexable / Addable / Subtractable / ...) —
@@ -529,4 +568,69 @@ fn monomorphic_method_on_generic_schema_stays_silent() {
         "method with no generics of its own should never warn: {:?}",
         tree.diagnostics
     );
+}
+
+// ====== #internal privacy: method-body call sites ======
+
+#[test]
+fn internal_cross_schema_method_body_call_flagged() {
+    let tree = analyze_fixture("schema_methods/internal_cross_schema_call.relon");
+    let n = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::PrivateMethodViolation { schema, method, .. }
+            if schema == "Money" && method == "secret")
+    });
+    assert_eq!(n, 1, "{:?}", tree.diagnostics);
+}
+
+#[test]
+fn internal_same_schema_method_body_call_silent() {
+    let tree = analyze_fixture("schema_methods/internal_same_schema_call.relon");
+    let n = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::PrivateMethodViolation { .. })
+    });
+    assert_eq!(n, 0, "{:?}", tree.diagnostics);
+}
+
+#[test]
+fn internal_entry_root_call_still_flagged() {
+    // The pre-existing entry-root rejection must survive the
+    // method-context wiring: a direct external call from the entry
+    // body is never "inside" any method block.
+    let src = r#"
+#schema Money { Int amount: * } with {
+    #internal
+    secret() -> Int: self.amount
+}
+#main(Money m) -> Int
+m.secret()
+"#;
+    let node = relon_parser::parse_document(src).expect("parse");
+    let tree = relon_analyzer::analyze(&node);
+    let n = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::PrivateMethodViolation { schema, method, .. }
+            if schema == "Money" && method == "secret")
+    });
+    assert_eq!(n, 1, "{:?}", tree.diagnostics);
+}
+
+#[test]
+fn internal_self_typed_param_same_schema_silent() {
+    // A `Self`-typed parameter is still the owning schema: calling the
+    // sibling's `#internal` method on it stays legal (privacy is
+    // per-schema, not per-instance — mirrors Rust).
+    let src = r#"
+#schema Money { Int amount: * } with {
+    #internal
+    secret() -> Int: self.amount
+    le(other: Self) -> Bool: self.secret() <= other.secret()
+}
+#main(Money m) -> Bool
+m.le(m)
+"#;
+    let node = relon_parser::parse_document(src).expect("parse");
+    let tree = relon_analyzer::analyze(&node);
+    let n = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::PrivateMethodViolation { .. })
+    });
+    assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }

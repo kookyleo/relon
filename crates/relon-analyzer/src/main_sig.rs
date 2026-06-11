@@ -80,6 +80,18 @@ pub fn collect_main(root: &Node, tree: &mut AnalyzedTree) {
                 range: p.name_range,
             })
             .collect();
+        // Spec §#main: the same parameter name declared more than once
+        // is a `DuplicateMainParam` analyze error — host arguments bind
+        // by name, so a duplicate would make the binding ambiguous.
+        for (idx, p) in params.iter().enumerate() {
+            if let Some(prev) = params[..idx].iter().find(|q| q.name == p.name) {
+                tree.diagnostics.push(Diagnostic::DuplicateMainParam {
+                    name: p.name.clone(),
+                    first: span_of(prev.range),
+                    second: span_of(p.range),
+                });
+            }
+        }
         tree.main_signature = Some(MainSignature {
             params,
             return_type: return_type.clone(),
@@ -273,6 +285,55 @@ mod tests {
             .filter(|d| matches!(d, Diagnostic::UnknownTypeName { .. }))
             .collect();
         assert!(unk.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    // ============= DuplicateMainParam =============
+
+    /// Spec §#main forward: the same parameter name declared twice is
+    /// a `DuplicateMainParam` analyze error.
+    #[test]
+    fn flags_duplicate_main_param_name() {
+        let tree = analyze_str(
+            r#"#main(Int x, String x) -> Int
+            x + 1"#,
+        );
+        let dup: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::DuplicateMainParam { name, .. } if name == "x"))
+            .collect();
+        assert_eq!(dup.len(), 1, "{:?}", tree.diagnostics);
+    }
+
+    /// Three occurrences report one diagnostic per redeclaration,
+    /// each pointing back to the first declaration.
+    #[test]
+    fn flags_each_redeclaration_of_main_param() {
+        let tree = analyze_str(
+            r#"#main(Int x, Int x, Int x) -> Int
+            x"#,
+        );
+        let dup: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::DuplicateMainParam { .. }))
+            .collect();
+        assert_eq!(dup.len(), 2, "{:?}", tree.diagnostics);
+    }
+
+    /// Reverse: distinct parameter names stay silent.
+    #[test]
+    fn does_not_flag_distinct_main_param_names() {
+        let tree = analyze_str(
+            r#"#main(Int x, Int y) -> Int
+            x + y"#,
+        );
+        let dup: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::DuplicateMainParam { .. }))
+            .collect();
+        assert!(dup.is_empty(), "{:?}", tree.diagnostics);
     }
 
     // ============= v1.6 ban-Any in #main =============

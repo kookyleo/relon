@@ -94,21 +94,66 @@ impl<'a> Walker<'a> {
             return;
         };
         let display_name = sig.name.clone();
-        let positional_count = args.iter().filter(|a| a.name.is_none()).count();
-        // v1 only validates positional args; named args silently pass
-        // (they would just shadow positions or be redundant). Bail out
-        // early when any named arg is present so we don't false-flag.
-        if positional_count != args.len() {
+
+        // Bind every argument to a parameter slot, mirroring the
+        // runtime's binding semantics (`eval_closure`): positional
+        // args fill params left-to-right; named args bind by declared
+        // name. An unknown name and a doubly-bound param are both hard
+        // runtime errors, so they're surfaced statically here.
+        // Positional args past the fixed list flow into the variadic
+        // tail (when the signature has one) or trip the arity check.
+        let mut slot_args: Vec<Option<&relon_parser::CallArg>> = vec![None; sig.params.len()];
+        let mut tail_args: Vec<&relon_parser::CallArg> = Vec::new();
+        let mut binding_diags: Vec<Diagnostic> = Vec::new();
+        let mut pos_idx = 0usize;
+        for arg in args.iter().filter(|a| a.name.is_none()) {
+            if pos_idx < sig.params.len() {
+                slot_args[pos_idx] = Some(arg);
+                pos_idx += 1;
+            } else {
+                tail_args.push(arg);
+            }
+        }
+        for arg in args {
+            let Some(name) = &arg.name else {
+                continue;
+            };
+            let Some(p_idx) = sig.params.iter().position(|p| &p.name == name) else {
+                binding_diags.push(Diagnostic::FnCallUnknownNamedArg {
+                    fn_name: display_name.clone(),
+                    arg_name: name.clone(),
+                    range: span_of(arg.value.range),
+                });
+                continue;
+            };
+            if slot_args[p_idx].is_some() {
+                binding_diags.push(Diagnostic::FnCallDuplicateArgBinding {
+                    fn_name: display_name.clone(),
+                    param_name: name.clone(),
+                    range: span_of(arg.value.range),
+                });
+                continue;
+            }
+            slot_args[p_idx] = Some(arg);
+        }
+        if !binding_diags.is_empty() {
+            // The binding map is broken — arity / type verdicts on top
+            // of it would only double-report the same root cause.
+            self.tree.diagnostics.extend(binding_diags);
             return;
         }
-        // Arity check honoring optional tail params and variadic_tail.
+
+        // Arity check honoring optional tail params and variadic_tail:
+        // every non-optional param must be bound, and extra positional
+        // args are only legal when the signature is variadic.
         let (required, max_fixed) = required_and_max(&sig);
-        let in_range = if sig.variadic_tail.is_some() {
-            args.len() >= required
-        } else {
-            args.len() >= required && args.len() <= max_fixed
-        };
-        if !in_range {
+        let missing_required = sig
+            .params
+            .iter()
+            .zip(slot_args.iter())
+            .any(|(p, slot)| !p.optional && slot.is_none());
+        let too_many = !tail_args.is_empty() && sig.variadic_tail.is_none();
+        if missing_required || too_many {
             let expected = if sig.variadic_tail.is_some() {
                 format!("at least {required}")
             } else if required == max_fixed {
@@ -127,10 +172,10 @@ impl<'a> Walker<'a> {
             return;
         }
 
-        // Per-arg type check. Arguments past the fixed list are
-        // validated against `variadic_tail`. Arguments mapped to
-        // optional params still check, but a missing optional is fine
-        // (already accepted above by `required <= len`).
+        // Per-arg type check over the resolved binding map. Arguments
+        // past the fixed list are validated against `variadic_tail`.
+        // Arguments mapped to optional params still check, but a
+        // missing optional is fine (already accepted above).
         //
         // We collect diagnostics into a local Vec so the inference
         // scope's read-only borrow of `self.tree` doesn't collide with
@@ -143,29 +188,44 @@ impl<'a> Walker<'a> {
         // is shared with the FnCall return-type inference path in
         // `infer::infer_type` so the rest of the analyzer reads the
         // tightened type back out as `List<Int>` etc.
+        //
+        // `collect_bindings` pairs params with args by index, so feed
+        // it the *re-ordered* arg list: the densely-bound slot prefix
+        // (named args sit at their declared positions), plus the tail
+        // when every fixed slot is filled. A gap (unbound optional in
+        // the middle) cuts the unification input short — unbound
+        // generics then fall back to `Any`, which never false-flags.
         let mut to_emit: Vec<Diagnostic> = Vec::new();
         {
             let scope = self.build_type_scope();
             let working_sig = if sig.generics.is_empty() {
                 sig.clone()
             } else {
-                let bindings = collect_bindings(&sig, args, &scope);
+                let mut unify_args: Vec<relon_parser::CallArg> = Vec::new();
+                for slot in &slot_args {
+                    match slot {
+                        Some(a) => unify_args.push((*a).clone()),
+                        None => break,
+                    }
+                }
+                if unify_args.len() == sig.params.len() {
+                    unify_args.extend(tail_args.iter().map(|a| (*a).clone()));
+                }
+                let bindings = collect_bindings(&sig, &unify_args, &scope);
                 instantiate(&sig, &bindings)
             };
-            for (idx, arg) in args.iter().enumerate() {
-                let (param_name, expected_ty) = if idx < working_sig.params.len() {
-                    (
-                        working_sig.params[idx].name.clone(),
-                        working_sig.params[idx].ty.clone(),
-                    )
-                } else if let Some(tail_ty) = &working_sig.variadic_tail {
-                    (
-                        format!("rest[{}]", idx - working_sig.params.len()),
-                        tail_ty.clone(),
-                    )
-                } else {
-                    continue;
-                };
+            let fixed_checks = working_sig
+                .params
+                .iter()
+                .zip(slot_args.iter())
+                .filter_map(|(p, slot)| slot.map(|arg| (p.name.clone(), p.ty.clone(), arg)));
+            let tail_checks = tail_args.iter().enumerate().filter_map(|(j, arg)| {
+                working_sig
+                    .variadic_tail
+                    .as_ref()
+                    .map(|t| (format!("rest[{j}]"), t.clone(), *arg))
+            });
+            for (param_name, expected_ty, arg) in fixed_checks.chain(tail_checks) {
                 let Some(arg_ty) = infer_type(&arg.value, &scope) else {
                     continue;
                 };
@@ -473,17 +533,123 @@ impl<'a> Walker<'a> {
     }
 
     /// True when the walker is currently inside the body of a method
-    /// declared on `schema`. The typecheck walker only traverses the
-    /// entry root today — method bodies are not walked from this
-    /// path — so the answer is always `false`. The `#internal` check
-    /// in `check_method_dispatch` therefore only flags calls reached
-    /// from the entry root, which is the correct conservative
-    /// behaviour: private methods are explicitly opt-out of external
-    /// callers. When a future pass walks method bodies, it must push
-    /// a "currently inside schema X's method body" frame onto the
-    /// walker so this hook returns `true` for sibling-method calls.
-    pub(super) fn in_method_block(&self, _schema: &str) -> bool {
-        false
+    /// declared on `schema`. The entry-root walk never sets
+    /// `method_context`, so calls reached from the root always answer
+    /// `false` (external callers of `#internal` methods are rejected).
+    /// The method-body privacy pass (`check_schema_method_privacy`)
+    /// sets it to the *owning* schema while scanning each body, so
+    /// same-schema sibling-method calls stay legal and calls into
+    /// another schema's `#internal` method are rejected — mirroring
+    /// the adjudicated semantics (the evaluator itself performs no
+    /// privacy enforcement; this is the only gate).
+    pub(super) fn in_method_block(&self, schema: &str) -> bool {
+        self.method_context.as_deref() == Some(schema)
+    }
+
+    /// Privacy pass over every declared schema method body. The
+    /// entry-root walk doesn't traverse `with { ... }` bodies, so
+    /// without this pass a method body could call another schema's
+    /// `#internal` method unchecked (and the runtime would silently
+    /// allow it). The scan is privacy-only: it resolves receivers and
+    /// flags `PrivateMethodViolation`, but deliberately does not run
+    /// the full typecheck arms over the bodies (those have their own
+    /// dedicated checks and strict-mode surfaces).
+    pub(super) fn check_schema_method_privacy(&mut self) {
+        // Snapshot (owning schema, params, body) triples up front —
+        // the scan needs `&mut self` for diagnostics.
+        let bodies: Vec<(
+            String,
+            Vec<crate::schema::SchemaMethodParamInfo>,
+            std::sync::Arc<Node>,
+        )> = self
+            .tree
+            .schema_methods
+            .iter()
+            .flat_map(|(schema, methods)| {
+                methods.iter().filter_map(|m| {
+                    m.body_node
+                        .clone()
+                        .map(|body| (schema.clone(), m.params.clone(), body))
+                })
+            })
+            .collect();
+        for (schema, params, body) in bodies {
+            // Seed a frame so receiver walks inside the body resolve:
+            // `self` is the owning schema; each declared param carries
+            // its annotated type (`Self` folds to the owning schema).
+            let mut frame = crate::resolve::ScopeFrame::default();
+            let self_ty = relon_parser::TypeNode {
+                path: vec![schema.clone()],
+                generics: Vec::new(),
+                is_optional: false,
+                range: TokenRange::default(),
+                variant_fields: None,
+                doc_comment: None,
+            };
+            frame
+                .closure_param_types
+                .insert("self".to_string(), self_ty.clone());
+            for p in &params {
+                let ty = if p.type_node.path.as_slice() == ["Self"] {
+                    self_ty.clone()
+                } else {
+                    p.type_node.clone()
+                };
+                frame.closure_param_types.insert(p.name.clone(), ty);
+            }
+            self.scope_stack.push(frame);
+            self.method_context = Some(schema);
+            self.scan_privacy(&body);
+            self.method_context = None;
+            self.scope_stack.pop();
+        }
+    }
+
+    /// Recursive privacy-only scan used by
+    /// [`Self::check_schema_method_privacy`]: for every method-shaped
+    /// `FnCall` whose receiver resolves to a schema, flag `#internal`
+    /// methods called from outside their owning schema.
+    fn scan_privacy(&mut self, node: &Node) {
+        if let Expr::FnCall { path, args: _ } = &*node.expr {
+            self.check_privacy_only(path);
+        }
+        for child in relon_parser::child_nodes(node) {
+            self.scan_privacy(child);
+        }
+    }
+
+    /// The `PrivateMethodViolation` half of `check_method_dispatch`,
+    /// without the `UnknownMethod` half — unknown names inside method
+    /// bodies are out of scope for the privacy pass.
+    fn check_privacy_only(&mut self, path: &[TokenKey]) {
+        if path.len() < 2 || self.is_enum_tuple_variant_call(path) {
+            return;
+        }
+        let last_idx = path.len() - 1;
+        let TokenKey::String(method, method_range, _) = &path[last_idx] else {
+            return;
+        };
+        let Some(schema) = self.resolve_method_receiver_prefix(&path[..last_idx]) else {
+            return;
+        };
+        let Some(info) = self
+            .tree
+            .schema_methods
+            .get(&schema)
+            .and_then(|methods| methods.iter().find(|m| &m.name == method))
+            .cloned()
+        else {
+            return;
+        };
+        if info.is_private && !self.in_method_block(&schema) {
+            self.tree
+                .diagnostics
+                .push(Diagnostic::PrivateMethodViolation {
+                    schema,
+                    method: method.clone(),
+                    range: span_of(*method_range),
+                });
+        }
     }
 
     /// Resolve the receiver schema name of a method call's head segment.

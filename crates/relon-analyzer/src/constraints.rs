@@ -202,6 +202,16 @@ fn lookup_constraint(name: &str) -> Option<&'static ExpectedWitness> {
     CONSTRAINTS.iter().find(|c| c.constraint == name)
 }
 
+/// Comma-separated list of every registered constraint name, for the
+/// `UnknownDeriveConstraint` diagnostic's "known constraints" slot.
+fn known_constraint_names() -> String {
+    CONSTRAINTS
+        .iter()
+        .map(|c| c.constraint)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Render an `ExpectedWitness` for the diagnostic's `expected_shape`
 /// slot. Output mirrors source-level Relon: `eq(other: Self) -> Bool`.
 fn format_expected_shape(w: &ExpectedWitness) -> String {
@@ -338,10 +348,16 @@ pub fn check_derive_witnesses(tree: &mut AnalyzedTree) {
         for method in methods {
             for constraint_name in &method.derives {
                 let Some(expected) = lookup_constraint(constraint_name) else {
-                    // Unknown constraint name: silent for now (Phase C
-                    // hasn't introduced `InvalidDeriveTarget` yet; see
-                    // type-constraints-spec §"错误类型草案"). The parser
-                    // would have rejected garbage at the lex level.
+                    // Unknown constraint name: the registry is a closed
+                    // set, so a name outside it is a typo (or a
+                    // constraint that doesn't exist) — the witness shape
+                    // check would silently not happen. Loud per the
+                    // "loud, never silent" discipline.
+                    diags.push(Diagnostic::UnknownDeriveConstraint {
+                        constraint: constraint_name.clone(),
+                        known: known_constraint_names(),
+                        range: span_of(method.name_range),
+                    });
                     continue;
                 };
                 let ok = method.name == expected.method

@@ -49,6 +49,25 @@ pub(crate) fn check_main_return(root: &Node, tree: &mut AnalyzedTree) {
     let Some(body_ty) = infer_type(root, &scope) else {
         return;
     };
+    // When the body's inference collapsed to `Any` we cannot prove a
+    // mismatch (no `MainReturnTypeMismatch`), but the declared
+    // `-> Type` annotation then goes entirely unverified. `Any`
+    // subsumes every slot, so this must be handled *before* the
+    // subsumption check or it silently passes. Under strict mode the
+    // information gap surfaces (same class as `ExpressionTypeUnknown`
+    // elsewhere); `#relaxed` keeps the runtime-check fallback silent.
+    if matches!(body_ty, InferredType::Any) {
+        if tree.strict_mode {
+            tree.diagnostics.push(Diagnostic::ExpressionTypeUnknown {
+                reason: format!(
+                    "entry body inferred `Any`, so the declared `#main` return type `{}` cannot be verified statically",
+                    format_type(return_type)
+                ),
+                range: span_of(signature.range),
+            });
+        }
+        return;
+    }
     if tuple_schema_return_matches(tree, return_type, &body_ty, &bases) {
         return;
     }
@@ -57,12 +76,6 @@ pub(crate) fn check_main_return(root: &Node, tree: &mut AnalyzedTree) {
         Some(&bases),
         tree.workspace_import_index.as_ref(),
     ) {
-        return;
-    }
-    // Avoid double-reporting when the body's inference already
-    // collapsed to `Any` — we'd just be repeating the runtime's
-    // verdict.
-    if matches!(body_ty, InferredType::Any) {
         return;
     }
     tree.diagnostics.push(Diagnostic::MainReturnTypeMismatch {
@@ -388,6 +401,82 @@ mod tests {
             .filter(|d| matches!(d, Diagnostic::MainReturnTypeMismatch { .. }))
             .collect();
         assert!(mm.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    /// Strict: a body that collapses to `Any` leaves the declared
+    /// `-> Type` annotation unverifiable — the information gap must
+    /// surface as `ExpressionTypeUnknown` instead of silently passing.
+    #[test]
+    fn strict_flags_unverifiable_main_return_on_any_body() {
+        // A path step into an Int yields `UnknownStep`, which the
+        // inference wrapper collapses to `Any` — previously the
+        // `Any`-subsumes-everything shortcut let the unverified
+        // `-> String` annotation pass silently even in strict mode.
+        let tree = analyze_str(
+            r#"
+            #main(Int n) -> String
+            n.something
+            "#,
+        );
+        let gap: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(d, Diagnostic::ExpressionTypeUnknown { reason, .. }
+                    if reason.contains("#main") && reason.contains("String"))
+            })
+            .collect();
+        assert_eq!(gap.len(), 1, "{:?}", tree.diagnostics);
+        // Still no false mismatch claim.
+        let mm: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::MainReturnTypeMismatch { .. }))
+            .collect();
+        assert!(mm.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    /// `#relaxed`: the same `Any`-body entry stays silent — the
+    /// return-type check falls back to the runtime verdict.
+    #[test]
+    fn relaxed_keeps_unverifiable_main_return_silent() {
+        let tree = analyze_str(
+            r#"
+            #relaxed
+            #main(Int n) -> String
+            n.something
+            "#,
+        );
+        let gap: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(d, Diagnostic::ExpressionTypeUnknown { reason, .. }
+                    if reason.contains("#main"))
+            })
+            .collect();
+        assert!(gap.is_empty(), "{:?}", tree.diagnostics);
+    }
+
+    /// Strict reverse: an inferrable body does not trigger the
+    /// information-gap diagnostic from the return-type pass.
+    #[test]
+    fn strict_inferrable_body_no_main_return_gap() {
+        let tree = analyze_str(
+            r#"
+            #main(Int n) -> Int
+            n + 1
+            "#,
+        );
+        let gap: Vec<_> = tree
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(d, Diagnostic::ExpressionTypeUnknown { reason, .. }
+                    if reason.contains("#main"))
+            })
+            .collect();
+        assert!(gap.is_empty(), "{:?}", tree.diagnostics);
     }
 
     /// v1.4 reverse: stepping into a non-schema, non-dict head (Int has

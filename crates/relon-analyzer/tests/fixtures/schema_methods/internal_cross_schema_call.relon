@@ -1,0 +1,14 @@
+// `#internal` methods may only be called from the owning schema's own
+// method bodies. `Wallet.peek` reaching into `Money.secret` is an
+// external call site — the runtime performs no privacy enforcement,
+// so the analyzer must reject it.
+// EXPECTED: 1x PrivateMethodViolation (Money.secret).
+#schema Money { Int amount: * } with {
+  #internal
+  secret() -> Int: self.amount
+}
+#schema Wallet { Money money: * } with {
+  peek() -> Int: self.money.secret()
+}
+#main(Wallet w) -> Int
+w.peek()

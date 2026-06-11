@@ -166,6 +166,21 @@ pub enum Diagnostic {
         second: SourceSpan,
     },
 
+    #[error("duplicate `#main` parameter `{name}`")]
+    #[diagnostic(
+        code(relon::analyze::duplicate_main_param),
+        help(
+            "Each `#main(...)` parameter name may be declared only once; host arguments bind by name. Rename or remove the duplicate."
+        )
+    )]
+    DuplicateMainParam {
+        name: String,
+        #[label("first declared here")]
+        first: SourceSpan,
+        #[label("redeclared with the same name")]
+        second: SourceSpan,
+    },
+
     #[error("duplicate root-level `#schema` name `{name}`")]
     #[diagnostic(
         code(relon::analyze::duplicate_root_schema_name),
@@ -271,6 +286,22 @@ pub enum Diagnostic {
         range: SourceSpan,
     },
 
+    #[error("`#derive {constraint}` names an unknown constraint (known constraints: {known})")]
+    #[diagnostic(
+        code(relon::analyze::unknown_derive_constraint),
+        help(
+            "`#derive` only accepts the built-in constraint set; an unrecognized name would silently skip the witness shape check. Fix the spelling, or drop the pragma if this method isn't intended as a constraint witness."
+        )
+    )]
+    UnknownDeriveConstraint {
+        /// Constraint name as written in the `#derive C` pragma.
+        constraint: String,
+        /// Comma-separated list of the registered constraint names.
+        known: String,
+        #[label("unknown constraint `{constraint}`")]
+        range: SourceSpan,
+    },
+
     #[error(
         "`#derive {constraint}` witness `{method}` does not match the constraint's expected shape (expected `{expected_shape}`, found `{found_shape}`)"
     )]
@@ -371,6 +402,34 @@ pub enum Diagnostic {
         range: SourceSpan,
     },
 
+    #[error("function `{fn_name}` has no parameter named `{arg_name}`")]
+    #[diagnostic(
+        code(relon::analyze::fn_call_unknown_named_arg),
+        help(
+            "Named arguments must match a declared parameter name; the runtime rejects names outside the signature. Fix the spelling or pass the value positionally."
+        )
+    )]
+    FnCallUnknownNamedArg {
+        fn_name: String,
+        arg_name: String,
+        #[label("no such parameter")]
+        range: SourceSpan,
+    },
+
+    #[error("parameter `{param_name}` of `{fn_name}` is bound more than once")]
+    #[diagnostic(
+        code(relon::analyze::fn_call_duplicate_arg_binding),
+        help(
+            "A parameter can be bound by at most one argument. This call binds it twice — either positionally and by name, or by two named arguments. Drop one of the bindings."
+        )
+    )]
+    FnCallDuplicateArgBinding {
+        fn_name: String,
+        param_name: String,
+        #[label("already bound")]
+        range: SourceSpan,
+    },
+
     #[error(
         "native function `{fn_name}` requires capability `{capability}`, but it isn't granted"
     )]
@@ -438,6 +497,21 @@ pub enum Diagnostic {
         /// (`Int`, `List<Int>`, etc.).
         source_type: String,
         #[label("source is `{source_type}`, not spreadable")]
+        range: SourceSpan,
+    },
+
+    #[error("cannot iterate a value of type `{source_type}` in a comprehension")]
+    #[diagnostic(
+        code(relon::analyze::non_iterable_source),
+        help(
+            "Comprehension sources must be sequence-shaped (`List<T>`, `Dict<K, V>`, `range(...)`, or an `Iterable` schema). Tuples are heterogeneous, fixed-arity records — there is no single element type to bind. Use a `List` if the elements are meant to be iterated."
+        )
+    )]
+    NonIterableSource {
+        /// Statically-derived type of the comprehension source, so the
+        /// message names the concrete offender (`Tuple`, etc.).
+        source_type: String,
+        #[label("source is `{source_type}`, not iterable")]
         range: SourceSpan,
     },
 
@@ -710,6 +784,7 @@ impl Diagnostic {
             | Diagnostic::SchemaFieldBrandConflict { .. }
             | Diagnostic::SchemaFieldBrandInvalidArg { .. }
             | Diagnostic::DuplicateMainDirective { .. }
+            | Diagnostic::DuplicateMainParam { .. }
             | Diagnostic::DuplicateRootSchemaName { .. }
             | Diagnostic::RootSchemaCollidesWithField { .. }
             | Diagnostic::RootSchemaInvalidValue { .. }
@@ -717,6 +792,11 @@ impl Diagnostic {
             | Diagnostic::MethodNameConflict { .. }
             | Diagnostic::UnknownMethod { .. }
             | Diagnostic::PrivateMethodViolation { .. }
+            // Constraint names form a closed built-in set, so a
+            // `#derive` naming something outside it is statically
+            // provable wrong in every mode — same bucket as the
+            // witness-shape mismatch it would otherwise silently skip.
+            | Diagnostic::UnknownDeriveConstraint { .. }
             | Diagnostic::ConstraintWitnessShapeMismatch { .. }
             // Static type mismatches are derivable from source + schema
             // alone — the workhorse of Stage 1 hardening. Surface them
@@ -728,6 +808,12 @@ impl Diagnostic {
             | Diagnostic::MainReturnTypeMismatch { .. }
             | Diagnostic::FnCallArgCountMismatch { .. }
             | Diagnostic::FnCallArgTypeMismatch { .. }
+            // Named-argument binding errors mirror the runtime's
+            // closure-binding verdicts (`eval_closure`): an unknown
+            // parameter name or a twice-bound parameter is a hard
+            // runtime error, so it's statically provable in every mode.
+            | Diagnostic::FnCallUnknownNamedArg { .. }
+            | Diagnostic::FnCallDuplicateArgBinding { .. }
             // Stage 4: capability errors are derivable from source +
             // host_fn_gates + caps alone — surface as Error so the
             // evaluator never reaches the gated call.
@@ -745,6 +831,11 @@ impl Diagnostic {
             // cross-mode (no `<T>` hint can fix `...int_value`),
             // while `SpreadSourceTypeUnknown` stays strict-only.
             | Diagnostic::NonSpreadableSource { .. }
+            // A comprehension over a statically-known non-iterable
+            // source (Tuple) is wrong in every mode — the evaluator
+            // unconditionally traps `TypeMismatch: expected List or
+            // Iter` on it, so reject before evaluation.
+            | Diagnostic::NonIterableSource { .. }
             | Diagnostic::SpreadSourceTypeUnknown { .. }
             | Diagnostic::DynamicKeyTypeUnknown { .. }
             | Diagnostic::UnknownReferenceType { .. }

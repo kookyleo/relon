@@ -1266,6 +1266,130 @@ fn stage3_string_upper_int_arg() {
     assert_eq!(mismatches.len(), 1, "{:?}", tree.diagnostics);
 }
 
+// ===================================================================
+// D1: named-argument binding checks. Calls with named args used to
+// skip arity + type validation entirely; they now go through the same
+// slot-binding model the runtime applies (`eval_closure`).
+// ===================================================================
+
+/// D1 reverse: a legal named/positional mix and a fully-named call in
+/// swapped order both bind cleanly — no diagnostics.
+#[test]
+fn named_args_legal_mix_silent() {
+    let tree = analyze_str(
+        r#"{
+            f(Int a, Int b) -> Int: a + b,
+            mixed: f(1, b = 2),
+            swapped: f(b = 2, a = 1)
+        }"#,
+    );
+    let diags: Vec<_> = tree
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(
+                d,
+                Diagnostic::FnCallArgCountMismatch { .. }
+                    | Diagnostic::FnCallArgTypeMismatch { .. }
+                    | Diagnostic::FnCallUnknownNamedArg { .. }
+                    | Diagnostic::FnCallDuplicateArgBinding { .. }
+            )
+        })
+        .collect();
+    assert!(diags.is_empty(), "{:?}", tree.diagnostics);
+}
+
+/// D1 forward: a named arg whose name isn't a declared parameter is a
+/// runtime `VariableNotFound` — flag it statically.
+#[test]
+fn named_args_unknown_name_flagged() {
+    let tree = analyze_str(
+        r#"{
+            f(Int a, Int b) -> Int: a + b,
+            out: f(1, c = 2)
+        }"#,
+    );
+    let diags: Vec<_> = tree
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(d, Diagnostic::FnCallUnknownNamedArg { fn_name, arg_name, .. }
+                if fn_name == "f" && arg_name == "c")
+        })
+        .collect();
+    assert_eq!(diags.len(), 1, "{:?}", tree.diagnostics);
+}
+
+/// D1 forward: a named arg re-binding a positionally-filled slot (and
+/// a doubled named arg) are runtime duplicate-binding errors.
+#[test]
+fn named_args_duplicate_binding_flagged() {
+    let tree = analyze_str(
+        r#"{
+            f(Int a, Int b) -> Int: a + b,
+            pos_clash: f(1, a = 2),
+            named_clash: f(a = 1, b = 2, b = 3)
+        }"#,
+    );
+    let dup_a = tree
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(d, Diagnostic::FnCallDuplicateArgBinding { param_name, .. } if param_name == "a")
+        })
+        .count();
+    let dup_b = tree
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(d, Diagnostic::FnCallDuplicateArgBinding { param_name, .. } if param_name == "b")
+        })
+        .count();
+    assert_eq!((dup_a, dup_b), (1, 1), "{:?}", tree.diagnostics);
+}
+
+/// D1 forward: named args participate in the arity check — a call that
+/// leaves a required param unbound flags `FnCallArgCountMismatch`.
+#[test]
+fn named_args_missing_required_flagged() {
+    let tree = analyze_str(
+        r#"{
+            f(Int a, Int b) -> Int: a + b,
+            out: f(a = 1)
+        }"#,
+    );
+    let diags: Vec<_> = tree
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(d, Diagnostic::FnCallArgCountMismatch { fn_name, expected, .. }
+                if fn_name == "f" && expected == "2")
+        })
+        .collect();
+    assert_eq!(diags.len(), 1, "{:?}", tree.diagnostics);
+}
+
+/// D1 forward: named args get the same per-arg type check as
+/// positional ones.
+#[test]
+fn named_args_type_mismatch_flagged() {
+    let tree = analyze_str(
+        r#"{
+            f(Int a, Int b) -> Int: a + b,
+            out: f(1, b = "x")
+        }"#,
+    );
+    let diags: Vec<_> = tree
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(d, Diagnostic::FnCallArgTypeMismatch { fn_name, param_name, expected, found, .. }
+                if fn_name == "f" && param_name == "b" && expected == "Int" && found == "String")
+        })
+        .collect();
+    assert_eq!(diags.len(), 1, "{:?}", tree.diagnostics);
+}
+
 /// Stage 3.7 #9 reverse: `range(0, 10)` is legal (uses variadic_tail).
 #[test]
 fn stage3_range_two_args_legal() {
@@ -2631,6 +2755,53 @@ fn v1_5_strict_comprehension_element_mismatch() {
         matches!(d, Diagnostic::StaticTypeMismatch { .. })
     });
     assert!(stm >= 1, "{:?}", tree.diagnostics);
+}
+
+/// Tuple comprehension sources are rejected statically: tuples are
+/// heterogeneous, not iterable. The rejection is cross-mode and must
+/// not stack a strict-only `ExpressionTypeUnknown` on top.
+#[test]
+fn comprehension_tuple_source_rejected() {
+    let tree = analyze_str(
+        r#"
+        { out: [x * 10 for x in (1, 2, 3)] }
+        "#,
+    );
+    let ni = count(&tree, |d| matches!(d, Diagnostic::NonIterableSource { .. }));
+    let il = count(&tree, |d| {
+        matches!(d, Diagnostic::ExpressionTypeUnknown { .. })
+    });
+    assert_eq!(ni, 1, "{:?}", tree.diagnostics);
+    assert_eq!(il, 0, "{:?}", tree.diagnostics);
+}
+
+/// Tuple rejection is cross-mode: `#relaxed` still flags it.
+#[test]
+fn comprehension_tuple_source_rejected_relaxed() {
+    let tree = analyze_str(
+        r#"
+        #relaxed
+        { out: [x * 10 for x in (1, 2, 3)] }
+        "#,
+    );
+    let ni = count(&tree, |d| matches!(d, Diagnostic::NonIterableSource { .. }));
+    assert_eq!(ni, 1, "{:?}", tree.diagnostics);
+}
+
+/// Reverse: List and range comprehension sources stay silent.
+#[test]
+fn comprehension_list_and_range_sources_silent() {
+    let tree = analyze_str(
+        r#"
+        {
+          List<Int> xs: [1, 2, 3],
+          List<Int> a: [x * 2 for x in xs],
+          List<Int> b: [x + 1 for x in range(4)]
+        }
+        "#,
+    );
+    let ni = count(&tree, |d| matches!(d, Diagnostic::NonIterableSource { .. }));
+    assert_eq!(ni, 0, "{:?}", tree.diagnostics);
 }
 
 /// v1.5 forward: where-expression's body is inferred under a scope
