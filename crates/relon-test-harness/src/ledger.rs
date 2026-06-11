@@ -3241,4 +3241,26 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
                 relon-codegen-llvm::aot_wasm_parity::st_unique_* incl. the NaN-dup and \
                 neg-zero-dup float cases; List<String>/List<Bool> stay capped)",
     },
+    // ---- stdlib symmetry wave: checked sum + min mirror ----
+    SurfaceEntry {
+        construct: "checked xs.sum() overflow trap (TrapKind::NumericOverflow -> \
+                    NumericOverflow)",
+        wave: "SYM",
+        corpus: "stdlib_list_sum_overflow",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift trap NumericOverflow on the first overflowing \
+                partial sum; llvm-native leg (state-trap route) + boundary value parity \
+                in relon-codegen-llvm::list_sum_overflow_four_way, wasm leg structural \
+                (same emitter + trap code 6)",
+    },
+    SurfaceEntry {
+        construct: "list min method (xs.min(), Int elements)",
+        wave: "SYM",
+        corpus: "stdlib_list_min",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift + trace const; llvm-native leg + empty-trap and \
+                min/max symmetry in relon-codegen-llvm::list_min_four_way (registry \
+                slot 78, exact list_int_max mirror; List<Float> min stays on the \
+                tree-walk fallback like Float max)",
+    },
 ];

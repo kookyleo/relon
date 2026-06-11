@@ -130,6 +130,11 @@ pub fn stdlib_method_index(receiver_ty: IrType, name: &str) -> Option<u32> {
         (IrType::String, "glob_match") => stdlib_function_index("glob_match"),
         (IrType::ListInt, "sum") => stdlib_function_index("list_int_sum"),
         (IrType::ListInt, "max") => stdlib_function_index("list_int_max"),
+        // `xs.min()` — exact mirror of `max` (registry slot appended at
+        // the tail; declaration order is wire format). `List<Float>`
+        // `min` / `max` stay on the tree-walk fallback (no `ListFloat`
+        // row here), matching each other.
+        (IrType::ListInt, "min") => stdlib_function_index("list_int_min"),
         // Phase 10-a higher-order List<Int> methods. Dispatch covers
         // the `xs.map(|x| ...)` / `xs.filter(|x| ...)` /
         // `xs.fold(init, |acc, x| ...)` surfaces.

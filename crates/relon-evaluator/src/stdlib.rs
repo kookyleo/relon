@@ -284,13 +284,14 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_method("List", "join", string_join);
     ctx.register_pure_method("List", "len", Arc::clone(&len));
     // v6-δ M1 R4: see String.length / String.is_empty above for
-    // rationale. `sum` + `max` are list-aggregations the cranelift
-    // backend already exposes as `list_int_sum` etc.; `length` is the
-    // `len()` alias the corpus uses.
+    // rationale. `sum` + `max` + `min` are list-aggregations the
+    // cranelift backend already exposes as `list_int_sum` etc.;
+    // `length` is the `len()` alias the corpus uses.
     ctx.register_pure_method("List", "length", Arc::clone(&len));
     ctx.register_pure_method("List", "is_empty", Arc::new(IsEmpty));
     ctx.register_pure_method("List", "sum", Arc::new(ListSum));
     ctx.register_pure_method("List", "max", Arc::new(ListMax));
+    ctx.register_pure_method("List", "min", Arc::new(ListMin));
 
     // Dict methods
     ctx.register_pure_method("Dict", "merge", dict_merge);
@@ -2297,6 +2298,69 @@ impl RelonFunction for ListMax {
                         Value::Float(x) => {
                             let xv = x.into_inner();
                             if xv > acc {
+                                acc = xv;
+                            }
+                        }
+                        other => {
+                            return Err(RuntimeError::TypeMismatch {
+                                expected: "List<Float>".to_string(),
+                                found: other.type_name().to_string(),
+                                range,
+                            })
+                        }
+                    }
+                }
+                Ok(Value::Float(acc.into()))
+            }
+            other => Err(RuntimeError::TypeMismatch {
+                expected: "List<Int> or List<Float>".to_string(),
+                found: other.type_name().to_string(),
+                range,
+            }),
+        }
+    }
+}
+
+/// `xs.min()` over a `List<Int>` / `List<Float>`. Returns the smallest
+/// element (signed for Int) — the exact mirror of [`ListMax`],
+/// including the typed `TypeMismatch` ("non-empty list") on an empty
+/// receiver. Closes the historical `max`-without-`min` asymmetry.
+struct ListMin;
+impl RelonFunction for ListMin {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let list = expect_list(&args[0], range)?;
+        if list.is_empty() {
+            return Err(RuntimeError::TypeMismatch {
+                expected: "non-empty list".to_string(),
+                found: "empty list".to_string(),
+                range,
+            });
+        }
+        let first = &list[0];
+        match first {
+            Value::Int(seed) => {
+                let mut acc = *seed;
+                for v in &list[1..] {
+                    let x = expect_int(v, range)?;
+                    if x < acc {
+                        acc = x;
+                    }
+                }
+                Ok(Value::Int(acc))
+            }
+            Value::Float(seed) => {
+                let mut acc = seed.into_inner();
+                for v in &list[1..] {
+                    match v {
+                        Value::Float(x) => {
+                            let xv = x.into_inner();
+                            if xv < acc {
                                 acc = xv;
                             }
                         }

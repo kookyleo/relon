@@ -538,6 +538,10 @@ fn parse_recipe(source: &str) -> Option<SynthRecipe> {
             Value::Int(9),
         ),
         (
+            "#main() -> Int [3, 1, 4, 1, 5, 9, 2, 6].min()",
+            Value::Int(1),
+        ),
+        (
             "#main() -> String \"é\".nfd()",
             Value::String("e\u{301}".into()),
         ),
