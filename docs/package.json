@@ -7,7 +7,7 @@
     "docs:dev": "vitepress dev",
     "docs:build": "vitepress build",
     "docs:preview": "vitepress preview",
-    "build:wasm": "wasm-pack build ../crates/relon-wasm-bindings --target web --out-dir ../../docs/public/wasm/relon",
+    "build:wasm": "wasm-pack build ../crates/relon-wasm-bindings --target web --out-dir ../../docs/public/wasm/relon --out-name relon_wasm",
     "test:wasm": "node ../crates/relon-wasm-bindings/test-node.mjs"
   },
   "devDependencies": {
