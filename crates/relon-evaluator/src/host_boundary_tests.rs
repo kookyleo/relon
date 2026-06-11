@@ -31,8 +31,7 @@ fn run(source: &str) -> Result<Value, RuntimeError> {
 
 fn run_with_caps(source: &str, caps: Capabilities) -> Result<Value, RuntimeError> {
     let node = parse_document(source).expect("parse");
-    let mut ctx = Context::new().with_root(node);
-    ctx.capabilities = caps;
+    let ctx = Context::new().with_root(node).with_capabilities(caps);
     TreeWalkEvaluator::new(Arc::new({
         let mut ctx = ctx;
         crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
@@ -445,7 +444,9 @@ fn capability_denied_reports_first_missing_bit() {
 
     let node = parse_document(r#"{ x: fetch() }"#).expect("parse");
     let mut ctx = Context::sandboxed().with_root(node);
-    ctx.capabilities.reads_fs = true; // grant one of the two
+    let mut caps = ctx.capabilities().clone();
+    caps.reads_fs = true; // grant one of the two
+    ctx = ctx.with_capabilities(caps);
     ctx.register_fn(
         "fetch",
         {

@@ -644,7 +644,7 @@ environment reads — register them with `register_fn` and set the
 corresponding `NativeFnGate` bit:
 
 ```rust
-use relon_evaluator::{Context, NativeFnGate, NativeArgs, RelonFunction, Value, RuntimeError};
+use relon_evaluator::{Capabilities, Context, NativeFnGate, NativeArgs, RelonFunction, Value, RuntimeError};
 use relon_parser::TokenRange;
 use std::sync::Arc;
 
@@ -657,15 +657,17 @@ impl RelonFunction for ReadSecret {
     }
 }
 
-let mut ctx = Context::sandboxed();
+// How to allow this under the sandbox: grant every bit the gate
+// declares, at construction time
+let mut caps = Capabilities::default();
+caps.reads_fs = true;
+
+let mut ctx = Context::sandboxed().with_capabilities(caps);
 ctx.register_fn(
     "secret.read",
     NativeFnGate { reads_fs: true, ..Default::default() },
     Arc::new(ReadSecret),
 );
-
-// How to allow this under the sandbox: grant every bit the gate declared
-ctx.capabilities.reads_fs = true;
 ```
 
 Every native function goes through the same gate check: every bit the
@@ -680,9 +682,9 @@ host grants for every bit set in `gate`.
 ## Module resolution
 
 `#import <bindspec> from "path"` doesn't read files directly — it
-asks each resolver in `Context::module_resolvers` "can you resolve
-this path?" The first to return `Some(ModuleSource)` wins; an `Err`
-aborts immediately.
+asks each resolver in the `Context` resolver chain (readable via
+`module_resolvers()`) "can you resolve this path?" The first to
+return `Some(ModuleSource)` wins; an `Err` aborts immediately.
 
 The default chain:
 
@@ -693,20 +695,20 @@ The default chain:
      `FilesystemModuleResolver::trusted()` for no root restriction.
    - Under `Context::sandboxed()` the default is
      `FilesystemModuleResolver::default()`, which **denies
-     everything** — replace it or append a `with_root_dir(...)`
-     instance.
+     everything** — mount a `with_root_dir(...)` instance in front
+     of it to allow anything.
 
-Replacement example:
+Mounting example (the rooted resolver sits ahead of the
+default-denying one; first match wins):
 
 ```rust
-use relon_evaluator::{Context, FilesystemModuleResolver, StdModuleResolver};
+use relon_evaluator::{Context, FilesystemModuleResolver};
 use std::sync::Arc;
 
 let mut ctx = Context::sandboxed();
-ctx.module_resolvers = vec![
-    Arc::new(StdModuleResolver),
-    Arc::new(FilesystemModuleResolver::with_root_dir("/var/relon-configs")),
-];
+ctx.prepend_module_resolver(Arc::new(
+    FilesystemModuleResolver::with_root_dir("/var/relon-configs"),
+));
 ```
 
 `with_root_dir` canonicalizes the root path and, on every import,
@@ -720,8 +722,9 @@ OCI registry"), implement the `ModuleResolver` trait:
 
 ```rust
 ctx.prepend_module_resolver(Arc::new(MyResolver)); // run first
-// As a fallback: just push to the end of ctx.module_resolvers
-ctx.module_resolvers.push(Arc::new(FallbackResolver));
+// As a fallback: append to the end of the chain, consulted only
+// when no earlier resolver claims the path
+ctx.append_module_resolver(Arc::new(FallbackResolver));
 ```
 
 ## Decorator plugins

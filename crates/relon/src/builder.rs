@@ -300,7 +300,7 @@ fn build_tree_walk(
     // trusted-filesystem + remote-HTTP resolvers, matching the
     // assembly used by `crate::evaluate_source` in the trusted branch.
     if matches!(trust, TrustLevel::Trusted) {
-        ctx.capabilities = Capabilities::all_granted();
+        ctx = ctx.with_capabilities(Capabilities::all_granted());
         ctx.prepend_module_resolver(
             Arc::new(FilesystemModuleResolver::trusted()) as Arc<dyn ModuleResolver>
         );

@@ -25,23 +25,24 @@ use std::sync::Arc;
 /// constructs two independent contexts to verify they observe identical
 /// behaviour — proves no implicit shared state leaks between runs.
 fn eval_in_fresh_context(source: &str) -> Result<Value, RuntimeError> {
-    eval_in_fresh_context_with(source, |_| {})
+    eval_in_fresh_context_with(source, |ctx| ctx)
 }
 
 /// Variant that lets the caller adjust `Capabilities` before evaluation
-/// (e.g. set `max_value_elements`). The mutator runs on the freshly
-/// constructed sandboxed context. The analyzer is always attached —
-/// method dispatch on built-in types (e.g. `xs.map(...)`) consults the
-/// analyzed tree to resolve the receiver's type, so omitting it would
-/// surface `FunctionNotFound` for valid surface syntax.
-fn eval_in_fresh_context_with<F>(source: &str, mutate: F) -> Result<Value, RuntimeError>
+/// (e.g. set `max_value_elements`). The configurator consumes and
+/// returns the freshly constructed sandboxed context, matching the
+/// builder-style `Context::with_capabilities` write path. The analyzer
+/// is always attached — method dispatch on built-in types (e.g.
+/// `xs.map(...)`) consults the analyzed tree to resolve the receiver's
+/// type, so omitting it would surface `FunctionNotFound` for valid
+/// surface syntax.
+fn eval_in_fresh_context_with<F>(source: &str, configure: F) -> Result<Value, RuntimeError>
 where
-    F: FnOnce(&mut Context),
+    F: FnOnce(Context) -> Context,
 {
     let node = parse_document(source).expect("test source must parse");
     let analyzed = Arc::new(relon_analyzer::analyze(&node));
-    let mut ctx = Context::sandboxed();
-    mutate(&mut ctx);
+    let ctx = configure(Context::sandboxed());
     let ctx = ctx.with_root(node).with_analyzed(analyzed);
     let ctx = Arc::new({
         let mut ctx = ctx;
@@ -168,7 +169,9 @@ proptest! {
         let n = cap + delta;
         let source = format!("{{ xs: range(0, {n}) }}");
         let result = eval_in_fresh_context_with(&source, |ctx| {
-            ctx.capabilities.max_value_elements = Some(cap);
+            let mut caps = ctx.capabilities().clone();
+            caps.max_value_elements = Some(cap);
+            ctx.with_capabilities(caps)
         });
 
         if n <= cap {

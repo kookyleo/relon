@@ -5,10 +5,13 @@
 //! capability grants, and the per-run caches a backend uses to thread
 //! state across `eval_root` / `run_main` invocations.
 //!
-//! All fields are `pub` so that any backend implementing
+//! Most fields are `pub` so that any backend implementing
 //! [`crate::Evaluator`] in a different crate can read and update them.
-//! Hosts should use the constructors and `register_*` / `with_*` helpers
-//! rather than poking the fields directly.
+//! Sandbox-relevant state (`capabilities`, `module_resolvers`,
+//! `analyzed`) is private: reads go through the `&`-returning getters
+//! and writes through the construction-time `with_*` / controlled
+//! `*_module_resolver` entry points, so a host cannot silently widen
+//! a sandbox after handing the context to an evaluator.
 
 use crate::decorator::DecoratorPlugin;
 use crate::module::ModuleResolver;
@@ -43,9 +46,11 @@ pub struct GatedNativeFn {
 /// Holds the document root, registered plugins, cached modules, and
 /// sandbox [`Capabilities`]. Thread-safe.
 ///
-/// All fields are `pub` so any backend implementing [`crate::Evaluator`]
-/// from a separate crate can read and update them. Hosts should prefer
-/// the constructor / `register_*` / `with_*` helpers.
+/// Most fields are `pub` so any backend implementing [`crate::Evaluator`]
+/// from a separate crate can read and update them. The sandbox-policy
+/// fields (`capabilities`, `module_resolvers`, `analyzed`) are private;
+/// hosts and backends go through the constructor / `register_*` /
+/// `with_*` helpers and the `&`-returning getters instead.
 pub struct Context {
     pub root_node: Option<Arc<Node>>,
     pub decorators: HashMap<String, Arc<dyn DecoratorPlugin>>,
@@ -66,7 +71,13 @@ pub struct Context {
     /// allocations on every comparator / index / arithmetic dispatch.
     pub native_methods: HashMap<String, HashMap<String, GatedNativeFn>>,
     pub schemas: HashMap<String, Value>,
-    pub module_resolvers: Vec<Arc<dyn ModuleResolver>>,
+    /// Ordered module-resolution chain consulted front-to-back by the
+    /// evaluator's `#import` handling. Private: mutation goes through
+    /// [`Context::prepend_module_resolver`] /
+    /// [`Context::append_module_resolver`] so the sandbox's resolver
+    /// order (e.g. the default-deny tail installed for
+    /// [`Context::sandboxed`]) cannot be silently replaced wholesale.
+    module_resolvers: Vec<Arc<dyn ModuleResolver>>,
     pub path_cache: Mutex<HashMap<String, Value>>,
     pub module_cache: Mutex<HashMap<String, Value>>,
     /// Backing cursor table for user-callable `Iter.next()`. Keyed by
@@ -102,7 +113,12 @@ pub struct Context {
     /// (e.g. `&sibling.x`) are not shared across distinct invocations
     /// with different bound parameters.
     pub closure_call_counter: AtomicU64,
-    pub analyzed: Option<Arc<relon_analyzer::AnalyzedTree>>,
+    /// Analyzer side-table for the entry file. Private: installed at
+    /// construction time via [`Context::with_analyzed`] /
+    /// [`Context::with_workspace`], read through
+    /// [`Context::analyzed`] — backends never swap the tree under a
+    /// live evaluation.
+    analyzed: Option<Arc<relon_analyzer::AnalyzedTree>>,
     /// Pre-computed workspace tree (entry + every reachable module),
     /// produced by `relon_analyzer::analyze_entry`. When present, the
     /// evaluator's `evaluate_module_source` skips the per-module
@@ -112,7 +128,13 @@ pub struct Context {
     /// file specifically, so existing callers that don't drive
     /// workspace analysis keep working unchanged.
     pub workspace: Option<Arc<relon_analyzer::WorkspaceTree>>,
-    pub capabilities: Capabilities,
+    /// Sandbox capability grants. Private so the only write path is
+    /// construction-time [`Context::with_capabilities`]; once the
+    /// context is handed to an evaluator the grants are immutable
+    /// policy, read through [`Context::capabilities`]. This is the
+    /// audit guarantee: an embedder cannot widen a running sandbox by
+    /// poking the field.
+    capabilities: Capabilities,
     /// Set by [`Context::sandboxed`] so the backend's deferred setup
     /// step can attach the default-deny filesystem resolver after the
     /// stdlib / decorators / prelude registration. Untouched by the
@@ -201,8 +223,47 @@ impl Context {
         self
     }
 
+    /// Set the sandbox capability grants. Construction-time only by
+    /// design: the method consumes `self`, so it composes with the
+    /// other `with_*` builders but cannot retarget a context that is
+    /// already shared with an evaluator (those hold `Arc<Context>`).
+    /// There is deliberately no `&mut self` setter — widening a
+    /// sandbox mid-run is not a supported operation.
+    pub fn with_capabilities(mut self, capabilities: Capabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Read-only view of the sandbox capability grants.
+    pub fn capabilities(&self) -> &Capabilities {
+        &self.capabilities
+    }
+
+    /// Read-only view of the analyzer side-table for the entry file,
+    /// when one was installed via [`Self::with_analyzed`] /
+    /// [`Self::with_workspace`].
+    pub fn analyzed(&self) -> Option<&Arc<relon_analyzer::AnalyzedTree>> {
+        self.analyzed.as_ref()
+    }
+
+    /// Read-only view of the module-resolution chain, in consultation
+    /// order (front wins).
+    pub fn module_resolvers(&self) -> &[Arc<dyn ModuleResolver>] {
+        &self.module_resolvers
+    }
+
+    /// Insert a resolver at the front of the chain so it is consulted
+    /// before every existing resolver (front wins).
     pub fn prepend_module_resolver(&mut self, resolver: Arc<dyn ModuleResolver>) {
         self.module_resolvers.insert(0, resolver);
+    }
+
+    /// Append a resolver at the back of the chain so it is consulted
+    /// only when no earlier resolver claimed the path. This is where a
+    /// backend installs catch-all / default-deny resolvers (e.g. the
+    /// sandboxed filesystem resolver) during its prepare step.
+    pub fn append_module_resolver(&mut self, resolver: Arc<dyn ModuleResolver>) {
+        self.module_resolvers.push(resolver);
     }
 
     /// Register a native function with explicit capability requirements.
@@ -302,8 +363,7 @@ impl Context {
     }
 
     pub fn analyzer_target(&self, id: relon_parser::NodeId) -> Option<Node> {
-        self.analyzed
-            .as_ref()
+        self.analyzed()
             .and_then(|tree| tree.node(id).map(|arc| (**arc).clone()))
     }
 

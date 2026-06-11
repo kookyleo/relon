@@ -232,12 +232,14 @@ A freshly constructed `Context` has **no capabilities**. Scripts:
 
 ### 4.2 Explicit grants
 
-The host grants via `Capabilities` fields:
+The host grants via a `Capabilities` value installed at construction
+time:
 
 ```rust
-let mut ctx = Context::sandboxed();
-ctx.capabilities.reads_fs = true;                           // permit #import on real FS and any host fn gated on reads_fs
-ctx.capabilities.max_steps = Some(1_000_000);               // step budget
+let mut caps = Capabilities::default();
+caps.reads_fs = true;             // permit #import on real FS and any host fn gated on reads_fs
+caps.max_steps = Some(1_000_000); // step budget
+let ctx = Context::sandboxed().with_capabilities(caps);
 ```
 
 Or grant everything at once via `Capabilities::all_granted()` — but

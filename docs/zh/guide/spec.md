@@ -203,12 +203,13 @@ source。语法 corpus 由 `fixtures/` 与 `examples/` 中的样例 +
 
 ### 4.2 显式授权才放行
 
-Host 通过 `Capabilities` 字段显式授权：
+Host 通过构造期安装的 `Capabilities` 显式授权：
 
 ```rust
-let mut ctx = Context::sandboxed();
-ctx.capabilities.reads_fs = true;                           // 允许 #import 真实文件，同时让声明 reads_fs 的 host fn 通过 gate
-ctx.capabilities.max_steps = Some(1_000_000);               // 限制求值步数
+let mut caps = Capabilities::default();
+caps.reads_fs = true;                  // 允许 #import 真实文件，同时让声明 reads_fs 的 host fn 通过 gate
+caps.max_steps = Some(1_000_000);      // 限制求值步数
+let ctx = Context::sandboxed().with_capabilities(caps);
 ```
 
 或一次性授权全部（`Capabilities::all_granted()`）——但这是显式的、
