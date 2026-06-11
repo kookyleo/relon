@@ -1143,6 +1143,17 @@ impl<'a> Parser<'a> {
                 break;
             }
             self.open_at(lhs_ck, SyntaxKind::BINARY_EXPR);
+            if op == SyntaxKind::PLUS_PLUS {
+                // `++` was parseable but never executable (the
+                // evaluator always trapped UnsupportedOperator).
+                // String concatenation is spelled `+`; keep consuming
+                // the token inside the BINARY_EXPR node (so recovery
+                // stays structured and the round-trip stays lossless)
+                // but flag the precise migration. Plain `error` — not
+                // `error_at_current`, which would wrap the token in an
+                // extra ERROR node and skip the normal bump below.
+                self.error("`++` is not an operator — use `+` to concatenate strings");
+            }
             self.bump();
             self.parse_expr_bp(rbp);
             self.close();
@@ -2595,7 +2606,9 @@ impl<'a> Parser<'a> {
 //   2. and  &&
 //   3. equality   ==  !=
 //   4. comparison <  >  <=  >=
-//   5. concat  ++
+//   5. (retired) concat ++ — still consumed here for structured
+//      recovery, but `parse_expr_bp` flags it with a migration
+//      diagnostic pointing at `+` (string concatenation operator)
 //   6. additive + -
 //   7. multiplicative * / %
 //   8. pipe |
@@ -2786,6 +2799,47 @@ mod tests {
         assert!(
             parsed.errors.iter().any(|e| e.message.contains("`_`")),
             "diagnostic should point at `_`: {:?}",
+            parsed.errors
+        );
+    }
+
+    #[test]
+    fn plus_plus_concat_now_errors() {
+        // `++` was parseable but never executable — string
+        // concatenation is spelled `+`. The token is still consumed
+        // (round-trip stays lossless, recovery stays structured) but
+        // the parse carries a migration diagnostic pointing at `+`.
+        let parsed = parse_round_trip("{ msg: \"a\" ++ \"b\" }");
+        assert!(
+            parsed.has_errors(),
+            "`++` must error (use `+`): {:?}",
+            parsed.errors
+        );
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|e| e.message.contains("use `+` to concatenate strings")),
+            "diagnostic should point at `+`: {:?}",
+            parsed.errors
+        );
+    }
+
+    #[test]
+    fn plus_plus_in_main_body_errors() {
+        // Same diagnostic through the `#main` body expression path.
+        let parsed = parse_round_trip("#main(String s) -> String\ns ++ \"!\"\n");
+        assert!(
+            parsed.has_errors(),
+            "`++` in a #main body must error: {:?}",
+            parsed.errors
+        );
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .any(|e| e.message.contains("use `+` to concatenate strings")),
+            "diagnostic should point at `+`: {:?}",
             parsed.errors
         );
     }

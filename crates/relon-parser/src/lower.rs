@@ -3087,6 +3087,12 @@ fn lower_binary_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
         SyntaxKind::STAR => crate::Operator::Mul,
         SyntaxKind::SLASH => crate::Operator::Div,
         SyntaxKind::PERCENT => crate::Operator::Mod,
+        // `++` is retired surface — the CST parser always attaches a
+        // migration diagnostic ("use `+` to concatenate strings"), so
+        // strict parsing never reaches this arm. Recovering mode (IDE
+        // partial AST) still lowers the token so hover / completion
+        // keep a navigable tree; the evaluator traps Concat with
+        // UnsupportedOperator as defense in depth.
         SyntaxKind::PLUS_PLUS => crate::Operator::Concat,
         SyntaxKind::EQ_EQ => crate::Operator::Eq,
         SyntaxKind::BANG_EQ => crate::Operator::Ne,

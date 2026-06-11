@@ -147,3 +147,10 @@ round_trip: true
 cst_errors: 0
 parse_document: Err(parse error: empty document)
 
+=== 21_plus_plus_concat.relon ===
+source: "{ msg: \"a\" ++ \"b\" }\n"
+round_trip: true
+cst_errors: 1
+  - `++` is not an operator — use `+` to concatenate strings @ 10
+parse_document: Err(parse error: `++` is not an operator — use `+` to concatenate strings)
+
