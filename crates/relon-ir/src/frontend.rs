@@ -1,7 +1,7 @@
 //! Shared compiled-backend frontend pipeline.
 //!
-//! Every compiled backend (bytecode VM, cranelift-native AOT, LLVM
-//! AOT) re-implements the same parse → analyze → lower triplet before
+//! Every compiled backend (cranelift-native AOT, LLVM AOT, and future
+//! targets) re-implements the same parse → analyze → lower triplet before
 //! it diverges into backend-specific schema / layout / codegen work.
 //! [`compile`] extracts that triplet behind one entry so the three
 //! backends stop drifting on the order of steps, the error mapping,

@@ -1,0 +1,10 @@
+{
+  "bind": "https://0.0.0.0:8443",
+  "probe": "/healthz",
+  "public_api": {
+    "health_path": "/healthz",
+    "name": "api",
+    "port": 8443,
+    "protocol": "https"
+  }
+}

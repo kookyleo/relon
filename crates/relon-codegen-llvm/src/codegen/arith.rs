@@ -5,12 +5,13 @@
 //! out of the monolithic emitter (Phase 0a); each `emit_*` is invoked
 //! by the central `lower_op` dispatch in `super`.
 
-use inkwell::values::{BasicMetadataValueEnum, IntValue};
+use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue};
 use inkwell::{FloatPredicate, IntPredicate};
 
 use relon_ir::ir::{F64UnaryOp, IrType};
 
 use crate::error::LlvmError;
+use crate::state::NativeTrap;
 
 use super::*;
 
@@ -65,14 +66,16 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             return self.emit_binop_f64(op, a, b);
         }
 
-        // Phase E.2 sandbox parity: guard Div / Mod against a zero RHS
-        // so the JIT raises a deterministic trap instead of leaving
-        // LLVM's `sdiv` / `srem` to invoke UB (which on x86 surfaces
-        // as a host-level SIGFPE that the host can't catch on stable
-        // Rust). Emit an `if rhs == 0 { llvm.trap; unreachable } else
-        // { ... }` skeleton and continue the division in the `else`
-        // arm. The `unreachable` after `llvm.trap` is what tells LLVM
-        // the trap path doesn't fall through.
+        if ty == IrType::I64 && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+            let r = self.emit_checked_i64_arith(op, a, b)?;
+            self.push(r, ty);
+            return Ok(());
+        }
+
+        // Sandbox parity: guard Div / Mod against a zero RHS so the JIT
+        // never reaches LLVM's UB `sdiv` / `srem` case. Buffer entries
+        // lift this through the typed trap channel; legacy/fast entries
+        // retain a hard `llvm.trap` because their ABI has no error lane.
         if matches!(op, BinOp::Div | BinOp::Mod) {
             let zero = b.get_type().const_zero();
             let cmp_name = self.next_name("divz_cmp");
@@ -80,22 +83,34 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 .builder
                 .build_int_compare(IntPredicate::EQ, b, zero, &cmp_name)
                 .map_err(|e| LlvmError::Codegen(format!("{} divz cmp: {e}", op.name())))?;
-            let trap_bb = self.ctx.append_basic_block(self.func, "div_by_zero_trap");
-            let cont_bb = self.ctx.append_basic_block(self.func, "div_by_zero_ok");
-            self.builder
-                .build_conditional_branch(is_zero, trap_bb, cont_bb)
-                .map_err(|e| LlvmError::Codegen(format!("{} divz branch: {e}", op.name())))?;
-            // Trap block: call `llvm.trap` then `unreachable`. The
-            // intrinsic is declared lazily; subsequent emits reuse the
-            // declaration so the module ends up with at most one
-            // `@llvm.trap` symbol regardless of how many guards fire.
-            self.builder.position_at_end(trap_bb);
-            self.emit_llvm_trap_call(op.name())?;
-            self.builder
-                .build_unreachable()
-                .map_err(|e| LlvmError::Codegen(format!("{} divz unreachable: {e}", op.name())))?;
-            // Continue normal codegen in the "ok" block.
-            self.builder.position_at_end(cont_bb);
+            self.emit_trap_guard(is_zero, NativeTrap::DivisionByZero, "div_by_zero")?;
+        }
+
+        // LLVM signed div/rem also has UB for INT_MIN / -1. Relon's
+        // tree-walker uses checked_div / checked_rem and reports this
+        // as NumericOverflow, so guard it before lowering to sdiv/srem.
+        if ty == IrType::I64 && matches!(op, BinOp::Div | BinOp::Mod) {
+            let i64_t = self.ctx.i64_type();
+            let min = i64_t.const_int(i64::MIN as u64, false);
+            let neg_one = i64_t.const_all_ones();
+            let lhs_min = self
+                .builder
+                .build_int_compare(IntPredicate::EQ, a, min, &self.next_name("divof_lhs_min"))
+                .map_err(|e| LlvmError::Codegen(format!("{} overflow lhs cmp: {e}", op.name())))?;
+            let rhs_neg_one = self
+                .builder
+                .build_int_compare(
+                    IntPredicate::EQ,
+                    b,
+                    neg_one,
+                    &self.next_name("divof_rhs_neg_one"),
+                )
+                .map_err(|e| LlvmError::Codegen(format!("{} overflow rhs cmp: {e}", op.name())))?;
+            let overflow = self
+                .builder
+                .build_and(lhs_min, rhs_neg_one, &self.next_name("divof"))
+                .map_err(|e| LlvmError::Codegen(format!("{} overflow and: {e}", op.name())))?;
+            self.emit_trap_guard(overflow, NativeTrap::NumericOverflow, "div_overflow")?;
         }
 
         let name = self.next_name(op.name());
@@ -109,6 +124,93 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         }
         .map_err(|e| LlvmError::Codegen(format!("{} build failed: {e}", op.name())))?;
         self.push(r, ty);
+        Ok(())
+    }
+
+    fn emit_checked_i64_arith(
+        &mut self,
+        op: BinOp,
+        a: IntValue<'ctx>,
+        b: IntValue<'ctx>,
+    ) -> Result<IntValue<'ctx>, LlvmError> {
+        let intrinsic = self.i64_overflow_intrinsic(op)?;
+        let args: [BasicMetadataValueEnum; 2] = [a.into(), b.into()];
+        let call = self
+            .builder
+            .build_call(intrinsic, &args, &self.next_name("checked_arith"))
+            .map_err(|e| {
+                LlvmError::Codegen(format!("{} overflow intrinsic call: {e}", op.name()))
+            })?;
+        let pair = match call.try_as_basic_value() {
+            inkwell::values::ValueKind::Basic(BasicValueEnum::StructValue(v)) => v,
+            other => {
+                return Err(LlvmError::Codegen(format!(
+                    "{} overflow intrinsic returned {other:?}, expected struct",
+                    op.name()
+                )));
+            }
+        };
+        let value = self
+            .builder
+            .build_extract_value(pair, 0, &self.next_name("checked_value"))
+            .map_err(|e| LlvmError::Codegen(format!("{} overflow value extract: {e}", op.name())))?
+            .into_int_value();
+        let overflow = self
+            .builder
+            .build_extract_value(pair, 1, &self.next_name("checked_overflow"))
+            .map_err(|e| LlvmError::Codegen(format!("{} overflow flag extract: {e}", op.name())))?
+            .into_int_value();
+        self.emit_trap_guard(overflow, NativeTrap::NumericOverflow, op.name())?;
+        Ok(value)
+    }
+
+    fn i64_overflow_intrinsic(&self, op: BinOp) -> Result<FunctionValue<'ctx>, LlvmError> {
+        let name = match op {
+            BinOp::Add => "llvm.sadd.with.overflow.i64",
+            BinOp::Sub => "llvm.ssub.with.overflow.i64",
+            BinOp::Mul => "llvm.smul.with.overflow.i64",
+            other => {
+                return Err(LlvmError::Codegen(format!(
+                    "{:?} has no checked i64 overflow intrinsic",
+                    other.name()
+                )));
+            }
+        };
+        if let Some(f) = self.module.get_function(name) {
+            return Ok(f);
+        }
+        let i64_t = self.ctx.i64_type();
+        let i1_t = self.ctx.bool_type();
+        let pair_t = self.ctx.struct_type(&[i64_t.into(), i1_t.into()], false);
+        let fn_ty = pair_t.fn_type(&[i64_t.into(), i64_t.into()], false);
+        Ok(self.module.add_function(name, fn_ty, None))
+    }
+
+    fn emit_trap_guard(
+        &mut self,
+        cond: IntValue<'ctx>,
+        trap: NativeTrap,
+        label: &str,
+    ) -> Result<(), LlvmError> {
+        let trap_bb = self
+            .ctx
+            .append_basic_block(self.func, &format!("{label}_trap"));
+        let ok_bb = self
+            .ctx
+            .append_basic_block(self.func, &format!("{label}_ok"));
+        self.builder
+            .build_conditional_branch(cond, trap_bb, ok_bb)
+            .map_err(|e| LlvmError::Codegen(format!("{label} branch: {e}")))?;
+        self.builder.position_at_end(trap_bb);
+        if self.shape == EntryShape::Buffer {
+            self.emit_state_trap(trap, label)?;
+        } else {
+            self.emit_llvm_trap_call(label)?;
+            self.builder
+                .build_unreachable()
+                .map_err(|e| LlvmError::Codegen(format!("{label} unreachable: {e}")))?;
+        }
+        self.builder.position_at_end(ok_bb);
         Ok(())
     }
 

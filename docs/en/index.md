@@ -4,7 +4,7 @@ layout: home
 hero:
   name: "Relon"
   text: "Logic as data"
-  tagline: "Write the business rule once and store it like JSON. Relon is an executable data format whose payload is the logic itself — validation rules, pricing formulas, workflows, risk policies — evaluated by a sandboxed embeddable runtime (Rust). Same source + same input → byte-identical output, by design."
+  tagline: "Write the business rule once and store it like JSON. Relon is an executable data format whose payload is the logic itself — validation rules, pricing formulas, workflows, risk policies — evaluated by an embeddable Rust runtime with explicit capability and budget controls. Same source + same input → byte-identical output, by design."
   image:
     src: /logo.svg
     alt: Relon
@@ -15,12 +15,15 @@ hero:
     - theme: alt
       text: View on GitHub
       link: https://github.com/kookyleo/relon
+    - theme: alt
+      text: Threat Model
+      link: /en/guide/threat-model
 
 features:
   - title: Deterministic by design
     details: "Same source + same input → byte-identical output. Dict iteration is `BTreeMap`-ordered, floats are IEEE-754 `f64`, the environment is opaque to the script. Replay, hash, cache evaluation freely — running the same `.relon` twice cannot diverge."
-  - title: Sandboxed by default — no escape hatch
-    details: "Scripts hold zero ambient privileges. `Capabilities` explicitly grant filesystem reads, step budgets, value-size watermarks, and capability-bit gates on native fns. There is no \"trusted mode\" the script can fall back to without the host's consent."
+  - title: Sandboxed by default — no implicit trust
+    details: "Scripts hold zero ambient privileges. `Capabilities` grant filesystem reads and host-native authority explicitly; `ResourceBudget` defines the budget model. Host-owned code may opt into full trust explicitly, while untrusted deployments should use a VM or process boundary."
   - title: Self-describing type contracts
     details: "`#schema`, sum-type tagged enums, recursive schemas, branded values, computed defaults — type information travels with the payload. Receivers validate without out-of-band documentation."
   - title: Context-aware references

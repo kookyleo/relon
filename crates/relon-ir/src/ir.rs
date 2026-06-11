@@ -670,9 +670,8 @@ pub enum Op {
     /// deepest leaf is the bottom-most operand, the outermost RHS the
     /// topmost). Lowering folds a left-leaning source chain
     /// `(((a + b) + c) + d)` into one `StrConcatN { operand_count: N }`
-    /// op so every IR-consuming backend (bytecode / cranelift AOT /
-    /// trace-JIT) can route through a single concat allocator instead
-    /// of `N - 1` pair-wise `Add(String)` allocations.
+    /// op so every IR-consuming backend can route through a single concat
+    /// allocator instead of `N - 1` pair-wise `Add(String)` allocations.
     ///
     /// `operand_count >= 2` — the AST fold pass never emits the
     /// degenerate one-operand shape (it would be a plain copy) and
@@ -681,10 +680,8 @@ pub enum Op {
     StrConcatN {
         /// Number of `String` operands the op pops from the operand
         /// stack. Each operand is a complete `String` IR value
-        /// (backend-specific wire shape — arena handle for the
-        /// bytecode VM, i32 record pointer for cranelift, `SmolStr`
-        /// for the tree-walker — but the type tag is `IrType::String`
-        /// in all cases).
+        /// (backend-specific wire shape, but the type tag is
+        /// `IrType::String` in all cases).
         operand_count: u32,
     },
     /// Wave R2 (f-string lowering) — convert a signed `I64` value to its

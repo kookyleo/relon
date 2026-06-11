@@ -129,8 +129,8 @@ pub(super) fn try_lower_range_chain_len(
 ///
 /// The cmp_lua W3 workload (`range(n).map((i) => "a").reduce("",
 /// (acc, s) => acc + s)`) is the canonical caller — its string-concat
-/// reduce returns a `String` accumulator the bytecode VM accepts via
-/// the B-1 / B-2 string-arena infrastructure.
+/// reduce returns a `String` accumulator that compiled string backends
+/// can keep in their native string representation.
 pub(super) fn try_lower_range_chain_reduce(
     path: &[TokenKey],
     args: &[relon_parser::CallArg],

@@ -2102,7 +2102,7 @@ dependencies = [
 
 [[package]]
 name = "relon"
-version = "0.1.0"
+version = "0.1.0-rc2"
 dependencies = [
  "hex",
  "relon-analyzer",
@@ -2121,7 +2121,7 @@ dependencies = [
 
 [[package]]
 name = "relon-analyzer"
-version = "0.1.0"
+version = "0.1.0-rc2"
 dependencies = [
  "hex",
  "miette",
@@ -2135,7 +2135,7 @@ dependencies = [
 
 [[package]]
 name = "relon-bench"
-version = "0.1.0"
+version = "0.1.0-rc2"
 dependencies = [
  "criterion",
  "dhat",
@@ -2156,11 +2156,11 @@ dependencies = [
 
 [[package]]
 name = "relon-cap"
-version = "0.1.0"
+version = "0.1.0-rc2"
 
 [[package]]
 name = "relon-cli"
-version = "0.1.0"
+version = "0.1.0-rc2"
 dependencies = [
  "anyhow",
  "clap",
@@ -2179,7 +2179,7 @@ dependencies = [
 
 [[package]]
 name = "relon-codegen-cranelift"
-version = "0.1.0"
+version = "0.1.0-rc2"
 dependencies = [
  "arc-swap",
  "cranelift-codegen",
@@ -2209,7 +2209,7 @@ dependencies = [
 
 [[package]]
 name = "relon-codegen-llvm"
-version = "0.1.0"
+version = "0.1.0-rc2"
 dependencies = [
  "inkwell",
  "libc",
@@ -2229,7 +2229,7 @@ dependencies = [
 
 [[package]]
 name = "relon-eval-api"
-version = "0.1.0"
+version = "0.1.0-rc2"
 dependencies = [
  "miette",
  "ordered-float",
@@ -2245,7 +2245,7 @@ dependencies = [
 
 [[package]]
 name = "relon-evaluator"
-version = "0.1.0"
+version = "0.1.0-rc2"
 dependencies = [
  "hex",
  "miette",
@@ -2267,7 +2267,7 @@ dependencies = [
 
 [[package]]
 name = "relon-fmt"
-version = "0.1.0"
+version = "0.1.0-rc2"
 dependencies = [
  "clap",
  "relon-parser",
@@ -2276,7 +2276,7 @@ dependencies = [
 
 [[package]]
 name = "relon-ir"
-version = "0.1.0"
+version = "0.1.0-rc2"
 dependencies = [
  "miette",
  "ordered-float",
@@ -2289,7 +2289,7 @@ dependencies = [
 
 [[package]]
 name = "relon-lsp"
-version = "0.1.0"
+version = "0.1.0-rc2"
 dependencies = [
  "anyhow",
  "lsp-server",
@@ -2305,7 +2305,7 @@ dependencies = [
 
 [[package]]
 name = "relon-object-cache"
-version = "0.1.0"
+version = "0.1.0-rc2"
 dependencies = [
  "bincode",
  "cranelift-codegen",
@@ -2326,7 +2326,7 @@ dependencies = [
 
 [[package]]
 name = "relon-object-link"
-version = "0.1.0"
+version = "0.1.0-rc2"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -2341,7 +2341,7 @@ dependencies = [
 
 [[package]]
 name = "relon-parser"
-version = "0.1.0"
+version = "0.1.0-rc2"
 dependencies = [
  "miette",
  "ordered-float",
@@ -2352,7 +2352,7 @@ dependencies = [
 
 [[package]]
 name = "relon-rs-build"
-version = "0.1.0"
+version = "0.1.0-rc2"
 dependencies = [
  "hex",
  "relon-analyzer",
@@ -2363,7 +2363,7 @@ dependencies = [
 
 [[package]]
 name = "relon-rs-demo"
-version = "0.1.0"
+version = "0.1.0-rc2"
 dependencies = [
  "relon-rs-build",
  "relon-rs-macro",
@@ -2372,7 +2372,7 @@ dependencies = [
 
 [[package]]
 name = "relon-rs-macro"
-version = "0.1.0"
+version = "0.1.0-rc2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2382,7 +2382,7 @@ dependencies = [
 
 [[package]]
 name = "relon-rs-shims"
-version = "0.1.0"
+version = "0.1.0-rc2"
 dependencies = [
  "relon-eval-api",
  "relon-util",
@@ -2390,7 +2390,7 @@ dependencies = [
 
 [[package]]
 name = "relon-test-harness"
-version = "0.1.0"
+version = "0.1.0-rc2"
 dependencies = [
  "ordered-float",
  "proptest",
@@ -2406,15 +2406,15 @@ dependencies = [
 
 [[package]]
 name = "relon-unicode"
-version = "0.1.0"
+version = "0.1.0-rc2"
 
 [[package]]
 name = "relon-util"
-version = "0.1.0"
+version = "0.1.0-rc2"
 
 [[package]]
 name = "relon-wasm-bindings"
-version = "0.1.0"
+version = "0.1.0-rc2"
 dependencies = [
  "miette",
  "relon",

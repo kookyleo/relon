@@ -337,13 +337,13 @@ fn first_significant_offset(node: &SyntaxNode) -> Option<usize> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum PairTier {
     /// `#internal name(p): body` — private method, the most-internal
-    /// helpers. Pricing's `#internal currency(symbol, val): …` lands
+    /// helpers. Pricing's `#internal Int line_cents(...): ...` lands
     /// here.
     PrivateMethod = 0,
     /// `name(p): body` — public method (closure value, no `#internal`).
     PublicMethod = 1,
     /// `#internal name: value` — private constant / config field
-    /// (e.g. pricing's `#internal tax_rate: 0.08`).
+    /// (e.g. workflow's `#internal List<String> pay_effects: ...`).
     PrivateField = 2,
     /// `name: value` — public field, the default.
     PublicField = 3,
@@ -1348,13 +1348,199 @@ mod tests {
     /// the *canonical* expected output of the formatter — if the
     /// preset content in the playground changes, mirror it here.
     mod presets {
-        pub const DEMO: &str = "// Try editing me - evaluate runs automatically.\n{\n    currency(val, symbol): val + \" \" + symbol,\n    multiply(a, b): a * b,\n    project: {\n        name: \"Relon Playground\",\n        details: {\n            base_price: 1500,\n            total: multiply(&sibling.base_price, 1.2),\n            @currency(\"GBP\")\n            display: &sibling.total\n        }\n    },\n    meta: {\n        tags_count: len([\"rust\", \"config\", \"dsl\"]),\n        summary: f\"Active project: ${&root.project.name}\"\n    }\n}\n";
+        pub const DEMO: &str = r#"/*
+  Release gate as executable configuration.
 
-        pub const PRICING: &str = "/*\n  Invoice pricing with tiered discounts and tax.\n  See examples/pricing.relon in the repo for the full annotated source.\n*/\n#schema LineItem {\n    String sku: *,\n    #expect \"qty must be > 0\"\n    Int qty: (n) => n > 0,\n    #expect \"unit_price must be >= 0\"\n    Float unit_price: (p) => p >= 0\n}\n\n#schema Order {\n    List<LineItem> items: *,\n    #expect \"tier must be one of: standard / gold\"\n    String tier: (t) => t == \"standard\" || t == \"gold\"\n}\n\n#main(Order order)\n{\n    #internal\n    currency(symbol, val): symbol + \" \" + val,\n    #internal\n    volume_rate(sub): sub >= 1000 ? 0.10: sub >= 500 ? 0.05: 0.0,\n    #internal\n    loyalty_rate(tier): tier == \"gold\" ? 0.03: 0.0,\n    #internal\n    tax_rate: 0.08,\n    #internal\n    sum_floats(xs): _list_reduce(xs, 0.0, (a, x) => a + x),\n    subtotal: sum_floats([it.qty * it.unit_price for it in order.items]),\n    discount_rate: volume_rate(&sibling.subtotal) + loyalty_rate(order.tier),\n    discount_amount: &sibling.subtotal * &sibling.discount_rate,\n    taxable: &sibling.subtotal - &sibling.discount_amount,\n    tax_amount: &sibling.taxable * tax_rate,\n    total: &sibling.taxable + &sibling.tax_amount,\n    @currency(\"USD\")\n    total_display: &sibling.total\n}\n";
+  The data is small, the contract is explicit, and the final decision is
+  a pure value the host can log or reject.
+*/
 
-        pub const FEATURE_FLAG: &str = "/*\n  Runtime feature-flag evaluator.\n\n  Percentage rollouts need a host-registered `native_hash(s) -> Int`.\n  See examples/feature_flag.relon for the full annotated source.\n*/\n#schema User {\n    String id: *,\n    String region: (r) => r == \"us\" || r == \"eu\" || r == \"apac\",\n    String plan: (p) => p == \"free\" || p == \"pro\" || p == \"enterprise\"\n}\n\n#main(User user) -> Dict<String, Dict<String, Bool>>\n{\n    #internal\n    hash_mod_100(s): native_hash(s) % 100,\n    #internal\n    rules: {\n        legacy_checkout: (u) => false,\n        dark_mode: (u) => true,\n        gdpr_banner: (u) => u.region == \"eu\",\n        advanced_editor: (u) => u.plan == \"pro\" || u.plan == \"enterprise\",\n        new_search: (u) => hash_mod_100(u.id) < 25\n    },\n    flags: {\n        legacy_checkout: rules.legacy_checkout(user),\n        dark_mode: rules.dark_mode(user),\n        gdpr_banner: rules.gdpr_banner(user),\n        advanced_editor: rules.advanced_editor(user),\n        new_search: rules.new_search(user)\n    }\n}\n";
+#schema Check {
+    String name: *,
+    Bool pass: *,
+    #expect "severity must be 0..3"
+    Int severity: (Int n) -> Bool => n >= 0 && n <= 3
+}
 
-        pub const WORKFLOW: &str = "/*\n  Order workflow as a data-driven state machine.\n\n  Try via the CLI:\n    cargo run -q -p relon-cli -- run examples/workflow.relon \\\n        --args '{\"state\": \"placed\", \"event\": \"pay\"}'\n*/\n#schema Transition {\n    String from: (s) => s == \"placed\" || s == \"paid\" || s == \"shipped\",\n    String on: *,\n    String to: (s) => s == \"paid\" || s == \"shipped\" || s == \"delivered\" || s == \"cancelled\",\n    List<String> emit: *\n}\n\n#main(String state, String event)\n{\n    #internal\n    transitions: [\n        #brand Transition {\n            from: \"placed\",\n            on: \"pay\",\n            to: \"paid\",\n            emit: [\n                \"charge_card\",\n                \"log_payment\"\n            ]\n        },\n        #brand Transition {\n            from: \"paid\",\n            on: \"ship\",\n            to: \"shipped\",\n            emit: [\n                \"notify_shipper\",\n                \"email_user\"\n            ]\n        },\n        #brand Transition {\n            from: \"shipped\",\n            on: \"deliver\",\n            to: \"delivered\",\n            emit: [\n                \"email_user\"\n            ]\n        },\n        #brand Transition {\n            from: \"placed\",\n            on: \"cancel\",\n            to: \"cancelled\",\n            emit: []\n        },\n        #brand Transition {\n            from: \"paid\",\n            on: \"cancel\",\n            to: \"cancelled\",\n            emit: [\n                \"refund_card\"\n            ]\n        }\n    ],\n    #internal\n    match_one(t): t.from == state && t.on == event,\n    #internal\n    matched: _list_filter(&sibling.transitions, &sibling.match_one),\n    next_state: len(matched) > 0 ? matched[0].to: state,\n    emit: len(matched) > 0 ? matched[0].emit: [\"unhandled_event\"]\n}\n";
+{
+    #internal
+    Bool is_clear(Check check): check.pass || check.severity == 0,
+
+    checks: [
+        #brand Check {
+            name: "schema_migration",
+            pass: true,
+            severity: 3
+        },
+        #brand Check {
+            name: "capacity_headroom",
+            pass: true,
+            severity: 2
+        },
+        #brand Check {
+            name: "kill_switch",
+            pass: true,
+            severity: 3
+        }
+    ],
+    blockers: [
+        check.name for check in &sibling.checks if is_clear(check) == false
+    ],
+    decision: len(&sibling.blockers) == 0 ? "ship": "hold",
+    summary: f"${&sibling.decision}: ${len(&sibling.blockers)} blockers"
+}
+"#;
+
+        pub const PRICING: &str = r#"/*
+  Invoice pricing in integer cents.
+
+  The host pushes an Order; Relon validates the shape, computes discounts
+  in basis points, and returns the exact cents that the host may charge.
+
+  Try:
+    cargo run -q -p relon-cli -- run --backend tree-walk examples/pricing.relon \
+        --args '{"order": {"tier": "gold", "items": [\
+            {"sku": "BOOK-01", "qty": 3, "unit_cents": 10000}, \
+            {"sku": "PEN-09",  "qty": 4, "unit_cents": 5000},  \
+            {"sku": "DESK-22", "qty": 1, "unit_cents": 30000}  \
+        ]}}'
+*/
+
+#import list from "std/list"
+
+#schema LineItem {
+    String sku: *,
+    #expect "qty must be > 0"
+    Int qty: (Int n) -> Bool => n > 0,
+    #expect "unit_cents must be >= 0"
+    Int unit_cents: (Int cents) -> Bool => cents >= 0
+}
+
+#schema Order {
+    List<LineItem> items: *,
+    #expect "tier must be one of: standard / gold"
+    String tier: (String tier) -> Bool => tier == "standard" || tier == "gold"
+}
+
+#main(Order order) -> Dict
+{
+    #internal
+    Int line_cents(LineItem item): item.qty * item.unit_cents,
+    #internal
+    Int volume_bps(Int subtotal): subtotal >= 100000 ? 1000: subtotal >= 50000 ? 500: 0,
+    #internal
+    Int loyalty_bps(String tier): tier == "gold" ? 300: 0,
+    #internal
+    Int prorate(Int cents, Int bps): cents * bps / 10000,
+    #internal
+    String cents_pair(Int cents): cents % 100 < 10 ? "0" + (cents % 100): "" + (cents % 100),
+    #internal
+    String money(Int cents): "USD " + (cents / 100) + "." + cents_pair(cents),
+
+    List<Int> line_totals_cents: [
+        line_cents(item) for item in order.items
+    ],
+    Int subtotal_cents: list.sum(&sibling.line_totals_cents),
+    Int discount_bps: volume_bps(&sibling.subtotal_cents) + loyalty_bps(order.tier),
+    Int discount_cents: prorate(&sibling.subtotal_cents, &sibling.discount_bps),
+    Int taxable_cents: &sibling.subtotal_cents - &sibling.discount_cents,
+    Int tax_cents: prorate(&sibling.taxable_cents, 800),
+    Int total_cents: &sibling.taxable_cents + &sibling.tax_cents,
+    String total_display: money(&sibling.total_cents)
+}
+"#;
+
+        pub const FEATURE_FLAG: &str = r#"/*
+  Feature flags as a deterministic decision table.
+
+  The host computes a stable rollout bucket before evaluation and pushes
+  it with the user. Relon stays pure: no clock, no RNG, no native hash.
+
+  Try:
+    cargo run -q -p relon-cli -- run --backend tree-walk examples/feature_flag.relon \
+        --args '{"user": {"id": "alice-42", "region": "eu", "plan": "pro", "rollout_bucket": 17}}'
+*/
+
+#schema User {
+    String id: *,
+    #expect "region must be us / eu / apac"
+    String region: (String region) -> Bool => region == "us" || region == "eu" || region == "apac",
+    #expect "plan must be free / pro / enterprise"
+    String plan: (String plan) -> Bool => plan == "free" || plan == "pro" || plan == "enterprise",
+    #expect "rollout_bucket must be 0..99"
+    Int rollout_bucket: (Int n) -> Bool => n >= 0 && n < 100
+}
+
+#main(User user) -> Dict
+{
+    flags: {
+        legacy_checkout: false,
+        dark_mode: true,
+        gdpr_banner: user.region == "eu",
+        advanced_editor: user.plan == "pro" || user.plan == "enterprise",
+        new_search: user.rollout_bucket < 25
+    },
+    audit: {
+        subject: user.id,
+        bucket: user.rollout_bucket,
+        ruleset: "2026-06-11"
+    }
+}
+"#;
+
+        pub const WORKFLOW: &str = r#"/*
+  Order workflow as pure transition rules.
+
+  The host pushes the current state and event. Relon returns the next
+  state plus symbolic effects; the host decides how to execute them.
+
+  Try:
+    cargo run -q -p relon-cli -- run --backend tree-walk examples/workflow.relon \
+        --args '{"input": {"state": "placed", "event": "pay"}}'
+*/
+
+#schema WorkflowInput {
+    #expect "state must be placed / paid / shipped"
+    String state: (String s) -> Bool => s == "placed" || s == "paid" || s == "shipped",
+    #expect "event must be pay / ship / deliver / cancel"
+    String event: (String e) -> Bool => e == "pay" || e == "ship" || e == "deliver" || e == "cancel"
+}
+
+#main(WorkflowInput input) -> Dict
+{
+    #internal
+    Bool is_event(String state, String event): input.state == state && input.event == event,
+    #internal
+    String route_state(): is_event("placed", "pay") ? "paid": is_event("paid", "ship") ? "shipped": is_event("shipped", "deliver") ? "delivered": is_event("placed", "cancel") || is_event("paid", "cancel") ? "cancelled": input.state,
+    #internal
+    List<String> pay_effects: [
+        "charge_card",
+        "log_payment"
+    ],
+    #internal
+    List<String> ship_effects: [
+        "notify_shipper",
+        "email_user"
+    ],
+    #internal
+    List<String> deliver_effects: [
+        "email_user"
+    ],
+    #internal
+    List<String> refund_effects: [
+        "refund_card"
+    ],
+    #internal
+    List<String> no_effects: [],
+    #internal
+    List<String> unhandled_effects: [
+        "unhandled_event"
+    ],
+
+    String next_state: route_state(),
+    List<String> emit: is_event("placed", "pay") ? &sibling.pay_effects: is_event("paid", "ship") ? &sibling.ship_effects: is_event("shipped", "deliver") ? &sibling.deliver_effects: is_event("paid", "cancel") ? &sibling.refund_effects: is_event("placed", "cancel") ? &sibling.no_effects: &sibling.unhandled_effects
+}
+"#;
 
         pub const MODULES: &str = "// Three #import shapes — try Mod-clicking any imported name to\n// jump across files.\n#import lib from \"./lib.relon\"\n#import { format_price } from \"./lib.relon\"\n#import * from \"./lib.relon\"\n\n{\n    namespaced: lib.with_tax(100.0, 0.08),\n    destructured: format_price(199.99, \"USD\"),\n    spread: discount(50.0, 0.15)\n}\n";
 
@@ -1654,7 +1840,7 @@ mod tests {
     #[test]
     fn pricing_schema_bodies_unchanged_by_format() {
         // The `#schema LineItem` body owns `String sku / Int qty /
-        // Float unit_price`. A previous reorder pre-pass
+        // Int unit_cents`. A previous reorder pre-pass
         // mis-identified the root Dict's brace range as the schema
         // body's range and overwrote it with `#main`'s methods. After
         // format, both schema bodies must still contain their
@@ -1663,7 +1849,7 @@ mod tests {
         assert!(
             formatted.contains("String sku:")
                 && formatted.contains("Int qty:")
-                && formatted.contains("Float unit_price:"),
+                && formatted.contains("Int unit_cents:"),
             "#schema LineItem body lost its declarations after format:\n{formatted}"
         );
         assert!(
@@ -1675,46 +1861,29 @@ mod tests {
             .find("#main(")
             .expect("expected #main block in pricing preset")];
         assert!(
-            !schema_section.contains("currency(symbol, val)"),
-            "method `currency` leaked into schema section:\n{schema_section}"
+            !schema_section.contains("line_cents("),
+            "method `line_cents` leaked into schema section:\n{schema_section}"
         );
         assert!(
-            !schema_section.contains("volume_rate("),
-            "method `volume_rate` leaked into schema section:\n{schema_section}"
+            !schema_section.contains("volume_bps("),
+            "method `volume_bps` leaked into schema section:\n{schema_section}"
         );
     }
 
     #[test]
-    fn feature_flag_private_attached_to_key() {
-        // `#internal` is a pair-level pragma — it MUST sit on the
-        // immediately-preceding line of its pair's key. A previous
-        // paragraph-break pre-pass inserted a blank between
-        // `#internal` and `rules:`, severing the ownership.
+    fn workflow_private_attached_to_key() {
         let formatted = format_source(presets::FEATURE_FLAG).unwrap();
         assert!(
-            formatted.contains("#internal\n    rules:"),
-            "#internal must sit directly above `rules:` with no blank line:\n{formatted}"
+            !formatted.contains("native_hash"),
+            "feature flag preset must stay pure:\n{formatted}"
         );
-        assert!(
-            formatted.contains("#internal\n    hash_mod_100("),
-            "#internal must sit directly above `hash_mod_100(`:\n{formatted}"
-        );
-        // Defensive: no double-newline between `#internal` and any pair key.
-        assert!(
-            !formatted.contains("#internal\n\n"),
-            "found a blank line directly after `#internal`:\n{formatted}"
-        );
-    }
 
-    #[test]
-    fn pricing_private_attached_to_key() {
-        let formatted = format_source(presets::PRICING).unwrap();
+        let formatted = format_source(presets::WORKFLOW).unwrap();
         for pair in [
-            "currency(symbol, val):",
-            "volume_rate(sub):",
-            "loyalty_rate(tier):",
-            "tax_rate:",
-            "sum_floats(xs):",
+            "Bool is_event(",
+            "String route_state():",
+            "List<String> pay_effects:",
+            "List<String> unhandled_effects:",
         ] {
             let expected = format!("#internal\n    {pair}");
             assert!(
@@ -1729,13 +1898,36 @@ mod tests {
     }
 
     #[test]
-    fn pricing_decorator_attached_to_key() {
-        // `@currency("USD")` is a decorator attached to
-        // `total_display:`. Must stay glued to its key.
+    fn pricing_private_attached_to_key() {
         let formatted = format_source(presets::PRICING).unwrap();
+        for pair in [
+            "Int line_cents(",
+            "Int volume_bps(",
+            "Int loyalty_bps(",
+            "Int prorate(",
+            "String cents_pair(",
+            "String money(",
+        ] {
+            let expected = format!("#internal\n    {pair}");
+            assert!(
+                formatted.contains(&expected),
+                "#internal must sit directly above `{pair}`:\n{formatted}"
+            );
+        }
         assert!(
-            formatted.contains("@currency(\"USD\")\n    total_display:"),
-            "@currency decorator must sit directly above `total_display:`:\n{formatted}"
+            !formatted.contains("#internal\n\n"),
+            "found a blank line directly after `#internal`:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn pricing_import_stays_before_schemas() {
+        let formatted = format_source(presets::PRICING).unwrap();
+        let import = formatted.find("#import list").expect("import missing");
+        let schema = formatted.find("#schema LineItem").expect("schema missing");
+        assert!(
+            import < schema,
+            "std import must stay before schemas:\n{formatted}"
         );
     }
 
@@ -1749,8 +1941,8 @@ mod tests {
             "#expect must sit directly above `Int qty:`:\n{formatted}"
         );
         assert!(
-            formatted.contains("#expect \"unit_price must be >= 0\"\n    Float unit_price:"),
-            "#expect must sit directly above `Float unit_price:`:\n{formatted}"
+            formatted.contains("#expect \"unit_cents must be >= 0\"\n    Int unit_cents:"),
+            "#expect must sit directly above `Int unit_cents:`:\n{formatted}"
         );
         assert!(
             formatted
@@ -1760,15 +1952,19 @@ mod tests {
     }
 
     #[test]
-    fn workflow_brand_directives_attached_to_dict() {
-        // `#brand Transition { ... }` is a Value-shape directive
-        // attached to the inline Dict that follows. Must stay
-        // adjacent — no blank line between `#brand Transition` and
-        // its `{`.
+    fn demo_brand_directives_attached_to_dict() {
+        // `#brand Check { ... }` is a Value-shape directive attached
+        // to the inline Dict that follows. Must stay adjacent.
         let formatted = format_source(presets::WORKFLOW).unwrap();
         assert!(
-            formatted.contains("#brand Transition {"),
-            "#brand Transition must precede its {{ on the same logical block:\n{formatted}"
+            !formatted.contains("#brand Transition"),
+            "workflow preset no longer uses transition brands:\n{formatted}"
+        );
+
+        let formatted = format_source(presets::DEMO).unwrap();
+        assert!(
+            formatted.contains("#brand Check {"),
+            "#brand Check must precede its {{ on the same logical block:\n{formatted}"
         );
     }
 

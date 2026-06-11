@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.1.0-rc2] — 2026-06-11
+
+This release track narrows the public contract before the first public
+release. It does not add syntax, promote a new backend tier, or promise
+machine-readable diagnostics.
+
+### Stable core
+
+- Parser, analyzer, tree-walk evaluator, facade API, CLI, formatter,
+  docs, and LSP basics remain the Tier 1 release surface.
+- Cranelift AOT remains the Tier 2 default native-performance path when
+  source is compatible with compiled execution.
+- The stable user stdlib surface is the documented module API:
+  `list.*`, `dict.*`, `string.*` except `string.glob_match`, `math.*`,
+  `is.*`, `value.default`, and language builtins `len`, `range`, `type`.
+
+### Preview / advanced surface
+
+- LLVM AOT, Rust build-time AOT, object cache/link integration, wasm
+  bindings, and playground bindings remain Tier 3 or host-owned paths.
+- Portable implementation intrinsics such as `_list_*`, `_string_*`,
+  `_dict_*`, and `_math_*` are implementation contracts, not recommended
+  user API.
+- `ensure.*` remains a schema-internal stable contract and is not
+  promoted as ordinary user-facing stdlib.
+
+### Not promised
+
+- No JSON diagnostic output in the first public release.
+- No implicit trust, OS sandbox, or multi-tenant security boundary from
+  `Context::sandboxed()` alone; untrusted execution must use an explicit
+  VM, process, container, or host boundary.
+- No automatic `Backend::Auto + TrustLevel::Trusted` dispatch in the
+  first public release; use `Backend::TreeWalk` for trusted local imports
+  or staged host fns.
+- No Wasmtime helper crate or complete VM runtime product; `host-policy`
+  emits operator-owned templates for Wasmtime/process/container wiring.
+- No `config.relon` layer.
+- No promotion of legacy runtime-only stdlib names, including
+  `string.glob_match`, without analyzer signatures, docs, and backend
+  tests.
+
 ## [Unreleased] — Schema-rooted dispatch (trait-bound foundation)
 
 ### Breaking: `relon-object-cache` — `IntegrityMode::TrustOnWrite` removed

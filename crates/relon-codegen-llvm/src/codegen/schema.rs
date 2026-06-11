@@ -43,8 +43,6 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// [`relon_ir::ir::Op::LoadSchemaPtr`]: `local.get $in_ptr;
     /// i32.load offset=N; <add in_ptr>`.
     ///
-    /// No bounds check (Phase B/C/D LLVM emitter trusts the IR + relies
-    /// on the host trap for UB, matching the other `Load*Ptr` paths).
     fn emit_load_schema_ptr(&mut self, _ip_hint: &str, offset: u32) -> Result<(), LlvmError> {
         let arena_base_ptr = self.arena_base_ptr.ok_or_else(|| {
             LlvmError::Codegen("Op::LoadSchemaPtr outside buffer-protocol entry shape".into())
@@ -57,7 +55,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         // so the loaded value is the schema instance's arena-relative base
         // directly — no `+ in_ptr` rebase. LoadFieldAtAbsolute adds
         // `arena_base` itself.
-        let slot_addr = self.compute_buffer_addr(arena_base_ptr, in_ptr_i32, offset)?;
+        let slot_addr = self.compute_buffer_addr(arena_base_ptr, in_ptr_i32, offset, 4)?;
         let name = self.next_name("schemaptr_abs");
         let abs = self
             .builder

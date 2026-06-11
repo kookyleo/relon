@@ -189,7 +189,8 @@ npm run docs:dev     # 本地起 VitePress，导航栏 Playground 即可用
 
 浏览器内与宿主嵌入是同一姿势：绑定层用 `Context::sandboxed()` 构
 造求值上下文，能力**默认全拒**，并且不向不可信的浏览器用户暴露任
-何 `--trust` 式开关。
+何 `--trust` 式开关。这是 capability 姿态；通用边界模型见
+[威胁模型](./threat-model.md)。
 
 - 没有文件系统模块解析器：`#import` 只能命中 `sources` 表中的文件
   或 `std/*` 虚拟模块；引用表里不存在的路径在分析期即报
@@ -197,4 +198,5 @@ npm run docs:dev     # 本地起 VitePress，导航栏 Playground 即可用
 - 任何触碰真实能力（文件、宿主原生函数等）的调用都会干净地以
   `CapabilityDenied` 失败，呈现为 `EvalError`。
 
-能力模型的完整说明见[沙箱与权限](./sandbox.md)。
+边界声明见 [威胁模型](./threat-model.md)，能力模型的完整说明见
+[沙箱与权限](./sandbox.md)。

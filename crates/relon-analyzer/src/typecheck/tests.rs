@@ -8,7 +8,7 @@ use super::*;
 use crate::analyze;
 use crate::sig::{type_node_simple, FnParam, FnSignature};
 use relon_parser::parse_document;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 fn analyze_str(src: &str) -> AnalyzedTree {
     let node = parse_document(src).unwrap();
@@ -1564,6 +1564,60 @@ fn stage3_stdlib_signatures_cover_all_register_fn_names() {
     assert!(
         missing.is_empty(),
         "stdlib functions without analyzer signatures: {missing:?}"
+    );
+}
+
+fn stdlib_manifest_names(marker: &str) -> BTreeSet<String> {
+    let path =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/en/guide/stdlib.md");
+    let doc =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let start = format!("<!-- {marker}:start -->");
+    let end = format!("<!-- {marker}:end -->");
+    let section = doc
+        .split_once(&start)
+        .and_then(|(_, rest)| rest.split_once(&end).map(|(section, _)| section))
+        .unwrap_or_else(|| panic!("stdlib.md must contain {marker} markers"));
+
+    let names: BTreeSet<String> = section
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("| `")?;
+            let (name, _) = rest.split_once('`')?;
+            Some(name.to_string())
+        })
+        .collect();
+
+    assert!(
+        !names.is_empty(),
+        "{marker} marker section listed no callable names"
+    );
+    names
+}
+
+/// Public-doc drift defense: every analyzer-known stdlib callable must
+/// appear in the stable manifest. Runtime-only evaluator registrations
+/// are checked from the evaluator crate; this side guards the release
+/// promise that analyzer signatures are documented before they become
+/// stable surface.
+#[test]
+fn stable_stdlib_manifest_covers_analyzer_signatures() {
+    let user_manifest = stdlib_manifest_names("relon-stdlib-user-manifest");
+    let internal_manifest = stdlib_manifest_names("relon-stdlib-internal-manifest");
+    let mut manifest = internal_manifest;
+    for builtin in ["len", "range", "type"] {
+        if user_manifest.contains(builtin) {
+            manifest.insert(builtin.to_string());
+        }
+    }
+
+    let analyzer_known: BTreeSet<String> = crate::stdlib_signatures::stdlib_fn_names()
+        .map(str::to_string)
+        .collect();
+    let missing: Vec<&String> = analyzer_known.difference(&manifest).collect();
+    assert!(
+        missing.is_empty(),
+        "analyzer stdlib signatures missing from docs/en/guide/stdlib.md manifest: {missing:?}"
     );
 }
 

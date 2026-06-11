@@ -11,6 +11,8 @@
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde_json::Value as JsonValue;
+
 const BINARY: &str = env!("CARGO_BIN_EXE_relon-cli");
 
 /// Per-call counter so parallel tests in this file each get a unique
@@ -22,17 +24,24 @@ const BINARY: &str = env!("CARGO_BIN_EXE_relon-cli");
 /// missing path. The counter discriminates every invocation.
 static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+fn write_fixture(prefix: &str, source: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "relon-cli-{prefix}-{}-{}.relon",
+        std::process::id(),
+        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
+    ));
+    std::fs::write(&path, source).expect("write fixture");
+    path
+}
+
 /// Write a one-off `#main(Int x) -> Int : x * 2` source file under
 /// the system temp dir and run the CLI against it with the supplied
 /// backend flag plus `--args`. Returns the captured stdout (utf-8).
 fn run_doubler(backend: &str) -> String {
-    let path = std::env::temp_dir().join(format!(
-        "relon-cli-backend-{}-{}-{}.relon",
-        std::process::id(),
-        FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed),
-        backend.replace('-', "_"),
-    ));
-    std::fs::write(&path, "#main(Int x) -> Int\nx * 2\n").expect("write fixture");
+    let path = write_fixture(
+        &format!("backend-{}", backend.replace('-', "_")),
+        "#main(Int x) -> Int\nx * 2\n",
+    );
 
     let output = Command::new(BINARY)
         .arg("run")
@@ -71,6 +80,236 @@ fn backends_produce_identical_output() {
     let tw = run_doubler("tree-walk");
     let aot = run_doubler("cranelift-aot");
     assert_eq!(tw, aot, "tree-walk vs cranelift-aot output differs");
+}
+
+#[test]
+fn budget_profile_runs_under_default_auto() {
+    let path = write_fixture("budget-profile", "#main(Int x) -> Int\nx + 1\n");
+    let output = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--budget")
+        .arg("dev")
+        .arg("--args")
+        .arg(r#"{"x": 41}"#)
+        .output()
+        .expect("spawn relon CLI");
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        output.status.success(),
+        "budget profile should run: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
+}
+
+#[test]
+fn max_steps_limit_surfaces_runtime_error() {
+    let path = write_fixture("max-steps", "#main(Int x) -> Int\nx + 1\n");
+    let output = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--max-steps")
+        .arg("1")
+        .arg("--args")
+        .arg(r#"{"x": 41}"#)
+        .output()
+        .expect("spawn relon CLI");
+    let _ = std::fs::remove_file(&path);
+
+    assert!(!output.status.success(), "tight step budget must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Step limit exceeded"),
+        "stderr should mention step exhaustion, got: {stderr}"
+    );
+}
+
+#[test]
+fn max_value_elements_limit_surfaces_runtime_error() {
+    let path = write_fixture("max-value-elements", "[1, 2]\n");
+    let output = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--max-value-elements")
+        .arg("1")
+        .output()
+        .expect("spawn relon CLI");
+    let _ = std::fs::remove_file(&path);
+
+    assert!(!output.status.success(), "tight value budget must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Value too large"),
+        "stderr should mention value size, got: {stderr}"
+    );
+}
+
+#[test]
+fn max_output_bytes_limit_rejects_serialized_output() {
+    let path = write_fixture("max-output-bytes", "{ message: \"too long\" }\n");
+    let output = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--max-output-bytes")
+        .arg("1")
+        .output()
+        .expect("spawn relon CLI");
+    let _ = std::fs::remove_file(&path);
+
+    assert!(!output.status.success(), "tight output budget must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("JSON output exceeded --max-output-bytes"),
+        "stderr should mention output limit, got: {stderr}"
+    );
+}
+
+#[test]
+fn max_source_bytes_limit_rejects_before_parse() {
+    let path = write_fixture("max-source-bytes", "{ message: \"too long\" }\n");
+    let output = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--max-source-bytes")
+        .arg("1")
+        .output()
+        .expect("spawn relon CLI");
+    let _ = std::fs::remove_file(&path);
+
+    assert!(!output.status.success(), "tight source budget must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Relon source exceeded --max-source-bytes"),
+        "stderr should mention source limit, got: {stderr}"
+    );
+}
+
+#[test]
+fn cranelift_aot_rejects_evaluator_budget_flags() {
+    let path = write_fixture("aot-budget-reject", "#main(Int x) -> Int\nx + 1\n");
+    let output = Command::new(BINARY)
+        .arg("run")
+        .arg(&path)
+        .arg("--backend")
+        .arg("cranelift-aot")
+        .arg("--max-steps")
+        .arg("1")
+        .arg("--args")
+        .arg(r#"{"x": 41}"#)
+        .output()
+        .expect("spawn relon CLI");
+    let _ = std::fs::remove_file(&path);
+
+    assert!(!output.status.success(), "AOT budget mismatch must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("currently require `--backend tree-walk`"),
+        "stderr should explain unsupported AOT budget, got: {stderr}"
+    );
+}
+
+#[test]
+fn check_reports_tree_walk_compatibility_without_running() {
+    let path = write_fixture("check-tree-walk", "{ answer: 42 }\n");
+    let output = Command::new(BINARY)
+        .arg("check")
+        .arg(&path)
+        .arg("--backend")
+        .arg("tree-walk")
+        .output()
+        .expect("spawn relon CLI");
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        output.status.success(),
+        "check should succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("ok: analyzer"));
+    assert!(stdout.contains("backend tree-walk: compatible"));
+}
+
+#[test]
+fn check_rejects_library_mode_for_cranelift_aot() {
+    let path = write_fixture("check-cranelift-library", "{ answer: 42 }\n");
+    let output = Command::new(BINARY)
+        .arg("check")
+        .arg(&path)
+        .arg("--backend")
+        .arg("cranelift-aot")
+        .output()
+        .expect("spawn relon CLI");
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        !output.status.success(),
+        "cranelift check should reject no-main source"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cranelift-aot requires `#main(...)`"),
+        "stderr should explain backend incompatibility, got: {stderr}"
+    );
+}
+
+#[test]
+fn host_policy_wasmtime_json_defaults_to_untrusted() {
+    let output = Command::new(BINARY)
+        .arg("host-policy")
+        .arg("--target")
+        .arg("wasmtime")
+        .output()
+        .expect("spawn relon CLI");
+
+    assert!(
+        output.status.success(),
+        "host-policy should succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: JsonValue = serde_json::from_slice(&output.stdout).expect("host-policy emits JSON");
+    assert_eq!(json["target"], "wasmtime");
+    assert_eq!(json["profile"], "untrusted");
+    assert_eq!(json["engine"]["consume_fuel"], true);
+    assert_eq!(json["engine"]["epoch_interruption"], true);
+    assert_eq!(json["store"]["fuel"], 1_000_000);
+    assert_eq!(
+        json["store"]["limits"]["memory_size_bytes"],
+        16 * 1024 * 1024
+    );
+    assert_eq!(json["host"]["output_bytes"], 8 * 1024 * 1024);
+    assert_eq!(json["host"]["wasi"], "deny-by-default");
+}
+
+#[test]
+fn host_policy_wasmtime_rust_snippet_mentions_enforcement_points() {
+    let output = Command::new(BINARY)
+        .arg("host-policy")
+        .arg("--target")
+        .arg("wasmtime")
+        .arg("--profile")
+        .arg("dev")
+        .arg("--format")
+        .arg("rust")
+        .output()
+        .expect("spawn relon CLI");
+
+    assert!(
+        output.status.success(),
+        "host-policy rust should succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("config.consume_fuel(true);"));
+    assert!(stdout.contains("config.epoch_interruption(true);"));
+    assert!(stdout.contains("StoreLimitsBuilder::new()"));
+    assert!(stdout.contains("store.limiter(|state| &mut state.limits);"));
+    assert!(stdout.contains("store.set_fuel(5000000)?;"));
+    assert!(stdout.contains("engine.increment_epoch()"));
 }
 
 /// F1b: a cross-region object return
@@ -316,7 +555,7 @@ fn deep_chain_list_return_cjk_byte_equal_across_backends() {
     );
 }
 
-/// `--trust` is honoured by tree-walk + bytecode but is a no-op on the
+/// `--trust` is honoured by tree-walk but is a no-op on the
 /// cranelift-AOT backend (no host-fn registry to grant capabilities
 /// from). It must NOT be silently dropped: the CLI warns on stderr so
 /// the operator is not misled, while the run still succeeds. tree-walk,
@@ -411,8 +650,8 @@ fn lite_mode_matches_default_on_scalar_main() {
     assert_eq!(default_out, lite_out, "default vs --lite output differs");
 }
 
-/// v6-fix-D2: `--lite` is incompatible with cranelift-AOT / bytecode
-/// — the flag's contract is "force tree-walk plus skip heavy lazy
+/// v6-fix-D2: `--lite` is incompatible with cranelift-AOT — the flag's
+/// contract is "force tree-walk plus skip heavy lazy
 /// init", so a conflicting `--backend` argument must surface as a
 /// clean error rather than silently swap the backend.
 #[test]

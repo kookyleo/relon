@@ -182,11 +182,9 @@ pub fn builtin_stdlib() -> &'static [StdlibFunction] {
             full_casefold_lookup_helper(),
             final_sigma_check_helper(),
             // F-D7-D (2026-05-20): `contains(haystack, needle) -> Bool`.
-            // Lives at index 36 — the slot the trace recorder pins via
-            // [`relon_trace_recorder::lowering::STDLIB_IDX_CONTAINS`].
-            // Body is naive O(s_len * p_len); the JIT side has the F-D7-C
-            // inline lowering for short const needles, so the body cost is
-            // only seen on the cold / tree-walk path.
+            // Lives at index 36, the fixed slot native string fast paths
+            // dispatch against. Body is naive O(s_len * p_len); optimized
+            // native paths can intercept the slot for hot compiled rows.
             contains_string(),
             // 2026-05-21: `glob_match(s, pattern) -> Bool`.
             // Lives at index 37 (pinned via `GLOB_MATCH_INDEX`). Tier-2

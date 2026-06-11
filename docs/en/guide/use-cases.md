@@ -42,18 +42,19 @@ This is the load-bearing axis that governs every other design choice:
   the same `.relon` library; type contracts backed by `#schema`
   prevent the data shape from warping in transit.
 
-### B. Capability-Granted sandbox
+### B. Capability-granted execution posture
 
 - **Essence**: a pure-function VM with a step counter and zero default
   I/O privileges.
 - **Pain point**: SaaS platforms need to let users author custom
   rules. Running JS is risky; modeling logic as JSON is too clunky.
-- **Relon advantage**: sandboxed by default and very lightweight.
-  Step counts, value sizes, and native-fn allowlists are all
-  controlled explicitly through `Capabilities`. Scripts have **no**
-  fallback to bypass the sandbox.
+- **Relon advantage**: zero ambient authority by default and very
+  lightweight. Step counts, value sizes, and native-fn allowlists are
+  all controlled explicitly through `Capabilities`. Scripts have **no**
+  fallback to bypass host grants.
 
-See [Sandbox & capabilities](./sandbox) for details.
+See [Threat model](./threat-model) for the security boundary and
+[Sandbox & capabilities](./sandbox) for operational details.
 
 ### C. Context-aware references
 

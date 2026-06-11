@@ -7,17 +7,19 @@ Rust runtime evaluate it **deterministically** — the same source plus
 the same input always produces a byte-identical result.
 
 > **One-liner**: Logic as data — write the rule once, store it like
-> JSON, evaluate it deterministically inside a sandbox.
+> JSON, evaluate it deterministically with explicit host authority.
 
 ## What this commits us to (the hard constraints)
 
 * **Same source + same input → same output.** Dict iteration is
   `BTreeMap`-ordered; floats are IEEE-754 `f64`; the script reads no
   environment variables, system clock, or RNG.
-* **Sandboxed by default, no escape hatch.** Scripts have zero ambient
+* **No implicit trust.** Scripts have zero ambient
   privileges. Filesystem, network, native functions are all gated by
-  `Capabilities` and granted explicitly by the host. There is no
-  "trusted mode" that lets a script bypass that consent.
+  `Capabilities` and granted explicitly by the host. Host-owned code
+  may opt into full trust, but that grant must be explicit and
+  auditable; scripts cannot bypass host consent on their own. For the
+  security boundary, see [Threat model](./threat-model).
 * **The std library is part of the language.** `std/list`,
   `std/string`, `std/math`, … ship with the runtime — scripts can
   `#import` them without the embedder wiring anything up. Authors
@@ -35,7 +37,7 @@ Treat Relon as a small toolkit purpose-built for business configuration:
 - **JSON-like syntax**: it reads like JSON with expressions, directives, decorators, and references. People who already know JSON pick it up in minutes.
 - **Typed schemas**: `#schema` defines contracts, with sum-type tagged enums, recursive schemas, custom validation messages, and computed defaults.
 - **Host extensions**: register native functions and decorator plugins from Rust; ship shared schemas / helpers in `.relon`; tie the two sides together with `#import`.
-- **Sandboxed by default**: `Capabilities` control filesystem reads, evaluation budgets, and value sizes; native fns are admitted by the capability bits they declare on `NativeFnGate` — there is no by-name allowlist.
+- **Capability posture by default**: `Capabilities` control filesystem reads, evaluation budgets, and value sizes; native fns are admitted by the capability bits they declare on `NativeFnGate` — there is no by-name allowlist.
 
 ## Who writes what — the two-tier model
 
@@ -93,13 +95,13 @@ let json = relon::json_from_file_trusted("app/main.relon")?;
 println!("{}", serde_json::to_string_pretty(&json)?);
 ```
 
-> The default entry `json_from_file` is **sandboxed**: scripts hold
-> zero ambient privileges, so the `#import` here would be denied
-> filesystem access. That's why this example uses
+> The default entry `json_from_file` uses the sandboxed posture:
+> scripts hold zero ambient privileges, so the `#import` here would be
+> denied filesystem access. That's why this example uses
 > `json_from_file_trusted` (host-owned scripts only); when running
-> untrusted scripts, stay on the sandboxed entry and grant the needed
-> `Capabilities` explicitly — see
-> [Sandbox & capabilities](./sandbox).
+> untrusted scripts, keep explicit capabilities narrow and use the
+> appropriate VM/process boundary — see [Threat model](./threat-model)
+> and [Sandbox & capabilities](./sandbox).
 
 Output (note that the `Email` layer is the externally-tagged sum-type form):
 

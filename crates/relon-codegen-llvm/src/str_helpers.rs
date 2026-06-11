@@ -21,15 +21,14 @@
 //! a hardware-assisted byte scan in `libc` / Rust's vectorised slice
 //! primitives.
 //!
-//! ## Why not reuse the trace-jit shim?
+//! ## Why not reuse another native string shim?
 //!
-//! `relon_trace_jit::runtime::__relon_str_contains` accepts
-//! `*const StringRef` — a heap-style header carrying `(ptr, len, hash)`.
-//! The LLVM AOT pipeline never materialises that header; it stores
-//! strings as `[len: u32 LE][utf8 bytes]` records inside the per-call
-//! arena (see `ConstPool` doc in `emitter.rs`). Calling the trace-jit
-//! shim would force a per-iter `StringRef` materialisation in the hot
-//! loop — strictly worse than just passing two arena pointers and
+//! Other native string shims may use heap-style headers carrying `(ptr,
+//! len, hash)`. The LLVM AOT pipeline never materialises that header; it
+//! stores strings as `[len: u32 LE][utf8 bytes]` records inside the per-call
+//! arena (see `ConstPool` doc in `emitter.rs`). Reusing a header-oriented
+//! shim would force a per-iter record materialisation in the hot loop —
+//! strictly worse than just passing two arena pointers and
 //! reading the headers in-shim.
 //!
 //! ## ABI
@@ -126,11 +125,10 @@ unsafe fn read_record(ptr: *const u8) -> Option<&'static [u8]> {
 /// equality against a single MRU slot lets the steady-state 999/1000
 /// iters skip the per-call FFI / UTF-8 / `str::contains` work entirely.
 ///
-/// Mirrors the trace-JIT's `__relon_str_contains` IC
-/// (`relon_trace_jit::runtime::str_ops::STR_CONTAINS_IC`) — the LLVM
-/// AOT side replays the same pattern because the const-pool arena
-/// layout produces the same `(stable_ptr, stable_ptr)` workload shape
-/// the trace-JIT bench validates.
+/// Mirrors the string-containment inline-cache shape used by other
+/// native fast paths: the LLVM AOT side replays the same pattern because
+/// the const-pool arena layout produces a stable `(haystack, needle)`
+/// workload shape.
 ///
 /// ## Phase G: process-global atomic slot instead of thread-local
 ///

@@ -31,7 +31,9 @@ use std::sync::{Arc, Mutex};
 // resolving unchanged. The enforcement machinery that references
 // eval-api types — `CapabilityGate`, `GatedNativeFn`, `NativeFnCaps` —
 // stays in this crate.
-pub use relon_cap::{Capabilities, CapabilityBit, NativeFnGate};
+pub use relon_cap::{
+    Capabilities, CapabilityBit, NativeFnGate, ResourceBudget, ResourceBudgetProfile,
+};
 
 /// Internal helper: a registered native function with its capability gate.
 /// `pub` so backend crates can read both the underlying `func` and the

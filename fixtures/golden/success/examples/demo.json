@@ -1,14 +1,22 @@
 {
-  "meta": {
-    "summary": "Active project: Relon Modern",
-    "tags_count": 3
-  },
-  "project": {
-    "details": {
-      "base_price": 1500,
-      "display": "1800 GBP",
-      "total": 1800.0
+  "blockers": [],
+  "checks": [
+    {
+      "name": "schema_migration",
+      "pass": true,
+      "severity": 3
     },
-    "name": "Relon Modern"
-  }
+    {
+      "name": "capacity_headroom",
+      "pass": true,
+      "severity": 2
+    },
+    {
+      "name": "kill_switch",
+      "pass": true,
+      "severity": 3
+    }
+  ],
+  "decision": "ship",
+  "summary": "ship: 0 blockers"
 }

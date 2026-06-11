@@ -59,27 +59,24 @@ use crate::state::HostFnRegistry;
 /// `SandboxConfig` field-for-field so a side-by-side comparison of the
 /// two AOT backends shares the same knob surface.
 ///
-/// The four bools are independent; turning any of them off elides the
-/// matching codegen path entirely, which is useful for the bench
-/// scenarios that want to measure raw arithmetic without sandbox
-/// overhead. Production builds always have every guard enabled — these
-/// knobs exist for benchmarking and host-side debugging only.
-///
-/// Phase C wires `capability_check` (the `Op::CheckCap` gate, already
-/// emitted in `codegen/call.rs`) and `div_check` (the `sdiv`/`srem`
-/// zero-guard already emitted in `codegen/arith.rs`). `bounds_check` and
-/// `deadline_check` are reserved for the LLVM bounds / deadline work
-/// that lands alongside the wider emitter; the fields exist now so the
-/// config surface stays a stable mirror of cranelift's.
+/// Production LLVM buffer entries emit the guard surface unconditionally:
+/// arena bounds checks, div/mod guards, checked signed `Int` arithmetic,
+/// capability gates, dynamic host-call trap lifting, and deterministic
+/// step-budget fuel. This struct stays field-compatible with cranelift's
+/// configuration so tests and host code can describe the same policy
+/// intent across backends. The booleans are bench/debug intent records
+/// for LLVM today; they should not be used to create a trusted execution
+/// posture for untrusted source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxConfig {
-    /// When `true`, every host-visible memory load is preceded by a
-    /// bounds check against the arena byte length. Reserved for the
-    /// LLVM bounds-check work; the emitter does not yet read it.
+    /// When `true`, host-visible memory access should be guarded
+    /// against the arena byte length. LLVM buffer entries currently emit
+    /// these guards unconditionally.
     pub bounds_check: bool,
-    /// When `true`, the entry prologue reads the deadline and the loop
-    /// body cadence inserts deadline rechecks. Reserved for the LLVM
-    /// deadline work; the emitter does not yet read it.
+    /// When `true`, resource exhaustion should be enforced. LLVM uses
+    /// deterministic step-budget fuel configured on `LlvmAotEvaluator`
+    /// rather than reading this bool directly as a wall-clock deadline
+    /// switch.
     pub deadline_check: bool,
     /// When `true`, `Op::CheckCap` bakes the `caps`-bitmask test into
     /// the emitted object. The `codegen/call.rs` lowering already emits
@@ -126,28 +123,30 @@ impl SandboxConfig {
 /// the `Op::CheckCap` trap arm.
 ///
 /// Only the subset the LLVM native path can currently raise
-/// (`DivisionByZero` via the `sdiv`/`srem` guard, `CapabilityDenied` via
-/// `Op::CheckCap`, `HostFnMissing`/`HostFnError` via dynamic dispatch) is
-/// reachable today; the remaining variants are kept so the numbering
-/// stays a faithful mirror of cranelift's for the bounds / deadline work
-/// that lands with the wider emitter.
+/// (`DivisionByZero` via the `sdiv`/`srem` guard, `BoundsViolation`
+/// via arena guards, `CapabilityDenied` via `Op::CheckCap`,
+/// `NumericOverflow` via checked Int arithmetic / reductions, and
+/// `HostFnMissing`/`HostFnError` via dynamic dispatch) is reachable
+/// today; the remaining variants are kept so the numbering stays a
+/// faithful mirror of cranelift's for the deadline work that lands
+/// with the wider emitter.
 #[repr(u64)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxTrapKind {
-    /// Division (`Op::Div` / `Op::Mod`) by zero. On the LLVM path this
-    /// surfaces as an `llvm.trap` (`ud2`) today rather than a recorded
-    /// code — the variant exists for numbering parity with cranelift.
+    /// Division (`Op::Div` / `Op::Mod`) by zero. Buffer entries record
+    /// this code in `ArenaState::trap_code`; legacy/fast entries have no
+    /// typed error lane and still use `llvm.trap`.
     DivisionByZero = 1,
-    /// Pointer dereference walked past the arena bounds. Reserved for
-    /// the LLVM bounds-check work.
+    /// Pointer dereference walked past the arena bounds.
     BoundsViolation = 2,
     /// An `Op::CheckCap { cap_bit }` found the matching bit clear in the
     /// host-granted `caps` mask. Lifts to `RuntimeError::CapabilityDenied`.
     /// Matches cranelift's `TrapKind::CapabilityDenied` and
     /// [`crate::state::NativeTrap::CapabilityDenied`] (= 3).
     CapabilityDenied = 3,
-    /// Per-call wall-clock deadline elapsed. Reserved for the LLVM
-    /// deadline work.
+    /// Per-call resource budget exhausted. LLVM currently raises this
+    /// through deterministic step-budget fuel; a future wall-clock
+    /// deadline can reuse the same trap code.
     ResourceExhausted = 4,
     /// No host fn registered at the requested `import_idx`, or no
     /// registry installed. Matches cranelift's `TrapKind::Unreachable`
@@ -156,11 +155,9 @@ pub enum SandboxTrapKind {
     HostFnMissing = 5,
     /// Signed integer overflow. Matches cranelift's
     /// `TrapKind::NumericOverflow` (= 6) and
-    /// [`crate::state::NativeTrap::NumericOverflow`]. Raised today by
-    /// the bundled `list_int_sum` body's checked-reduction guard
-    /// (`Op::Trap { NumericOverflow }`); general `Op::Add` / `Op::Sub`
-    /// / `Op::Mul` overflow checks on the LLVM path remain reserved
-    /// for the overflow-check work.
+    /// [`crate::state::NativeTrap::NumericOverflow`]. Raised by checked
+    /// `Op::Add` / `Op::Sub` / `Op::Mul`, the `INT_MIN / -1` div/rem
+    /// guard, and bundled checked reductions such as `list_int_sum`.
     NumericOverflow = 6,
     /// A host fn returned an error, or a value outside the scalar return
     /// envelope. Matches [`crate::state::NativeTrap::HostFnError`] (= 7);

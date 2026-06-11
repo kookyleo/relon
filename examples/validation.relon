@@ -1,16 +1,33 @@
+/*
+  Load-time validation for an edge service.
+
+  A bad port, protocol, or health path fails before the host sees a
+  config object. There is no relaxed mode in this example.
+
+  Recommended backend: tree-walk (full-surface reference)
+  Expected output: fixtures/golden/success/examples/validation.json
+
+  Try:
+    cargo run -q -p relon-cli -- run --backend tree-walk examples/validation.relon
+*/
+
+#schema Endpoint {
+    String name: *,
+    #expect "port must be in the non-privileged TCP range"
+    Int port: (Int p) -> Bool => p >= 1024 && p <= 65535,
+    #expect "protocol must be http or https"
+    String protocol: (String p) -> Bool => p == "http" || p == "https",
+    #expect "health_path must be absolute"
+    String health_path: (String path) -> Bool => path.starts_with("/")
+}
+
 {
-    @ensure.int
-    @ensure.at_least(1024)
-    @ensure.at_most(65535)
-    "port": 80,
-    @ensure.string
-    @ensure.one_of([
-        "TCP",
-        "UDP"
-    ])
-    "protocol": "TCP",
-    "nested": {
-        @ensure.bool
-        "is_active": true
-    }
+    Endpoint public_api: {
+        name: "api",
+        port: 8443,
+        protocol: "https",
+        health_path: "/healthz"
+    },
+    bind: f"${&sibling.public_api.protocol}://0.0.0.0:${&sibling.public_api.port}",
+    probe: &sibling.public_api.health_path
 }

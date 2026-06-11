@@ -6052,7 +6052,7 @@ fn unprepared_shared_arc_panics_loudly() {
 /// dict-scope / closure-self-reference path surfaces a regression here
 /// rather than silently in the bench harness.
 ///
-/// IR-driven tiers (bytecode VM, trace-JIT, cranelift / LLVM AOT) do
+/// IR-driven tiers (Cranelift / LLVM AOT and future compiled targets) do
 /// **not** accept this source today — relon-ir's `lower_workspace_single`
 /// bails on `-> Dict` + `Expr::Closure` at a non-higher-order site. The
 /// Phase F.2 design doc (local-only) captures the lifting work; this

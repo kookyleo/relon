@@ -226,8 +226,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     ///      `llvm.trap` (surfaces as a typed host error);
     ///   5. push the i64 result if `ret_ty != Unit`.
     ///
-    /// Scope (phase-0b parity with the bytecode VM + the cranelift
-    /// dynamic path): scalar args ride the i64 lane; `ret_ty` must be
+    /// Scope: scalar args ride the i64 lane; `ret_ty` must be
     /// `I64` / `Bool` / `Unit`. The capability gate is enforced
     /// independently by the preceding `Op::CheckCap` op (which the
     /// source lowering always prepends for a gated call); a
@@ -626,7 +625,11 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// Requires the buffer-protocol entry (caller asserts `state_ptr`).
     /// After the terminator the caller positions at a fresh continuation
     /// block.
-    fn emit_state_trap(&mut self, code: NativeTrap, op_hint: &str) -> Result<(), LlvmError> {
+    pub(crate) fn emit_state_trap(
+        &mut self,
+        code: NativeTrap,
+        op_hint: &str,
+    ) -> Result<(), LlvmError> {
         let state_ptr = self.state_ptr.ok_or_else(|| {
             LlvmError::Codegen(format!("{op_hint}: state trap requires the buffer entry"))
         })?;

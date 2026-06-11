@@ -24,7 +24,8 @@ source + input combination covered by it:
    rejects every source it rejects.
 2. **Evaluate**: it produces a `Value` byte-identical to the reference.
 3. **Capability model**: it implements the `Capabilities` defined in
-   §4 with no escape hatch that lets a script bypass them.
+   §4 with no implicit trust path that lets a script bypass host
+   grants.
 4. **Standard library**: it implements every std module listed in §6
    with the documented semantics.
 5. **Error codes**: error kind tags use the stable list in §5 (the
@@ -242,10 +243,13 @@ caps.max_steps = Some(1_000_000); // step budget
 let ctx = Context::sandboxed().with_capabilities(caps);
 ```
 
-Or grant everything at once via `Capabilities::all_granted()` — but
-that's an explicit, auditable grant rather than an implicit "trusted"
-mode. **The spec forbids any `trusted()`-style shortcut constructor**:
-scripts must be able to observe what the host did and didn't grant.
+Or grant everything at once via `Capabilities::all_granted()`. That is
+allowed only as an explicit, auditable host decision, not as implicit
+trust hidden from review. Public shortcut APIs may exist for host-owned
+scripts, but their names and documentation must make the trust posture
+obvious (`--trust`, `*_trusted`, `TrustLevel::Trusted`); untrusted
+scripts must stay on the sandboxed path with narrowly granted
+capabilities.
 
 ### 4.3 std modules' special status
 
@@ -316,10 +320,15 @@ available unconditionally:
 |---|---|---|
 | `std/list` | `map`, `filter`, `reduce`, `contains`, `sum`, `avg`, `len`, `first`, `last`, `compact`, `flatten` | Functional list ops |
 | `std/dict` | `merge`, `keys`, `values`, `has_key` | Dict meta ops |
-| `std/string` | `split`, `join`, `replace`, `upper`, `lower`, `contains`, `glob_match` | String ops |
+| `std/string` | `split`, `join`, `replace`, `upper`, `lower`, `contains` | String ops |
 | `std/math` | `abs`, `max`, `min`, `clamp` | Numeric ops |
 | `std/is` | `int`, `string`, `bool`, `float`, `list`, `dict`, `number`, `empty` | Type predicates |
 | `std/value` | `default` | Fallback for `None` |
+
+The stable stdlib surface is the
+[Stable user API manifest](./stdlib#stable-user-api-manifest).
+`std/string.glob_match` is legacy/runtime-only for the first public
+release and is not promoted into the stable catalog.
 
 Each function's exact contract is defined by the reference
 implementation's `crates/relon-evaluator/src/std_relon/<name>.relon`
@@ -859,31 +868,22 @@ entry shape for `count` (`count(range(0))`, no buffer operand — the
 wasm object emitter rejects it loudly; the equivalent Buffer-entry
 source is verified four-way).
 
-**Tier-2 (tree-walker) only stdlib.** The tree-walker's free-fn
-registry holds ~76 `register_pure_fn` names
-(`crates/relon-evaluator/src/stdlib.rs`); the remainder of the
-JSON-Schema-parity wave is still registered **only in the
-tree-walker**. They have **no analyzer signatures** and are **absent
-from every compiled backend** (Cranelift / LLVM-native / wasm).
-Calling them under a
-compiled backend, or relying on them to be statically typed, will not
-behave like the tree-walker. The set is:
+**Legacy runtime-only registrations are not stable stdlib.** The
+tree-walker's internal free-fn registry still contains historical
+`register_pure_fn` names that have no analyzer signature and no
+compiled-backend slot. Those names are not part of the portable
+language surface, even if the reference evaluator can call them when
+the analyzer is bypassed. The stable user-facing stdlib is the
+[Standard library manifest](./stdlib#stable-user-api-manifest): it must
+be documented there and accepted by the analyzer's stdlib-signature
+table.
 
-* format predicates: `is_ipv4`, `is_ipv6`
-* string: `starts_with` (free-fn form; the method form has a
-  compiled registry slot), `matches` (regex-engine cap)
-* dict: `select_keys`, `omit_keys`
-* json / date: `to_json`, `parse_iso_date`
-
-These are **tier-2 / tree-walker-only**, and that is an
-**adjudicated design boundary**, not a backlog: `select_keys` /
-`omit_keys` / `parse_iso_date` return a Dict (compiled Dict values
-were adjudicated out of scope); `to_json` is composite → String
-(likewise adjudicated); `is_ipv4` / `is_ipv6` route through
-`core::net::Ipv*Addr::parse` and `matches` depends on a regex
-engine — neither has a wasm-portable body (engine / seam caps).
-Treat them as reference-evaluator conveniences, not portable
-language surface.
+Current runtime-only names are pinned by
+`crates/relon-evaluator/src/stdlib_drift_tests.rs`: adding a new
+free function without an analyzer signature fails tests, and giving a
+legacy name a real signature forces it out of the allowlist. This is a
+drift guard, not a product tier. Scripts should not depend on these
+names for portable behavior.
 
 **There is no `#strict` directive.** Strict static inference is the
 analyzer's **default** — you do not opt *in* to it. The only opt-out
@@ -958,7 +958,8 @@ nothing to stand on.
 
 Logic-as-Data replaces that framing. It means:
 
-* No "trusted mode" lets scripts bypass the sandbox.
+* No implicit trust lets scripts bypass the sandbox; any host opt-out
+  must be explicit and auditable.
 * No ambient global names for scripts to depend on implicitly
   (host-injected names are out of spec scope; authors choose
   whether to use them).

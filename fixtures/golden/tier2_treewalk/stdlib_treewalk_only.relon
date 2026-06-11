@@ -1,4 +1,4 @@
-// Tier-2 tree-walker-only stdlib coverage fixture.
+// Legacy runtime-only stdlib registration coverage fixture.
 //
 // Every function called here is registered by the evaluator's
 // `stdlib::register_to` (crates/relon-evaluator/src/stdlib.rs) but has
@@ -7,7 +7,8 @@
 // `ExpressionTypeUnknown: "call to <fn> has no static return type"`, so
 // this fixture is driven exclusively through the tree-walking evaluator
 // (see `stdlib_drift_tests.rs`), NOT through the cross-backend golden
-// harness in `crates/relon`. These functions are tree-walker-only; they
+// harness in `crates/relon`. These functions are runtime-only legacy
+// registrations; they
 // do NOT run on the cranelift / LLVM / wasm-AOT backends.
 {
     // math batch: sqrt / pow / round (banker's) / floor / ceil / in_range

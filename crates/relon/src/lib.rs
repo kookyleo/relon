@@ -62,7 +62,9 @@ pub use relon_codegen_cranelift::AotEvaluator;
 // backend-agnostic `Evaluator` trait re-export below so the
 // open-the-box [`EvaluatorBuilder`] path doesn't force a second
 // crate dep just to spell the return / arg types.
-pub use relon_eval_api::{Evaluator, RuntimeError, Scope, Value};
+pub use relon_eval_api::{
+    Evaluator, ResourceBudget, ResourceBudgetProfile, RuntimeError, Scope, Value,
+};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -669,6 +671,17 @@ pub enum BackendError {
     /// "the script can't see my fn" bug reports.
     #[error("backend does not support the requested feature: {0}")]
     UnsupportedFeature(String),
+
+    /// Source was rejected before parsing because the host installed a
+    /// source-byte preflight limit.
+    #[error(
+        "source {label} exceeded max_source_bytes: actual {actual} bytes, limit {limit} bytes"
+    )]
+    SourceTooLarge {
+        label: String,
+        actual: usize,
+        limit: usize,
+    },
 }
 
 /// Construct an [`relon_eval_api::Evaluator`] over `source` using the
@@ -745,7 +758,7 @@ pub(crate) fn build_tree_walk_evaluator_from_parsed(
     node: relon_parser::Node,
 ) -> std::result::Result<TreeWalkEvaluator, BackendError> {
     let analyzed = Arc::new(relon_analyzer::analyze(&node));
-    let mut ctx = Context::new()
+    let mut ctx = Context::sandboxed()
         .with_root(node)
         .with_analyzed(Arc::clone(&analyzed));
     TreeWalkEvaluator::prepare_in_place(&mut ctx);
@@ -977,81 +990,29 @@ mod tests {
 
     #[test]
     fn main_entry_examples_match_canonical_outputs() {
-        // Regression guard for the three `#main`-style examples added in
+        // Regression guard for the `#main`-style examples added in
         // commit 30e2b79. The library-mode golden runner above excludes
         // them because it doesn't push args; this test drives each
         // through `Evaluator::run_main` with the canonical `--args`
         // documented in each file's header and compares JSON output
         // against a golden snapshot under `fixtures/golden/examples_main/`.
-        //
-        // `examples/feature_flag.relon` requires a host-registered
-        // `native_hash(String) -> Int` (the example documents this in
-        // its header). This test wires a deterministic stand-in so the
-        // example actually runs; production hosts substitute siphash /
-        // blake3 / fxhash.
-        use relon_evaluator::{NativeArgs, RelonFunction};
-        use relon_parser::TokenRange;
-
-        struct StableHostHash;
-        impl RelonFunction for StableHostHash {
-            fn call(
-                &self,
-                args: NativeArgs,
-                range: TokenRange,
-            ) -> std::result::Result<Value, RuntimeError> {
-                let positional = args.into_positional();
-                if positional.len() != 1 {
-                    return Err(RuntimeError::TypeMismatch {
-                        expected: "1 argument".to_string(),
-                        found: positional.len().to_string(),
-                        range,
-                    });
-                }
-                let Value::String(s) = &positional[0] else {
-                    return Err(RuntimeError::TypeMismatch {
-                        expected: "String".to_string(),
-                        found: positional[0].type_name().to_string(),
-                        range,
-                    });
-                };
-                // Deterministic, byte-stable hash. Production hosts
-                // would swap in a real hash family; this one is good
-                // enough that the snapshot stays stable across
-                // platforms and rustc versions.
-                let mut h: i64 = 0;
-                for b in s.as_bytes() {
-                    h = h.wrapping_mul(31).wrapping_add(*b as i64);
-                }
-                Ok(Value::Int(h.wrapping_abs()))
-            }
-        }
-
-        type CtxSetup = fn(&mut Context);
-        let no_setup: CtxSetup = |_ctx: &mut Context| {};
-        let feature_flag_setup: CtxSetup = |ctx: &mut Context| {
-            ctx.register_pure_fn("native_hash", Arc::new(StableHostHash));
-        };
-
         let root = workspace_root();
-        let cases: &[(&str, &str, CtxSetup)] = &[
+        let cases: &[(&str, &str)] = &[
             (
                 "examples/feature_flag.relon",
-                r#"{"user": {"id": "alice-42", "region": "eu", "plan": "pro"}}"#,
-                feature_flag_setup,
+                r#"{"user": {"id": "alice-42", "region": "eu", "plan": "pro", "rollout_bucket": 17}}"#,
             ),
             (
                 "examples/pricing.relon",
-                r#"{"order": {"tier": "gold", "items": [{"sku": "BOOK-01", "qty": 3, "unit_price": 100.0}, {"sku": "PEN-09", "qty": 4, "unit_price": 50.0}, {"sku": "DESK-22", "qty": 1, "unit_price": 300.0}]}}"#,
-                no_setup,
+                r#"{"order": {"tier": "gold", "items": [{"sku": "BOOK-01", "qty": 3, "unit_cents": 10000}, {"sku": "PEN-09", "qty": 4, "unit_cents": 5000}, {"sku": "DESK-22", "qty": 1, "unit_cents": 30000}]}}"#,
             ),
             (
                 "examples/workflow.relon",
-                r#"{"state": "placed", "event": "pay"}"#,
-                no_setup,
+                r#"{"input": {"state": "placed", "event": "pay"}}"#,
             ),
         ];
 
-        for (rel_path, args_json, setup) in cases {
+        for (rel_path, args_json) in cases {
             let file = root.join(rel_path);
             let content = std::fs::read_to_string(&file)
                 .unwrap_or_else(|e| panic!("{rel_path}: failed to read: {e}"));
@@ -1060,10 +1021,9 @@ mod tests {
             let analyzed = Arc::new(relon_analyzer::analyze(&node));
             let args: std::collections::HashMap<String, Value> = serde_json::from_str(args_json)
                 .unwrap_or_else(|e| panic!("{rel_path}: args json: {e}"));
-            let mut ctx = Context::new()
+            let ctx = Context::new()
                 .with_root(node)
                 .with_analyzed(Arc::clone(&analyzed));
-            setup(&mut ctx);
             let evaluator = TreeWalkEvaluator::new(Arc::new(ctx));
             let value = evaluator
                 .run_main(&Arc::new(Scope::default()), args)
@@ -1087,7 +1047,6 @@ mod tests {
         for rel_path in [
             "fixtures/errors/circular.relon",
             "fixtures/errors/integer_overflow.relon",
-            "examples/validation.relon",
         ] {
             let path = root.join(rel_path);
             let error = value_from_file_trusted(&path).expect_err("expected fixture to fail");
@@ -1231,7 +1190,6 @@ mod tests {
         // (`r13_*`) + the wasm/llvm parity tests, and its CLI cross-
         // backend output is documented in the file header.
         let main_entry_examples: &[&Path] = &[
-            Path::new("examples/validation.relon"),
             Path::new("examples/feature_flag.relon"),
             Path::new("examples/pricing.relon"),
             Path::new("examples/workflow.relon"),

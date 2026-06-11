@@ -369,8 +369,9 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         let src_off_i32 = self.pop_int(ip_hint)?;
         let i32_t = self.ctx.i32_type();
         // Read the record's leading `[len: u32]` header to size the
-        // copy. `arena_addr_i32` resolves `arena_base + src_off`.
-        let src_abs = self.arena_addr_i32(src_off_i32)?;
+        // copy.
+        let src_abs =
+            self.arena_addr_i32_checked_const(src_off_i32, 4, "EmitTailRecord src len")?;
         let len_i32 = self
             .builder
             .build_load(i32_t, src_abs, "tail_rec_len")
@@ -420,7 +421,9 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .builder
             .build_int_add(out_ptr_i32, pre_cursor, "tail_rec_dst_off")
             .map_err(|e| LlvmError::Codegen(format!("EmitTailRecord dst off: {e}")))?;
-        let dst_ptr = self.arena_addr_i32(dst_off)?;
+        let dst_ptr = self.arena_addr_i32_checked(dst_off, record_size, "EmitTailRecord dst")?;
+        let src_ptr =
+            self.arena_addr_i32_checked(src_off_i32, record_size, "EmitTailRecord src")?;
         // The earlier `src_abs` GEP is still valid — both source and
         // destination pointers are pure address arithmetic off the
         // cached `arena_base_ptr`, no aliasing constraint between them.
@@ -430,7 +433,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .build_int_z_extend(record_size, i64_t, "tail_rec_size64")
             .map_err(|e| LlvmError::Codegen(format!("EmitTailRecord size zext: {e}")))?;
         self.builder
-            .build_memcpy(dst_ptr, align, src_abs, 1, rec64)
+            .build_memcpy(dst_ptr, align, src_ptr, 1, rec64)
             .map_err(|e| LlvmError::Codegen(format!("EmitTailRecord memcpy: {e}")))?;
         // Push the record's **arena-absolute** offset (`dst_off = out_ptr +
         // pre_cursor`, the F1 slot convention) for the parent record's
@@ -472,7 +475,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .build_int_add(out_ptr_i32, base_rel, "variant_record_abs")
             .map_err(|e| LlvmError::Codegen(format!("BuildVariantRecord abs add: {e}")))?;
 
-        let tag_addr = self.arena_addr_i32(record_abs)?;
+        let tag_addr =
+            self.arena_addr_i32_checked_const(record_abs, 1, "BuildVariantRecord tag")?;
         let tag_v = i8_t.const_int(u64::from(tag), false);
         self.builder
             .build_store(tag_addr, tag_v)
@@ -487,7 +491,12 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                     "variant_payload_off",
                 )
                 .map_err(|e| LlvmError::Codegen(format!("BuildVariantRecord slot off: {e}")))?;
-            let slot_addr = self.arena_addr_i32(slot_off)?;
+            let access_size = self.field_access_size(ty)?;
+            let slot_addr = self.arena_addr_i32_checked_const(
+                slot_off,
+                access_size,
+                "BuildVariantRecord slot",
+            )?;
             match ty {
                 IrType::I64 => {
                     self.builder.build_store(slot_addr, payload).map_err(|e| {
@@ -584,7 +593,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 })?
         };
 
-        let tag_addr = self.arena_addr_i32(record_abs)?;
+        let tag_addr =
+            self.arena_addr_i32_checked_const(record_abs, 1, "BuildVariantRecordScratch tag")?;
         let tag_v = i8_t.const_int(u64::from(tag), false);
         self.builder
             .build_store(tag_addr, tag_v)
@@ -601,7 +611,12 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 .map_err(|e| {
                     LlvmError::Codegen(format!("BuildVariantRecordScratch slot off: {e}"))
                 })?;
-            let slot_addr = self.arena_addr_i32(slot_off)?;
+            let access_size = self.field_access_size(ty)?;
+            let slot_addr = self.arena_addr_i32_checked_const(
+                slot_off,
+                access_size,
+                "BuildVariantRecordScratch slot",
+            )?;
             match ty {
                 IrType::I64 => {
                     self.builder.build_store(slot_addr, payload).map_err(|e| {
@@ -683,7 +698,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .build_int_add(out_ptr_i32, base_rel, "ptr_list_abs")
             .map_err(|e| LlvmError::Codegen(format!("BuildPointerList abs add: {e}")))?;
 
-        let header_addr = self.arena_addr_i32(header_abs)?;
+        let header_addr =
+            self.arena_addr_i32_checked_const(header_abs, 4, "BuildPointerList len")?;
         self.builder
             .build_store(header_addr, i32_t.const_int(u64::from(len), false))
             .map_err(|e| LlvmError::Codegen(format!("BuildPointerList len store: {e}")))?;
@@ -698,7 +714,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                     "ptr_list_slot",
                 )
                 .map_err(|e| LlvmError::Codegen(format!("BuildPointerList slot off: {e}")))?;
-            let slot_addr = self.arena_addr_i32(slot_off)?;
+            let slot_addr =
+                self.arena_addr_i32_checked_const(slot_off, 4, "BuildPointerList elem")?;
             self.builder
                 .build_store(slot_addr, elem)
                 .map_err(|e| LlvmError::Codegen(format!("BuildPointerList elem store: {e}")))?;
@@ -739,7 +756,9 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 "scratch_record_slot_off",
             )
             .map_err(|e| LlvmError::Codegen(format!("scratch record slot off: {e}")))?;
-        let addr = self.arena_addr_i32(slot_off)?;
+        let access_size = self.field_access_size(ty)?;
+        let addr =
+            self.arena_addr_i32_checked_const(slot_off, access_size, "StoreFieldAtRecordAbsolute")?;
         match ty {
             IrType::I64 => {
                 self.builder.build_store(addr, value).map_err(|e| {
@@ -847,34 +866,38 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             ))
         })?;
         let i32_t = self.ctx.i32_type();
-        let i64_t = self.ctx.i64_type();
         let i8_t = self.ctx.i8_type();
-        // Read the record-local offset, add `offset`, add `out_ptr`,
-        // then z-extend the sum into the i64 arena GEP index.
+        // Read the record-local offset, then compose
+        // `out_ptr + record_local + offset` in i64 before the bounds
+        // check so an extreme/corrupt i32 offset cannot wrap first and
+        // re-enter the arena as a small address.
         let record_base = self
             .builder
             .build_load(i32_t, slot, "record_base")
             .map_err(|e| LlvmError::Codegen(format!("record_base load: {e}")))?
             .into_int_value();
-        let off_const = i32_t.const_int(u64::from(offset), false);
+        let i64_t = self.ctx.i64_type();
+        let record_base64 = self
+            .builder
+            .build_int_z_extend(record_base, i64_t, "record_base64")
+            .map_err(|e| LlvmError::Codegen(format!("record_base64: {e}")))?;
+        let off_const = i64_t.const_int(u64::from(offset), false);
         let slot_off = self
             .builder
-            .build_int_add(record_base, off_const, "record_slot_off")
+            .build_int_add(record_base64, off_const, "record_slot_off")
             .map_err(|e| LlvmError::Codegen(format!("record_slot_off: {e}")))?;
         let out_ptr_i32 = self.lookup_param(2)?; // IR LocalGet(2) == out_ptr under buffer protocol
+        let out_ptr64 = self
+            .builder
+            .build_int_z_extend(out_ptr_i32, i64_t, "record_out_ptr64")
+            .map_err(|e| LlvmError::Codegen(format!("record_out_ptr64: {e}")))?;
         let total_off = self
             .builder
-            .build_int_add(out_ptr_i32, slot_off, "record_total_off")
+            .build_int_add(out_ptr64, slot_off, "record_total_off")
             .map_err(|e| LlvmError::Codegen(format!("record_total_off: {e}")))?;
-        let total_off64 = self
-            .builder
-            .build_int_z_extend(total_off, i64_t, "record_total_off_zext")
-            .map_err(|e| LlvmError::Codegen(format!("record_total_off zext: {e}")))?;
-        let addr = unsafe {
-            self.builder
-                .build_in_bounds_gep(i8_t, arena_base_ptr, &[total_off64], "record_dst")
-                .map_err(|e| LlvmError::Codegen(format!("record_dst GEP: {e}")))?
-        };
+        let access_size = self.field_access_size(ty)?;
+        self.emit_arena_bounds_check_const(total_off, access_size, "StoreFieldAtRecord")?;
+        let addr = self.arena_addr_from_base_offset(arena_base_ptr, total_off, "abs")?;
         // Emit the typed store. For `Bool` / `Unit`, narrow the i32
         // stack slot to i8 before writing — matches the on-wire
         // record layout. For pointer-indirect types (`String`,

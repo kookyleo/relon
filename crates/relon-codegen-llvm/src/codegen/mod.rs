@@ -1920,6 +1920,7 @@ fn emit_buffer_entry_impl<'ctx, 'cp>(
         }
     }
     emit.let_floor = relon_ir::ir::body_let_watermark(&func.body);
+    emit.emit_step_budget_check("entry")?;
     emit.lower_body(&func.body)?;
 
     Ok(llvm_fn)

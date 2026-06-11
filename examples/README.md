@@ -1,11 +1,30 @@
 # `examples/` — user-facing `.relon` showcases
 
 Small, self-contained `.relon` programs meant to be **read and run by
-users** evaluating the language:
+users** evaluating the language. They should stay strict by default,
+deterministic, and directly runnable:
 
 ```bash
-cargo run -p relon-cli -- run examples/demo.relon
+cargo run -q -p relon-cli -- run --backend tree-walk examples/demo.relon
 ```
+
+The three main learning tracks are:
+
+- **Schema-backed validation** — `examples/validation.relon`.
+- **Feature / pricing policy** — `examples/feature_flag.relon` and
+  `examples/pricing.relon`.
+- **Workflow / integration glue** — `examples/workflow.relon`.
+
+Every `.relon` file in this directory has a header with:
+
+- `Try:` — the canonical runnable command.
+- `Recommended backend:` — currently `tree-walk`, the full-surface
+  reference backend for learning examples.
+- `Expected output:` — the golden JSON path the command should match.
+
+Compiled backend coverage is tested separately in the fixture and parity
+suites; examples are the user-facing learning entry, while fixtures are
+the test corpus.
 
 Distinct from the two sibling locations (deliberately not merged):
 

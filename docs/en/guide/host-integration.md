@@ -6,7 +6,23 @@ your own process: parsing, evaluating, registering native functions,
 customizing module resolution, and controlling JSON output.
 
 > Need a security policy for untrusted scripts? Continue to
-> [Sandbox & capabilities](./sandbox) after this page.
+> [Threat model](./threat-model) and [Sandbox & capabilities](./sandbox)
+> after this page.
+
+## First-release embedding paths
+
+Choose one path up front:
+
+| Path | Use when | Backend / trust posture |
+| --- | --- | --- |
+| Sandboxed facade | The host treats Relon as computed config and pushes all data in. | `relon::from_str` / `EvaluatorBuilder` defaults: sandboxed posture, no local imports or staged host fns. |
+| Trusted host-owned script | The host owns the source and needs local imports or staged native fns. | `Backend::TreeWalk` plus explicit trust/capability grants. This is the only first-release path for staged host fn registration. |
+| Native performance path | The host wants compiled execution for compatible `#main(...)` programs. | `Backend::Auto` or an explicit compiled backend, without staged host fns. `Backend::Auto + TrustLevel::Trusted` is rejected in the first public release. |
+
+For untrusted plugins, tenants, or uploaded scripts, keep the Relon
+source behind a VM/process/container boundary. Relon provides the
+capability vocabulary and budget model; Wasmtime/process/container
+limits enforce the hard boundary.
 
 ## Recommended pattern: push by default
 
@@ -89,10 +105,11 @@ signature**; each parameter declares one host-pushed slot:
   signature: missing field → `MissingMainArg`; extra field →
   `UnexpectedMainArg`; type mismatch → `MainArgTypeMismatch`.
 
-> **Compiled backends — structured inputs.** The compiled executors
-> (cranelift-native / llvm-native / compiled wasm) decode structured
-> `#main` parameters over their buffer protocol, not just scalars. All
-> of the following flow through bit-identically to the tree-walk oracle:
+> **Compiled paths — structured inputs.** The native compiled executors
+> (cranelift / LLVM) and the compiled-wasm parity target decode
+> structured `#main` parameters over their buffer protocol, not just
+> scalars. All of the following flow through bit-identically to the
+> tree-walk oracle:
 >
 > - scalar leaves (`Int` / `Float` / `Bool`),
 > - **`String`** parameters (e.g. file contents the host read and pushes
@@ -133,22 +150,23 @@ signature**; each parameter declares one host-pushed slot:
 >   correctly,
 > - **`List<List<scalar>>` identity returns from a `#main` parameter**
 >   (`#main(List<List<Int|Float|Bool>> xss) -> List<List<…>> = xss`), on
->   **the cranelift, llvm, and compiled-wasm backends.** This is the first
+>   **cranelift, llvm, and the compiled-wasm parity target.** This is the first
 >   shape carried by the *in-place region-walk return ABI*: instead of
 >   copying the nested pointer-array graph, the machine code reports the
 >   arena offset of the result root and the host verifies + decodes it in
->   place in its source region (see the design note below); all backends
->   share one host decode pipeline. On wasm the host reads the same arena
+>   place in its source region (see the design note below); the native
+>   compiled paths and wasm target share one host decode pipeline. On wasm
+>   the host reads the same arena
 >   straight out of the module's **linear memory** and runs the same
 >   verifier before decoding (four-way bit-equal: tree-walk == cranelift ==
 >   llvm == wasm). A parameter-*field* `List<List<scalar>>`
->   (`#main(W w) -> List<List<Int>> = w.rows`) is **also supported** on all
->   three (F4): under the arena-absolute slot convention the field load
+>   (`#main(W w) -> List<List<Int>> = w.rows`) is **also supported** on the
+>   same compiled routes (F4): under the arena-absolute slot convention the field load
 >   pushes the field list root's arena-absolute offset directly, so it
 >   rides the same in-place return as the identity case,
 > - **`List<String>` identity returns from a `#main` parameter**
->   (`#main(List<String> ss) -> List<String> = ss`), on **the cranelift,
->   llvm, and compiled-wasm backends.** This is the first *per-element
+>   (`#main(List<String> ss) -> List<String> = ss`), on **cranelift,
+>   llvm, and the compiled-wasm parity target.** This is the first *per-element
 >   pointer-array* shape carried by the in-place region-walk return ABI
 >   (the formation that previously segfaulted under the rigid tail copy):
 >   the outer `[len][off_i]` header and each `off_i`'s `[len][utf8]` String
@@ -159,10 +177,10 @@ signature**; each parameter declares one host-pushed slot:
 >   included, and on wasm read out of linear memory through the same
 >   verifier). A parameter-*field* `List<String>`
 >   (`#main(Outer o) -> List<String> = o.tags`) is **also supported** on
->   all three (F4) via the same arena-absolute field-load,
+>   the same compiled routes (F4) via the same arena-absolute field-load,
 > - **`List<Schema>` identity returns from a `#main` parameter**
->   (`#main(List<Cfg> items) -> List<Cfg> = items`), on **the cranelift,
->   llvm, and compiled-wasm backends.** This is the deepest in-place
+>   (`#main(List<Cfg> items) -> List<Cfg> = items`), on **cranelift,
+>   llvm, and the compiled-wasm parity target.** This is the deepest in-place
 >   region-walk shape: the outer `[len][off_i]` header points at per-element
 >   schema sub-records, each of which itself carries `String` /
 >   `List<scalar>` / `List<String>` pointer fields (plus inline scalars at
@@ -174,7 +192,7 @@ signature**; each parameter declares one host-pushed slot:
 >   oracle including every sub-object's field bytes, on wasm too (the same
 >   recursion runs over linear memory). A parameter-*field*
 >   `List<Schema>` (`#main(W w) -> List<Cfg> = w.items`) is **also
->   supported** on all three (F4) via the same arena-absolute field-load.
+>   supported** on the same compiled routes (F4) via the same arena-absolute field-load.
 >   An element sub-record that itself carries a nested `List<Schema>` /
 >   `List<List<…>>` field (e.g. `Team { name: String, members: List<Person>,
 >   tags: List<List<Int>> }`) is **also supported, recursively to any depth**
@@ -183,8 +201,8 @@ signature**; each parameter declares one host-pushed slot:
 >   types recursively, so nested object arrays and nested lists inside the
 >   element schema decode bit-equal at any nesting depth,
 > - **deep nested-schema field-walk returns** (`#main(Outer o) ->
->   List<String> = o.inner.tags`, and deeper such as `o.a.b.tags`), on **the
->   cranelift, llvm, and compiled-wasm backends** (F6). A `≥3`-segment chain
+>   List<String> = o.inner.tags`, and deeper such as `o.a.b.tags`), on
+>   **cranelift, llvm, and the compiled-wasm parity target** (F6). A `≥3`-segment chain
 >   whose intermediate segments are nested-schema fields and whose leaf is a
 >   pointer-array list (`List<String>` / `List<Int|Float|Bool>` /
 >   `List<Schema>` / `List<List<scalar>>`) loads each intermediate
@@ -195,8 +213,8 @@ signature**; each parameter declares one host-pushed slot:
 >   an object field (anon-`Dict` / branded struct),
 > - **`List<List<String>>` / `List<List<Schema>>` returns from a `#main`
 >   parameter** (`#main(List<List<String>> xss) -> List<List<String>> = xss`,
->   and the `List<List<Cfg>>` form), on **the cranelift, llvm, and
->   compiled-wasm backends** (F5). This is the *doubly-nested* pointer-array
+>   and the `List<List<Cfg>>` form), on **cranelift, llvm, and the
+>   compiled-wasm parity target** (F5). This is the *doubly-nested* pointer-array
 >   shape: the outer `[len][off_i]` header points at inner pointer-array list
 >   records, each of which is itself a `[len][inner_off_j]` header whose
 >   entries name `String` / schema-sub-record records. The recursive input
@@ -237,7 +255,7 @@ signature**; each parameter declares one host-pushed slot:
 >   is an **anon-`Dict`** (`-> Dict { servers: servers, n: 1 }`) or a
 >   **branded `#schema` struct** (`#schema Wrapper { servers: List<Server>,
 >   n: Int }` returned via `-> Wrapper { servers: servers, n: 7 }`) — is
->   supported **four-way** (tree-walk == cranelift == llvm == compiled wasm).
+>   supported **four-way** (tree-walk == cranelift == llvm == compiled wasm target).
 >   The field may be `List<Schema>`, `List<List<scalar>>`, `List<String>`,
 >   or `List<Int|Float|Bool>` (F1b/F2 on cranelift/llvm/wasm for
 >   `List<Schema>` / `List<List<scalar>>`; F3 added the branded-struct path
@@ -518,12 +536,11 @@ execution backend, running a `#main` entry, registering native fns),
 use the facade's `EvaluatorBuilder`:
 
 ```rust
-use relon::{Backend, EvaluatorBuilder, TrustLevel};
+use relon::{Backend, EvaluatorBuilder, ResourceBudget, TrustLevel};
 
 let evaluator = EvaluatorBuilder::from_str(source)   // or from_file(path)
     .backend(Backend::Auto)        // Auto (default) / TreeWalk / CraneliftAot / LlvmAot
     .trust(TrustLevel::Sandboxed)  // Sandboxed (default) / Trusted
-    .register_pure_native_fn("app_version", Arc::new(AppVersion))
     .build()?;                     // -> Box<dyn relon::Evaluator>
 
 let json_value = evaluator.eval_root(&Arc::new(relon::Scope::default()))?;
@@ -534,11 +551,36 @@ let json_value = evaluator.eval_root(&Arc::new(relon::Scope::default()))?;
   programs to the tree-walker, lazily compiles everything else with
   cranelift AOT, and falls back loudly to the tree-walker for shapes
   the compiler doesn't support — see [Performance](./performance).
+- `Backend::Auto + TrustLevel::Trusted` is not wired in the first public
+  release; the builder rejects it instead of guessing. Use
+  `Backend::TreeWalk` for trusted local imports or staged host fns, or
+  select an explicit compiled backend for host-owned sources that do not
+  need staged host fns.
 - `register_native_fn(name, gate, fn)` / `register_pure_native_fn`
-  are only meaningful for tree-walker-backed builds
-  (`Backend::TreeWalk` and the tree-walk side of `Auto`); building
-  under `CraneliftAot` with staged fns fails loudly with
-  `BackendError::UnsupportedFeature`.
+  are tree-walker-only in the current builder surface. Use
+  `Backend::TreeWalk` when staging host fns; `Backend::Auto` /
+  `CraneliftAot` / `LlvmAot` fail loudly instead of ignoring them.
+- `max_source_bytes(n)` rejects source above `n` bytes before parsing.
+  This is the parser/input guardrail; it is separate from evaluator
+  step/value budgets.
+- `resource_budget(ResourceBudget::dev())` / `ResourceBudget::untrusted()`
+  installs evaluator-side step/value guardrails. In the initial API this
+  requires `Backend::TreeWalk`; other backends fail loudly instead of
+  ignoring the budget. Hard untrusted execution should use a wasm runtime
+  and engine-level limits. Use
+  `relon host-policy --target wasmtime --profile untrusted` for the
+  Wasmtime starting point; see
+  [Threat model](./threat-model) and
+  [Wasmtime host policy](./wasmtime-host-policy).
+
+```rust
+let guarded = EvaluatorBuilder::from_str(source)
+    .backend(Backend::TreeWalk)
+    .trust(TrustLevel::Sandboxed)
+    .max_source_bytes(256 * 1024)
+    .resource_budget(ResourceBudget::untrusted())
+    .build()?;
+```
 
 ## What `Context` is
 
@@ -571,8 +613,10 @@ let value = TreeWalkEvaluator::new(Arc::new(ctx))
 - **`module_resolvers`** — the resolver chain `#import` walks;
   `Context::sandboxed()` defaults to
   `[StdModuleResolver, FilesystemModuleResolver::default()]`.
-- **`capabilities`** — sandbox / resource budgets (see
+- **`capabilities`** — granted host authority bits (see
   [Sandbox & capabilities](./sandbox) for details).
+- **resource budgets** — currently bridged through `ResourceBudget` into the
+  evaluator compatibility fields on `Capabilities`.
 - **`root_node`** + **`analyzed`** — the root AST and the analyzer
   side-table (which includes the `#main` signature).
 - **Multiple caches** (path / module / loading) — to avoid redundant
@@ -591,7 +635,7 @@ There are two construction tracks:
 
 | Constructor | Default safety level |
 | --- | --- |
-| `Context::sandboxed()` | Fully sandboxed: filesystem denied, all capability bits off, only `std/...` virtual modules survive |
+| `Context::sandboxed()` | Sandboxed posture: filesystem denied, all capability bits off, only `std/...` virtual modules survive; not a tenant boundary by itself |
 | `Context::new()` | Lightweight base constructor: virtual std modules + built-in pure fns; for real workloads prefer `Context::sandboxed()` with explicit grants |
 | `Capabilities::all_granted()` + `FilesystemModuleResolver::trusted()` | The host's own scripts can flip everything on explicitly: filesystem unrestricted, all gated native fns pass, no step / size budget |
 
@@ -875,7 +919,7 @@ don't match the `#main` signature).
 ## Next
 
 - Security strategy for untrusted scripts:
-  [Sandbox & capabilities](./sandbox).
+  [Threat model](./threat-model) and [Sandbox & capabilities](./sandbox).
 - Make `.relon` use the functions you registered: wrap them inside
   schemas / libraries — see [Types & schema contracts](./types).
 - Miette-friendly error formatting: pass `RuntimeError` /

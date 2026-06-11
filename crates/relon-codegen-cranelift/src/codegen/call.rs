@@ -337,8 +337,8 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
     /// right after the call and routes a non-zero value to the shared
     /// trap epilogue.
     ///
-    /// Scope (phase-4a parity with the bytecode VM): scalar args travel
-    /// through the i64 lane and the return is the i64-encoded scalar.
+    /// Scope: scalar args travel through the i64 lane and the return is
+    /// the i64-encoded scalar.
     /// `ret_ty` outside `{ I64, Unit }` is rejected — the richer return
     /// lanes (Bool / Float / String) ship with the buffer-protocol
     /// envelope.

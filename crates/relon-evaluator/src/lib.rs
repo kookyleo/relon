@@ -33,8 +33,8 @@ pub use eval::TreeWalkEvaluator;
 pub use relon_eval_api::{
     Capabilities, ClosureData, Context, DecoratorPlugin, EnumSchemaData, EvaluatedArg, Evaluator,
     GatedNativeFn, ListContext, ModuleResolver, ModuleSource, NativeArgs, NativeFn, NativeFnCaps,
-    NativeFnGate, PreEvalOutcome, RelonFunction, RootRef, RuntimeError, SchemaData, SchemaField,
-    Scope, Thunk, Value, ValueDict,
+    NativeFnGate, PreEvalOutcome, RelonFunction, ResourceBudget, ResourceBudgetProfile, RootRef,
+    RuntimeError, SchemaData, SchemaField, Scope, Thunk, Value, ValueDict,
 };
 // Concrete backend-side helpers that are not part of `relon-eval-api`.
 pub use module::{FilesystemModuleResolver, StdModuleResolver};

@@ -210,7 +210,8 @@ The browser uses the exact same posture as host embedding: the
 bindings construct the evaluation context with
 `Context::sandboxed()`, capabilities are **all denied by default**,
 and no `--trust`-style toggle is ever surfaced to untrusted browser
-users.
+users. This is a capability posture; the general boundary model is in
+[Threat model](./threat-model).
 
 - No filesystem module resolver: `#import` can only hit files in the
   `sources` map or `std/*` virtual modules; referencing a path not in
@@ -220,5 +221,5 @@ users.
   functions, …) fails cleanly with `CapabilityDenied`, surfaced as an
   `EvalError`.
 
-See [Sandbox & capabilities](./sandbox.md) for the full capability
-model.
+See [Threat model](./threat-model) for the boundary statement and
+[Sandbox & capabilities](./sandbox.md) for the full capability model.

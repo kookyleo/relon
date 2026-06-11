@@ -1,78 +1,60 @@
 /*
-  Invoice pricing with tiered discounts and tax.
+  Invoice pricing in integer cents.
 
-  Subtotal = sum(qty * unit_price). Two stacking discounts apply:
-    - Volume:  5% at >= 500, 10% at >= 1000.
-    - Loyalty: 3% extra for `gold`-tier customers.
-  Tax (8%) is applied to (subtotal - total_discount).
+  The host pushes an Order; Relon validates the shape, computes discounts
+  in basis points, and returns the exact cents that the host may charge.
 
-  The display fields are formatted with a `@currency("USD")` decorator
-  so the JSON reads `"USD 567.34"` rather than the raw number.
+  Recommended backend: tree-walk (full-surface reference)
+  Expected output: fixtures/golden/examples_main/pricing.json
 
   Try:
-    cargo run -q -p relon-cli -- run examples/pricing.relon \
+    cargo run -q -p relon-cli -- run --backend tree-walk examples/pricing.relon \
         --args '{"order": {"tier": "gold", "items": [\
-            {"sku": "BOOK-01", "qty": 3, "unit_price": 100.0}, \
-            {"sku": "PEN-09",  "qty": 4, "unit_price": 50.0},  \
-            {"sku": "DESK-22", "qty": 1, "unit_price": 300.0}  \
+            {"sku": "BOOK-01", "qty": 3, "unit_cents": 10000}, \
+            {"sku": "PEN-09",  "qty": 4, "unit_cents": 5000},  \
+            {"sku": "DESK-22", "qty": 1, "unit_cents": 30000}  \
         ]}}'
-
-  Note: IEEE-754 binary floats produce trailing-digit noise on values
-  like 0.08 * 460.0. Real billing systems keep money in integer cents;
-  this toy uses Float for readability and leaves rounding to the host.
 */
-#relaxed
+
+#import list from "std/list"
 
 #schema LineItem {
     String sku: *,
     #expect "qty must be > 0"
-    Int qty: (n) => n > 0,
-    #expect "unit_price must be >= 0"
-    Float unit_price: (p) => p >= 0
+    Int qty: (Int n) -> Bool => n > 0,
+    #expect "unit_cents must be >= 0"
+    Int unit_cents: (Int cents) -> Bool => cents >= 0
 }
-#relaxed
 
 #schema Order {
     List<LineItem> items: *,
     #expect "tier must be one of: standard / gold"
-    String tier: (t) => t == "standard" || t == "gold"
+    String tier: (String tier) -> Bool => tier == "standard" || tier == "gold"
 }
 
-#main(Order order)
+#main(Order order) -> Dict
 {
-    // Currency formatter — used as a decorator below. Two positional
-    // args (symbol, value); the decorated field's value is appended
-    // as the last positional, so `@currency("USD") x: 12.3` reads as
-    // `currency("USD", 12.3)`.
     #internal
-    currency(symbol, val): symbol + " " + val,
-    // Tiered volume discount expressed as a rate, not a flat amount.
+    Int line_cents(LineItem item): item.qty * item.unit_cents,
     #internal
-    volume_rate(sub): sub >= 1000 ? 0.10: sub >= 500 ? 0.05: 0.0,
-    // Loyalty discount stacks on top of volume.
+    Int volume_bps(Int subtotal): subtotal >= 100000 ? 1000: subtotal >= 50000 ? 500: 0,
     #internal
-    loyalty_rate(tier): tier == "gold" ? 0.03: 0.0,
+    Int loyalty_bps(String tier): tier == "gold" ? 300: 0,
+    #internal
+    Int prorate(Int cents, Int bps): cents * bps / 10000,
+    #internal
+    String cents_pair(Int cents): cents % 100 < 10 ? "0" + (cents % 100): "" + (cents % 100),
+    #internal
+    String money(Int cents): "USD " + (cents / 100) + "." + cents_pair(cents),
 
-    #internal
-    tax_rate: 0.08,
-    // Pure aggregation over the line items.
-    #internal
-    sum_floats(xs): _list_reduce(xs, 0.0, (a, x) => a + x),
-
-    subtotal: sum_floats([
-        it.qty * it.unit_price for it in order.items
-    ]),
-    discount_rate: volume_rate(&sibling.subtotal) + loyalty_rate(order.tier),
-    discount_amount: &sibling.subtotal * &sibling.discount_rate,
-    taxable: &sibling.subtotal - &sibling.discount_amount,
-    tax_amount: &sibling.taxable * tax_rate,
-    total: &sibling.taxable + &sibling.tax_amount,
-    @currency("USD")
-    subtotal_display: &sibling.subtotal,
-    @currency("USD")
-    discount_display: &sibling.discount_amount,
-    @currency("USD")
-    tax_display: &sibling.tax_amount,
-    @currency("USD")
-    total_display: &sibling.total
+    List<Int> line_totals_cents: [
+        line_cents(item) for item in order.items
+    ],
+    Int subtotal_cents: list.sum(&sibling.line_totals_cents),
+    Int discount_bps: volume_bps(&sibling.subtotal_cents) + loyalty_bps(order.tier),
+    Int discount_cents: prorate(&sibling.subtotal_cents, &sibling.discount_bps),
+    Int taxable_cents: &sibling.subtotal_cents - &sibling.discount_cents,
+    Int tax_cents: prorate(&sibling.taxable_cents, 800),
+    Int total_cents: &sibling.taxable_cents + &sibling.tax_cents,
+    String total_display: money(&sibling.total_cents)
 }

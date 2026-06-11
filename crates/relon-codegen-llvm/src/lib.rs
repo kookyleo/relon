@@ -1,9 +1,9 @@
 //! LLVM-backed AOT evaluator for Relon. **Phase B production envelope.**
 //!
-//! This crate is the second slice of the dual-backend strategy
-//! decided in Phase A: cranelift keeps the trace-JIT throne
-//! (`relon-codegen-cranelift`) and the LLVM AOT pipeline here chases
-//! Rust-native peak performance for the `#main` entry path.
+//! This crate is the second slice of the dual-backend strategy:
+//! Cranelift covers the default native AOT route and the LLVM AOT
+//! pipeline here chases Rust-native peak performance for the `#main`
+//! entry path.
 //!
 //! ## Scope (Phase B)
 //!
@@ -19,45 +19,41 @@
 //!   compile + per-call arena dispatch. The cmp_lua W1 / W2
 //!   workloads (list.sum(range(n)) / list.sum(range(n).map(...))) go
 //!   end-to-end through this path.
-//! - Op set covers what `lower_workspace_single` synthesises for
-//!   the W1 / W2 shape after the IR's `range_pipeline` peephole has
+//! - The op set started with what `lower_workspace_single` synthesised
+//!   for the W1 / W2 shape after the IR's `range_pipeline` peephole
 //!   collapsed `range.map.sum` into a single accumulator loop:
 //!   `LocalGet`, `ConstI64` / `ConstI32` / `ConstBool`, `LetGet` /
 //!   `LetSet`, `LoadField` / `StoreField` (scalar slots),
 //!   `Add` / `Sub` / `Mul` / `Div` / `Mod` / `BitAnd` (I32 + I64),
 //!   `Eq` / `Ne` / `Lt` / `Le` / `Gt` / `Ge`, structured control flow
-//!   (`Block` / `Loop` / `Br` / `BrIf` / `If`), and `Return`. The IR's
-//!   peephole turns `list.sum` / `list.map` / `iter.len` into the
-//!   above op set directly — no stdlib call indirection needed.
+//!   (`Block` / `Loop` / `Br` / `BrIf` / `If`), and `Return`. The
+//!   emitter has since widened into strings, lists, pointer-indirect
+//!   fields, host calls, closures, object emission, wasm32 object
+//!   emission, and several stdlib surfaces; the tests are the
+//!   authoritative coverage map for those later slices.
 //!
-//! Everything past the Phase B envelope (sandbox traps, pointer-
-//! indirect StoreField, MakeClosure / CallClosure, schema-method
-//! dispatch, stdlib call surfaces beyond peephole-inlined shapes)
-//! stays parked on the cranelift backend. Phase C widens the emitter
-//! when the cmp_lua W3..W12 work calls for it.
+//! ## Safety contract
 //!
-//! ## What this crate deliberately does **not** do today
+//! The source-driven buffer-protocol path is the production entry and
+//! carries the backend sandbox contract: capability gates, div/mod
+//! guards, checked signed `Int` arithmetic, arena bounds checks before
+//! host-pointer formation, dynamic host-call trap lifting, and
+//! deterministic step-budget fuel all report through typed
+//! `RuntimeError`s. The legacy / typed-fast i64 entries remain for
+//! focused tests and benchmark kernels; they have no `ArenaState` error
+//! lane, and public `run_main` routes trap-capable bodies through the
+//! buffer entry.
 //!
-//! - **Sandbox traps / capability vtable** — Phase B does not emit
-//!   `__relon_raise_trap` / capability-bit checks. `Div(I64)` /
-//!   `Mod(I64)` lower to LLVM's `sdiv` / `srem`, which are UB on
-//!   div-by-zero and produce host-level signals. Bounds checks on
-//!   `LoadField` / `StoreField` are also omitted (the host owns the
-//!   arena and the IR's static offsets fit). Phase C wires the
-//!   helper-call surface for sandbox parity.
+//! ## Remaining limits
+//!
+//! - **Full language surface** — tree-walk remains the complete
+//!   reference implementation. LLVM AOT covers the explicitly tested
+//!   compiled-backend surface and rejects shapes outside that envelope
+//!   loudly rather than fabricating partial results.
 //! - **`.o` / `.so` emit + dlopen** — Phase B still uses the
 //!   in-process MCJIT engine. The single-knob `OptimizationLevel`
 //!   API hides the engine choice so Phase C / ORC migration is a
 //!   localised diff.
-//! - **Pointer-indirect StoreField** — Phase B accepts only scalar
-//!   `LoadField` / `StoreField` (I32 / I64 / F64 / Bool / Unit). The
-//!   IR's tail-cursor protocol for String / ListInt returns stays on
-//!   the cranelift backend. W1 / W2 only emit scalar Int returns,
-//!   so this is sufficient for the Phase B target workloads.
-//! - **MakeClosure / CallClosure** — the IR's `range.map(...).sum`
-//!   peephole inlines the closure body directly into the loop, so
-//!   no first-class closure surface is needed. Closures past the
-//!   peephole (W3 / W4 / W9) move with Phase C.
 //!
 //! ## Decision log (Phase A.1)
 //!

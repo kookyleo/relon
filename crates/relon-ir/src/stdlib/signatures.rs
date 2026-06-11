@@ -83,61 +83,45 @@ pub(crate) const FULL_CASEFOLD_LOOKUP_INDEX: u32 = 34;
 
 /// Stable slot of the Tier-2 `glob_match(s, pattern) -> Bool` body.
 ///
-/// Tree-walker / cranelift / trace-JIT all special-case dispatch
-/// against this constant; the wasm AOT inline path traps because
-/// writing the full Unicode glob algorithm out as IR ops is on the
-/// follow-up roadmap. See `crate::glob::glob_match` for the matcher
-/// itself and `crate::stdlib::defs::glob_match_string` for the
-/// registry entry / body-shape rationale.
+/// Backends with native glob dispatch special-case this slot; the wasm
+/// AOT inline path traps because writing the full Unicode glob algorithm
+/// out as IR ops is on the follow-up roadmap. See
+/// `crate::glob::glob_match` for the matcher itself and
+/// `crate::stdlib::defs::glob_match_string` for the registry entry /
+/// body-shape rationale.
 ///
-/// Unit-tested by the consistency tests in `super` and (drift-side)
-/// by `relon_trace_recorder::lowering::STDLIB_IDX_GLOB_MATCH` once
-/// the trace recorder gains its own constant.
+/// Unit-tested by the consistency tests in `super`.
 pub const GLOB_MATCH_INDEX: u32 = 37;
 
-/// Stable slot of `length(String) -> Int`. Bytecode-coverage-
-/// expansion B-2 routes this slot onto `BcOp::StrLen` so the
-/// real-handle `visit_const_string` / `visit_load_string_ptr` path
-/// can answer `"foo".length()` without the integer-length stand-in
-/// the `list_int_length` / `Op::ReadStringLen` scaffold relies on.
+/// Stable slot of `length(String) -> Int`. Native string backends may
+/// short-circuit this slot onto their direct string-length operation.
 pub const LENGTH_INDEX: u32 = 0;
 
-/// Stable slot of `is_empty(String) -> Bool`. Bytecode-coverage-
-/// expansion B-2 short-circuits this slot the same way `LENGTH_INDEX`
-/// is short-circuited — its body walks `LocalGet + ReadStringLen +
-/// ConstI64(0) + Eq(I64)` and the `ReadStringLen` no-op in the new
-/// real-handle path leaves the handle (not the length) on the stack,
-/// which compares wrong against `0`. The short-circuit emits the
-/// equivalent `BcOp::StrLen + BcOp::ConstI64(0) + BcOp::EqI64`
-/// sequence so the answer stays correct for both empty and non-empty
-/// strings.
+/// Stable slot of `is_empty(String) -> Bool`. Native string backends may
+/// short-circuit this slot the same way `LENGTH_INDEX` is short-circuited,
+/// using their direct string-length operation instead of inlining the
+/// generic IR body.
 pub const IS_EMPTY_INDEX: u32 = 5;
 
-/// Stable slot of `concat(String, String) -> String`. Mirrors
-/// [`relon_trace_recorder::lowering::STDLIB_IDX_CONCAT`] (drift
-/// guard cross-checked by `stdlib_index_consistency`).
+/// Stable slot of `concat(String, String) -> String`.
 ///
-/// Bytecode-coverage-expansion B-1: the bytecode VM intercepts
-/// `Op::Call { fn_index = CONCAT_INDEX, arg_count = 2 }` and routes
-/// onto the dedicated `BcOp::StrConcat` dispatch instead of inlining
-/// the bundled `concat_string_string` IR body — that body uses raw-
-/// memory `Load*AtAbsolute` ops the bytecode VM's scalar envelope
-/// rejects. Same routing as the `GLOB_MATCH_INDEX` short-circuit above
-/// so trace-jit deopts that land mid-string-concat resume cleanly.
+/// Native string backends can intercept `Op::Call { fn_index =
+/// CONCAT_INDEX, arg_count = 2 }` and route onto a direct concat
+/// operation instead of inlining the bundled `concat_string_string` IR
+/// body. The fixed slot lets that dispatch stay stable across bundle
+/// edits.
 pub const CONCAT_INDEX: u32 = 6;
 
-/// Stable slot of `substring(String, Int, Int) -> String`. Mirrors
-/// [`relon_trace_recorder::lowering::STDLIB_IDX_SUBSTRING`].
+/// Stable slot of `substring(String, Int, Int) -> String`.
 ///
-/// Bytecode-coverage-expansion B-1: routed onto `BcOp::StrSubstring`
-/// by the bytecode compile pass — same rationale as `CONCAT_INDEX`.
+/// Native string backends can intercept this slot for direct substring
+/// dispatch — same rationale as `CONCAT_INDEX`.
 pub const SUBSTRING_INDEX: u32 = 9;
 
-/// Stable slot of `contains(String, String) -> Bool`. Mirrors
-/// [`relon_trace_recorder::lowering::STDLIB_IDX_CONTAINS`].
+/// Stable slot of `contains(String, String) -> Bool`.
 ///
-/// Bytecode-coverage-expansion B-1: routed onto `BcOp::StrContains`
-/// by the bytecode compile pass — same rationale as `CONCAT_INDEX`.
+/// Native string backends can intercept this slot for direct containment
+/// dispatch — same rationale as `CONCAT_INDEX`.
 pub const CONTAINS_INDEX: u32 = 36;
 
 /// v3++ b-7 reframed: stable slot of the

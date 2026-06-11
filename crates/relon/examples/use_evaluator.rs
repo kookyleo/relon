@@ -19,45 +19,44 @@ use serde::Deserialize;
 /// resulting JSON shape into this struct.
 #[derive(Debug, Deserialize)]
 struct Config {
-    project: Project,
-    meta: Meta,
+    public_api: Endpoint,
+    bind: String,
+    probe: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct Project {
+struct Endpoint {
     name: String,
-    base_price: i64,
-    total: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct Meta {
-    tags_count: i64,
-    summary: String,
+    port: i64,
+    protocol: String,
+    health_path: String,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Inline Relon source. Mixes user-defined logic
-    // (`multiply(...)`), sibling references (`&sibling.base_price`),
-    // an f-string interpolation (`f"..."`), and a stdlib call
-    // (`len(...)`). The facade evaluates everything in a default-
-    // sandboxed context so the source can't reach the filesystem or
-    // touch host capabilities.
+    // Inline Relon source. The schema validates the config at load time,
+    // then computed fields produce the exact host-facing values. The
+    // facade evaluates everything in a default-sandboxed context so the
+    // source can't reach the filesystem or touch host capabilities.
     let source = r#"
-#relaxed
+#schema Endpoint {
+    String name: *,
+    #expect "port must be in the non-privileged TCP range"
+    Int port: (Int p) -> Bool => p >= 1024 && p <= 65535,
+    #expect "protocol must be http or https"
+    String protocol: (String p) -> Bool => p == "http" || p == "https",
+    #expect "health_path must be absolute"
+    String health_path: (String path) -> Bool => path.starts_with("/")
+}
+
 {
-    multiply(a, b): a * b,
-
-    project: {
-        name: "Relon Modern",
-        base_price: 1500,
-        total: multiply(&sibling.base_price, 1.2)
+    Endpoint public_api: {
+        name: "api",
+        port: 8443,
+        protocol: "https",
+        health_path: "/healthz"
     },
-
-    meta: {
-        tags_count: len(["rust", "config", "dsl"]),
-        summary: f"Active project: ${&root.project.name}"
-    }
+    bind: f"${&sibling.public_api.protocol}://0.0.0.0:${&sibling.public_api.port}",
+    probe: &sibling.public_api.health_path
 }
 "#;
 
@@ -65,11 +64,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // serde_json's deserialisation; any `DeserializeOwned` type works.
     let config: Config = relon::from_str(source)?;
 
-    println!("project   = {}", config.project.name);
-    println!("base      = {}", config.project.base_price);
-    println!("total     = {}", config.project.total);
-    println!("tags_cnt  = {}", config.meta.tags_count);
-    println!("summary   = {}", config.meta.summary);
+    println!("service = {}", config.public_api.name);
+    println!("bind    = {}", config.bind);
+    println!("probe   = {}", config.probe);
+    println!("port    = {}", config.public_api.port);
+    println!("scheme  = {}", config.public_api.protocol);
+    println!("health  = {}", config.public_api.health_path);
 
     // The same source can also be projected straight to
     // `serde_json::Value` (skip the typed `Config` step) or to a

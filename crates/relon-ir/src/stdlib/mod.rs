@@ -264,14 +264,10 @@ mod d7d_index_tests {
     use super::*;
     use crate::ir::IrType;
 
-    /// F-D7-D: `contains(String, String) -> Bool` lands at slot 36 —
-    /// the slot the trace recorder pins via
-    /// [`relon_trace_recorder::lowering::STDLIB_IDX_CONTAINS`]. Any
-    /// reordering that drifts the slot would either silently route a
-    /// different op through `TraceOp::StrContains` or break the
-    /// recorder's drift guard. The `stdlib_index_consistency` test in
-    /// `relon-trace-recorder` cross-checks this against the recorder's
-    /// hardcoded constant.
+    /// F-D7-D: `contains(String, String) -> Bool` lands at slot 36, the
+    /// fixed slot native string fast paths dispatch against. Any reordering
+    /// that drifts the slot would silently route a different stdlib function
+    /// through the fast path.
     #[test]
     fn contains_index_is_36() {
         assert_eq!(stdlib_function_index("contains"), Some(36));
@@ -414,14 +410,11 @@ mod glob_match_index_tests {
     }
 }
 
-/// Bytecode-coverage-expansion B-1: drift guard for the public
-/// `CONCAT_INDEX` / `SUBSTRING_INDEX` / `CONTAINS_INDEX` constants the
-/// bytecode VM short-circuits against. The trace recorder mirrors the
-/// same slots via its own `STDLIB_IDX_*` constants — see
-/// `relon-trace-recorder` for the parallel guard. Any reordering of
-/// the bundle that drifts these slots silently re-routes a different
-/// op through `BcOp::Str*` and almost certainly produces a wrong
-/// answer on the first call.
+/// Drift guard for the public `CONCAT_INDEX` / `SUBSTRING_INDEX` /
+/// `CONTAINS_INDEX` constants that native string fast paths dispatch
+/// against. Any reordering of the bundle that drifts these slots
+/// silently re-routes a different op through a string fast path and
+/// almost certainly produces a wrong answer on the first call.
 #[cfg(test)]
 mod str_stdlib_index_consistency_tests {
     use super::*;

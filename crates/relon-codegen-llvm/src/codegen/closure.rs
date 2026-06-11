@@ -107,18 +107,18 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
 
         // Step 3: store fn_table_idx at handle_ptr + 0.
         let fn_idx_v = i32_t.const_int(u64::from(fn_table_idx), false);
-        let handle_addr = self.arena_addr_i32(handle_ptr)?;
+        let handle_addr = self.arena_addr_i32_checked_const(handle_ptr, 4, "MakeClosure fn_idx")?;
         self.builder
             .build_store(handle_addr, fn_idx_v)
             .map_err(|e| LlvmError::Codegen(format!("MakeClosure fn_idx store: {e}")))?;
 
         // Step 4: store captures_ptr at handle_ptr + 4.
-        let four = self.ctx.i32_type().const_int(4, false);
-        let handle_plus_4 = self
-            .builder
-            .build_int_add(handle_ptr, four, "handle_plus_4")
-            .map_err(|e| LlvmError::Codegen(format!("MakeClosure handle+4: {e}")))?;
-        let captures_slot_addr = self.arena_addr_i32(handle_plus_4)?;
+        let captures_slot_addr = self.arena_addr_i32_offset_checked_const(
+            handle_ptr,
+            4,
+            4,
+            "MakeClosure captures slot",
+        )?;
         self.builder
             .build_store(captures_slot_addr, captures_ptr)
             .map_err(|e| LlvmError::Codegen(format!("MakeClosure captures store: {e}")))?;
@@ -138,7 +138,12 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                     .builder
                     .build_int_add(captures_ptr, cap_offset, "cap_off")
                     .map_err(|e| LlvmError::Codegen(format!("MakeClosure cap off: {e}")))?;
-                let cap_addr = self.arena_addr_i32(cap_addr_i32)?;
+                let access_size = self.field_access_size(cap.ty)?;
+                let cap_addr = self.arena_addr_i32_checked_const(
+                    cap_addr_i32,
+                    access_size,
+                    "MakeClosure cap",
+                )?;
                 let value: BasicValueEnum<'ctx> = if let Some((slot, slot_ty)) =
                     self.let_slots.get(&mapped_idx).copied()
                 {
@@ -392,14 +397,12 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                     // closure's captured environment must be passed
                     // verbatim (unchanged from the slow path).
                     let i32_t = self.ctx.i32_type();
-                    let four = i32_t.const_int(4, false);
-                    let handle_plus_4 = self
-                        .builder
-                        .build_int_add(handle_ptr, four, "ccd_handle_plus_4")
-                        .map_err(|e| {
-                            LlvmError::Codegen(format!("CallClosure(known) handle+4: {e}"))
-                        })?;
-                    let cap_ptr_addr = self.arena_addr_i32(handle_plus_4)?;
+                    let cap_ptr_addr = self.arena_addr_i32_offset_checked_const(
+                        handle_ptr,
+                        4,
+                        4,
+                        "CallClosure(known) captures slot",
+                    )?;
                     let captures_ptr_name = self.next_name("ccd_captures_ptr");
                     let captures_ptr = self
                         .builder
@@ -421,7 +424,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         }
 
         // Load fn_table_idx (handle+0) and captures_ptr (handle+4).
-        let handle_addr = self.arena_addr_i32(handle_ptr)?;
+        let handle_addr = self.arena_addr_i32_checked_const(handle_ptr, 4, "CallClosure fn_idx")?;
         let i32_t = self.ctx.i32_type();
         let fn_idx_name = self.next_name("cc_fn_idx");
         let fn_idx = self
@@ -429,12 +432,12 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .build_load(i32_t, handle_addr, &fn_idx_name)
             .map_err(|e| LlvmError::Codegen(format!("CallClosure fn_idx load: {e}")))?
             .into_int_value();
-        let four = i32_t.const_int(4, false);
-        let handle_plus_4 = self
-            .builder
-            .build_int_add(handle_ptr, four, "cc_handle_plus_4")
-            .map_err(|e| LlvmError::Codegen(format!("CallClosure handle+4: {e}")))?;
-        let cap_ptr_addr = self.arena_addr_i32(handle_plus_4)?;
+        let cap_ptr_addr = self.arena_addr_i32_offset_checked_const(
+            handle_ptr,
+            4,
+            4,
+            "CallClosure captures slot",
+        )?;
         let captures_ptr_name = self.next_name("cc_captures_ptr");
         let captures_ptr = self
             .builder

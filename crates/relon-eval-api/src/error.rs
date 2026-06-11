@@ -101,8 +101,7 @@ pub enum RuntimeError {
 
     /// Step / resource budget exhausted. The tree-walker fills `limit`
     /// with the configured `max_steps`; the compiled backends
-    /// (cranelift deadline, bytecode step / deadline) trap with the
-    /// numeric tag only and leave `limit` as `None`.
+    /// trap with the numeric tag only and leave `limit` as `None`.
     #[error("Step limit exceeded")]
     #[diagnostic(
         code(relon::eval::step_limit_exceeded),
@@ -174,7 +173,7 @@ pub enum RuntimeError {
     /// A guarded native-fn / `#import` was denied because the host did
     /// not grant a required capability. Produced by every backend: the
     /// tree-walker fills a descriptive `reason` (and the bit, when it
-    /// has one); the compiled cranelift / bytecode trap paths carry
+    /// has one); the compiled trap paths carry
     /// only the numeric `cap_bit` and a generic `reason`.
     #[error("Capability denied: {reason}")]
     #[diagnostic(

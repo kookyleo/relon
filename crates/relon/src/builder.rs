@@ -41,7 +41,7 @@ use relon_eval_api::{Evaluator, NativeFnGate, RelonFunction};
 #[cfg(all(not(target_arch = "wasm32"), feature = "remote-http"))]
 use relon_evaluator::module::RemoteHttpResolver;
 use relon_evaluator::module::{FilesystemModuleResolver, ModuleResolver};
-use relon_evaluator::{Capabilities, Context, TreeWalkEvaluator};
+use relon_evaluator::{Capabilities, Context, ResourceBudget, TreeWalkEvaluator};
 use relon_parser::parse_document;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -108,11 +108,13 @@ pub struct EvaluatorBuilder {
     source: Source,
     backend: Backend,
     trust: TrustLevel,
+    resource_budget: Option<ResourceBudget>,
+    max_source_bytes: Option<usize>,
     /// Host fns staged for registration on the tree-walker `Context`.
-    /// Stays empty for the cranelift / bytecode backends since they
-    /// cannot dispatch host fns; carrying values into a non-TreeWalk
-    /// build surfaces `BackendError::UnsupportedFeature` so the
-    /// failure is loud rather than silent.
+    /// Stays empty for compiled backends since they cannot dispatch host
+    /// fns; carrying values into a non-TreeWalk build surfaces
+    /// `BackendError::UnsupportedFeature` so the failure is loud rather
+    /// than silent.
     pending_fns: Vec<PendingNativeFn>,
 }
 
@@ -133,6 +135,8 @@ impl EvaluatorBuilder {
             source: Source::Inline(source.into()),
             backend: Backend::default(),
             trust: TrustLevel::default(),
+            resource_budget: None,
+            max_source_bytes: None,
             pending_fns: Vec::new(),
         }
     }
@@ -146,6 +150,8 @@ impl EvaluatorBuilder {
             source: Source::File(path.as_ref().to_path_buf()),
             backend: Backend::default(),
             trust: TrustLevel::default(),
+            resource_budget: None,
+            max_source_bytes: None,
             pending_fns: Vec::new(),
         }
     }
@@ -159,6 +165,32 @@ impl EvaluatorBuilder {
     /// Switch trust posture. Defaults to [`TrustLevel::Sandboxed`].
     pub fn trust(mut self, trust: TrustLevel) -> Self {
         self.trust = trust;
+        self
+    }
+
+    /// Install evaluator-side resource limits.
+    ///
+    /// This first public budget surface covers the limits the tree-walker
+    /// already enforces: `max_steps` and `max_value_elements`. It is not a
+    /// hard sandbox boundary. Hosts running untrusted code should route
+    /// through a wasm runtime and connect policy to engine-level controls.
+    ///
+    /// In this initial version, a non-empty budget requires
+    /// [`Backend::TreeWalk`]. Other backend selections fail loudly at
+    /// [`Self::build`] rather than ignoring the budget.
+    pub fn resource_budget(mut self, budget: ResourceBudget) -> Self {
+        self.resource_budget = Some(budget);
+        self
+    }
+
+    /// Reject source text above `limit` bytes before parsing.
+    ///
+    /// This is intentionally separate from [`ResourceBudget`]: parser
+    /// recursion and file reads happen before evaluator-side step/value
+    /// limits can fire. Hosts accepting externally supplied source should
+    /// set this at the same boundary where they accept the source bytes.
+    pub fn max_source_bytes(mut self, limit: usize) -> Self {
+        self.max_source_bytes = Some(limit);
         self
     }
 
@@ -203,6 +235,8 @@ impl EvaluatorBuilder {
             source,
             backend,
             trust,
+            resource_budget,
+            max_source_bytes,
             pending_fns,
         } = self;
 
@@ -210,11 +244,28 @@ impl EvaluatorBuilder {
         // here (not at construction time) so the host can pre-stage
         // a builder and only pay the I/O cost at `build` time.
         let source_string = match source {
-            Source::Inline(s) => s,
+            Source::Inline(s) => {
+                enforce_source_limit("<memory>", s.len(), max_source_bytes)?;
+                s
+            }
             Source::File(path) => {
                 let canonical_path = std::fs::canonicalize(&path).map_err(|e| {
                     BackendError::Parse(format!("file read {}: {}", path.display(), e))
                 })?;
+                let actual = std::fs::metadata(&canonical_path)
+                    .map_err(|e| {
+                        BackendError::Parse(format!(
+                            "file stat {}: {}",
+                            canonical_path.display(),
+                            e
+                        ))
+                    })?
+                    .len() as usize;
+                enforce_source_limit(
+                    &canonical_path.display().to_string(),
+                    actual,
+                    max_source_bytes,
+                )?;
                 std::fs::read_to_string(&canonical_path).map_err(|e| {
                     BackendError::Parse(format!("file read {}: {}", canonical_path.display(), e))
                 })?
@@ -230,6 +281,20 @@ impl EvaluatorBuilder {
                 backend
             )));
         }
+        if resource_budget.is_some_and(ResourceBudget::has_evaluator_limits)
+            && !matches!(backend, Backend::TreeWalk)
+        {
+            return Err(BackendError::UnsupportedFeature(format!(
+                "resource_budget is currently enforced only by Backend::TreeWalk; got {:?}",
+                backend
+            )));
+        }
+        if matches!(backend, Backend::Auto) && matches!(trust, TrustLevel::Trusted) {
+            return Err(BackendError::UnsupportedFeature(
+                "TrustLevel::Trusted under Backend::Auto is not yet implemented; use Backend::TreeWalk for trusted local imports / host fns, or select an explicit compiled backend"
+                    .to_string(),
+            ));
+        }
 
         match backend {
             Backend::Auto => {
@@ -244,11 +309,10 @@ impl EvaluatorBuilder {
                         "native-fn registration under Backend::Auto is not yet implemented; use Backend::TreeWalk".to_string(),
                     ));
                 }
-                let _ = trust; // Auto's TrustLevel honouring lives upstream of this stage.
                 Ok(Box::new(auto))
             }
             Backend::TreeWalk => {
-                let tw = build_tree_walk(&source_string, trust, pending_fns)?;
+                let tw = build_tree_walk(&source_string, trust, resource_budget, pending_fns)?;
                 Ok(Box::new(tw))
             }
             #[cfg(feature = "cranelift-aot")]
@@ -262,20 +326,40 @@ impl EvaluatorBuilder {
                 "this build was compiled without the `cranelift-aot` feature; rebuild with `--features cranelift-aot` to enable the backend"
                     .to_string(),
             )),
-            // Phase A LLVM-AOT does not yet ingest `from_source`
-            // because `lower_workspace_single` emits buffer-protocol
-            // IR which the Phase A emitter rejects. Surface a clear
-            // not-implemented so hosts know to fall back to the
-            // cranelift backend until Phase B.
+            #[cfg(feature = "llvm-aot")]
+            Backend::LlvmAot => {
+                let ev = relon_codegen_llvm::LlvmAotEvaluator::from_source(&source_string)
+                    .map_err(|e| BackendError::LlvmAot(e.to_string()))?;
+                Ok(Box::new(ev))
+            }
+            #[cfg(not(feature = "llvm-aot"))]
             Backend::LlvmAot => Err(BackendError::LlvmAot(
-                "Phase A bootstrap: `from_source` not wired yet — \
-                 use `Backend::CraneliftAot` for source-driven AOT or \
-                 construct an `LlvmAotEvaluator::from_ir_direct` against \
-                 a pre-lowered IR module for the bootstrap envelope"
+                "this build was compiled without the `llvm-aot` feature; \
+                 rebuild with `--features llvm-aot` (requires LLVM 18 \
+                 dev headers and the `LLVM_SYS_181_PREFIX` env var) to \
+                 enable the backend"
                     .to_string(),
             )),
         }
     }
+}
+
+fn enforce_source_limit(
+    label: &str,
+    actual: usize,
+    limit: Option<usize>,
+) -> Result<(), BackendError> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    if actual > limit {
+        return Err(BackendError::SourceTooLarge {
+            label: label.to_string(),
+            actual,
+            limit,
+        });
+    }
+    Ok(())
 }
 
 /// Assemble a tree-walker honouring trust posture + staged host fns.
@@ -285,6 +369,7 @@ impl EvaluatorBuilder {
 fn build_tree_walk(
     source: &str,
     trust: TrustLevel,
+    resource_budget: Option<ResourceBudget>,
     pending_fns: Vec<PendingNativeFn>,
 ) -> Result<TreeWalkEvaluator, BackendError> {
     let node = parse_document(source).map_err(|e| BackendError::Parse(e.to_string()))?;
@@ -299,8 +384,21 @@ fn build_tree_walk(
     // Honour Trusted by granting all capabilities and prepending the
     // trusted-filesystem + remote-HTTP resolvers, matching the
     // assembly used by `crate::evaluate_source` in the trusted branch.
+    let mut caps = if matches!(trust, TrustLevel::Trusted) {
+        Capabilities::all_granted()
+    } else {
+        Capabilities::default()
+    };
+    if let Some(resource_budget) = resource_budget {
+        resource_budget.apply_to_capabilities(&mut caps);
+    }
+    if matches!(trust, TrustLevel::Trusted)
+        || resource_budget.is_some_and(ResourceBudget::has_evaluator_limits)
+    {
+        ctx = ctx.with_capabilities(caps);
+    }
+
     if matches!(trust, TrustLevel::Trusted) {
-        ctx = ctx.with_capabilities(Capabilities::all_granted());
         ctx.prepend_module_resolver(
             Arc::new(FilesystemModuleResolver::trusted()) as Arc<dyn ModuleResolver>
         );
@@ -399,6 +497,37 @@ mod tests {
             Err(BackendError::UnsupportedFeature(_)) => {}
             Err(other) => panic!("expected UnsupportedFeature, got {other:?}"),
             Ok(_) => panic!("expected builder to reject native fns under a non-tree-walk backend"),
+        }
+    }
+
+    #[test]
+    fn source_limit_rejects_inline_source_before_parse() {
+        let result = EvaluatorBuilder::from_str("{ really_long: 1 }")
+            .backend(Backend::TreeWalk)
+            .max_source_bytes(4)
+            .build();
+        match result {
+            Err(BackendError::SourceTooLarge { actual, limit, .. }) => {
+                assert!(actual > limit);
+                assert_eq!(limit, 4);
+            }
+            Err(other) => panic!("expected SourceTooLarge, got {other:?}"),
+            Ok(_) => panic!("expected source-size preflight to reject"),
+        }
+    }
+
+    #[test]
+    fn auto_trusted_is_rejected_instead_of_ignored() {
+        let result = EvaluatorBuilder::from_str("#main(Int x) -> Int\nx")
+            .backend(Backend::Auto)
+            .trust(TrustLevel::Trusted)
+            .build();
+        match result {
+            Err(BackendError::UnsupportedFeature(message)) => {
+                assert!(message.contains("TrustLevel::Trusted under Backend::Auto"));
+            }
+            Err(other) => panic!("expected UnsupportedFeature, got {other:?}"),
+            Ok(_) => panic!("expected Auto + Trusted to reject until trust is wired"),
         }
     }
 

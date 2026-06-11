@@ -1,4 +1,4 @@
-//! Reverse stdlib-drift defense + tier-2 tree-walker-only execution
+//! Reverse stdlib-drift defense + legacy runtime-only execution
 //! coverage.
 //!
 //! Background: `stdlib::register_to` (crates/relon-evaluator/src/stdlib.rs)
@@ -12,15 +12,15 @@
 //! the numeric helpers (`sqrt` / `pow` / `round` / `floor` / `ceil`) —
 //! drifted in with ZERO analyzer signatures and ZERO test coverage.
 //!
-//! The functions in that drift set are *tier-2 tree-walker-only*: because
-//! they lack an analyzer signature, the analyzer rejects any program that
-//! calls them in its default strict mode with
+//! The functions in that drift set are legacy runtime-only registrations:
+//! because they lack an analyzer signature, the analyzer rejects any program
+//! that calls them in its default strict mode with
 //! `ExpressionTypeUnknown: "call to <fn> has no static return type"`. They
 //! can only be reached through the tree-walking evaluator; they do NOT run
 //! on the cranelift / LLVM / wasm-AOT backends.
 //!
 //! This module:
-//!   1. Pins that drift set (`TIER2_TREEWALK_ONLY_DRIFT`) and FAILS if the
+//!   1. Pins that drift set (`LEGACY_RUNTIME_ONLY_DRIFT`) and FAILS if the
 //!      evaluator gains a NEW free fn without either an analyzer signature
 //!      or an explicit drift-allowlist entry — i.e. the reverse of the
 //!      analyzer-side test, driven from the evaluator's real register
@@ -36,16 +36,16 @@ use std::sync::Arc;
 
 /// Names registered with `register_pure_fn` by the evaluator that have
 /// NO signature in the analyzer's `stdlib_signatures` table. These are
-/// the tier-2 tree-walker-only free functions: reachable through the
-/// tree-walking evaluator only, never on a compiled backend, and invisible
-/// to static type inference (any call site infers `ExpressionTypeUnknown`).
+/// legacy runtime-only free functions: reachable through the tree-walking
+/// evaluator only, never on a compiled backend, and invisible to static type
+/// inference (any call site infers `ExpressionTypeUnknown`).
 ///
 /// This constant pins the *currently known* drift. The reverse-drift test
 /// computes (registered free fns) − (analyzer-known names) and asserts it
 /// equals exactly this set, so adding a new free fn without an analyzer
 /// signature — or shipping a signature for one of these — fails the test
 /// and forces a deliberate decision.
-const TIER2_TREEWALK_ONLY_DRIFT: &[&str] = &[
+const LEGACY_RUNTIME_ONLY_DRIFT: &[&str] = &[
     // -- string: case-fold / normalization / glob (underscore intrinsics
     //    plus the bare `glob_match` surface) --
     "_string_title",
@@ -130,7 +130,7 @@ fn registered_free_fn_names() -> BTreeSet<String> {
 /// Reverse drift defense, driven from the evaluator's real register sites.
 ///
 /// Asserts that the set of `register_pure_fn` names lacking an analyzer
-/// signature equals exactly [`TIER2_TREEWALK_ONLY_DRIFT`]. Fails loudly
+/// signature equals exactly [`LEGACY_RUNTIME_ONLY_DRIFT`]. Fails loudly
 /// when a maintainer:
 ///   * adds a NEW free fn without an analyzer signature (it lands in the
 ///     computed drift but not the pinned allowlist), or
@@ -160,7 +160,7 @@ fn reverse_stdlib_drift_is_pinned() {
         .collect();
 
     let actual_drift: BTreeSet<String> = registered.difference(&analyzer_known).cloned().collect();
-    let pinned_drift: BTreeSet<String> = TIER2_TREEWALK_ONLY_DRIFT
+    let pinned_drift: BTreeSet<String> = LEGACY_RUNTIME_ONLY_DRIFT
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -169,7 +169,7 @@ fn reverse_stdlib_drift_is_pinned() {
     let stale: Vec<&String> = pinned_drift.difference(&registered).collect();
     assert!(
         stale.is_empty(),
-        "TIER2_TREEWALK_ONLY_DRIFT lists names that are not registered as free fns: {stale:?}"
+        "LEGACY_RUNTIME_ONLY_DRIFT lists names that are not registered as free fns: {stale:?}"
     );
 
     let newly_drifted: Vec<&String> = actual_drift.difference(&pinned_drift).collect();
@@ -177,14 +177,14 @@ fn reverse_stdlib_drift_is_pinned() {
     assert!(
         newly_drifted.is_empty() && now_covered.is_empty(),
         "reverse stdlib drift changed.\n  NEW drift (registered free fn with no analyzer \
-         signature, not yet in the tier-2 allowlist): {newly_drifted:?}\n  RESOLVED (now has a \
-         signature — drop from TIER2_TREEWALK_ONLY_DRIFT): {now_covered:?}"
+         signature, not yet in the legacy runtime-only allowlist): {newly_drifted:?}\n  RESOLVED \
+         (now has a signature — drop from LEGACY_RUNTIME_ONLY_DRIFT): {now_covered:?}"
     );
 }
 
 /// Run a relon source string through the tree-walking evaluator,
 /// bypassing the analyzer's strict static-type gate. This is the only
-/// execution path the tier-2 tree-walker-only stdlib fns can take.
+/// execution path the legacy runtime-only stdlib fns can take.
 fn tree_walk(source: &str) -> Value {
     tree_walk_result(source).expect("fixture must evaluate")
 }
@@ -204,13 +204,69 @@ fn workspace_root() -> PathBuf {
         .expect("workspace root above crates/relon-evaluator")
 }
 
-/// Execution coverage for a representative slice of the tier-2
-/// tree-walker-only stdlib (sqrt / pow / round / floor / ceil / in_range /
-/// trim / unique / count / to_json). Drives the fixture through the
+fn stable_stdlib_manifest_names() -> BTreeSet<String> {
+    let path = workspace_root().join("docs/en/guide/stdlib.md");
+    let doc =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let start = "<!-- relon-stdlib-user-manifest:start -->";
+    let end = "<!-- relon-stdlib-user-manifest:end -->";
+    let section = doc
+        .split_once(start)
+        .and_then(|(_, rest)| rest.split_once(end).map(|(section, _)| section))
+        .expect("stdlib.md must contain relon-stdlib-user-manifest markers");
+
+    let names: BTreeSet<String> = section
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("| `")?;
+            let (name, _) = rest.split_once('`')?;
+            Some(name.to_string())
+        })
+        .collect();
+
+    assert!(
+        !names.is_empty(),
+        "stable user stdlib manifest marker section listed no callable names"
+    );
+    names
+}
+
+#[test]
+fn legacy_runtime_only_names_are_not_in_stable_manifest() {
+    let manifest = stable_stdlib_manifest_names();
+    let leaked_intrinsics: Vec<&String> = manifest
+        .iter()
+        .filter(|name| name.starts_with('_'))
+        .collect();
+    assert!(
+        leaked_intrinsics.is_empty(),
+        "stable user stdlib manifest must not list implementation intrinsics: \
+         {leaked_intrinsics:?}"
+    );
+    assert!(
+        !manifest.contains("std/string.glob_match"),
+        "std/string.glob_match is legacy/runtime-only and must not be stable user API"
+    );
+
+    let documented_as_stable: Vec<&str> = LEGACY_RUNTIME_ONLY_DRIFT
+        .iter()
+        .copied()
+        .filter(|name| manifest.contains(*name))
+        .collect();
+    assert!(
+        documented_as_stable.is_empty(),
+        "legacy runtime-only stdlib names must not be listed as stable portable: \
+         {documented_as_stable:?}"
+    );
+}
+
+/// Execution coverage for a representative slice of the legacy runtime-only
+/// registrations (sqrt / pow / round / floor / ceil / in_range / trim /
+/// unique / count / to_json). Drives the fixture through the
 /// tree-walker — NOT the cross-backend golden harness, which the analyzer
 /// would reject — and compares the serialized result to the golden JSON.
 #[test]
-fn tier2_treewalk_only_fixture_executes() {
+fn legacy_runtime_only_fixture_executes() {
     let root = workspace_root();
     let fixture = root.join("fixtures/golden/tier2_treewalk/stdlib_treewalk_only.relon");
     let golden = root.join("fixtures/golden/tier2_treewalk/stdlib_treewalk_only.json");
@@ -229,7 +285,7 @@ fn tier2_treewalk_only_fixture_executes() {
     assert_eq!(
         actual,
         expected,
-        "tier-2 tree-walker-only golden mismatch.\n  actual: {}",
+        "legacy runtime-only golden mismatch.\n  actual: {}",
         serde_json::to_string_pretty(&actual).unwrap()
     );
 }

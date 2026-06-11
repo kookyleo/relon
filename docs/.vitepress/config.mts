@@ -80,13 +80,18 @@ export default defineConfig({
             text: '嵌入与安全',
             items: [
               { text: '嵌入宿主', link: '/zh/guide/host-integration' },
+              { text: '威胁模型', link: '/zh/guide/threat-model' },
               { text: '沙箱与权限', link: '/zh/guide/sandbox' },
+              { text: 'Wasmtime 宿主策略', link: '/zh/guide/wasmtime-host-policy' },
               { text: 'Playground 与 wasm 绑定', link: '/zh/guide/playground' },
             ]
           },
           {
             text: '参考',
             items: [
+              { text: '发布 tier', link: '/zh/guide/release-tiers' },
+              { text: '诊断契约', link: '/zh/guide/diagnostics' },
+              { text: 'CI 集成', link: '/zh/guide/ci' },
               { text: '语言规范 (SPEC)', link: '/zh/guide/spec' },
               { text: '严格模式 (#relaxed)', link: '/zh/guide/strict-mode' },
               { text: '标准库', link: '/zh/guide/stdlib' },
@@ -139,13 +144,18 @@ export default defineConfig({
             text: 'Embedding & sandbox',
             items: [
               { text: 'Host integration', link: '/en/guide/host-integration' },
+              { text: 'Threat model', link: '/en/guide/threat-model' },
               { text: 'Sandbox & capabilities', link: '/en/guide/sandbox' },
+              { text: 'Wasmtime host policy', link: '/en/guide/wasmtime-host-policy' },
               { text: 'Playground & wasm bindings', link: '/en/guide/playground' },
             ]
           },
           {
             text: 'Reference',
             items: [
+              { text: 'Release tiers', link: '/en/guide/release-tiers' },
+              { text: 'Diagnostics contract', link: '/en/guide/diagnostics' },
+              { text: 'CI integration', link: '/en/guide/ci' },
               { text: 'Language spec', link: '/en/guide/spec' },
               { text: 'Strict mode (#relaxed)', link: '/en/guide/strict-mode' },
               { text: 'Standard library', link: '/en/guide/stdlib' },

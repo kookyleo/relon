@@ -7,7 +7,18 @@
 
 Relon is a **programmable configuration language**: you write a JS / Lua-style snippet that decides "can this user log in?", "should this order get a discount?", "should this log line be dropped?". The host program **executes** your snippet and gets back yes / no or a number.
 
-Faster is better. LuaJIT is the traditional speed champion of this class — Relon's goal is to match or beat it **while keeping the sandbox**. On the benchmarks below, Relon's compiled backends now beat LuaJIT across the board (2.7×–17×) and sit in the same tier as native Rust.
+Faster is better. LuaJIT is the traditional speed champion of this
+class — Relon's goal is to match or beat it while keeping deterministic
+language checks and explicit host authority. On the benchmarks below,
+Relon's compiled backends now beat LuaJIT across the board
+(2.7×–17×) and sit in the same tier as native Rust.
+
+Release contract note: Cranelift AOT is the default native performance
+path. LLVM AOT is an advanced / preview path. Tree-walk is the
+full-surface reference implementation. For untrusted tenant or plugin
+source, use a VM or process boundary; compiled native backends are not a
+multi-tenant safety boundary. See [Release tiers](./release-tiers) and
+[Threat model](./threat-model).
 
 ## 2. Three execution backends
 
@@ -19,7 +30,7 @@ Think of an execution backend as a **restaurant kitchen**:
 | **Cranelift AOT** | Compiles to native machine instructions | Central kitchen, common dishes pre-made | Hundreds of µs | Fast |
 | **LLVM AOT** | Machine code through the LLVM optimisation pipeline | Michelin kitchen, longest prep | Higher | **Fastest** (native-Rust tier) |
 
-The further down, the faster the steady state — and the higher the prep cost. All three backends run the same IR with the same sandbox semantics and produce bit-identical results. Tree-walk covers the entire language surface; the compiled backends cover an explicitly declared supported surface (see the Auto fallback note below).
+The further down, the faster the steady state — and the higher the prep cost. Tree-walk is the full-surface reference implementation. The compiled backends lower the analysed program into IR and are tested against tree-walk on their explicitly declared supported surface, including the same observable sandbox errors (see the Auto fallback note below).
 
 ## 3. How `Backend::Auto` picks
 
@@ -36,16 +47,21 @@ When you do want to force a backend, `EvaluatorBuilder` offers the explicit opti
 
 Relon runs user-supplied configuration, so **user code must not corrupt the host**. Every operation passes through 4 checks:
 
+These are language and host-API guardrails, not an OS sandbox. For hard
+isolation of untrusted source, run Relon behind Wasmtime, a subprocess,
+or another host-enforced boundary.
+
 | Check | Prevents | Analogy |
 |---|---|---|
 | **Bounds check** | Reading / writing outside an array | No peeking over the neighbour's fence |
 | **Trap** | Integer overflow / divide-by-zero must error | Dashboard red light, engine cuts out |
 | **Capability gate** | Calling un-authorised host functions | Only the keys you've been issued |
-| **Resource limit** | Infinite loops eating CPU / RAM | Hard timeout of 1 minute |
+| **Resource limit** | Infinite loops eating CPU / RAM | Step budget / host deadline |
 
-LuaJIT has **none of these**, which is why its speed is the "naked" baseline. Relon matches and beats it *while keeping all four* — that is the core design result.
+LuaJIT has **none of these**, which is why its speed is the "naked" baseline. Relon matches and beats it *while keeping all four language guardrails* — that is the core design result.
 
-See [Sandbox & capabilities](./sandbox.md) for full details.
+See [Sandbox & capabilities](./sandbox.md) for operational details and
+[Threat model](./threat-model.md) for the boundary statement.
 
 ## 5. Where performance stands today (2026-06-10, W-series benchmarks)
 
@@ -84,6 +100,9 @@ The cache carries HMAC-SHA256 integrity tags (anti-tampering + anti-third-party-
 
 ## 8. One-sentence summary
 
-> **The interpreter guarantees full coverage and correctness; the compiled backends provide the speed; `Backend::Auto` picks for you and falls back loudly to the interpreter when it can't compile — fast path and slow path produce bit-identical results.**
+> **The interpreter guarantees full coverage and correctness; the compiled backends provide the speed on their declared supported surface; `Backend::Auto` picks for you and falls back loudly to the interpreter when it can't compile.**
 
-That's the whole route by which Relon reaches native-Rust parity and beats LuaJIT while keeping the full sandbox.
+That's the route by which Relon reaches native-Rust parity and beats
+LuaJIT on native benchmarks while keeping the language guardrails. For
+untrusted deployments, put those guardrails inside a VM or process
+boundary.

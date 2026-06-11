@@ -155,9 +155,10 @@ fn build_wasm(
 /// Replicated `#[repr(C)] ArenaState` byte layout (same constants as
 /// `aot_wasm.rs` / `aot_wasm_wasi.rs`).
 const STATE_OFF_ARENA_BASE: usize = 0;
+const STATE_OFF_ARENA_LEN: usize = 8;
 const STATE_OFF_TAIL_CURSOR: usize = 12;
 const STATE_OFF_SCRATCH_BASE: usize = 20;
-const STATE_SIZE: usize = 40;
+const STATE_SIZE: usize = 48;
 
 /// Run the buffer-protocol wasm entry in wasmtime. No `env::pure_add`
 /// import is registered — the closed-world module must NOT need one
@@ -216,6 +217,7 @@ fn run_in_wasmtime(
     let mut state = [0u8; STATE_SIZE];
     state[STATE_OFF_ARENA_BASE..STATE_OFF_ARENA_BASE + 8]
         .copy_from_slice(&(arena_abs as u64).to_le_bytes());
+    state[STATE_OFF_ARENA_LEN..STATE_OFF_ARENA_LEN + 4].copy_from_slice(&arena_bytes.to_le_bytes());
     state[STATE_OFF_TAIL_CURSOR..STATE_OFF_TAIL_CURSOR + 4]
         .copy_from_slice(&info.return_root_size.to_le_bytes());
     state[STATE_OFF_SCRATCH_BASE..STATE_OFF_SCRATCH_BASE + 4]

@@ -7,12 +7,11 @@
 //! carries the agreed `Value` on [`TwoWayResult::Agree`] so callers can
 //! additionally assert the expected output, not just backend agreement.
 //!
-//! Historical note: this module used to host a third "trace-JIT" leg.
-//! That leg was a string-pattern synthesiser keyed off recipe source
-//! strings — it never executed an engine (the trace-JIT crate is gone
-//! from the workspace) and therefore added zero differential value. It
-//! has been retired; the real compiled legs beyond cranelift (wasm,
-//! llvm-native) are covered by the `aot_wasm_parity` /
+//! Historical note: this module used to host a third experimental compiled
+//! leg. That leg was a string-pattern synthesiser keyed off recipe source
+//! strings — it never executed an engine and therefore added zero
+//! differential value. It has been retired; the real compiled legs beyond
+//! cranelift (wasm, llvm-native) are covered by the `aot_wasm_parity` /
 //! `inplace_return_four_way` codegen tests.
 
 use std::collections::HashMap;

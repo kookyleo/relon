@@ -22,10 +22,10 @@
 //! - It would require pulling cranelift-native as a hard dependency of
 //!   the LLVM crate just to share an opaque struct layout. The LLVM
 //!   backend is meant to stand on its own.
-//! - The Phase B envelope does not need sandbox traps, deadline
-//!   checks, capability bits, or the closure / scratch / trap_code
-//!   subsystems. A minimal C-layout `ArenaState` is enough to drive
-//!   the buffer protocol.
+//! - The LLVM backend keeps its sandbox state local: arena bounds,
+//!   capability trap codes, host-fn dispatch, and the step-budget fuel
+//!   live in this C-layout `ArenaState` instead of depending on the
+//!   cranelift crate's `SandboxState`.
 //! - Keeping the layout local to this crate makes the offsets we
 //!   embed in emitted LLVM IR self-contained — if the cranelift
 //!   crate ever rearranges `SandboxState` it cannot accidentally
@@ -77,10 +77,8 @@ pub struct ArenaState {
     /// `field_offset`. The pointer is `usize`-wide so the cast
     /// matches the host's pointer width.
     pub arena_base: UnsafeCell<usize>,
-    /// Length of the arena in bytes. Phase B does not emit bounds
-    /// checks (the task spec explicitly notes div0 / overflow /
-    /// bounds are exposed as `llvm.trap` / panic at most), so this
-    /// is recorded for future use rather than read by the JIT today.
+    /// Length of the arena in bytes. The LLVM emitter uses this for
+    /// arena-relative bounds guards before forming host pointers.
     pub arena_len: UnsafeCell<u32>,
     /// Phase E.1: tail cursor used by pointer-indirect StoreField
     /// (`String` / `ListInt` / `ListFloat` / `ListBool`) to bump-
@@ -112,15 +110,19 @@ pub struct ArenaState {
     /// it is a plain pointer-width field the JIT never dereferences
     /// directly (only the helper does, on the Rust side).
     pub host_fns: UnsafeCell<usize>,
+    /// Remaining loop/entry budget for the current dispatch. `0`
+    /// means "unlimited"; positive values are decremented by the LLVM
+    /// emitter at the entry prologue and loop headers; negative values
+    /// trap `ResourceExhausted`.
+    pub step_budget: UnsafeCell<i64>,
 }
 
 /// Byte offset of [`ArenaState::arena_base`] inside the `#[repr(C)]`
 /// layout. Used by the LLVM emitter to materialise the load.
 pub const ARENA_STATE_OFFSET_BASE: u32 = 0;
 
-/// Byte offset of [`ArenaState::arena_len`]. Reserved for Phase C
-/// bounds-check work; the emitter leaves it untouched today.
-#[allow(dead_code)]
+/// Byte offset of [`ArenaState::arena_len`]. The LLVM emitter reads it
+/// before arena-relative host-pointer formation.
 pub const ARENA_STATE_OFFSET_LEN: u32 = std::mem::size_of::<usize>() as u32;
 
 /// Byte offset of [`ArenaState::tail_cursor`]. The pointer-indirect
@@ -153,6 +155,11 @@ pub const ARENA_STATE_OFFSET_TRAP_CODE: u32 = 24;
 #[allow(dead_code)]
 pub const ARENA_STATE_OFFSET_HOST_FNS: u32 = ARENA_STATE_OFFSET_TRAP_CODE + 8;
 
+/// Byte offset of [`ArenaState::step_budget`]. Appended after the
+/// existing host-fn word so the earlier ABI offsets stay stable.
+pub const ARENA_STATE_OFFSET_STEP_BUDGET: u32 =
+    ARENA_STATE_OFFSET_HOST_FNS + std::mem::size_of::<usize>() as u32;
+
 /// Phase 0b native-dispatch trap codes recorded in
 /// [`ArenaState::trap_code`] by [`relon_llvm_call_native`]. Mirrors the
 /// cranelift backend's `TrapKind` numbering for the subset the LLVM
@@ -160,6 +167,18 @@ pub const ARENA_STATE_OFFSET_HOST_FNS: u32 = ARENA_STATE_OFFSET_TRAP_CODE + 8;
 #[repr(u64)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeTrap {
+    /// Division (`Op::Div` / `Op::Mod`) by zero. Matches cranelift's
+    /// `TrapKind::DivisionByZero` (= 1); lifts to
+    /// `RuntimeError::DivisionByZero`.
+    DivisionByZero = 1,
+    /// Pointer dereference walked past the arena bounds. Matches
+    /// cranelift's `TrapKind::BoundsViolation` (= 2); lifts to
+    /// `RuntimeError::IndexOutOfBounds`.
+    BoundsViolation = 2,
+    /// Per-call resource budget exhausted. LLVM currently raises this
+    /// from deterministic step-budget fuel; a future wall-clock deadline
+    /// can reuse the same trap code.
+    ResourceExhausted = 4,
     /// The `Op::CheckCap` gate denied a gated native call (the granted
     /// `caps` bitmask had the required bit clear). Matches cranelift's
     /// `TrapKind::CapabilityDenied` (= 3); lifts to
@@ -204,6 +223,10 @@ impl NativeTrap {
     /// subset the LLVM dynamic-dispatch path raises.
     pub fn runtime_error_from_code(code: u64) -> RuntimeError {
         match code {
+            1 => RuntimeError::DivisionByZero(TokenRange::default()),
+            2 => RuntimeError::IndexOutOfBounds {
+                range: TokenRange::default(),
+            },
             3 => RuntimeError::CapabilityDenied {
                 cap_bit: None,
                 reason: "llvm-aot: host-fn call denied by capability gate".to_string(),
@@ -221,6 +244,10 @@ impl NativeTrap {
                 // trap; it states the structural cause instead.
                 expected: "a matching arm".to_string(),
                 found: "no matching arm".to_string(),
+                range: TokenRange::default(),
+            },
+            4 => RuntimeError::StepLimitExceeded {
+                limit: None,
                 range: TokenRange::default(),
             },
             _ => RuntimeError::Unsupported {
@@ -258,6 +285,15 @@ impl ArenaState {
             scratch_base: UnsafeCell::new(scratch_base),
             trap_code: UnsafeCell::new(0),
             host_fns: UnsafeCell::new(0),
+            step_budget: UnsafeCell::new(0),
+        }
+    }
+
+    /// Set the remaining step budget for this dispatch. `0` disables
+    /// budget checks; negative values are already exhausted.
+    pub fn set_step_budget(&self, budget: i64) {
+        unsafe {
+            *self.step_budget.get() = budget;
         }
     }
 
@@ -403,8 +439,7 @@ pub const RELON_LLVM_CALL_NATIVE_SYMBOL: &str = "relon_llvm_call_native";
 /// `RuntimeError` the same way every other LLVM trap surfaces. Mirrors
 /// the cranelift backend's `SandboxState::call_native`.
 ///
-/// Scope (phase-0b parity with the bytecode VM + cranelift dynamic
-/// path): scalar `Int` args in, `Int` / `Bool` / `Unit` result out.
+/// Scope: scalar `Int` args in, `Int` / `Bool` / `Unit` result out.
 ///
 /// # Safety
 ///
@@ -504,6 +539,10 @@ mod tests {
             (state.host_fns.get() as usize) - base,
             ARENA_STATE_OFFSET_HOST_FNS as usize
         );
+        assert_eq!(
+            (state.step_budget.get() as usize) - base,
+            ARENA_STATE_OFFSET_STEP_BUDGET as usize
+        );
     }
 
     struct AddOne;
@@ -551,5 +590,21 @@ mod tests {
         let r = unsafe { relon_llvm_call_native(&state as *const _, 0, std::ptr::null(), 0) };
         assert_eq!(r, 0);
         assert_eq!(state.trap_code(), NativeTrap::HostFnMissing as u64);
+    }
+
+    #[test]
+    fn native_trap_bounds_code_lifts_to_index_out_of_bounds() {
+        assert!(matches!(
+            NativeTrap::runtime_error_from_code(NativeTrap::DivisionByZero as u64),
+            RuntimeError::DivisionByZero(_)
+        ));
+        assert!(matches!(
+            NativeTrap::runtime_error_from_code(NativeTrap::BoundsViolation as u64),
+            RuntimeError::IndexOutOfBounds { .. }
+        ));
+        assert!(matches!(
+            NativeTrap::runtime_error_from_code(NativeTrap::ResourceExhausted as u64),
+            RuntimeError::StepLimitExceeded { .. }
+        ));
     }
 }

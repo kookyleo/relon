@@ -17,9 +17,8 @@ use std::sync::{Arc, Mutex};
 /// Tree-walking interpreter. Implements [`relon_eval_api::Evaluator`]
 /// and is the default backend hosts construct directly.
 ///
-/// Previously named `Evaluator`; the rename makes room for alternative
-/// backends (a bytecode VM is on the roadmap) without ambiguity at the
-/// host import site.
+/// Previously named `Evaluator`; the rename keeps alternative backend
+/// implementations unambiguous at the host import site.
 pub struct TreeWalkEvaluator {
     pub context: Arc<Context>,
     /// Lazy cache for the `Arc<dyn NativeFnCaps>` handed to native fns so

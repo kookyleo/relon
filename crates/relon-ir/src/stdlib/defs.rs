@@ -994,10 +994,9 @@ fn starts_with_string_body() -> Vec<TaggedOp> {
 /// F-D7-D body for `contains(haystack: String, needle: String) -> Bool`.
 ///
 /// Algorithm: naive O(s_len * p_len) substring scan. Mirrors the
-/// pre-existing `__relon_str_contains` host shim (and the F-D7-C
-/// inline lowering on the trace-JIT side) so the IR-level path stays
-/// compatible with the trace recorder's `TraceOp::StrContains`
-/// short-circuit (`STDLIB_IDX_CONTAINS = 36`).
+/// pre-existing `__relon_str_contains` host shim so the IR-level path
+/// stays compatible with native string fast paths that intercept
+/// `STDLIB_IDX_CONTAINS = 36`.
 ///
 /// 1. Load `s_len` / `p_len` from the records' `[len: u32 LE]` headers.
 /// 2. `p_len > s_len` → return `false` (needle too long).
@@ -1028,7 +1027,7 @@ pub(super) fn contains_string() -> StdlibFunction {
 
 /// Registry entry for `glob_match(s: String, pattern: String) -> Bool`.
 ///
-/// Tier-2 LuaJIT-pattern-subset glob matcher: `*` / `?` / `[set]` /
+/// Lua-style pattern-subset glob matcher: `*` / `?` / `[set]` /
 /// `[^set]` plus `\`-escapes, anchored on both ends, char-by-char
 /// Unicode, case-sensitive. The matcher itself lives in
 /// [`crate::glob::glob_match`].
@@ -1036,8 +1035,8 @@ pub(super) fn contains_string() -> StdlibFunction {
 /// ## Why the body traps
 ///
 /// The body builder emits a single `Op::Trap` so any backend that
-/// inlines the IR body literally (`wasm` AOT, future bytecode
-/// inliner) fails loudly rather than silently returning `false`. The
+/// inlines the IR body literally fails loudly rather than silently
+/// returning `false`. The
 /// production lowering paths route around the trap:
 ///
 /// * **Tree-walker** registers its own Rust impl in
@@ -1047,9 +1046,9 @@ pub(super) fn contains_string() -> StdlibFunction {
 ///   STDLIB_IDX_GLOB_MATCH }` in `emit_call_stdlib` and emits an
 ///   indirect call to the `RelonGlobMatch` vtable slot instead of
 ///   inlining the body.
-/// * **Bytecode / trace-JIT** treat the call as an opaque stdlib
-///   dispatch — they fall back to the tree-walker bridge until the
-///   inline-lowering follow-up phase lands.
+/// * **Future compiled targets** should either route around the trap as
+///   an opaque stdlib dispatch or implement the Unicode glob algorithm
+///   directly.
 ///
 /// The IR body still occupies a fixed slot (`STDLIB_IDX_GLOB_MATCH =
 /// 37`) so the wire format stays stable: any module compiled against

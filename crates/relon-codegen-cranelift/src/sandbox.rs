@@ -217,11 +217,10 @@ unsafe extern "C" fn cap_grant_sentinel(x: i64) -> i64 {
     x
 }
 
-/// Zero-sized [`NativeFnCaps`] for cranelift-dispatched host fns. Same
-/// shape as the bytecode VM's caps: no closure-callback / iterator
-/// surface yet, so host fns that need those route through the
-/// tree-walker. Cached as a single `Arc` so each dispatch is a refcount
-/// bump rather than an allocation.
+/// Zero-sized [`NativeFnCaps`] for cranelift-dispatched host fns. This
+/// path exposes no closure-callback / iterator surface yet, so host fns
+/// that need those route through the tree-walker. Cached as a single
+/// `Arc` so each dispatch is a refcount bump rather than an allocation.
 struct CraneliftNativeFnCaps;
 
 impl NativeFnCaps for CraneliftNativeFnCaps {
@@ -353,7 +352,7 @@ impl CapabilityVtable {
     /// `slots[cap_bit]`. An `Op::CheckCap { cap_bit }` only null-checks
     /// the slot, so a sentinel is enough to let the guard pass; the
     /// actual call dispatches through the `import_idx`-keyed `host_fns`
-    /// registry, not this slot. Mirrors the bytecode VM's grant set.
+    /// registry, not this slot.
     pub fn grant(&mut self, cap_bit: u32) {
         // SAFETY-of-intent: `cap_grant_sentinel` is never *called* — the
         // CheckCap path only compares the slot pointer against null, and
@@ -949,8 +948,7 @@ impl SandboxState {
     /// unsupported shape) the same way every other cranelift trap
     /// surfaces.
     ///
-    /// Scope (phase-4a parity with the bytecode VM): scalar `Int` args
-    /// in, `Int` result out. A non-`Int` arg or result records
+    /// Scope: scalar `Int` args in, `Int` result out. A non-`Int` arg or result records
     /// [`TrapKind::Unreachable`] (→ `RuntimeError::Unsupported`).
     ///
     /// # Safety

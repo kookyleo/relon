@@ -82,7 +82,49 @@ jobs:
       - name: cargo build (workspace, all targets)
         run: cargo build --workspace --all-targets
 
+  portable-core:
+    name: portable core (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo test portable core
+        run: cargo test -p relon-parser -p relon-analyzer -p relon-eval-api -p relon-evaluator -p relon-fmt -p relon --no-default-features
+      - name: cargo build CLI
+        run: cargo test -p relon-cli --no-run
+
+  docs:
+    name: docs build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+      - name: Install docs dependencies
+        working-directory: docs
+        run: npm ci
+      - name: Build docs
+        working-directory: docs
+        run: npm run docs:build
+
   # The kani job (F-2 bounds proofs) was removed: its only proof target
-  # was relon-trace-jit/src/runtime/proofs.rs, deleted with the retired
-  # trace-JIT crate in 62bf6805. No #[cfg(kani)] proofs remain in the
+  # lived in a retired experimental JIT proof crate deleted in 62bf6805.
+  # No #[cfg(kani)] proofs remain in the
   # workspace, so there is nothing to model-check.

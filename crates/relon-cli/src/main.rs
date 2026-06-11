@@ -18,9 +18,9 @@ use relon_analyzer::{
 };
 use relon_codegen_cranelift::AotEvaluator;
 use relon_evaluator::module::FilesystemModuleResolver;
-use relon_evaluator::{Capabilities, Context, TreeWalkEvaluator};
+use relon_evaluator::{Capabilities, Context, ResourceBudget, TreeWalkEvaluator};
 use relon_parser::{parse_document, ParseDocumentError, TypeNode};
-use serde_json::Value as JsonValue;
+use serde_json::{json, Value as JsonValue};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -52,6 +52,289 @@ enum BackendArg {
     /// is rejected — this backend only ships entries.
     #[value(name = "cranelift-aot")]
     CraneliftAot,
+}
+
+/// Resource-budget profile for `relon run`. Profiles are CLI policy,
+/// not Relon source policy: the operator chooses them at the call site.
+#[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
+enum BudgetArg {
+    /// Preserve the historical default: no CLI-installed evaluator or
+    /// output budget.
+    #[default]
+    #[value(name = "off")]
+    Off,
+    /// Local development guardrails: enough room for normal configs,
+    /// but catches accidental runaway evaluation and huge output.
+    #[value(name = "dev")]
+    Dev,
+    /// Tighter guardrails for externally supplied configs. This is a
+    /// convenience profile, not a VM security boundary.
+    #[value(name = "untrusted")]
+    Untrusted,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RunBudget {
+    max_source_bytes: Option<usize>,
+    max_steps: Option<u64>,
+    max_value_elements: Option<usize>,
+    max_output_bytes: Option<usize>,
+}
+
+struct RunCommand {
+    file: PathBuf,
+    pretty: bool,
+    lite: bool,
+    args: Option<String>,
+    trust: bool,
+    backend: BackendArg,
+    budget: BudgetArg,
+    max_source_bytes: Option<usize>,
+    max_steps: Option<u64>,
+    max_value_elements: Option<usize>,
+    max_output_bytes: Option<usize>,
+    require_hash: bool,
+}
+
+impl RunBudget {
+    const DEV_MAX_SOURCE_BYTES: usize = 1024 * 1024;
+    const DEV_MAX_STEPS: u64 = ResourceBudget::DEV_MAX_STEPS;
+    const DEV_MAX_VALUE_ELEMENTS: usize = ResourceBudget::DEV_MAX_VALUE_ELEMENTS;
+    const DEV_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+    const UNTRUSTED_MAX_SOURCE_BYTES: usize = 256 * 1024;
+    const UNTRUSTED_MAX_STEPS: u64 = ResourceBudget::UNTRUSTED_MAX_STEPS;
+    const UNTRUSTED_MAX_VALUE_ELEMENTS: usize = ResourceBudget::UNTRUSTED_MAX_VALUE_ELEMENTS;
+    const UNTRUSTED_MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
+    fn from_cli(
+        profile: BudgetArg,
+        max_source_bytes: Option<usize>,
+        max_steps: Option<u64>,
+        max_value_elements: Option<usize>,
+        max_output_bytes: Option<usize>,
+    ) -> Self {
+        let mut budget = match profile {
+            BudgetArg::Off => Self::default(),
+            BudgetArg::Dev => Self {
+                max_source_bytes: Some(Self::DEV_MAX_SOURCE_BYTES),
+                max_steps: Some(Self::DEV_MAX_STEPS),
+                max_value_elements: Some(Self::DEV_MAX_VALUE_ELEMENTS),
+                max_output_bytes: Some(Self::DEV_MAX_OUTPUT_BYTES),
+            },
+            BudgetArg::Untrusted => Self {
+                max_source_bytes: Some(Self::UNTRUSTED_MAX_SOURCE_BYTES),
+                max_steps: Some(Self::UNTRUSTED_MAX_STEPS),
+                max_value_elements: Some(Self::UNTRUSTED_MAX_VALUE_ELEMENTS),
+                max_output_bytes: Some(Self::UNTRUSTED_MAX_OUTPUT_BYTES),
+            },
+        };
+        if let Some(max_source_bytes) = max_source_bytes {
+            budget.max_source_bytes = Some(max_source_bytes);
+        }
+        if let Some(max_steps) = max_steps {
+            budget.max_steps = Some(max_steps);
+        }
+        if let Some(max_value_elements) = max_value_elements {
+            budget.max_value_elements = Some(max_value_elements);
+        }
+        if let Some(max_output_bytes) = max_output_bytes {
+            budget.max_output_bytes = Some(max_output_bytes);
+        }
+        budget
+    }
+
+    fn has_evaluator_limits(self) -> bool {
+        self.max_steps.is_some() || self.max_value_elements.is_some()
+    }
+
+    fn apply_to_capabilities(self, caps: &mut Capabilities) {
+        if let Some(max_steps) = self.max_steps {
+            caps.max_steps = Some(max_steps);
+        }
+        if let Some(max_value_elements) = self.max_value_elements {
+            caps.max_value_elements = Some(max_value_elements);
+        }
+    }
+}
+
+/// Host-runtime policy target for VM-style deployments. The CLI emits
+/// policy material; the host remains responsible for applying it to the
+/// actual runtime.
+#[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
+enum HostPolicyTargetArg {
+    /// Wasmtime engine/store limits for Relon wasm execution.
+    #[default]
+    #[value(name = "wasmtime")]
+    Wasmtime,
+}
+
+/// Built-in VM host policy profiles. These are deliberately CLI policy
+/// profiles, not Relon source-level configuration.
+#[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
+enum HostPolicyProfileArg {
+    /// Local development guardrails with enough headroom for interactive
+    /// debugging.
+    #[value(name = "dev")]
+    Dev,
+    /// Tighter default for externally supplied scripts running inside a VM.
+    #[default]
+    #[value(name = "untrusted")]
+    Untrusted,
+}
+
+impl HostPolicyProfileArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Dev => "dev",
+            Self::Untrusted => "untrusted",
+        }
+    }
+}
+
+/// Output format for `relon host-policy`.
+#[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
+enum HostPolicyFormatArg {
+    /// Machine-readable policy values for CI/deployment tooling.
+    #[default]
+    #[value(name = "json")]
+    Json,
+    /// Rust template showing where the generated limits attach to Wasmtime.
+    #[value(name = "rust")]
+    Rust,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WasmtimeHostPolicy {
+    profile: HostPolicyProfileArg,
+    fuel: u64,
+    epoch_deadline_ticks: u64,
+    wall_clock_timeout_ms: u64,
+    memory_size_bytes: usize,
+    table_elements: usize,
+    instances: usize,
+    tables: usize,
+    memories: usize,
+    output_bytes: usize,
+}
+
+impl WasmtimeHostPolicy {
+    fn from_profile(profile: HostPolicyProfileArg) -> Self {
+        match profile {
+            HostPolicyProfileArg::Dev => Self {
+                profile,
+                fuel: RunBudget::DEV_MAX_STEPS,
+                epoch_deadline_ticks: 1,
+                wall_clock_timeout_ms: 5_000,
+                memory_size_bytes: 64 * 1024 * 1024,
+                table_elements: 10_000,
+                instances: 1,
+                tables: 8,
+                memories: 1,
+                output_bytes: RunBudget::DEV_MAX_OUTPUT_BYTES,
+            },
+            HostPolicyProfileArg::Untrusted => Self {
+                profile,
+                fuel: RunBudget::UNTRUSTED_MAX_STEPS,
+                epoch_deadline_ticks: 1,
+                wall_clock_timeout_ms: 1_000,
+                memory_size_bytes: 16 * 1024 * 1024,
+                table_elements: 4_096,
+                instances: 1,
+                tables: 4,
+                memories: 1,
+                output_bytes: RunBudget::UNTRUSTED_MAX_OUTPUT_BYTES,
+            },
+        }
+    }
+
+    fn to_json_value(self) -> JsonValue {
+        json!({
+            "target": "wasmtime",
+            "profile": self.profile.as_str(),
+            "engine": {
+                "consume_fuel": true,
+                "epoch_interruption": true
+            },
+            "store": {
+                "fuel": self.fuel,
+                "epoch_deadline_ticks": self.epoch_deadline_ticks,
+                "limits": {
+                    "memory_size_bytes": self.memory_size_bytes,
+                    "table_elements": self.table_elements,
+                    "instances": self.instances,
+                    "tables": self.tables,
+                    "memories": self.memories,
+                    "trap_on_grow_failure": true
+                }
+            },
+            "host": {
+                "wall_clock_timeout_ms": self.wall_clock_timeout_ms,
+                "output_bytes": self.output_bytes,
+                "wasi": "deny-by-default",
+                "imports": "allowlist"
+            },
+            "notes": [
+                "Fuel is a Wasmtime instruction-cost budget, not a Relon evaluator step count.",
+                "Epoch interruption requires a host timer/task that calls Engine::increment_epoch().",
+                "Output bytes must be checked by the host after serializing the returned value."
+            ]
+        })
+    }
+
+    fn to_rust_snippet(self) -> String {
+        format!(
+            r#"use wasmtime::{{Config, Engine, Store, StoreLimits, StoreLimitsBuilder}};
+
+pub struct RelonVmState {{
+    limits: StoreLimits,
+    // Add host-owned state for Relon imports/functions here.
+}}
+
+pub fn build_relon_store() -> Result<(Engine, Store<RelonVmState>), wasmtime::Error> {{
+    let mut config = Config::new();
+    config.consume_fuel(true);
+    config.epoch_interruption(true);
+
+    let engine = Engine::new(&config)?;
+    let state = RelonVmState {{
+        limits: StoreLimitsBuilder::new()
+            .memory_size({memory_size_bytes})
+            .table_elements({table_elements})
+            .instances({instances})
+            .tables({tables})
+            .memories({memories})
+            .trap_on_grow_failure(true)
+            .build(),
+    }};
+
+    let mut store = Store::new(&engine, state);
+    store.limiter(|state| &mut state.limits);
+    store.set_fuel({fuel})?;
+
+    #[cfg(target_has_atomic = "64")]
+    store.set_epoch_deadline({epoch_deadline_ticks});
+
+    Ok((engine, store))
+}}
+
+// Profile: {profile}
+// Host wall-clock timeout: {wall_clock_timeout_ms} ms.
+// Host JSON/output byte limit: {output_bytes} bytes.
+// Keep WASI denied by default and expose only audited Relon host imports.
+// If epoch interruption is enabled, run a host timer/task that calls
+// `engine.increment_epoch()` after the wall-clock deadline."#,
+            profile = self.profile.as_str(),
+            fuel = self.fuel,
+            epoch_deadline_ticks = self.epoch_deadline_ticks,
+            wall_clock_timeout_ms = self.wall_clock_timeout_ms,
+            memory_size_bytes = self.memory_size_bytes,
+            table_elements = self.table_elements,
+            instances = self.instances,
+            tables = self.tables,
+            memories = self.memories,
+            output_bytes = self.output_bytes,
+        )
+    }
 }
 
 #[derive(Parser)]
@@ -119,6 +402,34 @@ enum Commands {
         /// for library-mode files.
         #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
         backend: BackendArg,
+        /// Resource-budget profile installed by the CLI. `off` preserves
+        /// the historical default. `dev` and `untrusted` currently apply
+        /// a source-byte preflight, tree-walk step/value limits, and an
+        /// output-byte limit; they are guardrails, not a replacement for a
+        /// wasm VM boundary.
+        #[arg(long, value_enum, default_value_t = BudgetArg::Off)]
+        budget: BudgetArg,
+        /// Maximum number of bytes the input `.relon` source file may
+        /// contain. Checked from file metadata before reading/parsing so
+        /// pathological untrusted inputs can be rejected before the parser
+        /// stack is involved.
+        #[arg(long)]
+        max_source_bytes: Option<usize>,
+        /// Override the evaluator step budget. Forces the tree-walk
+        /// evaluator under `--backend auto`; rejected with explicit
+        /// `--backend cranelift-aot` because that backend does not honor
+        /// this CLI budget.
+        #[arg(long)]
+        max_steps: Option<u64>,
+        /// Override the maximum element count for a single list/tuple/dict.
+        /// Forces the tree-walk evaluator under `--backend auto`; rejected
+        /// with explicit `--backend cranelift-aot`.
+        #[arg(long)]
+        max_value_elements: Option<usize>,
+        /// Maximum number of bytes the final JSON output may contain after
+        /// the selected pretty/compact serialization.
+        #[arg(long)]
+        max_output_bytes: Option<usize>,
         /// v3++ b-2: when set, every `#import` whose path looks remote
         /// (`https://`, `http://`) MUST carry an inline integrity pin
         /// (e.g. `sha256:"<hex>"`). Missing pins surface as
@@ -129,6 +440,42 @@ enum Commands {
         /// tree-time. Default off preserves the v3+ a-3 behavior.
         #[arg(long, default_value_t = false)]
         require_hash: bool,
+    },
+
+    /// Parse, analyze, and report whether a file is compatible with a
+    /// selected execution backend without running it.
+    Check {
+        /// The path to the .relon file
+        file: PathBuf,
+        /// Backend compatibility target to check.
+        #[arg(long, value_enum, default_value_t = BackendArg::Auto)]
+        backend: BackendArg,
+        /// Use the trusted resolver posture while checking imports.
+        #[arg(long)]
+        trust: bool,
+        /// Maximum number of bytes the input `.relon` source file may
+        /// contain. Checked before reading/parsing.
+        #[arg(long)]
+        max_source_bytes: Option<usize>,
+        /// Require remote imports to carry inline hash pins.
+        #[arg(long, default_value_t = false)]
+        require_hash: bool,
+    },
+
+    /// Emit host-runtime policy for VM deployments. This is intentionally
+    /// outside `.relon` source: operators choose limits at the runtime/host
+    /// boundary, where they can actually be enforced.
+    #[command(name = "host-policy")]
+    HostPolicy {
+        /// Runtime target to generate for.
+        #[arg(long, value_enum, default_value_t = HostPolicyTargetArg::Wasmtime)]
+        target: HostPolicyTargetArg,
+        /// Built-in policy profile.
+        #[arg(long, value_enum, default_value_t = HostPolicyProfileArg::Untrusted)]
+        profile: HostPolicyProfileArg,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = HostPolicyFormatArg::Json)]
+        format: HostPolicyFormatArg,
     },
 
     /// Format or check Relon files. Equivalent to the standalone
@@ -175,9 +522,9 @@ enum Commands {
 /// * `relon run <file> --args <json>` (or `--args -` for stdin)
 /// * `relon run <file> --lite [--args <json>]`
 ///
-/// Anything else — `fmt`, `lsp`, `--trust`, `--backend`,
-/// `--require-hash`, `--pretty`, `--help`, `--version` — defers to
-/// clap so the surface stays compatible.
+/// Anything else — `fmt`, `lsp`, `--trust`, `--backend`, budget flags,
+/// `--require-hash`, `--pretty`, `--help`, `--version` — defers to clap
+/// so the surface stays compatible.
 fn try_parse_run_fast(argv: &[std::ffi::OsString]) -> Option<Commands> {
     // argv[0] is the binary. The first command-line arg must be `run`;
     // everything else (`fmt`, `lsp`, `--help`, …) goes through clap.
@@ -224,6 +571,11 @@ fn try_parse_run_fast(argv: &[std::ffi::OsString]) -> Option<Commands> {
         args,
         trust: false,
         backend: BackendArg::Auto,
+        budget: BudgetArg::Off,
+        max_steps: None,
+        max_value_elements: None,
+        max_output_bytes: None,
+        max_source_bytes: None,
         require_hash: false,
     })
 }
@@ -276,8 +628,38 @@ fn main() -> miette::Result<()> {
             args,
             trust,
             backend,
+            budget,
+            max_steps,
+            max_value_elements,
+            max_output_bytes,
+            max_source_bytes,
             require_hash,
-        } => cmd_run(file, pretty, lite, args, trust, backend, require_hash)?,
+        } => cmd_run(RunCommand {
+            file,
+            pretty,
+            lite,
+            args,
+            trust,
+            backend,
+            budget,
+            max_source_bytes,
+            max_steps,
+            max_value_elements,
+            max_output_bytes,
+            require_hash,
+        })?,
+        Commands::Check {
+            file,
+            backend,
+            trust,
+            max_source_bytes,
+            require_hash,
+        } => cmd_check(file, backend, trust, max_source_bytes, require_hash)?,
+        Commands::HostPolicy {
+            target,
+            profile,
+            format,
+        } => cmd_host_policy(target, profile, format)?,
         Commands::Fmt {
             check,
             stdout,
@@ -315,6 +697,29 @@ const TRUST_UNSUPPORTED_ON_AOT: &str =
 
 fn warn_trust_unsupported_on_aot() {
     eprintln!("{TRUST_UNSUPPORTED_ON_AOT}");
+}
+
+fn cmd_host_policy(
+    target: HostPolicyTargetArg,
+    profile: HostPolicyProfileArg,
+    format: HostPolicyFormatArg,
+) -> miette::Result<()> {
+    match target {
+        HostPolicyTargetArg::Wasmtime => {
+            let policy = WasmtimeHostPolicy::from_profile(profile);
+            match format {
+                HostPolicyFormatArg::Json => {
+                    let output =
+                        serde_json::to_string_pretty(&policy.to_json_value()).into_diagnostic()?;
+                    println!("{output}");
+                }
+                HostPolicyFormatArg::Rust => {
+                    println!("{}", policy.to_rust_snippet());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_main_args_json(
@@ -976,15 +1381,151 @@ fn type_key(type_hint: &TypeNode) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cmd_run(
+fn enforce_source_size(path: &Path, limit: Option<usize>) -> miette::Result<()> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    let actual = std::fs::metadata(path)
+        .into_diagnostic()
+        .map_err(|e| e.wrap_err(format!("Failed to stat file {:?}", path)))?
+        .len() as usize;
+    if actual > limit {
+        return Err(miette::miette!(
+            "Relon source exceeded --max-source-bytes: actual {actual} bytes, limit {limit} bytes"
+        ));
+    }
+    Ok(())
+}
+
+fn cmd_check(
     file: PathBuf,
-    pretty: bool,
-    lite: bool,
-    args: Option<String>,
-    trust: bool,
     backend: BackendArg,
+    trust: bool,
+    max_source_bytes: Option<usize>,
     require_hash: bool,
 ) -> miette::Result<()> {
+    let canonical_file = std::fs::canonicalize(&file)
+        .into_diagnostic()
+        .map_err(|e| e.wrap_err(format!("Failed to resolve file {:?}", file)))?;
+    enforce_source_size(&canonical_file, max_source_bytes)?;
+    let content = std::fs::read_to_string(&canonical_file)
+        .into_diagnostic()
+        .map_err(|e| e.wrap_err(format!("Failed to read file {:?}", canonical_file)))?;
+
+    let cache_namespace = canonical_file.to_string_lossy().to_string();
+    let entry_dir = canonical_file
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let mut loader = if trust {
+        ResolverChainLoader::trusted()
+    } else {
+        ResolverChainLoader::sandboxed()
+    };
+    let analyze_options = AnalyzeOptions {
+        require_hash,
+        ..AnalyzeOptions::default()
+    };
+    let workspace = analyze_entry_with_options(
+        cache_namespace.clone(),
+        &content,
+        entry_dir,
+        &mut loader,
+        &analyze_options,
+    );
+    if workspace.has_errors() {
+        let mut messages: Vec<String> = workspace
+            .workspace_diagnostics
+            .iter()
+            .filter(|d| d.severity() == relon_analyzer::Severity::Error)
+            .map(|d| d.to_string())
+            .collect();
+        for (id, tree) in &workspace.modules {
+            for d in &tree.diagnostics {
+                if d.severity() == relon_analyzer::Severity::Error {
+                    messages.push(format!("[{id}] {d}"));
+                }
+            }
+        }
+        let joined = messages.join("\n  - ");
+        return Err(miette::miette!("Analyzer reported errors:\n  - {joined}")
+            .with_source_code(NamedSource::new(file.to_string_lossy(), content)));
+    }
+
+    let has_main = workspace
+        .modules
+        .get(&cache_namespace)
+        .and_then(|tree| tree.main_signature.as_ref())
+        .is_some();
+    println!("ok: analyzer");
+    match backend {
+        BackendArg::TreeWalk => {
+            println!("backend tree-walk: compatible (reference evaluator)");
+            Ok(())
+        }
+        BackendArg::CraneliftAot => {
+            if trust {
+                warn_trust_unsupported_on_aot();
+            }
+            check_cranelift_compat(&content, has_main, "cranelift-aot", true)
+        }
+        BackendArg::Auto => {
+            if !has_main {
+                println!("backend auto: compatible (library-mode routes to tree-walk)");
+                return Ok(());
+            }
+            if relon::is_trivial_scalar_main(&content) {
+                println!("backend auto: compatible (trivial #main routes to tree-walk)");
+                return Ok(());
+            }
+            check_cranelift_compat(&content, has_main, "auto/cranelift-aot", false)
+        }
+    }
+}
+
+fn check_cranelift_compat(
+    content: &str,
+    has_main: bool,
+    label: &str,
+    strict: bool,
+) -> miette::Result<()> {
+    if !has_main {
+        let message = format!("{label}: incompatible (cranelift-aot requires `#main(...)`)");
+        return if strict {
+            Err(miette::miette!("{message}"))
+        } else {
+            println!("backend {message}; auto will route to tree-walk");
+            Ok(())
+        };
+    }
+    match AotEvaluator::from_source(content) {
+        Ok(_) => {
+            println!("backend {label}: compatible");
+            Ok(())
+        }
+        Err(e) if e.is_unsupported_shape() && !strict => {
+            println!("backend {label}: not compiled ({e}); auto will fall back to tree-walk");
+            Ok(())
+        }
+        Err(e) => Err(miette::miette!("{label}: incompatible: {e}")),
+    }
+}
+
+fn cmd_run(command: RunCommand) -> miette::Result<()> {
+    let RunCommand {
+        file,
+        pretty,
+        lite,
+        args,
+        trust,
+        backend,
+        budget,
+        max_source_bytes,
+        max_steps,
+        max_value_elements,
+        max_output_bytes,
+        require_hash,
+    } = command;
     // v6-fix-D2: phase timing. Emitted only when the
     // operator opts in via `RELON_CLI_PROFILE=1`; default
     // path stays silent so `--lite` doesn't pollute
@@ -1002,6 +1543,14 @@ fn cmd_run(
         eprintln!("[relon-cli profile] {label:<24} +{delta_us:>6}us  (total {total_us}us)");
         last_phase_at = now;
     };
+    let run_budget = RunBudget::from_cli(
+        budget,
+        max_source_bytes,
+        max_steps,
+        max_value_elements,
+        max_output_bytes,
+    );
+
     // v6-fix-D2: `--lite` forces the tree-walker, which is
     // the only backend whose cold-start fits inside a 2x
     // LuaJIT envelope on the W11 shape. Resolve the effective
@@ -1011,23 +1560,35 @@ fn cmd_run(
     //     (operator should not see a silent swap).
     //   * --lite + auto / tree-walk         -> tree-walk
     //   * no --lite                          -> requested backend
-    let effective_backend = if lite {
-        match backend {
-            BackendArg::Auto | BackendArg::TreeWalk => BackendArg::TreeWalk,
-            other => {
-                return Err(miette::miette!(
-                            "--lite forces `--backend tree-walk`; remove the explicit `--backend {:?}` or drop `--lite`",
-                            other
-                        ));
-            }
+    //
+    // CLI evaluator-side budgets are currently tree-walk-enforced
+    // (`Capabilities::max_steps` / `max_value_elements`). `--backend auto`
+    // therefore resolves to tree-walk when such a budget is present; an
+    // explicit `--backend cranelift-aot` rejects instead of silently
+    // ignoring the operator's limit.
+    let effective_backend = match (lite, run_budget.has_evaluator_limits(), backend) {
+        (true, _, BackendArg::Auto | BackendArg::TreeWalk)
+        | (false, true, BackendArg::Auto)
+        | (false, _, BackendArg::TreeWalk) => BackendArg::TreeWalk,
+        (true, _, other) => {
+            return Err(miette::miette!(
+                "--lite forces `--backend tree-walk`; remove the explicit `--backend {:?}` or drop `--lite`",
+                other
+            ));
         }
-    } else {
-        backend
+        (false, true, BackendArg::CraneliftAot) => {
+            return Err(miette::miette!(
+                "evaluator resource budgets (--budget dev|untrusted, --max-steps, --max-value-elements) \
+                 currently require `--backend tree-walk`; cranelift-aot does not honor these CLI limits"
+            ));
+        }
+        (false, false, other) => other,
     };
     let canonical_file = std::fs::canonicalize(&file)
         .into_diagnostic()
         .map_err(|e| e.wrap_err(format!("Failed to resolve file {:?}", file)))?;
     phase("canonicalize");
+    enforce_source_size(&canonical_file, run_budget.max_source_bytes)?;
     let content = std::fs::read_to_string(&canonical_file)
         .into_diagnostic()
         .map_err(|e| e.wrap_err(format!("Failed to read file {:?}", canonical_file)))?;
@@ -1303,8 +1864,16 @@ fn cmd_run(
         let mut ctx = Context::sandboxed()
             .with_root(entry_node)
             .with_workspace(Arc::clone(&workspace));
+        let mut caps = if trust {
+            Capabilities::all_granted()
+        } else {
+            Capabilities::default()
+        };
+        run_budget.apply_to_capabilities(&mut caps);
+        if trust || run_budget.has_evaluator_limits() {
+            ctx = ctx.with_capabilities(caps);
+        }
         if trust {
-            ctx = ctx.with_capabilities(Capabilities::all_granted());
             ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
             // v3+ a-3: --trust opens remote `#import "https://..."`
             // resolution. Resolver lives on native targets only;
@@ -1617,7 +2186,8 @@ fn cmd_run(
 
     phase("evaluate");
     let final_val = relon::to_json_value(result).map_err(|e| {
-        miette::miette!("{}", e).with_source_code(NamedSource::new(file.to_string_lossy(), content))
+        miette::miette!("{}", e)
+            .with_source_code(NamedSource::new(file.to_string_lossy(), content.clone()))
     })?;
     phase("to_json_value");
 
@@ -1627,6 +2197,16 @@ fn cmd_run(
         serde_json::to_string(&final_val).into_diagnostic()?
     };
     phase("serialise_json");
+
+    if let Some(limit) = run_budget.max_output_bytes {
+        let actual = output.len();
+        if actual > limit {
+            return Err(miette::miette!(
+                "JSON output exceeded --max-output-bytes: actual {actual} bytes, limit {limit} bytes"
+            )
+            .with_source_code(NamedSource::new(file.to_string_lossy(), content)));
+        }
+    }
 
     println!("{}", output);
     phase("println");

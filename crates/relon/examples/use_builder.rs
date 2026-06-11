@@ -5,6 +5,12 @@
 //! flipping trust posture, and (on the tree-walker only) registering
 //! host-supplied native fns the script can call.
 //!
+//! First-release embedding rule of thumb:
+//! - pure computed config: use `relon::from_str` / sandboxed defaults;
+//! - trusted local imports or staged host fns: use `Backend::TreeWalk`;
+//! - native performance: use `Backend::Auto` or an explicit compiled
+//!   backend, but do not rely on staged host fns there.
+//!
 //! Run with:
 //!
 //! ```sh
@@ -52,12 +58,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source = "#main(Int x) -> Int\nhost_double(x) + 1";
 
     let evaluator = EvaluatorBuilder::from_str(source)
-        // Default is `Backend::Auto`; pin to `TreeWalk` because host
-        // fn registration is only meaningful on that backend.
+        // Default is `Backend::Auto`; pin to `TreeWalk` because staged
+        // host fn registration is only meaningful on that first-release
+        // backend path. `Backend::Auto + TrustLevel::Trusted` rejects
+        // loudly instead of guessing how to dispatch host-owned effects.
         .backend(Backend::TreeWalk)
-        // Default is `Sandboxed`. Trusted unlocks filesystem
-        // `#import` and capability-gated native fns; this example
-        // doesn't need it but the flip is one line.
+        // Default is `Sandboxed`. Use `TrustLevel::Trusted` only for
+        // host-owned scripts that need local imports or capability-gated
+        // native fns; this pure example does not need that grant.
         .trust(TrustLevel::Sandboxed)
         .register_pure_native_fn("host_double", Arc::new(HostDouble))
         .build()?;

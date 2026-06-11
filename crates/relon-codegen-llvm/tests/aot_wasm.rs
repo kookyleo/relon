@@ -188,9 +188,6 @@ fn build_wasm(wl: &Workload) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// Instantiate `bytes` in wasmtime and call the exported entry with
-/// `args`, returning the i64 result.
-///
 /// The LLVM wasm backend lowers 128-bit integer multiply (which shows
 /// up in wide `list.sum` accumulation) to a `call $__multi3` against the
 /// compiler-rt builtin. On a native target compiler-rt supplies it; for
@@ -199,14 +196,9 @@ fn build_wasm(wl: &Workload) -> Result<Vec<u8>, String> {
 /// b_hi)` writes the 128-bit signed product `[a_hi:a_lo] * [b_hi:b_lo]`
 /// to `linear_memory[ret_ptr..ret_ptr+16]` little-endian. This keeps the
 /// wasm module self-contained and the arithmetic correct.
-fn run_in_wasmtime(bytes: &[u8], entry: &str, args: &[i64]) -> i64 {
-    use wasmtime::{Caller, Engine, Extern, Linker, Module, Store, Val};
-
-    let engine = Engine::default();
-    let module = Module::new(&engine, bytes).expect("wasmtime Module::new");
-    let mut store = Store::new(&engine, ());
-
-    let mut linker = Linker::new(&engine);
+fn linker_with_multi3(engine: &wasmtime::Engine) -> wasmtime::Linker<()> {
+    use wasmtime::{Caller, Extern, Linker};
+    let mut linker = Linker::new(engine);
     // Register the compiler-rt 128-bit multiply builtin the LLVM wasm
     // backend may emit. Signature: (i32 ret_ptr, i64 a_lo, i64 a_hi,
     // i64 b_lo, i64 b_hi). Result is the full i128 product written LE
@@ -234,6 +226,19 @@ fn run_in_wasmtime(bytes: &[u8], entry: &str, args: &[i64]) -> i64 {
             },
         )
         .expect("register __multi3");
+    linker
+}
+
+/// Instantiate `bytes` in wasmtime and call the exported entry with
+/// `args`, returning the i64 result.
+fn run_in_wasmtime(bytes: &[u8], entry: &str, args: &[i64]) -> i64 {
+    use wasmtime::{Engine, Module, Store, Val};
+
+    let engine = Engine::default();
+    let module = Module::new(&engine, bytes).expect("wasmtime Module::new");
+    let mut store = Store::new(&engine, ());
+
+    let linker = linker_with_multi3(&engine);
 
     let instance = linker
         .instantiate(&mut store, &module)
@@ -300,9 +305,10 @@ fn fastpath_workloads_align_native_via_wasmtime() {
 /// as an i64 at offset 0, then `inttoptr`s — the i64→i32 wasm-pointer
 /// truncation is harmless since the arena offset fits in 32 bits).
 const STATE_OFF_ARENA_BASE: usize = 0; // i64 (8 bytes)
+const STATE_OFF_ARENA_LEN: usize = 8; // u32
 const STATE_OFF_TAIL_CURSOR: usize = 12; // u32
 const STATE_OFF_SCRATCH_BASE: usize = 20; // u32
-const STATE_SIZE: usize = 40; // through host_fns (8 bytes @ 32)
+const STATE_SIZE: usize = 48; // through step_budget (8 bytes @ 40)
 
 /// Drive a buffer-protocol wasm entry in wasmtime with a real arena
 /// laid out in linear memory. Lays the `ArenaState` struct at
@@ -320,12 +326,15 @@ fn run_buffer_in_wasmtime(
     in_record: &[u8],
     out_root_size: u32,
 ) -> Vec<u8> {
-    use wasmtime::{Engine, Extern, Instance, Module, Store, Val};
+    use wasmtime::{Engine, Extern, Module, Store, Val};
 
     let engine = Engine::default();
     let module = Module::new(&engine, bytes).expect("wasmtime Module::new");
     let mut store = Store::new(&engine, ());
-    let instance = Instance::new(&mut store, &module, &[]).expect("wasmtime instantiate");
+    let linker = linker_with_multi3(&engine);
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .expect("wasmtime instantiate");
 
     let memory = match instance.get_export(&mut store, "memory") {
         Some(Extern::Memory(m)) => m,
@@ -367,6 +376,7 @@ fn run_buffer_in_wasmtime(
     let mut state = [0u8; STATE_SIZE];
     state[STATE_OFF_ARENA_BASE..STATE_OFF_ARENA_BASE + 8]
         .copy_from_slice(&(arena_abs as u64).to_le_bytes());
+    state[STATE_OFF_ARENA_LEN..STATE_OFF_ARENA_LEN + 4].copy_from_slice(&arena_bytes.to_le_bytes());
     state[STATE_OFF_TAIL_CURSOR..STATE_OFF_TAIL_CURSOR + 4]
         .copy_from_slice(&out_root_size.to_le_bytes());
     state[STATE_OFF_SCRATCH_BASE..STATE_OFF_SCRATCH_BASE + 4]

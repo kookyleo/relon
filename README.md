@@ -2,10 +2,11 @@
 
 **Logic as data.** Relon is an executable data format: business
 logic — validation rules, pricing formulas, workflow steps — is written
-once and stored like JSON, then evaluated by an embeddable, sandboxed
-runtime. Determinism is part of the design: same source + same input →
-byte-identical output, no floating-point quirks, no iteration-order
-leaks, no implicit ambient state.
+once and stored like JSON, then evaluated by an embeddable runtime with
+explicit capability and budget controls. Determinism is part of the
+design: same source + same input → byte-identical output, no
+floating-point quirks, no iteration-order leaks, no implicit ambient
+state.
 
 ## 🚀 Quick Start
 
@@ -17,13 +18,15 @@ cargo build --release
 ### Run an Example
 Use the `relon-cli` to evaluate a file and output JSON:
 ```bash
-cargo run -p relon-cli -- run examples/demo.relon
+cargo run -q -p relon-cli -- run --backend tree-walk examples/demo.relon
 ```
 
-The CLI runs **sandboxed by default**: only `std/*` imports resolve and
-capability-gated native fns are denied. If your script needs local
-`#import "./lib.relon"` paths or registered host fns that touch FS /
-network, pass `--trust`:
+The CLI runs in a **sandboxed posture by default**: only `std/*` imports
+resolve and capability-gated native fns are denied. This is a
+capability/budget policy, not an OS sandbox; see the
+[Threat model](docs/en/guide/threat-model.md). If your script needs
+local `#import "./lib.relon"` paths or registered host fns that touch
+FS / network, pass `--trust`:
 ```bash
 cargo run -p relon-cli -- run fixtures/modules/main.relon --trust
 ```
@@ -39,8 +42,9 @@ CI on GitHub Actions enforces the same checks on every PR, plus a
 separate `cargo build` job against the pinned MSRV (`1.92`) so
 toolchain drift surfaces early.
 
-See [`SECURITY.md`](./SECURITY.md) for the sandbox threat model and
-how to report vulnerabilities.
+See [`SECURITY.md`](./SECURITY.md) for vulnerability reporting and
+[`docs/en/guide/threat-model.md`](docs/en/guide/threat-model.md) for
+the sandbox threat model.
 
 After a fresh clone, install the repository's git hooks once:
 ```bash
@@ -52,36 +56,65 @@ parallel workflows). It's advisory — never blocks.
 
 ## 🛠 Features
 
-- **Sandboxed by default**: a script declares the capabilities it needs
+- **No implicit trust**: a script declares the capabilities it needs
   (`reads_fs` / `writes_fs` / `network` / `reads_clock` / `reads_env` /
   `uses_rng`; native fns are gated by the same capability bits); the
   host grants them.
   Scripts can't elevate themselves; the host can choose to grant all
   caps explicitly via `--trust` / `Capabilities::all_granted()`, and
   that grant is auditable code at the call site rather than an implicit
-  trusted mode.
+  trust path.
 - **Self-describing schemas**: `#schema` records and `#enum` tagged
   enums, recursive contracts, branded values — type information travels
   with the payload.
 - **Context-aware references**: `&root`, `&sibling`, `&prev`, `&next`
   let logic reference its surrounding data without hard-coded paths.
-- **Functional core**: arrow closures (`(x) => x + 1`) and method
-  shorthands (`f(x): x + 1`), comprehensions, pipes, pattern match —
+- **Functional core**: arrow closures (`(Int x) -> Int => x + 1`) and
+  method shorthands (`Int f(Int x): x + 1`), comprehensions, pipes, pattern match —
   pure expressions, no IO or side effects.
 - **Canonical std**: `#import list from "std/list"` is part of the
   language, not a host extension — scripts can rely on it without the
   embedder wiring anything up.
 
+## Release Surface
+
+The first public release promise is deliberately narrower than the
+repository layout:
+
+- **Stable core**: parser, analyzer, strict diagnostics, tree-walk
+  reference evaluator, `relon` facade, CLI `run` / `check` / `fmt` /
+  `host-policy`, docs, formatter, LSP basics, and documented `std/...`
+  modules.
+- **Default native performance path**: Cranelift AOT through
+  `Backend::Auto` / `relon run --backend auto`, with loud fallback or
+  loud refusal for unsupported shapes.
+- **Host-owned trusted scripts**: use `Backend::TreeWalk` when you need
+  trusted local imports or staged host fns; `Backend::Auto + TrustLevel::Trusted`
+  is rejected in the first public release. See
+  [Host integration](docs/en/guide/host-integration.md).
+- **Advanced / preview**: LLVM AOT, Rust build-time AOT, object
+  cache/link internals, and wasm playground bindings.
+- **Untrusted scripts**: use a VM or process boundary. Relon defines
+  the capability vocabulary and budget model; hard limits for
+  multi-tenant execution belong in Wasmtime, a process wrapper, or the
+  host infrastructure.
+
+See [`docs/en/guide/release-tiers.md`](docs/en/guide/release-tiers.md)
+for the support contract.
+
 ## 📖 Example
 
-```javascript
+```relon
+#schema Request {
+    String path: *,
+    #expect "risk must be 0..100"
+    Int risk: (Int n) -> Bool => n >= 0 && n <= 100
+}
+
+#main(Request req) -> Dict
 {
-    currency(val, symbol): val + " " + symbol,
-
-    price: 100,
-
-    @currency("USD")
-    display: &sibling.price
+    allow: req.path.starts_with("/api/") && req.risk < 70,
+    reason: req.risk < 70 ? "within_budget": "manual_review"
 }
 ```
 
@@ -94,7 +127,16 @@ parallel workflows). It's advisory — never blocks.
   [`docs/zh/guide/use-cases.md`](docs/zh/guide/use-cases.md)
 - **Architecture overview** (for contributors / deep host integrations):
   [`docs/zh/guide/architecture.md`](docs/zh/guide/architecture.md)
-- **Playground & wasm bindings** (in-browser sandboxed runtime):
+- **Release tiers**:
+  [`docs/en/guide/release-tiers.md`](docs/en/guide/release-tiers.md) ·
+  [中文](docs/zh/guide/release-tiers.md)
+- **Threat model**:
+  [`docs/en/guide/threat-model.md`](docs/en/guide/threat-model.md) ·
+  [中文](docs/zh/guide/threat-model.md)
+- **CI integration**:
+  [`docs/en/guide/ci.md`](docs/en/guide/ci.md) ·
+  [中文](docs/zh/guide/ci.md)
+- **Playground & wasm bindings** (in-browser capability-limited runtime):
   [`docs/zh/guide/playground.md`](docs/zh/guide/playground.md) ·
   [English](docs/en/guide/playground.md)
 - **Local docs site**: `cd docs && npx vitepress dev`

@@ -5,7 +5,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-rc2"
 edition = "2021"
 rust-version = "1.92"
 license = "Apache-2.0"
@@ -69,25 +69,25 @@ regex = "1"
 # default without pulling cranelift-jit / region into a target where
 # neither builds. Native consumers (relon-cli, relon-bench, downstream
 # hosts) re-enable `default-features = true` in their own dep entries.
-relon = { path = "crates/relon", version = "0.1.0", default-features = false }
-relon-parser = { path = "crates/relon-parser", version = "0.1.0" }
-relon-analyzer = { path = "crates/relon-analyzer", version = "0.1.0" }
-relon-eval-api = { path = "crates/relon-eval-api", version = "0.1.0" }
-relon-evaluator = { path = "crates/relon-evaluator", version = "0.1.0" }
-relon-fmt = { path = "crates/relon-fmt", version = "0.1.0" }
-relon-ir = { path = "crates/relon-ir", version = "0.1.0" }
-relon-codegen-cranelift = { path = "crates/relon-codegen-cranelift", version = "0.1.0" }
+relon = { path = "crates/relon", version = "0.1.0-rc2", default-features = false }
+relon-parser = { path = "crates/relon-parser", version = "0.1.0-rc2" }
+relon-analyzer = { path = "crates/relon-analyzer", version = "0.1.0-rc2" }
+relon-eval-api = { path = "crates/relon-eval-api", version = "0.1.0-rc2" }
+relon-evaluator = { path = "crates/relon-evaluator", version = "0.1.0-rc2" }
+relon-fmt = { path = "crates/relon-fmt", version = "0.1.0-rc2" }
+relon-ir = { path = "crates/relon-ir", version = "0.1.0-rc2" }
+relon-codegen-cranelift = { path = "crates/relon-codegen-cranelift", version = "0.1.0-rc2" }
 # Phase A bootstrap: LLVM-backed AOT backend (inkwell + llvm-sys 18.1
 # pinned to the system LLVM 18.1.3 install). Lives in a separate
 # crate so the cranelift JIT path stays the workspace-default and
 # only hosts that opt into the `llvm-aot` feature on `relon` pay the
 # LLVM build-time dep (system `llvm-config` + Polly dev headers).
-relon-codegen-llvm = { path = "crates/relon-codegen-llvm", version = "0.1.0" }
-relon-object-cache = { path = "crates/relon-object-cache", version = "0.1.0" }
-relon-object-link = { path = "crates/relon-object-link", version = "0.1.0" }
-relon-lsp = { path = "crates/relon-lsp", version = "0.1.0" }
-relon-wasm-bindings = { path = "crates/relon-wasm-bindings", version = "0.1.0" }
-relon-test-harness = { path = "crates/relon-test-harness", version = "0.1.0" }
+relon-codegen-llvm = { path = "crates/relon-codegen-llvm", version = "0.1.0-rc2" }
+relon-object-cache = { path = "crates/relon-object-cache", version = "0.1.0-rc2" }
+relon-object-link = { path = "crates/relon-object-link", version = "0.1.0-rc2" }
+relon-lsp = { path = "crates/relon-lsp", version = "0.1.0-rc2" }
+relon-wasm-bindings = { path = "crates/relon-wasm-bindings", version = "0.1.0-rc2" }
+relon-test-harness = { path = "crates/relon-test-harness", version = "0.1.0-rc2" }
 # Phase 1 relon-as-Rust-library bridge: three new crates split along
 # the build.rs / runtime / proc-macro boundary so each side can
 # evolve independently.
@@ -97,27 +97,27 @@ relon-test-harness = { path = "crates/relon-test-harness", version = "0.1.0" }
 #     plus matching Rust binding files.
 #   * `relon-rs-macro`: `include_relon!` proc-macro that splices the
 #     build.rs-generated bindings into the consuming source.
-relon-rs-shims = { path = "crates/relon-rs-shims", version = "0.1.0" }
-relon-rs-build = { path = "crates/relon-rs-build", version = "0.1.0" }
-relon-rs-macro = { path = "crates/relon-rs-macro", version = "0.1.0" }
+relon-rs-shims = { path = "crates/relon-rs-shims", version = "0.1.0-rc2" }
+relon-rs-build = { path = "crates/relon-rs-build", version = "0.1.0-rc2" }
+relon-rs-macro = { path = "crates/relon-rs-macro", version = "0.1.0-rc2" }
 # Leaf utility crate: byte-identical helpers (alignment math, Rust
 # identifier checks) deduped out of the codegen / ABI / build crates.
 # Depends on no other relon-* crate so it stays at the bottom of the
 # dep graph.
-relon-util = { path = "crates/relon-util", version = "0.1.0" }
+relon-util = { path = "crates/relon-util", version = "0.1.0-rc2" }
 # Leaf crate holding the canonical capability data types (CapabilityBit /
 # NativeFnGate / Capabilities) shared by `relon-eval-api` and
 # `relon-analyzer`. Depends on no other relon-* crate so it stays at the
 # bottom of the dep graph and breaks the eval-api <-> analyzer cycle that
 # forced the analyzer to mirror these types.
-relon-cap = { path = "crates/relon-cap", version = "0.1.0" }
+relon-cap = { path = "crates/relon-cap", version = "0.1.0-rc2" }
 # Leaf crate holding the Unicode tables, case-folding / normalization
 # algorithms, the SIMD ASCII fast path, and the glob matcher. Consumed
 # by the tree-walk evaluator and the codegen backends. Depends on no
 # other relon-* crate so it stays at the bottom of the dep graph and
 # lets `relon-evaluator` drop its edge to `relon-ir` (the evaluator only
 # ever needed these shared tables, never the IR surface).
-relon-unicode = { path = "crates/relon-unicode", version = "0.1.0" }
+relon-unicode = { path = "crates/relon-unicode", version = "0.1.0-rc2" }
 
 # Default release profile — throughput-tuned. Fat LTO + single
 # codegen unit so the optimizer sees the whole program; downstream

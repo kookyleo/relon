@@ -169,9 +169,10 @@ fn build_wasm(entry: &str) -> Result<(Vec<u8>, relon_codegen_llvm::EmitObjectInf
 /// Byte layout of the native `#[repr(C)] ArenaState` struct, replicated
 /// in wasm linear memory (same constants as `aot_wasm.rs`).
 const STATE_OFF_ARENA_BASE: usize = 0; // i64
+const STATE_OFF_ARENA_LEN: usize = 8; // u32
 const STATE_OFF_TAIL_CURSOR: usize = 12; // u32
 const STATE_OFF_SCRATCH_BASE: usize = 20; // u32
-const STATE_SIZE: usize = 40;
+const STATE_SIZE: usize = 48;
 
 /// Run the buffer-protocol wasm entry in wasmtime with:
 ///   * a real arena laid out in linear memory (mirrors `aot_wasm.rs`'s
@@ -250,6 +251,7 @@ fn run_wasi_in_wasmtime(
     let mut state = [0u8; STATE_SIZE];
     state[STATE_OFF_ARENA_BASE..STATE_OFF_ARENA_BASE + 8]
         .copy_from_slice(&(arena_abs as u64).to_le_bytes());
+    state[STATE_OFF_ARENA_LEN..STATE_OFF_ARENA_LEN + 4].copy_from_slice(&arena_bytes.to_le_bytes());
     state[STATE_OFF_TAIL_CURSOR..STATE_OFF_TAIL_CURSOR + 4]
         .copy_from_slice(&info.return_root_size.to_le_bytes());
     state[STATE_OFF_SCRATCH_BASE..STATE_OFF_SCRATCH_BASE + 4]

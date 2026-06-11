@@ -411,11 +411,12 @@ fn run_buffer_arena(
     use wasmtime::{Engine, Extern, Module, Store, Val};
 
     // ArenaState layout (mirrors aot_wasm.rs): arena_base i64 @0,
-    // tail_cursor u32 @12, scratch_base u32 @20, size 40.
+    // arena_len u32 @8, tail_cursor u32 @12, scratch_base u32 @20, size 48.
     const STATE_OFF_ARENA_BASE: usize = 0;
+    const STATE_OFF_ARENA_LEN: usize = 8;
     const STATE_OFF_TAIL_CURSOR: usize = 12;
     const STATE_OFF_SCRATCH_BASE: usize = 20;
-    const STATE_SIZE: usize = 40;
+    const STATE_SIZE: usize = 48;
 
     let engine = Engine::default();
     let module = Module::new(&engine, bytes).expect("Module::new");
@@ -469,6 +470,7 @@ fn run_buffer_arena(
     let mut state = [0u8; STATE_SIZE];
     state[STATE_OFF_ARENA_BASE..STATE_OFF_ARENA_BASE + 8]
         .copy_from_slice(&(arena_abs as u64).to_le_bytes());
+    state[STATE_OFF_ARENA_LEN..STATE_OFF_ARENA_LEN + 4].copy_from_slice(&arena_bytes.to_le_bytes());
     state[STATE_OFF_TAIL_CURSOR..STATE_OFF_TAIL_CURSOR + 4]
         .copy_from_slice(&out_root.to_le_bytes());
     state[STATE_OFF_SCRATCH_BASE..STATE_OFF_SCRATCH_BASE + 4]
@@ -2270,10 +2272,16 @@ fn w7_recursive_closure_dict_aligns_four_ways_via_wasmtime() {
     }
 
     // Native LLVM oracle (in-process MCJIT).
-    let native = w7_result(&native_run(
-        src,
-        HashMap::from([("n".to_string(), Value::Int(n))]),
-    ));
+    let native_ev = LlvmAotEvaluator::from_source(src).expect("native from_source");
+    assert!(
+        !native_ev.has_fast_path(),
+        "closure modules must stay on the buffer entry so lambdas receive a real ArenaState"
+    );
+    let native = w7_result(
+        &native_ev
+            .run_main(HashMap::from([("n".to_string(), Value::Int(n))]))
+            .expect("native run_main"),
+    );
     assert_eq!(native, want, "native LLVM fib(13) != 233");
 
     // Cranelift JIT.

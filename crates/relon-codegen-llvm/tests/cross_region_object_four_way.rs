@@ -177,11 +177,13 @@ fn run_wasm(src: &str, args: &HashMap<String, Value>) -> Option<Result<Value, St
     let _ = std::fs::remove_file(&wasm);
 
     // ArenaState layout mirrors the native `#[repr(C)] ArenaState`:
-    // arena_base i64 @0, tail_cursor u32 @12, scratch_base u32 @20.
+    // arena_base i64 @0, arena_len u32 @8, tail_cursor u32 @12,
+    // scratch_base u32 @20.
     const STATE_OFF_ARENA_BASE: usize = 0;
+    const STATE_OFF_ARENA_LEN: usize = 8;
     const STATE_OFF_TAIL_CURSOR: usize = 12;
     const STATE_OFF_SCRATCH_BASE: usize = 20;
-    const STATE_SIZE: usize = 40;
+    const STATE_SIZE: usize = 48;
 
     let engine = wasmtime::Engine::default();
     let module = Module::new(&engine, &bytes).expect("Module::new");
@@ -223,6 +225,7 @@ fn run_wasm(src: &str, args: &HashMap<String, Value>) -> Option<Result<Value, St
     let mut state = [0u8; STATE_SIZE];
     state[STATE_OFF_ARENA_BASE..STATE_OFF_ARENA_BASE + 8]
         .copy_from_slice(&(arena_abs as u64).to_le_bytes());
+    state[STATE_OFF_ARENA_LEN..STATE_OFF_ARENA_LEN + 4].copy_from_slice(&arena_size.to_le_bytes());
     let return_root_size = info.return_root_size.max(8);
     state[STATE_OFF_TAIL_CURSOR..STATE_OFF_TAIL_CURSOR + 4]
         .copy_from_slice(&return_root_size.to_le_bytes());

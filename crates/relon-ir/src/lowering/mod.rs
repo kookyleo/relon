@@ -6019,8 +6019,8 @@ fn lower_fn_call(
     // Open follow-up #2: `range(start, end)[. map(...) | . filter(...)]*.len()`
     // desugars to a pure i64 count accumulator. Without this the
     // chain would lower into the buffer-protocol list pipeline and
-    // hit the bytecode VM's scalar-envelope rejection at backend
-    // build time, so cmp_lua W4 stays at `n/a`. The desugar fires
+    // miss the scalar accumulator shape the native backends need, so
+    // cmp_lua W4 stays at `n/a`. The desugar fires
     // before regular method dispatch because the receiver path
     // (`range(...)` etc.) is not statically reachable as a known
     // schema in the analyzer's IR-side table — without the peephole
@@ -8726,8 +8726,7 @@ fn lower_binary(
 ) -> Result<(), LoweringError> {
     // #165 — collapse a left-leaning `String + String + ... + String`
     // chain into a single `Op::StrConcatN { operand_count: N }` so
-    // every IR-consuming backend (bytecode VM / cranelift AOT /
-    // trace-JIT) routes through a single allocation instead of N - 1
+    // every IR-consuming backend routes through a single allocation instead of N - 1
     // pairwise `Op::Add(String)` allocs. The fold is gated on AST
     // shape (the outer node is `Add` and the LHS is itself an `Add`),
     // matches the tree-walker's `try_eval_string_concat_chain` filter,
@@ -8923,11 +8922,9 @@ fn lower_binary(
             ));
         }
         // F-D7-D: `String + String` lowers to `Op::Add(IrType::String)`.
-        // The trace recorder short-circuits this onto `TraceOp::StrConcat`
-        // (see `relon_trace_recorder::lowering::lower_str_add`); the
-        // tree-walk / cranelift-AOT backends route through their generic
-        // string-concat dispatch (Value-level concat in the evaluator,
-        // and a host-shim call in cranelift). Only `Operator::Add` is
+        // Backends route through their generic string-concat dispatch
+        // (Value-level concat in the evaluator, and a host-shim call in
+        // cranelift). Only `Operator::Add` is
         // accepted for strings — `String - String` / `String * String`
         // would have been rejected upstream by the analyzer
         // (`infer_binary` returns `None`) so the lhs/rhs types would
@@ -9262,8 +9259,7 @@ fn lower_fstring_part(
 
 /// #165 — fold a left-leaning `String + String + ... + String` chain
 /// into a single `Op::StrConcatN { operand_count: N }` so every
-/// IR-consuming backend (bytecode VM / cranelift AOT / trace-JIT)
-/// allocates once instead of N - 1 times.
+/// IR-consuming backend allocates once instead of N - 1 times.
 ///
 /// Returns `Ok(true)` when the fold fired (caller skips its standard
 /// pair-wise path), `Ok(false)` when the chain mixes non-String
@@ -13743,9 +13739,8 @@ mod str_concat_chain_tests {
 //
 // Verifies that the extended `try_lower_list_sum_range` recognises the
 // `range(...).map((p) => body)` chain and emits a pure-i64 accumulator
-// loop with no list allocation. The bytecode VM relies on this shape to
-// produce `relon_bytecode` cmp_lua rows for W2 / W6 / W8 / W10 — the
-// scalar envelope rejects any IR that materialises a `List<Int>`.
+// loop with no list allocation. Native benchmark rows rely on this shape
+// because the scalar envelope rejects any IR that materialises a `List<Int>`.
 // =====================================================================
 
 #[cfg(test)]

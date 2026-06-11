@@ -43,7 +43,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         // Load each operand's `[len: u32]` header once.
         let mut lens: Vec<IntValue<'ctx>> = Vec::with_capacity(n);
         for off in &offs {
-            let addr = self.arena_addr_i32(*off)?;
+            let addr = self.arena_addr_i32_checked_const(*off, 4, "StrConcatN operand len")?;
             let name = self.next_name("strconcat_len");
             let l = self
                 .builder
@@ -72,7 +72,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         self.emit_alloc_scratch_common(record_size)?;
         let base_off = self.pop_int(ip_hint)?;
         // Write header: i32.store(base, total_len).
-        let base_abs = self.arena_addr_i32(base_off)?;
+        let base_abs = self.arena_addr_i32_checked_const(base_off, 4, "StrConcatN header")?;
         self.builder
             .build_store(base_abs, total_len)
             .map_err(|e| LlvmError::Codegen(format!("StrConcatN header store: {e}")))?;
@@ -90,8 +90,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 .builder
                 .build_int_add(offs[i], four, &name)
                 .map_err(|e| LlvmError::Codegen(format!("StrConcatN src off: {e}")))?;
-            let dst_ptr = self.arena_addr_i32(cursor_off)?;
-            let src_ptr = self.arena_addr_i32(src_off_payload)?;
+            let dst_ptr = self.arena_addr_i32_checked(cursor_off, len, "StrConcatN dst")?;
+            let src_ptr = self.arena_addr_i32_checked(src_off_payload, len, "StrConcatN src")?;
             let i64_t = self.ctx.i64_type();
             let name = self.next_name("strconcat_lenzext");
             let len64 = self
@@ -219,7 +219,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         // skip the per-iter `[len]` header load and feed LLVM an
         // i32 const — this removes the alias hazard between the
         // in-place store at `lhs_addr` and the rhs header read.
-        let lhs_addr = self.arena_addr_i32(lhs_off)?;
+        let lhs_addr = self.arena_addr_i32_checked_const(lhs_off, 4, "Add(String) lhs len")?;
         let lhs_len = if let Some(len) = lhs_const_len {
             i32_t.const_int(u64::from(len), false)
         } else {
@@ -231,7 +231,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         let rhs_len = if let Some((len, _)) = rhs_const_len {
             i32_t.const_int(u64::from(len), false)
         } else {
-            let rhs_addr = self.arena_addr_i32(rhs_off)?;
+            let rhs_addr = self.arena_addr_i32_checked_const(rhs_off, 4, "Add(String) rhs len")?;
             self.builder
                 .build_load(i32_t, rhs_addr, "stradd_rhs_len")
                 .map_err(|e| LlvmError::Codegen(format!("Add(String) rhs len load: {e}")))?
@@ -320,7 +320,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         //     `callq *memcpy`.
         //   * non-const — historical path: zext runtime rhs_len to
         //     i64 and hand it to memcpy.
-        let fast_dst = self.arena_addr_i32(lhs_end)?;
+        let fast_dst = self.arena_addr_i32_checked(lhs_end, rhs_len, "Add(String) fast dst")?;
         match rhs_const_len {
             Some((1, Some(byte))) => {
                 let byte_const = i8_t.const_int(u64::from(byte), false);
@@ -331,11 +331,12 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                     })?;
             }
             Some((len, _)) => {
-                let rhs_payload_off = self
-                    .builder
-                    .build_int_add(rhs_off, four, "stradd_rhs_payload_off")
-                    .map_err(|e| LlvmError::Codegen(format!("stradd rhs payload off: {e}")))?;
-                let fast_src = self.arena_addr_i32(rhs_payload_off)?;
+                let fast_src = self.arena_addr_i32_offset_checked_const(
+                    rhs_off,
+                    4,
+                    len,
+                    "Add(String) fast src",
+                )?;
                 let rhs_len64 = i64_t.const_int(u64::from(len), false);
                 self.builder
                     .build_memcpy(fast_dst, 1, fast_src, 1, rhs_len64)
@@ -344,11 +345,12 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                     })?;
             }
             None => {
-                let rhs_payload_off = self
-                    .builder
-                    .build_int_add(rhs_off, four, "stradd_rhs_payload_off")
-                    .map_err(|e| LlvmError::Codegen(format!("stradd rhs payload off: {e}")))?;
-                let fast_src = self.arena_addr_i32(rhs_payload_off)?;
+                let fast_src = self.arena_addr_i32_offset_checked(
+                    rhs_off,
+                    4,
+                    rhs_len,
+                    "Add(String) fast src",
+                )?;
                 let rhs_len64 = self
                     .builder
                     .build_int_z_extend(rhs_len, i64_t, "stradd_rhs_len64")
@@ -386,7 +388,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         self.emit_alloc_scratch_common(record_size)?;
         let base_off = self.pop_int(ip_hint)?;
         // write header at base
-        let base_addr = self.arena_addr_i32(base_off)?;
+        let base_addr =
+            self.arena_addr_i32_checked_const(base_off, 4, "Add(String) slow header")?;
         self.builder
             .build_store(base_addr, total_len_slow)
             .map_err(|e| LlvmError::Codegen(format!("stradd slow header store: {e}")))?;
@@ -395,12 +398,10 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .builder
             .build_int_add(base_off, four, "stradd_slow_basep4")
             .map_err(|e| LlvmError::Codegen(format!("stradd slow base+4: {e}")))?;
-        let dst1 = self.arena_addr_i32(base_plus_4)?;
-        let lhs_payload_off = self
-            .builder
-            .build_int_add(lhs_off, four, "stradd_slow_lhsp")
-            .map_err(|e| LlvmError::Codegen(format!("stradd slow lhsp: {e}")))?;
-        let src1 = self.arena_addr_i32(lhs_payload_off)?;
+        let dst1 =
+            self.arena_addr_i32_offset_checked(base_off, 4, lhs_len, "Add(String) slow lhs dst")?;
+        let src1 =
+            self.arena_addr_i32_offset_checked(lhs_off, 4, lhs_len, "Add(String) slow lhs src")?;
         // Phase L W3: hand LLVM an i64 const memcpy size whenever
         // the lhs / rhs comes from `Op::ConstString` so the
         // `expand-memcpy` lowering can unroll to inline stores
@@ -421,12 +422,10 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .builder
             .build_int_add(base_plus_4, lhs_len, "stradd_slow_cur2")
             .map_err(|e| LlvmError::Codegen(format!("stradd slow cur2: {e}")))?;
-        let dst2 = self.arena_addr_i32(lhs_dst_cursor)?;
-        let rhs_payload_off2 = self
-            .builder
-            .build_int_add(rhs_off, four, "stradd_slow_rhsp")
-            .map_err(|e| LlvmError::Codegen(format!("stradd slow rhsp: {e}")))?;
-        let src2 = self.arena_addr_i32(rhs_payload_off2)?;
+        let dst2 =
+            self.arena_addr_i32_checked(lhs_dst_cursor, rhs_len, "Add(String) slow rhs dst")?;
+        let src2 =
+            self.arena_addr_i32_offset_checked(rhs_off, 4, rhs_len, "Add(String) slow rhs src")?;
         let rhs_len64_slow: IntValue<'ctx> = if let Some((len, _)) = rhs_const_len {
             i64_t.const_int(u64::from(len), false)
         } else {
@@ -452,8 +451,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         let base_off_val: BasicValueEnum<'ctx> = base_off.into();
         phi.add_incoming(&[(&lhs_off_val, fast_end_bb), (&base_off_val, slow_end_bb)]);
         let result = phi.as_basic_value().into_int_value();
-        // arena_base_ptr is referenced implicitly inside arena_addr_i32;
-        // bind it to silence the borrow checker.
+        // arena_base_ptr is referenced implicitly inside the checked
+        // arena-address helpers; bind it to silence the borrow checker.
         let _ = arena_base_ptr;
         self.push(result, IrType::String);
         Ok(())
@@ -492,12 +491,55 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         haystack_off: IntValue<'ctx>,
         needle_off: IntValue<'ctx>,
     ) -> Result<(), LlvmError> {
-        // GEP into the cached arena base. Mirrors `emit_load_at_absolute`
-        // / `emit_str_concat_n` — both produce `arena_base + off_i32`
-        // pointers the inner ops then read through. The shim consumes
-        // raw `*const u8` headers, so we hand the GEP result directly.
-        let haystack_ptr = self.arena_addr_i32(haystack_off)?;
-        let needle_ptr = self.arena_addr_i32(needle_off)?;
+        // Resolve and bounds-check both full `[len][payload]` records
+        // before handing raw header pointers to the host shim.
+        let i32_t = self.ctx.i32_type();
+        let i64_t = self.ctx.i64_type();
+        let four64 = i64_t.const_int(4, false);
+
+        let hay_hdr =
+            self.arena_addr_i32_checked_const(haystack_off, 4, "contains haystack header")?;
+        let hay_len = self
+            .builder
+            .build_load(i32_t, hay_hdr, &self.next_name("contains_hay_len"))
+            .map_err(|e| LlvmError::Codegen(format!("contains haystack len: {e}")))?
+            .into_int_value();
+        let hay_len64 = self
+            .builder
+            .build_int_z_extend(hay_len, i64_t, &self.next_name("contains_hay_len64"))
+            .map_err(|e| LlvmError::Codegen(format!("contains haystack len64: {e}")))?;
+        let hay_record_len = self
+            .builder
+            .build_int_add(
+                hay_len64,
+                four64,
+                &self.next_name("contains_hay_record_len"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("contains haystack record len: {e}")))?;
+        let haystack_ptr =
+            self.arena_addr_i32_checked(haystack_off, hay_record_len, "contains haystack record")?;
+
+        let needle_hdr =
+            self.arena_addr_i32_checked_const(needle_off, 4, "contains needle header")?;
+        let needle_len = self
+            .builder
+            .build_load(i32_t, needle_hdr, &self.next_name("contains_needle_len"))
+            .map_err(|e| LlvmError::Codegen(format!("contains needle len: {e}")))?
+            .into_int_value();
+        let needle_len64 = self
+            .builder
+            .build_int_z_extend(needle_len, i64_t, &self.next_name("contains_needle_len64"))
+            .map_err(|e| LlvmError::Codegen(format!("contains needle len64: {e}")))?;
+        let needle_record_len = self
+            .builder
+            .build_int_add(
+                needle_len64,
+                four64,
+                &self.next_name("contains_needle_record_len"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("contains needle record len: {e}")))?;
+        let needle_ptr =
+            self.arena_addr_i32_checked(needle_off, needle_record_len, "contains needle record")?;
 
         // Declare (or look up) the extern shim. Idempotent so multiple
         // `contains` call sites in the same module share a single
@@ -645,23 +687,23 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         let i32_t = self.ctx.i32_type();
         let i64_t = self.ctx.i64_type();
         let ptr_t = self.ctx.ptr_type(AddressSpace::default());
-        let four = i32_t.const_int(4, false);
         let needle_arg = i32_t.const_int(u64::from(needle_byte), false);
 
         // Materialise haystack record header + payload pointer.
-        let hay_hdr_ptr = self.arena_addr_i32(haystack_off)?;
+        let hay_hdr_ptr =
+            self.arena_addr_i32_checked_const(haystack_off, 4, "contains-inline header")?;
         let hay_len_name = self.next_name("strc_inl_haylen");
         let hay_len = self
             .builder
             .build_load(i32_t, hay_hdr_ptr, &hay_len_name)
             .map_err(|e| LlvmError::Codegen(format!("str_contains_inline hay_len: {e}")))?
             .into_int_value();
-        let payload_off_name = self.next_name("strc_inl_payoff");
-        let payload_off = self
-            .builder
-            .build_int_add(haystack_off, four, &payload_off_name)
-            .map_err(|e| LlvmError::Codegen(format!("str_contains_inline payload_off: {e}")))?;
-        let hay_payload_ptr = self.arena_addr_i32(payload_off)?;
+        let hay_payload_ptr = self.arena_addr_i32_offset_checked(
+            haystack_off,
+            4,
+            hay_len,
+            "contains-inline payload",
+        )?;
         let hay_len64_name = self.next_name("strc_inl_haylen64");
         let hay_len64 = self
             .builder
@@ -868,7 +910,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         self.emit_alloc_scratch_common(record_size)?;
         let base_off = self.pop_int(ip_hint)?;
         // Header: store total_len at base.
-        let base_abs = self.arena_addr_i32(base_off)?;
+        let base_abs = self.arena_addr_i32_checked_const(base_off, 4, "IntToStr header")?;
         self.builder
             .build_store(base_abs, total_len)
             .map_err(|e| cg(e, "header store"))?;
@@ -936,7 +978,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .builder
             .build_int_sub(cur_val, one32, "i2s_curnext")
             .map_err(|e| cg(e, "curnext"))?;
-        let ch_abs = self.arena_addr_i32(cur_next)?;
+        let ch_abs = self.arena_addr_i32_checked_const(cur_next, 1, "IntToStr digit")?;
         self.builder
             .build_store(ch_abs, ch8)
             .map_err(|e| cg(e, "digit store"))?;
@@ -948,8 +990,12 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .builder
             .build_int_compare(IntPredicate::NE, m_next, zero64, "i2s_more")
             .map_err(|e| cg(e, "more"))?;
-        m_phi.add_incoming(&[(&m_next, write_hdr)]);
-        cur_phi.add_incoming(&[(&cur_next, write_hdr)]);
+        let write_body_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| LlvmError::Codegen("IntToStr: no write body block".into()))?;
+        m_phi.add_incoming(&[(&m_next, write_body_end)]);
+        cur_phi.add_incoming(&[(&cur_next, write_body_end)]);
         self.builder
             .build_conditional_branch(more, write_hdr, write_done)
             .map_err(|e| cg(e, "write br"))?;
@@ -962,7 +1008,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .build_conditional_branch(is_neg, minus_body, minus_done)
             .map_err(|e| cg(e, "minus br"))?;
         self.builder.position_at_end(minus_body);
-        let minus_abs = self.arena_addr_i32(payload_off)?;
+        let minus_abs = self.arena_addr_i32_checked_const(payload_off, 1, "IntToStr minus")?;
         let minus8 = i8_t.const_int(u64::from(b'-'), false);
         self.builder
             .build_store(minus_abs, minus8)
@@ -1032,7 +1078,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         // in `relon_ir::float_str`.
         self.emit_alloc_scratch_static(FLOAT_TO_STR_RECORD_SIZE)?;
         let base_off = self.pop_int(ip_hint)?;
-        let dest_ptr = self.arena_addr_i32(base_off)?;
+        let dest_ptr =
+            self.arena_addr_i32_checked_const(base_off, FLOAT_TO_STR_RECORD_SIZE, "FloatToStr")?;
 
         let shim = self.declare_f64_to_str_extern();
         let call_name = self.next_name("f64_to_str");

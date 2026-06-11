@@ -1,73 +1,39 @@
 /*
-  Runtime feature-flag evaluator.
+  Feature flags as a deterministic decision table.
 
-  Given a user (id / region / plan) and a fixed set of rollout rules,
-  produce a `{ flags: { name: bool, ... } }` dict the host can read
-  cheaply.
+  The host computes a stable rollout bucket before evaluation and pushes
+  it with the user. Relon stays pure: no clock, no RNG, no native hash.
 
-  ──────────────────────────────────────────────────────────────────
-  HOST INTEGRATION REQUIRED
-
-  Percentage rollouts need a real hash so the rollout fraction is
-  uniformly distributed across user ids. This example calls
-  `native_hash(s) -> Int`, which the host MUST register before
-  evaluation — e.g. with `ctx.register_pure_fn("native_hash", ...)`
-  wrapping siphash / blake3 / fxhash. The bundled `relon-cli` does
-  not register one, so running this file directly via
-  `cargo run -p relon-cli -- run examples/feature_flag.relon ...`
-  surfaces a `FunctionNotFound: native_hash` — by design. The
-  example demonstrates the **shape** of a real feature-flag wiring,
-  not a runnable shortcut.
-
-  See `crates/relon/src/lib.rs::main_entry_examples_match_canonical_outputs`
-  for a programmatic example that does register the hash.
-  ──────────────────────────────────────────────────────────────────
+  Recommended backend: tree-walk (full-surface reference)
+  Expected output: fixtures/golden/examples_main/feature_flag.json
 
   Try:
-    cargo run -q -p relon-cli -- run examples/feature_flag.relon \
-        --args '{"user": {"id": "alice-42", "region": "eu", "plan": "pro"}}'
+    cargo run -q -p relon-cli -- run --backend tree-walk examples/feature_flag.relon \
+        --args '{"user": {"id": "alice-42", "region": "eu", "plan": "pro", "rollout_bucket": 17}}'
 */
-#relaxed
 
 #schema User {
     String id: *,
-    #expect "region must be one of: us / eu / apac"
-    String region: (r) => r == "us" || r == "eu" || r == "apac",
-    #expect "plan must be one of: free / pro / enterprise"
-    String plan: (p) => p == "free" || p == "pro" || p == "enterprise"
+    #expect "region must be us / eu / apac"
+    String region: (String region) -> Bool => region == "us" || region == "eu" || region == "apac",
+    #expect "plan must be free / pro / enterprise"
+    String plan: (String plan) -> Bool => plan == "free" || plan == "pro" || plan == "enterprise",
+    #expect "rollout_bucket must be 0..99"
+    Int rollout_bucket: (Int n) -> Bool => n >= 0 && n < 100
 }
 
-#main(User user) -> Dict<String, Dict<String, Bool>>
+#main(User user) -> Dict
 {
-    // Maps a user id to a stable bucket 0..99. Backed by a
-    // host-registered `native_hash(String) -> Int` — see the file
-    // header. The host is responsible for picking a hash family
-    // that's deterministic across runs and uniformly distributed
-    // across the input space (siphash / blake3 / fxhash all qualify).
-    #internal
-    hash_mod_100(s): native_hash(s) % 100,
-    // Each flag returns a Bool given the User. Keeping them as
-    // closures lets the rollout table below stay tabular.
-
-    #internal
-    rules: {
-        // 1. Hard-off — kill switch for a half-shipped experiment.
-        legacy_checkout: (u) => false,
-        // 2. Hard-on — feature is GA, kept in the table for audit.
-        dark_mode: (u) => true,
-        // 3. Region gate — EU only while we finish a localization pass.
-        gdpr_banner: (u) => u.region == "eu",
-        // 4. Tier gate — paid plans unlock the advanced editor.
-        advanced_editor: (u) => u.plan == "pro" || u.plan == "enterprise",
-        // 5. Percentage rollout — 25% of users see the new search.
-        new_search: (u) => hash_mod_100(u.id) < 25
-    },
-
     flags: {
-        legacy_checkout: rules.legacy_checkout(user),
-        dark_mode: rules.dark_mode(user),
-        gdpr_banner: rules.gdpr_banner(user),
-        advanced_editor: rules.advanced_editor(user),
-        new_search: rules.new_search(user)
+        legacy_checkout: false,
+        dark_mode: true,
+        gdpr_banner: user.region == "eu",
+        advanced_editor: user.plan == "pro" || user.plan == "enterprise",
+        new_search: user.rollout_bucket < 25
+    },
+    audit: {
+        subject: user.id,
+        bucket: user.rollout_bucket,
+        ruleset: "2026-06-11"
     }
 }

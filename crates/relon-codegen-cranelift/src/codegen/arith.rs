@@ -191,7 +191,7 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
 
     /// `Op::Add(IrType::F64)` — IEEE-754 `fadd`. No overflow trap:
     /// Float arithmetic saturates to ±inf rather than trapping, matching
-    /// the tree-walker (`lhs + rhs`) and the bytecode VM's `AddF64`.
+    /// the tree-walker (`lhs + rhs`).
     pub(super) fn emit_add_f64(&mut self) -> Result<(), CraneliftError> {
         let b = self.pop()?;
         let a = self.pop()?;

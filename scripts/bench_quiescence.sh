@@ -129,7 +129,7 @@ done
 # ---- 4. Bench-CPU pinning hint ----------------------------------------
 bold "[4/5] Bench-core pinning"
 echo "  Suggested invocation:"
-echo "      taskset -c $BENCH_CPUS cargo bench --bench trace_jit_hot_loop"
+echo "      taskset -c $BENCH_CPUS cargo bench -p relon-bench --bench cmp_lua"
 echo "  Bench CPUs ($BENCH_CPUS) reserved for the bench; ideally isolcpus= them at boot."
 
 # ---- 5. Baseline noise (5s perf stat) ---------------------------------
@@ -161,6 +161,6 @@ fi
 green "=== Machine appears quiescent. Ready to bench. ==="
 echo
 echo "Next steps:"
-echo "  taskset -c $BENCH_CPUS cargo bench --bench trace_jit_hot_loop"
+echo "  taskset -c $BENCH_CPUS cargo bench -p relon-bench --bench cmp_lua"
 echo "  cargo run --release -p relon-bench --bin bench_stats -- \\"
-echo "      target/criterion/v6_epsilon_hot_loop"
+echo "      target/criterion/cmp_lua"

@@ -25,6 +25,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use inkwell::context::Context;
@@ -206,6 +207,12 @@ pub struct LlvmAotEvaluator {
     /// past the LTO inline-cost threshold, de-inlining it from bench
     /// loops and costing the W12 kernel 2.7x per call.
     fast_path_arity: usize,
+    /// Whether the public `run_main` method may automatically choose the
+    /// typed fast entry. The fast entry has no `ArenaState` / trap-code
+    /// channel, so bodies that can raise typed runtime traps stay
+    /// callable through `run_main_legacy_i64_fast` for benchmarks but
+    /// normal host evaluation routes through the buffer entry.
+    fast_path_auto_dispatch: bool,
     /// Phase E.1: const-data bytes the IR's `Op::ConstString` /
     /// `Op::ConstList*` records reference through arena-relative i32
     /// offsets. The host copies this blob into the arena prefix at
@@ -229,6 +236,9 @@ pub struct LlvmAotEvaluator {
     /// gate tests bit `cap_bit` of this word; `0` denies every gated
     /// call. Set via [`Self::with_granted_cap`] / [`Self::with_caps`].
     caps_mask: i64,
+    /// Remaining step budget installed into each per-call
+    /// [`ArenaState`]. `0` means unlimited.
+    step_budget: AtomicI64,
 }
 
 thread_local! {
@@ -239,6 +249,14 @@ thread_local! {
     /// observable prefix. Mirrors the cranelift backend's
     /// `ARENA_POOL` to keep the dispatch boundary cost comparable.
     static LLVM_ARENA_POOL: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+fn step_budget_to_i64(steps: Option<u64>) -> i64 {
+    match steps {
+        None => 0,
+        Some(0) => -1,
+        Some(n) => i64::try_from(n).unwrap_or(i64::MAX),
+    }
 }
 
 impl LlvmAotEvaluator {
@@ -329,14 +347,13 @@ impl LlvmAotEvaluator {
         // trips the v1.5 / v1.6 strict-mode type-surface diagnostics
         // (`ClosureParamTypeMissing`, `ClosureReturnTypeUnknown`,
         // `ExpressionTypeUnknown`) even though IR lowering accepts the
-        // shape via `lower_anon_dict_body`. Mirror the bytecode tier
-        // (`relon-bytecode::evaluator::from_source`): run the analyzer
-        // with `strict_mode: false` so the soft bans don't gate LLVM
+        // shape via `lower_anon_dict_body`. Run the analyzer with
+        // `strict_mode: false` so the soft bans don't gate LLVM
         // codegen. Hard structural errors (`UnknownTypeName`,
         // `MainReturnTypeMismatch`, etc.) still surface as `Error`-
         // severity diagnostics under non-strict mode and still gate the
-        // build below. Unlike the bytecode / cranelift tiers, the LLVM
-        // backend does NOT force `standalone_capability_check`.
+        // build below. Unlike the Cranelift route, the LLVM backend does
+        // NOT force `standalone_capability_check`.
         //
         // Phase 0b: a caller-supplied `options` (host `#native` fns)
         // takes precedence — the host already sets `strict_mode: false`
@@ -575,13 +592,21 @@ impl LlvmAotEvaluator {
         // We discover eligibility from the `buffer_schema` (declared
         // `#main` params + return) and the IR body. Sources that
         // touch ops outside the fast envelope (strings, sandbox
-        // traps, non-self-recursive closures with non-virtualisable
-        // captures, etc.) fail emission inside `emit_fast_entry`; we
+        // traps, etc.) fail emission inside `emit_fast_entry`; we
         // capture the error to the IR dump for post-mortem and
         // continue with the buffer-only module.
+        //
+        // Closure modules are stateful even when their outer schema
+        // looks like a single-Int fast shape: lambda bodies receive the
+        // real `ArenaState` so they can read captures from the arena and
+        // participate in bounds/trap semantics. The typed fast entry has
+        // no state pointer, so keep it off for any closure table entry.
+        // The wasm/object path already applies this same routing rule.
         let fast_profile = buffer_schema
             .as_ref()
+            .filter(|_| ir.closure_table.is_empty())
             .and_then(|s| build_fast_path_profile(s).ok());
+        let fast_path_auto_dispatch = !body_may_raise_typed_trap(&entry.body);
         let mut fast_emit_diagnostic: Option<String> = None;
         if let Some(profile) = fast_profile.as_ref() {
             match emit_fast_entry(
@@ -878,10 +903,12 @@ impl LlvmAotEvaluator {
             param_names,
             buffer_schema,
             fast_path_arity,
+            fast_path_auto_dispatch,
             const_data: const_pool.bytes,
             native_imports: ir.imports.clone(),
             host_fns: Arc::new(crate::state::HostFnRegistry::new()),
             caps_mask: 0,
+            step_budget: AtomicI64::new(0),
         })
     }
 
@@ -956,6 +983,21 @@ impl LlvmAotEvaluator {
     /// hold a packed mask.
     pub fn with_caps(mut self, caps_mask: i64) -> Self {
         self.caps_mask = caps_mask;
+        self
+    }
+
+    /// Configure the LLVM buffer-entry step budget. `None` disables
+    /// the budget. `Some(n)` permits `n` entry/loop budget ticks before
+    /// the JIT records `ResourceExhausted` and the host lifts it to
+    /// `RuntimeError::StepLimitExceeded`.
+    pub fn set_step_budget(&self, steps: Option<u64>) {
+        self.step_budget
+            .store(step_budget_to_i64(steps), Ordering::Relaxed);
+    }
+
+    /// Builder-style companion to [`Self::set_step_budget`].
+    pub fn with_step_budget(self, steps: Option<u64>) -> Self {
+        self.set_step_budget(steps);
         self
     }
 
@@ -1171,6 +1213,9 @@ impl LlvmAotEvaluator {
         if self.jit.fast_entry_ptr.is_none() {
             return Ok(None);
         }
+        if !self.fast_path_auto_dispatch {
+            return Ok(None);
+        }
         // Pairing invariant: `fast_path_arity` is assigned together
         // with `fast_entry_ptr` at the single resolution site, so
         // reaching here (entry ptr is Some) means the bare-`usize`
@@ -1363,6 +1408,7 @@ impl LlvmAotEvaluator {
 
         let live_arena = &mut arena[..arena_size];
         let state = ArenaState::new(live_arena, scratch_base);
+        state.set_step_budget(self.step_budget.load(Ordering::Relaxed));
         // Phase 0b: point the per-call state at the host-fn registry so
         // a source-lowered `Op::CallNative` resolves through
         // `relon_llvm_call_native`. The registry lives on the evaluator
@@ -2187,6 +2233,40 @@ fn return_needs_tail_region(schema: &relon_eval_api::schema_canonical::Schema) -
 /// "buffer entry also present" fallback to fall onto).
 fn fast_entry_emittable(entry: &relon_ir::ir::Func) -> bool {
     !body_references_const_pool(&entry.body)
+}
+
+fn body_may_raise_typed_trap(body: &[relon_ir::ir::TaggedOp]) -> bool {
+    use relon_ir::ir::{IrType, Op};
+    for tagged in body {
+        let hit = match &tagged.op {
+            Op::Add(IrType::I64)
+            | Op::Sub(IrType::I64)
+            | Op::Mul(IrType::I64)
+            | Op::Div(IrType::I64)
+            | Op::Mod(IrType::I64)
+            | Op::Trap { .. }
+            | Op::CheckCap { .. }
+            | Op::CallNative { .. } => true,
+            Op::Block { body, .. } | Op::Loop { body, .. } => body_may_raise_typed_trap(body),
+            Op::If {
+                then_body,
+                else_body,
+                ..
+            } => body_may_raise_typed_trap(then_body) || body_may_raise_typed_trap(else_body),
+            Op::Call { fn_index, .. } => {
+                let stdlib = relon_ir::stdlib::builtin_stdlib();
+                stdlib
+                    .get(*fn_index as usize)
+                    .map(|callee| body_may_raise_typed_trap(&callee.body_owned()))
+                    .unwrap_or(true)
+            }
+            _ => false,
+        };
+        if hit {
+            return true;
+        }
+    }
+    false
 }
 
 fn body_references_const_pool(body: &[relon_ir::ir::TaggedOp]) -> bool {

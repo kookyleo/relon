@@ -23,7 +23,7 @@ facade crate: relon  ——  对宿主暴露 from_str / json_from_* / EvaluatorB
 | `relon-parser` | 词法 + 语法 → AST。每个 `Node` 携带 process-wide `NodeId` 用于跨层 side-table | `Node`, `Expr`, `TypeNode`, `Decorator`, `NodeId`, `parse_document` |
 | `relon-analyzer` | 多个 pass（schema / extend / main_sig / modules / resolve / typecheck 等）输出 `AnalyzedTree` 侧表 | `AnalyzedTree`, `SchemaDef`, `ResolvedRef`, `Diagnostic`, `analyze` |
 | `relon-evaluator` | 树遍历求值，承载 `Context` / `Capabilities` / `Value` / 内建装饰器 / stdlib | `Context`, `Capabilities`, `Value`, `Evaluator`, `RuntimeError` |
-| `relon-ir` + `relon-codegen-cranelift` / `relon-codegen-llvm` | AST + 侧表 lowering 为 IR，再 AOT 编译为本机机器码；与 tree-walk 按位一致 | IR module、各编译后端入口 |
+| `relon-ir` + `relon-codegen-cranelift` / `relon-codegen-llvm` | AST + 侧表 lowering 为 IR，再把已声明支持的形态 AOT 编译为本机机器码；与 tree-walk 对照验证 | IR module、各编译后端入口 |
 | `relon` (facade) | 拼装 parse → analyze → eval 全链路；`EvaluatorBuilder` 选后端（默认 `Backend::Auto`）；`Projector` 控制 JSON 输出形态 | `from_str`, `value_from_str`, `json_from_str`, `EvaluatorBuilder`, `Error` |
 | `relon-lsp` | 同步 lsp-server，复用 analyzer 的 `Diagnostic` 与 side-tables | 二进制 `relon-lsp` |
 
@@ -54,7 +54,7 @@ plain JSON
 
 `AnalyzedTree` 是**只读的侧表**，不修改 AST。求值器需要哪一项就查哪一项；如果某一项缺失，evaluator 走 fallback（例如 schema 没预转换时按需调用 `lower_schema_pure`）。
 
-编译后端走平行管线：同一份 AST + `AnalyzedTree` 经 `relon-ir` lowering 为 IR，再由 cranelift / LLVM 后端编译为本机机器码——三个后端共享沙箱语义，结果按位一致。
+编译后端走平行管线：同一份 AST + `AnalyzedTree` 经 `relon-ir` lowering 为 IR，再由 cranelift / LLVM 后端编译为本机机器码。Tree-walk 保持全语言面参照实现；编译后端在已声明支持面上与它对照验证，并必须报出相同的可观察沙箱错误。
 
 ## Analyzer 的 pass 流水线
 

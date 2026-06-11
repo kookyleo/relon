@@ -2,8 +2,8 @@
 //!
 //! # Why
 //!
-//! Tree-walker / bytecode VM / trace-JIT all spend a non-trivial slice of
-//! their hot path on `String` allocation + drop pairs that hold a few
+//! Tree-walker and compiled string paths spend a non-trivial slice of their
+//! hot path on `String` allocation + drop pairs that hold a few
 //! bytes of payload — dict keys, identifiers, short concat intermediates
 //! (`"a" + i.to_str()`), `type_name()` results, etc. Every one of those
 //! `String`s touches the global allocator twice (alloc on push / drop
@@ -173,13 +173,10 @@ impl SmolStr {
     /// * **Heap** (`Arc<str>`): delegates to `str::is_ascii()`, which
     ///   the standard library implements via the same SIMD primitive
     ///   over the full payload. A future revision can cache the bit
-    ///   beside the `Arc<str>` pointer (mirroring the
-    ///   [`relon_trace_abi::STRING_RECORD_ASCII_FLAG_BIT`] flag the
-    ///   trace-JIT keeps on its StringRef header) so heap payloads
-    ///   become an O(1) load too; for now the on-demand scan keeps
-    ///   the slot layout identical to its pre-flag shape and avoids
-    ///   touching the niche-optimisation that pins the enum size to
-    ///   24 bytes.
+    ///   beside the `Arc<str>` pointer so heap payloads become an O(1)
+    ///   load too; for now the on-demand scan keeps the slot layout
+    ///   identical to its pre-flag shape and avoids touching the
+    ///   niche-optimisation that pins the enum size to 24 bytes.
     #[inline]
     pub fn is_ascii(&self) -> bool {
         match &self.repr {

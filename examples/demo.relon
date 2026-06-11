@@ -1,39 +1,47 @@
 /*
-  Relon Language Demo (Modern Edition)
-  - Using @fn for unified logic.
-  - Using unquoted keys for cleaner JSON-like structure.
-  - `#relaxed` to keep the untyped closure params and dynamic
-    reference paths as a quick-glance showcase.
-*/
-#relaxed
-{
-    // --- 1. LOGIC DEFINITIONS ---
-    // Define a formatter as a decorator-compatible function
-    currency(val, symbol): val + " " + symbol,
-    // Define a simple math function
-    multiply(a, b): a * b,
-    // --- 2. DATA STRUCTURE ---
+  Release gate as executable configuration.
 
-    project: {
-        name: "Relon Modern",
-        details: {
-            base_price: 1500,
-            // Calling user-defined function
-            total: multiply(&sibling.base_price, 1.2),
-            // Using logic as a DECORATOR on an unquoted key
-            @currency("GBP")
-            display: &sibling.total
+  The data is small, the contract is explicit, and the final decision is
+  a pure value the host can log or reject.
+
+  Recommended backend: tree-walk (full-surface reference)
+  Expected output: fixtures/golden/success/examples/demo.json
+
+  Try:
+    cargo run -q -p relon-cli -- run --backend tree-walk examples/demo.relon
+*/
+
+#schema Check {
+    String name: *,
+    Bool pass: *,
+    #expect "severity must be 0..3"
+    Int severity: (Int n) -> Bool => n >= 0 && n <= 3
+}
+
+{
+    #internal
+    Bool is_clear(Check check): check.pass || check.severity == 0,
+
+    checks: [
+        #brand Check {
+            name: "schema_migration",
+            pass: true,
+            severity: 3
+        },
+        #brand Check {
+            name: "capacity_headroom",
+            pass: true,
+            severity: 2
+        },
+        #brand Check {
+            name: "kill_switch",
+            pass: true,
+            severity: 3
         }
-    },
-    // --- 3. BUILT-INS & INTERPOLATION ---
-    meta: {
-        // Built-in len() function
-        tags_count: len([
-            "rust",
-            "config",
-            "dsl"
-        ]),
-        // F-String interpolation
-        summary: f"Active project: ${&root.project.name}"
-    }
+    ],
+    blockers: [
+        check.name for check in &sibling.checks if is_clear(check) == false
+    ],
+    decision: len(&sibling.blockers) == 0 ? "ship": "hold",
+    summary: f"${&sibling.decision}: ${len(&sibling.blockers)} blockers"
 }

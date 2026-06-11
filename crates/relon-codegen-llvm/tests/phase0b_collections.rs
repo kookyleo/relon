@@ -139,11 +139,15 @@ fn nested_branded_dict_codegen_parity_and_shape() {
         "nested-dict IR must wire the tail cursor (AllocSubRecord bump). Dump:\n{dump}"
     );
     // The parent pointer-slot store (`PushRecordBase` value written into
-    // the `Wrap.p` slot) and the nested-field stores all land through
-    // the `record_dst` GEP the record-local store path emits.
+    // the `Wrap.p` slot) and the nested-field stores compose the output
+    // pointer in i64, pass through a bounds check, and only then form the
+    // `abs_addr*` GEP. The old unguarded GEP name was `record_dst`.
     assert!(
-        dump.contains("record_dst"),
-        "nested-dict IR must store fields through the record_dst path \
+        dump.contains("record_out_ptr64")
+            && dump.contains("add nuw nsw i64 %record_out_ptr64")
+            && dump.contains("bounds_arena_len")
+            && dump.contains("abs_addr"),
+        "nested-dict IR must store fields through the checked record-local path \
          (StoreFieldAtRecord + PushRecordBase slot store). Dump:\n{dump}"
     );
 }

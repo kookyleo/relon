@@ -66,13 +66,11 @@ fn w7_production_source_lowers_and_evaluates() {
     }
 }
 
-/// Phase D.2: the W7 `#main(Int n) -> Dict { result: Int }` shape now
-/// qualifies for the typed-i64 fast-path entry. Hits
-/// [`LlvmAotEvaluator::run_main_legacy_i64_fast`] directly so the test
-/// fails if the fast emitter ever drops back to the buffer path on this
-/// shape — the cmp_lua `relon_llvm_aot_fast` row depends on this.
+/// Closure modules must not expose the typed-i64 fast-path entry. That
+/// entry has no `ArenaState`; recursive lambda bodies need a real state
+/// pointer to read captures from the arena and to run bounds guards.
 #[test]
-fn w7_production_source_has_fast_path() {
+fn w7_production_source_does_not_expose_fast_path() {
     let src = "#main(Int n) -> Dict\n\
                {\n\
                  #internal\n\
@@ -81,31 +79,16 @@ fn w7_production_source_has_fast_path() {
                }";
     let ev = LlvmAotEvaluator::from_source(src).expect("W7 source compiles via LLVM AOT");
     assert!(
-        ev.has_fast_path(),
-        "Phase D.2: W7 anon-Dict-return should qualify for the typed-i64 fast path; \
-         either `build_fast_path_profile` regressed or `emit_fast_entry` failed (check \
-         the IR dump for the fast-emit diagnostic)"
+        !ev.has_fast_path(),
+        "closure modules must stay on the buffer entry so lambda calls receive ArenaState"
     );
-    for n in [0i64, 1, 2, 5, 10, 13, 15, 20] {
-        let got = ev
-            .run_main_legacy_i64_fast(&[n])
-            .expect("W7 fast entry dispatch");
-        let want = fib_oracle(n);
-        assert_eq!(
-            got, want,
-            "W7 fast-path fib({n}) result mismatches tree-walker oracle"
-        );
-    }
 }
 
-/// Phase D.2: the fast-path `run_main` re-wraps the i64 result into a
-/// `Value::Dict { result: Int }` matching the buffer-protocol decoder's
-/// shape. The cmp_lua `relon_llvm_aot_fast` row uses
-/// `run_main_legacy_i64_fast` directly (i64 -> i64), but production
-/// hosts go through `run_main` and rely on the wrapped value lining up
-/// with the schema's declared return shape.
+/// The buffer path still returns a `Value::Dict { result: Int }`
+/// matching the schema's declared return shape after the fast path is
+/// kept off for closure modules.
 #[test]
-fn w7_fast_path_run_main_returns_dict() {
+fn w7_buffer_run_main_returns_dict() {
     let src = "#main(Int n) -> Dict\n\
                {\n\
                  #internal\n\

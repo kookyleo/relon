@@ -1,94 +1,55 @@
 /*
-  Order workflow as a data-driven state machine.
+  Order workflow as pure transition rules.
 
-  The transition table maps (current_state, event) -> (next_state, emit).
-  Side-effects are returned as a list of opaque strings — the host
-  interprets each entry and performs the actual I/O. Relon stays pure:
-  we just return the *decision*, never the action.
+  The host pushes the current state and event. Relon returns the next
+  state plus symbolic effects; the host decides how to execute them.
 
-  States:   placed -> paid -> shipped -> delivered (or -> cancelled)
-  Failures: an unknown (state, event) returns the same state and a
-            single-element list `["unhandled_event"]`. No exception —
-            just a data-shaped no-op so callers can branch on it.
+  Recommended backend: tree-walk (full-surface reference)
+  Expected output: fixtures/golden/examples_main/workflow.json
 
   Try:
-    cargo run -q -p relon-cli -- run examples/workflow.relon \
-        --args '{"state": "placed", "event": "pay"}'
-
-  Other shapes to try:
-    --args '{"state": "paid",    "event": "cancel"}'    // refund
-    --args '{"state": "shipped", "event": "deliver"}'   // happy path
-    --args '{"state": "placed",  "event": "deliver"}'   // unhandled
+    cargo run -q -p relon-cli -- run --backend tree-walk examples/workflow.relon \
+        --args '{"input": {"state": "placed", "event": "pay"}}'
 */
-#relaxed
 
-#schema Transition {
-    #expect "from must be a known state"
-    String from: (s) => s == "placed" || s == "paid" || s == "shipped",
-    String on: *,
-    #expect "to must be a known state"
-    String to: (s) => s == "paid" || s == "shipped" || s == "delivered" || s == "cancelled",
-    List<String> emit: *
+#schema WorkflowInput {
+    #expect "state must be placed / paid / shipped"
+    String state: (String s) -> Bool => s == "placed" || s == "paid" || s == "shipped",
+    #expect "event must be pay / ship / deliver / cancel"
+    String event: (String e) -> Bool => e == "pay" || e == "ship" || e == "deliver" || e == "cancel"
 }
 
-#main(String state, String event)
+#main(WorkflowInput input) -> Dict
 {
-    // The table is the contract. Adding a new edge means appending a
-    // row here — no Rust changes, no redeploy. The schema brand on
-    // each row enforces the four-field shape at load time.
     #internal
-    transitions: [
-        #brand Transition {
-            from: "placed",
-            on: "pay",
-            to: "paid",
-            emit: [
-                "charge_card",
-                "log_payment"
-            ]
-        },
-        #brand Transition {
-            from: "paid",
-            on: "ship",
-            to: "shipped",
-            emit: [
-                "notify_shipper",
-                "email_user"
-            ]
-        },
-        #brand Transition {
-            from: "shipped",
-            on: "deliver",
-            to: "delivered",
-            emit: [
-                "email_user"
-            ]
-        },
-        #brand Transition {
-            from: "placed",
-            on: "cancel",
-            to: "cancelled",
-            emit: []
-        },
-        #brand Transition {
-            from: "paid",
-            on: "cancel",
-            to: "cancelled",
-            emit: [
-                "refund_card"
-            ]
-        }
+    Bool is_event(String state, String event): input.state == state && input.event == event,
+    #internal
+    String route_state(): is_event("placed", "pay") ? "paid": is_event("paid", "ship") ? "shipped": is_event("shipped", "deliver") ? "delivered": is_event("placed", "cancel") || is_event("paid", "cancel") ? "cancelled": input.state,
+    #internal
+    List<String> pay_effects: [
+        "charge_card",
+        "log_payment"
     ],
-    // Linear scan — workflows tend to have < 50 transitions, so a
-    // hash table would be overkill.
     #internal
-    match_one(t): t.from == state && t.on == event,
-
+    List<String> ship_effects: [
+        "notify_shipper",
+        "email_user"
+    ],
     #internal
-    matched: _list_filter(&sibling.transitions, &sibling.match_one),
-
-    next_state: len(matched) > 0 ? matched[0].to: state,
-    emit: len(matched) > 0 ? matched[0].emit: [
+    List<String> deliver_effects: [
+        "email_user"
+    ],
+    #internal
+    List<String> refund_effects: [
+        "refund_card"
+    ],
+    #internal
+    List<String> no_effects: [],
+    #internal
+    List<String> unhandled_effects: [
         "unhandled_event"
-    ]
+    ],
+
+    String next_state: route_state(),
+    List<String> emit: is_event("placed", "pay") ? &sibling.pay_effects: is_event("paid", "ship") ? &sibling.ship_effects: is_event("shipped", "deliver") ? &sibling.deliver_effects: is_event("paid", "cancel") ? &sibling.refund_effects: is_event("placed", "cancel") ? &sibling.no_effects: &sibling.unhandled_effects
 }

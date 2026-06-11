@@ -1,7 +1,7 @@
 //! Backend-dispatch visitor over the canonical [`Op`] enum.
 //!
-//! Each codegen / interpretation backend (bytecode VM,
-//! cranelift-native, future targets) historically maintained its own
+//! Each IR-consuming backend (cranelift-native, LLVM, future targets)
+//! historically maintained its own
 //! `match op { Op::Add(..) => ..., Op::Sub(..) => ..., ... }` block.
 //! With ~70 variants and three backends the duplication risked
 //! silent drift: a new variant might be wired in one backend and
@@ -124,9 +124,8 @@ pub trait OpVisitor {
     /// `operand_count` String values off the operand stack (deepest
     /// leaf first), pushes one concatenated String. Backends decide
     /// how to fulfil "single allocation"; the tree-walker delegates to
-    /// `SmolStr::concat_many`, the bytecode VM materialises a single
-    /// fresh arena slot, and cranelift sums the lengths once before
-    /// the alloc.
+    /// `SmolStr::concat_many`, while compiled backends sum the lengths
+    /// once before the alloc.
     fn visit_str_concat_n(&mut self, operand_count: u32) -> Result<Self::Output, Self::Error>;
     /// Wave R2 (f-string lowering) — pop one `I64`, push its base-10
     /// decimal `String` record. Byte-exact with the tree-walker's

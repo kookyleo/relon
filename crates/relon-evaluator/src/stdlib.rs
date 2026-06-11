@@ -923,9 +923,8 @@ fn fold_string(s: &str, mode: CaseFoldMode, locale_turkish: bool) -> String {
 /// in via the plain [`fold_string`] entry point and supply
 /// [`AsciiHint::Unknown`]; the fast path then runs its usual SIMD
 /// scan to decide whether to skip the slow per-codepoint loop. When
-/// a future caller can prove the input is pure ASCII upstream — e.g.
-/// the StringRef record's [`relon_trace_abi::STRING_RECORD_ASCII_FLAG_BIT`]
-/// is set after intern / record-build — it can pass
+/// a future caller can prove the input is pure ASCII upstream — e.g. by
+/// caching an ASCII flag after intern / record-build — it can pass
 /// [`AsciiHint::AllAscii`] to skip the per-call scan entirely.
 ///
 /// `KnownNonAscii` lets a future intern-table classifier report the
@@ -944,8 +943,8 @@ enum AsciiHint {
     /// the input `SmolStr`, so this variant is only constructed by the
     /// test suite + the `#[cfg(test)]` `fold_string` wrapper. The
     /// fold engine still pattern-matches against it because future
-    /// bytecode / trace-JIT callers may want the legacy SIMD-scan
-    /// shape when no upstream classification exists.
+    /// compiled callers may want the legacy SIMD-scan shape when no
+    /// upstream classification exists.
     #[cfg_attr(
         not(test),
         allow(
@@ -1299,9 +1298,8 @@ fn fold_string_to_smol_ascii_fast(
 /// [`fold_string_with_ascii_hint`] for the full Unicode pipeline.
 ///
 /// `ascii_hint` is typically derived from the input `SmolStr` via
-/// [`AsciiHint::from_smol`] at the surface call site; future bytecode
-/// / trace-JIT callers can read the same fact from
-/// [`relon_trace_abi::STRING_RECORD_ASCII_FLAG_BIT`] without any
+/// [`AsciiHint::from_smol`] at the surface call site; future compiled
+/// callers can cache the same fact in their string header without any
 /// additional scan. Passing [`AsciiHint::Unknown`] preserves the
 /// pre-#163 behaviour where the fold engine + the inline ASCII fast
 /// path each run their own SIMD scan.

@@ -21,8 +21,8 @@
 ///
 /// Each variant's discriminant is the bit index the compiled backends
 /// key on: the cranelift `CapabilityVtable` slots a host fn at
-/// `cap_bit`, the bytecode VM consults the same index, and the wasm
-/// `__relon_check_cap` import receives it. Hosts registering a
+/// `cap_bit`, the LLVM / wasm host boundaries consult the same index,
+/// and the wasm `__relon_check_cap` import receives it. Hosts registering a
 /// `#native` function tag the registration with the matching bit.
 ///
 /// Discriminants are stable: adding a new capability appends a new
@@ -53,8 +53,8 @@ pub enum CapabilityBit {
 
 impl CapabilityBit {
     /// Stable bit index this capability claims. Used by the cranelift
-    /// vtable, the bytecode VM consult, and the wasm `__relon_check_cap`
-    /// import to key the same capability across backends.
+    /// vtable and LLVM / wasm host-boundary checks to key the same
+    /// capability across backends.
     pub fn bit_index(self) -> u32 {
         self as u32
     }
@@ -224,6 +224,91 @@ pub struct Capabilities {
     pub max_value_elements: Option<usize>,
 }
 
+/// Evaluator-side resource-budget presets.
+///
+/// These profiles cover limits the in-process evaluator can enforce today.
+/// Host/VM limits such as wall-clock time, process memory, Wasmtime fuel, and
+/// final-output bytes live at their respective host boundaries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResourceBudgetProfile {
+    /// Preserve historical behavior: no evaluator-side resource limit.
+    #[default]
+    Off,
+    /// Developer guardrails for local runs.
+    Dev,
+    /// Tighter guardrails for externally supplied source. This is not a VM
+    /// security boundary; use a wasm engine for hard untrusted execution.
+    Untrusted,
+}
+
+/// Evaluator-side resource budget.
+///
+/// `ResourceBudget` is deliberately separate from [`Capabilities`]:
+/// capabilities answer "may the program use this host authority?", while a
+/// budget answers "how much evaluator work/value growth is this host willing
+/// to pay for?". The current implementation still stores these two fields on
+/// [`Capabilities`] for compatibility; call [`Self::apply_to_capabilities`] to
+/// bridge the new model into the existing evaluator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ResourceBudget {
+    /// Maximum evaluator steps. `None` is unbounded.
+    pub max_steps: Option<u64>,
+    /// Maximum number of elements in a single List/Tuple/Dict. `None` is
+    /// unbounded.
+    pub max_value_elements: Option<usize>,
+}
+
+impl ResourceBudget {
+    pub const DEV_MAX_STEPS: u64 = 5_000_000;
+    pub const DEV_MAX_VALUE_ELEMENTS: usize = 100_000;
+    pub const UNTRUSTED_MAX_STEPS: u64 = 1_000_000;
+    pub const UNTRUSTED_MAX_VALUE_ELEMENTS: usize = 10_000;
+
+    /// No evaluator-side budget.
+    pub fn off() -> Self {
+        Self::default()
+    }
+
+    /// Local-development guardrails.
+    pub fn dev() -> Self {
+        Self {
+            max_steps: Some(Self::DEV_MAX_STEPS),
+            max_value_elements: Some(Self::DEV_MAX_VALUE_ELEMENTS),
+        }
+    }
+
+    /// Tighter evaluator guardrails for externally supplied source.
+    pub fn untrusted() -> Self {
+        Self {
+            max_steps: Some(Self::UNTRUSTED_MAX_STEPS),
+            max_value_elements: Some(Self::UNTRUSTED_MAX_VALUE_ELEMENTS),
+        }
+    }
+
+    pub fn from_profile(profile: ResourceBudgetProfile) -> Self {
+        match profile {
+            ResourceBudgetProfile::Off => Self::off(),
+            ResourceBudgetProfile::Dev => Self::dev(),
+            ResourceBudgetProfile::Untrusted => Self::untrusted(),
+        }
+    }
+
+    pub fn has_evaluator_limits(self) -> bool {
+        self.max_steps.is_some() || self.max_value_elements.is_some()
+    }
+
+    pub fn apply_to_capabilities(self, caps: &mut Capabilities) {
+        if let Some(max_steps) = self.max_steps {
+            caps.max_steps = Some(max_steps);
+        }
+        if let Some(max_value_elements) = self.max_value_elements {
+            caps.max_value_elements = Some(max_value_elements);
+        }
+    }
+}
+
 impl Capabilities {
     /// Audit-visible "grant everything" preset: every capability bit
     /// flipped, no step / value-size budget. The spec forbids an
@@ -284,5 +369,51 @@ mod tests {
             ]
         );
         assert!(gate.missing_bits(&Capabilities::all_granted()).is_empty());
+    }
+
+    #[test]
+    fn resource_budget_profiles_are_stable() {
+        assert_eq!(
+            ResourceBudget::from_profile(ResourceBudgetProfile::Off),
+            ResourceBudget::off()
+        );
+        assert_eq!(
+            ResourceBudget::from_profile(ResourceBudgetProfile::Dev),
+            ResourceBudget {
+                max_steps: Some(ResourceBudget::DEV_MAX_STEPS),
+                max_value_elements: Some(ResourceBudget::DEV_MAX_VALUE_ELEMENTS),
+            }
+        );
+        assert_eq!(
+            ResourceBudget::from_profile(ResourceBudgetProfile::Untrusted),
+            ResourceBudget {
+                max_steps: Some(ResourceBudget::UNTRUSTED_MAX_STEPS),
+                max_value_elements: Some(ResourceBudget::UNTRUSTED_MAX_VALUE_ELEMENTS),
+            }
+        );
+    }
+
+    #[test]
+    fn resource_budget_does_not_grant_capabilities() {
+        let mut caps = Capabilities::default();
+        ResourceBudget::untrusted().apply_to_capabilities(&mut caps);
+        assert_eq!(caps.max_steps, Some(ResourceBudget::UNTRUSTED_MAX_STEPS));
+        assert_eq!(
+            caps.max_value_elements,
+            Some(ResourceBudget::UNTRUSTED_MAX_VALUE_ELEMENTS)
+        );
+        assert_eq!(
+            NativeFnGate {
+                reads_fs: true,
+                writes_fs: true,
+                network: true,
+                reads_clock: true,
+                reads_env: true,
+                uses_rng: true,
+            }
+            .missing_bits(&caps)
+            .len(),
+            6
+        );
     }
 }

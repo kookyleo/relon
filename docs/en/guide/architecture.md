@@ -27,7 +27,7 @@ ones one-way only.
 | `relon-parser` | Lex + parse → AST. Every `Node` carries a process-wide `NodeId` for cross-layer side-tables | `Node`, `Expr`, `TypeNode`, `Decorator`, `NodeId`, `parse_document` |
 | `relon-analyzer` | Many passes (schema / extend / main_sig / modules / resolve / typecheck, …) producing the `AnalyzedTree` side-table | `AnalyzedTree`, `SchemaDef`, `ResolvedRef`, `Diagnostic`, `analyze` |
 | `relon-evaluator` | Tree-walk evaluation; carries `Context` / `Capabilities` / `Value` / built-in decorators / stdlib | `Context`, `Capabilities`, `Value`, `Evaluator`, `RuntimeError` |
-| `relon-ir` + `relon-codegen-cranelift` / `relon-codegen-llvm` | Lower AST + side-tables to IR, then AOT-compile to native machine code; bit-identical with tree-walk | IR module, per-backend entry points |
+| `relon-ir` + `relon-codegen-cranelift` / `relon-codegen-llvm` | Lower AST + side-tables to IR, then AOT-compile declared supported shapes to native machine code; matched against tree-walk | IR module, per-backend entry points |
 | `relon` (facade) | Stitches parse → analyze → eval; `EvaluatorBuilder` selects the backend (default `Backend::Auto`); `Projector` controls JSON output shape | `from_str`, `value_from_str`, `json_from_str`, `EvaluatorBuilder`, `Error` |
 | `relon-lsp` | Synchronous lsp-server; reuses analyzer `Diagnostic` and side-tables | binary `relon-lsp` |
 
@@ -63,9 +63,10 @@ it falls back (e.g. schemas not pre-lowered get lowered on demand via
 
 The compiled backends run a parallel pipeline: the same AST +
 `AnalyzedTree` is lowered to IR by `relon-ir`, then compiled to
-native machine code by the cranelift / LLVM backends — all three
-backends share the sandbox semantics and produce bit-identical
-results.
+native machine code by the cranelift / LLVM backends. Tree-walk stays
+the full-surface reference; compiled backends are matched against it on
+their declared supported surface and must report the same observable
+sandbox errors.
 
 ## The analyzer's pass pipeline
 

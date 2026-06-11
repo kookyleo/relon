@@ -12,8 +12,8 @@ use relon_ir::ir::{IrType, Op};
 
 use crate::error::LlvmError;
 use crate::state::{
-    ARENA_STATE_OFFSET_SCRATCH_BASE, ARENA_STATE_OFFSET_SCRATCH_CURSOR,
-    ARENA_STATE_OFFSET_TAIL_CURSOR,
+    NativeTrap, ARENA_STATE_OFFSET_LEN, ARENA_STATE_OFFSET_SCRATCH_BASE,
+    ARENA_STATE_OFFSET_SCRATCH_CURSOR, ARENA_STATE_OFFSET_TAIL_CURSOR,
 };
 
 use super::*;
@@ -76,9 +76,9 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// integer-typed, and Bool / Unit (i8 on the wire) zero-extend to
     /// i32 to match the IR's virtual-stack convention.
     ///
-    /// No bounds check — same "trust the IR + LLVM trap on UB" stance
-    /// the rest of the `*AtAbsolute` family takes (Phase 3 wires the
-    /// trap-propagation work).
+    /// Emits an arena bounds check before the field load so a corrupt
+    /// pointer records `BoundsViolation` instead of forming an invalid
+    /// host pointer.
     pub(crate) fn emit_load_field_at_absolute(
         &mut self,
         ip_hint: &str,
@@ -86,7 +86,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         ty: IrType,
     ) -> Result<(), LlvmError> {
         let base = self.pop_int(ip_hint)?;
-        let addr = self.compose_abs_addr(base, offset)?;
+        let access_size = self.field_access_size(ty)?;
+        let addr = self.compose_abs_addr(base, offset, access_size, "LoadFieldAtAbsolute")?;
         // Pointer-indirect schema field (`String` / `List<scalar>` /
         // `List<String>` / `List<Schema>` / `List<List<scalar>>`): the slot
         // holds a 4-byte offset to the field's tail record. F1: the input
@@ -191,7 +192,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             LlvmError::Codegen("LoadField outside buffer-protocol entry shape".into())
         })?;
         let in_ptr_i32 = self.lookup_param(0)?; // IR LocalGet(0) == in_ptr
-        let addr = self.compute_buffer_addr(arena_base_ptr, in_ptr_i32, offset)?;
+        let access_size = self.field_access_size(ty)?;
+        let addr = self.compute_buffer_addr(arena_base_ptr, in_ptr_i32, offset, access_size)?;
         // AOT-1: an F64 field is stored as 8 LE bytes; load it as a
         // `double`, then bit-cast to i64 bits so the operand stack stays
         // integer-typed (Option B). Routing it through `field_load_kind`
@@ -349,7 +351,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             LlvmError::Codegen("StoreField outside buffer-protocol entry shape".into())
         })?;
         let out_ptr_i32 = self.lookup_param(2)?; // IR LocalGet(2) == out_ptr
-        let addr = self.compute_buffer_addr(arena_base_ptr, out_ptr_i32, offset)?;
+        let access_size = self.field_access_size(ty)?;
+        let addr = self.compute_buffer_addr(arena_base_ptr, out_ptr_i32, offset, access_size)?;
         let v = self.pop_int(ip_hint)?;
         let store_val: BasicValueEnum<'ctx> = match ty {
             IrType::I64 => v.into(),
@@ -384,7 +387,9 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         Ok(())
     }
 
-    /// Compute `arena_base + buf_ptr + offset` as an LLVM pointer.
+    /// Compute `arena_base + buf_ptr + offset` as an LLVM pointer after
+    /// checking `[buf_ptr + offset, buf_ptr + offset + access_size)` lies
+    /// within the arena.
     /// The result is a typed-stripped opaque pointer suitable for any
     /// `load` / `store` width.
     pub(crate) fn compute_buffer_addr(
@@ -392,6 +397,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         arena_base_ptr: PointerValue<'ctx>,
         buf_ptr_i32: IntValue<'ctx>,
         offset: u32,
+        access_size: u32,
     ) -> Result<PointerValue<'ctx>, LlvmError> {
         let i32_t = self.ctx.i32_type();
         let i64_t = self.ctx.i64_type();
@@ -413,6 +419,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .builder
             .build_int_add(buf_ptr64, off64, &name)
             .map_err(|e| LlvmError::Codegen(format!("buf_ptr + offset: {e}")))?;
+        self.emit_arena_bounds_check_const(combined, access_size, "buffer_addr")?;
         // GEP from the cached arena_base pointer (which is an i8*)
         // by the combined byte offset.
         let name = self.next_name("field_addr");
@@ -443,16 +450,31 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         Ok(pair)
     }
 
+    pub(crate) fn field_access_size(&self, ty: IrType) -> Result<u32, LlvmError> {
+        match ty {
+            IrType::I64 | IrType::F64 => Ok(8),
+            IrType::I32
+            | IrType::String
+            | IrType::ListInt
+            | IrType::ListFloat
+            | IrType::ListBool
+            | IrType::ListString
+            | IrType::ListSchema
+            | IrType::ListList
+            | IrType::Closure
+            | IrType::Dict => Ok(4),
+            IrType::Bool | IrType::Unit => Ok(1),
+        }
+    }
+
     /// Phase 2 surface-widening: lower `Op::ReadStringLen` — pop an
     /// arena-relative i32 record pointer (String or List* header),
     /// load the leading 4-byte length prefix, zext to i64, push.
     /// Mirrors `relon-codegen-cranelift::codegen::field::emit_read_string_len`.
     ///
-    /// No bounds check today (Phase B/C/D LLVM emitter doesn't emit
-    /// `cond_trap`; Phase 3 wires the trap-propagation work).
     pub(crate) fn emit_read_string_len(&mut self, ip_hint: &str) -> Result<(), LlvmError> {
         let ptr_i32 = self.pop_int(ip_hint)?;
-        let addr = self.arena_addr_i32(ptr_i32)?;
+        let addr = self.arena_addr_i32_checked_const(ptr_i32, 4, "ReadStringLen")?;
         let name = self.next_name("rs_len");
         let len_i32 = self
             .builder
@@ -491,8 +513,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
     /// **input-buffer-relative** (relative to `in_ptr`, the start of the
     /// input record — `BufferBuilder` lays the tail record into the input
     /// buffer and back-patches a buffer-relative offset). Every operand-
-    /// stack pointer consumer downstream (`ReadStringLen` via
-    /// `arena_addr_i32`, the pointer-indirect `StoreField` /
+    /// stack pointer consumer downstream (`ReadStringLen`, the
+    /// pointer-indirect `StoreField` /
     /// `EmitTailRecordFromAbsoluteAddr` tail-record copy, `Op::Call`
     /// stdlib helpers) treats the pointer as **arena-relative** — the
     /// same coordinate the const-pool / scratch producers push. So we
@@ -513,7 +535,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             ))
         })?;
         let in_ptr_i32 = self.lookup_param(0)?; // IR LocalGet(0) == in_ptr
-        let addr = self.compute_buffer_addr(arena_base_ptr, in_ptr_i32, offset)?;
+        let addr = self.compute_buffer_addr(arena_base_ptr, in_ptr_i32, offset, 4)?;
         // F1: the input marshaller baked `in_ptr` into the slot
         // (`finish_arena_absolute`), so the loaded value is already the
         // arena-relative offset the uniform `arena_base + ptr` resolution
@@ -567,25 +589,72 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .map_err(|e| LlvmError::Codegen(format!("{label} align and: {e}")))
     }
 
-    /// Compute `arena_base + off_i32` as an LLVM pointer. Mirrors
-    /// `Codegen::arena_addr` on the cranelift side — used by every
-    /// `*AtAbsolute` lowering path. No bounds check (Phase E.1 retains
-    /// the same "trust the IR + LLVM trap on UB" stance as Phase B).
-    pub(crate) fn arena_addr_i32(
+    /// Compute `arena_base + off_i32` only after checking the accessed
+    /// byte range against `ArenaState::arena_len`.
+    pub(crate) fn arena_addr_i32_checked_const(
         &mut self,
         off_i32: IntValue<'ctx>,
+        access_size: u32,
+        label: &str,
+    ) -> Result<PointerValue<'ctx>, LlvmError> {
+        let len = self.ctx.i32_type().const_int(u64::from(access_size), false);
+        self.arena_addr_i32_checked(off_i32, len, label)
+    }
+
+    pub(crate) fn arena_addr_i32_checked(
+        &mut self,
+        off_i32: IntValue<'ctx>,
+        access_len: IntValue<'ctx>,
+        label: &str,
     ) -> Result<PointerValue<'ctx>, LlvmError> {
         let arena_base_ptr = self.arena_base_ptr.ok_or_else(|| {
             LlvmError::Codegen("absolute load/store outside buffer-protocol entry shape".into())
         })?;
-        let i64_t = self.ctx.i64_type();
-        let i8_t = self.ctx.i8_type();
-        let name = self.next_name("abs_off_zext");
-        let off64 = self
+        self.emit_arena_bounds_check(off_i32, access_len, label)?;
+        self.arena_addr_from_base_offset(arena_base_ptr, off_i32, "abs")
+    }
+
+    pub(crate) fn arena_addr_i32_offset_checked_const(
+        &mut self,
+        base: IntValue<'ctx>,
+        offset: u32,
+        access_size: u32,
+        label: &str,
+    ) -> Result<PointerValue<'ctx>, LlvmError> {
+        let len = self.ctx.i32_type().const_int(u64::from(access_size), false);
+        self.arena_addr_i32_offset_checked(base, offset, len, label)
+    }
+
+    pub(crate) fn arena_addr_i32_offset_checked(
+        &mut self,
+        base: IntValue<'ctx>,
+        offset: u32,
+        access_len: IntValue<'ctx>,
+        label: &str,
+    ) -> Result<PointerValue<'ctx>, LlvmError> {
+        let arena_base_ptr = self.arena_base_ptr.ok_or_else(|| {
+            LlvmError::Codegen("absolute load/store outside buffer-protocol entry shape".into())
+        })?;
+        let base64 = self.zext_to_i64(base, label, "base")?;
+        let off_const = self.ctx.i64_type().const_int(u64::from(offset), false);
+        let name = self.next_name("abs_offset_compose");
+        let composed = self
             .builder
-            .build_int_z_extend(off_i32, i64_t, &name)
-            .map_err(|e| LlvmError::Codegen(format!("abs offset zext: {e}")))?;
-        let name = self.next_name("abs_addr");
+            .build_int_add(base64, off_const, &name)
+            .map_err(|e| LlvmError::Codegen(format!("{label} offset compose add: {e}")))?;
+        self.emit_arena_bounds_check(composed, access_len, label)?;
+        self.arena_addr_from_base_offset(arena_base_ptr, composed, "abs")
+    }
+
+    pub(crate) fn arena_addr_from_base_offset(
+        &mut self,
+        arena_base_ptr: PointerValue<'ctx>,
+        offset: IntValue<'ctx>,
+        prefix: &str,
+    ) -> Result<PointerValue<'ctx>, LlvmError> {
+        let i8_t = self.ctx.i8_type();
+        let off64 = self.zext_to_i64(offset, prefix, "off")?;
+        let name = self.next_name(&format!("{prefix}_addr"));
         let addr = unsafe {
             self.builder
                 .build_in_bounds_gep(i8_t, arena_base_ptr, &[off64], &name)
@@ -594,20 +663,119 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         Ok(addr)
     }
 
-    /// Compose `base + offset` (both i32) into the absolute pointer
-    /// each `Load*AtAbsolute` / `Store*AtAbsolute` op reads from.
+    pub(crate) fn emit_arena_bounds_check_const(
+        &mut self,
+        offset: IntValue<'ctx>,
+        access_size: u32,
+        label: &str,
+    ) -> Result<(), LlvmError> {
+        let len = self.ctx.i32_type().const_int(u64::from(access_size), false);
+        self.emit_arena_bounds_check(offset, len, label)
+    }
+
+    fn emit_arena_bounds_check(
+        &mut self,
+        offset: IntValue<'ctx>,
+        access_len: IntValue<'ctx>,
+        label: &str,
+    ) -> Result<(), LlvmError> {
+        let state_ptr = self.state_ptr.ok_or_else(|| {
+            LlvmError::Codegen(format!("{label}: bounds check requires state ptr"))
+        })?;
+        let i8_t = self.ctx.i8_type();
+        let i32_t = self.ctx.i32_type();
+        let i64_t = self.ctx.i64_type();
+        let len_gep = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    state_ptr,
+                    &[i32_t.const_int(u64::from(ARENA_STATE_OFFSET_LEN), false)],
+                    &self.next_name("bounds_len_gep"),
+                )
+                .map_err(|e| LlvmError::Codegen(format!("{label} bounds len GEP: {e}")))?
+        };
+        let arena_len32 = self
+            .builder
+            .build_load(i32_t, len_gep, &self.next_name("bounds_arena_len"))
+            .map_err(|e| LlvmError::Codegen(format!("{label} bounds len load: {e}")))?
+            .into_int_value();
+        let arena_len64 = self
+            .builder
+            .build_int_z_extend(arena_len32, i64_t, &self.next_name("bounds_len64"))
+            .map_err(|e| LlvmError::Codegen(format!("{label} bounds len zext: {e}")))?;
+        let off64 = self.zext_to_i64(offset, label, "off")?;
+        let access64 = self.zext_to_i64(access_len, label, "access")?;
+        let end64 = self
+            .builder
+            .build_int_add(off64, access64, &self.next_name("bounds_end"))
+            .map_err(|e| LlvmError::Codegen(format!("{label} bounds end add: {e}")))?;
+        let out_of_bounds = self
+            .builder
+            .build_int_compare(
+                inkwell::IntPredicate::UGT,
+                end64,
+                arena_len64,
+                &self.next_name("bounds_oob"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("{label} bounds cmp: {e}")))?;
+        let trap_bb = self.ctx.append_basic_block(self.func, "bounds_trap");
+        let ok_bb = self.ctx.append_basic_block(self.func, "bounds_ok");
+        self.builder
+            .build_conditional_branch(out_of_bounds, trap_bb, ok_bb)
+            .map_err(|e| LlvmError::Codegen(format!("{label} bounds branch: {e}")))?;
+
+        self.builder.position_at_end(trap_bb);
+        if self.shape == EntryShape::Buffer {
+            self.emit_state_trap(NativeTrap::BoundsViolation, label)?;
+        } else {
+            self.emit_llvm_trap_call(label)?;
+            self.builder
+                .build_unreachable()
+                .map_err(|e| LlvmError::Codegen(format!("{label} bounds unreachable: {e}")))?;
+        }
+        self.builder.position_at_end(ok_bb);
+        Ok(())
+    }
+
+    fn zext_to_i64(
+        &mut self,
+        value: IntValue<'ctx>,
+        label: &str,
+        name: &str,
+    ) -> Result<IntValue<'ctx>, LlvmError> {
+        let width = value.get_type().get_bit_width();
+        if width == 64 {
+            return Ok(value);
+        }
+        if width > 64 {
+            return Err(LlvmError::Codegen(format!(
+                "{label} bounds {name}: i{width} is wider than i64"
+            )));
+        }
+        self.builder
+            .build_int_z_extend(
+                value,
+                self.ctx.i64_type(),
+                &self.next_name(&format!("bounds_{name}64")),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("{label} bounds {name} zext: {e}")))
+    }
+
+    /// Compose `base + offset` into the absolute pointer each
+    /// `Load*AtAbsolute` / `Store*AtAbsolute` op reads from.
+    ///
+    /// Widen before adding the constant so a hostile/corrupt base near
+    /// `u32::MAX` cannot wrap in i32 and then pass the bounds check as a
+    /// small offset.
     pub(crate) fn compose_abs_addr(
         &mut self,
         base: IntValue<'ctx>,
         offset: u32,
+        access_size: u32,
+        label: &str,
     ) -> Result<PointerValue<'ctx>, LlvmError> {
-        let off_const = self.ctx.i32_type().const_int(u64::from(offset), false);
-        let name = self.next_name("abs_compose");
-        let composed = self
-            .builder
-            .build_int_add(base, off_const, &name)
-            .map_err(|e| LlvmError::Codegen(format!("abs compose add: {e}")))?;
-        self.arena_addr_i32(composed)
+        self.arena_addr_i32_offset_checked_const(base, offset, access_size, label)
     }
 
     pub(crate) fn emit_load_at_absolute(
@@ -617,7 +785,13 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         kind: AbsLoad,
     ) -> Result<(), LlvmError> {
         let base = self.pop_int(ip_hint)?;
-        let addr = self.compose_abs_addr(base, offset)?;
+        let access_size = match kind {
+            AbsLoad::I32 => 4,
+            AbsLoad::I64 => 8,
+            AbsLoad::I8U => 1,
+            AbsLoad::F64 => 8,
+        };
+        let addr = self.compose_abs_addr(base, offset, access_size, "LoadAtAbsolute")?;
         match kind {
             AbsLoad::I32 => {
                 let name = self.next_name("loadi32_abs");
@@ -684,7 +858,13 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         // base. Mirrors cranelift's pop order.
         let value = self.pop_int(ip_hint)?;
         let base = self.pop_int(ip_hint)?;
-        let addr = self.compose_abs_addr(base, offset)?;
+        let access_size = match kind {
+            AbsStore::I32 => 4,
+            AbsStore::I64 => 8,
+            AbsStore::I8 => 1,
+            AbsStore::F64 => 8,
+        };
+        let addr = self.compose_abs_addr(base, offset, access_size, "StoreAtAbsolute")?;
         match kind {
             AbsStore::I32 => {
                 self.builder
@@ -731,8 +911,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         let len = self.pop_int(ip_hint)?;
         let src = self.pop_int(ip_hint)?;
         let dst = self.pop_int(ip_hint)?;
-        let dst_ptr = self.arena_addr_i32(dst)?;
-        let src_ptr = self.arena_addr_i32(src)?;
+        let dst_ptr = self.arena_addr_i32_checked(dst, len, "MemcpyAtAbsolute dst")?;
+        let src_ptr = self.arena_addr_i32_checked(src, len, "MemcpyAtAbsolute src")?;
         // `inkwell`'s `build_memcpy` requires the length to be the
         // pointer-width int. Widen our i32 length to i64 (zero-extend).
         let i64_t = self.ctx.i64_type();
@@ -809,6 +989,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .builder
             .build_int_add(cur, size_v, "scratch_new_cur")
             .map_err(|e| LlvmError::Codegen(format!("scratch cur bump: {e}")))?;
+        self.emit_arena_bounds_check(off, size_v, "AllocScratch")?;
         self.builder
             .build_store(cursor_gep, new_cur)
             .map_err(|e| LlvmError::Codegen(format!("scratch cursor store: {e}")))?;
@@ -849,7 +1030,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         let i32_t = self.ctx.i32_type();
         let i8_t = self.ctx.i8_type();
         // Read the record's `[len: u32]` header to size the memcpy.
-        let src_abs = self.arena_addr_i32(src_off_i32)?;
+        let src_abs =
+            self.arena_addr_i32_checked_const(src_off_i32, 4, "StoreField ptr src len")?;
         let len_i32 = self
             .builder
             .build_load(i32_t, src_abs, "ptr_indirect_len")
@@ -954,7 +1136,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .builder
             .build_int_add(out_ptr_i32, aligned, "ptr_indirect_dst_off")
             .map_err(|e| LlvmError::Codegen(format!("ptr-indirect dst off: {e}")))?;
-        let dst_ptr = self.arena_addr_i32(dst_off)?;
+        let dst_ptr = self.arena_addr_i32_checked_const(dst_off, 4, "StoreField ptr dst len")?;
         let i64_t = self.ctx.i64_type();
         let _ = arena_base_ptr;
         // Header: store the `[len: u32]` prefix at the destination record
@@ -976,10 +1158,12 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         // it from the (arena-relative) source record start rather than
         // assuming a fixed header+pad — see the comment above.
         let src_payload_off = self.align_up_const(src_off_i32, 4, align, "src_payload")?;
-        let src_payload_ptr = self.arena_addr_i32(src_payload_off)?;
+        let src_payload_ptr =
+            self.arena_addr_i32_checked(src_payload_off, payload_bytes, "StoreField ptr src")?;
         // Destination payload offset = align_up(dst_off + 4, align).
         let dst_payload_off = self.align_up_const(dst_off, 4, align, "dst_payload")?;
-        let dst_payload_ptr = self.arena_addr_i32(dst_payload_off)?;
+        let dst_payload_ptr =
+            self.arena_addr_i32_checked(dst_payload_off, payload_bytes, "StoreField ptr dst")?;
         let payload64 = self
             .builder
             .build_int_z_extend(payload_bytes, i64_t, "ptr_indirect_payload64")
@@ -998,7 +1182,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 "ptr_indirect_slot_off",
             )
             .map_err(|e| LlvmError::Codegen(format!("ptr-indirect slot off: {e}")))?;
-        let slot_addr = self.arena_addr_i32(slot_off)?;
+        let slot_addr =
+            self.arena_addr_i32_checked_const(slot_off, 4, "StoreField ptr fixed slot")?;
         self.builder
             .build_store(slot_addr, dst_off)
             .map_err(|e| LlvmError::Codegen(format!("ptr-indirect slot store: {e}")))?;
@@ -1058,7 +1243,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 "ls_slot_off",
             )
             .map_err(|e| LlvmError::Codegen(format!("ListString slot off: {e}")))?;
-        let slot_addr = self.arena_addr_i32(slot_off)?;
+        let slot_addr =
+            self.arena_addr_i32_checked_const(slot_off, 4, "StoreField ListString slot")?;
         self.builder
             .build_store(slot_addr, new_header)
             .map_err(|e| LlvmError::Codegen(format!("ListString slot store: {e}")))?;
@@ -1087,7 +1273,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         let i64_t = self.ctx.i64_type();
 
         // len = [header_off].
-        let header_abs = self.arena_addr_i32(header_off)?;
+        let header_abs =
+            self.arena_addr_i32_checked_const(header_off, 4, "ListString header len")?;
         let len = self
             .builder
             .build_load(i32_t, header_abs, "ls_len")
@@ -1111,13 +1298,9 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
 
         // src_block_start = (len != 0) ? off_0 : header_off, where
         // off_0 = [header_off + 4] (the first / lowest String record
-        // offset). For an empty list the block is just the 4-byte header.
-        let off0_abs = self.arena_addr_i32(header_payload)?;
-        let off0 = self
-            .builder
-            .build_load(i32_t, off0_abs, "ls_off0")
-            .map_err(|e| LlvmError::Codegen(format!("ListString off0 load: {e}")))?
-            .into_int_value();
+        // offset). For an empty list the block is just the 4-byte header;
+        // do not speculatively load off_0 in that case, because the slot
+        // is outside the empty header.
         let len_nz = self
             .builder
             .build_int_compare(
@@ -1127,11 +1310,38 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
                 "ls_len_nz",
             )
             .map_err(|e| LlvmError::Codegen(format!("ListString len!=0: {e}")))?;
-        let src_block_start = self
+        let off0_load_bb = self.ctx.append_basic_block(self.func, "ls_off0_load");
+        let off0_done_bb = self.ctx.append_basic_block(self.func, "ls_off0_done");
+        let off0_pre_bb = self
             .builder
-            .build_select(len_nz, off0, header_off, "ls_block_start")
-            .map_err(|e| LlvmError::Codegen(format!("ListString block_start select: {e}")))?
+            .get_insert_block()
+            .ok_or_else(|| LlvmError::Codegen("ListString off0: no insert block".into()))?;
+        self.builder
+            .build_conditional_branch(len_nz, off0_load_bb, off0_done_bb)
+            .map_err(|e| LlvmError::Codegen(format!("ListString off0 branch: {e}")))?;
+
+        self.builder.position_at_end(off0_load_bb);
+        let off0_abs = self.arena_addr_i32_checked_const(header_payload, 4, "ListString off0")?;
+        let off0 = self
+            .builder
+            .build_load(i32_t, off0_abs, "ls_off0")
+            .map_err(|e| LlvmError::Codegen(format!("ListString off0 load: {e}")))?
             .into_int_value();
+        let off0_load_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| LlvmError::Codegen("ListString off0: no load block".into()))?;
+        self.builder
+            .build_unconditional_branch(off0_done_bb)
+            .map_err(|e| LlvmError::Codegen(format!("ListString off0 done br: {e}")))?;
+
+        self.builder.position_at_end(off0_done_bb);
+        let src_block_phi = self
+            .builder
+            .build_phi(i32_t, "ls_block_start")
+            .map_err(|e| LlvmError::Codegen(format!("ListString block_start phi: {e}")))?;
+        src_block_phi.add_incoming(&[(&header_off, off0_pre_bb), (&off0, off0_load_end)]);
+        let src_block_start = src_block_phi.as_basic_value().into_int_value();
         let block_size = self
             .builder
             .build_int_sub(offsets_end, src_block_start, "ls_block_size")
@@ -1179,8 +1389,9 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .builder
             .build_int_add(out_ptr, dst_block, "ls_dst_off")
             .map_err(|e| LlvmError::Codegen(format!("ListString dst off: {e}")))?;
-        let dst_ptr = self.arena_addr_i32(dst_off)?;
-        let src_ptr = self.arena_addr_i32(src_block_start)?;
+        let dst_ptr = self.arena_addr_i32_checked(dst_off, block_size, "ListString dst block")?;
+        let src_ptr =
+            self.arena_addr_i32_checked(src_block_start, block_size, "ListString src block")?;
         let block64 = self
             .builder
             .build_int_z_extend(block_size, i64_t, "ls_block64")
@@ -1268,7 +1479,8 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             .builder
             .build_int_add(entries_base, i_bytes, "ls_entry_off")
             .map_err(|e| LlvmError::Codegen(format!("ListString entry off: {e}")))?;
-        let entry_addr = self.arena_addr_i32(entry_off)?;
+        let entry_addr =
+            self.arena_addr_i32_checked_const(entry_off, 4, "ListString reloc entry")?;
         let old = self
             .builder
             .build_load(i32_t, entry_addr, "ls_entry_old")

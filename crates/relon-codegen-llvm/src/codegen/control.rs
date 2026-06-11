@@ -9,11 +9,107 @@ use inkwell::IntPredicate;
 use relon_ir::ir::{IrType, Op, TaggedOp};
 
 use crate::error::LlvmError;
-use crate::state::ARENA_STATE_OFFSET_TAIL_CURSOR;
+use crate::state::{NativeTrap, ARENA_STATE_OFFSET_STEP_BUDGET, ARENA_STATE_OFFSET_TAIL_CURSOR};
 
 use super::*;
 
 impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
+    pub(crate) fn emit_step_budget_check(&mut self, label: &str) -> Result<(), LlvmError> {
+        if self.shape != EntryShape::Buffer {
+            return Ok(());
+        }
+        let state_ptr = self.state_ptr.ok_or_else(|| {
+            LlvmError::Codegen(format!("{label}: step budget check requires state ptr"))
+        })?;
+        let i8_t = self.ctx.i8_type();
+        let i32_t = self.ctx.i32_type();
+        let i64_t = self.ctx.i64_type();
+        let budget_gep = unsafe {
+            self.builder
+                .build_in_bounds_gep(
+                    i8_t,
+                    state_ptr,
+                    &[i32_t.const_int(u64::from(ARENA_STATE_OFFSET_STEP_BUDGET), false)],
+                    &self.next_name("step_budget_gep"),
+                )
+                .map_err(|e| LlvmError::Codegen(format!("{label} step budget GEP: {e}")))?
+        };
+        let budget = self
+            .builder
+            .build_load(i64_t, budget_gep, &self.next_name("step_budget"))
+            .map_err(|e| LlvmError::Codegen(format!("{label} step budget load: {e}")))?
+            .into_int_value();
+        let unlimited = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                budget,
+                i64_t.const_zero(),
+                &self.next_name("step_unlimited"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("{label} step unlimited cmp: {e}")))?;
+        let exhausted = self
+            .builder
+            .build_int_compare(
+                IntPredicate::SLT,
+                budget,
+                i64_t.const_zero(),
+                &self.next_name("step_exhausted"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("{label} step exhausted cmp: {e}")))?;
+        let active_bb = self.ctx.append_basic_block(self.func, "step_budget_active");
+        let trap_bb = self.ctx.append_basic_block(self.func, "step_budget_trap");
+        let cont_bb = self.ctx.append_basic_block(self.func, "step_budget_cont");
+        self.builder
+            .build_conditional_branch(unlimited, cont_bb, active_bb)
+            .map_err(|e| LlvmError::Codegen(format!("{label} step unlimited branch: {e}")))?;
+
+        self.builder.position_at_end(active_bb);
+        let dec_bb = self.ctx.append_basic_block(self.func, "step_budget_dec");
+        self.builder
+            .build_conditional_branch(exhausted, trap_bb, dec_bb)
+            .map_err(|e| LlvmError::Codegen(format!("{label} step exhausted branch: {e}")))?;
+        self.builder.position_at_end(trap_bb);
+        self.emit_state_trap(NativeTrap::ResourceExhausted, label)?;
+
+        self.builder.position_at_end(dec_bb);
+        let next_raw = self
+            .builder
+            .build_int_sub(
+                budget,
+                i64_t.const_int(1, false),
+                &self.next_name("step_budget_next_raw"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("{label} step decrement: {e}")))?;
+        let spent_last = self
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                next_raw,
+                i64_t.const_zero(),
+                &self.next_name("step_spent_last"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("{label} step spent-last cmp: {e}")))?;
+        let next = self
+            .builder
+            .build_select(
+                spent_last,
+                i64_t.const_all_ones(),
+                next_raw,
+                &self.next_name("step_budget_next"),
+            )
+            .map_err(|e| LlvmError::Codegen(format!("{label} step select: {e}")))?
+            .into_int_value();
+        self.builder
+            .build_store(budget_gep, next)
+            .map_err(|e| LlvmError::Codegen(format!("{label} step store: {e}")))?;
+        self.builder
+            .build_unconditional_branch(cont_bb)
+            .map_err(|e| LlvmError::Codegen(format!("{label} step cont branch: {e}")))?;
+        self.builder.position_at_end(cont_bb);
+        Ok(())
+    }
+
     /// Phase 0b seam: multi-way / select control flow (`Select`,
     /// `BrTable`). Dispatched from `super::lower_op`. Ported from
     /// `relon-codegen-cranelift`'s `op_visitor::visit_select` and
@@ -446,6 +542,7 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
             tail_bb,
             kind: LabelKind::Loop,
         });
+        self.emit_step_budget_check("Loop")?;
         // Devirtualisation (W18) correctness: a loop body runs 0+ times
         // and a `LetGet` at the top of the body re-executes every
         // iteration, so a `KnownClosure` let-slot the body *reassigns*

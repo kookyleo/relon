@@ -2,7 +2,22 @@
 
 Relon 不是「装好就跑」的独立程序——它是一个 **Rust 可嵌入的 toolkit**。这一页讲怎么把它接进你自己的进程：解析、求值、注册原生函数、定制模块解析、控制 JSON 输出形态。
 
-> 想要不可信脚本的安全策略？看完这页之后跳到 [沙箱与权限](./sandbox.md)。
+> 想要不可信脚本的安全策略？看完这页之后跳到
+> [威胁模型](./threat-model.md) 和 [沙箱与权限](./sandbox.md)。
+
+## 首发版嵌入路径
+
+先选定一条路径：
+
+| 路径 | 适用场景 | 后端 / 信任姿态 |
+| --- | --- | --- |
+| Sandboxed facade | 宿主把 Relon 当作“可计算配置”，所有数据都由宿主推入。 | `relon::from_str` / `EvaluatorBuilder` 默认值：sandboxed 姿态，无本地 import，无 staged host fn。 |
+| Trusted host-owned script | 源码归宿主所有，并且需要本地 import 或 staged native fn。 | `Backend::TreeWalk` 加显式 trust/capability grant。这是首发版 staged host fn 注册的唯一推荐路径。 |
+| Native performance path | 宿主希望兼容的 `#main(...)` 程序走编译执行。 | `Backend::Auto` 或显式 compiled backend，但不混用 staged host fn。首个公开版本会拒绝 `Backend::Auto + TrustLevel::Trusted`。 |
+
+对于不可信插件、租户脚本或上传源码，把 Relon 放在 VM / 进程 /
+容器边界之后运行。Relon 提供 capability 词汇和预算模型；真正硬边界由
+Wasmtime、进程或容器限制执行。
 
 ## 推荐范式：Push-by-default
 
@@ -80,8 +95,8 @@ host-pushed slot：
   `MissingMainArg`；多字段 → `UnexpectedMainArg`；类型不匹配 →
   `MainArgTypeMismatch`。
 
-> **编译后端 — 结构化入参。** 编译执行器（cranelift-native /
-> llvm-native / 编译版 wasm）的 buffer 协议现已支持结构化 `#main`
+> **编译路径 — 结构化入参。** native 编译执行器（cranelift / LLVM）
+> 与编译版 wasm 校验目标的 buffer 协议现已支持结构化 `#main`
 > 入参，而不仅是标量。以下形态都与 tree-walk oracle 逐字节一致地流入：
 >
 > - 标量叶子（`Int` / `Float` / `Bool`）；
@@ -116,35 +131,35 @@ host-pushed slot：
 >   重定位；
 > - **从 `#main` 入参恒等返回 `List<List<scalar>>`**
 >   （`#main(List<List<Int|Float|Bool>> xss) -> List<List<…>> = xss`），
->   **cranelift、llvm 与已编译 wasm 三个后端均已支持。** 这是「就地区走读
+>   **cranelift、llvm 与编译版 wasm 校验目标均已支持。** 这是「就地区走读
 >   返回 ABI」承载的第一个形状：机器码不拷贝嵌套指针数组图，而是把结果根的
 >   arena 偏移报给 host，host 在其来源区内 **校验后就地解码**（见下方设计
->   注记）；三个后端共用同一条 host 解码管线。wasm 上 host 直接读模块的
+>   注记）；native 编译路径与 wasm 目标共用同一条 host 解码管线。wasm 上 host 直接读模块的
 >   **线性内存**得到同一片 arena，并在解码前跑同一份 verifier（四方逐字节
 >   相等：tree-walk == cranelift == llvm == wasm）。入参 **字段** 形式的
->   `List<List<scalar>>`（`#main(W w) -> List<List<Int>> = w.rows`）在三个
->   后端上 **同样支持**（F4）：arena-绝对槽约定下，字段读取直接把字段列表根
+>   `List<List<scalar>>`（`#main(W w) -> List<List<Int>> = w.rows`）在这些
+>   编译路径上 **同样支持**（F4）：arena-绝对槽约定下，字段读取直接把字段列表根
 >   的 arena-绝对偏移压栈，故与恒等形走同一条就地返回；
 > - **从 `#main` 入参恒等返回 `List<String>`**
 >   （`#main(List<String> ss) -> List<String> = ss`），**cranelift、llvm
->   与已编译 wasm 三个后端均已支持。** 这是就地区走读返回 ABI 承载的第一个
+>   与编译版 wasm 校验目标均已支持。** 这是就地区走读返回 ABI 承载的第一个
 >   **逐元素指针数组** 形状（也正是旧刚性尾拷贝会段错误的那种形状）：外层
 >   `[len][off_i]` 头与各 `off_i` 指向的 `[len][utf8]` String 记录都在输入区
 >   内，机器码报根偏移，host verifier 先逐个 String 记录在区内校验、再就地
 >   解码 —— 逐字节等价于 tree-walk oracle（含每个字符串内容；CJK / emoji /
 >   4 KiB 长串亦覆盖，wasm 上同样从线性内存经同一 verifier 读出）。入参
 >   **字段** 形式的 `List<String>`（`#main(Outer o) -> List<String> = o.tags`）
->   在三个后端上 **同样支持**（F4，经同一 arena-绝对字段读取）；
+>   在这些编译路径上 **同样支持**（F4，经同一 arena-绝对字段读取）；
 > - **从 `#main` 入参恒等返回 `List<Schema>`**
 >   （`#main(List<Cfg> items) -> List<Cfg> = items`），**cranelift、llvm
->   与已编译 wasm 三个后端均已支持。** 这是就地区走读最深的形状：外层
+>   与编译版 wasm 校验目标均已支持。** 这是就地区走读最深的形状：外层
 >   `[len][off_i]` 头指向每个 schema 子记录，子记录自身又带 `String` /
 >   `List<scalar>` / `List<String>` 指针字段（及不同偏移的内联标量）。机器码
 >   报根偏移，host verifier 递归走到 **每个子记录的字段指针层**（每个 off_i →
 >   子记录头 → 每个 String / List 字段的尾记录）再就地把每个元素解成 branded
 >   dict —— 逐字节等价于 tree-walk oracle（含每个子对象每个字段的内容），
 >   wasm 上亦然（同一递归在线性内存上跑）。入参 **字段**
->   形式的 `List<Schema>`（`#main(W w) -> List<Cfg> = w.items`）在三个后端上
+>   形式的 `List<Schema>`（`#main(W w) -> List<Cfg> = w.items`）在这些编译路径上
 >   **同样支持**（F4，经同一 arena-绝对字段读取）；元素子记录自身再含
 >   嵌套 `List<Schema>` / `List<List<…>>` 字段者（如 `Team { name: String,
 >   members: List<Person>, tags: List<List<Int>> }`）**亦已支持，且递归到
@@ -152,8 +167,8 @@ host-pushed slot：
 >   准入对元素 schema 的字段类型递归判定，故元素 schema 内的嵌套对象数组与
 >   嵌套列表在任意嵌套深度上都逐字节等价解码；
 > - **深层嵌套 schema 字段链返回**（`#main(Outer o) -> List<String> =
->   o.inner.tags`，乃至更深的 `o.a.b.tags`），**cranelift、llvm 与已编译
->   wasm 三个后端均已支持**（F6）。`≥3` 段链，中间各段为嵌套 schema 字段、
+>   o.inner.tags`，乃至更深的 `o.a.b.tags`），**cranelift、llvm 与编译版
+>   wasm 校验目标均已支持**（F6）。`≥3` 段链，中间各段为嵌套 schema 字段、
 >   叶子为指针数组 list（`List<String>` / `List<Int|Float|Bool>` /
 >   `List<Schema>` / `List<List<scalar>>`）：每个中间段读取对应子记录的
 >   arena-绝对基址，再从该基址读叶子 list 根的 arena-绝对偏移 —— 与单段走读
@@ -161,7 +176,7 @@ host-pushed slot：
 >   oracle。支持作顶层返回与对象字段（匿名 `Dict` / 结构体）；
 > - **从 `#main` 入参返回 `List<List<String>>` / `List<List<Schema>>`**
 >   （`#main(List<List<String>> xss) -> List<List<String>> = xss`，及
->   `List<List<Cfg>>` 形），**cranelift、llvm 与已编译 wasm 三个后端均已
+>   `List<List<Cfg>>` 形），**cranelift、llvm 与编译版 wasm 校验目标均已
 >   支持**（F5）。这是**双层**指针数组形状：外层 `[len][off_i]` 头指向内层
 >   指针数组 list 记录，每个内层记录自身又是 `[len][inner_off_j]` 头，其
 >   entry 指向 `String` / schema 子记录。递归输入 marshaller 写出整张图，
@@ -193,7 +208,7 @@ host-pushed slot：
 >   （`-> Dict { servers: servers, n: 1 }`）还是**结构体 `#schema`**
 >   （`#schema Wrapper { servers: List<Server>, n: Int }`，经
 >   `-> Wrapper { servers: servers, n: 7 }` 返回）—— 均**四方**支持
->   （tree-walk == cranelift == llvm == 编译 wasm）。字段类型可为
+>   （tree-walk == cranelift == llvm == 编译 wasm 目标）。字段类型可为
 >   `List<Schema>`、`List<List<scalar>>`、`List<String>` 或
 >   `List<Int|Float|Bool>`（`List<Schema>` / `List<List<scalar>>` 在
 >   cranelift 为 F1b、llvm 与 wasm 为 F2；F3 增加了结构体路径与标量/String
@@ -261,7 +276,7 @@ host-pushed slot：
 > 与 llvm 走完全相同的总开关。读取器、verifier 与 **两个** native 后端的
 > `List<List<scalar>>`、`List<String>` 与 `List<Schema>` 入参恒等形均已接通
 > （verifier 递归走到每个 `List<Schema>` 子记录的字段指针层），对象字段返回
-> 与 wasm 线性内存也走同一 ABI；剩余响亮 cap 是来自函数调用 / 任意表达式的
+> 与编译版 wasm 校验目标的线性内存也走同一 ABI；剩余响亮 cap 是来自函数调用 / 任意表达式的
 > 指针数组 list 返回，而不是入参恒等、入参字段或源码字面量。
 
 ### 入口边界 Result 与 Relon 值层 Result
@@ -427,12 +442,11 @@ let cfg: ServerConfig = relon::from_file("config/app.relon")?;
 native fn）时，用 facade 的 `EvaluatorBuilder`：
 
 ```rust
-use relon::{Backend, EvaluatorBuilder, TrustLevel};
+use relon::{Backend, EvaluatorBuilder, ResourceBudget, TrustLevel};
 
 let evaluator = EvaluatorBuilder::from_str(source)   // 或 from_file(path)
     .backend(Backend::Auto)        // Auto（默认）/ TreeWalk / CraneliftAot / LlvmAot
     .trust(TrustLevel::Sandboxed)  // Sandboxed（默认）/ Trusted
-    .register_pure_native_fn("app_version", Arc::new(AppVersion))
     .build()?;                     // -> Box<dyn relon::Evaluator>
 
 let json_value = evaluator.eval_root(&Arc::new(relon::Scope::default()))?;
@@ -442,10 +456,33 @@ let json_value = evaluator.eval_root(&Arc::new(relon::Scope::default()))?;
 - `Backend::Auto`（默认）会对平凡标量 `#main` 走 tree-walk 短路，
   其余形状惰性走 cranelift AOT，编译不支持的形状响亮回退 tree-walk
   ——详见 [性能](./performance.md)。
+- 首个公开版本没有接通 `Backend::Auto + TrustLevel::Trusted`；builder
+  会直接拒绝，而不是替宿主猜测。需要 trusted 本地 import 或 staged
+  host fn 时用 `Backend::TreeWalk`；host-owned 源码若不需要 staged host
+  fn，可选择显式编译后端。
 - `register_native_fn(name, gate, fn)` / `register_pure_native_fn`
-  只在 tree-walk 承载的构建（`Backend::TreeWalk` 及 `Auto` 的
-  tree-walk 侧）有意义；在 `CraneliftAot` 下构建会以
-  `BackendError::UnsupportedFeature` 响亮失败。
+  在当前 builder surface 里只支持 tree-walk。需要 staged host fn 时
+  用 `Backend::TreeWalk`；`Backend::Auto` / `CraneliftAot` / `LlvmAot`
+  会响亮失败，而不是忽略这些函数。
+- `max_source_bytes(n)` 在 parse 之前拒绝超过 `n` 字节的源码。这是
+  parser/input guardrail，和 evaluator 的 step/value budget 分开。
+- `resource_budget(ResourceBudget::dev())` /
+  `ResourceBudget::untrusted()` 安装 evaluator 侧 step/value 预算。
+  初版 API 要求 `Backend::TreeWalk`；其它后端会响亮失败，而不是静默
+  忽略预算。强不可信执行应走 wasm runtime 和 engine 级限制。
+  Wasmtime 的起点可以用
+  `relon host-policy --target wasmtime --profile untrusted` 生成，见
+  [威胁模型](./threat-model.md) 和
+  [Wasmtime 宿主策略](./wasmtime-host-policy)。
+
+```rust
+let guarded = EvaluatorBuilder::from_str(source)
+    .backend(Backend::TreeWalk)
+    .trust(TrustLevel::Sandboxed)
+    .max_source_bytes(256 * 1024)
+    .resource_budget(ResourceBudget::untrusted())
+    .build()?;
+```
 
 ## `Context` 是什么
 
@@ -470,7 +507,9 @@ let value = TreeWalkEvaluator::new(Arc::new(ctx))
 - **`functions`** — 通过 `register_fn` 注册的原生函数表（纯函数走便捷封装 `register_pure_fn`）。
 - **`decorators`** — 通过 `register_decorator` 注册的装饰器插件。
 - **`module_resolvers`** — `#import` 走的解析器链；`Context::sandboxed()` 默认是 `[StdModuleResolver, FilesystemModuleResolver::default()]`。
-- **`capabilities`** — 沙箱 / 资源预算（[沙箱与权限](./sandbox.md) 详解）。
+- **`capabilities`** — 宿主授予的能力位（[沙箱与权限](./sandbox.md) 详解）。
+- **资源预算** — 目前通过 `ResourceBudget` 桥接到 `Capabilities` 上的
+  evaluator 兼容字段。
 - **`root_node`** + **`analyzed`** — 根 AST 与 analyzer side-table（含 `#main` 签名）。
 - **多份 cache**（path / module / loading）——避免重复求值。
 
@@ -484,7 +523,7 @@ let value = TreeWalkEvaluator::new(Arc::new(ctx))
 
 | 构造器 | 默认安全等级 |
 | --- | --- |
-| `Context::sandboxed()` | 完全沙箱：filesystem 默认拒绝、capability 全空、只剩 `std/...` 虚拟模块 |
+| `Context::sandboxed()` | 沙箱姿态：filesystem 默认拒绝、capability 全空、只剩 `std/...` 虚拟模块；单独使用并不是多租户边界 |
 | `Context::new()` | 轻量基础构造器：只挂载虚拟 std 模块与内置纯函数；需要真实 workloads 时优先用 `Context::sandboxed()` 并显式授权 |
 | `Capabilities::all_granted()` + `FilesystemModuleResolver::trusted()` | 宿主自有脚本的显式全开形态：filesystem 全开、门控 native fn 全放、无步数 / 大小预算 |
 
@@ -725,6 +764,6 @@ fn main() {
 
 ## 接下来
 
-- 不可信脚本的安全策略：[沙箱与权限](./sandbox.md)
+- 不可信脚本的安全策略：[威胁模型](./threat-model.md) 和 [沙箱与权限](./sandbox.md)
 - 让 `.relon` 端能用上你注册的函数：在 schema / library 里包装它们，参考 [类型与契约](./types.md)
 - 错误的 miette 友好格式：直接把 `RuntimeError` / `Diagnostic` 喂给 `miette::Report`

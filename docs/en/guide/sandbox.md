@@ -7,10 +7,18 @@ trust from the host: FS access, network, host-registered native
 functions, evaluation budget — all are **explicitly granted** by the
 host.
 
-`Capabilities` is that grant channel. The spec explicitly forbids a
-"trusted-mode" bypass constructor (see [Language spec](./spec) §4.2)
-— scripts must explicitly declare what they need, and the host
-explicitly decides what to grant.
+`Capabilities` is that grant channel. The rule is not "trusted APIs
+cannot exist"; it is that there is **no implicit trust**. Scripts must
+explicitly declare what they need, and the host explicitly decides what
+to grant. Any full-trust host path (`--trust`, `*_trusted`,
+`TrustLevel::Trusted`) is reserved for host-owned scripts and must be
+visible at the call site.
+
+This page is the operational guide. The canonical security-boundary
+statement lives in [Threat model](./threat-model): `Capabilities` is an
+authority vocabulary, `ResourceBudget` is a standard budget model, and
+hard isolation for untrusted deployments belongs to Wasmtime, a process
+boundary, or the host infrastructure.
 
 ## What the sandbox guards against
 
@@ -28,15 +36,15 @@ What harm can an untrusted script do?
 Relon provides a capability knob for each — **all off by default**;
 they take effect only when the host explicitly turns them on.
 
-## The only constructor: `Context::sandboxed()`
+## The default untrusted entry: `Context::sandboxed()`
 
-For real-world use, `Context` has a single constructor —
-`Context::sandboxed()`: zero privilege by default; the host must
-grant explicitly to permit anything.
+For untrusted or user-authored scripts, use `Context::sandboxed()`:
+zero privilege by default; the host must grant explicitly to permit
+anything.
 
 ```rust
 use relon_evaluator::module::FilesystemModuleResolver;
-use relon_evaluator::{Capabilities, Context};
+use relon_evaluator::{Capabilities, Context, ResourceBudget};
 use std::sync::Arc;
 
 // Assemble the grants on a `Capabilities` value first, then install
@@ -44,17 +52,16 @@ use std::sync::Arc;
 // capabilities mid-run — once the context is handed to an evaluator,
 // the grants are immutable policy.
 let mut caps = Capabilities::default();
+let budget = ResourceBudget::untrusted();
 
 // 1. Filesystem read bit (if the script needs to #import other .relon files)
 caps.reads_fs = true;
 
-// 2. Set a step budget (guards against recursion / comprehension explosions)
-caps.max_steps = Some(1_000_000);
+// 2. Install evaluator-side guardrails. This bridges the newer
+// ResourceBudget model into the evaluator's compatibility fields.
+budget.apply_to_capabilities(&mut caps);
 
-// 3. Set a value-element water mark (guards against giant list/tuple/dict)
-caps.max_value_elements = Some(10_000);
-
-// 4. Grant only the bits you actually need (e.g. clock read)
+// 3. Grant only the bits you actually need (e.g. clock read)
 caps.reads_clock = true;
 
 let mut ctx = Context::sandboxed().with_capabilities(caps);
@@ -66,22 +73,48 @@ ctx.prepend_module_resolver(Arc::new(
 ));
 ```
 
+CLI users set the same policy at the call site:
+
+```bash
+relon run config.relon --budget untrusted
+relon run config.relon --max-source-bytes 262144
+relon run config.relon --max-steps 100000 --max-value-elements 10000 --max-output-bytes 8388608
+```
+
+`--max-source-bytes` is checked from file metadata before reading or parsing,
+so it can reject pathological source before parser recursion is involved.
+Evaluator-side CLI budgets force the tree-walker under `--backend auto` and
+are rejected with explicit `--backend cranelift-aot`, so the limit is never
+silently ignored. `--max-output-bytes` is enforced at the CLI JSON output
+boundary and works independently of evaluator backend.
+
+For VM deployments, generate host-runtime policy instead of putting budgets
+inside Relon source:
+
+```bash
+relon host-policy --target wasmtime --profile untrusted
+```
+
+See [Threat model](./threat-model) for the boundary model and
+[Wasmtime host policy](./wasmtime-host-policy) for the runtime-side
+mapping.
+
 ### "I just want everything on" — `Capabilities::all_granted()`
 
 For host-authored scripts (CLI, build-time, host-owned config files)
 it's perfectly legitimate to access every capability. The spec
-requires that **this grant be explicitly visible** — it must not hide
-behind a constructor named `trusted()`. So write it out:
+requires that **this grant be explicitly visible and auditable**. The
+fully spelled-out form is:
 
 ```rust
 let mut ctx = Context::sandboxed().with_capabilities(Capabilities::all_granted());
 ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
 ```
 
-Those two lines = the old `Context::trusted()`. The difference is
-that a code review can see at a glance "FS unrestricted + all six
-capability bits on (any gate passes) + no step budget" — delete the
-lines you don't want.
+Those two lines mean "FS unrestricted + all six capability bits on
+(any gate passes) + no step budget". The facade also exposes
+trust-named shortcuts for host-owned scripts; use them only when that
+all-open posture is intentional and visible in review.
 
 ## `Capabilities` fields
 
@@ -100,6 +133,21 @@ pub struct Capabilities {
     pub max_steps: Option<u64>,
     pub max_value_elements: Option<usize>,
 }
+```
+
+`max_steps` and `max_value_elements` remain on `Capabilities` as the
+compatibility carrier the evaluator reads today. New host code should prefer
+`ResourceBudget` and bridge it with `ResourceBudget::apply_to_capabilities`:
+
+```rust
+#[non_exhaustive]
+pub struct ResourceBudget {
+    pub max_steps: Option<u64>,
+    pub max_value_elements: Option<usize>,
+}
+
+let mut caps = Capabilities::default();
+ResourceBudget::untrusted().apply_to_capabilities(&mut caps);
 ```
 
 `#[non_exhaustive]` means adding new capability bits later is not a
@@ -163,7 +211,7 @@ language is a pure function — effectful values are taken by the host and
 fed in as inputs. See
 [Standard library → No effectful language builtins](./stdlib).
 
-### `max_steps: Option<u64>`
+### `ResourceBudget::max_steps`
 
 The evaluator carries an internal step counter — each `eval_internal`
 entry adds 1. `max_steps = Some(N)` caps it at N; exceeding it raises
@@ -171,7 +219,11 @@ entry adds 1. `max_steps = Some(N)` caps it at N; exceeding it raises
 
 ```rust
 let mut caps = Capabilities::default();
-caps.max_steps = Some(100);
+ResourceBudget {
+    max_steps: Some(100),
+    max_value_elements: None,
+}
+.apply_to_capabilities(&mut caps);
 let ctx = Context::sandboxed().with_capabilities(caps);
 // Running `loop(): loop()` (infinite recursion) gets cut off at step 101
 ```
@@ -182,7 +234,7 @@ not CPU time — one dispatch may invoke a slow built-in (a big
 strict CPU control, add a wall-clock timer on the host side (see
 [Things outside the sandbox's design](#things-outside-the-sandbox-s-design)).
 
-### `max_value_elements: Option<usize>`
+### `ResourceBudget::max_value_elements`
 
 The **measurement is "Value element count"** — a list or tuple's
 element count, or a dict's key/value pair count. Check points cover
@@ -204,7 +256,11 @@ every language-level entry where a list / tuple / dict is produced:
 
 ```rust
 let mut caps = Capabilities::default();
-caps.max_value_elements = Some(3);
+ResourceBudget {
+    max_steps: None,
+    max_value_elements: Some(3),
+}
+.apply_to_capabilities(&mut caps);
 let ctx = Context::sandboxed().with_capabilities(caps);
 // `[1, 2, 3, 4, 5]` triggers ValueTooLarge { limit: 3, actual: 5 }
 // `range(0, 1_000_000)` is rejected at the stdlib entry too
@@ -267,7 +323,8 @@ locked down.
 
 ```rust
 use relon_evaluator::{
-    Capabilities, Context, NativeArgs, NativeFnGate, RelonFunction, RuntimeError, Value,
+    Capabilities, Context, NativeArgs, NativeFnGate, RelonFunction, ResourceBudget, RuntimeError,
+    Value,
 };
 use relon_parser::{parse_document, TokenRange};
 use std::sync::Arc;
@@ -290,8 +347,11 @@ fn run_user_rule(
     // nothing to disable — just don't grant reads_fs or mount a
     // with_root_dir resolver.
     let mut caps = Capabilities::default();
-    caps.max_steps = Some(100_000);
-    caps.max_value_elements = Some(10_000);
+    ResourceBudget {
+        max_steps: Some(100_000),
+        max_value_elements: Some(10_000),
+    }
+    .apply_to_capabilities(&mut caps);
 
     let mut ctx = Context::sandboxed().with_capabilities(caps);
 
@@ -357,7 +417,9 @@ To avoid overestimating the guarantees, here's what Relon's sandbox
 - ❌ **CPU wall-clock limit**: Relon has no built-in wall-clock
   budget. If you need "this script runs at most 100 ms", implement
   it on the host side with `tokio::time::timeout` or a separate
-  thread + timeout channel.
+  thread + timeout channel. For Wasmtime, use engine/store limits and
+  host epoch increments as described in
+  [Wasmtime host policy](./wasmtime-host-policy).
 - ❌ **Exact heap-byte accounting**: `max_value_elements` only
   counts list/tuple/dict element counts; it doesn't count String bytes or
   closure-captured ref-counted references. For a strict in-process
@@ -378,4 +440,5 @@ To avoid overestimating the guarantees, here's what Relon's sandbox
 
 - The complete capability model and implementation contract:
   [Language spec](./spec).
+- Security boundary model: [Threat model](./threat-model).
 - The full host integration flow: [Host integration](./host-integration).
