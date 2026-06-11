@@ -12,25 +12,20 @@
 //!
 //! Each [`CorpusCase`] carries an explicit `supported_by` list — the
 //! backends that **claim** to handle the source today. The drivers
-//! ([`crate::diff_test`] / [`crate::three_way::diff_test_3way`])
+//! ([`crate::diff_test`] / [`crate::two_way::diff_test_2way`])
 //! treat a backend's
-//! `Unsupported` / `NotApplicable` surface as a soft pass **only**
+//! `Unsupported` surface as a soft pass **only**
 //! when the backend is not in `supported_by`. If a backend in the
 //! claim list bounces, the corpus harness tests fail loud — that's
 //! the ratchet that stops a backend from silently regressing into
 //! its fallback after it had taken responsibility for a case.
 //!
-//! Today's support matrix:
-//!
-//! | tier | tree-walk | cranelift-AOT | trace-JIT | bytecode VM |
-//! | ---- | --------- | ------------- | --------- | ----------- |
-//! | ArithControl (28) | 28 | 27 (`let_chain` analyzer-only) | 22 | 27 |
-//! | StdlibSimple (9) | 9 | 9 | 9 | 9 |
-//! | StdlibMemory (6) | 6 | 6 | 4 (`StrConcatN` shapes not in recipe) | 0 (`String` return shape) |
-//! | StdlibCaseFold (8) | 8 | 8 | 8 | 0 (`String` return shape) |
-//! | StdlibList (5) | 5 | 5 | 2 (`*_range_*` shapes not in recipe) | 3 (`*_range_*` only) |
-//! | StdlibNormalize (2) | 2 | 2 | 2 | 0 |
-//! | DictReturn (2) | 2 | 2 | 0 | 1 (`dict_simple_return` only) |
+//! The differential legs are tree-walk (oracle) and cranelift-AOT;
+//! the wasm / llvm-native compiled legs are covered separately by the
+//! `aot_wasm_parity` / `inplace_return_four_way` codegen tests.
+//! Tree-walk claims every case except the analyzer-only entries; the
+//! handful of cases cranelift legitimately bounces (e.g. `let_chain`
+//! forward-refs) carry a `TW_ONLY` claim.
 //!
 //! When a backend widens its envelope, the corpus entry's
 //! `supported_by` list grows; the ratchet then locks in the new
@@ -81,31 +76,7 @@ pub struct CorpusCase {
 // ratchet asserts the harness does not regress *below* this list. Add
 // a case here when a backend's envelope widens.
 
-/// Claim list: every backend supports every case in its tier. Used
-/// for cases where all 4 backends agree.
-const FULL_SUPPORT: &[BackendKind] = &[
-    BackendKind::TreeWalk,
-    BackendKind::CraneliftAot,
-    BackendKind::TraceJit,
-    BackendKind::Bytecode,
-];
-
-/// Reference + cranelift + bytecode; trace-JIT recipe absent.
-const TW_CR_BC: &[BackendKind] = &[
-    BackendKind::TreeWalk,
-    BackendKind::CraneliftAot,
-    BackendKind::Bytecode,
-];
-
-/// Reference + cranelift + trace-JIT; bytecode envelope excludes it.
-const TW_CR_TJ: &[BackendKind] = &[
-    BackendKind::TreeWalk,
-    BackendKind::CraneliftAot,
-    BackendKind::TraceJit,
-];
-
-/// Reference + cranelift only. Trace-JIT not in recipe catalogue and
-/// bytecode envelope rejects the entry shape.
+/// Reference + cranelift — both differential legs claim the case.
 const TW_CR: &[BackendKind] = &[BackendKind::TreeWalk, BackendKind::CraneliftAot];
 
 /// Reference only — analyzer rejects on the IR / cranelift side, so
@@ -380,80 +351,79 @@ pub fn all_cases() -> Vec<CorpusCase> {
             source: "#main(Int x, Int y) -> Int\nx + y",
             args_factory: args_x_40_y_2,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "arith_sub",
             source: "#main(Int x, Int y) -> Int\nx - y",
             args_factory: args_x_neg3_y_10,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "arith_mul",
             source: "#main(Int x, Int y) -> Int\nx * y",
             args_factory: args_x_7_y_6,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "arith_div",
             source: "#main(Int x, Int y) -> Int\nx / y",
             args_factory: args_x_17_y_5,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "arith_mod",
             source: "#main(Int x, Int y) -> Int\nx % y",
             args_factory: args_x_17_y_5,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "arith_div_negative",
             source: "#main(Int x, Int y) -> Int\nx / y",
             args_factory: args_x_neg10_y_neg5,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "arith_chain",
             source: "#main(Int x, Int y) -> Int\nx * y + x",
             args_factory: args_x_3_y_minus_1,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "arith_paren",
             source: "#main(Int x, Int y) -> Int\n(x + y) * x",
             args_factory: args_x_5_y_5,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "arith_negate_via_sub",
             source: "#main(Int x) -> Int\n0 - x",
             args_factory: args_x_42,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
-        // Trap cases: trace-JIT recorder doesn't model the trap path
-        // (synth recipe returns a wrapping value); tree-walk +
-        // cranelift + bytecode all raise the same `DivisionByZero`.
+        // Trap cases: tree-walk + cranelift raise the same
+        // `DivisionByZero`.
         CorpusCase {
             name: "arith_div_by_zero_traps",
             source: "#main(Int x, Int y) -> Int\nx / y",
             args_factory: args_x_5_y_0,
             tier: Tier::ArithControl,
-            supported_by: TW_CR_BC,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "arith_mod_by_zero_traps",
             source: "#main(Int x, Int y) -> Int\nx % y",
             args_factory: args_x_5_y_0,
             tier: Tier::ArithControl,
-            supported_by: TW_CR_BC,
+            supported_by: TW_CR,
         },
         // ---- cmp ----
         CorpusCase {
@@ -461,49 +431,49 @@ pub fn all_cases() -> Vec<CorpusCase> {
             source: "#main(Int x, Int y) -> Bool\nx == y",
             args_factory: args_x_5_y_5,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "cmp_eq_false",
             source: "#main(Int x, Int y) -> Bool\nx == y",
             args_factory: args_x_5_y_0,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "cmp_ne",
             source: "#main(Int x, Int y) -> Bool\nx != y",
             args_factory: args_x_5_y_5,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "cmp_lt",
             source: "#main(Int x, Int y) -> Bool\nx < y",
             args_factory: args_x_3_y_minus_1,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "cmp_le_eq",
             source: "#main(Int x, Int y) -> Bool\nx <= y",
             args_factory: args_x_5_y_5,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "cmp_gt",
             source: "#main(Int x, Int y) -> Bool\nx > y",
             args_factory: args_x_17_y_5,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "cmp_ge_eq",
             source: "#main(Int x, Int y) -> Bool\nx >= y",
             args_factory: args_x_5_y_5,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         // ---- control flow ----
         CorpusCase {
@@ -511,14 +481,14 @@ pub fn all_cases() -> Vec<CorpusCase> {
             source: "#main(Int x, Int y) -> Int\nx > y ? x : y",
             args_factory: args_x_17_y_5,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "if_false_arm",
             source: "#main(Int x, Int y) -> Int\nx > y ? x : y",
             args_factory: args_x_neg3_y_10,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "if_nested",
@@ -526,7 +496,7 @@ pub fn all_cases() -> Vec<CorpusCase> {
                 "#main(Int x) -> Int\nx > 0 ? (x > 10 ? x * 2 : x + 1) : (0 - x)",
             args_factory: args_x_42,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "if_nested_neg",
@@ -534,7 +504,7 @@ pub fn all_cases() -> Vec<CorpusCase> {
                 "#main(Int x) -> Int\nx > 0 ? (x > 10 ? x * 2 : x + 1) : (0 - x)",
             args_factory: args_x_neg42,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         // ---- let-binding (Relon uses `where { name: value }` postfix) ----
         CorpusCase {
@@ -542,7 +512,7 @@ pub fn all_cases() -> Vec<CorpusCase> {
             source: "#main(Int x) -> Int\n(y + 1) where { y: x * 2 }",
             args_factory: args_x_42,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         // `let_chain` (forward-references inside `where`) — the
         // analyzer rejects this source before IR lowering, so neither
@@ -560,113 +530,108 @@ pub fn all_cases() -> Vec<CorpusCase> {
             source: "#main(Int x) -> Int\n(y * 2) where { y: x > 0 ? x : 0 - x }",
             args_factory: args_x_neg42,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         // ---- boundary values ----
-        // Overflow boundary cases: trace synth returns a wrapping
-        // value; tw + cr + bytecode all trap on `NumericOverflow`.
+        // Overflow boundary cases: tw + cr both trap on
+        // `NumericOverflow`.
         CorpusCase {
             name: "boundary_max_plus_one",
             source: "#main(Int x) -> Int\nx + 1",
             args_factory: args_x_max,
             tier: Tier::ArithControl,
-            supported_by: TW_CR_BC,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "boundary_min_minus_one",
             source: "#main(Int x) -> Int\nx - 1",
             args_factory: args_x_min,
             tier: Tier::ArithControl,
-            supported_by: TW_CR_BC,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "boundary_zero_times_x",
             source: "#main(Int x) -> Int\n0 * x",
             args_factory: args_x_max,
             tier: Tier::ArithControl,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
-        // ---- StdlibSimple: all 4 backends agree today ----
+        // ---- StdlibSimple ----
         CorpusCase {
             name: "stdlib_abs_pos",
             source: "#main(Int x) -> Int\nabs(x)",
             args_factory: args_x_42,
             tier: Tier::StdlibSimple,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "stdlib_abs_neg",
             source: "#main(Int x) -> Int\nabs(x)",
             args_factory: args_x_neg42,
             tier: Tier::StdlibSimple,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "stdlib_min",
             source: "#main(Int x, Int y) -> Int\nmin(x, y)",
             args_factory: args_x_17_y_5,
             tier: Tier::StdlibSimple,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "stdlib_max",
             source: "#main(Int x, Int y) -> Int\nmax(x, y)",
             args_factory: args_x_17_y_5,
             tier: Tier::StdlibSimple,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "stdlib_min_neg",
             source: "#main(Int x, Int y) -> Int\nmin(x, y)",
             args_factory: args_x_neg10_y_neg5,
             tier: Tier::StdlibSimple,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "stdlib_length_const",
             source: "#main() -> Int\n\"hello\".length()",
             args_factory: no_args,
             tier: Tier::StdlibSimple,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "stdlib_is_empty_false",
             source: "#main() -> Bool\n\"hi\".is_empty()",
             args_factory: no_args,
             tier: Tier::StdlibSimple,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "stdlib_is_empty_true",
             source: "#main() -> Bool\n\"\".is_empty()",
             args_factory: no_args,
             tier: Tier::StdlibSimple,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "stdlib_list_int_length",
             source: "#main() -> Int\n[1, 2, 3, 4, 5].length()",
             args_factory: no_args,
             tier: Tier::StdlibSimple,
-            supported_by: FULL_SUPPORT,
+            supported_by: TW_CR,
         },
         // ---- StdlibMemory: needs scratch arena ----
-        // The bytecode VM scaffold today rejects `String`-typed return
-        // fields, so every entry here excludes `Bytecode` from
-        // `supported_by`. The trace-JIT recipe catalogue handles the
-        // const-table forms but not the `+`-chain shapes (which need
-        // `Op::StrConcatN` synth coverage).
         CorpusCase {
             name: "stdlib_concat_const",
             source: "#main() -> String\n\"foo\".concat(\"bar\")",
             args_factory: no_args,
             tier: Tier::StdlibMemory,
-            supported_by: TW_CR_TJ,
+            supported_by: TW_CR,
         },
         // #165 — left-leaning 4-leaf String concat chain folds to one
-        // `Op::StrConcatN { 4 }` in IR; the four-way harness validates
-        // tree-walker / bytecode / cranelift / trace-JIT all agree on
-        // the joined payload (single-alloc shape for each).
+        // `Op::StrConcatN { 4 }` in IR; the differential validates
+        // tree-walker / cranelift agree on the joined payload
+        // (single-alloc shape for each).
         CorpusCase {
             name: "str_concat_chain_four_way",
             source: "#main() -> String\n\"foo\" + \"bar\" + \"baz\" + \"qux\"",
@@ -689,21 +654,21 @@ pub fn all_cases() -> Vec<CorpusCase> {
             source: "#main() -> String\n\"hello\".substring(1, 3)",
             args_factory: no_args,
             tier: Tier::StdlibMemory,
-            supported_by: TW_CR_TJ,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "stdlib_starts_with_true",
             source: "#main() -> Bool\n\"hello world\".starts_with(\"hello\")",
             args_factory: no_args,
             tier: Tier::StdlibMemory,
-            supported_by: TW_CR_TJ,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "stdlib_starts_with_false",
             source: "#main() -> Bool\n\"hello world\".starts_with(\"world\")",
             args_factory: no_args,
             tier: Tier::StdlibMemory,
-            supported_by: TW_CR_TJ,
+            supported_by: TW_CR,
         },
         // `s.ends_with(suffix)` method form — symmetry append to
         // `starts_with` above. The free-call form has been four-way
@@ -714,22 +679,21 @@ pub fn all_cases() -> Vec<CorpusCase> {
             source: "#main() -> Bool\n\"hello world\".ends_with(\"world\")",
             args_factory: no_args,
             tier: Tier::StdlibMemory,
-            supported_by: TW_CR_TJ,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "stdlib_ends_with_false",
             source: "#main() -> Bool\n\"hello world\".ends_with(\"hello\")",
             args_factory: no_args,
             tier: Tier::StdlibMemory,
-            supported_by: TW_CR_TJ,
+            supported_by: TW_CR,
         },
         // Wave R2 — f-string lowering. A pure static desugar: literal
         // parts become `Op::ConstString`, interpolations are coerced to
         // `String` (identity for a String, `Op::IntToStr` for an Int),
-        // and the parts join via `Op::StrConcatN`. These return `String`
-        // (bytecode rejects the shape) and are not in the trace recipe
-        // catalogue, so both claim `TW_CR`. Byte-exactness with the
-        // tree-walker's `Display` coercion is the differential guard.
+        // and the parts join via `Op::StrConcatN`. Byte-exactness with
+        // the tree-walker's `Display` coercion is the differential
+        // guard.
         CorpusCase {
             name: "fstring_string_interp",
             source: "#main(String s) -> String\nf\"hi ${s}!\"",
@@ -817,9 +781,7 @@ pub fn all_cases() -> Vec<CorpusCase> {
         // and the 327-char `5e-324` subnormal expansion are byte-equal
         // by construction. Differential battery covers both consumer
         // paths (f-string + both concat orders); the llvm-native + wasm
-        // legs ride `aot_wasm_parity::wave_b_*`. Same `TW_CR` claim as
-        // every other String-returning row (bytecode rejects the shape,
-        // trace recipe absent).
+        // legs ride `aot_wasm_parity::wave_b_*`.
         CorpusCase {
             name: "wave_b_fstring_float_typical",
             source: "#main(Float x) -> String\nf\"v=${x}\"",
@@ -927,43 +889,40 @@ pub fn all_cases() -> Vec<CorpusCase> {
             supported_by: TW_CR,
         },
         // ---- StdlibCaseFold ----
-        // All case-fold entries return `String`, which the bytecode
-        // M2-A scaffold rejects; cranelift + tree-walk + the trace
-        // const-table all agree.
         CorpusCase {
             name: "stdlib_upper_ascii",
             source: "#main() -> String\n\"hello\".upper()",
             args_factory: no_args,
             tier: Tier::StdlibCaseFold,
-            supported_by: TW_CR_TJ,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "stdlib_lower_ascii",
             source: "#main() -> String\n\"WORLD\".lower()",
             args_factory: no_args,
             tier: Tier::StdlibCaseFold,
-            supported_by: TW_CR_TJ,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "stdlib_title_ascii",
             source: "#main() -> String\n\"hello world\".title()",
             args_factory: no_args,
             tier: Tier::StdlibCaseFold,
-            supported_by: TW_CR_TJ,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "stdlib_upper_unicode_greek",
             source: "#main() -> String\n\"σίγμα\".upper()",
             args_factory: no_args,
             tier: Tier::StdlibCaseFold,
-            supported_by: TW_CR_TJ,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "stdlib_lower_final_sigma",
             source: "#main() -> String\n\"ΣΙΓΜΑ\".lower()",
             args_factory: no_args,
             tier: Tier::StdlibCaseFold,
-            supported_by: TW_CR_TJ,
+            supported_by: TW_CR,
         },
         // v3++ b-7 reframed: FULL multi-cp + Σ-context coverage.
         CorpusCase {
@@ -971,54 +930,50 @@ pub fn all_cases() -> Vec<CorpusCase> {
             source: "#main() -> String\n\"straße\".upper()",
             args_factory: no_args,
             tier: Tier::StdlibCaseFold,
-            supported_by: TW_CR_TJ,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "stdlib_lower_final_sigma_at_end",
             source: "#main() -> String\n\"ΟΔΥΣΣΕΥΣ\".lower()",
             args_factory: no_args,
             tier: Tier::StdlibCaseFold,
-            supported_by: TW_CR_TJ,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "stdlib_upper_ligature_fi",
             source: "#main() -> String\n\"ﬁle\".upper()",
             args_factory: no_args,
             tier: Tier::StdlibCaseFold,
-            supported_by: TW_CR_TJ,
+            supported_by: TW_CR,
         },
         // ---- StdlibList: higher-order needs closure ABI ----
-        // The two const-list cases are covered by the trace const
-        // table; bytecode rejects the list-literal entry shape.
         CorpusCase {
             name: "stdlib_list_sum",
             source: "#main() -> Int\n[1, 2, 3, 4, 5].sum()",
             args_factory: no_args,
             tier: Tier::StdlibList,
-            supported_by: TW_CR_TJ,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "stdlib_list_max",
             source: "#main() -> Int\n[3, 1, 4, 1, 5, 9, 2, 6].max()",
             args_factory: no_args,
             tier: Tier::StdlibList,
-            supported_by: TW_CR_TJ,
+            supported_by: TW_CR,
         },
         // `min` symmetry append (registry slot 78): the exact mirror of
-        // `stdlib_list_max` — same trace const-table convention, same
-        // claim list.
+        // `stdlib_list_max` — same claim list.
         CorpusCase {
             name: "stdlib_list_min",
             source: "#main() -> Int\n[3, 1, 4, 1, 5, 9, 2, 6].min()",
             args_factory: no_args,
             tier: Tier::StdlibList,
-            supported_by: TW_CR_TJ,
+            supported_by: TW_CR,
         },
         // Checked `xs.sum()` overflow: every claiming backend must trap
         // `NumericOverflow` on the first overflowing partial sum (the
         // bundled body's pre-add guard; the tree-walk native's
-        // `checked_add`). Trap cases have no trace const-table form, so
-        // the claim list is `TW_CR`.
+        // `checked_add`).
         CorpusCase {
             name: "stdlib_list_sum_overflow",
             source: "#main() -> Int\n[9223372036854775806, 1, 1].sum()",
@@ -1026,36 +981,34 @@ pub fn all_cases() -> Vec<CorpusCase> {
             tier: Tier::StdlibList,
             supported_by: TW_CR,
         },
-        // review-improvement-160 bytecode M3 phase 2: the IR-level
-        // `list.sum(range(...))` peephole desugar.  The tree-walker
-        // resolves the call through the dynamic `std/list` module
-        // loader; the bytecode + cranelift backends recognise the
-        // pattern in `lower_fn_call` and emit an explicit `Op::Loop`
-        // accumulator.  Differential agreement here is the regression
-        // guard — without the peephole, the IR side surfaces
-        // `UnresolvedVariable("list")` and fails the diff. The
-        // `range`-based shapes are *not* in the trace recipe
-        // catalogue, so `TraceJit` is intentionally excluded.
+        // review-improvement-160: the IR-level `list.sum(range(...))`
+        // peephole desugar.  The tree-walker resolves the call through
+        // the dynamic `std/list` module loader; the cranelift backend
+        // recognises the pattern in `lower_fn_call` and emits an
+        // explicit `Op::Loop` accumulator.  Differential agreement
+        // here is the regression guard — without the peephole, the IR
+        // side surfaces `UnresolvedVariable("list")` and fails the
+        // diff.
         CorpusCase {
             name: "stdlib_list_sum_range_n",
             source: "#import list from \"std/list\"\n#main(Int n) -> Int\nlist.sum(range(n))",
             args_factory: || one_int("n", 100),
             tier: Tier::StdlibList,
-            supported_by: TW_CR_BC,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "stdlib_list_sum_range_start_end",
             source: "#import list from \"std/list\"\n#main(Int n) -> Int\nlist.sum(range(5, n))",
             args_factory: || one_int("n", 100),
             tier: Tier::StdlibList,
-            supported_by: TW_CR_BC,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "stdlib_list_sum_range_empty",
             source: "#import list from \"std/list\"\n#main(Int n) -> Int\nlist.sum(range(n))",
             args_factory: || one_int("n", 0),
             tier: Tier::StdlibList,
-            supported_by: TW_CR_BC,
+            supported_by: TW_CR,
         },
         // Wave R2 — pipe operator. `range(n) | list.sum` is a pure
         // static desugar of `list.sum(range(n))`: the lowering prepends
@@ -1068,7 +1021,7 @@ pub fn all_cases() -> Vec<CorpusCase> {
             source: "#import list from \"std/list\"\n#main(Int n) -> Int\nrange(n) | list.sum",
             args_factory: || one_int("n", 100),
             tier: Tier::StdlibList,
-            supported_by: TW_CR_BC,
+            supported_by: TW_CR,
         },
         // ---- Wave R3: general list-building higher-order ops ----
         // `range(n)` as a materialised List<Int> value (not folded inside
@@ -1079,11 +1032,7 @@ pub fn all_cases() -> Vec<CorpusCase> {
         // (range value) and the bundled `list_int_map`/`filter`/`fold`
         // bodies (closure dispatched through the proven `Op::CallClosure`
         // substrate). Differential agreement vs the tree-walk oracle is
-        // the regression guard. List-returning shapes use `TW_CR` (the
-        // bytecode VM rejects List<Int> return entry shapes and these
-        // `range`-based shapes aren't in the trace recipe catalogue);
-        // `_list_reduce` returns Int and rides `TW_CR` for the same
-        // range-recipe reason.
+        // the regression guard.
         CorpusCase {
             name: "r3_range_value",
             source: "#main(Int n) -> List<Int>\nrange(n)",
@@ -1138,7 +1087,7 @@ pub fn all_cases() -> Vec<CorpusCase> {
             source: "#import list from \"std/list\"\n#main(Int n) -> Int\n_list_reduce(range(n), 0, (Int a, Int x) => a + x)",
             args_factory: || one_int("n", 5),
             tier: Tier::StdlibList,
-            supported_by: TW_CR_BC,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "r3_comprehension",
@@ -1162,9 +1111,7 @@ pub fn all_cases() -> Vec<CorpusCase> {
         //      type, so a Float-source comprehension and an Int -> Float /
         //      * -> String element map lower the same way the method /
         //      free forms do. Ride `TW_CR` alongside the sibling
-        //      `r3b_*` / `r3c_*` HOF cases (the `List<Float>` /
-        //      `List<String>` return shape is out of the bytecode entry
-        //      envelope and has no trace recipe); the llvm-native leg is
+        //      `r3b_*` / `r3c_*` HOF cases; the llvm-native leg is
         //      covered three-way in `relon-codegen-llvm`.
         CorpusCase {
             name: "r3b_comprehension_float",
@@ -1208,12 +1155,8 @@ pub fn all_cases() -> Vec<CorpusCase> {
         //      via `Op::CallClosure`, so cranelift / tree-walk agree
         //      element-by-element. Float arithmetic inside the closure is
         //      IEEE-754 (no overflow trap), matched to the tree-walker.
-        //      List-returning shapes ride `TW_CR` (the bytecode VM rejects
-        //      List return entry shapes and these aren't in the trace
-        //      recipe catalogue); the `Float`-returning reduce rides
-        //      `TW_CR` too (Float scalar return is out of the bytecode
-        //      entry envelope). The wasm / llvm-native legs are covered by
-        //      the dedicated `list_float_hof_four_way` test +
+        //      The wasm / llvm-native legs are covered by the dedicated
+        //      `list_float_hof_four_way` test +
         //      `aot_wasm_parity::r3b_float_reduce_*`.
         CorpusCase {
             name: "r3b_float_map",
@@ -1340,8 +1283,7 @@ pub fn all_cases() -> Vec<CorpusCase> {
         //      tree-walk oracle (`f64::abs` / `floor` / `ceil` /
         //      `round_ties_even` / `sqrt`). These ride `TW_CR`: a scalar
         //      Float/Int return is established four-way (incl. wasm) in
-        //      `aot_wasm_parity::r7_*`; the bytecode / trace tiers keep
-        //      their Float-scalar exclusion (mirrors the R3b float rows).
+        //      `aot_wasm_parity::r7_*`.
         //      `pow` joined in the stdlib tail wave via `Op::F64Pow`
         //      (libm `pow` on every leg) — see the `st_pow_*` cases.
         CorpusCase {
@@ -1890,32 +1832,27 @@ pub fn all_cases() -> Vec<CorpusCase> {
             supported_by: TW_CR,
         },
         // ---- StdlibNormalize: most complex ----
-        // Bytecode rejects `String`-typed return; trace const table
-        // pre-computes both NFD / NFC payloads.
         CorpusCase {
             name: "stdlib_nfd_combine",
             source: "#main() -> String\n\"é\".nfd()",
             args_factory: no_args,
             tier: Tier::StdlibNormalize,
-            supported_by: TW_CR_TJ,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "stdlib_nfc_combine",
             source: "#main() -> String\n\"e\\u0301\".nfc()",
             args_factory: no_args,
             tier: Tier::StdlibNormalize,
-            supported_by: TW_CR_TJ,
+            supported_by: TW_CR,
         },
         // ---- DictReturn: schema-rooted output buffer ----
-        // The trace recipe catalogue doesn't model dict construction;
-        // bytecode handles `Int`-only return dicts but rejects `String`
-        // fields.
         CorpusCase {
             name: "dict_simple_return",
             source: "#schema Out { Int v: * }\n#main(Int x) -> Out\n{ v: x * 2 }",
             args_factory: args_x_42,
             tier: Tier::DictReturn,
-            supported_by: TW_CR_BC,
+            supported_by: TW_CR,
         },
         CorpusCase {
             name: "dict_with_string_return",
@@ -1928,10 +1865,9 @@ pub fn all_cases() -> Vec<CorpusCase> {
         // A `#main(...) -> Tuple<...>` lowers to a positional record that
         // reuses the whole branded-record/return ABI; the only fork is the
         // host decode (positional `Value::Tuple` → JSON array). Shares the
-        // DictReturn tier (schema-rooted output buffer) and rides `TW_CR`:
-        // the bytecode / trace recipe catalogues don't model anon-record
-        // construction, and the wasm + llvm-native legs are proven in the
-        // dedicated `relon-codegen-llvm::tuple_return_four_way` test.
+        // DictReturn tier (schema-rooted output buffer) and rides `TW_CR`;
+        // the wasm + llvm-native legs are proven in the dedicated
+        // `relon-codegen-llvm::tuple_return_four_way` test.
         CorpusCase {
             name: "tuple_scalar_return",
             source: "#main(Int n) -> Tuple<Int, String, Bool>\n(n, \"x\", true)",
@@ -1975,8 +1911,7 @@ pub fn all_cases() -> Vec<CorpusCase> {
         // `#relaxed`-mode feature (strict-mode static type derivation of a
         // reference is a separate analyzer concern; the production
         // `examples/pricing.relon` surface is `#relaxed`), so these carry
-        // the directive. `Int` Dict return ⇒ `TW_CR` (the bytecode VM and
-        // trace recipe catalogue don't model anon-Dict construction).
+        // the directive. `Int` Dict return ⇒ `TW_CR`.
         CorpusCase {
             name: "r10_sibling_backward",
             source: "#relaxed\n#main(Int a, Int b) -> Dict\n{ x: a + b, y: &sibling.x * 2 }",
@@ -2007,8 +1942,7 @@ pub fn all_cases() -> Vec<CorpusCase> {
         // `infer::infer_reference`), so the same program now passes strict
         // analysis. The lowering is unchanged (R10 already handles the
         // backward field-let graph), so this proves the strict path runs
-        // byte-equal four-way. `Int` Dict return ⇒ `TW_CR` (bytecode VM and
-        // trace recipes don't model anon-Dict construction).
+        // byte-equal four-way. `Int` Dict return ⇒ `TW_CR`.
         CorpusCase {
             name: "r10b_strict_sibling_chain",
             source: "#main(Int a, Int b) -> Dict\n{ x: a + b, y: &sibling.x * 2, z: &root.x + &sibling.y }",
@@ -2072,9 +2006,8 @@ pub fn all_cases() -> Vec<CorpusCase> {
         // evaluated decorator args). The decorator resolves to an
         // `#internal` field-form function (lifted to a closure let), so
         // the desugared call lowers through `try_lower_local_closure_call`.
-        // `Int` Dict return ⇒ `TW_CR` (bytecode / trace don't model
-        // anon-Dict construction). Verified byte-equal four-way for the
-        // scalar-Int shape (wasm + llvm-native legs in
+        // `Int` Dict return ⇒ `TW_CR`. Verified byte-equal four-way for
+        // the scalar-Int shape (wasm + llvm-native legs in
         // `relon-codegen-llvm::aot_wasm_parity`).
         CorpusCase {
             name: "r11_int_decorator",
@@ -2132,8 +2065,7 @@ pub fn all_cases() -> Vec<CorpusCase> {
         // (`IrType::type_name`, asserted byte-equal to
         // `Value::type_name`). The argument is still evaluated for trap
         // parity, then discarded. `String` return ⇒ tree-walk +
-        // cranelift claim (bytecode rejects String return; the trace
-        // recipe catalogue has no `type` shape).
+        // cranelift claim.
         CorpusCase {
             name: "r4_type_int",
             source: "#main(Int n) -> String\ntype(n)",
@@ -2192,8 +2124,7 @@ pub fn all_cases() -> Vec<CorpusCase> {
         // scrutinee is still evaluated + discarded for trap / ordering
         // parity (the R4 `type(v)` discard pattern), then the selected
         // arm's body is lowered as the result. `String`-returning shapes
-        // ride `TW_CR` (bytecode rejects String return; the trace recipe
-        // catalogue has no match shape) exactly like the R4 entries.
+        // ride `TW_CR` exactly like the R4 entries.
         //
         // A builtin-scalar pattern (`Int`) against an `Int` scrutinee
         // matches; the wildcard never fires.
@@ -2205,14 +2136,13 @@ pub fn all_cases() -> Vec<CorpusCase> {
             supported_by: TW_CR,
         },
         // A non-literal arm body (`n * 2`) lowered as real IR — proves the
-        // selected body is general codegen, not a folded constant. Int
-        // return rides `TW_CR_BC` (bytecode handles Int return).
+        // selected body is general codegen, not a folded constant.
         CorpusCase {
             name: "r5_match_int_body_arith",
             source: "#main(Int n) -> Int\nn match { Int: n * 2, _: 0 }",
             args_factory: || one_int("n", 7),
             tier: Tier::StdlibSimple,
-            supported_by: TW_CR_BC,
+            supported_by: TW_CR,
         },
         // Source ordering: two arms both statically match; the FIRST wins.
         CorpusCase {
@@ -2262,10 +2192,9 @@ pub fn all_cases() -> Vec<CorpusCase> {
         // its elements in order — matching the tree-walk `Expr::List`
         // spread branch — then the flat sequence rides the same runtime
         // scalar-list materialiser the computed-list path uses. `TW_CR`
-        // like every other `List<Int>` return (the bytecode VM rejects the
-        // entry shape; these aren't in the trace recipe catalogue). The
-        // llvm-native + wasm legs are proven in the dedicated
-        // `inplace_return_four_way` / `aot_wasm_parity` codegen tests.
+        // like every other `List<Int>` return. The llvm-native + wasm
+        // legs are proven in the dedicated `inplace_return_four_way` /
+        // `aot_wasm_parity` codegen tests.
         CorpusCase {
             name: "r12_list_spread_into_return",
             source: "#main(Int n) -> List<Int>\n[...[1, 2], n, ...[5, 6]]",

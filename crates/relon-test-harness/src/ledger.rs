@@ -2646,35 +2646,35 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         wave: "base",
         corpus: "arith_chain",
         status: Status::Covered,
-        proof: "four-way (tree-walk + cranelift + wasm + llvm-native), FULL_SUPPORT",
+        proof: "four-way (tree-walk + cranelift + wasm + llvm-native), TW_CR",
     },
     SurfaceEntry {
         construct: "Int comparison (== != < > <= >=)",
         wave: "base",
         corpus: "cmp_lt",
         status: Status::Covered,
-        proof: "four-way, FULL_SUPPORT",
+        proof: "four-way, TW_CR",
     },
     SurfaceEntry {
         construct: "ternary control flow (cond ? a : b), nested",
         wave: "base",
         corpus: "if_nested",
         status: Status::Covered,
-        proof: "four-way, FULL_SUPPORT",
+        proof: "four-way, TW_CR",
     },
     SurfaceEntry {
         construct: "where-binding (postfix let)",
         wave: "base",
         corpus: "let_then_add",
         status: Status::Covered,
-        proof: "four-way, FULL_SUPPORT",
+        proof: "four-way, TW_CR",
     },
     SurfaceEntry {
         construct: "arithmetic trap parity (div-by-zero / overflow)",
         wave: "base",
         corpus: "arith_div_by_zero_traps",
         status: Status::Covered,
-        proof: "tree-walk + cranelift + bytecode agree on the trap (trace synth wraps)",
+        proof: "tree-walk + cranelift agree on the trap",
     },
     // ---- simple stdlib (scalar) ----
     SurfaceEntry {
@@ -2682,7 +2682,7 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         wave: "base",
         corpus: "stdlib_abs_neg",
         status: Status::Covered,
-        proof: "four-way, FULL_SUPPORT",
+        proof: "four-way, TW_CR",
     },
     // ---- Wave R1: contextual-typed closures via list HOFs ----
     SurfaceEntry {
@@ -2733,14 +2733,14 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         wave: "R2",
         corpus: "pipe_range_into_list_sum",
         status: Status::Covered,
-        proof: "tree-walk + cranelift + bytecode (pure desugar to the spelled-out call)",
+        proof: "tree-walk + cranelift (pure desugar to the spelled-out call)",
     },
     SurfaceEntry {
         construct: "f-string interpolation (String + Int parts)",
         wave: "R2",
         corpus: "fstring_mixed_parts",
         status: Status::Covered,
-        proof: "tree-walk + cranelift (String return; bytecode/trace exclude String entry)",
+        proof: "tree-walk + cranelift (String return)",
     },
     // ---- Wave 1: unified value→String skeleton, Bool leg ----
     SurfaceEntry {
@@ -2824,7 +2824,7 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         wave: "R3",
         corpus: "r3_list_reduce_free",
         status: Status::Covered,
-        proof: "tree-walk + cranelift + bytecode (Int return)",
+        proof: "tree-walk + cranelift (Int return)",
     },
     // ---- Wave R3b: List<Float> HOFs + cross-type numeric map ----
     SurfaceEntry {
@@ -2885,7 +2885,7 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         wave: "R5",
         corpus: "r5_match_int_body_arith",
         status: Status::Covered,
-        proof: "tree-walk + cranelift + bytecode (Int return; body is real IR, not a const)",
+        proof: "tree-walk + cranelift (Int return; body is real IR, not a const)",
     },
     SurfaceEntry {
         construct: "strict match source-order tie-break + mismatch->wildcard",
@@ -3048,7 +3048,7 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         wave: "base",
         corpus: "dict_simple_return",
         status: Status::Covered,
-        proof: "tree-walk + cranelift + bytecode (schema-rooted, NOT a Dict param/literal)",
+        proof: "tree-walk + cranelift (schema-rooted, NOT a Dict param/literal)",
     },
     // ---- Wave T2: tuple return (anonymous positional record) ----
     SurfaceEntry {
@@ -3258,7 +3258,7 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         wave: "SYM",
         corpus: "stdlib_list_min",
         status: Status::Covered,
-        proof: "tree-walk + cranelift + trace const; llvm-native leg + empty-trap and \
+        proof: "tree-walk + cranelift; llvm-native leg + empty-trap and \
                 min/max symmetry in relon-codegen-llvm::list_min_four_way (registry \
                 slot 78, exact list_int_max mirror; List<Float> min stays on the \
                 tree-walk fallback like Float max)",
@@ -3268,7 +3268,7 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         wave: "SYM",
         corpus: "stdlib_ends_with_true",
         status: Status::Covered,
-        proof: "tree-walk + cranelift + trace const (method dispatch onto the same \
+        proof: "tree-walk + cranelift (method dispatch onto the same \
                 bundled ends_with body, slot 53, that the R8 free-call form rides); \
                 wasm + llvm-native legs in \
                 relon-codegen-llvm::aot_wasm_parity::r8_ends_with_method_*",

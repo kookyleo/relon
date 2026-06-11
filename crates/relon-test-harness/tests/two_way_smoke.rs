@@ -1,16 +1,14 @@
-//! v6-γ M4: three-way differential smoke tests.
+//! Two-way differential smoke tests.
 //!
-//! Each test case feeds `(source, args)` into
-//! [`diff_test_3way`] and asserts the resulting
-//! [`ThreeWayResult`] is one of the passing variants. The trace-JIT
-//! path only synthesises the Phase-1 ArithControl subset today, so
-//! every test here uses a `#main(Int x, Int y) -> Int : x op y`
-//! shape.
+//! Each test case feeds `(source, args)` into [`diff_test_2way`] and
+//! asserts the result is [`TwoWayResult::Agree`] with the expected
+//! value — both backends must match bitwise AND produce the right
+//! answer. Cases use a `#main(Int x, Int y) -> Int` shape.
 
 use std::collections::HashMap;
 
 use relon_eval_api::Value;
-use relon_test_harness::three_way::{diff_test_3way, ThreeWayResult};
+use relon_test_harness::two_way::{diff_test_2way, TwoWayResult};
 
 fn args(x: i64, y: i64) -> HashMap<String, Value> {
     let mut h = HashMap::new();
@@ -21,12 +19,12 @@ fn args(x: i64, y: i64) -> HashMap<String, Value> {
 
 /// Drive one case and pretty-print the outcome on assertion failure.
 fn run(source: &'static str, args: HashMap<String, Value>, expected: Value) {
-    let result = diff_test_3way(source, args).expect("backend setup");
+    let result = diff_test_2way(source, args).expect("backend setup");
     match &result {
-        ThreeWayResult::AllAgree(v) => {
-            assert_eq!(*v, expected, "AllAgree returned wrong value");
+        TwoWayResult::Agree(v) => {
+            assert_eq!(*v, expected, "Agree returned wrong value");
         }
-        other => panic!("expected AllAgree({expected:?}), got {other:?} for `{source}`"),
+        other => panic!("expected Agree({expected:?}), got {other:?} for `{source}`"),
     }
 }
 
@@ -120,16 +118,19 @@ fn mul_by_one_is_identity() {
     );
 }
 
-/// Source outside the synthesis envelope still produces a "pass"
-/// variant. This is the canary that the harness doesn't FAIL on
-/// rich corpus cases — it surfaces them as
-/// `TraceJitNotApplicable` / `CraneliftUnsupported`.
+/// A richer expression shape (mixed precedence) still agrees across
+/// both backends — and the runner classifies it through a passing
+/// variant rather than failing setup.
 #[test]
-fn rich_source_falls_back_gracefully() {
-    let result = diff_test_3way("#main(Int x, Int y) -> Int\nx + y * 2", args(10, 16))
+fn rich_source_agrees() {
+    let result = diff_test_2way("#main(Int x, Int y) -> Int\nx + y * 2", args(10, 16))
         .expect("backend setup");
     assert!(
         result.is_pass(),
-        "rich expressions must fall back through a non-failing variant; got {result:?}"
+        "rich expressions must land on a passing variant; got {result:?}"
+    );
+    assert!(
+        matches!(result, TwoWayResult::Agree(Value::Int(42))),
+        "expected Agree(Int(42)); got {result:?}"
     );
 }
