@@ -485,6 +485,21 @@ pub enum Diagnostic {
         range: SourceSpan,
     },
 
+    #[error("cannot iterate a value of type `{source_type}` in a comprehension")]
+    #[diagnostic(
+        code(relon::analyze::non_iterable_source),
+        help(
+            "Comprehension sources must be sequence-shaped (`List<T>`, `Dict<K, V>`, `range(...)`, or an `Iterable` schema). Tuples are heterogeneous, fixed-arity records — there is no single element type to bind. Use a `List` if the elements are meant to be iterated."
+        )
+    )]
+    NonIterableSource {
+        /// Statically-derived type of the comprehension source, so the
+        /// message names the concrete offender (`Tuple`, etc.).
+        source_type: String,
+        #[label("source is `{source_type}`, not iterable")]
+        range: SourceSpan,
+    },
+
     #[error("spread source has no statically known type; add a `<T>` hint")]
     #[diagnostic(
         code(relon::analyze::spread_source_type_unknown),
@@ -800,6 +815,11 @@ impl Diagnostic {
             // cross-mode (no `<T>` hint can fix `...int_value`),
             // while `SpreadSourceTypeUnknown` stays strict-only.
             | Diagnostic::NonSpreadableSource { .. }
+            // A comprehension over a statically-known non-iterable
+            // source (Tuple) is wrong in every mode — the evaluator
+            // unconditionally traps `TypeMismatch: expected List or
+            // Iter` on it, so reject before evaluation.
+            | Diagnostic::NonIterableSource { .. }
             | Diagnostic::SpreadSourceTypeUnknown { .. }
             | Diagnostic::DynamicKeyTypeUnknown { .. }
             | Diagnostic::UnknownReferenceType { .. }

@@ -49,6 +49,19 @@ fn fixture_comprehension_list_comp_o_id() {
     assert_eq!(mm, 0, "{:?}", tree.diagnostics);
 }
 
+#[test]
+fn fixture_comprehension_tuple_source_rejected() {
+    let tree = analyze_fixture("comprehension/list_comp_tuple_source.relon");
+    let ni = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::NonIterableSource { .. })
+    });
+    let il = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::ExpressionTypeUnknown { .. })
+    });
+    assert_eq!(ni, 1, "{:?}", tree.diagnostics);
+    assert_eq!(il, 0, "{:?}", tree.diagnostics);
+}
+
 // ====== where_expr ======
 
 #[test]

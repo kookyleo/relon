@@ -571,18 +571,32 @@ impl<'a> Walker<'a> {
                 // binding isn't visible to its own source).
                 self.visit_internal(iterable, None);
 
+                let mut non_iterable: Option<String> = None;
                 let elem_ty = {
                     let scope = self.build_type_scope();
                     let iter_ty = infer_type(iterable, &scope).unwrap_or(InferredType::Any);
                     match iter_ty {
                         InferredType::List(t) => Some(*t),
                         InferredType::Dict(v) => Some(*v),
-                        InferredType::Tuple(elems) if !elems.is_empty() => elems
-                            .into_iter()
-                            .reduce(|acc, t| InferredType::join(&acc, &t)),
+                        // A tuple is a heterogeneous fixed-arity record,
+                        // not a sequence — the evaluator unconditionally
+                        // traps `TypeMismatch: expected List or Iter` on
+                        // it (`materialize_iterable`). Reject statically
+                        // in every mode so the front- and back-end agree.
+                        ty @ InferredType::Tuple(_) => {
+                            non_iterable = Some(ty.name());
+                            None
+                        }
                         _ => None,
                     }
                 };
+                let tuple_rejected = non_iterable.is_some();
+                if let Some(source_type) = non_iterable {
+                    self.tree.diagnostics.push(Diagnostic::NonIterableSource {
+                        source_type,
+                        range: span_of(iterable.range),
+                    });
+                }
 
                 let mut frame = ScopeFrame::default();
                 frame.closure_params.insert(id.clone(), element.id);
@@ -605,7 +619,10 @@ impl<'a> Walker<'a> {
                 // the body reference (it can't tell a comprehension
                 // binding from a closure param), so we surface the failure
                 // here on the iterable itself.
-                if !pinned && self.tree.strict_mode {
+                // (Tuple sources already got the cross-mode
+                // `NonIterableSource` above — don't stack the strict-only
+                // inference-gap diagnostic on top of it.)
+                if !pinned && !tuple_rejected && self.tree.strict_mode {
                     self.tree
                         .diagnostics
                         .push(Diagnostic::ExpressionTypeUnknown {

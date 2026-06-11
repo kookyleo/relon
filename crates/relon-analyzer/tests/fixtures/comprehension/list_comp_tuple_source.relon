@@ -1,0 +1,5 @@
+// Tuple comprehension sources are rejected statically: tuples are
+// heterogeneous and not iterable (the evaluator traps with
+// "expected List or Iter, found Tuple").
+// EXPECTED: 1x NonIterableSource.
+{ out: [x * 10 for x in (1, 2, 3)] }

@@ -2757,6 +2757,59 @@ fn v1_5_strict_comprehension_element_mismatch() {
     assert!(stm >= 1, "{:?}", tree.diagnostics);
 }
 
+/// Tuple comprehension sources are rejected statically: tuples are
+/// heterogeneous, not iterable. The rejection is cross-mode and must
+/// not stack a strict-only `ExpressionTypeUnknown` on top.
+#[test]
+fn comprehension_tuple_source_rejected() {
+    let tree = analyze_str(
+        r#"
+        { out: [x * 10 for x in (1, 2, 3)] }
+        "#,
+    );
+    let ni = count(&tree, |d| {
+        matches!(d, Diagnostic::NonIterableSource { .. })
+    });
+    let il = count(&tree, |d| {
+        matches!(d, Diagnostic::ExpressionTypeUnknown { .. })
+    });
+    assert_eq!(ni, 1, "{:?}", tree.diagnostics);
+    assert_eq!(il, 0, "{:?}", tree.diagnostics);
+}
+
+/// Tuple rejection is cross-mode: `#relaxed` still flags it.
+#[test]
+fn comprehension_tuple_source_rejected_relaxed() {
+    let tree = analyze_str(
+        r#"
+        #relaxed
+        { out: [x * 10 for x in (1, 2, 3)] }
+        "#,
+    );
+    let ni = count(&tree, |d| {
+        matches!(d, Diagnostic::NonIterableSource { .. })
+    });
+    assert_eq!(ni, 1, "{:?}", tree.diagnostics);
+}
+
+/// Reverse: List and range comprehension sources stay silent.
+#[test]
+fn comprehension_list_and_range_sources_silent() {
+    let tree = analyze_str(
+        r#"
+        {
+          List<Int> xs: [1, 2, 3],
+          List<Int> a: [x * 2 for x in xs],
+          List<Int> b: [x + 1 for x in range(4)]
+        }
+        "#,
+    );
+    let ni = count(&tree, |d| {
+        matches!(d, Diagnostic::NonIterableSource { .. })
+    });
+    assert_eq!(ni, 0, "{:?}", tree.diagnostics);
+}
+
 /// v1.5 forward: where-expression's body is inferred under a scope
 /// extended with the bindings — `(n + 1)` infers Int when `n` was
 /// bound to `x: Int`.
