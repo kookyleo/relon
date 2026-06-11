@@ -2609,6 +2609,29 @@ fn r8_ends_with_empty_aligns_native_via_wasmtime() {
     );
 }
 
+// `s.ends_with(suffix)` method form — dispatches onto the same
+// bundled body (slot 53) as the free-call probes above; these pin
+// that the method route reaches it on the wasm32 leg too (the
+// tree-walk == cranelift == trace legs are in the corpus
+// `stdlib_ends_with_*` cases).
+#[test]
+fn r8_ends_with_method_true_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "r8_ends_with_mt",
+        "#main(Int n) -> Bool\n\"hello\".ends_with(\"lo\")",
+        true,
+    );
+}
+
+#[test]
+fn r8_ends_with_method_false_aligns_native_via_wasmtime() {
+    r8_check_bool(
+        "r8_ends_with_mf",
+        "#main(Int n) -> Bool\n\"hello\".ends_with(\"xo\")",
+        false,
+    );
+}
+
 #[test]
 fn r8_replace_all_aligns_native_via_wasmtime() {
     r8_check_str(

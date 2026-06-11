@@ -705,6 +705,24 @@ pub fn all_cases() -> Vec<CorpusCase> {
             tier: Tier::StdlibMemory,
             supported_by: TW_CR_TJ,
         },
+        // `s.ends_with(suffix)` method form — symmetry append to
+        // `starts_with` above. The free-call form has been four-way
+        // since R8 (`r8_ends_with_*`); the method form now dispatches
+        // onto the same bundled body (slot 53).
+        CorpusCase {
+            name: "stdlib_ends_with_true",
+            source: "#main() -> Bool\n\"hello world\".ends_with(\"world\")",
+            args_factory: no_args,
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR_TJ,
+        },
+        CorpusCase {
+            name: "stdlib_ends_with_false",
+            source: "#main() -> Bool\n\"hello world\".ends_with(\"hello\")",
+            args_factory: no_args,
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR_TJ,
+        },
         // Wave R2 — f-string lowering. A pure static desugar: literal
         // parts become `Op::ConstString`, interpolations are coerced to
         // `String` (identity for a String, `Op::IntToStr` for an Int),

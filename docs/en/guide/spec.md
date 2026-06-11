@@ -824,7 +824,9 @@ tree-walk oracle (see the `SUPPORTED_SURFACE` ledger and the
   negative exponents, overflow to `inf`); `multiple_of` (Int form),
   `in_range`
 * format predicates: `is_uuid`, `is_email`, `is_uri`, `is_iso_date`
-* string: `len`, `ends_with`, `replace`, `trim`, `trim_start`,
+* string: `len`, `ends_with` (the free-fn form and the
+  `s.ends_with(p)` method form share one body, symmetric with the
+  `starts_with` method form), `replace`, `trim`, `trim_start`,
   `trim_end`, `split`
 * list / size: `size_in_range` (List form, element count from the
   record header); `count` (record-header length read, any element

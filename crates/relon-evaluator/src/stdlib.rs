@@ -274,6 +274,7 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_method("String", "concat", Arc::new(StringConcat));
     ctx.register_pure_method("String", "substring", Arc::new(StringSubstring));
     ctx.register_pure_method("String", "starts_with", Arc::new(StringStartsWith));
+    ctx.register_pure_method("String", "ends_with", Arc::new(StringEndsWith));
 
     // List methods (note: `_string_join` takes `(List<T>, sep)`, so
     // its receiver is the List, not the String — register under List).
@@ -2417,7 +2418,10 @@ impl RelonFunction for StringMatches {
 }
 
 /// `ends_with(s, suffix) -> Bool` — sibling to the existing
-/// `StringStartsWith`; no method-form yet, so we add both.
+/// `StringStartsWith`. Registered both as a free fn and as a
+/// `String` method (`s.ends_with(suffix)`), mirroring `starts_with`;
+/// the compiled backends dispatch both surfaces onto the same
+/// bundled `ends_with` body (registry slot 53).
 struct StringEndsWith;
 impl RelonFunction for StringEndsWith {
     fn call(

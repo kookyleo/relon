@@ -3263,4 +3263,14 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
                 slot 78, exact list_int_max mirror; List<Float> min stays on the \
                 tree-walk fallback like Float max)",
     },
+    SurfaceEntry {
+        construct: "string ends_with method form (s.ends_with(suffix))",
+        wave: "SYM",
+        corpus: "stdlib_ends_with_true",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift + trace const (method dispatch onto the same \
+                bundled ends_with body, slot 53, that the R8 free-call form rides); \
+                wasm + llvm-native legs in \
+                relon-codegen-llvm::aot_wasm_parity::r8_ends_with_method_*",
+    },
 ];

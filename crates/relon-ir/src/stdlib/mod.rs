@@ -284,6 +284,16 @@ mod d7d_index_tests {
         let idx = stdlib_function_index("contains").expect("contains stdlib slot");
         assert_eq!(stdlib_method_index(IrType::String, "contains"), Some(idx));
     }
+
+    /// Symmetry wave: method-form dispatch `s.ends_with(suffix)`
+    /// resolves to the same slot (53) as the R8 free-call form
+    /// `ends_with(s, suffix)`, mirroring the `starts_with` method.
+    #[test]
+    fn ends_with_method_dispatch_resolves() {
+        let idx = stdlib_function_index("ends_with").expect("ends_with stdlib slot");
+        assert_eq!(idx, 53);
+        assert_eq!(stdlib_method_index(IrType::String, "ends_with"), Some(idx));
+    }
 }
 
 #[cfg(test)]

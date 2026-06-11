@@ -500,6 +500,14 @@ fn parse_recipe(source: &str) -> Option<SynthRecipe> {
             Value::Bool(false),
         ),
         (
+            "#main() -> Bool \"hello world\".ends_with(\"world\")",
+            Value::Bool(true),
+        ),
+        (
+            "#main() -> Bool \"hello world\".ends_with(\"hello\")",
+            Value::Bool(false),
+        ),
+        (
             "#main() -> String \"hello\".upper()",
             Value::String("HELLO".into()),
         ),
