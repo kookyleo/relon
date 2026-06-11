@@ -95,6 +95,9 @@ parallel workflows). It's advisory — never blocks.
   [`docs/zh/guide/use-cases.md`](docs/zh/guide/use-cases.md)
 - **Architecture overview** (for contributors / deep host integrations):
   [`docs/zh/guide/architecture.md`](docs/zh/guide/architecture.md)
+- **Playground & wasm bindings** (in-browser sandboxed runtime):
+  [`docs/zh/guide/playground.md`](docs/zh/guide/playground.md) ·
+  [English](docs/en/guide/playground.md)
 - **Local docs site**: `cd docs && npx vitepress dev`
 
 ## 🏗 Project Structure

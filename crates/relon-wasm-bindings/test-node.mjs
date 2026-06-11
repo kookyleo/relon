@@ -4,8 +4,8 @@
 // we hand the wasm bytes to `initSync` so we exercise the same module
 // without the browser-only fetch path.
 //
-// Run:  node test-node.mjs   (after `wasm-pack build --target web
-//                                 --out-dir ../../docs/.wasm/relon`)
+// Run:  node test-node.mjs   (after `npm run build:wasm` in docs/,
+//                                 which emits docs/public/wasm/relon/)
 //
 // Exits non-zero on any failure; CI / `npm run build:wasm` can chain it.
 
@@ -39,7 +39,7 @@ check('object-sources arithmetic', out1 && out1.price === 123, JSON.stringify(ou
 // 2. array sources + cross-module import.
 const out2 = evaluate(
     [
-        { path: 'main.relon', content: '#import lib from "./lib.relon"\n{ g: lib.hello + ", world" }' },
+        { path: 'main.relon', content: '#relaxed\n#import lib from "./lib.relon"\n{ g: lib.hello + ", world" }' },
         { path: 'lib.relon', content: '{ hello: "hi" }' },
     ],
     'main.relon'
