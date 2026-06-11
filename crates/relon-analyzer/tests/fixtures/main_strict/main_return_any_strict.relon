@@ -1,0 +1,7 @@
+// Strict: the entry body's path walk dead-ends (`n.something` steps
+// into an Int) and collapses to `Any`, so the declared `-> String`
+// return type cannot be verified — the information gap surfaces as
+// ExpressionTypeUnknown instead of silently passing.
+// EXPECTED: 1x ExpressionTypeUnknown mentioning the #main return type.
+#main(Int n) -> String
+n.something
