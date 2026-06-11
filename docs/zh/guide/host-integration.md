@@ -532,7 +532,7 @@ ctx.register_pure_fn("app_version", Arc::new(AppVersion));
 册时把对应的 `NativeFnGate` bit 标上：
 
 ```rust
-use relon_evaluator::{Context, NativeFnGate, NativeArgs, RelonFunction, Value, RuntimeError};
+use relon_evaluator::{Capabilities, Context, NativeFnGate, NativeArgs, RelonFunction, Value, RuntimeError};
 use relon_parser::TokenRange;
 use std::sync::Arc;
 
@@ -545,15 +545,16 @@ impl RelonFunction for ReadSecret {
     }
 }
 
-let mut ctx = Context::sandboxed();
+// 沙箱下放行的方式：在构造期授予 gate 声明的每一个 bit
+let mut caps = Capabilities::default();
+caps.reads_fs = true;
+
+let mut ctx = Context::sandboxed().with_capabilities(caps);
 ctx.register_fn(
     "secret.read",
     NativeFnGate { reads_fs: true, ..Default::default() },
     Arc::new(ReadSecret),
 );
-
-// 沙箱下放行的方式：授予 gate 声明的每一个 bit
-ctx.capabilities.reads_fs = true;
 ```
 
 每个原生函数都走同一条 gate 检查：函数声明的所有 bit 都必须在
@@ -566,26 +567,25 @@ ctx.capabilities.reads_fs = true;
 
 ## 模块解析（Module Resolvers）
 
-`#import <bindspec> from "path"` 不是直接读文件——它问 `Context::module_resolvers` 链上的每个 resolver 「你能解析这个路径吗？」第一个返回 `Some(ModuleSource)` 的赢，错误（`Err`）会立刻中断。
+`#import <bindspec> from "path"` 不是直接读文件——它问 `Context` 的 resolver 链（`module_resolvers()` 可读取）上的每个 resolver 「你能解析这个路径吗？」第一个返回 `Some(ModuleSource)` 的赢，错误（`Err`）会立刻中断。
 
 默认链：
 
 1. **`StdModuleResolver`** — 解析 `std/list`、`std/string` 这些虚拟模块（嵌在 binary 里，零 IO）。
 2. **`FilesystemModuleResolver`** — 从文件系统读：
    - host-owned 脚本可显式安装 `FilesystemModuleResolver::trusted()`，无 root 限制；
-   - `Context::sandboxed()` 下使用 `FilesystemModuleResolver::default()`，**默认拒绝一切**——必须替换或追加一个 `with_root_dir(...)` 实例。
+   - `Context::sandboxed()` 下使用 `FilesystemModuleResolver::default()`，**默认拒绝一切**——必须在它前面挂一个 `with_root_dir(...)` 实例才放行。
 
-替换示例：
+挂载示例（rooted resolver 排在默认拒绝的 resolver 之前，先到先得）：
 
 ```rust
-use relon_evaluator::{Context, FilesystemModuleResolver, StdModuleResolver};
+use relon_evaluator::{Context, FilesystemModuleResolver};
 use std::sync::Arc;
 
 let mut ctx = Context::sandboxed();
-ctx.module_resolvers = vec![
-    Arc::new(StdModuleResolver),
-    Arc::new(FilesystemModuleResolver::with_root_dir("/var/relon-configs")),
-];
+ctx.prepend_module_resolver(Arc::new(
+    FilesystemModuleResolver::with_root_dir("/var/relon-configs"),
+));
 ```
 
 `with_root_dir` 会把 root 路径 canonicalize，并在每次 import 时确认目标路径在 root 下面（包括防止符号链接逃逸）——细节见 [沙箱与权限](./sandbox.md#filesystemmoduleresolver-的行为)。
@@ -594,8 +594,8 @@ ctx.module_resolvers = vec![
 
 ```rust
 ctx.prepend_module_resolver(Arc::new(MyResolver)); // 走最前
-// 想做 fallback：直接 push 到 ctx.module_resolvers 末尾即可
-ctx.module_resolvers.push(Arc::new(FallbackResolver));
+// 想做 fallback：追加到链尾，仅在前面都不认时才被问到
+ctx.append_module_resolver(Arc::new(FallbackResolver));
 ```
 
 ## 装饰器插件

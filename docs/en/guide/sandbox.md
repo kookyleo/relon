@@ -39,22 +39,31 @@ use relon_evaluator::module::FilesystemModuleResolver;
 use relon_evaluator::{Capabilities, Context};
 use std::sync::Arc;
 
-let mut ctx = Context::sandboxed();
+// Assemble the grants on a `Capabilities` value first, then install
+// it once at construction time. `Context` exposes no way to change
+// capabilities mid-run — once the context is handed to an evaluator,
+// the grants are immutable policy.
+let mut caps = Capabilities::default();
 
-// 1. Grant a filesystem read root (if the script needs to #import other .relon files)
-ctx.capabilities.reads_fs = true;
+// 1. Filesystem read bit (if the script needs to #import other .relon files)
+caps.reads_fs = true;
+
+// 2. Set a step budget (guards against recursion / comprehension explosions)
+caps.max_steps = Some(1_000_000);
+
+// 3. Set a value-element water mark (guards against giant list/tuple/dict)
+caps.max_value_elements = Some(10_000);
+
+// 4. Grant only the bits you actually need (e.g. clock read)
+caps.reads_clock = true;
+
+let mut ctx = Context::sandboxed().with_capabilities(caps);
+
+// Filesystem reads also need a rooted resolver (the bit is the
+// policy; the resolver is the mechanism)
 ctx.prepend_module_resolver(Arc::new(
     FilesystemModuleResolver::with_root_dir("/var/relon-userscripts"),
 ));
-
-// 2. Set a step budget (guards against recursion / comprehension explosions)
-ctx.capabilities.max_steps = Some(1_000_000);
-
-// 3. Set a value-element water mark (guards against giant list/tuple/dict)
-ctx.capabilities.max_value_elements = Some(10_000);
-
-// 4. Grant only the bits you actually need (e.g. clock read)
-ctx.capabilities.reads_clock = true;
 ```
 
 ### "I just want everything on" — `Capabilities::all_granted()`
@@ -65,12 +74,11 @@ requires that **this grant be explicitly visible** — it must not hide
 behind a constructor named `trusted()`. So write it out:
 
 ```rust
-let mut ctx = Context::sandboxed();
-ctx.capabilities = Capabilities::all_granted();
+let mut ctx = Context::sandboxed().with_capabilities(Capabilities::all_granted());
 ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
 ```
 
-Those three lines = the old `Context::trusted()`. The difference is
+Those two lines = the old `Context::trusted()`. The difference is
 that a code review can see at a glance "FS unrestricted + all six
 capability bits on (any gate passes) + no step budget" — delete the
 lines you don't want.
@@ -120,7 +128,8 @@ allow. Semantics:
 
 Each bit appears in two places:
 
-- **`Capabilities`** (host grant): `ctx.capabilities.network = true`
+- **`Capabilities`** (host grant): setting `network = true` on a
+  `Capabilities` value and installing it via `with_capabilities`
   means "this context allows networking".
 - **`NativeFnGate`** (function declaration): when registering a
   native fn, declare "I need the `network` bit to run".
@@ -162,7 +171,9 @@ entry adds 1. `max_steps = Some(N)` caps it at N; exceeding it raises
 `RuntimeError::StepLimitExceeded`.
 
 ```rust
-ctx.capabilities.max_steps = Some(100);
+let mut caps = Capabilities::default();
+caps.max_steps = Some(100);
+let ctx = Context::sandboxed().with_capabilities(caps);
 // Running `loop(): loop()` (infinite recursion) gets cut off at step 101
 ```
 
@@ -193,7 +204,9 @@ every language-level entry where a list / tuple / dict is produced:
   rejects immediately.
 
 ```rust
-ctx.capabilities.max_value_elements = Some(3);
+let mut caps = Capabilities::default();
+caps.max_value_elements = Some(3);
+let ctx = Context::sandboxed().with_capabilities(caps);
 // `[1, 2, 3, 4, 5]` triggers ValueTooLarge { limit: 3, actual: 5 }
 // `range(0, 1_000_000)` is rejected at the stdlib entry too
 ```
@@ -254,9 +267,8 @@ provides a "read the current user ID" function; everything else is
 locked down.
 
 ```rust
-use relon_evaluator::module::StdModuleResolver;
 use relon_evaluator::{
-    Context, NativeArgs, NativeFnGate, RelonFunction, RuntimeError, Value,
+    Capabilities, Context, NativeArgs, NativeFnGate, RelonFunction, RuntimeError, Value,
 };
 use relon_parser::{parse_document, TokenRange};
 use std::sync::Arc;
@@ -273,14 +285,16 @@ fn run_user_rule(
     rule_src: &str,
     current_user: &str,
 ) -> Result<serde_json::Value, RuntimeError> {
-    let mut ctx = Context::sandboxed();
+    // Evaluation budget. Filesystem reads stay off: the default
+    // resolver chain of `Context::sandboxed()` only answers for the
+    // std/ virtual modules and rejects every real path, so there is
+    // nothing to disable — just don't grant reads_fs or mount a
+    // with_root_dir resolver.
+    let mut caps = Capabilities::default();
+    caps.max_steps = Some(100_000);
+    caps.max_value_elements = Some(10_000);
 
-    // Disable filesystem reads (user scripts can't #import files, only std/)
-    ctx.module_resolvers = vec![Arc::new(StdModuleResolver)];
-
-    // Evaluation budget
-    ctx.capabilities.max_steps = Some(100_000);
-    ctx.capabilities.max_value_elements = Some(10_000);
+    let mut ctx = Context::sandboxed().with_capabilities(caps);
 
     // Expose a read-only, side-effect-free function. Pure fns use
     // register_pure_fn, declaring an empty gate. The sandbox's default
