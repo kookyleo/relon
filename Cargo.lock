@@ -2174,6 +2174,7 @@ dependencies = [
  "relon-lsp",
  "relon-parser",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
