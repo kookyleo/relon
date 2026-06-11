@@ -86,13 +86,16 @@ pub fn stdlib_method_index(receiver_ty: IrType, name: &str) -> Option<u32> {
         (IrType::String, "title_locale") => stdlib_function_index("title_locale"),
         (IrType::String, "substring") => stdlib_function_index("substring"),
         (IrType::String, "starts_with") => stdlib_function_index("starts_with"),
+        // `s.ends_with(suffix)` — the method form routes onto the same
+        // bundled `ends_with` body (slot 53) the free-call form uses,
+        // restoring symmetry with `starts_with` (slot 10): the
+        // evaluator registers both surfaces on `String`, so the
+        // four-way surface stays in lock-step with the oracle.
+        (IrType::String, "ends_with") => stdlib_function_index("ends_with"),
         // Wave R8: `s.replace(a, b)` receiver-method dispatch. The
         // free-call form `replace(s, a, b)` is method-only in the
         // evaluator (no `register_pure_fn`), so it never reaches the
         // free-call name lookup — only this method route fires.
-        // `ends_with` has NO tree-walk method form (only the free-call
-        // `ends_with(s, p)`), so it is intentionally absent here to keep
-        // the four-way surface in lock-step.
         (IrType::String, "replace") => stdlib_function_index("replace"),
         // `s.trim()` / `s.trim_start()` / `s.trim_end()` receiver-method
         // dispatch (also registered as free fns in the evaluator, so the
@@ -130,6 +133,11 @@ pub fn stdlib_method_index(receiver_ty: IrType, name: &str) -> Option<u32> {
         (IrType::String, "glob_match") => stdlib_function_index("glob_match"),
         (IrType::ListInt, "sum") => stdlib_function_index("list_int_sum"),
         (IrType::ListInt, "max") => stdlib_function_index("list_int_max"),
+        // `xs.min()` — exact mirror of `max` (registry slot appended at
+        // the tail; declaration order is wire format). `List<Float>`
+        // `min` / `max` stay on the tree-walk fallback (no `ListFloat`
+        // row here), matching each other.
+        (IrType::ListInt, "min") => stdlib_function_index("list_int_min"),
         // Phase 10-a higher-order List<Int> methods. Dispatch covers
         // the `xs.map(|x| ...)` / `xs.filter(|x| ...)` /
         // `xs.fold(init, |acc, x| ...)` surfaces.

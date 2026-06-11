@@ -705,6 +705,24 @@ pub fn all_cases() -> Vec<CorpusCase> {
             tier: Tier::StdlibMemory,
             supported_by: TW_CR_TJ,
         },
+        // `s.ends_with(suffix)` method form — symmetry append to
+        // `starts_with` above. The free-call form has been four-way
+        // since R8 (`r8_ends_with_*`); the method form now dispatches
+        // onto the same bundled body (slot 53).
+        CorpusCase {
+            name: "stdlib_ends_with_true",
+            source: "#main() -> Bool\n\"hello world\".ends_with(\"world\")",
+            args_factory: no_args,
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR_TJ,
+        },
+        CorpusCase {
+            name: "stdlib_ends_with_false",
+            source: "#main() -> Bool\n\"hello world\".ends_with(\"hello\")",
+            args_factory: no_args,
+            tier: Tier::StdlibMemory,
+            supported_by: TW_CR_TJ,
+        },
         // Wave R2 — f-string lowering. A pure static desugar: literal
         // parts become `Op::ConstString`, interpolations are coerced to
         // `String` (identity for a String, `Op::IntToStr` for an Int),
@@ -985,6 +1003,28 @@ pub fn all_cases() -> Vec<CorpusCase> {
             args_factory: no_args,
             tier: Tier::StdlibList,
             supported_by: TW_CR_TJ,
+        },
+        // `min` symmetry append (registry slot 78): the exact mirror of
+        // `stdlib_list_max` — same trace const-table convention, same
+        // claim list.
+        CorpusCase {
+            name: "stdlib_list_min",
+            source: "#main() -> Int\n[3, 1, 4, 1, 5, 9, 2, 6].min()",
+            args_factory: no_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR_TJ,
+        },
+        // Checked `xs.sum()` overflow: every claiming backend must trap
+        // `NumericOverflow` on the first overflowing partial sum (the
+        // bundled body's pre-add guard; the tree-walk native's
+        // `checked_add`). Trap cases have no trace const-table form, so
+        // the claim list is `TW_CR`.
+        CorpusCase {
+            name: "stdlib_list_sum_overflow",
+            source: "#main() -> Int\n[9223372036854775806, 1, 1].sum()",
+            args_factory: no_args,
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
         },
         // review-improvement-160 bytecode M3 phase 2: the IR-level
         // `list.sum(range(...))` peephole desugar.  The tree-walker

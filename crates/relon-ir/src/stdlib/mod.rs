@@ -284,6 +284,16 @@ mod d7d_index_tests {
         let idx = stdlib_function_index("contains").expect("contains stdlib slot");
         assert_eq!(stdlib_method_index(IrType::String, "contains"), Some(idx));
     }
+
+    /// Symmetry wave: method-form dispatch `s.ends_with(suffix)`
+    /// resolves to the same slot (53) as the R8 free-call form
+    /// `ends_with(s, suffix)`, mirroring the `starts_with` method.
+    #[test]
+    fn ends_with_method_dispatch_resolves() {
+        let idx = stdlib_function_index("ends_with").expect("ends_with stdlib slot");
+        assert_eq!(idx, 53);
+        assert_eq!(stdlib_method_index(IrType::String, "ends_with"), Some(idx));
+    }
 }
 
 #[cfg(test)]
@@ -328,12 +338,13 @@ mod glob_match_index_tests {
     /// `trim_end`) and the ASCII-structured validators (`is_email` /
     /// `is_uri`) append at 65..69; the RFC 3339 date validator
     /// `is_iso_date` appends at 70; the stdlib tail wave (`every` /
-    /// `some` / `unique` predicate loops + `pow`) appends at 71..77.
+    /// `some` / `unique` predicate loops + `pow`) appends at 71..77;
+    /// `list_int_min` (the `max` mirror) appends at 78.
     /// All are at the tail so every position-pinned index above stays
     /// put. Pinning the count catches accidental double-registrations.
     #[test]
-    fn bundle_has_78_entries() {
-        assert_eq!(stdlib_function_count(), 78);
+    fn bundle_has_79_entries() {
+        assert_eq!(stdlib_function_count(), 79);
         assert_eq!(stdlib_function_index("glob_match"), Some(37));
         assert_eq!(stdlib_function_index("list_list_length"), Some(38));
         // Wave R3b tail appends (order-pinned wire format).
@@ -398,6 +409,8 @@ mod glob_match_index_tests {
         assert_eq!(stdlib_function_index("list_int_unique"), Some(75));
         assert_eq!(stdlib_function_index("list_float_unique"), Some(76));
         assert_eq!(stdlib_function_index("pow"), Some(77));
+        // `min` symmetry append: the `list_int_max` mirror.
+        assert_eq!(stdlib_function_index("list_int_min"), Some(78));
     }
 }
 

@@ -169,13 +169,38 @@ impl<'ctx, 'b, 'cp> Emit<'ctx, 'b, 'cp> {
         // the process with no decodable cause. Route it through the same
         // `state.trap_code` + negative-sentinel epilogue the `CheckCap`
         // deny path uses; `run_buffer_main` lifts the recorded code via
-        // `NativeTrap::runtime_error_from_code`. Every other (stdlib-domain)
-        // trap keeps the unconditional `llvm.trap` it has always emitted.
-        if matches!(kind, TrapKind::NoMatch) {
-            self.emit_state_trap(NativeTrap::NoMatch, "Trap(NoMatch)")?;
-            let cont = self.ctx.append_basic_block(self.func, "after_trap_cont");
-            self.builder.position_at_end(cont);
-            return Ok(());
+        // `NativeTrap::runtime_error_from_code`. The checked-reduction
+        // overflow (`list_int_sum`'s per-iteration guard) takes the same
+        // route, lifting to `RuntimeError::NumericOverflow` byte-aligned
+        // with the tree-walk oracle's checked `+` and cranelift's
+        // `TrapKind::NumericOverflow`.
+        //
+        // The state-trap epilogue is `ret i32 -1` — the negative
+        // bytes-written sentinel, which is only well-typed (and only
+        // *means* "trap") in the buffer-protocol entry. Inside an
+        // emitted helper / lambda body (`EntryShape::LegacyI64`, raw
+        // scalar return) that return would either fail the LLVM
+        // verifier (i64 return) or — worse — hand the caller `-1` as a
+        // legitimate value (i32 Bool/handle return). There these kinds
+        // keep the unconditional `llvm.trap` every other stdlib-domain
+        // trap (`EmptyList` / `IndexOutOfBounds`) emits in any position:
+        // a loud process abort, never a silently wrong value. Threading
+        // a typed trap channel through helper returns is the recorded
+        // follow-up alongside the stdlib-domain traps.
+        if self.shape == EntryShape::Buffer {
+            let typed = match kind {
+                TrapKind::NoMatch => Some((NativeTrap::NoMatch, "Trap(NoMatch)")),
+                TrapKind::NumericOverflow => {
+                    Some((NativeTrap::NumericOverflow, "Trap(NumericOverflow)"))
+                }
+                _ => None,
+            };
+            if let Some((code, hint)) = typed {
+                self.emit_state_trap(code, hint)?;
+                let cont = self.ctx.append_basic_block(self.func, "after_trap_cont");
+                self.builder.position_at_end(cont);
+                return Ok(());
+            }
         }
         self.emit_llvm_trap_call("Trap")?;
         self.builder

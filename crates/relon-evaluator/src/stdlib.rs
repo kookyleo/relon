@@ -274,6 +274,7 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_method("String", "concat", Arc::new(StringConcat));
     ctx.register_pure_method("String", "substring", Arc::new(StringSubstring));
     ctx.register_pure_method("String", "starts_with", Arc::new(StringStartsWith));
+    ctx.register_pure_method("String", "ends_with", Arc::new(StringEndsWith));
 
     // List methods (note: `_string_join` takes `(List<T>, sep)`, so
     // its receiver is the List, not the String — register under List).
@@ -284,13 +285,14 @@ pub fn register_to(ctx: &mut Context) {
     ctx.register_pure_method("List", "join", string_join);
     ctx.register_pure_method("List", "len", Arc::clone(&len));
     // v6-δ M1 R4: see String.length / String.is_empty above for
-    // rationale. `sum` + `max` are list-aggregations the cranelift
-    // backend already exposes as `list_int_sum` etc.; `length` is the
-    // `len()` alias the corpus uses.
+    // rationale. `sum` + `max` + `min` are list-aggregations the
+    // cranelift backend already exposes as `list_int_sum` etc.;
+    // `length` is the `len()` alias the corpus uses.
     ctx.register_pure_method("List", "length", Arc::clone(&len));
     ctx.register_pure_method("List", "is_empty", Arc::new(IsEmpty));
     ctx.register_pure_method("List", "sum", Arc::new(ListSum));
     ctx.register_pure_method("List", "max", Arc::new(ListMax));
+    ctx.register_pure_method("List", "min", Arc::new(ListMin));
 
     // Dict methods
     ctx.register_pure_method("Dict", "merge", dict_merge);
@@ -2193,6 +2195,14 @@ impl RelonFunction for StringStartsWith {
 
 /// `xs.sum()` over a `List<Int>`. Float lists return `Float`; mixed
 /// lists fall through to a TypeMismatch.
+///
+/// Int summation is *checked*: the first overflowing partial sum (in
+/// element order) raises `NumericOverflow`, exactly like the `+`
+/// operator and the `std/list` reduce-based `sum`. This used to be
+/// the language's only silently-wrapping Int arithmetic — a spec
+/// violation (§2.3 mandates checked i64) fixed alongside the bundled
+/// `list_int_sum` compiled body, which traps `NumericOverflow` at the
+/// same partial sum.
 struct ListSum;
 impl RelonFunction for ListSum {
     fn call(
@@ -2227,7 +2237,9 @@ impl RelonFunction for ListSum {
             let mut acc: i64 = 0;
             for v in list {
                 if let Value::Int(x) = v {
-                    acc = acc.wrapping_add(*x);
+                    acc = acc
+                        .checked_add(*x)
+                        .ok_or(RuntimeError::NumericOverflow(range))?;
                 }
             }
             Ok(Value::Int(acc))
@@ -2310,6 +2322,69 @@ impl RelonFunction for ListMax {
     }
 }
 
+/// `xs.min()` over a `List<Int>` / `List<Float>`. Returns the smallest
+/// element (signed for Int) — the exact mirror of [`ListMax`],
+/// including the typed `TypeMismatch` ("non-empty list") on an empty
+/// receiver. Closes the historical `max`-without-`min` asymmetry.
+struct ListMin;
+impl RelonFunction for ListMin {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        let args = args.into_positional();
+        expect_arg_count(&args, 1, range)?;
+        let list = expect_list(&args[0], range)?;
+        if list.is_empty() {
+            return Err(RuntimeError::TypeMismatch {
+                expected: "non-empty list".to_string(),
+                found: "empty list".to_string(),
+                range,
+            });
+        }
+        let first = &list[0];
+        match first {
+            Value::Int(seed) => {
+                let mut acc = *seed;
+                for v in &list[1..] {
+                    let x = expect_int(v, range)?;
+                    if x < acc {
+                        acc = x;
+                    }
+                }
+                Ok(Value::Int(acc))
+            }
+            Value::Float(seed) => {
+                let mut acc = seed.into_inner();
+                for v in &list[1..] {
+                    match v {
+                        Value::Float(x) => {
+                            let xv = x.into_inner();
+                            if xv < acc {
+                                acc = xv;
+                            }
+                        }
+                        other => {
+                            return Err(RuntimeError::TypeMismatch {
+                                expected: "List<Float>".to_string(),
+                                found: other.type_name().to_string(),
+                                range,
+                            })
+                        }
+                    }
+                }
+                Ok(Value::Float(acc.into()))
+            }
+            other => Err(RuntimeError::TypeMismatch {
+                expected: "List<Int> or List<Float>".to_string(),
+                found: other.type_name().to_string(),
+                range,
+            }),
+        }
+    }
+}
+
 // ============================================================
 // Stdlib JSON Schema parity wave (2026-05-23)
 // ============================================================
@@ -2343,7 +2418,10 @@ impl RelonFunction for StringMatches {
 }
 
 /// `ends_with(s, suffix) -> Bool` — sibling to the existing
-/// `StringStartsWith`; no method-form yet, so we add both.
+/// `StringStartsWith`. Registered both as a free fn and as a
+/// `String` method (`s.ends_with(suffix)`), mirroring `starts_with`;
+/// the compiled backends dispatch both surfaces onto the same
+/// bundled `ends_with` body (registry slot 53).
 struct StringEndsWith;
 impl RelonFunction for StringEndsWith {
     fn call(

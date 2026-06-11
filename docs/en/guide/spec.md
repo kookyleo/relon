@@ -824,7 +824,9 @@ tree-walk oracle (see the `SUPPORTED_SURFACE` ledger and the
   negative exponents, overflow to `inf`); `multiple_of` (Int form),
   `in_range`
 * format predicates: `is_uuid`, `is_email`, `is_uri`, `is_iso_date`
-* string: `len`, `ends_with`, `replace`, `trim`, `trim_start`,
+* string: `len`, `ends_with` (the free-fn form and the
+  `s.ends_with(p)` method form share one body, symmetric with the
+  `starts_with` method form), `replace`, `trim`, `trim_start`,
   `trim_end`, `split`
 * list / size: `size_in_range` (List form, element count from the
   record header); `count` (record-header length read, any element
@@ -834,9 +836,18 @@ tree-walk oracle (see the `SUPPORTED_SURFACE` ledger and the
   `List<Int>` / `List<Float>`; float equality uses OrderedFloat
   semantics — `NaN == NaN` and `-0.0 == 0.0` both count as
   duplicates)
+* list method-form reducers: `xs.sum()` (`List<Int>`, **checked** —
+  the first overflowing partial sum, in element order, traps
+  `NumericOverflow`, matching the `+` operator and the `std/list`
+  reduce-based `sum`; this used to be the language's only silently
+  wrapping Int arithmetic, now fixed); `xs.max()` / `xs.min()`
+  (`List<Int>`; an empty receiver traps `EmptyList`; `min` is the
+  exact `max` mirror)
 
 Honest caps within that set (each routes to the interpreter loudly
 or refuses to compile loudly, never silently miscompiles):
+`xs.sum()` / `xs.max()` / `xs.min()` over `List<Float>` elements
+(stay on the tree-walk fallback; compiled backends refuse loudly);
 `multiple_of` on a Float argument (no native `%`/`Op::Mod(F64)` on
 Cranelift/wasm); `size_in_range` on a String argument (counts
 Unicode code points, which needs the UTF-8 decode seam — solvable,

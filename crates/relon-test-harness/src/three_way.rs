@@ -500,6 +500,14 @@ fn parse_recipe(source: &str) -> Option<SynthRecipe> {
             Value::Bool(false),
         ),
         (
+            "#main() -> Bool \"hello world\".ends_with(\"world\")",
+            Value::Bool(true),
+        ),
+        (
+            "#main() -> Bool \"hello world\".ends_with(\"hello\")",
+            Value::Bool(false),
+        ),
+        (
             "#main() -> String \"hello\".upper()",
             Value::String("HELLO".into()),
         ),
@@ -536,6 +544,10 @@ fn parse_recipe(source: &str) -> Option<SynthRecipe> {
         (
             "#main() -> Int [3, 1, 4, 1, 5, 9, 2, 6].max()",
             Value::Int(9),
+        ),
+        (
+            "#main() -> Int [3, 1, 4, 1, 5, 9, 2, 6].min()",
+            Value::Int(1),
         ),
         (
             "#main() -> String \"é\".nfd()",

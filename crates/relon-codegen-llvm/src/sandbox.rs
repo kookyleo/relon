@@ -154,9 +154,13 @@ pub enum SandboxTrapKind {
     /// (= 5) and [`crate::state::NativeTrap::HostFnMissing`]; lifts to
     /// `RuntimeError::Unsupported`.
     HostFnMissing = 5,
-    /// Signed integer overflow on `Op::Add` / `Op::Sub` / `Op::Mul`.
-    /// Matches cranelift's `TrapKind::NumericOverflow` (= 6). Reserved
-    /// for the LLVM overflow-check work.
+    /// Signed integer overflow. Matches cranelift's
+    /// `TrapKind::NumericOverflow` (= 6) and
+    /// [`crate::state::NativeTrap::NumericOverflow`]. Raised today by
+    /// the bundled `list_int_sum` body's checked-reduction guard
+    /// (`Op::Trap { NumericOverflow }`); general `Op::Add` / `Op::Sub`
+    /// / `Op::Mul` overflow checks on the LLVM path remain reserved
+    /// for the overflow-check work.
     NumericOverflow = 6,
     /// A host fn returned an error, or a value outside the scalar return
     /// envelope. Matches [`crate::state::NativeTrap::HostFnError`] (= 7);

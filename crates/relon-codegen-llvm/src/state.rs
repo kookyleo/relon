@@ -165,6 +165,14 @@ pub enum NativeTrap {
     /// `TrapKind::CapabilityDenied` (= 3); lifts to
     /// `RuntimeError::CapabilityDenied`.
     CapabilityDenied = 3,
+    /// A checked Int reduction overflowed i64 (`list_int_sum`'s
+    /// per-iteration guard). Matches cranelift's
+    /// `TrapKind::NumericOverflow` (= 6); lifts to
+    /// `RuntimeError::NumericOverflow`, the same typed error the
+    /// tree-walk oracle's checked `+` raises. Routed through
+    /// `state.trap_code` + the negative sentinel (not `llvm.trap`)
+    /// so the host can surface the typed error instead of a SIGILL.
+    NumericOverflow = 6,
     /// No host fn registered at the requested `import_idx`, or no
     /// registry installed at all. Surfaces as
     /// `RuntimeError::Unsupported`. Matches cranelift's
@@ -201,6 +209,10 @@ impl NativeTrap {
                 reason: "llvm-aot: host-fn call denied by capability gate".to_string(),
                 range: TokenRange::default(),
             },
+            // Checked-reduction overflow — same typed error class as the
+            // tree-walk oracle's checked `+` and cranelift's
+            // `TrapKind::NumericOverflow::to_runtime_error`.
+            6 => RuntimeError::NumericOverflow(TokenRange::default()),
             8 => RuntimeError::TypeMismatch {
                 // Byte-aligned with the tree-walk oracle's `Expr::Match`
                 // no-match path and the cranelift `TrapKind::NoMatch`

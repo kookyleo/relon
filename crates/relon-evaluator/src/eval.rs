@@ -1751,8 +1751,8 @@ impl TreeWalkEvaluator {
     /// `NumericOverflow` on the first overflowing partial sum, in ascending
     /// element order, rather than wrapping. The fused fold reproduces that
     /// trap-on-overflow exactly (it is a *fusion*, not a closed-form
-    /// substitution, and not the `wrapping_add` of the unrelated
-    /// `[..].sum()` method-form native).
+    /// substitution). The `[..].sum()` method-form native shares the same
+    /// checked semantics, so all three sum surfaces trap identically.
     ///
     /// Value-affecting capability checks are mirrored from `Range`: the
     /// requested length is `tick`ed and `max_value_elements` is enforced

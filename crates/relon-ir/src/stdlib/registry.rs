@@ -28,10 +28,10 @@ use super::defs::{
     list_float_map_to_int, list_float_map_to_string, list_float_map_to_variant_list,
     list_float_some, list_float_unique, list_int_every, list_int_filter, list_int_fold,
     list_int_length_to_int, list_int_map, list_int_map_to_float, list_int_map_to_string,
-    list_int_map_to_variant_list, list_int_max, list_int_some, list_int_sum, list_int_unique,
-    list_list_filter, list_list_length, list_schema_length, list_string_length, list_string_map,
-    list_string_map_to_variant_list, max_int, min_int, pow_float, round_float_to_int, sqrt_float,
-    starts_with_string, substring_string,
+    list_int_map_to_variant_list, list_int_max, list_int_min, list_int_some, list_int_sum,
+    list_int_unique, list_list_filter, list_list_length, list_schema_length, list_string_length,
+    list_string_map, list_string_map_to_variant_list, max_int, min_int, pow_float,
+    round_float_to_int, sqrt_float, starts_with_string, substring_string,
 };
 use super::normalization::{
     ccc_lookup_helper, compose_lookup_helper, decomp_lookup_helper, nfc_string, nfd_string,
@@ -65,7 +65,9 @@ use super::validators::{
 ///     traps as `IndexOutOfBounds` when the slice walks past the
 ///     receiver).
 ///   * `10` — `starts_with(String, String) -> Bool` (Phase 4.c-2).
-///   * `11` — `list_int_sum(List<Int>) -> Int` (Phase 4.c-2).
+///   * `11` — `list_int_sum(List<Int>) -> Int` (Phase 4.c-2; checked
+///     summation — traps as `NumericOverflow` on the first
+///     overflowing partial sum, matching the `+` operator).
 ///   * `12` — `list_int_max(List<Int>) -> Int` (Phase 4.c-2; traps
 ///     as `EmptyList` on a zero-length receiver).
 ///   * `13` — `list_int_map(List<Int>, Closure<Int -> Int>) -> List<Int>`
@@ -436,6 +438,13 @@ pub fn builtin_stdlib() -> &'static [StdlibFunction] {
             //             `List<Bool>` / pointer-array `every` / `some` /
             //             `unique` shapes stay capped (no four-way String
             //             `Eq` / no `String -> Bool` predicate surface).
+            //   * `78` — `list_int_min(List<Int>) -> Int` (exact mirror
+            //             of slot 12 `list_int_max` with the select
+            //             flipped to `val < acc`; traps as `EmptyList`
+            //             on a zero-length receiver. Appended at the
+            //             tail to close the historical max-without-min
+            //             asymmetry; `List<Float>` `min` stays on the
+            //             tree-walk fallback like Float `max`).
             list_int_every(),
             list_int_some(),
             list_float_every(),
@@ -443,6 +452,7 @@ pub fn builtin_stdlib() -> &'static [StdlibFunction] {
             list_int_unique(),
             list_float_unique(),
             pow_float(),
+            list_int_min(),
         ]
     })
 }
