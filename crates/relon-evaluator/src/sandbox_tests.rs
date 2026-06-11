@@ -60,11 +60,9 @@ fn filesystem_resolver_with_root_dir_allows_paths_under_root() {
     std::fs::write(dir.join("lib.relon"), r#"{ value: 42 }"#).unwrap();
 
     let mut ctx = Context::sandboxed();
-    // Replace the default-rejecting resolver with one rooted at `dir`.
-    ctx.module_resolvers = vec![
-        Arc::new(StdModuleResolver),
-        Arc::new(FilesystemModuleResolver::with_root_dir(&dir)),
-    ];
+    // Mount a resolver rooted at `dir` ahead of the default-rejecting
+    // tail that `prepare_in_place` appends for sandboxed contexts.
+    ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::with_root_dir(&dir)));
     let node = parse(r#"#import lib from "lib.relon" { v: lib.value }"#);
     let ctx = ctx.with_root(node);
     let ctx = std::sync::Arc::new({
@@ -98,10 +96,7 @@ fn filesystem_resolver_rejects_traversal_outside_root() {
     std::fs::write(outer.join("escape.relon"), r#"{ leak: 1 }"#).unwrap();
 
     let mut ctx = Context::sandboxed();
-    ctx.module_resolvers = vec![
-        Arc::new(StdModuleResolver),
-        Arc::new(FilesystemModuleResolver::with_root_dir(&inner)),
-    ];
+    ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::with_root_dir(&inner)));
     let node = parse(r#"#import x from "../escape.relon" { y: x.leak }"#);
     let ctx = ctx.with_root(node);
     let ctx = std::sync::Arc::new({
@@ -136,10 +131,7 @@ fn filesystem_resolver_rejects_symlink_escape() {
     std::os::unix::fs::symlink(outer.join("target.relon"), &link).unwrap();
 
     let mut ctx = Context::sandboxed();
-    ctx.module_resolvers = vec![
-        Arc::new(StdModuleResolver),
-        Arc::new(FilesystemModuleResolver::with_root_dir(&inner)),
-    ];
+    ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::with_root_dir(&inner)));
     let node = parse(r#"#import x from "link.relon" { y: x.leak }"#);
     let ctx = ctx.with_root(node);
     let ctx = std::sync::Arc::new({
@@ -169,7 +161,9 @@ fn max_steps_aborts_runaway_recursion() {
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
             let mut ctx = Context::sandboxed();
-            ctx.capabilities.max_steps = Some(100);
+            let mut caps = ctx.capabilities().clone();
+            caps.max_steps = Some(100);
+            ctx = ctx.with_capabilities(caps);
             eval_with(ctx, r#"{ loop(): loop(), "go": loop() }"#)
         })
         .unwrap();
@@ -191,7 +185,9 @@ fn max_steps_does_not_fire_under_limit() {
     // Sanity check: a small program well under the budget completes
     // normally — proves the counter isn't hair-trigger.
     let mut ctx = Context::sandboxed();
-    ctx.capabilities.max_steps = Some(10_000);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_steps = Some(10_000);
+    ctx = ctx.with_capabilities(caps);
     let result = eval_with(ctx, r#"{ a: 1, b: 2, c: a + b }"#).unwrap();
     let Value::Dict(d) = result else {
         panic!("expected dict")
@@ -207,7 +203,9 @@ fn max_steps_aborts_long_list_map() {
     // wired into the intrinsic's inner loop, the budget reflects the
     // real per-element work and aborts before the map drains.
     let mut ctx = Context::sandboxed();
-    ctx.capabilities.max_steps = Some(100);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_steps = Some(100);
+    ctx = ctx.with_capabilities(caps);
     let src = r#"{ xs: _list_map(range(0, 1000), (x) => x) }"#;
     let result = eval_with(ctx, src);
     assert!(
@@ -230,8 +228,12 @@ fn max_steps_aborts_range_collection() {
     // range under `max_steps = 100` (and `max_value_elements = None`,
     // so the element cap can't claim the kill) fails on the step gate.
     let mut ctx = Context::sandboxed();
-    ctx.capabilities.max_steps = Some(100);
-    ctx.capabilities.max_value_elements = None;
+    let mut caps = ctx.capabilities().clone();
+    caps.max_steps = Some(100);
+    ctx = ctx.with_capabilities(caps);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_value_elements = None;
+    ctx = ctx.with_capabilities(caps);
     let result = eval_with(ctx, r#"{ n: len(range(0, 10000)) }"#);
     assert!(
         matches!(
@@ -251,7 +253,9 @@ fn max_steps_allows_short_pipeline_under_budget() {
     // Guards against the tick being too eager — the per-element charge
     // should leave plenty of headroom for sub-thousand-step pipelines.
     let mut ctx = Context::sandboxed();
-    ctx.capabilities.max_steps = Some(1000);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_steps = Some(1000);
+    ctx = ctx.with_capabilities(caps);
     let result =
         eval_with(ctx, r#"{ ys: _list_map(range(0, 10), (x) => x * 2) }"#).expect("succeeds");
     let Value::Dict(d) = result else {
@@ -271,7 +275,9 @@ fn max_steps_ticked_intrinsic_attributes_span() {
     // assert the resulting `StepLimitExceeded.range` covers that call
     // (i.e. its byte slice in the source contains `_list_map`).
     let mut ctx = Context::sandboxed();
-    ctx.capabilities.max_steps = Some(50);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_steps = Some(50);
+    ctx = ctx.with_capabilities(caps);
     let src = r#"{ xs: _list_map(range(0, 500), (x) => x) }"#;
     let result = eval_with(ctx, src);
     let Err(RuntimeError::StepLimitExceeded { range, .. }) = result else {
@@ -296,7 +302,9 @@ fn max_value_elements_rejects_oversized_list() {
     // the stdlib-intrinsic cases live in their own dedicated tests
     // below (see `max_value_elements_rejects_range_preflight` etc.).
     let mut ctx = Context::sandboxed();
-    ctx.capabilities.max_value_elements = Some(3);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_value_elements = Some(3);
+    ctx = ctx.with_capabilities(caps);
     let result = eval_with(ctx, r#"{ "big": [1, 2, 3, 4, 5] }"#);
     assert!(
         matches!(
@@ -314,7 +322,9 @@ fn max_value_elements_rejects_oversized_list() {
 #[test]
 fn max_value_elements_rejects_oversized_dict() {
     let mut ctx = Context::sandboxed();
-    ctx.capabilities.max_value_elements = Some(2);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_value_elements = Some(2);
+    ctx = ctx.with_capabilities(caps);
     let result = eval_with(ctx, r#"{ a: 1, b: 2, c: 3, d: 4 }"#);
     assert!(
         matches!(
@@ -343,7 +353,9 @@ fn max_value_elements_rejects_range_preflight() {
     // rather than a hard-kill, while still being unambiguously larger
     // than what the post-call check would let through "for free."
     let mut ctx = Context::sandboxed();
-    ctx.capabilities.max_value_elements = Some(3);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_value_elements = Some(3);
+    ctx = ctx.with_capabilities(caps);
     let result = eval_with(ctx, r#"{ x: len(range(0, 10000000)) }"#);
     assert!(
         matches!(
@@ -371,7 +383,9 @@ fn max_value_elements_rejects_list_map_result() {
     //
     // Positive baseline: input and output both at cap → success.
     let mut ctx = Context::sandboxed();
-    ctx.capabilities.max_value_elements = Some(3);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_value_elements = Some(3);
+    ctx = ctx.with_capabilities(caps);
     let result = eval_with(ctx, r#"{ xs: _list_map(range(0, 3), (x) => x * 2) }"#);
     assert!(result.is_ok(), "expected success at cap=3, got {result:?}");
 
@@ -379,7 +393,9 @@ fn max_value_elements_rejects_list_map_result() {
     // the construction chain (range pre-flight, or the map result) —
     // we only care that the system refuses to bind an oversized list.
     let mut ctx = Context::sandboxed();
-    ctx.capabilities.max_value_elements = Some(3);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_value_elements = Some(3);
+    ctx = ctx.with_capabilities(caps);
     let result = eval_with(ctx, r#"{ xs: _list_map(range(0, 4), (x) => x * 2) }"#);
     assert!(
         matches!(result, Err(RuntimeError::ValueTooLarge { limit: 3, .. })),
@@ -396,12 +412,16 @@ fn max_value_elements_rejects_list_filter_result() {
     // fit) and a negative path where the input exceeds the cap, which
     // is rejected at the list-literal construction site.
     let mut ctx = Context::sandboxed();
-    ctx.capabilities.max_value_elements = Some(5);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_value_elements = Some(5);
+    ctx = ctx.with_capabilities(caps);
     let result = eval_with(ctx, r#"{ ys: _list_filter(range(0, 5), (x) => x > 0) }"#);
     assert!(result.is_ok(), "expected success at cap=5, got {result:?}");
 
     let mut ctx = Context::sandboxed();
-    ctx.capabilities.max_value_elements = Some(4);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_value_elements = Some(4);
+    ctx = ctx.with_capabilities(caps);
     let result = eval_with(ctx, r#"{ ys: _list_filter(range(0, 5), (x) => x > 0) }"#);
     assert!(
         matches!(result, Err(RuntimeError::ValueTooLarge { limit: 4, .. })),
@@ -417,7 +437,9 @@ fn max_value_elements_rejects_string_split_result() {
     // under `max_value_elements`. Splitting a 5-piece string under
     // cap=3 must reject with `actual=5`.
     let mut ctx = Context::sandboxed();
-    ctx.capabilities.max_value_elements = Some(3);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_value_elements = Some(3);
+    ctx = ctx.with_capabilities(caps);
     let result = eval_with(ctx, r#"{ parts: _string_split("a,b,c,d,e", ",") }"#);
     assert!(
         matches!(
@@ -433,7 +455,9 @@ fn max_value_elements_rejects_string_split_result() {
 
     // Positive baseline: cap=5 lets the same call through.
     let mut ctx = Context::sandboxed();
-    ctx.capabilities.max_value_elements = Some(5);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_value_elements = Some(5);
+    ctx = ctx.with_capabilities(caps);
     let result = eval_with(ctx, r#"{ parts: _string_split("a,b,c,d,e", ",") }"#);
     assert!(result.is_ok(), "expected success at cap=5, got {result:?}");
 }
@@ -449,7 +473,9 @@ fn max_value_elements_rejects_dict_merge_method_result() {
     // `arithmetic.rs`). Two 2-key dicts merged into a 4-key result must
     // reject under cap=3.
     let mut ctx = Context::sandboxed();
-    ctx.capabilities.max_value_elements = Some(3);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_value_elements = Some(3);
+    ctx = ctx.with_capabilities(caps);
     let result = eval_with(
         ctx,
         r#"{
@@ -472,7 +498,9 @@ fn max_value_elements_rejects_dict_merge_method_result() {
 
     // Positive baseline: under cap=4 the same merge passes.
     let mut ctx = Context::sandboxed();
-    ctx.capabilities.max_value_elements = Some(4);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_value_elements = Some(4);
+    ctx = ctx.with_capabilities(caps);
     let result = eval_with(
         ctx,
         r#"{
@@ -492,7 +520,9 @@ fn max_value_elements_allows_within_budget_intrinsics() {
     // results whose size is exactly at the limit. We pick a top-level
     // dict with 4 keys (≤ cap=5) so the outermost literal also passes.
     let mut ctx = Context::sandboxed();
-    ctx.capabilities.max_value_elements = Some(5);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_value_elements = Some(5);
+    ctx = ctx.with_capabilities(caps);
     let result = eval_with(
         ctx,
         r#"{
@@ -530,7 +560,9 @@ fn max_value_elements_rejects_receiver_method_intrinsic() {
     let node = relon_parser::parse_document(src).expect("parse");
     let analyzed = relon_analyzer::analyze(&node);
     let mut ctx = Context::sandboxed();
-    ctx.capabilities.max_value_elements = Some(4);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_value_elements = Some(4);
+    ctx = ctx.with_capabilities(caps);
     let ctx = ctx.with_root(node).with_analyzed(Arc::new(analyzed));
     let ctx = std::sync::Arc::new({
         let mut ctx = ctx;
@@ -554,7 +586,9 @@ fn max_value_elements_rejects_receiver_method_intrinsic() {
     let node = relon_parser::parse_document(src).expect("parse");
     let analyzed = relon_analyzer::analyze(&node);
     let mut ctx = Context::sandboxed();
-    ctx.capabilities.max_value_elements = Some(5);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_value_elements = Some(5);
+    ctx = ctx.with_capabilities(caps);
     let ctx = ctx.with_root(node).with_analyzed(Arc::new(analyzed));
     let ctx = std::sync::Arc::new({
         let mut ctx = ctx;
@@ -640,7 +674,9 @@ fn gated_fn_permitted_when_bit_granted() {
     }
 
     let mut ctx = Context::sandboxed();
-    ctx.capabilities.reads_fs = true;
+    let mut caps = ctx.capabilities().clone();
+    caps.reads_fs = true;
+    ctx = ctx.with_capabilities(caps);
     ctx.register_fn(
         "fs.read",
         {
@@ -678,7 +714,7 @@ fn fully_granted_caps_let_gated_fns_through() {
     }
 
     let mut ctx = Context::sandboxed();
-    ctx.capabilities = Capabilities::all_granted();
+    ctx = ctx.with_capabilities(Capabilities::all_granted());
     ctx.register_fn(
         "fs.read",
         {

@@ -99,10 +99,9 @@ impl TreeWalkEvaluator {
         crate::builtin_decorators::register_to(ctx);
         crate::stdlib::register_to(ctx);
         crate::prelude::seed_prelude_schemas(&mut ctx.schemas);
-        ctx.module_resolvers.insert(0, Arc::new(StdModuleResolver));
+        ctx.prepend_module_resolver(Arc::new(StdModuleResolver));
         if ctx.sandboxed_flag {
-            ctx.module_resolvers
-                .push(Arc::new(FilesystemModuleResolver::default()));
+            ctx.append_module_resolver(Arc::new(FilesystemModuleResolver::default()));
         }
         ctx.backend_prepared = true;
     }
@@ -181,7 +180,7 @@ impl TreeWalkEvaluator {
         value: &Value,
         range: TokenRange,
     ) -> Result<(), RuntimeError> {
-        let Some(limit) = self.context.capabilities.max_value_elements else {
+        let Some(limit) = self.context.capabilities().max_value_elements else {
             return Ok(());
         };
         let actual = match value {
@@ -239,7 +238,7 @@ impl TreeWalkEvaluator {
             )
         })?;
         let scope = self.prepare_root_scope(scope, &root)?;
-        if let Some(tree) = self.context.analyzed.as_ref() {
+        if let Some(tree) = self.context.analyzed() {
             if !tree.root_schemas.is_empty() {
                 self.seed_root_schemas(&tree.root_schemas, &scope)?;
             }
@@ -295,8 +294,7 @@ impl TreeWalkEvaluator {
         })?;
         let signature = self
             .context
-            .analyzed
-            .as_ref()
+            .analyzed()
             .and_then(|tree| tree.main_signature.clone())
             .ok_or_else(|| RuntimeError::NoMainSignature { range: root.range })?;
         let scope = self.prepare_root_scope(scope, &root)?;
@@ -326,7 +324,7 @@ impl TreeWalkEvaluator {
         // dict-field `#schema X: {...}` schemas likewise. Both seedings
         // are idempotent so doing them once up-front (instead of per
         // param) is enough.
-        if let Some(tree) = self.context.analyzed.as_ref() {
+        if let Some(tree) = self.context.analyzed() {
             if !tree.root_schemas.is_empty() {
                 self.seed_root_schemas(&tree.root_schemas, &scope)?;
             }
@@ -526,7 +524,7 @@ impl TreeWalkEvaluator {
         scope: &Arc<Scope>,
         is_schema_pred: bool,
     ) -> Result<Value, RuntimeError> {
-        if let Some(limit) = self.context.capabilities.max_steps {
+        if let Some(limit) = self.context.capabilities().max_steps {
             let prev = self.context.step_counter.fetch_add(1, Ordering::Relaxed);
             if prev >= limit {
                 return Err(RuntimeError::StepLimitExceeded {
@@ -1100,7 +1098,7 @@ impl TreeWalkEvaluator {
         // Fast path: an attached `AnalyzedTree` already split this body
         // into typed fields. Build the runtime `Value::Schema` directly
         // from the pre-computed `SchemaDef`.
-        if let Some(tree) = self.context.analyzed.as_ref() {
+        if let Some(tree) = self.context.analyzed() {
             if let Some(def) = tree.schema(body.id) {
                 if !def.variants.is_empty() {
                     return Ok(self.build_root_enum_schema(def));
@@ -1191,7 +1189,7 @@ impl TreeWalkEvaluator {
             SCHEMA | ENUM => match &directive.body {
                 DirectiveBody::NameBody { .. } => {}
                 DirectiveBody::Bare => {
-                    if let Some(tree) = self.context.analyzed.as_ref() {
+                    if let Some(tree) = self.context.analyzed() {
                         if let Some(def) = tree.schema(node.id) {
                             if !def.variants.is_empty() {
                                 return Ok(Some(self.build_root_enum_schema(def)));
@@ -1418,7 +1416,7 @@ impl TreeWalkEvaluator {
         scope: &Arc<Scope>,
         range: TokenRange,
     ) -> Result<ModuleSource, RuntimeError> {
-        for resolver in &self.context.module_resolvers {
+        for resolver in self.context.module_resolvers() {
             if let Some(source) = resolver.resolve(path_str, scope, range)? {
                 return Ok(source);
             }
@@ -2152,7 +2150,7 @@ impl TreeWalkEvaluator {
         let TokenKey::String(method_name, _, _) = &path[last_idx] else {
             return Ok(None);
         };
-        if self.context.analyzed.is_none() {
+        if self.context.analyzed().is_none() {
             return Ok(None);
         }
         // Static `Schema.method` dispatch (head names a schema directly,
@@ -2186,8 +2184,7 @@ impl TreeWalkEvaluator {
         };
         let analyzed = self
             .context
-            .analyzed
-            .as_ref()
+            .analyzed()
             .expect("caller already verified analyzed.is_some()");
         let Some(methods) = analyzed.schema_methods.get(head) else {
             return Ok(None);
@@ -2265,8 +2262,7 @@ impl TreeWalkEvaluator {
         }
         let analyzed = self
             .context
-            .analyzed
-            .as_ref()
+            .analyzed()
             .expect("caller already verified analyzed.is_some()");
         let Some(methods) = analyzed.schema_methods.get(&schema_name) else {
             return Ok(None);
@@ -2324,7 +2320,7 @@ impl TreeWalkEvaluator {
         let Some(schema_name) = value_schema_tag(receiver) else {
             return Ok(None);
         };
-        let Some(analyzed) = self.context.analyzed.as_ref() else {
+        let Some(analyzed) = self.context.analyzed() else {
             return Ok(None);
         };
         let has_method = analyzed
@@ -2618,7 +2614,7 @@ impl TreeWalkEvaluator {
         range: TokenRange,
     ) -> Result<(), RuntimeError> {
         use relon_eval_api::CapabilityGate;
-        match self.context.capabilities.check_gate(&entry.gate) {
+        match self.context.capabilities().check_gate(&entry.gate) {
             Ok(()) => Ok(()),
             Err(bit) => Err(RuntimeError::CapabilityDenied {
                 cap_bit: Some(bit.bit_index()),
@@ -3120,7 +3116,7 @@ impl NativeFnCaps for EvaluatorCaps {
     }
 
     fn max_value_elements(&self) -> Option<usize> {
-        self.context.capabilities.max_value_elements
+        self.context.capabilities().max_value_elements
     }
 
     fn next_iter_id(&self) -> u64 {
@@ -3136,7 +3132,7 @@ impl NativeFnCaps for EvaluatorCaps {
     /// counter, no separate cap. Hot-path shape: `fetch_add` first, post-
     /// check second, mirroring `eval_internal` near `eval.rs:870`.
     fn tick(&self, n: u64, range: TokenRange) -> Result<(), RuntimeError> {
-        let Some(limit) = self.context.capabilities.max_steps else {
+        let Some(limit) = self.context.capabilities().max_steps else {
             return Ok(());
         };
         let prev = self.context.step_counter.fetch_add(n, Ordering::Relaxed);

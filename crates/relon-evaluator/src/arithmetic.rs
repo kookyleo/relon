@@ -485,7 +485,7 @@ impl TreeWalkEvaluator {
         let Some(brand) = d.brand.as_ref() else {
             return Ok(None);
         };
-        let Some(analyzed) = self.context.analyzed.as_ref() else {
+        let Some(analyzed) = self.context.analyzed() else {
             return Ok(None);
         };
         let Some(method) = analyzed

@@ -1262,8 +1262,7 @@ fn rewrite_missing_main_arg(ctx: &Context, err: RuntimeError) -> RuntimeError {
     // use-site is just where evaluation noticed; matching `run_main`'s
     // own behaviour keeps both paths consistent.
     let param_range = ctx
-        .analyzed
-        .as_ref()
+        .analyzed()
         .and_then(|tree| tree.main_signature.as_ref())
         .and_then(|sig| sig.params.iter().find(|p| p.name == name))
         .map(|p| p.range);

@@ -534,7 +534,7 @@ fn evaluate_source(
         // the lazy backend setup in `TreeWalkEvaluator::new`.
         TreeWalkEvaluator::prepare_in_place(&mut ctx);
         if matches!(trust, TrustMode::Trusted) {
-            ctx.capabilities = Capabilities::all_granted();
+            ctx = ctx.with_capabilities(Capabilities::all_granted());
             ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
             // v3+ a-3: mirror the workspace-analyzer chain on the
             // evaluator side. The resolver only ships on native

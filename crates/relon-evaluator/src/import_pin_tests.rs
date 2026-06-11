@@ -52,13 +52,10 @@ fn parse(source: &str) -> relon_parser::Node {
 fn ctx_with_stub(path: &str, body: &str) -> Context {
     let mut ctx = Context::default();
     // Prepend so the stub wins over the default filesystem resolver.
-    ctx.module_resolvers.insert(
-        0,
-        Arc::new(StubResolver {
-            path: path.to_string(),
-            body: body.to_string(),
-        }),
-    );
+    ctx.prepend_module_resolver(Arc::new(StubResolver {
+        path: path.to_string(),
+        body: body.to_string(),
+    }));
     ctx
 }
 

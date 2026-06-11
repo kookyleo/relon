@@ -47,7 +47,7 @@ fn eval_doc(source: &str) -> Result<Value, RuntimeError> {
 /// inline so the trust scope is visible at the call site.
 fn fully_granted_ctx() -> Context {
     let mut ctx = Context::sandboxed();
-    ctx.capabilities = Capabilities::all_granted();
+    ctx = ctx.with_capabilities(Capabilities::all_granted());
     ctx.prepend_module_resolver(std::sync::Arc::new(
         crate::module::FilesystemModuleResolver::trusted(),
     ));
@@ -3011,7 +3011,9 @@ fn step_counter_resets_between_top_level_runs() {
     let mut ctx = Context::new().with_root(node.clone());
     // Tight budget that fits one such evaluation but would overflow on
     // accumulated steps from two back-to-back runs.
-    ctx.capabilities.max_steps = Some(50);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_steps = Some(50);
+    ctx = ctx.with_capabilities(caps);
     let ctx = std::sync::Arc::new({
         let mut ctx = ctx;
         crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
@@ -3672,7 +3674,7 @@ fn with_workspace_wires_entry_tree_into_analyzed_field() {
 
     let ctx = Context::new().with_root(node).with_workspace(Arc::new(ws));
     assert!(
-        ctx.analyzed.is_some(),
+        ctx.analyzed().is_some(),
         "with_workspace should wire entry analyzed tree"
     );
     assert!(ctx.workspace.is_some());
@@ -6239,7 +6241,9 @@ fn fused_list_sum_range_respects_max_value_elements() {
     // identity-checking the module succeeds) yet be smaller than the range,
     // isolating the range pre-flight as the trip.
     let mut ctx = Context::new();
-    ctx.capabilities.max_value_elements = Some(50);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_value_elements = Some(50);
+    ctx = ctx.with_capabilities(caps);
     let result = eval_fused_with(
         ctx,
         "#import list from \"std/list\"\n{ s: list.sum(range(100)) }",
@@ -6262,8 +6266,12 @@ fn fused_list_sum_range_respects_max_steps() {
     // The fused path mirrors `Range`'s length tick, so a large range under a
     // tight step budget still trips `StepLimitExceeded`.
     let mut ctx = Context::new();
-    ctx.capabilities.max_steps = Some(100);
-    ctx.capabilities.max_value_elements = None;
+    let mut caps = ctx.capabilities().clone();
+    caps.max_steps = Some(100);
+    ctx = ctx.with_capabilities(caps);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_value_elements = None;
+    ctx = ctx.with_capabilities(caps);
     let result = eval_fused_with(
         ctx,
         "#import list from \"std/list\"\n{ s: list.sum(range(10000)) }",

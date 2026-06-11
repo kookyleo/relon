@@ -1304,7 +1304,7 @@ fn cmd_run(
             .with_root(entry_node)
             .with_workspace(Arc::clone(&workspace));
         if trust {
-            ctx.capabilities = Capabilities::all_granted();
+            ctx = ctx.with_capabilities(Capabilities::all_granted());
             ctx.prepend_module_resolver(Arc::new(FilesystemModuleResolver::trusted()));
             // v3+ a-3: --trust opens remote `#import "https://..."`
             // resolution. Resolver lives on native targets only;
