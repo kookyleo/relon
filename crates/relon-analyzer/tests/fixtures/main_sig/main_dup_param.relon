@@ -1,0 +1,5 @@
+// Spec §#main: the same parameter name declared twice is an analyze
+// error — host arguments bind by name, so a duplicate is ambiguous.
+// EXPECTED: 1x DuplicateMainParam (`x`).
+#main(Int x, String x) -> Int
+x + 1

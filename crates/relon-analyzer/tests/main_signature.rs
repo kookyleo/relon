@@ -102,3 +102,14 @@ fn fixture_main_no_main_strict_silent() {
     });
     assert_eq!(n, 0, "{:?}", tree.diagnostics);
 }
+
+// ====== main_sig ======
+
+#[test]
+fn fixture_main_dup_param_flagged() {
+    let tree = analyze_fixture("main_sig/main_dup_param.relon");
+    let n = count(&tree.diagnostics, |d| {
+        matches!(d, Diagnostic::DuplicateMainParam { name, .. } if name == "x")
+    });
+    assert_eq!(n, 1, "{:?}", tree.diagnostics);
+}

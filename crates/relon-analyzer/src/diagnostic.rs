@@ -166,6 +166,21 @@ pub enum Diagnostic {
         second: SourceSpan,
     },
 
+    #[error("duplicate `#main` parameter `{name}`")]
+    #[diagnostic(
+        code(relon::analyze::duplicate_main_param),
+        help(
+            "Each `#main(...)` parameter name may be declared only once; host arguments bind by name. Rename or remove the duplicate."
+        )
+    )]
+    DuplicateMainParam {
+        name: String,
+        #[label("first declared here")]
+        first: SourceSpan,
+        #[label("redeclared with the same name")]
+        second: SourceSpan,
+    },
+
     #[error("duplicate root-level `#schema` name `{name}`")]
     #[diagnostic(
         code(relon::analyze::duplicate_root_schema_name),
@@ -769,6 +784,7 @@ impl Diagnostic {
             | Diagnostic::SchemaFieldBrandConflict { .. }
             | Diagnostic::SchemaFieldBrandInvalidArg { .. }
             | Diagnostic::DuplicateMainDirective { .. }
+            | Diagnostic::DuplicateMainParam { .. }
             | Diagnostic::DuplicateRootSchemaName { .. }
             | Diagnostic::RootSchemaCollidesWithField { .. }
             | Diagnostic::RootSchemaInvalidValue { .. }
