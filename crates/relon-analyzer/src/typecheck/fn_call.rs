@@ -533,17 +533,123 @@ impl<'a> Walker<'a> {
     }
 
     /// True when the walker is currently inside the body of a method
-    /// declared on `schema`. The typecheck walker only traverses the
-    /// entry root today — method bodies are not walked from this
-    /// path — so the answer is always `false`. The `#internal` check
-    /// in `check_method_dispatch` therefore only flags calls reached
-    /// from the entry root, which is the correct conservative
-    /// behaviour: private methods are explicitly opt-out of external
-    /// callers. When a future pass walks method bodies, it must push
-    /// a "currently inside schema X's method body" frame onto the
-    /// walker so this hook returns `true` for sibling-method calls.
-    pub(super) fn in_method_block(&self, _schema: &str) -> bool {
-        false
+    /// declared on `schema`. The entry-root walk never sets
+    /// `method_context`, so calls reached from the root always answer
+    /// `false` (external callers of `#internal` methods are rejected).
+    /// The method-body privacy pass (`check_schema_method_privacy`)
+    /// sets it to the *owning* schema while scanning each body, so
+    /// same-schema sibling-method calls stay legal and calls into
+    /// another schema's `#internal` method are rejected — mirroring
+    /// the adjudicated semantics (the evaluator itself performs no
+    /// privacy enforcement; this is the only gate).
+    pub(super) fn in_method_block(&self, schema: &str) -> bool {
+        self.method_context.as_deref() == Some(schema)
+    }
+
+    /// Privacy pass over every declared schema method body. The
+    /// entry-root walk doesn't traverse `with { ... }` bodies, so
+    /// without this pass a method body could call another schema's
+    /// `#internal` method unchecked (and the runtime would silently
+    /// allow it). The scan is privacy-only: it resolves receivers and
+    /// flags `PrivateMethodViolation`, but deliberately does not run
+    /// the full typecheck arms over the bodies (those have their own
+    /// dedicated checks and strict-mode surfaces).
+    pub(super) fn check_schema_method_privacy(&mut self) {
+        // Snapshot (owning schema, params, body) triples up front —
+        // the scan needs `&mut self` for diagnostics.
+        let bodies: Vec<(
+            String,
+            Vec<crate::schema::SchemaMethodParamInfo>,
+            std::sync::Arc<Node>,
+        )> = self
+            .tree
+            .schema_methods
+            .iter()
+            .flat_map(|(schema, methods)| {
+                methods.iter().filter_map(|m| {
+                    m.body_node
+                        .clone()
+                        .map(|body| (schema.clone(), m.params.clone(), body))
+                })
+            })
+            .collect();
+        for (schema, params, body) in bodies {
+            // Seed a frame so receiver walks inside the body resolve:
+            // `self` is the owning schema; each declared param carries
+            // its annotated type (`Self` folds to the owning schema).
+            let mut frame = crate::resolve::ScopeFrame::default();
+            let self_ty = relon_parser::TypeNode {
+                path: vec![schema.clone()],
+                generics: Vec::new(),
+                is_optional: false,
+                range: TokenRange::default(),
+                variant_fields: None,
+                doc_comment: None,
+            };
+            frame
+                .closure_param_types
+                .insert("self".to_string(), self_ty.clone());
+            for p in &params {
+                let ty = if p.type_node.path.as_slice() == ["Self"] {
+                    self_ty.clone()
+                } else {
+                    p.type_node.clone()
+                };
+                frame.closure_param_types.insert(p.name.clone(), ty);
+            }
+            self.scope_stack.push(frame);
+            self.method_context = Some(schema);
+            self.scan_privacy(&body);
+            self.method_context = None;
+            self.scope_stack.pop();
+        }
+    }
+
+    /// Recursive privacy-only scan used by
+    /// [`Self::check_schema_method_privacy`]: for every method-shaped
+    /// `FnCall` whose receiver resolves to a schema, flag `#internal`
+    /// methods called from outside their owning schema.
+    fn scan_privacy(&mut self, node: &Node) {
+        if let Expr::FnCall { path, args: _ } = &*node.expr {
+            self.check_privacy_only(path);
+        }
+        for child in relon_parser::child_nodes(node) {
+            self.scan_privacy(child);
+        }
+    }
+
+    /// The `PrivateMethodViolation` half of `check_method_dispatch`,
+    /// without the `UnknownMethod` half — unknown names inside method
+    /// bodies are out of scope for the privacy pass.
+    fn check_privacy_only(&mut self, path: &[TokenKey]) {
+        if path.len() < 2 || self.is_enum_tuple_variant_call(path) {
+            return;
+        }
+        let last_idx = path.len() - 1;
+        let TokenKey::String(method, method_range, _) = &path[last_idx] else {
+            return;
+        };
+        let Some(schema) = self.resolve_method_receiver_prefix(&path[..last_idx]) else {
+            return;
+        };
+        let Some(info) = self
+            .tree
+            .schema_methods
+            .get(&schema)
+            .and_then(|methods| methods.iter().find(|m| &m.name == method))
+            .cloned()
+        else {
+            return;
+        };
+        if info.is_private && !self.in_method_block(&schema) {
+            self.tree
+                .diagnostics
+                .push(Diagnostic::PrivateMethodViolation {
+                    schema,
+                    method: method.clone(),
+                    range: span_of(*method_range),
+                });
+        }
     }
 
     /// Resolve the receiver schema name of a method call's head segment.

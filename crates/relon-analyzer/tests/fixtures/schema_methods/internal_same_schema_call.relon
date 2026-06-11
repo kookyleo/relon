@@ -1,0 +1,10 @@
+// Same-schema sibling-method interdispatch is the legal use of
+// `#internal`: `Money.show` may call `Money.secret`.
+// EXPECTED: no diagnostics.
+#schema Money { Int amount: * } with {
+  #internal
+  secret() -> Int: self.amount
+  show() -> Int: self.secret() + 1
+}
+#main(Money m) -> Int
+m.show()

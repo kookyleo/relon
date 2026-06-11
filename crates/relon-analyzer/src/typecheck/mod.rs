@@ -134,8 +134,15 @@ pub fn typecheck(root: &Node, tree: &mut AnalyzedTree) {
         pipe_target_calls,
         closure_param_context: std::collections::HashMap::new(),
         match_arm_locals: Vec::new(),
+        method_context: None,
     };
     walker.visit(root);
+    // Schema method bodies are not reached by the entry-root walk
+    // above. Run the dedicated privacy pass over each declared method
+    // body so cross-schema `#internal` calls are rejected statically —
+    // the runtime performs no method-privacy enforcement at all, so
+    // this pass is the only gate.
+    walker.check_schema_method_privacy();
 }
 
 struct Walker<'a> {
@@ -176,6 +183,13 @@ struct Walker<'a> {
     /// `msg match { Email: msg.address }`, the `Email` arm temporarily
     /// treats `msg` as the `Notification.Email` payload record.
     match_arm_locals: Vec<std::collections::HashMap<String, InferredType>>,
+    /// Name of the schema whose method body the walker is currently
+    /// inside, set only by the method-body privacy pass
+    /// (`check_schema_method_privacy`). `in_method_block(schema)`
+    /// consults this so `#internal` sibling-method calls from the same
+    /// schema's bodies stay legal while every external call site —
+    /// including other schemas' method bodies — is rejected.
+    method_context: Option<String>,
 }
 
 impl<'a> Walker<'a> {
