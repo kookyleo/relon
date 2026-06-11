@@ -9,9 +9,9 @@
 //!
 //! - `<sha256>.relon-native-v1` — relon-object-cache format. Holds
 //!   the linked ET_DYN bytes plus the HMAC-protected metadata
-//!   trailer. Reserved for the dlopen execution path which v5-γ
-//!   wires up via [`load_object_bytes`] but does not yet *invoke*
-//!   directly (see "Deferred dlopen execution" below).
+//!   trailer. Executed directly on the next cold start via the
+//!   dlopen path in `AotEvaluator::from_cache_dir` (see "dlopen
+//!   execution" below).
 //!
 //! - `<sha256>.relon-ir-v1` — the legacy v5-β-1 IR cache produced by
 //!   [`crate::cache::serialize`]. Holds the IR module + sandbox
@@ -22,12 +22,12 @@
 //! linker, HMAC error, or unsupported triple downgrades the cache
 //! write to a logged warning and the in-mem JIT still runs.
 //!
-//! ## Deferred dlopen execution
+//! ## dlopen execution (landed in v5-γ stage 2)
 //!
-//! The linked ET_DYN bytes reference the sandbox helper symbols
-//! (`relon_now`, `relon_raise_trap`, `relon_cap_lookup`) and the
-//! lambda functions as ELF imports. Resolving them at `dlopen` time
-//! requires either:
+//! Originally the linked ET_DYN bytes referenced the sandbox helper
+//! symbols (`relon_now`, `relon_raise_trap`, `relon_cap_lookup`) and
+//! the lambda functions as ELF imports, so executing them at `dlopen`
+//! time required one of:
 //!
 //! 1. Building the host with `-rdynamic` so the main binary's
 //!    dynamic-symbol table exports the Rust `extern "C"` helpers, or
@@ -35,18 +35,17 @@
 //!    that the host populates after `dlopen` returns.
 //!
 //! Path (1) is fragile across host build configurations (`cargo test`
-//! binaries don't pass `-rdynamic` by default). Path (2) requires
-//! threading a `RELON_HELPER_VTABLE` GlobalValue through every helper
-//! call site in `codegen.rs` — a multi-stage refactor that lands in a
-//! follow-up phase.
-//!
-//! For v5-γ we therefore land the cache **write** path (parallel to
-//! the JIT compile so the ET_DYN bytes are persisted), the cache
-//! **load** path (round-trips through `relon-object-cache` so the
-//! integrity / HMAC story is exercised), and the **fast restore**
-//! through the IR cache (skips parse + analyze + lower). The
-//! ET_DYN bytes round-trip in this phase serves the dlopen-execution
-//! M2 milestone that activates in a follow-up.
+//! binaries don't pass `-rdynamic` by default), which is why the
+//! execution path was initially deferred. Stage 2 landed path (2):
+//! every host helper call now indirects through the fixed-layout
+//! `__relon_capability_vtable` data symbol (see [`crate::vtable`]),
+//! so the cached ET_DYN references exactly one external data symbol
+//! the host fills after `dlopen` returns. `AotEvaluator::from_cache_dir`
+//! drives the production chain: HMAC-verified load → metadata /
+//! generator-version match → schema-sidecar HMAC verify → memfd
+//! dlopen → dlsym (`run_main` + vtable + closure symbols) → vtable
+//! populate → execute. Any stage failing invalidates the triple,
+//! logs a `warn!`, and falls back to the in-process compile path.
 //!
 //! ## Authentication invariant (#171)
 //!
@@ -437,8 +436,10 @@ pub fn try_store_to_cache(
 pub struct LoadedCache {
     /// Decoded IR-cache entry — IR module + sandbox config.
     pub ir_entry: IrCacheEntry,
-    /// Linked ET_DYN bytes from the relon-object-cache file. Reserved
-    /// for the dlopen execution path landing in a follow-up phase.
+    /// Linked ET_DYN bytes from the relon-object-cache file. Consumed
+    /// by the dlopen execution path (`AotEvaluator::from_cache_dir`),
+    /// which loads them via memfd + `/proc/self/fd` after the schema
+    /// sidecar's HMAC has also been verified.
     pub object_bytes: Vec<u8>,
     /// SHA-256 of `object_bytes`. Surfaced so the schema-cache loader
     /// can verify the sidecar's HMAC binds to the same ET_DYN the
@@ -637,11 +638,11 @@ fn metadata_compatible(file: &Metadata, expected: &Metadata) -> bool {
 }
 
 /// Resolve raw ELF bytes (returned by [`try_load_from_cache`]) into a
-/// callable [`relon_object_cache::LoadedObject`]. Today this is used
-/// by smoke tests / benches to validate the loader API; the
-/// production `from_cache` path uses the IR-cache fast restore. The
-/// dlopen-execution wiring lands in the follow-up vtable-indirection
-/// phase referenced in the module-level doc.
+/// callable [`relon_object_cache::LoadedObject`]. Thin convenience
+/// wrapper used by smoke tests / benches; the production dlopen path
+/// (`AotEvaluator::from_cache_dir`) calls
+/// `LoadedObject::from_bytes` directly with the full symbol set
+/// (`run_main` + vtable + closure symbols).
 pub fn load_object_bytes(
     object_bytes: &[u8],
     expected_symbols: &[&str],
