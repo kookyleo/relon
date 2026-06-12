@@ -14,7 +14,7 @@ Relon 自己承担这些语言层保证：
 | --- | --- |
 | 确定性 | 语言 builtin 不读取时间、随机数、环境变量、文件、网络或进程状态。 |
 | 显式 trust | `--trust`、`*_trusted`、`TrustLevel::Trusted` 都是宿主 opt-in；脚本不能给自己授权。 |
-| 能力词汇 | `Capabilities` 命名语言/宿主权限，如文件 import、network、clock、subprocess、受闸门控制的 native fn。 |
+| 能力词汇 | `Capabilities` 命名语言/宿主权限：`reads_fs`、`writes_fs`、`network`、`reads_clock`、`reads_env`、`uses_rng`，以及受这些 bit 闸门控制的 native fn。 |
 | 静态能力诊断 | analyzer 会对静态可见的 gated call 报告缺失授权。 |
 | 运行时拒绝 | evaluator/backend 会拒绝未授权 capability bit，而不是静默调用宿主代码。 |
 | 正确性 trap | 除零、数值溢出、缺失 `#main` 参数、不支持的后端形状、越界、校验失败都会作为错误浮现。 |

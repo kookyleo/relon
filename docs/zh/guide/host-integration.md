@@ -79,9 +79,9 @@ variant 不从裸字符串解码。
 {
     #schema User { String name: *, String tier: * },
     #schema Post { String title: * },
-    #schema PostList List<Post>,
-    summary: f"${user.name} has ${len(posts)} posts",
-    eligible: len(posts) > 10 && user.tier == "gold"
+    #schema PostList { List<Post> items: * },
+    summary: f"${user.name} has ${len(posts.items)} posts",
+    eligible: len(posts.items) > 10 && user.tier == "gold"
 }
 ```
 
@@ -326,7 +326,7 @@ ctx.register_fn("http.get",
 );
 ```
 
-```relon
+```text
 // 脚本内主动拉数据
 {
     user: http.get("/api/user/" + user_id),
@@ -506,7 +506,12 @@ let value = TreeWalkEvaluator::new(Arc::new(ctx))
 
 - **`functions`** — 通过 `register_fn` 注册的原生函数表（纯函数走便捷封装 `register_pure_fn`）。
 - **`decorators`** — 通过 `register_decorator` 注册的装饰器插件。
-- **`module_resolvers`** — `#import` 走的解析器链；`Context::sandboxed()` 默认是 `[StdModuleResolver, FilesystemModuleResolver::default()]`。
+- **`module_resolvers`** — `#import` 走的解析器链。注意：
+  `Context::sandboxed()` 本身只记录 sandbox 姿态；当它被
+  `TreeWalkEvaluator::new` 包装，或宿主先调用
+  `TreeWalkEvaluator::prepare_in_place(&mut ctx)` 时，tree-walk 后端才会
+  安装 `StdModuleResolver`，并在 sandboxed 姿态下追加
+  `FilesystemModuleResolver::default()` 作为 default-deny tail。
 - **`capabilities`** — 宿主授予的能力位（[沙箱与权限](./sandbox.md) 详解）。
 - **资源预算** — 目前通过 `ResourceBudget` 桥接到 `Capabilities` 上的
   evaluator 兼容字段。
@@ -523,8 +528,8 @@ let value = TreeWalkEvaluator::new(Arc::new(ctx))
 
 | 构造器 | 默认安全等级 |
 | --- | --- |
-| `Context::sandboxed()` | 沙箱姿态：filesystem 默认拒绝、capability 全空、只剩 `std/...` 虚拟模块；单独使用并不是多租户边界 |
-| `Context::new()` | 轻量基础构造器：只挂载虚拟 std 模块与内置纯函数；需要真实 workloads 时优先用 `Context::sandboxed()` 并显式授权 |
+| `Context::sandboxed()` | 沙箱姿态：capability 全空；交给 tree-walk 后端准备后，`std/...` 虚拟模块可用，本地 filesystem import 由 default-deny resolver 拒绝。单独使用并不是多租户边界 |
+| `Context::new()` | 轻量基础构造器：capability 全空，不设置 sandboxed default-deny tail；tree-walk 后端准备后会安装 stdlib / decorators / `std/...` resolver。需要不可信 workloads 时优先用 `Context::sandboxed()` 并显式授权 |
 | `Capabilities::all_granted()` + `FilesystemModuleResolver::trusted()` | 宿主自有脚本的显式全开形态：filesystem 全开、门控 native fn 全放、无步数 / 大小预算 |
 
 ## 注册一个原生函数
@@ -551,6 +556,7 @@ ctx.register_pure_fn("app_version", Arc::new(AppVersion));
 之后在 `.relon` 里：
 
 ```relon
+#relaxed
 {
     version: app_version()
 }
@@ -564,6 +570,9 @@ ctx.register_pure_fn("app_version", Arc::new(AppVersion));
 - `NativeArgs` 同时拆好了 positional 和 named 参数：`args.get(0)` 拿位置参数，`args.get_named("name")` 拿命名参数。
 - 函数返回 `Value`——Relon 的内存值类型；想构造 dict / list / tuple 用
   `Value::Dict` / `Value::List` / `Value::tuple(...)`。
+- 这里的 Rust 片段只演示 runtime 注册。strict analyzer 要在静态阶段
+  认识 host fn，还需要宿主把同名签名接进分析配置；否则动态 host fn
+  示例应像上面一样用 `#relaxed`，让 runtime 边界兜底。
 
 ## 受 capability 门控的注册
 

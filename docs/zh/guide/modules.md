@@ -24,7 +24,7 @@
 
 ```relon
 // main.relon
-#import theme from "./lib.relon",
+#import theme from "./lib.relon"
 {
     // 调用 theme 模块内定义的工具函数或颜色变量
     button_color: theme.colors.primary,
@@ -39,7 +39,7 @@
 如果你有一堆通用的 Schema 或者常用的纯函数，每次都通过命名空间来调用可能会显得累赘。这时可以用 `*`，它会将目标文件顶层抛出的所有变量「解构」合并进当前作用域。
 
 ```relon
-#import * from "./helpers.relon",
+#import * from "./helpers.relon"
 {
     // 如果 helpers.relon 导出了 shout 函数，你可以直接在这里使用
     msg: shout("hello")
@@ -51,10 +51,10 @@
 只想引入若干个名字、可能伴随重命名时使用：
 
 ```relon
-#import { upper, lower as lo } from "std/string",
+#import { upper, lower as lo } from "std/string"
 {
-    a: upper("hello"),
-    b: lo("WORLD")
+    String a: upper("hello"),
+    String b: lo("WORLD")
 }
 ```
 
@@ -69,11 +69,11 @@
 // helpers.relon
 {
     // 将被平铺导入
-    shout(v): v + "!!!",
+    String shout(String v): v + "!!!",
 
     // 私有助手函数：不会被任何 #import 形式带出去
     #internal
-    add(a, b): a + b
+    Int add(Int a, Int b): a + b
 }
 ```
 
@@ -92,7 +92,7 @@
 钉**，语法为 `<算法>:"<十六进制摘要>"`，当前支持的算法只有
 `sha256`：
 
-```relon
+```text
 #import rules from "https://example.com/pricing.relon" sha256:"3f2a…c9"
 #import lib from "./lib.relon" sha256:"8d41…07"
 ```
@@ -120,10 +120,10 @@ Relon 没有「文件级别 library/entry 标记」这一概念。是否有 `#ma
 
 ```relon
 // app/main.relon —— 入口程序
-#import * from "../platform/notify.relon",
-#main(Notification notice)
+#import * from "../platform/notify.relon"
+#main(Notification notice) -> Dict<String, String>
 {
-    delivered: notice.title + " (via " + notice.via + ")"
+    delivered: notice.title
 }
 ```
 

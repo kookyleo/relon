@@ -404,6 +404,7 @@ fn test_virtual_stdlib_modules() {
         {
             "first": list.first([10, 20, 30]),
             "compact": list.compact([1, Option.None {}, 2]),
+            "flat": list.flatten([[1, 2], [3]]),
             "clamped": math.clamp(12, 0, 10),
             "defaulted": value.default(Option.None {}, "fallback"),
             "kept_false": value.default(false, true),
@@ -420,6 +421,10 @@ fn test_virtual_stdlib_modules() {
         assert_eq!(
             map.map.get("compact").unwrap(),
             &Value::list(vec![Value::Int(1), Value::Int(2)])
+        );
+        assert_eq!(
+            map.map.get("flat").unwrap(),
+            &Value::list(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
         );
         assert_eq!(map.map.get("clamped").unwrap(), &Value::Int(10));
         assert_eq!(
