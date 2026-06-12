@@ -24,7 +24,9 @@
 //! later phases will add the fallbacks.
 
 use std::collections::HashMap;
-use std::ffi::{c_void, CString};
+use std::ffi::c_void;
+#[cfg(target_os = "linux")]
+use std::ffi::CString;
 
 use crate::error::LoaderError;
 

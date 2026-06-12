@@ -49,6 +49,7 @@
 
 pub mod elf_check;
 pub mod error;
+#[cfg(unix)]
 pub mod linker_subproc;
 
 #[cfg(feature = "lld-inproc")]
@@ -56,6 +57,7 @@ pub mod linker_lld;
 
 pub use elf_check::{is_et_dyn, is_et_rel, parse_elf_type, ElfType};
 pub use error::LinkError;
+#[cfg(unix)]
 pub use linker_subproc::SubprocLinker;
 
 #[cfg(feature = "lld-inproc")]
@@ -68,7 +70,13 @@ pub use linker_lld::LldLinker;
 /// (`x86_64-unknown-linux-gnu`, …). Only `x86_64-*-linux-*` triples
 /// are accepted today; everything else returns
 /// [`LinkError::UnsupportedTriple`].
+#[cfg(unix)]
 pub fn link_to_dyn(et_rel_bytes: &[u8], target_triple: &str) -> Result<Vec<u8>, LinkError> {
     let linker = SubprocLinker::new()?;
     linker.link(et_rel_bytes, target_triple)
+}
+
+#[cfg(not(unix))]
+pub fn link_to_dyn(_et_rel_bytes: &[u8], target_triple: &str) -> Result<Vec<u8>, LinkError> {
+    Err(LinkError::UnsupportedTriple(target_triple.to_owned()))
 }
