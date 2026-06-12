@@ -1471,7 +1471,7 @@ mod tests {
     Int rollout_bucket: (Int n) -> Bool => n >= 0 && n < 100
 }
 
-#main(User user) -> Dict
+#main(User user)
 {
     flags: {
         legacy_checkout: false,

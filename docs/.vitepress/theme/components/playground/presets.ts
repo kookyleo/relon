@@ -6,12 +6,11 @@
 //
 // Each preset declares its own `entry` plus a `runnableInSandbox` flag.
 // When `false`, the playground will still call `evaluate()` (we don't
-// want a special-case branch that hides errors) — but a dismissable
-// banner explains why an `EvalError` is the expected outcome. The four
-// `#main(...)` examples need either CLI `--args` or host-registered
-// native functions; running them in the in-browser sandbox surfaces a
-// genuine, demo-correct failure, and the banner points users at the
-// CLI command that does work.
+// want a special-case branch that hides errors) — but a contextual
+// banner explains why an `EvalError` is the expected outcome. Most
+// `#main(...)` examples are runnable here because they carry
+// `defaultArgs`; presets that need host-only wiring should remain
+// explicit rather than failing as the first impression.
 
 export interface PresetFile {
     path: string;
@@ -99,39 +98,34 @@ const PRICING_MAIN = `/*
 `;
 
 const FEATURE_FLAG_MAIN = `/*
-  Runtime feature-flag evaluator.
+  Feature flags as a deterministic decision table.
 
-  Percentage rollouts need a host-registered \`native_hash(s) -> Int\`.
-  See examples/feature_flag.relon for the full annotated source.
-
-  #relaxed lets the demo keep its untyped closure params in
-  schema validators / helper fns; analyzer strict mode would
-  otherwise require explicit parameter types.
+  The host computes a stable rollout bucket before evaluation and pushes
+  it with the user. Relon stays pure: no clock, no RNG, no native hash.
 */
-#relaxed
 #schema User {
     String id: * ,
-    String region: (r) => r == "us" || r == "eu" || r == "apac",
-    String plan: (p) => p == "free" || p == "pro" || p == "enterprise"
+    #expect "region must be us / eu / apac"
+    String region: (String region) -> Bool => region == "us" || region == "eu" || region == "apac",
+    #expect "plan must be free / pro / enterprise"
+    String plan: (String plan) -> Bool => plan == "free" || plan == "pro" || plan == "enterprise",
+    #expect "rollout_bucket must be 0..99"
+    Int rollout_bucket: (Int n) -> Bool => n >= 0 && n < 100
 }
-#main(User user) -> Dict<String, Dict<String, Bool>>
+
+#main(User user)
 {
-    #internal
-    hash_mod_100(s): native_hash(s) % 100,
-    #internal
-    rules: {
-        legacy_checkout: (u) => false,
-        dark_mode: (u) => true,
-        gdpr_banner: (u) => u.region == "eu",
-        advanced_editor: (u) => u.plan == "pro" || u.plan == "enterprise",
-        new_search: (u) => hash_mod_100(u.id) < 25
-    },
     flags: {
-        legacy_checkout: rules.legacy_checkout(user),
-        dark_mode: rules.dark_mode(user),
-        gdpr_banner: rules.gdpr_banner(user),
-        advanced_editor: rules.advanced_editor(user),
-        new_search: rules.new_search(user)
+        legacy_checkout: false,
+        dark_mode: true,
+        gdpr_banner: user.region == "eu",
+        advanced_editor: user.plan == "pro" || user.plan == "enterprise",
+        new_search: user.rollout_bucket < 25
+    },
+    audit: {
+        subject: user.id,
+        bucket: user.rollout_bucket,
+        ruleset: "2026-06-11"
     }
 }
 `;
@@ -237,10 +231,9 @@ export const PRESETS: Preset[] = [
         label: 'feature_flag',
         files: [{ path: 'main.relon', content: FEATURE_FLAG_MAIN }],
         entry: 'main.relon',
-        runnableInSandbox: false,
-        note: '`#main(User user)` expects a `user` argument *and* a host-registered `native_hash` fn. The Args input takes care of the first; the browser sandbox can\'t register host fns, so evaluate still fails on `new_search` — see the host-integration guide for wiring.',
+        runnableInSandbox: true,
         defaultArgs: `{
-  "user": { "id": "u123", "region": "us", "plan": "pro" }
+  "user": { "id": "alice-42", "region": "eu", "plan": "pro", "rollout_bucket": 17 }
 }`,
     },
     {
