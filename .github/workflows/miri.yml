@@ -14,8 +14,9 @@ name: miri
 #   * Cargo.lock          — external dep version bumps (ordered-float / serde
 #                           etc.) that can shift a value layout
 #   * this workflow file
-# When it does run it uses the full proptest case count (no miri-only
-# reduction), so there is no fuzzing-density loss on the paths that matter.
+# When it does run, it exercises the same property families as native tests.
+# The test crate reduces per-property case count under `cfg(miri)` because
+# interpreter execution is orders of magnitude slower than native proptest.
 on:
   push:
     branches: [main]
@@ -48,8 +49,8 @@ jobs:
     # stable-job coverage.
     name: miri (unsafe modules)
     runs-on: ubuntu-latest
-    # Full proptest density under miri (~10-100x slower than native) takes
-    # the better part of an hour; give it room since this job is rare.
+    # Miri is still substantially slower than native tests; give it room
+    # since this job is rare and protects the unsafe buffer/verifier surface.
     timeout-minutes: 90
     steps:
       - name: Checkout
