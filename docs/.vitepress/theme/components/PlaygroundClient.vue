@@ -2205,7 +2205,7 @@ watch([files, entry, argsInput], () => {
   background: var(--vp-c-bg);
   font-family: var(--vp-font-family-base);
   font-size: 14px;
-  /* Containing block for the floating `.rp-errors` overlay below. */
+  /* Stable containing block for local menus and overlay dialogs. */
   position: relative;
 }
 
@@ -3188,8 +3188,9 @@ watch([files, entry, argsInput], () => {
 
 /* Errors dock — Chrome devtools style. Collapsed: just the header.
    Open: header + draggable top edge + scrollable body sized to
-   `errorsHeight`. The dock never pushes the editor off-screen because
-   the body owns its own overflow. */
+   `errorsHeight`. It is a normal flex sibling of `.rp-panes`, so it
+   pushes the editor/output area up instead of covering their scroll
+   ranges. */
 .rp-errors {
   border-top: 2px solid var(--vp-c-divider);
   background: var(--vp-c-bg-alt, var(--vp-c-bg-soft));
@@ -3204,25 +3205,6 @@ watch([files, entry, argsInput], () => {
   /* Height comes from inline style bound to `errorsHeight`. */
   min-height: 0;
   overflow: hidden;
-}
-
-/* Desktop: float the panel over the bottom of the playground so
-   expanding/dragging it never shifts the editor or output panes.
-   Mobile (≤768px) keeps the flow-based layout — see media query below. */
-@media (min-width: 769px) {
-  .rp-errors {
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    z-index: 2;
-  }
-  /* Reserve space under both panes equal to the collapsed header
-     (24px min-height + 2px border-top) so the last editor/output line
-     is never hidden under the floating header bar. */
-  .rp-panes {
-    padding-bottom: 26px;
-  }
 }
 
 /* Title bar doubles as the drag handle when the panel is open. */
