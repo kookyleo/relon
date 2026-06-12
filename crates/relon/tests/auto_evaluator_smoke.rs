@@ -47,6 +47,7 @@ const MAIN_SOURCE: &str = "#main(Int x) -> Int\nabs(x) * 2";
 /// a program error), auto adapts by running the tree-walk oracle instead
 /// of surfacing the error. The `x: Int` param matches the args the tests
 /// push.
+#[cfg(feature = "cranelift-aot")]
 const AOT_REJECTED_MAIN: &str = "#main(Int x) -> List<List<Int>>\n[[x]]";
 
 #[test]
@@ -103,6 +104,7 @@ fn lazy_aot_init_skipped_for_eval_on_arbitrary_node() {
     );
 }
 
+#[cfg(feature = "cranelift-aot")]
 #[test]
 fn run_main_routes_through_aot_and_caches() {
     // First `run_main` call must spin up the AOT backend, produce the
@@ -125,6 +127,7 @@ fn run_main_routes_through_aot_and_caches() {
     assert_eq!(out2, Value::Int(42));
 }
 
+#[cfg(feature = "cranelift-aot")]
 #[test]
 fn aot_unsupported_shape_falls_back_without_poisoning_tree_walk_surface() {
     // When the AOT pipeline rejects the source because it can't express
@@ -232,6 +235,7 @@ fn run_main_value_parity_auto_vs_tree_walk() {
     }
 }
 
+#[cfg(feature = "cranelift-aot")]
 #[test]
 fn concurrent_run_main_only_builds_aot_once() {
     // Spawn N threads racing on `run_main`. The `OnceLock` slot
