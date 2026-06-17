@@ -31,13 +31,22 @@ export interface Preset {
 
 const DEMO_MAIN = `// Try editing me - evaluate runs automatically.
 //
-// #relaxed keeps the untyped closure params in the helper functions;
-// strict mode by default would require explicit parameter types.
-#relaxed
+// Strict (default) mode: closure/function params need explicit types,
+// and a path-referenced dict (here &root.project.name in the f-string)
+// needs a schema so the analyzer can derive each field's type.
+#schema Details {
+    Int base_price: *,
+    Float total: *,
+    String display: *
+}
+#schema Project {
+    String name: *,
+    Details details: *
+}
 {
-    currency(val, symbol): val + " " + symbol,
-    multiply(a, b): a * b,
-    project: {
+    String currency(Float val, String symbol): val + " " + symbol,
+    Float multiply(Int a, Float b): a * b,
+    Project project: {
         name: "Relon Playground",
         details: {
             base_price: 1500,
@@ -57,35 +66,34 @@ const PRICING_MAIN = `/*
   Invoice pricing with tiered discounts and tax.
   See examples/pricing.relon in the repo for the full annotated source.
 
-  Uses #relaxed to keep the existing untyped closure params in the
-  helper functions; analyzer strict mode would otherwise demand
-  explicit closure-parameter types.
+  Strict (default) mode: every closure/function parameter carries an
+  explicit type and each schema #expect validator is written with typed
+  params and a Bool return type.
 */
-#relaxed
 #schema LineItem {
     String sku: * ,
     #expect "qty must be > 0"
-    Int qty: (n) => n > 0,
+    Int qty: (Int n) -> Bool => n > 0,
     #expect "unit_price must be >= 0"
-    Float unit_price: (p) => p >= 0
+    Float unit_price: (Float p) -> Bool => p >= 0
 }
 #schema Order {
     List<LineItem> items: * ,
     #expect "tier must be one of: standard / gold"
-    String tier: (t) => t == "standard" || t == "gold"
+    String tier: (String t) -> Bool => t == "standard" || t == "gold"
 }
 #main(Order order)
 {
     #internal
-    currency(symbol, val): symbol + " " + val,
+    String currency(Float symbol, String val): symbol + " " + val,
     #internal
-    volume_rate(sub): sub >= 1000 ? 0.10: sub >= 500 ? 0.05: 0.0,
+    Float volume_rate(Float sub): sub >= 1000 ? 0.10: sub >= 500 ? 0.05: 0.0,
     #internal
-    loyalty_rate(tier): tier == "gold" ? 0.03: 0.0,
+    Float loyalty_rate(String tier): tier == "gold" ? 0.03: 0.0,
     #internal
     tax_rate: 0.08,
     #internal
-    sum_floats(xs): _list_reduce(xs, 0.0, (a, x) => a + x),
+    Float sum_floats(List<Float> xs): _list_reduce(xs, 0.0, (a, x) => a + x),
     subtotal: sum_floats([it.qty * it.unit_price for it in order.items]),
     discount_rate: volume_rate(&sibling.subtotal) + loyalty_rate(order.tier),
     discount_amount: &sibling.subtotal * &sibling.discount_rate,
@@ -137,14 +145,14 @@ const WORKFLOW_MAIN = `/*
     cargo run -q -p relon-cli -- run examples/workflow.relon \\
         --args '{"state": "placed", "event": "pay"}'
 
-  #relaxed lets the schema validators use untyped closure
-  params; strict mode by default would error otherwise.
+  Strict mode: the schema validators and the #internal helper carry
+  explicit parameter and return types, and matched is typed so the
+  ternaries' field reads resolve statically.
 */
-#relaxed
 #schema Transition {
-    String from: (s) => s == "placed" || s == "paid" || s == "shipped",
+    String from: (String s) -> Bool => s == "placed" || s == "paid" || s == "shipped",
     String on: * ,
-    String to: (s) => s == "paid" || s == "shipped" || s == "delivered" || s == "cancelled",
+    String to: (String s) -> Bool => s == "paid" || s == "shipped" || s == "delivered" || s == "cancelled",
     List<String> emit: *
 }
 #main(String state, String event)
@@ -158,11 +166,11 @@ const WORKFLOW_MAIN = `/*
         #brand Transition { from: "paid",   on: "cancel",  to: "cancelled", emit: ["refund_card"] }
     ],
     #internal
-    match_one(t): t.from == state && t.on == event,
+    match_one(Transition t) -> Bool: t.from == state && t.on == event,
     #internal
-    matched: _list_filter(&sibling.transitions, &sibling.match_one),
-    next_state: len(matched) > 0 ? matched[0].to: state,
-    emit: len(matched) > 0 ? matched[0].emit: ["unhandled_event"]
+    List<Transition> matched: _list_filter(&sibling.transitions, &sibling.match_one),
+    next_state: len(matched) > 0 ? matched.0.to: state,
+    emit: len(matched) > 0 ? matched.0.emit: ["unhandled_event"]
 }
 `;
 
@@ -176,7 +184,8 @@ const MODULES_MAIN = `// Three #import shapes — try Mod-clicking any imported 
 //
 // #relaxed propagates from the entry to every reachable #import target,
 // so lib.relon's untyped closure params (with_tax / format_price / discount)
-// are accepted without explicit type annotations.
+// are accepted without explicit type annotations. This is the playground's
+// one deliberate #relaxed demo; every other preset uses strict (the default).
 #relaxed
 #import lib from "./lib.relon"
 #import { format_price } from "./lib.relon"
