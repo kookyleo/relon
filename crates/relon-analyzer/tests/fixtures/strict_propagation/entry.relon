@@ -1,5 +1,5 @@
-// Default-strict entry that imports a library with a silent-fallback
-// shape. The entry's strict mode propagates onto the lib via workspace
-// contagion, surfacing the spread-source-unknown diagnostic.
+// Default-strict entry that imports a directive-less library with a
+// silent-fallback shape. Strictness is file-local, so the lib is strict
+// on its own and surfaces the spread-source-unknown diagnostic itself.
 #import * from "./lib.relon"
 { x: 1 }

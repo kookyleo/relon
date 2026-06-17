@@ -305,11 +305,13 @@ fall back to `Any` (and defer to runtime) produce errors:
 - A call to a native fn whose return type isn't registered in
   `host_fn_signatures` → `NativeFnSignatureMissing`.
 
-**Contagion**: strict is decided at the entry. A strict entry (the
-default — no directive needed) makes every imported library run under
-strict rules, even one that didn't write `#relaxed` itself. A
-`#relaxed` entry stamps the cleared bit on every reachable import, so
-the workspace presents a single mode end to end.
+**Per-module**: strictness is file-local — every module is strict by
+default and opts out only via its OWN `#relaxed`. An entry's `#relaxed`
+is not stamped onto the libraries it imports: a directive-less library
+is always analysed strictly, no matter who imports it. The
+whole-program "no silent `Any`" guarantee comes from boundary
+enforcement — a strict module won't statically accept an `Any` from a
+`#relaxed` dependency, erroring at the use site.
 
 For the full strict semantics, the complete diagnostic list, `<T>`
 typehint syntax, and `Dict<K, V>` generics, see spec §6.6.

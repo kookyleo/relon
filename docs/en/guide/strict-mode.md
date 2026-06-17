@@ -25,22 +25,28 @@ sites fall back to a runtime-checked dynamic value.
 > also share every "this is statically wrong" error — strict mode
 > only adds the "we don't have enough information" errors on top.
 
-## Contagion across `#import`
+## Strictness across `#import` (per-module)
 
-Strict mode is decided at the **entry**. The entry's mode is stamped
-onto every reachable `#import` target, so the workspace presents a
-single mode end to end:
+Strictness is **per module (file-local)**: every module is strict by
+default and opts out only via its OWN `#relaxed` / `#unstrict`. A
+module's directive governs only that module — an entry's `#relaxed` is
+**not** stamped onto the libraries it imports.
 
-- A strict entry (the default — no directive needed) makes every
-  reachable import strict, even libraries that didn't write
-  `#relaxed` themselves. This prevents the entry from inheriting
-  silent fallbacks from a library that happened to be lax.
-- A `#relaxed` entry stamps the cleared bit on every reachable
-  import. A library that internally would have been strict is
-  analysed in relaxed mode for the duration of this workspace build,
-  so a strict library doesn't tighten a relaxed entry by accident.
+- A directive-less library is always analysed strictly, no matter who
+  imports it — a `#relaxed` entry does not relax it.
+- For a library to be relaxed, it must declare `#relaxed` at the top of
+  its OWN file; that opt-out applies to that library alone.
 
-Strict is a top-down policy: the entry's mode wins.
+So what preserves the whole-program "no silent `Any`" guarantee? Not
+contagion, but **boundary enforcement**: a strict module won't
+statically accept an `Any` produced by a `#relaxed` dependency — it
+errors at the use site (the dependency itself is neither re-checked nor
+relaxed by the consumer).
+
+This matches mainstream practice: TypeScript, Rust, Sorbet, C#, Dart,
+and JS all make strictness a per-file/per-module choice; Safe Haskell
+turns it into an inward import constraint. A consumer never downgrades
+a dependency.
 
 ## Cross-mode errors (fire in both modes)
 
@@ -143,9 +149,9 @@ lock-step with the analyzer.
 
 - Production rule files (pricing, scoring, validation) where you
   want a build-time guarantee that no value silently lands on `Any`.
-- Workspace libraries imported by strict entries — the contagion
-  rule means a relaxed library still gets analysed strictly when
-  pulled into a strict entry.
+- Shared workspace libraries — a library is strict by default (unless
+  it writes its own `#relaxed`), so it can't hide silent fallbacks,
+  regardless of who imports it.
 - Code that targets the AOT compilation path: the type-driven
   optimizations described in the
   [architecture overview](./architecture.md) only fire when every

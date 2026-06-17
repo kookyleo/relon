@@ -281,10 +281,10 @@ Relon 的 analyzer 默认就是严格模式：当前文件以及它通过 `#impo
 - 调用未在 `host_fn_signatures` 登记返回类型的 native fn →
   `NativeFnSignatureMissing`
 
-**传染性**：严格性由入口决定——严格入口（默认行为）会让所有被它 import
-的库（哪怕没写 `#relaxed`）都按严格校验，防止 silent fallback 从松弛
-库渗透进严格入口；`#relaxed` 入口则把清零位印到每一个可达 import 上，
-让 workspace 端到端只呈现一种模式。
+**按模块各管各的**：严格性是文件级的——每个模块默认严格，只能用它自己
+头部的 `#relaxed` 退出。入口的 `#relaxed` 不会被印到它 import 的库上：
+没写指令的库始终按严格校验，无论谁导入它。整程序「不漏 `Any`」靠边界
+拦截——严格模块不会静态接受 `#relaxed` 依赖产出的 `Any`，会在使用点报错。
 
 完整的严格模式语义、诊断列表、`<T>` typehint 语法、`Dict<K, V>`
 泛型，详见规范 §6.6。

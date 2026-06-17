@@ -522,13 +522,18 @@ file-level `Bare` directive `#relaxed` (or its exact synonym
 { ... }
 ```
 
-**Contagion rule**: strict mode is decided at the **entry**. The
-entry's mode is stamped onto every reachable `#import` target, so
-the workspace presents a single mode end to end. A strict entry
-analyses every reachable library under strict rules — preventing a
-relaxed library from sneaking silent fallbacks into a strict entry.
-A `#relaxed` entry stamps the cleared bit on every reachable import,
-so a strict library doesn't tighten a relaxed entry by accident.
+**Per-module rule**: strictness is file-local — every module is strict
+by default and opts out only via its OWN `#relaxed` / `#unstrict`, and
+a module's directive governs only that module. An entry's `#relaxed`
+is NOT stamped onto the libraries it `#import`s: a directive-less
+library is always analysed strictly, no matter who imports it; to
+relax a library, it must declare `#relaxed` at the top of its own file.
+The whole-program "no silent `Any`" guarantee comes from **boundary
+enforcement** — a strict module won't statically accept an `Any`
+produced by a `#relaxed` dependency, erroring at the use site (the
+dependency is neither re-checked nor relaxed by the consumer). This
+matches per-file/per-module mode in TypeScript, Rust, Sorbet, C#,
+Dart, and JS; Safe Haskell makes it an inward import constraint.
 
 **Diagnostic kinds** (all Error severity). Strict-mode checks split
 into *cross-mode* and *strict-only* buckets — see the

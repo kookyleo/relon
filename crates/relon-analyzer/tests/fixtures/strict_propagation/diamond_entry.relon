@@ -1,5 +1,5 @@
-// Diamond — entry imports b and c, both import d. Strict reaches
-// every node.
+// Diamond — entry imports b and c, both import d. Each directive-less
+// module is strict on its own (strictness is file-local).
 #import * from "./diamond_b.relon"
 #import * from "./diamond_c.relon"
 { x: 1 }

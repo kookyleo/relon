@@ -256,12 +256,12 @@ pub fn analyze_with_options(root: &Node, options: &AnalyzeOptions) -> AnalyzedTr
     // misconfigured.
     audit_host_fn_signatures(&mut tree);
     // Strict is the default; the source can opt out via `#relaxed` /
-    // `#unstrict`. The caller-supplied `strict_mode` flag is the
-    // workspace-level decision (contagion of the entry's mode to
-    // every reachable import); the per-file directive is the local
-    // override. The AND means a strict workspace can be overridden
-    // by a per-file opt-out (the contagion rule preserves this — a
-    // relaxed entry stamps `strict_mode: false` on every import).
+    // `#unstrict`. The caller-supplied `strict_mode` flag is the global
+    // default (normally `true`); the per-file directive is the local
+    // override. Strictness is file-local: each module's effective mode
+    // is the global default AND its OWN (non-)opt-out, so a `#relaxed`
+    // directive governs only the module that declares it — the entry's
+    // directive is never stamped onto the modules it imports.
     tree.strict_mode = options.strict_mode && !has_relaxed_directive(root);
     // Schema-rooted decision 21' (core.relon carrier): install the
     // built-in `String` / `List<T>` / `Dict<K, V>` / `Iter<T>` method
