@@ -1,0 +1,24 @@
+[package]
+name = "relon-aot-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Bench: relon LLVM-AOT native object vs literal hand-written Rust"
+publish = false
+
+[dependencies]
+# Shim ABI surface — the bench harness drives `SandboxState` exactly
+# the same way `relon-rs-demo` does, so the measured call site matches
+# the production embedding shape.
+relon-rs-shims = { workspace = true }
+# `include_relon!` splices the build.rs-generated bindings file in.
+relon-rs-macro = { workspace = true }
+
+[build-dependencies]
+# Drives parse + analyze + lower + LLVM emit of every bench `.relon`
+# source into a native `.o`. Pulls inkwell + llvm-sys transitively —
+# host must have LLVM 18 dev headers + `LLVM_SYS_181_PREFIX` set.
+relon-rs-build = { workspace = true }

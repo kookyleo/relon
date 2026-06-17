@@ -1,0 +1,4 @@
+#unstrict
+#import list from "std/list"
+#main(Int n) -> Int
+range(n).reduce(0, (acc, i) => acc + (i % 7) * (i % 13))

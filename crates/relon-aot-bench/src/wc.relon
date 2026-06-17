@@ -1,0 +1,4 @@
+#unstrict
+#import list from "std/list"
+#main(Int n) -> Int
+range(n).reduce(0, (acc, i) => i % 3 == 0 ? acc + i * i : (i % 3 == 1 ? acc + i : acc - i))

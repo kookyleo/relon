@@ -1,0 +1,3 @@
+#import list from "std/list"
+#main(List<Int> xs) -> Int
+list.sum(xs)
