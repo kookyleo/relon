@@ -19,6 +19,10 @@
 //! region — a clean verify is asserted, so the verifier and the reader
 //! agree on "this buffer is well-formed" for the entire generated value
 //! space (proptest auto-shrinks any counterexample).
+//! Native test runs keep 256 generated cases per property. Miri runs the
+//! same property set with fewer cases because interpreter execution makes
+//! full-density fuzzing too slow for CI; the fixed edge generators above
+//! still keep the layout/UTF-8/bounds cases in every run.
 //!
 //! This is the S0 round-trip gate: it does **not** exercise the
 //! compiled backends (no codegen output exists for these return shapes
@@ -35,6 +39,11 @@ use relon_eval_api::layout::SchemaLayout;
 use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
 use relon_eval_api::value::{Value, ValueDict};
 use relon_eval_api::verifier::{verify_record, Region};
+
+#[cfg(miri)]
+const PROPTEST_CASES: u32 = 16;
+#[cfg(not(miri))]
+const PROPTEST_CASES: u32 = 256;
 
 // --- scalar element generators ---------------------------------------
 
@@ -415,7 +424,7 @@ fn list_list_float_strat() -> impl Strategy<Value = Value> {
 fn _value_dict_marker(_: &ValueDict) {}
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(PROPTEST_CASES))]
 
     #[test]
     fn roundtrip_scalar_int(v in int_strat()) {
@@ -645,7 +654,7 @@ fn xr_servers_strat() -> impl Strategy<Value = Vec<(String, i64)>> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+    #![proptest_config(ProptestConfig::with_cases(PROPTEST_CASES))]
 
     /// A legal cross-region `Dict { servers: List<Cfg>, n }` arena must
     /// verify clean under the multi-region map for the whole value space.

@@ -41,6 +41,10 @@ fn collect_fixtures() -> Vec<(String, String)> {
     out
 }
 
+fn normalize_snapshot_text(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
 #[test]
 fn broken_fixtures_round_trip_through_cst() {
     let fixtures = collect_fixtures();
@@ -92,6 +96,7 @@ fn broken_fixtures_match_golden_summary() {
     // and inspecting the resulting diff.
     let mut buf = String::new();
     for (name, source) in collect_fixtures() {
+        let source = normalize_snapshot_text(&source);
         buf.push_str(&format!("=== {name} ===\n"));
         buf.push_str(&format!("source: {source:?}\n"));
         let parsed = parse_cst(&source);
@@ -112,11 +117,14 @@ fn broken_fixtures_match_golden_summary() {
     }
 
     let golden_path = broken_dir().join("snapshot.txt");
+    let buf = normalize_snapshot_text(&buf);
     if std::env::var_os("BLESS").is_some() {
         fs::write(&golden_path, &buf).expect("write golden");
         return;
     }
-    let existing = fs::read_to_string(&golden_path).unwrap_or_else(|_| String::new());
+    let existing = normalize_snapshot_text(
+        &fs::read_to_string(&golden_path).unwrap_or_else(|_| String::new()),
+    );
     if existing != buf {
         let actual_path = golden_path.with_extension("actual");
         fs::write(&actual_path, &buf).expect("write actual");

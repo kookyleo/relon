@@ -778,6 +778,14 @@ mod tests {
         display: String,
     }
 
+    fn normalize_golden_text(text: &str) -> String {
+        text.replace("\r\n", "\n")
+    }
+
+    fn normalize_diagnostic_golden_text(text: &str) -> String {
+        normalize_golden_text(text).replace('\\', "/")
+    }
+
     #[test]
     fn deserializes_from_str() {
         let config: ServerConfig = from_str(
@@ -980,8 +988,8 @@ mod tests {
             });
 
             assert_eq!(
-                actual,
-                expected,
+                normalize_golden_text(&actual),
+                normalize_golden_text(&expected),
                 "golden mismatch for {}",
                 rel_path.display()
             );
@@ -1037,7 +1045,11 @@ mod tests {
                 .with_extension("json");
             let expected = std::fs::read_to_string(&golden_path)
                 .unwrap_or_else(|e| panic!("failed to read {}: {e}", golden_path.display()));
-            assert_eq!(actual, expected, "golden mismatch for {rel_path}");
+            assert_eq!(
+                normalize_golden_text(&actual),
+                normalize_golden_text(&expected),
+                "golden mismatch for {rel_path}"
+            );
         }
     }
 
@@ -1059,7 +1071,11 @@ mod tests {
                 panic!("failed to read {}: {error}", expected_path.display())
             });
 
-            assert_eq!(actual, expected, "diagnostic mismatch for {rel_path}");
+            assert_eq!(
+                normalize_diagnostic_golden_text(&actual),
+                normalize_diagnostic_golden_text(&expected),
+                "diagnostic mismatch for {rel_path}"
+            );
         }
     }
 

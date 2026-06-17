@@ -102,7 +102,7 @@ plain JSON
 
 文件系统的真正执行点在 resolver：`FilesystemModuleResolver` 默认拒绝；`with_root_dir` 限定根目录；`trusted()` 全开。`reads_fs` / `writes_fs` 只是 capability 层的 bit。
 
-`Context::sandboxed()` 默认拒绝文件系统与有 bit 声明的原生函数；需要全开时显式设置 `Capabilities::all_granted()`（一次翻全 6 bit），并安装 `FilesystemModuleResolver::trusted()`。`Context::new()` 是轻量基础构造器：只挂载虚拟 std 模块与内置纯函数，不代表全开信任模式。
+`Context::sandboxed()` 默认拒绝文件系统与有 bit 声明的原生函数；需要全开时显式设置 `Capabilities::all_granted()`（一次翻全 6 bit），并安装 `FilesystemModuleResolver::trusted()`。`Context::new()` 是轻量基础构造器：它本身不表示全开信任模式；tree-walk 后端在 `TreeWalkEvaluator::new` / `prepare_in_place` 阶段才注入 stdlib、内置装饰器与 `std/...` resolver。
 
 详见[沙箱与权限](./sandbox.md)。
 
@@ -116,7 +116,7 @@ plain JSON
 
 ## 当前还在演进的部分
 
-- **跨语言 host**：v1 路线图是 C ABI cdylib（JSON 进 JSON 出），v2 加 native-fn callback；v3 看需求做 PyO3 / napi-rs 封装。**不**做跨语言类型/装饰器注册。
+- **跨语言 host**：首个公开版本的稳定嵌入面是 Rust。后续如果补跨语言边界，也应优先保持窄接口，例如 C ABI cdylib 的「JSON 进 JSON 出」或 native-fn 回调；是否提供 PyO3 / napi-rs 这类封装要另行设计。**不**把跨语言类型 / 装饰器注册纳入当前承诺。
 - **stdlib 厚度**：当前是 6 类约 30 个函数；`time` / `regex` / `path` / `base64` 在 roadmap 上。
 - **Analyzer 类型推导深度**：当前 typecheck 的「matched expr 类型推导」只覆盖 Reference 链，更复杂的表达式跳过。
 - **性能层**：已落地，不再是远期目标——Cranelift AOT 与 LLVM AOT 两个编译后端与 tree-walk 并行存在，`Backend::Auto` 是 SDK 默认选档（平凡标量短路 + 惰性编译 + 不支持形状响亮回退）。仍在演进的是冷启动链路：`.o` 对象缓存已就绪（每次编译写入并回读校验），dlopen 直接执行该对象的路径推迟到后续阶段。详见 [性能与执行后端](./performance.md)。

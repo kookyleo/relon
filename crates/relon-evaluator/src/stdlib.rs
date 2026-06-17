@@ -3177,11 +3177,12 @@ mod purity_guard {
     #[test]
     fn stdlib_rs_uses_no_ambient_apis() {
         let source = include_str!("stdlib.rs");
+        let source = source.replace("\r\n", "\n");
         // Trim this test's own banned-list literals and the leading
         // doc comment so the scan doesn't flag itself.
         let source = match source.find("#[cfg(test)]\nmod purity_guard") {
             Some(idx) => &source[..idx],
-            None => source,
+            None => source.as_str(),
         };
         let banned = [
             "std::fs",
