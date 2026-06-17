@@ -1,5 +1,6 @@
-// Entry fixture: `#relaxed` so the imported `lib.relon` is analysed in
-// the same mode (contagion) and untyped helper calls stay legible.
+// Entry fixture: `#relaxed` governs only this module (strictness is
+// per-file). `lib.relon` declares its OWN `#relaxed` so its untyped
+// helpers stay legible — the entry's directive does not reach it.
 #relaxed
 {
     // Namespace import (default)

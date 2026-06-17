@@ -1,4 +1,4 @@
-// A library whose closure body spreads an untyped param. Imported by
-// `entry.relon` (strict by default); strict contagion makes the
-// analyzer flag the inner `{ ...n }` whose source type is Any.
+// A library whose closure body spreads an untyped param. The lib is
+// directive-less, so it is strict on its own; the analyzer flags the
+// inner `{ ...n }` whose source type is Any.
 { f: (n) => { ...n } }

@@ -1,3 +1,4 @@
-// 2-hop chain — entry -> mid -> leaf, strict propagates.
+// 2-hop chain — entry -> mid -> leaf; each directive-less module is
+// strict on its own (strictness is file-local, not propagated).
 #import * from "./chain_mid.relon"
 { x: 1 }

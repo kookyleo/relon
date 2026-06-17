@@ -182,10 +182,13 @@ const WORKFLOW_MAIN = `/*
 const MODULES_MAIN = `// Three #import shapes — try Mod-clicking any imported name to
 // jump across files.
 //
-// #relaxed propagates from the entry to every reachable #import target,
-// so lib.relon's untyped closure params (with_tax / format_price / discount)
-// are accepted without explicit type annotations. This is the playground's
-// one deliberate #relaxed demo; every other preset uses strict (the default).
+// #relaxed is per-module (file-local): each module declares its own
+// mode. main.relon's #relaxed governs only main.relon, so it does NOT
+// reach lib.relon — the entry's directive is never stamped onto its
+// imports. That is why lib.relon carries its OWN #relaxed to keep its
+// untyped helpers (with_tax / format_price / discount) legal. This is
+// the playground's one deliberate #relaxed demo; every other preset
+// uses strict (the default).
 #relaxed
 #import lib from "./lib.relon"
 #import { format_price } from "./lib.relon"
@@ -199,7 +202,10 @@ const MODULES_MAIN = `// Three #import shapes — try Mod-clicking any imported 
 }
 `;
 
-const MODULES_LIB = `// Pricing helpers shared by main.relon.
+const MODULES_LIB = `// Pricing helpers shared by main.relon. This library declares its
+// OWN #relaxed so its untyped closure params stay legal — the entry's
+// #relaxed does not reach here under per-module strictness.
+#relaxed
 {
     with_tax(amount, rate): amount * (1.0 + rate),
 

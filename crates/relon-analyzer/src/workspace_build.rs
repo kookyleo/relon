@@ -61,20 +61,28 @@ pub(crate) fn build<L: ModuleLoader>(
     match parse_document(entry_source) {
         Ok(node) => {
             let arc_node = Arc::new(node);
-            // Strict is the default; the entry can opt out via
-            // `#relaxed` / `#unstrict`. The workspace pass stamps the
-            // entry's mode onto every reachable import so the two
-            // halves don't disagree — a relaxed entry imports a
-            // relaxed view of its libraries (so a strict library
-            // doesn't tighten the entry), and a strict entry imports
-            // a strict view (so a relaxed library can't sneak silent
-            // fallbacks past the entry's contract).
-            let entry_strict = options.strict_mode && !crate::has_relaxed_directive(&arc_node);
-            ws.strict_mode = entry_strict;
-            let mut effective_options = options.clone();
-            effective_options.strict_mode = entry_strict;
+            // Strictness is file-local (per-module): every module is
+            // strict by default and opts out only via its OWN `#relaxed`
+            // / `#unstrict` directive. `analyze_with_options` applies
+            // that AND for each module (global default `&&` !own
+            // directive), so the entry's directive governs ONLY the
+            // entry — it is NOT stamped onto the modules it imports.
+            //
+            // `ws.strict_mode` is a workspace summary: the entry
+            // module's own effective mode. Imports are analyzed with the
+            // unchanged global `options`, so a directive-less library
+            // stays strict under a `#relaxed` entry, and a library that
+            // declares its own `#relaxed` stays relaxed regardless of
+            // who imports it.
+            //
+            // The whole-program "no silent Any" guarantee is preserved
+            // by boundary enforcement, not by contagion: a strict module
+            // still rejects an `Any` flowing in from a `#relaxed`
+            // dependency at the use site (the dependency itself is
+            // neither re-checked nor relaxed by the consumer).
+            ws.strict_mode = options.strict_mode && !crate::has_relaxed_directive(&arc_node);
 
-            let tree = crate::analyze_with_options(&arc_node, &effective_options);
+            let tree = crate::analyze_with_options(&arc_node, options);
             let imports = collect_import_targets(&tree, &entry_id, &entry_current_dir);
             ws.import_graph.insert(
                 entry_id.clone(),
@@ -127,7 +135,7 @@ pub(crate) fn build<L: ModuleLoader>(
                         &mut ws,
                         &mut module_dirs,
                         &mut level_seen,
-                        &effective_options,
+                        options,
                     ) {
                         jobs.push(job);
                     }
@@ -141,11 +149,11 @@ pub(crate) fn build<L: ModuleLoader>(
                 // overhead on the common single-import case.
                 let mut analyzed: Vec<AnalyzedJob> = if jobs.len() < 2 {
                     jobs.into_iter()
-                        .map(|job| analyze_job(job, &effective_options))
+                        .map(|job| analyze_job(job, options))
                         .collect()
                 } else {
                     jobs.into_par_iter()
-                        .map(|job| analyze_job(job, &effective_options))
+                        .map(|job| analyze_job(job, options))
                         .collect()
                 };
                 // Phase 3 (sequential, deterministic order): sort the
@@ -2251,13 +2259,14 @@ mod tests {
         );
     }
 
-    // ====== strict-mode contagion ======
+    // ====== strict-mode is file-local (per-module) ======
 
-    /// A strict entry (the default) stamps `strict_mode=true` on every
-    /// reachable module's `AnalyzedTree`. Demonstrates that imports
-    /// inherit the entry's mode when they don't opt out themselves.
+    /// A strict entry (the default) leaves a directive-less import
+    /// strict-by-default. Strictness is not propagated *to* imports;
+    /// each module is simply strict unless it opts out, so a strict
+    /// entry over a directive-less lib still sees a strict lib.
     #[test]
-    fn strict_entry_propagates_to_imports() {
+    fn strict_entry_directive_less_lib_stays_strict() {
         let mut loader = MapLoader::new();
         loader.add("./lib", "/abs/lib", r#"{ helper(Int x): x + 1 }"#);
         let ws = build(
@@ -2271,11 +2280,12 @@ mod tests {
         assert!(ws.modules.get("/abs/lib").unwrap().strict_mode);
     }
 
-    /// Reverse: a `#relaxed` entry propagates the cleared bit to every
-    /// reachable module. The library's own (non-)opt-out is overridden
-    /// by the entry's mode so the workspace presents a single mode.
+    /// Per-file: a `#relaxed` entry no longer relaxes the modules it
+    /// imports. The directive-less lib stays strict-by-default — the
+    /// entry's directive governs only the entry. `ws.strict_mode`
+    /// reflects the entry's own (relaxed) mode.
     #[test]
-    fn relaxed_entry_propagates_to_imports() {
+    fn relaxed_entry_does_not_relax_directive_less_lib() {
         let mut loader = MapLoader::new();
         loader.add("./lib", "/abs/lib", r#"{ helper(Int x): x + 1 }"#);
         let ws = build(
@@ -2284,14 +2294,50 @@ mod tests {
             PathBuf::from("/abs"),
             &mut loader,
         );
+        // Workspace summary tracks the entry's own mode.
         assert!(!ws.strict_mode);
         assert!(!ws.modules.get("/abs/entry").unwrap().strict_mode);
+        // The directive-less lib is NOT relaxed by the relaxed entry.
+        assert!(ws.modules.get("/abs/lib").unwrap().strict_mode);
+    }
+
+    /// A library that declares its OWN `#relaxed` stays relaxed
+    /// regardless of the entry's mode — its file-local directive is
+    /// always honoured. Checked under both a relaxed and a strict
+    /// entry; the entry's own mode never overrides the lib's.
+    #[test]
+    fn lib_own_relaxed_honoured_under_any_entry() {
+        // Relaxed entry.
+        let mut loader = MapLoader::new();
+        loader.add("./lib", "/abs/lib", "#relaxed\n{ helper(Int x): x + 1 }");
+        let ws = build(
+            "/abs/entry".to_string(),
+            "#relaxed\n#import * from \"./lib\"\n{ x: 1 }",
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        assert!(!ws.strict_mode);
+        assert!(!ws.modules.get("/abs/lib").unwrap().strict_mode);
+
+        // Strict entry — lib's own `#relaxed` is still honoured.
+        let mut loader = MapLoader::new();
+        loader.add("./lib", "/abs/lib", "#relaxed\n{ helper(Int x): x + 1 }");
+        let ws = build(
+            "/abs/entry".to_string(),
+            "#import * from \"./lib\"\n{ x: 1 }",
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        assert!(ws.strict_mode);
+        assert!(ws.modules.get("/abs/entry").unwrap().strict_mode);
         assert!(!ws.modules.get("/abs/lib").unwrap().strict_mode);
     }
 
-    /// Contagion through a 2-hop chain (entry → mid → leaf).
+    /// Per-file over a 2-hop chain (entry → mid → leaf): directive-less
+    /// modules are each strict-by-default; the entry's mode is not
+    /// stamped onto the chain.
     #[test]
-    fn strict_propagates_two_hops() {
+    fn per_file_strict_two_hops() {
         let mut loader = MapLoader::new();
         loader
             .add(
@@ -2312,10 +2358,11 @@ mod tests {
         assert!(ws.modules.get("/abs/leaf").unwrap().strict_mode);
     }
 
-    /// Diamond import (entry → b, c; b → d; c → d). Strict mode
-    /// reaches every node — `d` is visited once and stamped strict.
+    /// Diamond import (entry → b, c; b → d; c → d). Each directive-less
+    /// module is strict-by-default — `d` is visited once and stays
+    /// strict; no module's mode depends on its importer.
     #[test]
-    fn strict_propagates_diamond() {
+    fn per_file_strict_diamond() {
         let mut loader = MapLoader::new();
         loader
             .add("./b", "/abs/b", "#import * from \"./d\"\n{ from_b: 1 }")
@@ -2334,6 +2381,45 @@ mod tests {
                 "module {m} should be strict"
             );
         }
+    }
+
+    /// A `#relaxed` entry that imports a directive-less lib whose
+    /// untyped closure params would only be legal under relaxed mode:
+    /// per-file, the lib stays strict and reports
+    /// `ClosureParamTypeMissing`, while the relaxed entry itself does
+    /// not. This is the concrete behaviour change away from contagion.
+    #[test]
+    fn relaxed_entry_does_not_relax_untyped_lib_params() {
+        let mut loader = MapLoader::new();
+        loader.add("./lib", "/abs/lib", r#"{ helper(x): x + 1 }"#);
+        let ws = build(
+            "/abs/entry".to_string(),
+            "#relaxed\n#import * from \"./lib\"\n{ x: 1 }",
+            PathBuf::from("/abs"),
+            &mut loader,
+        );
+        let lib_missing = ws
+            .modules
+            .get("/abs/lib")
+            .unwrap()
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, Diagnostic::ClosureParamTypeMissing { .. }));
+        assert!(
+            lib_missing,
+            "directive-less lib must report ClosureParamTypeMissing under a relaxed entry"
+        );
+        let entry_missing = ws
+            .modules
+            .get("/abs/entry")
+            .unwrap()
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, Diagnostic::ClosureParamTypeMissing { .. }));
+        assert!(
+            !entry_missing,
+            "the relaxed entry itself must not report ClosureParamTypeMissing"
+        );
     }
 
     /// Non-spreadable sources (`1 + 2` → `Int`) fire

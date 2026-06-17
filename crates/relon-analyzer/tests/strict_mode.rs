@@ -208,10 +208,15 @@ fn fixture_closure_body_unclassified_flags() {
     assert!(n >= 1, "{:?}", tree.diagnostics);
 }
 
-// ====== strict_propagation (multi-module) ======
+// ====== per-file strictness (multi-module) ======
+//
+// Strictness is file-local: every module is strict by default and opts
+// out only via its own `#relaxed` / `#unstrict`. These fixtures use
+// directive-less entries and libs, so each module is independently
+// strict — the entry's mode is never stamped onto its imports.
 
 #[test]
-fn fixture_strict_propagation_one_hop() {
+fn fixture_per_file_strict_one_hop() {
     let ws = analyze_fixture_workspace("strict_propagation", "entry.relon");
     assert!(ws.strict_mode);
     for (id, tree) in &ws.modules {
@@ -221,7 +226,8 @@ fn fixture_strict_propagation_one_hop() {
             tree.diagnostics
         );
     }
-    // The lib's silent-fallback spread should be reported.
+    // The lib is strict on its own, so its silent-fallback spread is
+    // reported in the lib itself.
     let total_spread_diags: usize = ws
         .modules
         .values()
@@ -232,7 +238,7 @@ fn fixture_strict_propagation_one_hop() {
 }
 
 #[test]
-fn fixture_strict_propagation_two_hops() {
+fn fixture_per_file_strict_two_hops() {
     let ws = analyze_fixture_workspace("strict_propagation", "chain_entry.relon");
     assert!(ws.strict_mode);
     assert_eq!(ws.modules.len(), 3, "entry + mid + leaf");
@@ -242,7 +248,7 @@ fn fixture_strict_propagation_two_hops() {
 }
 
 #[test]
-fn fixture_strict_propagation_diamond() {
+fn fixture_per_file_strict_diamond() {
     let ws = analyze_fixture_workspace("strict_propagation", "diamond_entry.relon");
     assert!(ws.strict_mode);
     assert_eq!(ws.modules.len(), 4, "entry + b + c + d");
