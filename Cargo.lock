@@ -2134,6 +2134,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "relon-aot-bench"
+version = "0.1.0-rc2"
+dependencies = [
+ "relon-rs-build",
+ "relon-rs-macro",
+ "relon-rs-shims",
+]
+
+[[package]]
 name = "relon-bench"
 version = "0.1.0-rc2"
 dependencies = [

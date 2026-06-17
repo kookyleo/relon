@@ -1,0 +1,4 @@
+#unstrict
+#import list from "std/list"
+#main(Float x, Int n) -> Float
+range(n).reduce(x, (acc, i) => acc + 1.5)

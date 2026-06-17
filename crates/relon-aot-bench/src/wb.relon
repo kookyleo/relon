@@ -1,0 +1,4 @@
+#unstrict
+#import list from "std/list"
+#main(Int n) -> Int
+range(n).reduce(7, (acc, i) => acc * 6364136223846793005 + 1442695040888963407 + i)
