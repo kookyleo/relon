@@ -5,8 +5,8 @@
 #![allow(deprecated)]
 
 use relon_object_cache::{
-    compute_hmac, ensure_key, hmac_key_path, load, store, verify_hmac, CacheError, HostFnImport,
-    IntegrityMode, Metadata, SignatureHash,
+    compute_hmac, content_key, ensure_key, hmac_key_path, load, store, verify_hmac, CacheError,
+    HostFnImport, IntegrityMode, Metadata, SignatureHash,
 };
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -36,7 +36,9 @@ fn hmac_round_trips_when_key_matches() {
     let key = [0x42u8; 32];
     let triple = "x86_64-unknown-linux-gnu";
     let object = b"object-body-for-hmac-test".to_vec();
-    let src = sha(&object);
+    // Strict mode also runs after the HMAC check, so the stem must be
+    // the `content_key`, not the bare object digest.
+    let src = content_key(&object, &sample_meta());
 
     store(dir.path(), src, triple, &object, &sample_meta(), Some(&key)).unwrap();
     let entry = load(dir.path(), src, triple, Some(&key), IntegrityMode::Strict)
@@ -84,7 +86,7 @@ fn no_hmac_key_skips_verification() {
     let dir = tempdir().unwrap();
     let triple = "x86_64-unknown-linux-gnu";
     let object = b"unsigned-cache".to_vec();
-    let src = sha(&object);
+    let src = content_key(&object, &sample_meta());
 
     store(dir.path(), src, triple, &object, &sample_meta(), None).unwrap();
     let entry = load(dir.path(), src, triple, None, IntegrityMode::Strict)

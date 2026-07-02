@@ -56,9 +56,12 @@ pub enum CacheError {
     #[error("hmac verification failed")]
     HmacMismatch,
 
-    /// SHA-256 over the object bytes did not match the value embedded
-    /// in the filename. Either bit-rot or someone overwrote the body
-    /// in place.
+    /// The `Strict`-mode content-addressing key — SHA-256 over the
+    /// object bytes **and** the security-relevant metadata
+    /// (`cap_bitmap`, `host_fn_imports`, `main_signature`), see
+    /// [`crate::storage::content_key`] — did not match the value
+    /// embedded in the filename. Either bit-rot or someone overwrote
+    /// the object body or the metadata trailer in place.
     #[error("integrity check failed: sha256 mismatch")]
     Sha256Mismatch,
 

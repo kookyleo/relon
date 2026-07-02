@@ -4,7 +4,7 @@
 #![allow(deprecated)]
 
 use relon_object_cache::{
-    load, store, CacheError, HostFnImport, IntegrityMode, Metadata, SignatureHash,
+    content_key, load, store, CacheError, HostFnImport, IntegrityMode, Metadata, SignatureHash,
 };
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -33,7 +33,9 @@ fn strict_passes_on_unmodified_file() {
     let dir = tempdir().unwrap();
     let triple = "x86_64-unknown-linux-gnu";
     let object = b"strict-mode-payload".to_vec();
-    let src = sha(&object);
+    // Strict callers derive the stem from `content_key` (object body
+    // + security-relevant metadata), not the bare object digest.
+    let src = content_key(&object, &meta());
     store(dir.path(), src, triple, &object, &meta(), None).unwrap();
 
     let entry = load(dir.path(), src, triple, None, IntegrityMode::Strict)
@@ -101,7 +103,7 @@ fn strict_catches_in_place_body_swap() {
     let triple = "x86_64-unknown-linux-gnu";
     let object = b"body-len-12!".to_vec();
     assert_eq!(object.len(), 12);
-    let src = sha(&object);
+    let src = content_key(&object, &meta());
     let path = store(dir.path(), src, triple, &object, &meta(), None).unwrap();
 
     let mut bytes = std::fs::read(&path).unwrap();

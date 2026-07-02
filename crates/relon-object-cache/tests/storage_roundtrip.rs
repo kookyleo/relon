@@ -5,7 +5,7 @@
 #![allow(deprecated)]
 
 use relon_object_cache::{
-    load, store, CacheError, HostFnImport, IntegrityMode, Metadata, SignatureHash,
+    content_key, load, store, CacheError, HostFnImport, IntegrityMode, Metadata, SignatureHash,
 };
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -33,11 +33,12 @@ fn sha_of(bytes: &[u8]) -> [u8; 32] {
 fn store_then_load_returns_same_object_bytes() {
     let dir = tempdir().unwrap();
     let object = b"\x7fELF stub-payload bytes for tests".to_vec();
-    // Strict integrity recomputes sha256(object) and compares
-    // against the filename — use the actual digest as the key.
-    let key = sha_of(&object);
     let triple = "x86_64-unknown-linux-gnu";
     let meta = sample_metadata("relon-codegen-cranelift 0.1.0");
+    // Strict integrity recomputes `content_key` (object body +
+    // security-relevant metadata) and compares against the filename —
+    // derive the stem from it.
+    let key = content_key(&object, &meta);
 
     let path = store(dir.path(), key, triple, &object, &meta, None).unwrap();
     assert!(path.exists(), "store must produce a file at {path:?}");
@@ -56,8 +57,8 @@ fn two_distinct_sources_coexist() {
     let triple = "x86_64-unknown-linux-gnu";
     let obj_a = b"object-A-bytes".to_vec();
     let obj_b = b"object-B-different".to_vec();
-    let key_a = sha_of(&obj_a);
-    let key_b = sha_of(&obj_b);
+    let key_a = content_key(&obj_a, &sample_metadata("gen-A"));
+    let key_b = content_key(&obj_b, &sample_metadata("gen-B"));
 
     store(
         dir.path(),
@@ -195,9 +196,10 @@ fn malformed_blob_never_panics_only_errors() {
     let dir = tempdir().unwrap();
     let triple = "x86_64-unknown-linux-gnu";
     let object = b"some-object-body-that-is-reasonably-long".to_vec();
-    // Strict mode re-hashes the body against the filename key, so the
-    // key must be the object's own digest for the pristine sanity load.
-    let key = sha_of(&object);
+    // Strict mode re-hashes the body + security metadata against the
+    // filename key, so the key must be `content_key` for the pristine
+    // sanity load.
+    let key = content_key(&object, &sample_metadata("g"));
     let path = store(
         dir.path(),
         key,

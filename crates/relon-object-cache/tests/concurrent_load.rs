@@ -5,7 +5,9 @@
 
 #![allow(deprecated)]
 
-use relon_object_cache::{load, store, HostFnImport, IntegrityMode, Metadata, SignatureHash};
+use relon_object_cache::{
+    content_key, load, store, HostFnImport, IntegrityMode, Metadata, SignatureHash,
+};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::thread;
@@ -35,7 +37,7 @@ fn eight_threads_load_same_entry() {
     let dir = tempdir().unwrap();
     let triple = "x86_64-unknown-linux-gnu";
     let object: Vec<u8> = (0..1024).map(|i| (i & 0xFF) as u8).collect();
-    let src = sha(&object);
+    let src = content_key(&object, &meta());
     store(dir.path(), src, triple, &object, &meta(), None).unwrap();
 
     let dir = Arc::new(dir);
@@ -169,7 +171,7 @@ fn parallel_distinct_keys_dont_interfere() {
     let h1 = thread::spawn(move || {
         for i in 0..50u32 {
             let body = format!("body-A-{}", i).into_bytes();
-            let key = sha(&body);
+            let key = content_key(&body, &meta());
             store(&dir1, key, triple, &body, &meta(), None).unwrap();
             let entry = load(&dir1, key, triple, None, IntegrityMode::Strict)
                 .unwrap()
@@ -180,7 +182,7 @@ fn parallel_distinct_keys_dont_interfere() {
     let h2 = thread::spawn(move || {
         for i in 0..50u32 {
             let body = format!("body-B-{}", i).into_bytes();
-            let key = sha(&body);
+            let key = content_key(&body, &meta());
             store(&dir2, key, triple, &body, &meta(), None).unwrap();
             let entry = load(&dir2, key, triple, None, IntegrityMode::Strict)
                 .unwrap()

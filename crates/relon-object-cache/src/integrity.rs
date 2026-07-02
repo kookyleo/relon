@@ -2,12 +2,17 @@
 //!
 //! Two modes exist:
 //!
-//! - [`IntegrityMode::Strict`] (default) — recompute SHA-256 over
-//!   the object bytes on every load and compare against the value
-//!   embedded in the filename. Costs ~1 us per MB on modern x86_64
-//!   and protects against bit-rot or in-place tampering. Only
-//!   valid when the caller derives the filename stem from the
-//!   object body's own SHA-256.
+//! - [`IntegrityMode::Strict`] (default) — recompute the
+//!   content-addressing key on every load and compare against the
+//!   value embedded in the filename. The key
+//!   ([`crate::storage::content_key`]) is a SHA-256 over the object
+//!   bytes **and** the security-relevant metadata (`cap_bitmap`,
+//!   `host_fn_imports`, `main_signature`), so in-place tampering of
+//!   either the object body or the metadata trailer — e.g. flipping
+//!   `cap_bitmap` to "all caps on" — is caught even with no HMAC key.
+//!   Costs ~1 us per MB on modern x86_64 and also guards against
+//!   bit-rot. Only valid when the caller derives the filename stem
+//!   from [`crate::storage::content_key`].
 //!
 //! - [`IntegrityMode::HmacRequired`] — skip the SHA-256 recompute
 //!   because the caller routes a different value through the

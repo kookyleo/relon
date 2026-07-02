@@ -28,6 +28,13 @@
 //! goes in) is supplied by the caller and used verbatim as the
 //! filename stem. This crate never inspects the source; it just
 //! stores what it is given.
+//!
+//! Under [`IntegrityMode::Strict`] the caller must derive that stem
+//! from [`content_key`] — a digest over the object body **and** the
+//! security-relevant metadata (`cap_bitmap`, `host_fn_imports`,
+//! `main_signature`) — so the loader can detect in-place tampering
+//! of the metadata trailer (e.g. a forged `cap_bitmap`) even when no
+//! HMAC key is configured.
 
 use std::fs;
 use std::io::Write;
@@ -104,6 +111,65 @@ pub struct CacheEntry {
     pub object_bytes: Vec<u8>,
     /// Metadata trailer.
     pub metadata: Metadata,
+}
+
+/// Recompute the `Strict`-mode content-addressing key: a SHA-256
+/// that commits to the object body **and** the security-relevant
+/// metadata (`cap_bitmap`, `host_fn_imports`, `main_signature`).
+///
+/// ## Why this exists
+///
+/// `Strict` mode has no HMAC key, so its only root of trust is the
+/// caller-supplied `source_sha256` (never read from the file — the
+/// loader derives the on-disk path from it, then re-derives this key
+/// from the bytes and compares). Earlier revisions hashed *only* the
+/// object body, which left the metadata trailer unauthenticated: a
+/// local attacker with write access to the cache directory could
+/// keep the object body byte-for-byte identical and flip
+/// `cap_bitmap` to `0xFFFF..` ("all capabilities granted") in place,
+/// and `load` would still return `Ok(Some(..))`. A plain digest
+/// *stored in the file* would not help — an active tamperer just
+/// recomputes it — so the fix is to fold the security-relevant
+/// metadata into the key that is compared against the external,
+/// caller-owned `source_sha256`.
+///
+/// ## Dedup / content-addressing
+///
+/// The advisory fields (`created_at_unix`, `generator_version`) are
+/// deliberately excluded so two builds of identical code + caps +
+/// signature dedup to the same address regardless of when they were
+/// produced. Conversely, the *same* object bytes compiled under a
+/// *different* `cap_bitmap` now hash to a *different* address, which
+/// is the correct behaviour: capabilities are part of a cache
+/// entry's identity.
+///
+/// `Strict` callers MUST derive `source_sha256` from this function.
+/// (Production callers that route a source-derived key through the
+/// filename stem use [`IntegrityMode::HmacRequired`] instead and are
+/// unaffected — the HMAC tag already covers header + object +
+/// metadata.)
+pub fn content_key(object_bytes: &[u8], metadata: &Metadata) -> [u8; 32] {
+    let mut h = Sha256::new();
+    // Domain separator so this digest can never be confused with a
+    // bare `sha256(object_bytes)` from an older writer.
+    h.update(b"relon-object-cache/content-key/v1\0");
+    // Object body, length-prefixed to keep the encoding unambiguous.
+    h.update((object_bytes.len() as u64).to_le_bytes());
+    h.update(object_bytes);
+    // Security-relevant metadata. Every field is length-prefixed or
+    // fixed-width so no two distinct metadata values can collide by
+    // shifting a boundary.
+    h.update(metadata.cap_bitmap.to_le_bytes());
+    h.update(metadata.main_signature.0);
+    h.update((metadata.host_fn_imports.len() as u64).to_le_bytes());
+    for imp in &metadata.host_fn_imports {
+        h.update((imp.name.len() as u64).to_le_bytes());
+        h.update(imp.name.as_bytes());
+        h.update(imp.cap_bit.to_le_bytes());
+        h.update(imp.params_hash);
+        h.update(imp.returns_hash);
+    }
+    h.finalize().into()
 }
 
 /// Compose the canonical path: `<cache_dir>/<sha_hex><SUFFIX>`.
@@ -231,12 +297,15 @@ pub fn store(
 ///
 /// `integrity` decides how the loader proves the cache file's
 /// integrity. See [`IntegrityMode`] for the trade-offs.
-/// - [`IntegrityMode::Strict`] (default) — always re-hash.
+/// - [`IntegrityMode::Strict`] (default) — recompute the
+///   content-addressing key with [`content_key`] (object body +
+///   security-relevant metadata) and compare against `source_sha256`.
+///   Detects in-place tampering of either region without a key.
 /// - [`IntegrityMode::HmacRequired`] — refuse to load with no HMAC
 ///   key; rely on the HMAC tag (covers header + object bytes +
-///   metadata) for tamper detection. Strict's SHA-256 recompute is
-///   skipped because the filename stem is a source-derived key, not
-///   the object body's own hash.
+///   metadata) for tamper detection. Strict's recompute is skipped
+///   because the filename stem is a source-derived key, not the
+///   [`content_key`] value.
 pub fn load(
     cache_dir: &Path,
     source_sha256: [u8; 32],
@@ -260,9 +329,12 @@ pub fn load(
     let entry = decode_blob(&bytes, expected_triple, hmac_key)?;
 
     if integrity == IntegrityMode::Strict {
-        let mut hasher = Sha256::new();
-        hasher.update(&entry.object_bytes);
-        let actual: [u8; 32] = hasher.finalize().into();
+        // Recompute the content-addressing key over the object body
+        // *and* the security-relevant metadata (see `content_key`).
+        // Comparing against the caller-supplied `source_sha256` — a
+        // value that never lives in the file — is what makes in-place
+        // tampering of either region detectable without an HMAC key.
+        let actual = content_key(&entry.object_bytes, &entry.metadata);
         if actual != source_sha256 {
             return Err(CacheError::Sha256Mismatch);
         }
