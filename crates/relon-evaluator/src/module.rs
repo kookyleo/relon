@@ -233,9 +233,29 @@ mod remote_http {
     use relon_parser::TokenRange;
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use ureq::config::Config as UreqConfig;
+    use ureq::http::Uri;
+    use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+    use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
+    use ureq::Error as UreqError;
+
+    /// Default ceiling on a single remote-import fetch, connect +
+    /// transfer inclusive. ureq 3's defaults leave every network
+    /// timeout at `None`, so without this a slow-drip origin can wedge
+    /// the (synchronous, on the eval thread) fetch forever — and the
+    /// CLI wall-clock watchdog is a wasmtime epoch deadline that does
+    /// not reach into native blocking I/O. 30s is generous for a small
+    /// source file yet bounds the worst case.
+    const DEFAULT_REMOTE_TIMEOUT_GLOBAL: Duration = Duration::from_secs(30);
+    /// Default TCP/TLS connect ceiling. Kept well under the global
+    /// budget so a black-holed host fails fast instead of eating the
+    /// whole 30s window on the handshake alone.
+    const DEFAULT_REMOTE_TIMEOUT_CONNECT: Duration = Duration::from_secs(10);
 
     /// Default cache lifetime for a fetched module before the resolver
     /// re-issues an HTTP request. Expired entries still try a
@@ -530,6 +550,21 @@ mod remote_http {
     pub struct RemoteHttpResolver {
         cache: Option<RemoteImportCache>,
         allow_insecure: bool,
+        /// Opt in to fetching from private / loopback / link-local /
+        /// metadata addresses. Off by default: the SSRF guard below
+        /// refuses such targets so a `--trust`ed program cannot be
+        /// tricked into probing the host's internal network or a cloud
+        /// metadata endpoint. Also implicitly enabled by
+        /// [`allow_insecure`](Self::allow_insecure) — opting into
+        /// plaintext `http://` is already a local/dev posture, and the
+        /// in-process test servers bind to `127.0.0.1`.
+        allow_private_addrs: bool,
+        timeout_global: Duration,
+        timeout_connect: Duration,
+        /// Lazily-built, policy-hardened ureq agent. Built once on the
+        /// first fetch (all builder flags are settled by then) and
+        /// reused so the connection pool survives across imports.
+        agent: OnceLock<ureq::Agent>,
     }
 
     impl RemoteHttpResolver {
@@ -539,6 +574,10 @@ mod remote_http {
             Self {
                 cache: Some(RemoteImportCache::default_location()),
                 allow_insecure: false,
+                allow_private_addrs: false,
+                timeout_global: DEFAULT_REMOTE_TIMEOUT_GLOBAL,
+                timeout_connect: DEFAULT_REMOTE_TIMEOUT_CONNECT,
+                agent: OnceLock::new(),
             }
         }
 
@@ -547,7 +586,7 @@ mod remote_http {
         pub fn with_cache(cache: RemoteImportCache) -> Self {
             Self {
                 cache: Some(cache),
-                allow_insecure: false,
+                ..Self::new()
             }
         }
 
@@ -561,10 +600,78 @@ mod remote_http {
 
         /// Opt in to plaintext `http://` URLs. Off by default so the
         /// default trust posture refuses fetching executable Relon
-        /// code over an unencrypted channel.
+        /// code over an unencrypted channel. Enabling this is treated
+        /// as a deliberate local/dev posture and therefore also lifts
+        /// the private-address guard (see [`allow_private_addrs`]).
+        ///
+        /// [`allow_private_addrs`]: Self::allow_private_addrs
         pub fn allow_insecure(mut self, allow: bool) -> Self {
             self.allow_insecure = allow;
             self
+        }
+
+        /// Opt in to private / loopback / link-local / metadata target
+        /// addresses. Off by default; see the field docs. Independent
+        /// of [`allow_insecure`](Self::allow_insecure) so a host can
+        /// permit `https://10.x` internal mirrors without also allowing
+        /// plaintext `http://`.
+        pub fn allow_private_addrs(mut self, allow: bool) -> Self {
+            self.allow_private_addrs = allow;
+            self
+        }
+
+        /// Whether private / loopback / link-local targets are allowed
+        /// for this resolver. Opting into plaintext `http://` implies
+        /// it (local/dev posture); an explicit opt-in also sets it.
+        fn private_addrs_allowed(&self) -> bool {
+            self.allow_insecure || self.allow_private_addrs
+        }
+
+        /// Test-only knob to shrink the network timeouts so the
+        /// hang-forever regression can be exercised without waiting out
+        /// the 30s production ceiling.
+        #[cfg(test)]
+        fn with_timeouts(mut self, global: Duration, connect: Duration) -> Self {
+            self.timeout_global = global;
+            self.timeout_connect = connect;
+            self
+        }
+
+        /// Build (once) the hardened ureq agent that backs every fetch.
+        ///
+        /// Policy, in one place:
+        /// * `https_only(true)` unless plaintext was explicitly opted
+        ///   into — blocks any `https -> http` downgrade a redirect
+        ///   might otherwise smuggle in.
+        /// * `max_redirects(0)` with `max_redirects_will_error(false)`
+        ///   — redirects are not followed at all; the 3xx surfaces as a
+        ///   response we turn into a clean "pin the final URL" error.
+        ///   ureq's default is to chase up to 10 redirects, and those
+        ///   hops skip our scheme/host checks, which is the core SSRF
+        ///   vector.
+        /// * global + connect timeouts so a slow-drip origin cannot
+        ///   wedge the eval thread.
+        /// * a custom resolver that rejects private / loopback /
+        ///   link-local / metadata IPs *after* DNS resolution — closing
+        ///   the DNS-rebinding gap that a URL-string check alone leaves
+        ///   open.
+        fn agent(&self) -> &ureq::Agent {
+            self.agent.get_or_init(|| {
+                let config: UreqConfig = ureq::Agent::config_builder()
+                    .https_only(!self.allow_insecure)
+                    .max_redirects(0)
+                    .max_redirects_will_error(false)
+                    .timeout_global(Some(self.timeout_global))
+                    .timeout_connect(Some(self.timeout_connect))
+                    .build();
+                ureq::Agent::with_parts(
+                    config,
+                    DefaultConnector::default(),
+                    GuardedResolver {
+                        allow_private: self.private_addrs_allowed(),
+                    },
+                )
+            })
         }
 
         /// Best-effort: returns `true` when `path` looks like a URL this
@@ -590,7 +697,7 @@ mod remote_http {
             // Build the request. When we have a stale entry with at
             // least one validator, ask the origin to short-circuit
             // with `304 Not Modified` instead of resending the body.
-            let mut req = ureq::get(url);
+            let mut req = self.agent().get(url);
             if let Some(entry) = &cached {
                 if let Some(etag) = &entry.meta.etag {
                     req = req.header("If-None-Match", etag.as_str());
@@ -628,6 +735,28 @@ mod remote_http {
                         url: url.to_string(),
                         cause: "server replied 304 Not Modified but no cached body was available"
                             .to_string(),
+                    }),
+                    range,
+                });
+            }
+
+            // A 3xx reaches here only because the agent is pinned to
+            // `max_redirects(0)` (with `will_error(false)`), i.e. the
+            // origin tried to bounce us elsewhere and we refused to
+            // follow. Report it as a distinct, actionable failure so a
+            // redirect-based SSRF attempt is visible rather than
+            // silently chased into the internal network.
+            if status.is_redirection() {
+                let location = header_string(&response, "Location").unwrap_or_default();
+                return Err(RuntimeError::RemoteImportFailed {
+                    payload: Box::new(RemoteImportFailure {
+                        url: url.to_string(),
+                        cause: format!(
+                            "remote import does not follow redirects (HTTP {} -> {}); \
+                             pin the final URL directly",
+                            status.as_u16(),
+                            location
+                        ),
                     }),
                     range,
                 });
@@ -686,6 +815,107 @@ mod remote_http {
             .map(|s| s.to_string())
     }
 
+    /// Extract the host component of a remote-import URL, without any
+    /// surrounding IPv6 brackets. Returns `None` when the string does
+    /// not parse as a URI with an authority — such inputs never reach
+    /// `fetch` anyway (ureq rejects them), so a missing host here just
+    /// means "let the network layer produce the error".
+    fn url_host(url: &str) -> Option<String> {
+        url.parse::<Uri>()
+            .ok()
+            .and_then(|u| u.host().map(|h| h.trim_matches(['[', ']']).to_string()))
+    }
+
+    /// True when `host` is a literal that names the local machine or a
+    /// non-routable / internal network. Hostnames (which need DNS) are
+    /// deliberately *not* judged here — they are filtered post-resolution
+    /// by [`GuardedResolver`], which also defeats DNS rebinding.
+    fn host_is_blocked(host: &str) -> bool {
+        if host.eq_ignore_ascii_case("localhost") {
+            return true;
+        }
+        match host.parse::<IpAddr>() {
+            Ok(ip) => ip_is_blocked(ip),
+            Err(_) => false,
+        }
+    }
+
+    /// Central predicate: is `ip` in loopback / private / link-local /
+    /// metadata / unspecified space that a remote import must never be
+    /// steered toward?
+    fn ip_is_blocked(ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => ipv4_is_blocked(v4),
+            IpAddr::V6(v6) => ipv6_is_blocked(v6),
+        }
+    }
+
+    fn ipv4_is_blocked(v4: Ipv4Addr) -> bool {
+        v4.is_loopback()       // 127.0.0.0/8
+            || v4.is_private()   // 10/8, 172.16/12, 192.168/16
+            || v4.is_link_local()// 169.254.0.0/16, incl. 169.254.169.254 metadata
+            || v4.is_unspecified()// 0.0.0.0
+            || v4.is_broadcast() // 255.255.255.255
+    }
+
+    fn ipv6_is_blocked(v6: Ipv6Addr) -> bool {
+        if v6.is_loopback() || v6.is_unspecified() {
+            return true; // ::1, ::
+        }
+        // IPv4-mapped (`::ffff:a.b.c.d`) — judge by the embedded v4 so a
+        // `::ffff:127.0.0.1` cannot slip past the v4 rules.
+        if let Some(mapped) = v6.to_ipv4_mapped() {
+            return ipv4_is_blocked(mapped);
+        }
+        let seg0 = v6.segments()[0];
+        (seg0 & 0xfe00) == 0xfc00      // fc00::/7  unique-local
+            || (seg0 & 0xffc0) == 0xfe80 // fe80::/10 link-local
+    }
+
+    /// ureq resolver wrapper that runs the stock DNS lookup and then
+    /// drops any resolved address in blocked space. Because the check
+    /// happens on the *resolved* IPs (not the URL string), a hostname
+    /// that resolves — or re-resolves — to `127.0.0.1` / `169.254.x`
+    /// is rejected too, closing the DNS-rebinding hole a string check
+    /// leaves open. When every candidate is blocked the connect fails
+    /// cleanly instead of reaching the internal target.
+    #[derive(Debug)]
+    struct GuardedResolver {
+        allow_private: bool,
+    }
+
+    impl Resolver for GuardedResolver {
+        fn resolve(
+            &self,
+            uri: &Uri,
+            config: &UreqConfig,
+            timeout: NextTimeout,
+        ) -> Result<ResolvedSocketAddrs, UreqError> {
+            let inner = DefaultResolver::default();
+            let addrs = inner.resolve(uri, config, timeout)?;
+            if self.allow_private {
+                return Ok(addrs);
+            }
+            let mut kept: ResolvedSocketAddrs = inner.empty();
+            for addr in addrs.iter() {
+                if !ip_is_blocked(addr.ip()) {
+                    kept.push(*addr);
+                }
+            }
+            if kept.is_empty() {
+                return Err(UreqError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "remote import target {} resolved only to private/loopback/\
+                         link-local/metadata addresses; blocked by default",
+                        uri.host().unwrap_or("<unknown>")
+                    ),
+                )));
+            }
+            Ok(kept)
+        }
+    }
+
     impl ModuleResolver for RemoteHttpResolver {
         fn resolve(
             &self,
@@ -708,6 +938,32 @@ mod remote_http {
                     }),
                     range,
                 });
+            }
+
+            // Fast, pre-network SSRF guard on raw IP-literal / localhost
+            // hosts. Names that resolve to private space are caught
+            // later at the resolver (post-DNS), which additionally
+            // closes DNS-rebinding; this string check just gives a
+            // clean, specific denial for the common
+            // `https://127.0.0.1/`, `https://[::1]/`,
+            // `https://169.254.169.254/...` cases before any socket is
+            // opened.
+            if !self.private_addrs_allowed() {
+                if let Some(host) = url_host(path) {
+                    if host_is_blocked(&host) {
+                        return Err(RuntimeError::RemoteImportDenied {
+                            payload: Box::new(RemoteImportDenial {
+                                url: path.to_string(),
+                                reason: format!(
+                                    "target host {host} is a private/loopback/link-local/\
+                                     metadata address; blocked by default (opt in via \
+                                     allow_private_addrs if this is an internal mirror)"
+                                ),
+                            }),
+                            range,
+                        });
+                    }
+                }
             }
 
             let body = self.fetch(path, range)?;
@@ -1323,6 +1579,181 @@ mod remote_http {
             assert_eq!(again.body, "{ legacy: true }");
 
             let _ = std::fs::remove_dir_all(&cache_root);
+        }
+
+        // -------- network-hardening regression tests --------
+
+        /// Server that answers every request with a single `302` whose
+        /// `Location` points at the cloud-metadata endpoint. Models the
+        /// H1 SSRF vector: a trusted origin trying to bounce the client
+        /// into internal space.
+        fn start_redirect_server(location: &'static str) -> (String, thread::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr").to_string();
+            let join = thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let mut stream = match stream {
+                        Ok(s) => s,
+                        Err(_) => break,
+                    };
+                    use std::io::{Read, Write};
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    let response = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            });
+            (format!("http://{addr}/util.relon"), join)
+        }
+
+        /// H1: a `302` toward an internal address must surface as an
+        /// error, never be silently followed. `max_redirects(0)` is the
+        /// mechanism; this proves ureq's default 10-hop chase is off.
+        #[test]
+        fn redirect_is_not_followed() {
+            let (url, _join) = start_redirect_server("http://169.254.169.254/latest/meta-data/");
+            // allow_insecure so the http mock is reachable at all; the
+            // redirect target is what must not be chased.
+            let resolver = RemoteHttpResolver::new()
+                .without_cache()
+                .allow_insecure(true);
+            let scope = Arc::new(Scope::default());
+            let err = resolver
+                .resolve(&url, &scope, TokenRange::default())
+                .unwrap_err();
+            match err {
+                RuntimeError::RemoteImportFailed { payload, .. } => {
+                    assert!(
+                        payload.cause.contains("redirect"),
+                        "expected a redirect-refused error, got: {}",
+                        payload.cause
+                    );
+                }
+                other => panic!("unexpected error variant: {other:?}"),
+            }
+        }
+
+        /// M1: an origin that accepts the connection but never sends a
+        /// response must not hang the (synchronous) fetch forever. With
+        /// a short injected timeout the fetch returns `Err` promptly.
+        #[test]
+        fn slow_origin_times_out() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr").to_string();
+            let _join = thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let stream = match stream {
+                        Ok(s) => s,
+                        Err(_) => break,
+                    };
+                    // Accept, then block reading indefinitely without
+                    // ever writing a response — the client must hit its
+                    // own timeout. (No sleep-based coordination.)
+                    use std::io::Read;
+                    let mut stream = stream;
+                    let mut buf = [0u8; 64];
+                    loop {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => continue,
+                        }
+                    }
+                }
+            });
+            let url = format!("http://{addr}/hang.relon");
+            let resolver = RemoteHttpResolver::new()
+                .without_cache()
+                .allow_insecure(true)
+                // Short timeouts so the test does not wait out the 30s
+                // production ceiling.
+                .with_timeouts(Duration::from_millis(750), Duration::from_millis(500));
+            let scope = Arc::new(Scope::default());
+            let start = std::time::Instant::now();
+            let err = resolver
+                .resolve(&url, &scope, TokenRange::default())
+                .unwrap_err();
+            assert!(
+                matches!(err, RuntimeError::RemoteImportFailed { .. }),
+                "expected a fetch failure, got: {err:?}"
+            );
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "fetch should have timed out quickly, took {:?}",
+                start.elapsed()
+            );
+        }
+
+        /// SSRF address guard: a direct import of a loopback / internal
+        /// literal is denied before any socket opens, under the default
+        /// posture (no allow_insecure / allow_private_addrs).
+        #[test]
+        fn private_address_literals_are_denied() {
+            let resolver = RemoteHttpResolver::new().without_cache();
+            let scope = Arc::new(Scope::default());
+            for url in [
+                "https://127.0.0.1/util.relon",
+                "https://[::1]/util.relon",
+                "https://169.254.169.254/latest/meta-data/",
+                "https://10.0.0.5/util.relon",
+                "https://192.168.1.1/util.relon",
+                "https://localhost/util.relon",
+            ] {
+                let err = resolver
+                    .resolve(url, &scope, TokenRange::default())
+                    .unwrap_err();
+                assert!(
+                    matches!(err, RuntimeError::RemoteImportDenied { .. }),
+                    "expected {url} to be denied, got: {err:?}"
+                );
+            }
+        }
+
+        /// The private-address guard is lifted once the host explicitly
+        /// opts in, so an internal mirror can still be reached.
+        #[test]
+        fn private_address_allowed_when_opted_in() {
+            let server = MockServer::start("{ a: 1 }", 200);
+            let resolver = RemoteHttpResolver::new()
+                .without_cache()
+                .allow_insecure(true)
+                .allow_private_addrs(true);
+            let scope = Arc::new(Scope::default());
+            let url = server.url("/util.relon");
+            let src = resolver
+                .resolve(&url, &scope, TokenRange::default())
+                .expect("opted-in private fetch should succeed")
+                .expect("Some(source)");
+            assert_eq!(src.source, "{ a: 1 }");
+        }
+
+        #[test]
+        fn ip_block_predicate_matches_expected_ranges() {
+            use std::net::{Ipv4Addr, Ipv6Addr};
+            // Blocked.
+            assert!(ip_is_blocked(Ipv4Addr::new(127, 0, 0, 1).into()));
+            assert!(ip_is_blocked(Ipv4Addr::new(10, 1, 2, 3).into()));
+            assert!(ip_is_blocked(Ipv4Addr::new(172, 16, 0, 1).into()));
+            assert!(ip_is_blocked(Ipv4Addr::new(192, 168, 0, 1).into()));
+            assert!(ip_is_blocked(Ipv4Addr::new(169, 254, 169, 254).into()));
+            assert!(ip_is_blocked(Ipv4Addr::new(0, 0, 0, 0).into()));
+            assert!(ip_is_blocked(Ipv6Addr::LOCALHOST.into()));
+            assert!(ip_is_blocked("fc00::1".parse::<Ipv6Addr>().unwrap().into()));
+            assert!(ip_is_blocked("fe80::1".parse::<Ipv6Addr>().unwrap().into()));
+            assert!(ip_is_blocked(
+                "::ffff:127.0.0.1".parse::<Ipv6Addr>().unwrap().into()
+            ));
+            // Allowed (public).
+            assert!(!ip_is_blocked(Ipv4Addr::new(8, 8, 8, 8).into()));
+            assert!(!ip_is_blocked(Ipv4Addr::new(1, 1, 1, 1).into()));
+            assert!(!ip_is_blocked(
+                "2606:4700:4700::1111".parse::<Ipv6Addr>().unwrap().into()
+            ));
+            // Host string helper.
+            assert!(host_is_blocked("localhost"));
+            assert!(host_is_blocked("127.0.0.1"));
+            assert!(!host_is_blocked("example.com"));
         }
     }
 }
