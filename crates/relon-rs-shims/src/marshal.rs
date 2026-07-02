@@ -41,6 +41,7 @@
 use core::cell::RefCell;
 
 use relon_eval_api::buffer::{BufferBuilder, BufferReader};
+use relon_eval_api::inplace_return::{verify_object_return_multi, ArenaRegions};
 use relon_eval_api::layout::{FieldKind, FieldOffset, ListElementKind, OffsetTable};
 use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
 
@@ -436,9 +437,54 @@ fn dispatch_with_arena(
     }
     let return_schema = synthesise_schema(return_fields, "Ret");
     let return_layout = synthesise_layout(return_fields, return_root_size);
-    let out_bytes = &arena[out_ptr as usize..read_end];
-    let reader = BufferReader::new(&return_layout, &return_schema.fields, out_bytes)
-        .map_err(|e| BufferEntryError::Buffer(format!("{e}")))?;
+
+    // Return decode uses the F1 arena-absolute slot convention, identical
+    // to the in-process LLVM evaluator's object-return path
+    // (`relon_eval_api::inplace_return::decode_object_return`): the JIT
+    // body writes every tail pointer as an arena-absolute offset (relative
+    // to arena offset 0), and the return record's fixed area sits at
+    // `out_ptr`. So the reader must be anchored at `out_ptr` over the
+    // WHOLE arena (`new_at_base`), not over an `arena[out_ptr..]` slice —
+    // the latter reads each tail pointer relative to a base of `out_ptr`,
+    // over-shooting the payload by `out_ptr` bytes. That misframing is
+    // invisible when `out_ptr == 0` (a parameterless `#main`) but corrupts
+    // every tail-bearing return (`List` / `String`) as soon as `#main`
+    // takes a parameter (`out_ptr > 0`), which is exactly the quux
+    // (`#main(Int n) -> List<Int>`) failure. Scalar returns carry no tail
+    // pointer, so they decoded correctly under either framing.
+    let regions = ArenaRegions {
+        const_data_len: const_data.len(),
+        in_ptr,
+        in_len,
+        out_ptr,
+        out_cap,
+        scratch_base,
+        arena_size,
+    };
+    let arena_view = &arena[..arena_size];
+    // Bounds gate FIRST, mirroring the in-process object-return pipeline:
+    // the multi-region verifier certifies the whole reachable graph stays
+    // in-region before any slot is decoded, so a malformed / out-of-bounds
+    // tail pointer aborts loudly instead of being read past the arena end.
+    let multi = regions
+        .multi_region()
+        .map_err(|e| BufferEntryError::Buffer(format!("arena regions invalid: {e}")))?;
+    verify_object_return_multi(
+        "llvm-aot-native",
+        arena_view,
+        out_ptr as usize,
+        multi,
+        &return_layout,
+        &return_schema.fields,
+    )
+    .map_err(|e| BufferEntryError::Buffer(format!("{e}")))?;
+    let reader = BufferReader::new_at_base(
+        &return_layout,
+        &return_schema.fields,
+        arena_view,
+        out_ptr as usize,
+    )
+    .map_err(|e| BufferEntryError::Buffer(format!("{e}")))?;
     let mut out = Vec::with_capacity(return_fields.len());
     for field in return_fields.iter() {
         out.push(unpack_ret(&reader, field)?);
@@ -668,4 +714,233 @@ fn synthesise_layout(fields: &[EmittedField], root_size: u32) -> OffsetTable {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod native_decode_tests {
+    //! Regression coverage for the F1 arena-absolute return-decode frame
+    //! (the `out_ptr > 0` + tail-bearing return bug).
+    //!
+    //! The three-crate binding text is guarded by
+    //! `relon-rs-build/tests/marshal_roundtrip.rs`, and the LLVM in-process
+    //! decode is exercised by the codegen crate. What was **never** covered
+    //! is the *native* `call_buffer_entry` return decode for a return that
+    //! carries a tail pointer (`List` / `String`) when the input record is
+    //! non-empty — i.e. `out_ptr > 0`. That is exactly the demo's `quux`
+    //! (`#main(Int n) -> List<Int>`) shape, and exactly where the historical
+    //! `arena[out_ptr..]`-slice framing misread every tail pointer by
+    //! `out_ptr` bytes.
+    //!
+    //! These tests drive the real `call_buffer_entry` path with a synthetic
+    //! `extern "C"` entry that writes the return record the same way the
+    //! LLVM/cranelift JIT body does: the tail pointer slot holds an
+    //! **arena-absolute** offset (relative to arena offset 0), and the tail
+    //! record lives past `out_ptr`. A wrong frame surfaces as a decode error
+    //! or wrong value here rather than only in the linked demo.
+
+    use super::*;
+
+    /// Write `bytes` at absolute arena offset `at`.
+    ///
+    /// # Safety
+    /// `at + bytes.len()` must be within the arena the `ArenaState` points
+    /// at; the caller guarantees this from the dispatch's own layout.
+    unsafe fn poke(arena: *mut u8, at: usize, bytes: &[u8]) {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), arena.add(at), bytes.len());
+    }
+
+    /// Read the 8-byte `Int` slot at absolute arena offset `at`.
+    unsafe fn peek_i64(arena: *const u8, at: usize) -> i64 {
+        let mut b = [0u8; 8];
+        std::ptr::copy_nonoverlapping(arena.add(at), b.as_mut_ptr(), 8);
+        i64::from_le_bytes(b)
+    }
+
+    /// Recover `(arena_base, arena_len)` from the opaque `ArenaState`.
+    unsafe fn arena_of(state: *const ArenaState) -> (*mut u8, usize) {
+        let base = *(*state).arena_base.get() as *mut u8;
+        let len = *(*state).arena_len.get() as usize;
+        (base, len)
+    }
+
+    /// Synthetic `quux` body: reads `n` from the input record's first `Int`
+    /// slot and writes `[n, n + 1, 7]` as a `List<Int>` return using the F1
+    /// arena-absolute pointer convention (tail pointer = arena offset 0
+    /// based; tail record past `out_ptr`). Mirrors what the LLVM `mem.rs`
+    /// epilogue emits (`dst_off = out_ptr + aligned`).
+    unsafe extern "C" fn synthetic_quux_entry(
+        state: *const ArenaState,
+        in_ptr: i32,
+        _in_len: i32,
+        out_ptr: i32,
+        _out_cap: i32,
+        _caps: i64,
+    ) -> i32 {
+        let (arena, _len) = arena_of(state);
+        let in_ptr = in_ptr as usize;
+        let out_ptr = out_ptr as usize;
+        let n = peek_i64(arena, in_ptr);
+        let list = [n, n + 1, 7i64];
+
+        // Tail record at out_ptr + 8 (8-aligned). The pointer slot at the
+        // record root holds the ARENA-ABSOLUTE offset of the tail.
+        let tail_off = out_ptr + 8;
+        poke(arena, out_ptr, &(tail_off as u32).to_le_bytes());
+        poke(arena, tail_off, &(list.len() as u32).to_le_bytes());
+        // List<Int> tail: [len: u32][pad to 8][i64 …]; align(tail_off+4, 8)
+        // == tail_off + 8 since tail_off is 8-aligned.
+        let payload = tail_off + 8;
+        let mut cur = payload;
+        for v in list {
+            poke(arena, cur, &v.to_le_bytes());
+            cur += 8;
+        }
+        (cur - out_ptr) as i32
+    }
+
+    /// Synthetic body returning a fixed `String` via the same arena-absolute
+    /// tail convention (`[len: u32][utf8 bytes]`, no inner padding).
+    unsafe extern "C" fn synthetic_string_entry(
+        state: *const ArenaState,
+        _in_ptr: i32,
+        _in_len: i32,
+        out_ptr: i32,
+        _out_cap: i32,
+        _caps: i64,
+    ) -> i32 {
+        let (arena, _len) = arena_of(state);
+        let out_ptr = out_ptr as usize;
+        let s = b"relon-native-return";
+
+        let tail_off = out_ptr + 8;
+        poke(arena, out_ptr, &(tail_off as u32).to_le_bytes());
+        poke(arena, tail_off, &(s.len() as u32).to_le_bytes());
+        // String tail has no inner padding: payload starts at record + 4.
+        let payload = tail_off + 4;
+        poke(arena, payload, s);
+        (payload + s.len() - out_ptr) as i32
+    }
+
+    #[test]
+    fn list_return_with_one_param_decodes_arena_absolute_tail() {
+        // Single `Int` param forces `out_ptr > 0` (in_len == 8 → out_ptr
+        // == 8), the minimal reproduction of the quux bug.
+        let entry: BufferEntryFn = synthetic_quux_entry;
+        let main_fields = [EmittedField {
+            name: "n",
+            offset: 0,
+            ty: EmittedFieldType::Int,
+        }];
+        let return_fields = [EmittedField {
+            name: "value",
+            offset: 0,
+            ty: EmittedFieldType::ListInt,
+        }];
+        let state = SandboxState::new();
+        let args = [ArgValue::Int(10)];
+        let out = call_buffer_entry(
+            entry,
+            &[],
+            &main_fields,
+            8,
+            &return_fields,
+            8,
+            true,
+            &state,
+            &args,
+        )
+        .expect("native list-return decode must succeed");
+        assert_eq!(out, vec![RetValue::ListInt(vec![10, 11, 7])]);
+    }
+
+    #[test]
+    fn list_return_with_many_params_pushes_out_ptr_larger() {
+        // Four `Int` params grow `in_len` to 32, so `out_ptr == 32`. A
+        // frame that mis-based tail pointers by `out_ptr` would over-shoot
+        // further here, so this pins the fix across a larger `out_ptr`.
+        let entry: BufferEntryFn = synthetic_quux_entry;
+        let main_fields = [
+            EmittedField {
+                name: "a",
+                offset: 0,
+                ty: EmittedFieldType::Int,
+            },
+            EmittedField {
+                name: "b",
+                offset: 8,
+                ty: EmittedFieldType::Int,
+            },
+            EmittedField {
+                name: "c",
+                offset: 16,
+                ty: EmittedFieldType::Int,
+            },
+            EmittedField {
+                name: "d",
+                offset: 24,
+                ty: EmittedFieldType::Int,
+            },
+        ];
+        let return_fields = [EmittedField {
+            name: "value",
+            offset: 0,
+            ty: EmittedFieldType::ListInt,
+        }];
+        let state = SandboxState::new();
+        let args = [
+            ArgValue::Int(100),
+            ArgValue::Int(2),
+            ArgValue::Int(3),
+            ArgValue::Int(4),
+        ];
+        let out = call_buffer_entry(
+            entry,
+            &[],
+            &main_fields,
+            32,
+            &return_fields,
+            8,
+            true,
+            &state,
+            &args,
+        )
+        .expect("native list-return decode (large out_ptr) must succeed");
+        // synthetic body reads slot 0 (`a` == 100) → [100, 101, 7].
+        assert_eq!(out, vec![RetValue::ListInt(vec![100, 101, 7])]);
+    }
+
+    #[test]
+    fn string_return_with_param_decodes_arena_absolute_tail() {
+        // A tail-bearing `String` return with `out_ptr > 0` — the other
+        // pointer-indirect return shape the old frame corrupted.
+        let entry: BufferEntryFn = synthetic_string_entry;
+        let main_fields = [EmittedField {
+            name: "n",
+            offset: 0,
+            ty: EmittedFieldType::Int,
+        }];
+        let return_fields = [EmittedField {
+            name: "value",
+            offset: 0,
+            ty: EmittedFieldType::String,
+        }];
+        let state = SandboxState::new();
+        let args = [ArgValue::Int(1)];
+        let out = call_buffer_entry(
+            entry,
+            &[],
+            &main_fields,
+            8,
+            &return_fields,
+            8,
+            true,
+            &state,
+            &args,
+        )
+        .expect("native string-return decode must succeed");
+        assert_eq!(
+            out,
+            vec![RetValue::String("relon-native-return".to_string())]
+        );
+    }
 }
