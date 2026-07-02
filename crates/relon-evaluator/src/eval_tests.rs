@@ -1243,31 +1243,33 @@ fn recursion_limit_uses_dedicated_error_kind() {
     // whose `limit` field semantically counts evaluator steps, not
     // recursion depth.
     //
+    // The deep value is built at *runtime* by a recursive closure, not
+    // spelled as a deep literal. This keeps the surface syntax shallow
+    // (a handful of bracket levels) so the parser's own nesting-depth
+    // guard doesn't reject it first, while `build(150)` still produces a
+    // 150-deep `{ next: { next: ... } }` value that overruns the
+    // type-check recursion bound (`MAX_TYPE_CHECK_DEPTH = 100`) when
+    // `Cell root` validates it. 150 closure calls are trivially under
+    // the evaluator's step budget, so the recursion bound — not the
+    // step counter — is what trips.
+    //
     // We run on a generous-stack thread because debug-build dict
     // evaluation eats stack frames quickly: the platform default
     // (~512 KB on macOS test threads) can blow before the typecheck
-    // bound trips. 8 MB gives the bound room to fire instead.
+    // bound trips. 32 MB gives the bound room to fire instead.
     let handle = std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
         .spawn(|| {
-            let mut deeply_nested = String::new();
-            for _ in 0..150 {
-                deeply_nested.push_str("{ next: ");
-            }
-            deeply_nested.push_str("Option.None {}");
-            for _ in 0..150 {
-                deeply_nested.push_str(" }");
-            }
-            let source = format!(
-                r#"{{
+            let source = r#"{
                     #schema
-                    Cell: {{
+                    Cell: {
                         Option<Cell> next: *
-                    }},
-                    Cell root: {deeply_nested}
-                }}"#
-            );
-            eval_doc(&source)
+                    },
+                    #internal
+                    build: (n) => n <= 0 ? Option.None {} : { next: build(n - 1) },
+                    Cell root: build(150)
+                }"#;
+            eval_doc(source)
         })
         .unwrap();
     let result = handle.join().unwrap();

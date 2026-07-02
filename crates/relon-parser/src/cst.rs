@@ -108,6 +108,11 @@ struct Parser<'a> {
     /// Running byte offset — kept in sync with `pos` so we can record
     /// error positions without re-walking.
     cursor_byte: usize,
+    /// Recursive-descent nesting counter. Bumped on entry to
+    /// `parse_unary` (the choke point every deep-nesting cycle passes
+    /// through) and dropped on exit. Guards against stack-overflow
+    /// DoS from pathologically nested input — see [`Parser::MAX_DEPTH`].
+    depth: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -118,8 +123,25 @@ impl<'a> Parser<'a> {
             builder: GreenNodeBuilder::new(),
             errors: Vec::new(),
             cursor_byte: 0,
+            depth: 0,
         }
     }
+
+    /// Hard ceiling on recursive-descent nesting depth. Every deep
+    /// cycle — nested containers, right-associative binary chains,
+    /// prefix-unary runs, and f-string interpolation — funnels through
+    /// [`Parser::parse_unary`], which bumps [`Parser::depth`]; crossing
+    /// this limit is turned into an ordinary parse error rather than a
+    /// blown call stack.
+    ///
+    /// The value is deliberately low. Debug stack frames on the dict
+    /// path cost ~33 KiB per level, so ~62 levels already exhaust a
+    /// 2 MiB thread — and LSP servers routinely run the parser on such
+    /// threads. 32 keeps ~2x head-room under that empirical overflow
+    /// point while sitting ~10x above the deepest nesting seen across
+    /// the whole fixture/example corpus (3). No grammatically real
+    /// input comes anywhere near it; only crafted DoS payloads do.
+    const MAX_DEPTH: u32 = 32;
 
     fn finish(self) -> Parse {
         // `parse_document` is responsible for emitting every token
@@ -1163,14 +1185,29 @@ impl<'a> Parser<'a> {
     /// Prefix-unary or atom. Postfix call / index / dot are wrapped
     /// here via checkpoint.
     fn parse_unary(&mut self) {
+        // Recursion guard. Every deep-nesting cycle (containers,
+        // right-associative binary chains, prefix-unary runs, f-string
+        // interpolation) routes through `parse_unary`, so this single
+        // check caps them all. On overrun we emit a normal parse error
+        // and absorb the remaining tokens into one ERROR node — never
+        // panic, never abort. Consuming to end-of-input also stops the
+        // O(n^2) paren/type look-ahead scans from re-running at every
+        // deeper level. `depth` is decremented on every return path.
+        self.depth += 1;
+        if self.depth > Self::MAX_DEPTH {
+            self.error_recover("expression nesting too deep", &[]);
+            self.depth -= 1;
+            return;
+        }
         if self.at_set(&[SyntaxKind::MINUS, SyntaxKind::BANG, SyntaxKind::PLUS]) {
             self.open(SyntaxKind::UNARY_EXPR);
             self.bump();
             self.parse_unary();
             self.close();
-            return;
+        } else {
+            self.parse_postfix();
         }
-        self.parse_postfix();
+        self.depth -= 1;
     }
 
     /// Atom with postfix suffixes (`.field`, `[i]`, `(args)`,
@@ -3092,6 +3129,93 @@ mod tests {
     #[test]
     fn unknown_byte_does_not_crash() {
         parse_round_trip("{ x: \u{0000} 1 }");
+    }
+
+    // ---- recursion-depth DoS guard -----------------------------------
+    //
+    // Pathologically nested input used to recurse without bound and
+    // abort the process with a stack overflow (uncatchable SIGABRT).
+    // The `MAX_DEPTH` guard in `parse_unary` now turns it into an
+    // ordinary parse error. Depth 500 sits far above the ceiling (32),
+    // so every container/prefix/f-string family must report an error
+    // and return normally instead of blowing the stack.
+
+    fn deep_reports_error(source: &str) {
+        // `parse_cst` never returns `Err`; a well-formed reject shows up
+        // as recorded errors + a lossless round-trip.
+        let parsed = parse_cst(source);
+        assert!(
+            parsed.has_errors(),
+            "expected a nesting-depth error, got a clean parse"
+        );
+        assert_eq!(
+            parsed.syntax().text().to_string(),
+            source,
+            "round-trip must survive depth-limit recovery"
+        );
+        // The strict public entry must surface it as a hard `Err`
+        // (not a panic / abort).
+        assert!(
+            crate::parse_document(source).is_err(),
+            "strict parse_document should reject over-deep nesting"
+        );
+    }
+
+    #[test]
+    fn deep_nested_dict_reports_error_not_abort() {
+        let src = format!("{}1{}", "{a:".repeat(500), "}".repeat(500));
+        deep_reports_error(&src);
+    }
+
+    #[test]
+    fn deep_nested_list_reports_error_not_abort() {
+        let src = format!("{}1{}", "[".repeat(500), "]".repeat(500));
+        deep_reports_error(&src);
+    }
+
+    #[test]
+    fn deep_nested_paren_reports_error_not_abort() {
+        let src = format!("{}1{}", "(".repeat(500), ")".repeat(500));
+        deep_reports_error(&src);
+    }
+
+    #[test]
+    fn deep_prefix_unary_reports_error_not_abort() {
+        let src = format!("{}1", "!".repeat(500));
+        deep_reports_error(&src);
+    }
+
+    #[test]
+    fn deep_nested_fstring_reports_error_not_abort() {
+        let mut src = String::from("1");
+        for _ in 0..500 {
+            src = format!("f\"${{{src}}}\"");
+        }
+        deep_reports_error(&src);
+    }
+
+    #[test]
+    fn deep_nesting_survives_small_stack() {
+        // Simulate the constrained thread an LSP server runs the parser
+        // on. A 1 MiB stack overflowed at ~30 dict levels before the
+        // guard existed; with the guard, 500 levels must return cleanly.
+        let handle = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let src = format!("{}1{}", "{a:".repeat(500), "}".repeat(500));
+                crate::parse_document(&src).is_err()
+            })
+            .expect("spawn probe thread");
+        assert!(handle.join().expect("probe thread must not abort"));
+    }
+
+    #[test]
+    fn moderate_nesting_still_accepted() {
+        // Ten levels is far shallower than any real config yet exercises
+        // the guard's increment/decrement pairing; it must parse clean.
+        let src = format!("{}1{}", "[".repeat(10), "]".repeat(10));
+        let parsed = parse_round_trip(&src);
+        assert!(!parsed.has_errors(), "errors: {:?}", parsed.errors);
     }
 
     #[test]
