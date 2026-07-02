@@ -542,12 +542,21 @@ fn build_native_options(host_fns: &[NativeHostFn]) -> relon_analyzer::AnalyzeOpt
         caps.uses_rng |= f.gate.uses_rng;
     }
 
+    // Keep `strict_mode` at its `true` default and turn the single-file
+    // capability-reachability check on, so the closed-world `#native`
+    // `.o` seam aligns with the pure-source `emit_object` seam and the
+    // in-process `from_source` path. Every required cap bit is granted
+    // above, so the static check passes at build time; the runtime
+    // grant/deny decision still rides the host's `caps` mask per call.
+    // The frontend still runs through `compile_with_suppressed` in
+    // `lower_source_with_options`, so closure-as-value shapes keep
+    // compiling.
     relon_analyzer::AnalyzeOptions {
         host_fn_names: names,
         host_fn_signatures: signatures,
         host_fn_gates: gates,
         caps,
-        strict_mode: false,
+        standalone_capability_check: true,
         ..Default::default()
     }
 }

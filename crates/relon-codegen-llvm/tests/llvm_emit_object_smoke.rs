@@ -155,6 +155,31 @@ fn unique_entry_symbols() {
 }
 
 #[test]
+fn closure_as_value_dict_still_emits() {
+    // W7 closure-as-value production shape. Under the aligned seam the
+    // `.o` path preserves `strict_mode: true`, which trips three
+    // type-surface soft-ban diagnostics (`ClosureParamTypeMissing`,
+    // `ClosureReturnTypeUnknown`, `ExpressionTypeUnknown`) on the
+    // anonymous `(k) => ...` closure. `lower_source_with_options` routes
+    // the frontend through `compile_with_suppressed`, which drops
+    // exactly those three so the shape IR lowering already accepts keeps
+    // compiling — strict must not kill it. A regression that reinstated
+    // a blanket `strict_mode: false`, or dropped the suppression, would
+    // surface here.
+    let src =
+        "#main(Int n) -> Dict { #internal fib: (k) => k<2?k:fib(k-1)+fib(k-2), result: fib(n) }";
+    let info = emit_to_tmp("w7_closure_dict", src)
+        .expect("W7 closure-as-value source must still emit under strict + softban suppression");
+    assert_eq!(info.shape, EmittedEntryShape::Buffer);
+    assert_eq!(info.param_names, vec!["n".to_string()]);
+    // The Dict return projects to its single non-`#internal` field
+    // `result: Int` under the Phase 2 envelope.
+    assert_eq!(info.return_fields.len(), 1);
+    assert_eq!(info.return_fields[0].name, "result");
+    assert_eq!(info.return_fields[0].ty, EmittedFieldType::Int);
+}
+
+#[test]
 fn binding_path_arity_matches_param_names() {
     // The binding generator pairs `param_names[i]` with
     // `main_fields[i]` under the buffer-protocol envelope. The two

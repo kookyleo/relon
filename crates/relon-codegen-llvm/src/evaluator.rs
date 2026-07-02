@@ -2616,9 +2616,16 @@ impl LlvmAotEvaluator {
         // Thin wrapper preserving the historical 3-arg signature the
         // rs-build `emit_all` calls (Stage 2 keeps this call site
         // stable). Default options (no host `#native` declarations) +
-        // open-world dispatch — byte-identical to the pre-S2.⑤ path.
+        // open-world dispatch. Keeps `strict_mode` at its `true` default
+        // and turns the single-file capability-reachability check on, so
+        // the pure-source `.o` seam makes the SAME static accept/reject
+        // decision as the in-process `from_source` path (a gated call to
+        // an ungranted capability is rejected at compile time, not left
+        // to a runtime trap). `lower_source_with_options` still routes
+        // the frontend through `compile_with_suppressed`, so W7
+        // closure-as-value sources keep compiling.
         let options = relon_analyzer::AnalyzeOptions {
-            strict_mode: false,
+            standalone_capability_check: true,
             ..Default::default()
         };
         Self::emit_object_with_options(

@@ -38,25 +38,29 @@
 //!    *runtime outcomes* (cranelift carries the full state-pointer +
 //!    vtable harness, so it can run the gate to completion).
 //!
-//! ### Wiring gap (handed to the integration stage)
+//! ### Compile-time capability rejection on the `.o` seam
 //!
-//! `LlvmAotEvaluator::emit_object(src, symbol, path)` re-lowers with
-//! `AnalyzeOptions = None`, so it cannot resolve a host-declared
-//! `#native` fn and therefore cannot bake a `CheckCap` gate **from a
-//! gated source** today. Driving grant/deny end-to-end through the
-//! linked `.o` needs an options-carrying `emit_object` seam in
-//! `evaluator.rs` (the `lower_source_with_options(src, None)` call at
-//! `evaluator.rs:1780`, ~1 line to thread an `Option<&AnalyzeOptions>`
-//! through). `evaluator.rs` is W1-A's file, so that wiring is left for
-//! the integration stage. The gate machinery + its IR emission are
-//! proven here on every layer reachable without touching `evaluator.rs`.
+//! The options-carrying `emit_object_with_options` seam threads a
+//! caller `AnalyzeOptions` into the same `lower_source_with_options`
+//! the in-process `from_source` path uses, which forces
+//! `standalone_capability_check: true`. A host-gated `#native` call
+//! whose capability the options do **not** grant is therefore rejected
+//! at *compile time* (`LlvmError::Analyze`) — it never reaches the `.o`,
+//! matching cranelift's static accept/reject decision, rather than
+//! compiling and deferring to a runtime `CapabilityDenied` trap. See
+//! `emit_object_rejects_gated_call_without_granted_cap` below.
+//!
+//! The 3-arg `emit_object(src, symbol, path)` convenience form still
+//! lowers with *default* options (no host `#native` declarations), so it
+//! resolves no gated call and bakes no gate from a plain source — the
+//! gated flow rides `emit_object_with_options`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use relon_codegen_llvm::{
     populate_global_mappings, CapabilityVtable, LlvmAotEvaluator, SandboxConfig, SandboxTrapKind,
-    VtableSlot,
+    VtableSlot, WorldMode,
 };
 use relon_eval_api::{
     Capabilities, CapabilityBit, Evaluator, NativeArgs, NativeFnCaps, RelonFunction, RuntimeError,
@@ -156,6 +160,57 @@ fn emit_object_produces_a_linkable_native_artefact() {
         b"\x7fELF",
         "emitted file must be an ELF object"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn emit_object_rejects_gated_call_without_granted_cap() {
+    // Alignment guard: the `.o` seam runs the SAME single-file
+    // capability-reachability check as the in-process `from_source`
+    // path (`standalone_capability_check` is forced on in
+    // `lower_source_with_options`). A `#native` call gated on
+    // `reads_clock` whose options do NOT grant that bit must be
+    // rejected at *compile time* — the emit fails with `Analyze` and no
+    // `.o` is produced — rather than compiling and deferring to a
+    // runtime `CapabilityDenied` trap. Granting the bit compiles the
+    // exact same source, isolating the rejection to the capability gate.
+    let dir = std::env::temp_dir().join(format!("relon_aot_cap_reject_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mk tmp dir");
+    let src = "#main(Int x) -> Int\nclock_add(x)";
+
+    let ungranted = clock_add_options(/*grant_clock=*/ false);
+    let out_deny = dir.join("cap_reject.o");
+    let err = LlvmAotEvaluator::emit_object_with_options(
+        src,
+        "relon_main",
+        &out_deny,
+        &ungranted,
+        WorldMode::OpenWorld,
+        None,
+    )
+    .expect_err("ungranted gated call must be rejected at compile time");
+    assert!(
+        matches!(err, relon_codegen_llvm::LlvmError::Analyze(_)),
+        "expected a static Analyze rejection (CapabilityRequired), got {err:?}"
+    );
+    assert!(
+        !out_deny.exists(),
+        "a compile-time-rejected source must NOT leave a `.o` behind"
+    );
+
+    // Same source, capability granted -> compiles to a real `.o`.
+    let granted = clock_add_options(/*grant_clock=*/ true);
+    let out_ok = dir.join("cap_grant.o");
+    LlvmAotEvaluator::emit_object_with_options(
+        src,
+        "relon_main",
+        &out_ok,
+        &granted,
+        WorldMode::OpenWorld,
+        None,
+    )
+    .expect("granted gated call must compile");
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 
