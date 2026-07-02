@@ -98,3 +98,65 @@ where
     }
     lower_workspace_single(&analyzed, &ast).map_err(|e| FrontendError::Lowering(e.to_string()))
 }
+
+#[cfg(test)]
+mod fail_closed_e2e {
+    use super::*;
+    use relon_analyzer::{FnParam, FnSignature};
+    use std::collections::{HashMap, HashSet};
+
+    fn opts_with_native(name: &str) -> AnalyzeOptions {
+        let sig = FnSignature {
+            name: name.to_string(),
+            generics: Vec::new(),
+            params: vec![FnParam {
+                name: "_0".to_string(),
+                ty: relon_analyzer::type_node_simple("Int"),
+                optional: false,
+            }],
+            return_type: relon_analyzer::type_node_simple("Int"),
+            variadic_tail: None,
+        };
+        let mut sigs = HashMap::new();
+        sigs.insert(name.to_string(), sig);
+        let mut names = HashSet::new();
+        names.insert(name.to_string());
+        AnalyzeOptions {
+            host_fn_names: names,
+            host_fn_signatures: sigs,
+            strict_mode: false,
+            standalone_capability_check: true,
+            ..AnalyzeOptions::default()
+        }
+    }
+
+    const SRC: &str = "#main(Int n) -> Int\nreads_net(n)\n";
+
+    /// End-to-end: a host that opens the fail-closed switch and forgot to
+    /// declare a gate for an effectful native gets the build rejected at
+    /// compile time (the analyzer's Error diagnostic gates `compile`).
+    #[test]
+    fn switch_on_missing_gate_rejected_at_compile() {
+        let opts = AnalyzeOptions {
+            require_declared_native_gates: true,
+            ..opts_with_native("reads_net")
+        };
+        let err = compile(SRC, &opts).expect_err("under-declared native must fail the build");
+        assert!(
+            matches!(err, FrontendError::Analyze(n) if n >= 1),
+            "{err:?}"
+        );
+    }
+
+    /// Same source, switch OFF (default) → the build is not gated by the
+    /// declaration check (it lowers; the compiled call runs ungated, the
+    /// historical fail-open).
+    #[test]
+    fn switch_off_missing_gate_compiles() {
+        let opts = opts_with_native("reads_net"); // require flag defaults false
+        assert!(
+            compile(SRC, &opts).is_ok(),
+            "default fail-open path must still lower"
+        );
+    }
+}

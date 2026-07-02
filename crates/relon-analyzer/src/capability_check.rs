@@ -114,6 +114,46 @@ pub(crate) fn run_single(tree: &mut AnalyzedTree) {
     tree.diagnostics.extend(diagnostics);
 }
 
+/// Fail-closed native-gate *declaration* check (opt-in, driven by
+/// [`crate::AnalyzeOptions::require_declared_native_gates`]). Unlike
+/// [`run_single`], this is not a reachability check over the source — it
+/// audits the host's registration tables directly. A native fn is
+/// under-declared when it appears in `host_fn_signatures` (so it is part
+/// of the callable language surface) yet has neither a `host_fn_gates`
+/// entry nor a `host_fn_pure` declaration: its capability requirements
+/// are unknown, so the compiled/native call would run ungated even if it
+/// were effectful. Each such name yields one Error-severity
+/// [`Diagnostic::NativeGateUndeclared`], gating the build before
+/// lowering.
+///
+/// A declared-pure fn (`register_pure_fn` → `host_fn_pure`) and a
+/// properly gated effectful fn (present `host_fn_gates` entry, including
+/// an explicitly-empty gate) are both fully declared and never reported.
+/// The check is source-independent: it fires whether or not the entry
+/// actually calls the native, because the under-declaration is a host
+/// misconfiguration, not a per-call property. Names are sorted for
+/// deterministic diagnostics.
+pub(crate) fn check_declared_native_gates(tree: &mut AnalyzedTree) {
+    let mut undeclared: Vec<String> = tree
+        .host_fn_signatures
+        .keys()
+        .filter(|name| {
+            !tree.host_fn_gates.contains_key(*name) && !tree.host_fn_pure.contains(*name)
+        })
+        .cloned()
+        .collect();
+    undeclared.sort();
+    for fn_name in undeclared {
+        tree.diagnostics.push(Diagnostic::NativeGateUndeclared {
+            fn_name,
+            // Host-registration error, not a source position — anchor at
+            // the document start (same convention as the workspace-level
+            // diagnostics in `workspace_build`).
+            range: SourceSpan::from((0usize, 0usize)),
+        });
+    }
+}
+
 /// Shared per-tree walk: queue every `FnCall` and every
 /// statically-dead-branch id in one pass over `node_index`, then emit
 /// a diagnostic for each reachable gated call whose cap isn't granted.
@@ -778,5 +818,155 @@ mod tests {
         let ws = build_with_options("/abs/entry", r#"{ x: everything() }"#, &mut loader, &opts);
         let diags = cap_diags(&ws);
         assert!(diags.is_empty(), "{diags:#?}");
+    }
+}
+
+/// Fail-closed native-gate *declaration* check
+/// (`require_declared_native_gates`). Exercises the three native shapes
+/// (undeclared / declared-pure / gated) across the two switch states,
+/// driven through the real [`crate::analyze_with_options`] entry so the
+/// AnalyzeOptions → AnalyzedTree mirror and the diagnostic wiring are all
+/// on the path.
+#[cfg(test)]
+mod declared_gate_tests {
+    use crate::sig::type_node_simple;
+    use crate::{
+        analyze_with_options, AnalyzeOptions, Diagnostic, FnParam, FnSignature, NativeFnGate,
+        Severity,
+    };
+    use relon_parser::parse_document;
+    use std::collections::{HashMap, HashSet};
+
+    /// One `Int -> Int` host signature named `name`.
+    fn int_sig(name: &str) -> FnSignature {
+        FnSignature {
+            name: name.to_string(),
+            generics: Vec::new(),
+            params: vec![FnParam {
+                name: "_0".to_string(),
+                ty: type_node_simple("Int"),
+                optional: false,
+            }],
+            return_type: type_node_simple("Int"),
+            variadic_tail: None,
+        }
+    }
+
+    /// Options exposing a single native `name` as a callable signature.
+    /// The caller decorates it with a gate / purity / the switch.
+    fn opts_with_signature(name: &str) -> AnalyzeOptions {
+        let mut sigs = HashMap::new();
+        sigs.insert(name.to_string(), int_sig(name));
+        let mut names = HashSet::new();
+        names.insert(name.to_string());
+        AnalyzeOptions {
+            host_fn_names: names,
+            host_fn_signatures: sigs,
+            // Relaxed so the trivial body doesn't drag in unrelated
+            // strict-mode diagnostics — we assert specifically on the
+            // native-gate diagnostic.
+            strict_mode: false,
+            ..AnalyzeOptions::default()
+        }
+    }
+
+    fn undeclared_diags(tree: &crate::AnalyzedTree) -> Vec<&Diagnostic> {
+        tree.diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::NativeGateUndeclared { .. }))
+            .collect()
+    }
+
+    const SRC: &str = "#main(Int n) -> Int\nreads_net(n)\n";
+
+    // (a) Switch OFF (default): signature, no gate, no purity → build
+    // passes; no NativeGateUndeclared diagnostic (old fail-open behavior).
+    #[test]
+    fn switch_off_undeclared_is_not_gated() {
+        let ast = parse_document(SRC).unwrap();
+        let opts = opts_with_signature("reads_net"); // require flag defaults false
+        let tree = analyze_with_options(&ast, &opts);
+        assert!(
+            undeclared_diags(&tree).is_empty(),
+            "default (fail-open) must not emit the declaration Error: {:#?}",
+            tree.diagnostics
+        );
+    }
+
+    // (c) Switch ON: signature, no gate, not declared pure → hard fail.
+    #[test]
+    fn switch_on_undeclared_is_error() {
+        let ast = parse_document(SRC).unwrap();
+        let opts = AnalyzeOptions {
+            require_declared_native_gates: true,
+            ..opts_with_signature("reads_net")
+        };
+        let tree = analyze_with_options(&ast, &opts);
+        let diags = undeclared_diags(&tree);
+        assert_eq!(diags.len(), 1, "{:#?}", tree.diagnostics);
+        assert!(matches!(
+            diags[0],
+            Diagnostic::NativeGateUndeclared { fn_name, .. } if fn_name == "reads_net"
+        ));
+        assert_eq!(diags[0].severity(), Severity::Error);
+        assert!(tree.has_errors());
+    }
+
+    // (b) Switch ON + declared pure (host_fn_pure) → passes, no false
+    // positive.
+    #[test]
+    fn switch_on_declared_pure_passes() {
+        let ast = parse_document(SRC).unwrap();
+        let mut pure = HashSet::new();
+        pure.insert("reads_net".to_string());
+        let opts = AnalyzeOptions {
+            require_declared_native_gates: true,
+            host_fn_pure: pure,
+            ..opts_with_signature("reads_net")
+        };
+        let tree = analyze_with_options(&ast, &opts);
+        assert!(
+            undeclared_diags(&tree).is_empty(),
+            "declared-pure native must not be flagged: {:#?}",
+            tree.diagnostics
+        );
+    }
+
+    // (d) Switch ON + effectful gate declared → passes.
+    #[test]
+    fn switch_on_gated_effectful_passes() {
+        let ast = parse_document(SRC).unwrap();
+        let mut gate = NativeFnGate::default();
+        gate.network = true;
+        let mut gates = HashMap::new();
+        gates.insert("reads_net".to_string(), gate);
+        let mut caps = crate::Capabilities::default();
+        caps.network = true; // grant so the reachability check also passes
+        let opts = AnalyzeOptions {
+            require_declared_native_gates: true,
+            host_fn_gates: gates,
+            caps,
+            ..opts_with_signature("reads_net")
+        };
+        let tree = analyze_with_options(&ast, &opts);
+        assert!(
+            undeclared_diags(&tree).is_empty(),
+            "gated effectful native must not be flagged: {:#?}",
+            tree.diagnostics
+        );
+    }
+
+    // Source-independence: the under-declaration is flagged even when the
+    // entry never calls the native (it is still part of the callable
+    // surface the host exposed).
+    #[test]
+    fn switch_on_flags_even_when_uncalled() {
+        let ast = parse_document("#main(Int n) -> Int\nn + 1\n").unwrap();
+        let opts = AnalyzeOptions {
+            require_declared_native_gates: true,
+            ..opts_with_signature("reads_net")
+        };
+        let tree = analyze_with_options(&ast, &opts);
+        assert_eq!(undeclared_diags(&tree).len(), 1, "{:#?}", tree.diagnostics);
     }
 }

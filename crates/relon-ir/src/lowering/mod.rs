@@ -4218,20 +4218,21 @@ impl NativeImportBuilder {
         // the host declared but whose capability *gate* it never declared
         // lowers with an empty `required_bits` above → no `Op::CheckCap`
         // is emitted → the compiled call runs with no capability
-        // requirement. That is correct for a genuinely pure fn, but it is
-        // also exactly what a forgotten gate looks like: the two are
-        // indistinguishable from the analyzer/IR tables alone (the
-        // `register_pure_fn` "this is pure" intent lives on the evaluator
-        // `Context` and is erased when the host mirrors it into
-        // `AnalyzeOptions`). We therefore do NOT change lowering (no
-        // false-negative risk, no behavior change), but we surface every
-        // under-declared import as a `warn!` so an operator who enables
-        // tracing sees the fail-open. Declaring an explicit gate — an
-        // *empty* `NativeFnGate` for a pure fn — records intent and
-        // silences the warning. Emitting is inert (goes nowhere) unless a
-        // subscriber is installed, so this adds no stderr noise by
-        // default.
-        for name in undeclared_gate_imports(&resolved, &tree.host_fn_gates) {
+        // requirement. That is correct for a genuinely pure fn and also
+        // exactly what a forgotten gate looks like — but the two are now
+        // distinguishable: `register_pure_fn`'s "this is pure" intent is
+        // preserved through `Context::pure_fn_names` →
+        // `AnalyzeOptions::host_fn_pure` → `tree.host_fn_pure`. So the
+        // warning fires only for names that carry neither a gate nor a
+        // purity declaration, no longer false-triggering on legitimately
+        // pure fns. We still do NOT change lowering (no behavior change);
+        // this stays a `warn!` for operators who want the fail-open
+        // surfaced without opting into the hard
+        // `require_declared_native_gates` gate (which the analyzer
+        // enforces as an Error before lowering is ever reached). Emitting
+        // is inert unless a subscriber is installed, so it adds no stderr
+        // noise by default.
+        for name in undeclared_gate_imports(&resolved, &tree.host_fn_gates, &tree.host_fn_pure) {
             tracing::warn!(
                 native_fn = %name,
                 "host declared a signature for native `{name}` but no capability gate; \
@@ -4270,26 +4271,34 @@ impl NativeImportBuilder {
 }
 
 /// Names of resolved native imports the host declared a *signature* for
-/// but never declared a capability *gate* for (no entry in
-/// `host_fn_gates`). These lower with empty `required_bits` and so run
-/// ungated in the compiled backends — the fail-open the caller warns
-/// about. Sorted for deterministic diagnostics/tests.
+/// but declared neither a capability *gate* (`host_fn_gates`) nor an
+/// explicit *purity* marker (`host_fn_pure`). These lower with empty
+/// `required_bits` and so run ungated in the compiled backends — the
+/// fail-open the caller warns about. Sorted for deterministic
+/// diagnostics/tests.
 ///
-/// The rule is presence-of-key, not gate contents: a host that mirrors
-/// `register_pure_fn` faithfully inserts an *empty* `NativeFnGate` entry
-/// (the `register_fn(name, NativeFnGate::default(), …)` gate argument),
-/// which is a present key → treated as an explicit "declared, needs no
-/// capability" and is NOT reported. Only a wholly absent gate entry —
-/// the shape of "host filled `host_fn_signatures` but forgot to mirror
-/// the gate" — is reported. Generic over the gate value type so this
-/// leaf helper needs no capability-type import.
+/// The rule is presence-of-key in either table:
+///
+/// * A present `host_fn_gates` entry (including an explicitly-empty
+///   `NativeFnGate` — the `register_fn(name, NativeFnGate::default(), …)`
+///   shape) means "declared, needs exactly these caps" → NOT reported.
+/// * A present `host_fn_pure` entry — the `register_pure_fn` intent
+///   mirrored through `AnalyzeOptions::host_fn_pure` — means "declared
+///   pure, needs no cap" → NOT reported. This is what eliminates the
+///   prior false-positive on legitimately pure fns.
+///
+/// Only a name absent from *both* tables — the shape of "host filled
+/// `host_fn_signatures` but forgot to declare a gate" — is reported.
+/// Generic over the gate value type so this leaf helper needs no
+/// capability-type import.
 fn undeclared_gate_imports<G>(
     resolved: &HashMap<String, HostFnEntry>,
     gates: &HashMap<String, G>,
+    pure: &HashSet<String>,
 ) -> Vec<String> {
     let mut out: Vec<String> = resolved
         .keys()
-        .filter(|name| !gates.contains_key(*name))
+        .filter(|name| !gates.contains_key(*name) && !pure.contains(*name))
         .cloned()
         .collect();
     out.sort();
@@ -4309,28 +4318,44 @@ mod undeclared_gate_import_tests {
     }
 
     #[test]
-    fn signature_without_gate_entry_is_reported() {
-        // Host declared a signature but no gate at all → under-declared
-        // (a forgotten gate is indistinguishable from this shape).
+    fn signature_without_gate_or_purity_is_reported() {
+        // Host declared a signature but neither a gate nor a purity
+        // marker → under-declared (a forgotten gate looks exactly like
+        // this shape).
         let mut resolved = HashMap::new();
         resolved.insert("read_net".to_string(), entry());
         let gates: HashMap<String, ()> = HashMap::new();
+        let pure: HashSet<String> = HashSet::new();
         assert_eq!(
-            undeclared_gate_imports(&resolved, &gates),
+            undeclared_gate_imports(&resolved, &gates, &pure),
             vec!["read_net".to_string()]
         );
     }
 
     #[test]
-    fn empty_gate_entry_declares_purity_and_is_silent() {
-        // The faithful `register_pure_fn` mirror: an explicit (empty)
-        // gate entry is present → intent recorded → NOT reported. This
-        // is the "don't touch legit pure fns" guarantee.
+    fn empty_gate_entry_declares_intent_and_is_silent() {
+        // A present (even empty) gate entry records intent → NOT
+        // reported.
         let mut resolved = HashMap::new();
         resolved.insert("pure_add".to_string(), entry());
         let mut gates: HashMap<String, ()> = HashMap::new();
         gates.insert("pure_add".to_string(), ());
-        assert!(undeclared_gate_imports(&resolved, &gates).is_empty());
+        let pure: HashSet<String> = HashSet::new();
+        assert!(undeclared_gate_imports(&resolved, &gates, &pure).is_empty());
+    }
+
+    #[test]
+    fn declared_pure_via_purity_set_is_silent() {
+        // The `register_pure_fn` intent, mirrored through
+        // `host_fn_pure`: no gate entry at all, but the name is in the
+        // purity set → NOT reported. This is the false-positive the
+        // refinement eliminates.
+        let mut resolved = HashMap::new();
+        resolved.insert("pure_add".to_string(), entry());
+        let gates: HashMap<String, ()> = HashMap::new();
+        let mut pure: HashSet<String> = HashSet::new();
+        pure.insert("pure_add".to_string());
+        assert!(undeclared_gate_imports(&resolved, &gates, &pure).is_empty());
     }
 
     #[test]
@@ -4340,7 +4365,8 @@ mod undeclared_gate_import_tests {
         resolved.insert("clock_add".to_string(), entry());
         let mut gates: HashMap<String, ()> = HashMap::new();
         gates.insert("clock_add".to_string(), ());
-        assert!(undeclared_gate_imports(&resolved, &gates).is_empty());
+        let pure: HashSet<String> = HashSet::new();
+        assert!(undeclared_gate_imports(&resolved, &gates, &pure).is_empty());
     }
 
     #[test]
@@ -4349,10 +4375,13 @@ mod undeclared_gate_import_tests {
         resolved.insert("zeta".to_string(), entry());
         resolved.insert("alpha".to_string(), entry());
         resolved.insert("declared".to_string(), entry());
+        resolved.insert("pure_one".to_string(), entry());
         let mut gates: HashMap<String, ()> = HashMap::new();
         gates.insert("declared".to_string(), ());
+        let mut pure: HashSet<String> = HashSet::new();
+        pure.insert("pure_one".to_string());
         assert_eq!(
-            undeclared_gate_imports(&resolved, &gates),
+            undeclared_gate_imports(&resolved, &gates, &pure),
             vec!["alpha".to_string(), "zeta".to_string()]
         );
     }

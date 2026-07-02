@@ -245,7 +245,15 @@ pub fn analyze_with_options(root: &Node, options: &AnalyzeOptions) -> AnalyzedTr
     tree.host_fn_names = options.host_fn_names.clone();
     tree.host_fn_signatures = options.host_fn_signatures.clone();
     tree.host_fn_gates = options.host_fn_gates.clone();
+    tree.host_fn_pure = options.host_fn_pure.clone();
     tree.caps = options.caps.clone();
+    // Fail-closed (opt-in) native-gate declaration check. When the host
+    // requests it, every signature that carries neither a gate nor an
+    // explicit purity declaration is an under-declared capability surface
+    // and surfaces as an `Error` that gates the build. No-op by default.
+    if options.require_declared_native_gates {
+        capability_check::check_declared_native_gates(&mut tree);
+    }
     // v1.8 (C4 audit): every host-supplied signature is part of the
     // language surface — its parameter / return / variadic types are
     // visible to user source through stdlib-style resolution. Run the
@@ -384,7 +392,14 @@ fn analyze_trivial_main_fast(root: &Node, options: &AnalyzeOptions) -> AnalyzedT
     tree.host_fn_names = options.host_fn_names.clone();
     tree.host_fn_signatures = options.host_fn_signatures.clone();
     tree.host_fn_gates = options.host_fn_gates.clone();
+    tree.host_fn_pure = options.host_fn_pure.clone();
     tree.caps = options.caps.clone();
+    // Fail-closed (opt-in) native-gate declaration check — mirrors the
+    // full-pipeline path so the trivial-`#main` fast-path can't slip an
+    // under-declared native surface past the gate.
+    if options.require_declared_native_gates {
+        capability_check::check_declared_native_gates(&mut tree);
+    }
     // `audit_host_fn_signatures` walks the host-fn table; trivial
     // entries usually have an empty table (CLI `--lite` populates
     // none) but we still honour any caller-supplied signatures so
@@ -445,6 +460,25 @@ pub struct AnalyzeOptions {
     /// stays silent on those. Hosts populate this from the `gate`
     /// argument they passed to `register_fn(name, gate, fn)`.
     pub host_fn_gates: HashMap<String, cap::NativeFnGate>,
+    /// Native fns the host declared *pure* explicitly (mirror of the
+    /// evaluator's `Context::pure_fn_names`, written by
+    /// `register_pure_fn`). A name here means "the host asserts this fn
+    /// needs no capability", which is a legitimate reason for it to have
+    /// no `host_fn_gates` entry. Used only by the
+    /// [`Self::require_declared_native_gates`] fail-closed check to tell
+    /// a declared-pure fn apart from one whose gate the host simply
+    /// forgot. Empty by default — an empty set preserves the pre-existing
+    /// behavior (every gate-less signature is treated as it was before).
+    pub host_fn_pure: HashSet<String>,
+    /// Fail-closed opt-in (default `false`). When `true`, a native fn
+    /// that appears in `host_fn_signatures` but has neither a
+    /// `host_fn_gates` entry nor a `host_fn_pure` declaration is an
+    /// under-declared capability surface: the analyzer emits an
+    /// `Error`-severity [`Diagnostic::NativeGateUndeclared`] that gates
+    /// the build. Default `false` keeps the historical fail-open behavior
+    /// (a gate-less signature lowers ungated, with only a `warn!` on the
+    /// compiled path). Hosts that want the stricter contract flip this on.
+    pub require_declared_native_gates: bool,
     /// Stage 4: the host's actual capability grant (mirror of the
     /// evaluator's `Capabilities`). Used by the static reachability
     /// check to decide whether a gated fn would be denied at runtime.
@@ -519,6 +553,8 @@ impl Default for AnalyzeOptions {
             host_fn_names: HashSet::new(),
             host_fn_signatures: HashMap::new(),
             host_fn_gates: HashMap::new(),
+            host_fn_pure: HashSet::new(),
+            require_declared_native_gates: false,
             caps: cap::Capabilities::default(),
             strict_mode: true,
             require_hash: false,

@@ -72,6 +72,20 @@ pub struct Context {
     /// directly, eliminating the prior 2 × `String::from`
     /// allocations on every comparator / index / arithmetic dispatch.
     pub native_methods: HashMap<String, HashMap<String, GatedNativeFn>>,
+    /// Names of free native fns the host registered through
+    /// [`Context::register_pure_fn`] — i.e. that carry an explicit
+    /// "this fn is pure" declaration rather than merely defaulting to the
+    /// all-zero [`NativeFnGate`]. Kept distinct from `functions` because
+    /// a pure fn and an effectful fn whose gate the host *forgot* both
+    /// land in `functions` with an empty gate; the empty gate alone can't
+    /// tell them apart. This set records the intent so a declaration-
+    /// completeness check (analyzer's `require_declared_native_gates`
+    /// fail-closed mode, mirrored via `AnalyzeOptions::host_fn_pure`) can
+    /// distinguish "declared pure" from "gate omitted". Written by
+    /// `register_pure_fn`; a later `register_fn` with an explicit gate for
+    /// the same name clears the entry (the explicit gate supersedes the
+    /// purity claim).
+    pub pure_fn_names: HashSet<String>,
     pub schemas: HashMap<String, Value>,
     /// Ordered module-resolution chain consulted front-to-back by the
     /// evaluator's `#import` handling. Private: mutation goes through
@@ -171,6 +185,7 @@ impl Context {
             decorators: HashMap::new(),
             functions: HashMap::new(),
             native_methods: HashMap::new(),
+            pure_fn_names: HashSet::new(),
             schemas: HashMap::new(),
             module_resolvers: Vec::new(),
             path_cache: Mutex::new(HashMap::new()),
@@ -283,8 +298,13 @@ impl Context {
         gate: NativeFnGate,
         func: Arc<dyn RelonFunction>,
     ) {
-        self.functions
-            .insert(name.into(), GatedNativeFn { func, gate });
+        let name = name.into();
+        // An explicit-gate registration supersedes any prior purity
+        // claim for the same name: the host is now declaring exactly
+        // which capabilities the fn needs, so it must no longer be
+        // reported as "declared pure".
+        self.pure_fn_names.remove(&name);
+        self.functions.insert(name, GatedNativeFn { func, gate });
     }
 
     /// Register a pure native function: no I/O, no ambient state, no
@@ -297,7 +317,13 @@ impl Context {
     /// deterministic host fns whose contract is "args in, value out"
     /// register through this entry point.
     pub fn register_pure_fn<S: Into<String>>(&mut self, name: S, func: Arc<dyn RelonFunction>) {
-        self.register_fn(name, NativeFnGate::default(), func);
+        let name = name.into();
+        // Register with the all-zero gate as before, then record the
+        // explicit purity intent so it isn't erased into an empty gate
+        // (the register_fn call itself clears any stale purity entry, so
+        // we re-assert it afterwards).
+        self.register_fn(name.clone(), NativeFnGate::default(), func);
+        self.pure_fn_names.insert(name);
     }
 
     /// Schema-rooted Phase D: attach a host-supplied implementation to
@@ -447,6 +473,56 @@ impl Drop for LoadingModuleGuard<'_> {
                 loading.remove(&self.module_id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pure_fn_intent_tests {
+    use super::*;
+    use crate::native_fn::{NativeArgs, RelonFunction};
+    use crate::value::Value;
+    use relon_parser::TokenRange;
+
+    struct Noop;
+    impl RelonFunction for Noop {
+        fn call(
+            &self,
+            _args: NativeArgs,
+            _range: TokenRange,
+        ) -> Result<Value, crate::RuntimeError> {
+            Ok(Value::Int(0))
+        }
+    }
+
+    #[test]
+    fn register_pure_fn_records_purity_intent() {
+        let mut ctx = Context::new();
+        ctx.register_pure_fn("pure_add", Arc::new(Noop));
+        assert!(ctx.pure_fn_names.contains("pure_add"));
+        assert!(ctx.functions.contains_key("pure_add"));
+    }
+
+    #[test]
+    fn register_fn_does_not_claim_purity() {
+        let mut ctx = Context::new();
+        ctx.register_fn("read_net", NativeFnGate::default(), Arc::new(Noop));
+        // An empty gate alone is NOT a purity claim — only
+        // `register_pure_fn` records intent, so an operator can still tell
+        // a forgotten gate apart from a declared-pure fn.
+        assert!(!ctx.pure_fn_names.contains("read_net"));
+    }
+
+    #[test]
+    fn explicit_gate_supersedes_prior_purity_claim() {
+        let mut ctx = Context::new();
+        ctx.register_pure_fn("f", Arc::new(Noop));
+        assert!(ctx.pure_fn_names.contains("f"));
+        // Re-registering with an explicit gate clears the purity claim:
+        // the host is now declaring exactly which caps `f` needs.
+        let mut gate = NativeFnGate::default();
+        gate.network = true;
+        ctx.register_fn("f", gate, Arc::new(Noop));
+        assert!(!ctx.pure_fn_names.contains("f"));
     }
 }
 

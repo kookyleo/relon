@@ -115,6 +115,15 @@ pub struct AnalyzedTree {
     /// site whose required cap isn't in `caps` produces
     /// `Diagnostic::CapabilityRequired`.
     pub host_fn_gates: HashMap<String, NativeFnGate>,
+    /// Native fns the host declared *pure* explicitly (mirror of
+    /// `AnalyzeOptions::host_fn_pure` /
+    /// `relon_eval_api::Context::pure_fn_names`). A name here is a
+    /// legitimate reason for the fn to have no `host_fn_gates` entry —
+    /// the host asserted it needs no capability. Read by the fail-closed
+    /// `require_declared_native_gates` check (to distinguish a
+    /// declared-pure fn from a forgotten gate) and by the IR lowering
+    /// warn (to suppress the fail-open warning on declared-pure fns).
+    pub host_fn_pure: HashSet<String>,
     /// Stage 4: the context-wide capability grant the host plans to
     /// hand the evaluator. Compared against `host_fn_gates` during the
     /// reachability check.

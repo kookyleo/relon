@@ -446,6 +446,21 @@ pub enum Diagnostic {
         range: SourceSpan,
     },
 
+    #[error(
+        "native function `{fn_name}` is registered without a declared capability gate or purity marker"
+    )]
+    #[diagnostic(
+        code(relon::analyze::native_gate_undeclared),
+        help(
+            "Fail-closed mode (`require_declared_native_gates`) is on. The host declared a signature for `{fn_name}` but neither a capability gate nor an explicit purity declaration, so its capability requirements are unknown and the compiled/native call would run ungated. If `{fn_name}` is pure, register it via `register_pure_fn` (equivalently, add it to `host_fn_pure`); if it reads files / writes files / network / clock / env / rng, register the matching `NativeFnGate` via `register_fn`."
+        )
+    )]
+    NativeGateUndeclared {
+        fn_name: String,
+        #[label("capability requirements undeclared")]
+        range: SourceSpan,
+    },
+
     #[error("division by zero in constant expression")]
     #[diagnostic(
         code(relon::analyze::const_div_zero),
@@ -818,6 +833,10 @@ impl Diagnostic {
             // host_fn_gates + caps alone — surface as Error so the
             // evaluator never reaches the gated call.
             | Diagnostic::CapabilityRequired { .. }
+            // Fail-closed native-gate declaration check: an
+            // under-declared native surface is a build-time host
+            // misconfiguration the operator opted into treating as hard.
+            | Diagnostic::NativeGateUndeclared { .. }
             // Stage 5: literal-only arithmetic that would explode at
             // runtime (div-by-zero / i64 overflow) is fully derivable
             // from source — promote to Error so the evaluator never
