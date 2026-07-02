@@ -2727,6 +2727,7 @@ impl<'a> BufferReader<'a> {
         // pointer-array start. Each entry is a u32 buffer-relative
         // offset pointing at a String `[len: u32][bytes]` record.
         let (count, entries_start) = self.decode_pointer_header(field_name, entry.offset, 0)?;
+        self.check_pointer_entries_in_bounds(field_name, entries_start, count)?;
         let mut out = Vec::with_capacity(count);
         for i in 0..count {
             let cursor = entries_start + i * 4;
@@ -2803,6 +2804,7 @@ impl<'a> BufferReader<'a> {
         len_buf.copy_from_slice(&self.bytes[header_off..header_off + 4]);
         let count = u32::from_le_bytes(len_buf) as usize;
         let entries_start = header_off + 4;
+        self.check_pointer_entries_in_bounds("<in-place root>", entries_start, count)?;
         let mut out = Vec::with_capacity(count);
         for i in 0..count {
             let cursor =
@@ -2903,6 +2905,7 @@ impl<'a> BufferReader<'a> {
             });
         }
         let (count, entries_start) = self.decode_pointer_header(field_name, entry.offset, 0)?;
+        self.check_pointer_entries_in_bounds(field_name, entries_start, count)?;
         let mut out: Vec<BufferReader<'a>> = Vec::with_capacity(count);
         for i in 0..count {
             let cursor = entries_start + i * 4;
@@ -2996,6 +2999,7 @@ impl<'a> BufferReader<'a> {
         len_buf.copy_from_slice(&self.bytes[header_off..header_off + 4]);
         let count = u32::from_le_bytes(len_buf) as usize;
         let entries_start = header_off + 4;
+        self.check_pointer_entries_in_bounds("<in-place root>", entries_start, count)?;
         let mut out: Vec<BufferReader<'a>> = Vec::with_capacity(count);
         for i in 0..count {
             let cursor =
@@ -3163,9 +3167,41 @@ impl<'a> BufferReader<'a> {
         self.read_list_value_at(header_off, element)
     }
 
+    /// Validate that a pointer-array's `count` 4-byte entries all lie
+    /// within the buffer **before** any capacity-sized allocation.
+    ///
+    /// A pointer-array header stores `count` as an untrusted `u32` (up to
+    /// ~4.29e9). Calling `Vec::with_capacity(count)` on it directly lets a
+    /// malformed buffer request hundreds of gigabytes and abort the
+    /// process (OOM / allocation-failure DoS). Bounding `count` by the
+    /// buffer size here — the entry region `[entries_start, +count*4)` must
+    /// fit — makes the speculative allocation safe, mirroring the
+    /// `payload_end` interval guard the scalar list readers
+    /// (`read_list_int` / `read_list_float` / `read_inline_scalar_list_at`)
+    /// already apply. O(1); the per-entry bounds checks stay as a
+    /// belt-and-braces second line.
+    fn check_pointer_entries_in_bounds(
+        &self,
+        field_name: &str,
+        entries_start: usize,
+        count: usize,
+    ) -> Result<(), BufferError> {
+        let end = count
+            .checked_mul(4)
+            .and_then(|bytes| entries_start.checked_add(bytes));
+        match end {
+            Some(end) if end <= self.bytes.len() => Ok(()),
+            _ => Err(BufferError::MalformedPayload {
+                name: field_name.to_string(),
+                reason: "list pointer-array entries exceed buffer end",
+            }),
+        }
+    }
+
     /// Read the `[len][off_i]…` pointer-array header at `header_off`,
     /// returning `(count, entries_start)` after bounds-checking the length
-    /// prefix.
+    /// prefix **and** the full `count`-entry region (see
+    /// [`Self::check_pointer_entries_in_bounds`]).
     fn read_pointer_array_header(&self, header_off: usize) -> Result<(usize, usize), BufferError> {
         if header_off
             .checked_add(4)
@@ -3180,7 +3216,9 @@ impl<'a> BufferReader<'a> {
         let mut len_buf = [0u8; 4];
         len_buf.copy_from_slice(&self.bytes[header_off..header_off + 4]);
         let count = u32::from_le_bytes(len_buf) as usize;
-        Ok((count, header_off + 4))
+        let entries_start = header_off + 4;
+        self.check_pointer_entries_in_bounds("<in-place root>", entries_start, count)?;
+        Ok((count, entries_start))
     }
 
     /// Read the `i`-th entry pointer (a `u32`) of a pointer array whose
@@ -3702,6 +3740,7 @@ impl<'a> BufferReader<'a> {
         entries_start: usize,
     ) -> Result<Vec<Vec<crate::value::Value>>, BufferError> {
         use crate::value::Value;
+        self.check_pointer_entries_in_bounds(field_name, entries_start, count)?;
         let mut out: Vec<Vec<Value>> = Vec::with_capacity(count);
         for i in 0..count {
             let cursor =
@@ -3734,6 +3773,19 @@ impl<'a> BufferReader<'a> {
             } else {
                 rec_start + 4
             };
+            // Every inner scalar element occupies at least one byte, so a
+            // valid `inner_count` can never exceed the bytes remaining
+            // after `payload_start`. Bounding it here — before
+            // `with_capacity` — stops a malformed header (`inner_count`
+            // up to ~4.29e9) from requesting a multi-gigabyte allocation
+            // and aborting the process; the per-arm exact `payload_end`
+            // check below still enforces the tight element-width bound.
+            if inner_count > self.bytes.len().saturating_sub(payload_start) {
+                return Err(BufferError::MalformedPayload {
+                    name: field_name.to_string(),
+                    reason: "nested inner list count exceeds buffer end",
+                });
+            }
             let mut inner_vec: Vec<Value> = Vec::with_capacity(inner_count);
             match inner {
                 TypeRepr::Int => {
@@ -5001,6 +5053,114 @@ mod tests {
         let bytes = b.finish();
         let r = BufferReader::new(&layout, &schema.fields, &bytes).expect("reader");
         assert!(r.read_list_string("xs").expect("read").is_empty());
+    }
+
+    /// Regression (Medium DoS): a pointer-array / record list header whose
+    /// declared `count` is far larger than the buffer can hold must be a
+    /// loud `Err`, never a multi-gigabyte `Vec::with_capacity` that aborts
+    /// the process. Before the fix, `count` (an untrusted `u32`, here
+    /// `0xFFFF_FFFF`) was fed straight into `with_capacity` — requesting
+    /// ~17 GiB of entry slots — ahead of the per-entry bounds checks.
+    #[test]
+    fn oversized_list_count_is_loud_error_not_oom() {
+        // --- Direct-offset (`*_at`) readers: craft a tiny buffer whose
+        // header at offset 0 declares count = u32::MAX. ---
+        let holder = list_schema("xs", TypeRepr::String);
+        let holder_layout = SchemaLayout::offsets_for(&holder).expect("layout");
+        let mut bytes = vec![0u8; 32];
+        bytes[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let reader = BufferReader::new(&holder_layout, &holder.fields, &bytes).expect("reader");
+
+        let elem_schema = Schema {
+            name: "Elem".into(),
+            generics: vec![],
+            is_tuple: false,
+            fields: vec![field("n", TypeRepr::Int)],
+        };
+        let elem_layout = SchemaLayout::offsets_for(&elem_schema).expect("elem layout");
+
+        assert!(
+            reader.read_list_string_at(0).is_err(),
+            "read_list_string_at must reject oversized count"
+        );
+        assert!(
+            reader
+                .read_list_record_at(0, &elem_layout, &elem_schema)
+                .is_err(),
+            "read_list_record_at must reject oversized count"
+        );
+        assert!(
+            reader
+                .read_list_value_at(
+                    0,
+                    &TypeRepr::Schema {
+                        schema: Box::new(elem_schema.clone()),
+                    },
+                )
+                .is_err(),
+            "read_list_value_at (pointer-array) must reject oversized count"
+        );
+        assert!(
+            reader.read_list_list_at(0, &TypeRepr::Int).is_err(),
+            "read_list_list_at must reject oversized outer count"
+        );
+
+        // --- Field-slot readers: build a *valid* List<String>, confirm it
+        // decodes bit-equal, then corrupt only its length prefix and
+        // confirm the reader now errors instead of over-allocating. ---
+        let schema = list_schema("xs", TypeRepr::String);
+        let layout = SchemaLayout::offsets_for(&schema).expect("layout");
+        let mut b = BufferBuilder::new(&layout, &schema.fields);
+        b.write_list_string("xs", &["a", "bb", "ccc"])
+            .expect("write");
+        let mut buf = b.finish();
+        {
+            let r = BufferReader::new(&layout, &schema.fields, &buf).expect("reader");
+            assert_eq!(
+                r.read_list_string("xs").expect("valid decode"),
+                vec!["a", "bb", "ccc"],
+                "valid list must still decode bit-equal"
+            );
+        }
+        // Field slot for the single field sits at offset 0 and holds the
+        // record start; the `[len]` prefix is the first u32 of that record.
+        let record_start = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+        buf[record_start..record_start + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let r = BufferReader::new(&layout, &schema.fields, &buf).expect("reader");
+        assert!(
+            r.read_list_string("xs").is_err(),
+            "corrupted oversized count must be a loud error"
+        );
+
+        // Same corruption exercised through the List<Schema> record reader.
+        let rec_schema = Schema {
+            name: "Wrap".into(),
+            generics: vec![],
+            is_tuple: false,
+            fields: vec![field(
+                "items",
+                TypeRepr::List {
+                    element: Box::new(TypeRepr::Schema {
+                        schema: Box::new(elem_schema.clone()),
+                    }),
+                },
+            )],
+        };
+        let rec_layout = SchemaLayout::offsets_for(&rec_schema).expect("rec layout");
+        let mut rb = BufferBuilder::new(&rec_layout, &rec_schema.fields);
+        let mk = |val: i64| move |w: &mut BufferBuilder<'_>| w.write_int("n", val);
+        let entries = [mk(1), mk(2)];
+        rb.write_list_record("items", &elem_layout, &elem_schema, &entries)
+            .expect("write records");
+        let mut rbuf = rb.finish();
+        let rec_ptr = u32::from_le_bytes(rbuf[0..4].try_into().unwrap()) as usize;
+        rbuf[rec_ptr..rec_ptr + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let rr = BufferReader::new(&rec_layout, &rec_schema.fields, &rbuf).expect("reader");
+        assert!(
+            rr.read_list_record("items", &elem_layout, &elem_schema)
+                .is_err(),
+            "corrupted oversized record count must be a loud error"
+        );
     }
 
     #[test]
