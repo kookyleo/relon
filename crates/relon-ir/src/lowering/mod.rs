@@ -4214,6 +4214,33 @@ impl NativeImportBuilder {
                 },
             );
         }
+        // Fail-open guard (observability). A native whose *type signature*
+        // the host declared but whose capability *gate* it never declared
+        // lowers with an empty `required_bits` above → no `Op::CheckCap`
+        // is emitted → the compiled call runs with no capability
+        // requirement. That is correct for a genuinely pure fn, but it is
+        // also exactly what a forgotten gate looks like: the two are
+        // indistinguishable from the analyzer/IR tables alone (the
+        // `register_pure_fn` "this is pure" intent lives on the evaluator
+        // `Context` and is erased when the host mirrors it into
+        // `AnalyzeOptions`). We therefore do NOT change lowering (no
+        // false-negative risk, no behavior change), but we surface every
+        // under-declared import as a `warn!` so an operator who enables
+        // tracing sees the fail-open. Declaring an explicit gate — an
+        // *empty* `NativeFnGate` for a pure fn — records intent and
+        // silences the warning. Emitting is inert (goes nowhere) unless a
+        // subscriber is installed, so this adds no stderr noise by
+        // default.
+        for name in undeclared_gate_imports(&resolved, &tree.host_fn_gates) {
+            tracing::warn!(
+                native_fn = %name,
+                "host declared a signature for native `{name}` but no capability gate; \
+                 the compiled call will run with no capability requirement. If it is pure, \
+                 register an empty `NativeFnGate` to make that explicit; if it touches \
+                 files / network / clock / env / rng, register the matching gate so the \
+                 runtime can enforce it."
+            );
+        }
         Self {
             resolved,
             imports: Vec::new(),
@@ -4239,6 +4266,95 @@ impl NativeImportBuilder {
         });
         self.index_of.insert(name.to_string(), idx);
         idx
+    }
+}
+
+/// Names of resolved native imports the host declared a *signature* for
+/// but never declared a capability *gate* for (no entry in
+/// `host_fn_gates`). These lower with empty `required_bits` and so run
+/// ungated in the compiled backends — the fail-open the caller warns
+/// about. Sorted for deterministic diagnostics/tests.
+///
+/// The rule is presence-of-key, not gate contents: a host that mirrors
+/// `register_pure_fn` faithfully inserts an *empty* `NativeFnGate` entry
+/// (the `register_fn(name, NativeFnGate::default(), …)` gate argument),
+/// which is a present key → treated as an explicit "declared, needs no
+/// capability" and is NOT reported. Only a wholly absent gate entry —
+/// the shape of "host filled `host_fn_signatures` but forgot to mirror
+/// the gate" — is reported. Generic over the gate value type so this
+/// leaf helper needs no capability-type import.
+fn undeclared_gate_imports<G>(
+    resolved: &HashMap<String, HostFnEntry>,
+    gates: &HashMap<String, G>,
+) -> Vec<String> {
+    let mut out: Vec<String> = resolved
+        .keys()
+        .filter(|name| !gates.contains_key(*name))
+        .cloned()
+        .collect();
+    out.sort();
+    out
+}
+
+#[cfg(test)]
+mod undeclared_gate_import_tests {
+    use super::*;
+
+    fn entry() -> HostFnEntry {
+        HostFnEntry {
+            param_tys: Vec::new(),
+            ret_ty: IrType::I64,
+            required_bits: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn signature_without_gate_entry_is_reported() {
+        // Host declared a signature but no gate at all → under-declared
+        // (a forgotten gate is indistinguishable from this shape).
+        let mut resolved = HashMap::new();
+        resolved.insert("read_net".to_string(), entry());
+        let gates: HashMap<String, ()> = HashMap::new();
+        assert_eq!(
+            undeclared_gate_imports(&resolved, &gates),
+            vec!["read_net".to_string()]
+        );
+    }
+
+    #[test]
+    fn empty_gate_entry_declares_purity_and_is_silent() {
+        // The faithful `register_pure_fn` mirror: an explicit (empty)
+        // gate entry is present → intent recorded → NOT reported. This
+        // is the "don't touch legit pure fns" guarantee.
+        let mut resolved = HashMap::new();
+        resolved.insert("pure_add".to_string(), entry());
+        let mut gates: HashMap<String, ()> = HashMap::new();
+        gates.insert("pure_add".to_string(), ());
+        assert!(undeclared_gate_imports(&resolved, &gates).is_empty());
+    }
+
+    #[test]
+    fn gated_effectful_fn_is_silent() {
+        // A properly gated effectful fn has a present entry → silent.
+        let mut resolved = HashMap::new();
+        resolved.insert("clock_add".to_string(), entry());
+        let mut gates: HashMap<String, ()> = HashMap::new();
+        gates.insert("clock_add".to_string(), ());
+        assert!(undeclared_gate_imports(&resolved, &gates).is_empty());
+    }
+
+    #[test]
+    fn report_is_sorted_and_only_covers_undeclared() {
+        let mut resolved = HashMap::new();
+        resolved.insert("zeta".to_string(), entry());
+        resolved.insert("alpha".to_string(), entry());
+        resolved.insert("declared".to_string(), entry());
+        let mut gates: HashMap<String, ()> = HashMap::new();
+        gates.insert("declared".to_string(), ());
+        assert_eq!(
+            undeclared_gate_imports(&resolved, &gates),
+            vec!["alpha".to_string(), "zeta".to_string()]
+        );
     }
 }
 

@@ -28,6 +28,12 @@ relon-unicode = { workspace = true }
 
 thiserror = { workspace = true }
 miette = { workspace = true }
+# Structured diagnostics facade. Used to surface the "host registered a
+# native signature but never declared its capability gate" fail-open as
+# an opt-in-visibility `warn!` (inert unless the host installs a
+# subscriber) — matching the `tracing` usage already in the cranelift
+# backend and the top-level `relon` crate.
+tracing = "0.1"
 # Float wrapper that derives `Eq` / `Hash` / `PartialEq` so the IR's
 # `Op::ConstF64` can participate in derived comparisons — matches the
 # parser's `Expr::Float` representation so lowering stays a 1:1 copy.
