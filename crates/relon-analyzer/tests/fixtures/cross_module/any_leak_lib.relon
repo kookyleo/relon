@@ -1,0 +1,8 @@
+// Cross-strict `Any` leak regression: a `#relaxed` library exporting an
+// untyped closure. `blob`'s return type is the analyzer's internal
+// `Any` placeholder (untyped `#relaxed` closure). A strict importer must
+// not let that `Any` silently satisfy a concrete typed slot.
+#relaxed
+{
+    blob(x): x
+}

@@ -49,10 +49,20 @@ impl<'a> Walker<'a> {
             return;
         }
         if let Some(t) = &inferred {
+            // Value-binding slots (`Type field: value`, schema fields)
+            // are enforced by the runtime typed-slot check — an `Any`
+            // that turns out ill-typed is rejected there ("expected
+            // Int, got String"), so this path keeps the permissive
+            // `Any` pass rather than fail-closed. Tightening it here
+            // would statically reject runtime-safe uses of the untyped
+            // `#relaxed` stdlib (`Int x: list.sum(...)`). The
+            // fail-closed gate lives on the function-argument boundary
+            // (`fn_call.rs`), which has no runtime backstop.
             if t.subsumes_with_imports(
                 expected,
                 Some(&self.base_index),
                 self.tree.workspace_import_index.as_ref(),
+                false,
             ) {
                 self.check_generics(expected, value, field_name);
                 return;

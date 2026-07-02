@@ -71,10 +71,16 @@ pub(crate) fn check_main_return(root: &Node, tree: &mut AnalyzedTree) {
     if tuple_schema_return_matches(tree, return_type, &body_ty, &bases) {
         return;
     }
+    // A top-level `Any` #main body is already handled above (strict
+    // emits `ExpressionTypeUnknown`). The #main return value is
+    // runtime-checked against the declared type, so this subsumption
+    // keeps the permissive `Any` pass (non-strict) — the fail-closed
+    // gate is scoped to the function-argument boundary in `fn_call.rs`.
     if body_ty.subsumes_with_imports(
         return_type,
         Some(&bases),
         tree.workspace_import_index.as_ref(),
+        false,
     ) {
         return;
     }
@@ -110,7 +116,12 @@ fn tuple_schema_return_matches(
             .collect();
     }
     items.iter().zip(elements.iter()).all(|(item, slot)| {
-        item.subsumes_with_imports(slot, Some(bases), tree.workspace_import_index.as_ref())
+        item.subsumes_with_imports(
+            slot,
+            Some(bases),
+            tree.workspace_import_index.as_ref(),
+            false,
+        )
     })
 }
 

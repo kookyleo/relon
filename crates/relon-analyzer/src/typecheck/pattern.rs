@@ -158,7 +158,11 @@ impl<'a> Walker<'a> {
         let Some(body_ty) = infer_type(body, &scope) else {
             return;
         };
-        if body_ty.subsumes_with_imports(declared_return, Some(&self.base_index), imports) {
+        // Closure declared-return contract: keep the pre-existing
+        // permissive `Any` pass (non-strict). The fail-closed `Any`
+        // gate is scoped to the function-*argument* boundary in
+        // `fn_call.rs`, the one contract with no runtime backstop.
+        if body_ty.subsumes_with_imports(declared_return, Some(&self.base_index), imports, false) {
             return;
         }
         self.tree.diagnostics.push(Diagnostic::StaticTypeMismatch {

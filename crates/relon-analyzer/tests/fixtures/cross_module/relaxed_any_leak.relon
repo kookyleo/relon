@@ -1,0 +1,11 @@
+// `#relaxed` entry importing the same `#relaxed` lib: strictness is
+// per-module, so a relaxed checker keeps the permissive `Any` pass — the
+// untyped-closure `Any` may flow into the typed `Int` param/scalar slots
+// with no diagnostic. Pins that the fail-closed gate is strict-only.
+#relaxed
+{
+    #import lib from "./any_leak_lib.relon",
+    Int f(Int n): n + 1,
+    Int x: lib.blob(5),
+    "r": f(lib.blob(7))
+}

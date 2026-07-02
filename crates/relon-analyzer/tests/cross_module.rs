@@ -303,3 +303,67 @@ fn fixture_cross_module_strict_pkg_generic_value_path_mismatch() {
         .count();
     assert_eq!(stalls, 0, "{:#?}", ws.modules);
 }
+
+/// Cross-strict `Any` leak (soundness): a strict entry importing a
+/// `#relaxed` lib must not let the lib's untyped-closure `Any` return
+/// whitewash a concrete typed *call argument* slot. Pre-fix the top-of
+/// `subsumes_with_imports` `Any` short-circuit accepted anything, so
+/// `f(lib.blob("hello"))` type-checked clean and produced a wrong
+/// runtime value. Now it raises `FnCallArgTypeMismatch`.
+#[test]
+fn fixture_cross_module_strict_any_leak_call_flagged() {
+    let ws = analyze_fixture_workspace("cross_module", "strict_any_leak_call.relon");
+    let mismatches: usize = ws
+        .modules
+        .values()
+        .flat_map(|t| t.diagnostics.iter())
+        .filter(|d| {
+            matches!(
+                d,
+                Diagnostic::FnCallArgTypeMismatch { expected, found, .. }
+                    if expected == "Int" && found == "Any"
+            )
+        })
+        .count();
+    assert_eq!(mismatches, 1, "{:#?}", ws.modules);
+}
+
+/// Cross-strict `Any` into a scalar typed binding (`Int x: ...`) is
+/// intentionally NOT statically flagged: value-binding slots are
+/// enforced by the runtime typed-slot check, so the analyzer keeps the
+/// permissive `Any` pass to avoid rejecting runtime-safe uses of the
+/// untyped `#relaxed` stdlib. Pins that the fail-closed gate does not
+/// bleed onto the value-slot path (the gate lives on the call-arg
+/// boundary, covered by `..._call_flagged`).
+#[test]
+fn fixture_cross_module_strict_any_leak_scalar_permitted() {
+    let ws = analyze_fixture_workspace("cross_module", "strict_any_leak_scalar.relon");
+    let flagged: usize = ws
+        .modules
+        .values()
+        .flat_map(|t| t.diagnostics.iter())
+        .filter(|d| matches!(d, Diagnostic::StaticTypeMismatch { .. }))
+        .count();
+    assert_eq!(flagged, 0, "{:#?}", ws.modules);
+}
+
+/// Per-module strictness: the *same* `#relaxed`-lib `Any` flow inside a
+/// `#relaxed` entry stays permissive. Pins that the fail-closed gate is
+/// scoped to the *checking* module's strictness — a relaxed importer is
+/// not tightened, so no arg / scalar mismatch fires.
+#[test]
+fn fixture_cross_module_relaxed_any_leak_permitted() {
+    let ws = analyze_fixture_workspace("cross_module", "relaxed_any_leak.relon");
+    let flagged: usize = ws
+        .modules
+        .values()
+        .flat_map(|t| t.diagnostics.iter())
+        .filter(|d| {
+            matches!(
+                d,
+                Diagnostic::FnCallArgTypeMismatch { .. } | Diagnostic::StaticTypeMismatch { .. }
+            )
+        })
+        .count();
+    assert_eq!(flagged, 0, "{:#?}", ws.modules);
+}

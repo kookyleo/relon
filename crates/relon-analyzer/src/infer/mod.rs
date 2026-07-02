@@ -257,12 +257,15 @@ impl InferredType {
     /// Same as [`subsumes`] but consults a [`SchemaBaseIndex`] when
     /// comparing custom-schema heads, so a value typed as a derived
     /// schema satisfies a slot expecting one of its bases (Stage 2.3).
+    /// Non-strict convenience wrapper (only the unit tests reach the
+    /// subsumption engine without an import index / strictness signal).
+    #[cfg(test)]
     pub(crate) fn subsumes_with(
         &self,
         expected: &TypeNode,
         bases: Option<&SchemaBaseIndex>,
     ) -> bool {
-        self.subsumes_with_imports(expected, bases, None)
+        self.subsumes_with_imports(expected, bases, None, false)
     }
 
     /// v1.8 cross-module: same as [`subsumes_with`] but also consults
@@ -271,17 +274,22 @@ impl InferredType {
     /// `Schema("User")` slot when `pkg` is a known alias and `User`
     /// is one of its exports. Pre-v1.8 all multi-segment expected
     /// types accepted unconditionally.
+    ///
+    /// `strict` carries the *checking* module's strictness (per-module:
+    /// `#relaxed` files clear it, see `AnalyzedTree::strict_mode`). When
+    /// set, an internally-`Any` value (the analyzer's "type not
+    /// derivable" placeholder — chiefly the return of an untyped
+    /// `#relaxed` closure) is *not* allowed to silently satisfy a
+    /// concrete typed slot; that is the cross-strict `Any` leak.
     pub(crate) fn subsumes_with_imports(
         &self,
         expected: &TypeNode,
         bases: Option<&SchemaBaseIndex>,
         imports: Option<&WorkspaceImportIndex>,
+        strict: bool,
     ) -> bool {
-        // Shorthand: `Any` accepts anything; `T?` accepts the standard
-        // `None` tagged value or recursively-stripped `T`.
-        if let InferredType::Any = self {
-            return true;
-        }
+        // `T?` accepts the standard `None` tagged value regardless of
+        // the wrapped type.
         if expected.is_optional
             && matches!(self, InferredType::Variant(enum_name, variant) if enum_name == "Option" && variant == "None")
         {
@@ -290,15 +298,32 @@ impl InferredType {
         // v1.8 / v1.8e: `pkg.User` (two segments, alias resolved)
         // collapses to a single-segment `Schema("alias.User")` slot —
         // the *qualified* key so two aliases of `User` from different
-        // libs don't collide on the bare name.
+        // libs don't collide on the bare name. Done before the `Any`
+        // short-circuit so a resolved cross-module schema slot is
+        // treated as the concrete slot it is under `strict`.
         if expected.path.len() == 2 {
             if let Some(qualified) =
                 cross_module_schema(&expected.path[0], &expected.path[1], imports)
             {
                 let mut folded = expected.clone();
                 folded.path = vec![qualified];
-                return self.subsumes_with_imports(&folded, bases, imports);
+                return self.subsumes_with_imports(&folded, bases, imports, strict);
             }
+        }
+        // `Any` self: normally accepts anything. But in a strict module
+        // an internal `Any` must not whitewash a *resolved concrete*
+        // single-segment slot — that is the cross-strict leak this gate
+        // closes. `Any`-typed slots (`head == "Any"`) and unresolved
+        // multi-segment types stay permissive (the latter is owned by
+        // the downstream `re_check_unknown_types` pass). The refusal
+        // surfaces as a normal mismatch diagnostic at the call site,
+        // matching the untyped-slot path that already reports
+        // `ExpressionTypeUnknown`.
+        if let InferredType::Any = self {
+            if strict && expected.path.len() == 1 && expected.path[0] != "Any" {
+                return false;
+            }
+            return true;
         }
         // Multi-segment custom types (`module.Name`) we couldn't
         // resolve via the import index: conservative pass. The
@@ -325,14 +350,14 @@ impl InferredType {
             // behavior.
             "List" => match self {
                 InferredType::List(elem) => match expected.generics.first() {
-                    Some(slot) => elem.subsumes_with(slot, bases),
+                    Some(slot) => elem.subsumes_with_imports(slot, bases, imports, strict),
                     None => true,
                 },
                 _ => false,
             },
             "Dict" => match self {
                 InferredType::Dict(val) => match expected.generics.get(1) {
-                    Some(slot) => val.subsumes_with(slot, bases),
+                    Some(slot) => val.subsumes_with_imports(slot, bases, imports, strict),
                     None => true,
                 },
                 _ => false,
@@ -349,7 +374,7 @@ impl InferredType {
                     elems
                         .iter()
                         .zip(expected.generics.iter())
-                        .all(|(e, slot)| e.subsumes_with(slot, bases))
+                        .all(|(e, slot)| e.subsumes_with_imports(slot, bases, imports, strict))
                 }
                 _ => false,
             },

@@ -233,6 +233,7 @@ impl<'a> Walker<'a> {
                     &expected_ty,
                     Some(&self.base_index),
                     self.tree.workspace_import_index.as_ref(),
+                    self.tree.strict_mode,
                 ) {
                     continue;
                 }
@@ -517,6 +518,7 @@ impl<'a> Walker<'a> {
                 &key_param.ty,
                 Some(&self.base_index),
                 self.tree.workspace_import_index.as_ref(),
+                self.tree.strict_mode,
             ) {
                 continue;
             }

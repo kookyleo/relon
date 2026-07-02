@@ -1,0 +1,13 @@
+// Strict entry importing a `#relaxed` lib: the untyped-closure `Any`
+// return flows into a concrete `Int` scalar slot. Unlike the call-arg
+// path, a value-binding slot is enforced by the runtime typed-slot
+// check ("expected Int, got String"), so the analyzer intentionally
+// keeps the permissive `Any` pass here and does NOT statically flag it.
+// Tightening this path would reject runtime-safe uses of the untyped
+// `#relaxed` stdlib (`Int x: list.sum(...)`); the fail-closed gate is
+// scoped to the function-argument boundary instead. This fixture pins
+// that the value-slot path stays permissive-static.
+{
+    #import lib from "./any_leak_lib.relon",
+    Int x: lib.blob("hello")
+}

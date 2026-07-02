@@ -1,0 +1,9 @@
+// Strict entry importing a `#relaxed` lib: the untyped-closure `Any`
+// return flows into `f`'s typed `Int` parameter. Fail-closed: this must
+// raise `FnCallArgTypeMismatch` (expects Int, got Any) rather than the
+// old silent whitewash that produced a wrong runtime value.
+{
+    #import lib from "./any_leak_lib.relon",
+    Int f(Int n): n + 1,
+    "r": f(lib.blob("hello"))
+}

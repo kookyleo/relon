@@ -1455,20 +1455,44 @@ fn stage3_host_fn_without_sig_silent() {
     assert!(fn_call_diags.is_empty(), "{:?}", tree.diagnostics);
 }
 
-/// Stage 3.7 #12 reverse: an arg whose type is dynamic (`Any`)
-/// silently passes the per-arg check.
+/// Stage 3.7 #12 reverse: inside a `#relaxed` module an arg whose type
+/// is dynamic (`Any`, here an untyped closure param) silently passes
+/// the per-arg check. A strict module fails closed instead — that path
+/// is pinned by `strict_dynamic_arg_flagged` — so the silent-pass is a
+/// `#relaxed`-only affordance.
 #[test]
 fn stage3_dynamic_arg_silent() {
-    // The `_string_upper` param is String. Pass an unresolvable
-    // identifier (silent on inference) → arg infer returns None →
-    // the per-arg check `continue`s.
-    let tree = analyze_str(r#"{ f(x): _string_upper(x) }"#);
+    // The `_string_upper` param is String. The untyped `x` infers to
+    // `Any`; under `#relaxed` the per-arg check `continue`s.
+    let tree = analyze_str(r#"#relaxed { f(x): _string_upper(x) }"#);
     let mismatches: Vec<_> = tree
         .diagnostics
         .iter()
         .filter(|d| matches!(d, Diagnostic::FnCallArgTypeMismatch { .. }))
         .collect();
     assert!(mismatches.is_empty(), "{:?}", tree.diagnostics);
+}
+
+/// Strict counterpart of `stage3_dynamic_arg_silent`: in a strict module
+/// the internal `Any` (untyped closure param) must *not* satisfy the
+/// concrete `String` param of `_string_upper`. This is the cross-strict
+/// `Any` leak closed at the argument-subsumption boundary — the value
+/// fails closed with `FnCallArgTypeMismatch { found: "Any" }`.
+#[test]
+fn strict_dynamic_arg_flagged() {
+    let tree = analyze_str(r#"{ f(x): _string_upper(x) }"#);
+    let mismatches: Vec<_> = tree
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            matches!(
+                d,
+                Diagnostic::FnCallArgTypeMismatch { expected, found, .. }
+                    if expected == "String" && found == "Any"
+            )
+        })
+        .collect();
+    assert_eq!(mismatches.len(), 1, "{:?}", tree.diagnostics);
 }
 
 /// Stage 3.7 #13 (consistency): when the analyzer reports an
