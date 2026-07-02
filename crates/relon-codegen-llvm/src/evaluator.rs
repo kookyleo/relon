@@ -259,6 +259,21 @@ fn step_budget_to_i64(steps: Option<u64>) -> i64 {
     }
 }
 
+/// The three strict-mode closure-as-value *type-surface* soft-ban
+/// diagnostics the LLVM backend softens (see `lower_source_with_options`).
+/// IR lowering (`lower_anon_dict_body`) accepts the shape these flag, so
+/// they must not gate the compiled build — while every other strict and
+/// hard diagnostic (incl. the capability-reachability check) still does.
+fn is_closure_type_surface_softban(d: &relon_analyzer::Diagnostic) -> bool {
+    use relon_analyzer::Diagnostic as D;
+    matches!(
+        d,
+        D::ClosureParamTypeMissing { .. }
+            | D::ClosureReturnTypeUnknown { .. }
+            | D::ExpressionTypeUnknown { .. }
+    )
+}
+
 impl LlvmAotEvaluator {
     /// Compile a pre-lowered IR module into a JIT-resident function
     /// pointer. Accepts either a legacy-i64 entry
@@ -342,50 +357,42 @@ impl LlvmAotEvaluator {
         ),
         LlvmError,
     > {
+        // Compiled backend = standalone analyze (no workspace pass), so
+        // force the single-file capability-reachability check on and
+        // preserve the caller's `strict_mode` (default `true`). This
+        // mirrors the cranelift `lower_source_with_options`: the two
+        // compiled backends now make the SAME static accept/reject
+        // decision for a gated call to an ungranted capability (both
+        // reject at compile time rather than LLVM deferring to a runtime
+        // trap). Strict boundary interception stays live — hard
+        // structural errors (`UnknownTypeName`, `MainReturnTypeMismatch`,
+        // …) and every other strict diagnostic keep gating the build.
+        let owned = relon_analyzer::AnalyzeOptions {
+            standalone_capability_check: true,
+            ..options.cloned().unwrap_or_default()
+        };
+        let options = &owned;
         // W7 closure-as-value (Phase F.W7): the production source
         // `#main(Int n) -> Dict { #internal fib: (k) => ..., result: fib(n) }`
-        // trips the v1.5 / v1.6 strict-mode type-surface diagnostics
-        // (`ClosureParamTypeMissing`, `ClosureReturnTypeUnknown`,
-        // `ExpressionTypeUnknown`) even though IR lowering accepts the
-        // shape via `lower_anon_dict_body`. Run the analyzer with
-        // `strict_mode: false` so the soft bans don't gate LLVM
-        // codegen. Hard structural errors (`UnknownTypeName`,
-        // `MainReturnTypeMismatch`, etc.) still surface as `Error`-
-        // severity diagnostics under non-strict mode and still gate the
-        // build below. Unlike the Cranelift route, the LLVM backend does
-        // NOT force `standalone_capability_check`.
+        // trips exactly three v1.5 / v1.6 strict-mode *type-surface*
+        // soft-ban diagnostics (`ClosureParamTypeMissing`,
+        // `ClosureReturnTypeUnknown`, `ExpressionTypeUnknown`) even
+        // though IR lowering accepts the shape via `lower_anon_dict_body`.
+        // Precisely soften those three variants only — instead of the
+        // former blanket `strict_mode: false`, which also disabled the
+        // strict boundary interception and desynced the capability check
+        // from cranelift.
         //
-        // Phase 0b: a caller-supplied `options` (host `#native` fns)
-        // takes precedence — the host already sets `strict_mode: false`
-        // on it (see the cranelift `host_options` fixture). We force
-        // `strict_mode: false` regardless so the closure surface stays
-        // unblocked even if a host left it default-true.
-        let owned;
-        let options: &relon_analyzer::AnalyzeOptions = match options {
-            Some(o) => {
-                if o.strict_mode {
-                    owned = relon_analyzer::AnalyzeOptions {
-                        strict_mode: false,
-                        ..o.clone()
-                    };
-                    &owned
-                } else {
-                    o
-                }
-            }
-            None => {
-                owned = relon_analyzer::AnalyzeOptions {
-                    strict_mode: false,
-                    ..Default::default()
-                };
-                &owned
-            }
-        };
         // Map the shared frontend pipeline error onto this backend's
         // surface: Parse → Parse, Analyze(n) → Analyze(n), and Lowering
         // → Codegen with the historical `lower_workspace_single:` prefix
         // (the LLVM backend has no dedicated `Lowering` variant).
-        let lowered = relon_ir::frontend::compile(src, options).map_err(|e| match e {
+        let lowered = relon_ir::frontend::compile_with_suppressed(
+            src,
+            options,
+            is_closure_type_surface_softban,
+        )
+        .map_err(|e| match e {
             relon_ir::FrontendError::Parse(msg) => LlvmError::Parse(msg),
             relon_ir::FrontendError::Analyze(n) => LlvmError::Analyze(n),
             relon_ir::FrontendError::Lowering(msg) => {

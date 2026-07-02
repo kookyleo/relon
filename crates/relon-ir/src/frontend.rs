@@ -15,7 +15,7 @@
 //! [`FrontendError`] variant the backend translates to its own error
 //! type.
 
-use relon_analyzer::AnalyzeOptions;
+use relon_analyzer::{AnalyzeOptions, Diagnostic};
 
 use crate::lowering::{lower_workspace_single, LoweredEntry};
 
@@ -59,14 +59,41 @@ pub enum FrontendError {
 /// `standalone_capability_check`, no `strict_mode` relaxation); the
 /// caller owns that.
 pub fn compile(src: &str, options: &AnalyzeOptions) -> Result<LoweredEntry, FrontendError> {
+    compile_with_suppressed(src, options, |_| false)
+}
+
+/// Like [`compile`], but an `Error`-severity diagnostic for which
+/// `suppress` returns `true` is dropped from the analyze gate (it neither
+/// counts toward [`FrontendError::Analyze`] nor blocks lowering).
+///
+/// This is the seam a compiled backend uses to accept a source shape its
+/// IR lowering already handles even though a strict-mode *soft-ban*
+/// diagnostic flags it — e.g. the LLVM backend's closure-as-value dict
+/// surface (`ClosureParamTypeMissing` / `ClosureReturnTypeUnknown` /
+/// `ExpressionTypeUnknown`), which `lower_anon_dict_body` lowers fine.
+///
+/// The predicate is deliberately narrow: it only sees the diagnostics it
+/// explicitly matches, so every hard structural error
+/// (`UnknownTypeName`, `MainReturnTypeMismatch`, …) and the
+/// capability-reachability check keep gating the build. Passing
+/// `|_| false` recovers [`compile`] verbatim.
+pub fn compile_with_suppressed<F>(
+    src: &str,
+    options: &AnalyzeOptions,
+    suppress: F,
+) -> Result<LoweredEntry, FrontendError>
+where
+    F: Fn(&Diagnostic) -> bool,
+{
     let ast = relon_parser::parse_document(src).map_err(|e| FrontendError::Parse(e.to_string()))?;
     let analyzed = relon_analyzer::analyze_with_options(&ast, options);
-    if analyzed.has_errors() {
-        let err_count = analyzed
-            .diagnostics
-            .iter()
-            .filter(|d| d.severity() == relon_analyzer::Severity::Error)
-            .count();
+    let err_count = analyzed
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() == relon_analyzer::Severity::Error)
+        .filter(|d| !suppress(d))
+        .count();
+    if err_count > 0 {
         return Err(FrontendError::Analyze(err_count));
     }
     lower_workspace_single(&analyzed, &ast).map_err(|e| FrontendError::Lowering(e.to_string()))
