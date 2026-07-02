@@ -160,6 +160,21 @@ pub const ARENA_STATE_OFFSET_HOST_FNS: u32 = ARENA_STATE_OFFSET_TRAP_CODE + 8;
 pub const ARENA_STATE_OFFSET_STEP_BUDGET: u32 =
     ARENA_STATE_OFFSET_HOST_FNS + std::mem::size_of::<usize>() as u32;
 
+/// Compile-time layout guard. The entry prologue unconditionally loads
+/// `step_budget` (the trailing `i64`) at [`ARENA_STATE_OFFSET_STEP_BUDGET`],
+/// and the `relon-rs-shims` crate hand-mirrors this `#[repr(C)]` struct
+/// across a deliberate crate boundary. Pinning the exact size here makes
+/// any field added on this side without updating the mirror a **compile
+/// error** instead of a JIT-time out-of-bounds stack access.
+const _: () = assert!(
+    std::mem::size_of::<ArenaState>() == 48,
+    "ArenaState must stay 48 bytes; the rs-shims mirror hard-codes this layout"
+);
+const _: () = assert!(
+    std::mem::offset_of!(ArenaState, step_budget) == 40,
+    "ArenaState::step_budget must sit at offset 40 (entry prologue loads it there)"
+);
+
 /// Phase 0b native-dispatch trap codes recorded in
 /// [`ArenaState::trap_code`] by [`relon_llvm_call_native`]. Mirrors the
 /// cranelift backend's `TrapKind` numbering for the subset the LLVM

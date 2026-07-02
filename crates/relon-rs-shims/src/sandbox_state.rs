@@ -86,6 +86,17 @@ pub(crate) const ARENA_STATE_OFFSET_TRAP_CODE: u32 = 24;
 #[allow(dead_code)]
 pub(crate) const ARENA_STATE_OFFSET_HOST_FNS: u32 = ARENA_STATE_OFFSET_TRAP_CODE + 8;
 
+/// Byte offset of [`ArenaState::step_budget`]. Mirror of
+/// `relon_codegen_llvm::state::ARENA_STATE_OFFSET_STEP_BUDGET`. Appended
+/// after the `host_fns` pointer word on its natural 8-byte boundary at
+/// offset 40. The entry prologue's unconditional `emit_step_budget_check`
+/// loads this `i64`; the shim **must** own real backing memory here or
+/// the JIT reads (and, on a non-zero value, writes) 8 bytes of stack
+/// garbage past the end of the struct.
+#[allow(dead_code)]
+pub(crate) const ARENA_STATE_OFFSET_STEP_BUDGET: u32 =
+    ARENA_STATE_OFFSET_HOST_FNS + core::mem::size_of::<usize>() as u32;
+
 /// Per-call arena state handed to the JIT entry. The `#[repr(C)]`
 /// layout matches `relon_codegen_llvm::state::ArenaState` exactly so
 /// the emitted body's GEPs land on the right slots.
@@ -129,7 +140,34 @@ pub struct ArenaState {
     /// exists only to keep the `#[repr(C)]` tail byte-matched with the
     /// emitter's `ArenaState`.
     pub host_fns: UnsafeCell<usize>,
+    /// Remaining step budget. Exists **only** to keep the `#[repr(C)]`
+    /// tail byte-matched with `relon_codegen_llvm::state::ArenaState`,
+    /// whose entry prologue unconditionally loads this trailing `i64`
+    /// (`emit_step_budget_check("entry")`). Initialised to `0` — the
+    /// closed-world rs-build native path does not enforce a step budget,
+    /// and `0` means "unlimited", which hits the prologue's unlimited
+    /// short-circuit so the load/compare is a no-op. Without this field
+    /// the JIT would read 8 bytes of stack garbage past the struct's end
+    /// and, on a positive garbage value, store into that out-of-bounds
+    /// slot — corrupting the adjacent stack frame.
+    pub step_budget: UnsafeCell<i64>,
 }
+
+/// Compile-time layout guard: the shim's `ArenaState` **must** stay
+/// byte-for-byte identical to `relon_codegen_llvm::state::ArenaState`
+/// (48 bytes, `step_budget` at offset 40). The two structs are
+/// hand-mirrored across a deliberate crate boundary (the shim avoids a
+/// hard `llvm-sys`/`inkwell` dep), so a field added on one side without
+/// the other turns into a JIT-time out-of-bounds stack access. These
+/// `const` asserts turn that drift into a **compile error** instead.
+const _: () = assert!(
+    core::mem::size_of::<ArenaState>() == 48,
+    "rs-shims ArenaState must mirror relon_codegen_llvm::state::ArenaState (48 bytes)"
+);
+const _: () = assert!(
+    core::mem::offset_of!(ArenaState, step_budget) == 40,
+    "rs-shims ArenaState::step_budget must sit at offset 40 to match the emitter's #[repr(C)]"
+);
 
 /// Host-facing sandbox policy carrier threaded into every AOT call.
 ///
@@ -223,6 +261,12 @@ impl ArenaState {
             scratch_base: UnsafeCell::new(scratch_base),
             trap_code: UnsafeCell::new(0),
             host_fns: UnsafeCell::new(0),
+            // `0` = unlimited: the rs-build closed-world native path does
+            // not enforce a step budget, so the entry prologue's budget
+            // check short-circuits to a no-op. The field's only job is to
+            // back the 8 trailing bytes the emitter's `#[repr(C)]` view
+            // (and its unconditional prologue load) expects.
+            step_budget: UnsafeCell::new(0),
         }
     }
 
@@ -276,6 +320,13 @@ mod tests {
             offset_of!(ArenaState, host_fns) as u32,
             ARENA_STATE_OFFSET_HOST_FNS
         );
-        assert!(size_of::<ArenaState>() >= 32);
+        assert_eq!(
+            offset_of!(ArenaState, step_budget) as u32,
+            ARENA_STATE_OFFSET_STEP_BUDGET
+        );
+        // Pinned exact size: the emitter's entry prologue unconditionally
+        // loads the trailing `step_budget` i64 at offset 40, so the shim
+        // must own the full 48-byte layout — not merely "at least 32".
+        assert_eq!(size_of::<ArenaState>(), 48);
     }
 }
