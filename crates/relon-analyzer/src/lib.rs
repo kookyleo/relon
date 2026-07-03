@@ -52,6 +52,7 @@ pub mod root_schemas;
 pub mod schema;
 pub mod sig;
 pub mod signature_help;
+pub mod std_wrapper_signatures;
 pub mod stdlib_signatures;
 pub mod symbols;
 pub mod tree;

@@ -1005,11 +1005,36 @@ pub(crate) fn build_import_index(ws: &WorkspaceTree, importer_id: &str) -> Works
         // last-write-wins across all dict depths) so cross-module
         // imports only see top-level closures — the only ones the
         // importer can call directly.
-        let exported_closures: HashMap<String, FnSignature> = ws
+        let mut exported_closures: HashMap<String, FnSignature> = ws
             .nodes
             .get(target_id)
             .map(|root| collect_root_closure_signatures(root, target_tree))
             .unwrap_or_default();
+        // Issue #1, step 1: the `std/*` public wrappers (`list.sum`,
+        // `dict.values`, ...) are `#relaxed` closures authored without
+        // return annotations, so `collect_root_closure_signatures`
+        // hands them an `Any` return — erasing the element/return type
+        // at every `alias.method(...)` call site. For `std/` imports
+        // only, overlay the hand-written precise signatures so the type
+        // flows. Scoped to the `std/` path prefix and guarded by
+        // `contains_key` so a user module exporting a same-named
+        // closure is never hijacked and no phantom method is injected.
+        // Because `aliased_closures` / `spread_closures` /
+        // `destructured_closures` are all derived from
+        // `exported_closures` below, this single overlay covers every
+        // import form.
+        if let Some(path) = imp.path.as_deref() {
+            if path.starts_with("std/") {
+                if let Some(overrides) = crate::std_wrapper_signatures::std_wrapper_signatures(path)
+                {
+                    for (name, sig) in overrides {
+                        if exported_closures.contains_key(name) {
+                            exported_closures.insert(name.clone(), sig.clone());
+                        }
+                    }
+                }
+            }
+        }
         // Schema-rooted §J follow-up: collect root-level value fields
         // with declared type hints. Mirror of `exported_closures` for
         // non-callable values — drives `pkg.value.field` mid-path
