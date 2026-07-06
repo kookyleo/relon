@@ -86,6 +86,12 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
     /// `sdiv` otherwise. The cond_trap helper routes through
     /// `raise_trap` + early return so the trap is observable through
     /// the typed `RuntimeError` channel rather than SIGFPE/SIGILL.
+    ///
+    /// `i64::MIN / -1` is additionally guarded as `NumericOverflow`
+    /// (see [`Self::guard_i64_divmod_overflow`]): cranelift `sdiv`
+    /// traps the host process (SIGFPE on x86) for that operand pair,
+    /// while the tree-walk oracle's `checked_div` reports
+    /// `RuntimeError::NumericOverflow`.
     pub(super) fn emit_div_i64(&mut self) -> Result<(), CraneliftError> {
         let b = self.pop()?;
         let a = self.pop()?;
@@ -94,13 +100,17 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
             let cmp = self.builder.ins().icmp(IntCC::Equal, b, zero);
             self.cond_trap(cmp, TrapKind::DivisionByZero);
         }
+        self.guard_i64_divmod_overflow(a, b);
         let r = self.builder.ins().sdiv(a, b);
         self.push(r);
         Ok(())
     }
 
     /// `Op::Mod(IrType::I64)`. Mirrors [`Self::emit_div_i64`] but
-    /// emits `srem`.
+    /// emits `srem` — including the `i64::MIN % -1` overflow guard:
+    /// hardware `srem` yields `0` for that pair (or SIGFPEs, target-
+    /// dependent), while the oracle's `checked_rem` reports
+    /// `NumericOverflow`.
     pub(super) fn emit_mod_i64(&mut self) -> Result<(), CraneliftError> {
         let b = self.pop()?;
         let a = self.pop()?;
@@ -109,9 +119,30 @@ impl<'a, 'b> super::Codegen<'a, 'b> {
             let cmp = self.builder.ins().icmp(IntCC::Equal, b, zero);
             self.cond_trap(cmp, TrapKind::DivisionByZero);
         }
+        self.guard_i64_divmod_overflow(a, b);
         let r = self.builder.ins().srem(a, b);
         self.push(r);
         Ok(())
+    }
+
+    /// Trap `NumericOverflow` when `a == i64::MIN && b == -1` before an
+    /// `sdiv` / `srem`. Mirrors the LLVM AOT lowering's `div_overflow`
+    /// guard and the tree-walker's `checked_div` / `checked_rem`
+    /// semantics. Unconditional (not gated by `sandbox.div_check`) to
+    /// match the always-on `sadd_overflow` / `ssub_overflow` /
+    /// `smul_overflow` traps: this is overflow semantics, and without
+    /// the guard `sdiv` kills the host process with SIGFPE.
+    fn guard_i64_divmod_overflow(
+        &mut self,
+        a: cranelift_codegen::ir::Value,
+        b: cranelift_codegen::ir::Value,
+    ) {
+        let min = self.builder.ins().iconst(I64, i64::MIN);
+        let neg_one = self.builder.ins().iconst(I64, -1);
+        let lhs_min = self.builder.ins().icmp(IntCC::Equal, a, min);
+        let rhs_neg_one = self.builder.ins().icmp(IntCC::Equal, b, neg_one);
+        let overflow = self.builder.ins().band(lhs_min, rhs_neg_one);
+        self.cond_trap(overflow, TrapKind::NumericOverflow);
     }
 
     /// `Op::BitAnd(IrType::I64)`.
