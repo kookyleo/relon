@@ -272,7 +272,7 @@ host-pushed slot：
 > 这样既保住承重的单区墙（不跨区拷贝、不整 buffer 刚性重定位），又把整类
 > 「基址写错 / 散落图」bug 从 *静默错值* 变成 *明确的 verifier 失败*。host
 > 解码管线（哨兵 → 选区 → verifier → 解码）只在
-> `relon_eval_api::inplace_return` 落一份、由两个 AOT 后端共用，cranelift
+> `relon_abi::inplace_return` 落一份、由两个 AOT 后端共用，cranelift
 > 与 llvm 走完全相同的总开关。读取器、verifier 与 **两个** native 后端的
 > `List<List<scalar>>`、`List<String>` 与 `List<Schema>` 入参恒等形均已接通
 > （verifier 递归走到每个 `List<Schema>` 子记录的字段指针层），对象字段返回

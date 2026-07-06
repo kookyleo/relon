@@ -3,29 +3,42 @@
 > 本页面向**贡献者**和**深度集成 host**：解释代码组织、关键数据结构、扩展点、设计取舍。
 > 仅作为使用者阅读其它章节，不需要这一页。
 
-## 三层架构
+## Crate 分层
 
 ```
-relon-parser  ──→  relon-analyzer  ──┬─→  relon-evaluator (tree-walk)
-   (AST)            (side-tables)    │
-                          │          └─→  relon-ir ──→ relon-codegen-cranelift
-                          ▼                       └──→ relon-codegen-llvm
-                     relon-lsp                       (AOT 编译后端)
-                  (IDE 诊断 / 跳转 / 补全)
+叶子 crate: relon-util   relon-cap    relon-unicode      relon-object-cache / relon-object-link
+            (对齐数学)   (capability  (Unicode 表、SIMD  (编译产物磁盘缓存 + 链接)
+                          数据类型)    ASCII、glob)
+
+relon-parser  ──→  relon-analyzer  ──→  relon-eval-api ──┬─→  relon-evaluator (tree-walk)
+   (AST)            (side-tables)   (Value / Context /   │
+                          │          Evaluator trait)    └─→  relon-ir ──→ relon-codegen-cranelift
+                          ▼                                       │   └──→ relon-codegen-llvm
+                     relon-lsp                                    ▼          (AOT 编译后端)
+                  (IDE 诊断 / 跳转 / 补全)                    relon-abi
+                                                        (编译后端共享的二进制 ABI)
 
 facade crate: relon  ——  对宿主暴露 from_str / json_from_* / EvaluatorBuilder（Backend::Auto 选档）
+facade 之上的消费方：relon-cli、relon-lsp、relon-wasm-bindings、relon-rs-*（Rust 库桥接）
 ```
 
 每一层都是独立 crate，下游单向依赖上游。
 
 | Crate | 职责 | 主要导出 |
 | --- | --- | --- |
+| `relon-util` / `relon-cap` / `relon-unicode` / `relon-object-cache` / `relon-object-link` | 依赖图底部的叶子 crate：对齐 / 标识符工具；analyzer 与 eval-api 共享的 capability 数据类型；Unicode 表 + case folding + glob 匹配；`.o` 编译产物磁盘缓存与本机链接 | `align_up`, `CapabilityBit`, `NativeFnGate`、case-fold / normalize 表、cache 读写 |
 | `relon-parser` | 词法 + 语法 → AST。每个 `Node` 携带 process-wide `NodeId` 用于跨层 side-table | `Node`, `Expr`, `TypeNode`, `Decorator`, `NodeId`, `parse_document` |
 | `relon-analyzer` | 多个 pass（schema / extend / main_sig / modules / resolve / typecheck 等）输出 `AnalyzedTree` 侧表 | `AnalyzedTree`, `SchemaDef`, `ResolvedRef`, `Diagnostic`, `analyze` |
-| `relon-evaluator` | 树遍历求值，承载 `Context` / `Capabilities` / `Value` / 内建装饰器 / stdlib | `Context`, `Capabilities`, `Value`, `Evaluator`, `RuntimeError` |
+| `relon-eval-api` | 宿主与求值后端之间的接缝：值模型、宿主配置、沙箱面、以及每个后端都实现的 object-safe `Evaluator` trait。tree-walk 求值器、两个 AOT 后端、wasm 宿主包装共同依赖它 | `Value`, `Scope`, `Thunk`, `RuntimeError`, `Context`, `Capabilities`, `CapabilityGate`, `Evaluator` |
+| `relon-evaluator` | 树遍历求值（全语义面的参照后端）；内建装饰器 / stdlib | `TreeWalkEvaluator`、内建装饰器与 stdlib 注册 |
 | `relon-ir` + `relon-codegen-cranelift` / `relon-codegen-llvm` | AST + 侧表 lowering 为 IR，再把已声明支持的形态 AOT 编译为本机机器码；与 tree-walk 对照验证 | IR module、各编译后端入口 |
+| `relon-abi` | 编译执行面共享的内部 ABI：规范化 wire schema + hash、记录布局偏移表、二进制握手 buffer 的 writer/reader、返回路径校验器、就地返回解码。不是宿主 API——宿主永远不接触它 | `schema_canonical`, `layout`, `buffer`, `verifier`, `inplace_return` |
 | `relon` (facade) | 拼装 parse → analyze → eval 全链路；`EvaluatorBuilder` 选后端（默认 `Backend::Auto`）；`Projector` 控制 JSON 输出形态 | `from_str`, `value_from_str`, `json_from_str`, `EvaluatorBuilder`, `Error` |
 | `relon-lsp` | 同步 lsp-server，复用 analyzer 的 `Diagnostic` 与 side-tables | 二进制 `relon-lsp` |
+| `relon-rs-shims` / `relon-rs-build` / `relon-rs-macro` | relon 作为 Rust 库的桥接三件套：链接期 C ABI 帮手 + arena 封送、build.rs 编译到 `.o` 的 API、`include_relon!` 过程宏 | `include_relon!`、build.rs 入口 |
+
+`relon-cli` 与 `relon-wasm-bindings` 坐在 facade 之上：分别是 CLI
+二进制和浏览器 / wasmtime 宿主包装。
 
 ## 数据流
 

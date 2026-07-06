@@ -6,17 +6,23 @@
 > If you're reading the rest of the guide as a user, you don't need
 > this page.
 
-## Three-layer architecture
+## Crate layering
 
 ```
-relon-parser  ──→  relon-analyzer  ──┬─→  relon-evaluator (tree-walk)
-   (AST)            (side-tables)    │
-                          │          └─→  relon-ir ──→ relon-codegen-cranelift
-                          ▼                       └──→ relon-codegen-llvm
-                     relon-lsp                       (AOT compiled backends)
-                  (IDE diagnostics / go-to / completion)
+leaf crates: relon-util   relon-cap   relon-unicode   relon-object-cache / relon-object-link
+             (align math) (capability (Unicode tables, (compiled-object disk cache + linking)
+                           data types) SIMD ASCII, glob)
+
+relon-parser  ──→  relon-analyzer  ──→  relon-eval-api ──┬─→  relon-evaluator (tree-walk)
+   (AST)            (side-tables)   (Value / Context /   │
+                          │          Evaluator trait)    └─→  relon-ir ──→ relon-codegen-cranelift
+                          ▼                                       │   └──→ relon-codegen-llvm
+                     relon-lsp                                    ▼          (AOT compiled backends)
+                  (IDE diagnostics / go-to / completion)      relon-abi
+                                                        (backend-shared binary ABI)
 
 facade crate: relon  —  exposes from_str / json_from_* / EvaluatorBuilder (Backend::Auto dispatch)
+consumers of the facade: relon-cli, relon-lsp, relon-wasm-bindings, relon-rs-* (Rust-library bridge)
 ```
 
 Each layer is a separate crate; downstream crates depend on upstream
@@ -24,12 +30,19 @@ ones one-way only.
 
 | Crate | Responsibility | Key exports |
 | --- | --- | --- |
+| `relon-util` / `relon-cap` / `relon-unicode` / `relon-object-cache` / `relon-object-link` | Leaf crates at the bottom of the graph: alignment/identifier helpers; canonical capability data types shared by analyzer and eval-api; Unicode tables + case folding + glob matching; `.o` object disk cache and native linking | `align_up`, `CapabilityBit`, `NativeFnGate`, case-fold / normalize tables, cache read/write |
 | `relon-parser` | Lex + parse → AST. Every `Node` carries a process-wide `NodeId` for cross-layer side-tables | `Node`, `Expr`, `TypeNode`, `Decorator`, `NodeId`, `parse_document` |
 | `relon-analyzer` | Many passes (schema / extend / main_sig / modules / resolve / typecheck, …) producing the `AnalyzedTree` side-table | `AnalyzedTree`, `SchemaDef`, `ResolvedRef`, `Diagnostic`, `analyze` |
-| `relon-evaluator` | Tree-walk evaluation; carries `Context` / `Capabilities` / `Value` / built-in decorators / stdlib | `Context`, `Capabilities`, `Value`, `Evaluator`, `RuntimeError` |
+| `relon-eval-api` | The seam between hosts and evaluation backends: value model, host configuration, sandbox surface, and the object-safe `Evaluator` trait every backend implements. Shared by the tree-walk evaluator, both AOT backends, and the wasm host wrapper | `Value`, `Scope`, `Thunk`, `RuntimeError`, `Context`, `Capabilities`, `CapabilityGate`, `Evaluator` |
+| `relon-evaluator` | Tree-walk evaluation (the full-surface reference backend); built-in decorators / stdlib | `TreeWalkEvaluator`, built-in decorator + stdlib registration |
 | `relon-ir` + `relon-codegen-cranelift` / `relon-codegen-llvm` | Lower AST + side-tables to IR, then AOT-compile declared supported shapes to native machine code; matched against tree-walk | IR module, per-backend entry points |
+| `relon-abi` | Internal ABI shared by the compiled execution surfaces: canonical wire schema + hash, record layout offset tables, the binary handshake buffer writer/reader, the return-path verifier, and the in-place return decode. Not a host API — hosts never touch it | `schema_canonical`, `layout`, `buffer`, `verifier`, `inplace_return` |
 | `relon` (facade) | Stitches parse → analyze → eval; `EvaluatorBuilder` selects the backend (default `Backend::Auto`); `Projector` controls JSON output shape | `from_str`, `value_from_str`, `json_from_str`, `EvaluatorBuilder`, `Error` |
 | `relon-lsp` | Synchronous lsp-server; reuses analyzer `Diagnostic` and side-tables | binary `relon-lsp` |
+| `relon-rs-shims` / `relon-rs-build` / `relon-rs-macro` | The relon-as-Rust-library bridge: link-time C ABI helpers + arena marshalling, the build.rs compile-to-`.o` API, and the `include_relon!` proc-macro | `include_relon!`, build.rs entry points |
+
+`relon-cli` and `relon-wasm-bindings` sit on top of the facade: the
+CLI binary and the browser/wasmtime host wrapper respectively.
 
 ## Data flow
 

@@ -344,7 +344,7 @@ signature**; each parameter declares one host-pushed slot:
 > "wrong base / scattered graph" bugs from *silent miscompile* into
 > *explicit verifier failure*. The host decode pipeline (sentinel →
 > region-select → verifier → decode) lives once in
-> `relon_eval_api::inplace_return` and is shared by both AOT backends, so
+> `relon_abi::inplace_return` and is shared by both AOT backends, so
 > cranelift and llvm walk the exact same gate. The reader, verifier, and
 > the `List<List<scalar>>`, `List<String>`, and `List<Schema>`
 > parameter-identity cases on **both** native backends are wired (the
