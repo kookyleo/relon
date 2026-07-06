@@ -428,6 +428,7 @@ Error:   × cranelift-aot: incompatible (cranelift-aot requires `#main(...)`)"#,
             .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
 
         let mut command = Command::new(BINARY);
+        strip_color_env(&mut command);
         for arg in case.args {
             if *arg == "{file}" {
                 command.arg(&path);
@@ -461,6 +462,17 @@ struct DiagnosticCase<'a> {
     source: &'a str,
     args: &'a [&'a str],
     expected: &'a str,
+}
+
+/// Golden comparisons assume the CLI's default "no TTY, no color" output.
+/// Color-forcing variables inherited from the test runner's shell
+/// (`FORCE_COLOR=3` is common in CI and agent harnesses) would make miette
+/// emit ANSI codes into the captured pipes and fail the byte comparison,
+/// so strip every color knob before spawning.
+fn strip_color_env(command: &mut Command) {
+    for var in ["FORCE_COLOR", "NO_COLOR", "CLICOLOR", "CLICOLOR_FORCE"] {
+        command.env_remove(var);
+    }
 }
 
 fn normalize_diagnostic_output(stdout: &[u8], stderr: &[u8], temp_dir: &Path) -> String {
@@ -559,6 +571,7 @@ fn example_commands_match_golden_outputs() {
 
     for (example, args, golden) in cases {
         let mut command = Command::new(BINARY);
+        strip_color_env(&mut command);
         command
             .arg("run")
             .arg(root.join(example))
