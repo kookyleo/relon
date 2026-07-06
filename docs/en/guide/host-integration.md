@@ -399,10 +399,9 @@ The contrary — **not recommended** as the default — is:
 
 ```rust
 // ⚠️ pull-style: I/O moves inside evaluation
-ctx.register_fn("http.get",
-    NativeFnGate { network: true, ..Default::default() },
-    Arc::new(HttpGet),
-);
+let mut gate = NativeFnGate::default();
+gate.require(CapabilityBit::Network);
+ctx.register_fn("http.get", gate, Arc::new(HttpGet));
 ```
 
 ```relon
@@ -439,8 +438,8 @@ In these scenarios pull is still reasonable:
 
 In these cases register the host fn with
 [`register_fn`](#capability-gated-registration), declaring the right
-bits via `NativeFnGate { reads_clock: true, network: true, ..Default::default() }`
-as needed. **It's a deliberate trade**: the script author gives up
+bits on a `NativeFnGate` via `gate.require(CapabilityBit::Network)`
+etc. as needed. **It's a deliberate trade**: the script author gives up
 "running the same args twice always produces the same result" in
 exchange for "can pull data dynamically". Spec §1's determinism
 guarantee only covers push.
@@ -560,6 +559,15 @@ let json_value = evaluator.eval_root(&Arc::new(relon::Scope::default()))?;
   are tree-walker-only in the current builder surface. Use
   `Backend::TreeWalk` when staging host fns; `Backend::Auto` /
   `CraneliftAot` / `LlvmAot` fail loudly instead of ignoring them.
+- `.grant(CapabilityBit)` adds one capability bit on top of the
+  `Sandboxed` baseline — the least-privilege path for capability-gated
+  host fns (see
+  [Capability-gated registration](#capability-gated-registration)).
+  Grants follow the same backend rule as host fns: `Backend::TreeWalk`
+  only, other backends fail loudly at `build()`. Under
+  `TrustLevel::Trusted` every bit is already granted, so extra
+  `.grant` calls are accepted as redundant no-ops (the effective grant
+  set is the union).
 - `max_source_bytes(n)` rejects source above `n` bytes before parsing.
   This is the parser/input guardrail; it is separate from evaluator
   step/value budgets.
@@ -585,10 +593,14 @@ let guarded = EvaluatorBuilder::from_str(source)
 ## What `Context` is
 
 When you use the top-level `relon::*` API or `EvaluatorBuilder`,
-`Context` is constructed internally. To register decorators, custom
-module resolvers, or adjust capability knobs one by one, build
-`Context` directly and hand it to the concrete backend type
-`TreeWalkEvaluator` (`Evaluator` is the trait all backends share):
+`Context` is constructed internally. Trust posture, per-bit
+capability grants (`.grant(CapabilityBit)`), native-fn registration,
+and resource budgets are all covered by the builder, so most hosts
+never touch `Context`. Building it directly is usually not needed;
+reach for it only for the knobs the builder does not carry yet —
+registering decorators or mounting a custom module-resolver chain —
+by handing it to the concrete backend type `TreeWalkEvaluator`
+(`Evaluator` is the trait all backends share):
 
 ```rust
 use relon_evaluator::{Context, Scope, TreeWalkEvaluator};
@@ -684,11 +696,14 @@ Key points:
 ## Capability-gated registration
 
 For functions with side effects — file reads, network calls,
-environment reads — register them with `register_fn` and set the
-corresponding `NativeFnGate` bit:
+environment reads — declare the corresponding bit on the fn's
+`NativeFnGate`, and grant exactly that bit at construction time with
+`EvaluatorBuilder::grant`. The evaluator stays sandboxed; only the
+named authority is added on top:
 
 ```rust
-use relon_evaluator::{Capabilities, Context, NativeFnGate, NativeArgs, RelonFunction, Value, RuntimeError};
+use relon::{Backend, CapabilityBit, EvaluatorBuilder, NativeFnGate, TrustLevel};
+use relon_eval_api::{NativeArgs, RelonFunction, RuntimeError, Value};
 use relon_parser::TokenRange;
 use std::sync::Arc;
 
@@ -701,26 +716,62 @@ impl RelonFunction for ReadSecret {
     }
 }
 
-// How to allow this under the sandbox: grant every bit the gate
-// declares, at construction time
-let mut caps = Capabilities::default();
-caps.reads_fs = true;
+// The fn declares what it needs…
+let mut gate = NativeFnGate::default();
+gate.require(CapabilityBit::ReadsFs);
 
-let mut ctx = Context::sandboxed().with_capabilities(caps);
-ctx.register_fn(
-    "secret.read",
-    NativeFnGate { reads_fs: true, ..Default::default() },
-    Arc::new(ReadSecret),
-);
+// …and the host grants exactly that bit on the sandboxed baseline.
+let evaluator = EvaluatorBuilder::from_str(source)
+    .backend(Backend::TreeWalk)
+    .trust(TrustLevel::Sandboxed)          // default; shown for clarity
+    .grant(CapabilityBit::ReadsFs)         // least privilege: this bit only
+    .register_native_fn("secret.read", gate, Arc::new(ReadSecret))
+    .build()?;
 ```
 
-Every native function goes through the same gate check: every bit the
-function declares must be granted in `Capabilities`, or
-`CapabilityDenied`. Pure fns registered through `register_pure_fn`
-declare an empty gate — zero bits required — so they run without any
-capability grant. `register_fn(name, gate, fn)` requires explicit
-host grants for every bit set in `gate`.
-`Capabilities::all_granted()` flips all six bits at once. See
+Notes on `.grant`:
+
+- Grants are strictly additive on the `Sandboxed` baseline: nothing
+  else widens. In particular, `grant(CapabilityBit::ReadsFs)` does
+  **not** enable filesystem `#import` — the sandboxed module-resolver
+  chain still denies filesystem paths; the bit only satisfies
+  native-fn gates.
+- Under `TrustLevel::Trusted` every bit is already granted, so extra
+  `.grant` calls are redundant no-ops (accepted, not rejected — the
+  requested authority is in effect either way).
+- Grants are applied by `Backend::TreeWalk` only; staging one under
+  `Backend::Auto` or a compiled backend makes `build()` fail loudly
+  instead of silently ignoring it.
+
+The same wiring is possible without the builder by assembling
+`Context` directly — usually not needed now that the builder carries
+per-bit grants, but still legitimate when you are already deep in the
+lower-level crates (e.g. combining grants with custom decorators or
+resolver chains):
+
+```rust
+use relon_evaluator::{Capabilities, CapabilityBit, Context, NativeFnGate};
+use std::sync::Arc;
+
+let mut caps = Capabilities::default();
+caps.grant(CapabilityBit::ReadsFs);
+
+let mut gate = NativeFnGate::default();
+gate.require(CapabilityBit::ReadsFs);
+
+let mut ctx = Context::sandboxed().with_capabilities(caps);
+ctx.register_fn("secret.read", gate, Arc::new(ReadSecret));
+```
+
+Every native function goes through the same gate check regardless of
+which registration path it came in on (builder or `Context`): every
+bit the function declares must be granted in `Capabilities`, or the
+call fails with `CapabilityDenied`. Pure fns registered through
+`register_pure_fn` / `register_pure_native_fn` declare an empty gate
+— zero bits required — so they run without any capability grant.
+Gated registration requires explicit host grants for every bit set in
+the gate. `Capabilities::all_granted()` flips all six bits at once
+(that is what `TrustLevel::Trusted` uses). See
 [Sandbox & capabilities](./sandbox).
 
 ## Module resolution
