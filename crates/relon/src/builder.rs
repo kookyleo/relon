@@ -53,7 +53,12 @@ use crate::{Backend, BackendError};
 /// `TrustMode` the facade entry points use internally; surfaced
 /// publicly so the open-the-box construction path can flip it
 /// without writing a custom `Context`.
+/// `#[non_exhaustive]`: future trust postures are added here without a
+/// breaking semver bump. Downstream matches must carry a wildcard arm;
+/// the conservative fallback is to treat an unknown posture as
+/// [`TrustLevel::Sandboxed`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TrustLevel {
     /// Default. Refuses filesystem `#import` and every
     /// capability-gated native fn. Equivalent to

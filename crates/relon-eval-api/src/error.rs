@@ -9,7 +9,12 @@ fn format_chain(chain: &[String]) -> String {
     chain.join(" \u{2192} ")
 }
 
+/// `#[non_exhaustive]`: new error variants are added here without a
+/// breaking semver bump. Downstream matches must carry a wildcard arm;
+/// treat unknown variants as opaque runtime failures (format / propagate,
+/// never swallow).
 #[derive(Error, Debug, Diagnostic, Clone)]
+#[non_exhaustive]
 pub enum RuntimeError {
     #[error("Variable not found: {0}")]
     #[diagnostic(

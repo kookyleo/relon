@@ -68,7 +68,12 @@ pub use relon_eval_api::{
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// `#[non_exhaustive]`: new error variants are added here without a
+/// breaking semver bump. Downstream matches must carry a wildcard arm;
+/// treat unknown variants as opaque failures (format / propagate, never
+/// swallow).
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("failed to read Relon file {path}: {source}")]
     Io {
@@ -596,7 +601,10 @@ pub fn analyze_from_str(source: &str) -> Result<AnalyzedTree> {
 /// construction). The historical `Backend::WasmAot` variant is gone;
 /// upgrade callers to `Backend::Auto` (transparent) or
 /// `Backend::CraneliftAot` (eager).
+/// `#[non_exhaustive]`: future backends are added here without a
+/// breaking semver bump. Downstream matches must carry a wildcard arm.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Backend {
     /// Auto-tier (default). Returns an [`AutoEvaluator`] that routes
     /// `run_main` through the cranelift-AOT backend (lazily
@@ -644,7 +652,12 @@ pub enum Backend {
 /// [`crate::Error`] because the AOT path can fail before the
 /// runtime ever starts (codegen / JIT setup) and we don't want to
 /// stuff those shapes into the tree-walker's existing error enum.
+/// `#[non_exhaustive]`: new error variants are added here without a
+/// breaking semver bump. Downstream matches must carry a wildcard arm;
+/// treat unknown variants as opaque setup failures (format / propagate,
+/// never swallow).
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum BackendError {
     /// Parser rejected the source.
     #[error("parse error: {0}")]
