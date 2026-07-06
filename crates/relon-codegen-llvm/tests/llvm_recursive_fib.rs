@@ -1,7 +1,7 @@
 //! Phase E.2 synthetic recursive `fib` smoke.
 //!
 //! Constructs a hand-built IR module shaped like the production
-//! `fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2)` body, but bypasses
+//! `fib: (Int k) -> Int => k < 2 ? k : fib(k - 1) + fib(k - 2)` body, but bypasses
 //! the AST -> IR lowering pipeline (which still rejects closures as
 //! first-class dict values — see Phase F scope). The test proves the
 //! LLVM emitter's Phase E.2 multi-function path is wired correctly:

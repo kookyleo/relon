@@ -29,7 +29,7 @@ const CLOSURE_SRC: &str = "\
 #main(Int n) -> Dict
 {
   #internal
-  fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),
+  fib: (Int k) -> Int => k < 2 ? k : fib(k - 1) + fib(k - 2),
   result: fib(n)
 }";
 

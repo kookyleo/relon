@@ -546,7 +546,7 @@ pub(crate) fn is_buffer_protocol_signature(params: &[IrType], ret: IrType) -> bo
 /// Phase F.W7 widens the surface to closures-as-values:
 ///
 /// - `lambdas` carries the IR funcs the lowering pass appended to the
-///   module's closure table (`#main`-side `fib: (k) => ...` lifts to a
+///   module's closure table (`#main`-side `fib: (Int k) -> Int => ...` lifts to a
 ///   lambda Func). Each lambda is declared / emitted with the
 ///   signature `(state, captures_ptr, ...lambda.params[1..]) -> ret`
 ///   so the body's `LocalGet(0)` reads the captures_ptr arg, and so

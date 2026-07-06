@@ -23,7 +23,7 @@
 //! binding in the `where` clause hit the bare `Expr::Closure` arm of
 //! `lower_expr`. AOT-3 lifts the where-bound recursive helper to a
 //! top-level let-bound closure, exactly the way the W7 anon-Dict-return
-//! path lifts its `#internal fib: (k) => ...` field.
+//! path lifts its `#internal fib: (Int k) -> Int => ...` field.
 //!
 //! W17 is PURE recursion over an arithmetic index range (no list
 //! materialisation), so the lowering change alone lands it. This test

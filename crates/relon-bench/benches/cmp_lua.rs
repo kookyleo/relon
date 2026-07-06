@@ -785,7 +785,7 @@ fn w7_relon_src() -> &'static str {
     "#main(Int n) -> Dict\n\
      {\n\
        #internal\n\
-       fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
+       fib: (Int k) -> Int => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
        result: fib(n)\n\
      }"
 }
@@ -4539,7 +4539,7 @@ fn bench_cmp_lua(c: &mut Criterion) {
     // ----- W7 fib -----
     //
     // review-improvement-139: no `relon_trace_jit` row for W7. The
-    // workload is a recursive closure (`fib: (k) => k < 2 ? k : fib(k - 1)
+    // workload is a recursive closure (`fib: (Int k) -> Int => k < 2 ? k : fib(k - 1)
     // + fib(k - 2)`); the recorder treats every `Op::CallClosure` as
     // `AbortReason::UnrecoverableEffect` (closure-call lowering deferred
     // until trace inlining lands), so any IR fixture that records the

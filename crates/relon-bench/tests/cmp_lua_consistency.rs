@@ -222,7 +222,7 @@ fn w7_fib() {
             let r = "#main(Int n) -> Dict\n\
                      {\n\
                        #internal\n\
-                       fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
+                       fib: (Int k) -> Int => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
                        result: fib(n)\n\
                      }";
             let n = FIB_N;

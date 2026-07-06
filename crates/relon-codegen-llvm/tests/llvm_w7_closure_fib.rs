@@ -8,7 +8,7 @@
 //! #main(Int n) -> Dict
 //! {
 //!   #internal
-//!   fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),
+//!   fib: (Int k) -> Int => k < 2 ? k : fib(k - 1) + fib(k - 2),
 //!   result: fib(n)
 //! }
 //! ```
@@ -49,7 +49,7 @@ fn w7_production_source_lowers_and_evaluates() {
     let src = "#main(Int n) -> Dict\n\
                {\n\
                  #internal\n\
-                 fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
+                 fib: (Int k) -> Int => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
                  result: fib(n)\n\
                }";
     let ev = LlvmAotEvaluator::from_source(src).expect("W7 source compiles via LLVM AOT");
@@ -74,7 +74,7 @@ fn w7_production_source_does_not_expose_fast_path() {
     let src = "#main(Int n) -> Dict\n\
                {\n\
                  #internal\n\
-                 fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
+                 fib: (Int k) -> Int => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
                  result: fib(n)\n\
                }";
     let ev = LlvmAotEvaluator::from_source(src).expect("W7 source compiles via LLVM AOT");
@@ -92,7 +92,7 @@ fn w7_buffer_run_main_returns_dict() {
     let src = "#main(Int n) -> Dict\n\
                {\n\
                  #internal\n\
-                 fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
+                 fib: (Int k) -> Int => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
                  result: fib(n)\n\
                }";
     let ev = LlvmAotEvaluator::from_source(src).expect("W7 source compiles via LLVM AOT");

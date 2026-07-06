@@ -1488,7 +1488,7 @@ enum AnonDictField {
 ///
 /// Per-field type classification today is **heuristic**: a closure
 /// literal lifts to a `[I64] → I64` (or user-annotated) signature
-/// matching the W7 production source shape (`fib: (k) => ...`); a
+/// matching the W7 production source shape (`fib: (Int k) -> Int => ...`); a
 /// scalar field's type is taken from a small set of statically
 /// derivable expressions (literal, arithmetic between literals,
 /// `Variable(name)` against a `#main` Int param, and free-call
@@ -8609,7 +8609,7 @@ fn lower_where(
         // method-shorthand `name(params): body` desugars to an
         // `Expr::Closure`) is lifted to a closure-typed let-binding,
         // exactly the way the W7 anon-Dict-return path lifts its
-        // `#internal fib: (k) => ...` field (see `lower_anon_dict_body`).
+        // `#internal fib: (Int k) -> Int => ...` field (see `lower_anon_dict_body`).
         // The closure let-idx + its signature are registered in
         // `ctx.closure_let_signatures` BEFORE the body lowers so a
         // recursive self-call inside the body (W17's `bs((lo+hi)/2, hi,
@@ -14469,7 +14469,7 @@ mod range_pipeline_tests {
 // =====================================================================
 // Phase F.2 — first-class closure value boundary.
 //
-// The W7 cmp_lua workload (`#main(Int n) -> Dict { #internal fib: (k) =>
+// The W7 cmp_lua workload (`#main(Int n) -> Dict { #internal fib: (Int k) -> Int =>
 // ..., result: fib(n) }`) currently fails `lower_workspace_single` at
 // the return-type build step because `-> Dict` has no canonical
 // representation. The downstream `Expr::Closure` at a non-higher-order
@@ -14520,7 +14520,7 @@ mod w7_closure_boundary_tests {
         let src = "#main(Int n) -> Dict\n\
                    {\n\
                      #internal\n\
-                     fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
+                     fib: (Int k) -> Int => k < 2 ? k : fib(k - 1) + fib(k - 2),\n\
                      result: fib(n)\n\
                    }";
         let module = try_lower(src).expect("Phase C lowers W7 anon-Dict-return source");
