@@ -15,7 +15,7 @@ Relon itself owns these language-level guarantees:
 | --- | --- |
 | Determinism | No language builtin reads time, randomness, environment variables, files, network, or process state. |
 | Explicit trust | `--trust`, `*_trusted`, and `TrustLevel::Trusted` are host-owned opt-ins; scripts cannot grant trust to themselves. |
-| Capability vocabulary | `Capabilities` names language/host authority such as filesystem imports, network, clock, subprocess, and gated native functions. |
+| Capability vocabulary | `Capabilities` names language/host authority: `reads_fs`, `writes_fs`, `network`, `reads_clock`, `reads_env`, `uses_rng`, plus native functions gated on those bits. |
 | Static capability diagnostics | The analyzer reports missing grants for statically visible gated calls. |
 | Runtime capability denial | The evaluator/backends deny ungranted capability bits instead of silently calling host code. |
 | Correctness traps | Divide-by-zero, numeric overflow, missing `#main` args, unsupported backend shapes, bounds errors, and validation failures surface as errors. |

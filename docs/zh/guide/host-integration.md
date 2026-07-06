@@ -758,7 +758,7 @@ fn main() {
 | 变体 | 来源 |
 | --- | --- |
 | `Error::Parse(String)` | 词法 / 语法错误 |
-| `Error::Analyze(Vec<Diagnostic>)` | analyzer 错误**批量**返回（4 个 pass 一起跑完） |
+| `Error::AnalyzeWorkspace { workspace, modules }` | analyzer 错误**批量**返回（所有 pass 一起跑完）：workspace 级发现（循环、缺失 import、跨模块冲突）加上各模块自身的诊断 |
 | `Error::Eval(RuntimeError)` | 求值期错误：类型不匹配、未定义引用、capability 拒绝、step 超限等 |
 | `Error::Io { path, source }` | 读文件失败 |
 | `Error::Deserialize(serde_json::Error)` | `from_str::<T>` 类 API 反序列化失败 |

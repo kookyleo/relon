@@ -84,18 +84,14 @@ pub enum Error {
     #[error("failed to parse Relon source: {0}")]
     Parse(String),
 
-    /// One or more analyzer diagnostics at `Error` severity. Reported as a
-    /// batch (the whole point of having an analyzer pass) rather than
-    /// fail-fast like [`Error::Eval`].
-    #[error("analyzer reported {} error(s)", .0.len())]
-    Analyze(Vec<Diagnostic>),
-
     /// Workspace-level analyzer findings (cycles, missing imports,
     /// cross-module schema collisions, parse errors in imported
     /// modules) plus any per-module analyzer errors discovered while
-    /// walking the import graph. Distinct from [`Error::Analyze`] so
-    /// hosts can decide to render the import-graph errors with a
-    /// different layout (e.g. "imported here" labels).
+    /// walking the import graph. Reported as a batch (the whole point
+    /// of having an analyzer pass) rather than fail-fast like
+    /// [`Error::Eval`]; the two buckets stay separate so hosts can
+    /// render import-graph errors with a different layout (e.g.
+    /// "imported here" labels).
     #[error(
         "workspace analyzer reported {} workspace-level and {} module-level error(s)",
         workspace.len(),

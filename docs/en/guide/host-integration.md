@@ -902,7 +902,7 @@ authoritative list is `relon-rs-build`'s `rust_type_for` table). See
 | Variant | Source |
 | --- | --- |
 | `Error::Parse(String)` | Lexical / syntactic error |
-| `Error::Analyze(Vec<Diagnostic>)` | Analyzer errors returned **in batch** (all four passes run together) |
+| `Error::AnalyzeWorkspace { workspace, modules }` | Analyzer errors returned **in batch** (all passes run together): workspace-level findings (cycles, missing imports, cross-module collisions) plus per-module diagnostics |
 | `Error::Eval(RuntimeError)` | Evaluation-time error: type mismatch, unresolved reference, capability denial, step overrun, … |
 | `Error::Io { path, source }` | File-read failure |
 | `Error::Deserialize(serde_json::Error)` | `from_str::<T>`-class API deserialization failure |
