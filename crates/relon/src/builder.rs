@@ -25,6 +25,12 @@
 //! same capability gate the script-side `Capabilities` budget
 //! enforces.
 //!
+//! Between the two postures sits per-bit authorisation:
+//! [`EvaluatorBuilder::grant`] adds individual capability bits on top
+//! of the Sandboxed baseline, so a host can stay sandboxed and grant
+//! exactly the bits its registered native fns declare (least
+//! privilege) without dropping down to a hand-assembled `Context`.
+//!
 //! ## Backend coverage
 //!
 //! Native-fn registration is meaningful only for the tree-walker
@@ -37,7 +43,7 @@
 //! [`EvaluatorBuilder::build`] time so the failure is loud rather
 //! than silent.
 
-use relon_eval_api::{Evaluator, NativeFnGate, RelonFunction};
+use relon_eval_api::{CapabilityBit, Evaluator, NativeFnGate, RelonFunction};
 #[cfg(all(not(target_arch = "wasm32"), feature = "remote-http"))]
 use relon_evaluator::module::RemoteHttpResolver;
 use relon_evaluator::module::{FilesystemModuleResolver, ModuleResolver};
@@ -115,6 +121,12 @@ pub struct EvaluatorBuilder {
     trust: TrustLevel,
     resource_budget: Option<ResourceBudget>,
     max_source_bytes: Option<usize>,
+    /// Capability bits staged by [`Self::grant`], applied on top of
+    /// the Sandboxed baseline when the tree-walker `Context` is
+    /// assembled. Like `pending_fns`, carrying entries into a
+    /// non-TreeWalk build surfaces `BackendError::UnsupportedFeature`
+    /// so the failure is loud rather than silent.
+    granted: Vec<CapabilityBit>,
     /// Host fns staged for registration on the tree-walker `Context`.
     /// Stays empty for compiled backends since they cannot dispatch host
     /// fns; carrying values into a non-TreeWalk build surfaces
@@ -142,6 +154,7 @@ impl EvaluatorBuilder {
             trust: TrustLevel::default(),
             resource_budget: None,
             max_source_bytes: None,
+            granted: Vec::new(),
             pending_fns: Vec::new(),
         }
     }
@@ -157,6 +170,7 @@ impl EvaluatorBuilder {
             trust: TrustLevel::default(),
             resource_budget: None,
             max_source_bytes: None,
+            granted: Vec::new(),
             pending_fns: Vec::new(),
         }
     }
@@ -170,6 +184,42 @@ impl EvaluatorBuilder {
     /// Switch trust posture. Defaults to [`TrustLevel::Sandboxed`].
     pub fn trust(mut self, trust: TrustLevel) -> Self {
         self.trust = trust;
+        self
+    }
+
+    /// Grant a single capability bit on top of the
+    /// [`TrustLevel::Sandboxed`] baseline. Chain the call once per
+    /// bit; grants are strictly additive and never widen anything
+    /// else (module-resolver chain, budgets, trust posture all stay
+    /// as configured).
+    ///
+    /// This is the least-privilege path for capability-gated host
+    /// fns: stay sandboxed, register the fn with its
+    /// [`NativeFnGate`], and grant exactly the bits the gate
+    /// declares. A gated call goes through iff every bit on its gate
+    /// was granted; missing bits surface as
+    /// `RuntimeError::CapabilityDenied` at call time.
+    ///
+    /// Note that granting [`CapabilityBit::ReadsFs`] does *not* by
+    /// itself enable filesystem `#import`: the sandboxed
+    /// module-resolver chain still denies filesystem paths. The bit
+    /// only satisfies native-fn gates that declare `reads_fs`.
+    ///
+    /// Interaction with [`TrustLevel::Trusted`]: `Trusted` already
+    /// grants every capability bit (plus trusted module resolvers),
+    /// so additional `grant` calls are subsumed — they are accepted
+    /// as redundant no-ops rather than rejected, because the
+    /// requested authority *is* in effect (nothing is silently
+    /// dropped). The effective grant set is always the union.
+    ///
+    /// Backend coverage mirrors [`Self::register_native_fn`]: grants
+    /// are applied only by [`Backend::TreeWalk`]. Any staged grant
+    /// under [`Backend::Auto`] or a compiled backend
+    /// ([`Backend::CraneliftAot`] / [`Backend::LlvmAot`]) surfaces
+    /// [`BackendError::UnsupportedFeature`] at [`Self::build`] time
+    /// so the failure is loud rather than silent.
+    pub fn grant(mut self, bit: CapabilityBit) -> Self {
+        self.granted.push(bit);
         self
     }
 
@@ -242,6 +292,7 @@ impl EvaluatorBuilder {
             trust,
             resource_budget,
             max_source_bytes,
+            granted,
             pending_fns,
         } = self;
 
@@ -286,6 +337,16 @@ impl EvaluatorBuilder {
                 backend
             )));
         }
+        // Capability grants only reach the tree-walker `Context`.
+        // Compiled backends (and Auto, whose compiled side cannot
+        // consult a per-build grant set) reject loudly instead of
+        // building an evaluator that silently ignores the grants.
+        if !granted.is_empty() && !matches!(backend, Backend::TreeWalk) {
+            return Err(BackendError::UnsupportedFeature(format!(
+                "capability grants are currently applied only by Backend::TreeWalk; got {:?}",
+                backend
+            )));
+        }
         if resource_budget.is_some_and(ResourceBudget::has_evaluator_limits)
             && !matches!(backend, Backend::TreeWalk)
         {
@@ -317,7 +378,8 @@ impl EvaluatorBuilder {
                 Ok(Box::new(auto))
             }
             Backend::TreeWalk => {
-                let tw = build_tree_walk(&source_string, trust, resource_budget, pending_fns)?;
+                let tw =
+                    build_tree_walk(&source_string, trust, resource_budget, granted, pending_fns)?;
                 Ok(Box::new(tw))
             }
             #[cfg(feature = "cranelift-aot")]
@@ -375,6 +437,7 @@ fn build_tree_walk(
     source: &str,
     trust: TrustLevel,
     resource_budget: Option<ResourceBudget>,
+    granted: Vec<CapabilityBit>,
     pending_fns: Vec<PendingNativeFn>,
 ) -> Result<TreeWalkEvaluator, BackendError> {
     let node = parse_document(source).map_err(|e| BackendError::Parse(e.to_string()))?;
@@ -389,15 +452,22 @@ fn build_tree_walk(
     // Honour Trusted by granting all capabilities and prepending the
     // trusted-filesystem + remote-HTTP resolvers, matching the
     // assembly used by `crate::evaluate_source` in the trusted branch.
+    // Per-bit grants staged via `EvaluatorBuilder::grant` land on top
+    // of the Sandboxed baseline; under Trusted they are subsumed by
+    // `all_granted` (the effective set is the union).
     let mut caps = if matches!(trust, TrustLevel::Trusted) {
         Capabilities::all_granted()
     } else {
         Capabilities::default()
     };
+    for bit in &granted {
+        caps.grant(*bit);
+    }
     if let Some(resource_budget) = resource_budget {
         resource_budget.apply_to_capabilities(&mut caps);
     }
     if matches!(trust, TrustLevel::Trusted)
+        || !granted.is_empty()
         || resource_budget.is_some_and(ResourceBudget::has_evaluator_limits)
     {
         ctx = ctx.with_capabilities(caps);
@@ -540,6 +610,127 @@ mod tests {
     impl RelonFunction for NoopFn {
         fn call(&self, _args: NativeArgs, _range: TokenRange) -> Result<Value, RuntimeError> {
             Ok(Value::option_none())
+        }
+    }
+
+    /// Stand-in for a clock-reading host fn: gated on `reads_clock`,
+    /// returns a fixed value so tests can assert the call went through.
+    struct FixedClock;
+    impl RelonFunction for FixedClock {
+        fn call(&self, _args: NativeArgs, _range: TokenRange) -> Result<Value, RuntimeError> {
+            Ok(Value::Int(1234))
+        }
+    }
+
+    fn clock_gate() -> NativeFnGate {
+        let mut gate = NativeFnGate::default();
+        gate.require(CapabilityBit::ReadsClock);
+        gate
+    }
+
+    #[test]
+    fn grant_enables_gated_native_fn_under_sandbox() {
+        let evaluator = EvaluatorBuilder::from_str(r#"{ t: now_ms() }"#)
+            .backend(Backend::TreeWalk)
+            .trust(TrustLevel::Sandboxed)
+            .grant(CapabilityBit::ReadsClock)
+            .register_native_fn("now_ms", clock_gate(), Arc::new(FixedClock))
+            .build()
+            .expect("build");
+        let value = evaluator
+            .eval_root(&Arc::new(Scope::default()))
+            .expect("gated fn must pass once its bit is granted");
+        let Value::Dict(d) = value else {
+            panic!("expected dict")
+        };
+        assert_eq!(d.map.get("t"), Some(&Value::Int(1234)));
+    }
+
+    #[test]
+    fn ungranted_gated_native_fn_is_capability_denied() {
+        let evaluator = EvaluatorBuilder::from_str(r#"{ t: now_ms() }"#)
+            .backend(Backend::TreeWalk)
+            .register_native_fn("now_ms", clock_gate(), Arc::new(FixedClock))
+            .build()
+            .expect("build");
+        match evaluator.eval_root(&Arc::new(Scope::default())) {
+            Err(RuntimeError::CapabilityDenied { reason, .. }) => {
+                assert!(
+                    reason.contains("reads_clock"),
+                    "denial must name the missing bit, got: {reason}"
+                );
+            }
+            Err(other) => panic!("expected CapabilityDenied, got {other:?}"),
+            Ok(v) => panic!("expected sandbox to deny the gated fn, got {v:?}"),
+        }
+    }
+
+    #[test]
+    fn grant_is_per_bit_not_blanket() {
+        // Granting an unrelated bit must not satisfy the gate.
+        let evaluator = EvaluatorBuilder::from_str(r#"{ t: now_ms() }"#)
+            .backend(Backend::TreeWalk)
+            .grant(CapabilityBit::Network)
+            .register_native_fn("now_ms", clock_gate(), Arc::new(FixedClock))
+            .build()
+            .expect("build");
+        match evaluator.eval_root(&Arc::new(Scope::default())) {
+            Err(RuntimeError::CapabilityDenied { reason, .. }) => {
+                assert!(reason.contains("reads_clock"));
+            }
+            Err(other) => panic!("expected CapabilityDenied, got {other:?}"),
+            Ok(v) => panic!("expected denial: Network grant must not cover reads_clock, got {v:?}"),
+        }
+    }
+
+    #[test]
+    fn grant_under_trusted_is_redundant_but_accepted() {
+        // Trusted already grants every bit; an explicit grant is
+        // subsumed (union semantics), not rejected. The gated fn even
+        // passes on a bit that was *not* explicitly granted.
+        let evaluator = EvaluatorBuilder::from_str(r#"{ t: now_ms() }"#)
+            .backend(Backend::TreeWalk)
+            .trust(TrustLevel::Trusted)
+            .grant(CapabilityBit::Network)
+            .register_native_fn("now_ms", clock_gate(), Arc::new(FixedClock))
+            .build()
+            .expect("Trusted + grant must build (grant is a redundant no-op)");
+        let value = evaluator
+            .eval_root(&Arc::new(Scope::default()))
+            .expect("Trusted grants every bit");
+        let Value::Dict(d) = value else {
+            panic!("expected dict")
+        };
+        assert_eq!(d.map.get("t"), Some(&Value::Int(1234)));
+    }
+
+    #[test]
+    fn grant_rejected_on_compiled_backend() {
+        let result = EvaluatorBuilder::from_str("#main(Int x) -> Int\nx + 1")
+            .backend(Backend::LlvmAot)
+            .grant(CapabilityBit::ReadsClock)
+            .build();
+        match result {
+            Err(BackendError::UnsupportedFeature(message)) => {
+                assert!(message.contains("capability grants"));
+            }
+            Err(other) => panic!("expected UnsupportedFeature, got {other:?}"),
+            Ok(_) => panic!("expected builder to reject grants under a compiled backend"),
+        }
+    }
+
+    #[test]
+    fn grant_rejected_on_auto_backend() {
+        let result = EvaluatorBuilder::from_str("#main(Int x) -> Int\nx + 1")
+            .backend(Backend::Auto)
+            .grant(CapabilityBit::ReadsClock)
+            .build();
+        match result {
+            Err(BackendError::UnsupportedFeature(message)) => {
+                assert!(message.contains("capability grants"));
+            }
+            Err(other) => panic!("expected UnsupportedFeature, got {other:?}"),
+            Ok(_) => panic!("expected builder to reject grants under Backend::Auto"),
         }
     }
 }

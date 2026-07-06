@@ -116,6 +116,24 @@ pub struct NativeFnGate {
 }
 
 impl NativeFnGate {
+    /// Declare a required capability bit. Strictly additive: it flips
+    /// the matching per-bit boolean to `true` and never clears other
+    /// bits. Because the struct is `#[non_exhaustive]`, external
+    /// crates cannot use struct literals; this is the supported way
+    /// to build a gate: start from [`NativeFnGate::default`] and
+    /// `require` each bit the fn needs. Mirrors
+    /// [`Capabilities::grant`] on the grant side.
+    pub fn require(&mut self, bit: CapabilityBit) {
+        match bit {
+            CapabilityBit::ReadsFs => self.reads_fs = true,
+            CapabilityBit::WritesFs => self.writes_fs = true,
+            CapabilityBit::Network => self.network = true,
+            CapabilityBit::ReadsClock => self.reads_clock = true,
+            CapabilityBit::ReadsEnv => self.reads_env = true,
+            CapabilityBit::UsesRng => self.uses_rng = true,
+        }
+    }
+
     /// Capability bits required by this gate that are *not* granted in
     /// `caps`. Iteration order is the field-declaration order; runtime
     /// uses the first entry as the failure reason, analyzer emits one
@@ -331,6 +349,36 @@ impl Capabilities {
             max_value_elements: None,
         }
     }
+
+    /// Grant a single capability bit. Strictly additive: it flips the
+    /// matching per-bit boolean to `true` and never clears other bits
+    /// or touches the budget fields (`max_steps` /
+    /// `max_value_elements`). This is the canonical
+    /// [`CapabilityBit`]-to-field mapping; keep it in sync with
+    /// [`Self::is_granted`] when a new bit is appended.
+    pub fn grant(&mut self, bit: CapabilityBit) {
+        match bit {
+            CapabilityBit::ReadsFs => self.reads_fs = true,
+            CapabilityBit::WritesFs => self.writes_fs = true,
+            CapabilityBit::Network => self.network = true,
+            CapabilityBit::ReadsClock => self.reads_clock = true,
+            CapabilityBit::ReadsEnv => self.reads_env = true,
+            CapabilityBit::UsesRng => self.uses_rng = true,
+        }
+    }
+
+    /// Whether the given capability bit is granted. Reads the same
+    /// per-bit boolean [`Self::grant`] writes.
+    pub fn is_granted(&self, bit: CapabilityBit) -> bool {
+        match bit {
+            CapabilityBit::ReadsFs => self.reads_fs,
+            CapabilityBit::WritesFs => self.writes_fs,
+            CapabilityBit::Network => self.network,
+            CapabilityBit::ReadsClock => self.reads_clock,
+            CapabilityBit::ReadsEnv => self.reads_env,
+            CapabilityBit::UsesRng => self.uses_rng,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -369,6 +417,50 @@ mod tests {
             ]
         );
         assert!(gate.missing_bits(&Capabilities::all_granted()).is_empty());
+    }
+
+    #[test]
+    fn grant_is_per_bit_and_additive() {
+        const ALL_BITS: [CapabilityBit; 6] = [
+            CapabilityBit::ReadsFs,
+            CapabilityBit::WritesFs,
+            CapabilityBit::Network,
+            CapabilityBit::ReadsClock,
+            CapabilityBit::ReadsEnv,
+            CapabilityBit::UsesRng,
+        ];
+        for granted_bit in ALL_BITS {
+            let mut caps = Capabilities::default();
+            caps.grant(granted_bit);
+            for probe in ALL_BITS {
+                assert_eq!(
+                    caps.is_granted(probe),
+                    probe == granted_bit,
+                    "grant({granted_bit:?}) must flip exactly its own bit (probe {probe:?})"
+                );
+            }
+            assert_eq!(caps.max_steps, None);
+            assert_eq!(caps.max_value_elements, None);
+        }
+        // Additive: granting a second bit keeps the first.
+        let mut caps = Capabilities::default();
+        caps.grant(CapabilityBit::ReadsClock);
+        caps.grant(CapabilityBit::Network);
+        assert!(caps.is_granted(CapabilityBit::ReadsClock));
+        assert!(caps.is_granted(CapabilityBit::Network));
+    }
+
+    #[test]
+    fn require_and_grant_round_trip_through_missing_bits() {
+        let mut gate = NativeFnGate::default();
+        gate.require(CapabilityBit::ReadsClock);
+        assert_eq!(
+            gate.missing_bits(&Capabilities::default()),
+            vec!["reads_clock"]
+        );
+        let mut caps = Capabilities::default();
+        caps.grant(CapabilityBit::ReadsClock);
+        assert!(gate.missing_bits(&caps).is_empty());
     }
 
     #[test]
