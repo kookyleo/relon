@@ -72,15 +72,17 @@ pub(crate) fn check_main_return(root: &Node, tree: &mut AnalyzedTree) {
         return;
     }
     // A top-level `Any` #main body is already handled above (strict
-    // emits `ExpressionTypeUnknown`). The #main return value is
-    // runtime-checked against the declared type, so this subsumption
-    // keeps the permissive `Any` pass (non-strict) — the fail-closed
-    // gate is scoped to the function-argument boundary in `fn_call.rs`.
+    // emits `ExpressionTypeUnknown`). A *nested* `Any` (e.g. an `Any`
+    // element inside a `List<Any>` return) is fail-closed against the
+    // declared concrete slot under strict mode, consistent with the
+    // value-binding and function-argument boundaries; `#relaxed` clears
+    // `strict_mode` and keeps the permissive pass, falling back to the
+    // runtime return-type check.
     if body_ty.subsumes_with_imports(
         return_type,
         Some(&bases),
         tree.workspace_import_index.as_ref(),
-        false,
+        tree.strict_mode,
     ) {
         return;
     }
@@ -116,11 +118,16 @@ fn tuple_schema_return_matches(
             .collect();
     }
     items.iter().zip(elements.iter()).all(|(item, slot)| {
+        // Per-element tuple-schema return check: carry the module's
+        // strictness so an `Any` element is fail-closed against a
+        // concrete slot under strict mode, consistent with the scalar
+        // return path above. Zero current corpus impact; kept aligned
+        // for consistency.
         item.subsumes_with_imports(
             slot,
             Some(bases),
             tree.workspace_import_index.as_ref(),
-            false,
+            tree.strict_mode,
         )
     })
 }

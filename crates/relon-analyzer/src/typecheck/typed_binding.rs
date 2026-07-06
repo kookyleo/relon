@@ -50,19 +50,21 @@ impl<'a> Walker<'a> {
         }
         if let Some(t) = &inferred {
             // Value-binding slots (`Type field: value`, schema fields)
-            // are enforced by the runtime typed-slot check — an `Any`
-            // that turns out ill-typed is rejected there ("expected
-            // Int, got String"), so this path keeps the permissive
-            // `Any` pass rather than fail-closed. Tightening it here
-            // would statically reject runtime-safe uses of the untyped
-            // `#relaxed` stdlib (`Int x: list.sum(...)`). The
-            // fail-closed gate lives on the function-argument boundary
-            // (`fn_call.rs`), which has no runtime backstop.
+            // are fail-closed against `Any` in a strict module, mirroring
+            // the function-argument boundary (`fn_call.rs`): an internal
+            // `Any` (chiefly the return of an untyped `#relaxed` closure)
+            // must not silently whitewash a concrete typed slot. The
+            // strictness is per-module — a `#relaxed` file clears
+            // `strict_mode` and keeps the permissive `Any` pass, so the
+            // escape hatch stays open where the author opted out. (Empty
+            // collection literals infer `List(Never)` / `Dict(Never)`,
+            // a polymorphic bottom that still satisfies any element slot,
+            // so `List<Int> xs: []` is unaffected by this tightening.)
             if t.subsumes_with_imports(
                 expected,
                 Some(&self.base_index),
                 self.tree.workspace_import_index.as_ref(),
-                false,
+                self.tree.strict_mode,
             ) {
                 self.check_generics(expected, value, field_name);
                 return;

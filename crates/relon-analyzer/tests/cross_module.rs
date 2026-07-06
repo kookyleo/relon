@@ -328,23 +328,29 @@ fn fixture_cross_module_strict_any_leak_call_flagged() {
     assert_eq!(mismatches, 1, "{:#?}", ws.modules);
 }
 
-/// Cross-strict `Any` into a scalar typed binding (`Int x: ...`) is
-/// intentionally NOT statically flagged: value-binding slots are
-/// enforced by the runtime typed-slot check, so the analyzer keeps the
-/// permissive `Any` pass to avoid rejecting runtime-safe uses of the
-/// untyped `#relaxed` stdlib. Pins that the fail-closed gate does not
-/// bleed onto the value-slot path (the gate lives on the call-arg
-/// boundary, covered by `..._call_flagged`).
+/// Cross-strict `Any` into a scalar typed value-binding (`Int x: ...`)
+/// is fail-closed under strict mode: the value-slot path mirrors the
+/// call-arg boundary, so an untyped `#relaxed` closure's `Any` return
+/// landing in a concrete `Int` slot raises `StaticTypeMismatch`
+/// (expects Int, got Any) instead of silently deferring to the runtime
+/// typed-slot check. Per-module strictness keeps the escape hatch open
+/// for `#relaxed` importers (covered by `..._relaxed_any_leak_permitted`).
 #[test]
-fn fixture_cross_module_strict_any_leak_scalar_permitted() {
+fn fixture_cross_module_strict_any_leak_scalar_rejected() {
     let ws = analyze_fixture_workspace("cross_module", "strict_any_leak_scalar.relon");
     let flagged: usize = ws
         .modules
         .values()
         .flat_map(|t| t.diagnostics.iter())
-        .filter(|d| matches!(d, Diagnostic::StaticTypeMismatch { .. }))
+        .filter(|d| {
+            matches!(
+                d,
+                Diagnostic::StaticTypeMismatch { expected, found, .. }
+                    if expected == "Int" && found == "Any"
+            )
+        })
         .count();
-    assert_eq!(flagged, 0, "{:#?}", ws.modules);
+    assert_eq!(flagged, 1, "{:#?}", ws.modules);
 }
 
 /// Per-module strictness: the *same* `#relaxed`-lib `Any` flow inside a
