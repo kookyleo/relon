@@ -38,3 +38,9 @@ tracing = "0.1"
 # `Op::ConstF64` can participate in derived comparisons — matches the
 # parser's `Expr::Float` representation so lowering stays a 1:1 copy.
 ordered-float = { workspace = true }
+
+[dev-dependencies]
+# Integration tests (`tests/peephole_rewrites.rs`) drive the public
+# `frontend::compile` pipeline, which takes the analyzer's
+# `AnalyzeOptions` by reference.
+relon-analyzer = { workspace = true }
