@@ -334,6 +334,15 @@ fn args_x_min() -> HashMap<String, Value> {
 fn args_x_3_y_minus_1() -> HashMap<String, Value> {
     two_ints("x", 3, "y", -1)
 }
+fn args_x_min_y_neg1() -> HashMap<String, Value> {
+    two_ints("x", i64::MIN, "y", -1)
+}
+fn args_x_min_y_1() -> HashMap<String, Value> {
+    two_ints("x", i64::MIN, "y", 1)
+}
+fn args_x_neg1_y_min() -> HashMap<String, Value> {
+    two_ints("x", -1, "y", i64::MIN)
+}
 fn args_x_5_y_5() -> HashMap<String, Value> {
     two_ints("x", 5, "y", 5)
 }
@@ -553,6 +562,55 @@ pub fn all_cases() -> Vec<CorpusCase> {
             name: "boundary_zero_times_x",
             source: "#main(Int x) -> Int\n0 * x",
             args_factory: args_x_max,
+            tier: Tier::ArithControl,
+            supported_by: TW_CR,
+        },
+        // Div / Mod numeric boundaries. `i64::MIN / -1` overflows
+        // (the true quotient `i64::MAX + 1` is unrepresentable): the
+        // oracle's checked_div / checked_rem raise `NumericOverflow`,
+        // and compiled backends must trap identically rather than
+        // SIGFPE (hardware sdiv) or return 0 (hardware srem).
+        CorpusCase {
+            name: "boundary_div_min_by_neg_one",
+            source: "#main(Int x, Int y) -> Int\nx / y",
+            args_factory: args_x_min_y_neg1,
+            tier: Tier::ArithControl,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "boundary_mod_min_by_neg_one",
+            source: "#main(Int x, Int y) -> Int\nx % y",
+            args_factory: args_x_min_y_neg1,
+            tier: Tier::ArithControl,
+            supported_by: TW_CR,
+        },
+        // Non-trapping neighbours of the overflow pair: the guard must
+        // not fire when only one of the two operands matches.
+        CorpusCase {
+            name: "boundary_div_min_by_one",
+            source: "#main(Int x, Int y) -> Int\nx / y",
+            args_factory: args_x_min_y_1,
+            tier: Tier::ArithControl,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "boundary_mod_min_by_one",
+            source: "#main(Int x, Int y) -> Int\nx % y",
+            args_factory: args_x_min_y_1,
+            tier: Tier::ArithControl,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "boundary_div_neg_one_by_min",
+            source: "#main(Int x, Int y) -> Int\nx / y",
+            args_factory: args_x_neg1_y_min,
+            tier: Tier::ArithControl,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "boundary_mod_neg_one_by_min",
+            source: "#main(Int x, Int y) -> Int\nx % y",
+            args_factory: args_x_neg1_y_min,
             tier: Tier::ArithControl,
             supported_by: TW_CR,
         },
