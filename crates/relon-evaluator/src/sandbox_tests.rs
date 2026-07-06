@@ -1125,3 +1125,189 @@ fn test_brand_registry() {
         panic!()
     }
 }
+
+/// Concurrency / budget-integrity regression (security): `run_main`
+/// resets the step counter at entry, and pre-serialization two threads
+/// sharing one evaluator could zero each other's mid-flight counter —
+/// every entry reset handed the other run a fresh budget, so a
+/// deliberately over-limit program could complete successfully (budget
+/// escape). With top-level runs serialized per Context, an over-limit
+/// program must fail with `StepLimitExceeded` on **every** invocation,
+/// from both threads, no matter how the scheduler interleaves them.
+#[test]
+fn concurrent_run_main_cannot_escape_step_budget() {
+    use std::collections::HashMap;
+    // ~100_000 ticked iterations against a budget of 100: hugely over
+    // the limit, so any successful completion can only mean another
+    // run's entry reset re-armed this run's budget.
+    let source = r#"#main(Int n)
+{
+    "xs": _list_map(range(0, 100000), (x) => x + n),
+    "out": len(xs)
+}"#;
+    let node = parse(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut ctx = Context::sandboxed().with_root(node).with_analyzed(analyzed);
+    let mut caps = ctx.capabilities().clone();
+    caps.max_steps = Some(100);
+    caps.max_value_elements = None; // step gate must be the killer
+    ctx = ctx.with_capabilities(caps);
+    crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+    let evaluator = TreeWalkEvaluator::new(std::sync::Arc::new(ctx));
+
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for t in 0..2u8 {
+            let evaluator = &evaluator;
+            let barrier = &barrier;
+            handles.push(s.spawn(move || {
+                barrier.wait();
+                for round in 0..20 {
+                    let mut args: HashMap<String, Value> = HashMap::new();
+                    args.insert("n".to_string(), Value::Int(i64::from(t)));
+                    let result = evaluator.run_main(&Arc::new(Scope::default()), args);
+                    assert!(
+                        matches!(
+                            result,
+                            Err(RuntimeError::StepLimitExceeded {
+                                limit: Some(100),
+                                ..
+                            })
+                        ),
+                        "thread {t} round {round}: over-limit program must trip \
+                         the step gate every time (budget escape!), got {result:?}"
+                    );
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    });
+}
+
+/// Concurrency / correctness regression: two threads share one
+/// evaluator and push **different** `#main` args. Per-run state on the
+/// shared Context (path cache keyed without args, live iter cursors)
+/// used to be cleared by whichever run entered last, so concurrent runs
+/// could serve each other's cached sibling values or see their live
+/// iters go exhausted mid-run. Serialized runs must give every
+/// invocation its own consistent world: correct arg-dependent values,
+/// live cursors, no panic, and no step-limit false positive (each run's
+/// budget starts fresh).
+#[test]
+fn concurrent_run_main_keeps_per_run_values_isolated() {
+    use std::collections::HashMap;
+    let source = r#"#main(Int n)
+{
+    "base": n * 10,
+    "xs": _list_map(range(0, 500), (x) => x + base),
+    "it": xs.iter(),
+    "first": it.next(),
+    "checksum": len(xs) + base
+}"#;
+    let node = parse(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    let mut ctx = Context::sandboxed().with_root(node).with_analyzed(analyzed);
+    let mut caps = ctx.capabilities().clone();
+    // Generous per-run budget: a single run costs a few thousand steps,
+    // so a pass proves runs don't bleed steps into each other either.
+    caps.max_steps = Some(1_000_000);
+    caps.max_value_elements = None;
+    ctx = ctx.with_capabilities(caps);
+    crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+    let evaluator = TreeWalkEvaluator::new(std::sync::Arc::new(ctx));
+
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for t in 1..=2i64 {
+            let evaluator = &evaluator;
+            let barrier = &barrier;
+            handles.push(s.spawn(move || {
+                barrier.wait();
+                for round in 0..16 {
+                    let mut args: HashMap<String, Value> = HashMap::new();
+                    args.insert("n".to_string(), Value::Int(t));
+                    let result = evaluator
+                        .run_main(&Arc::new(Scope::default()), args)
+                        .unwrap_or_else(|e| {
+                            panic!("thread {t} round {round}: unexpected error {e:?}")
+                        });
+                    let Value::Dict(d) = result else {
+                        panic!("thread {t}: expected dict result");
+                    };
+                    // Arg-dependent sibling value: a cross-run path_cache
+                    // hit would hand thread 1 thread 2's `base` (or vice
+                    // versa) since cache keys don't include #main args.
+                    assert_eq!(
+                        d.map.get("checksum").unwrap(),
+                        &Value::Int(500 + t * 10),
+                        "thread {t} round {round}: checksum leaked another run's cache"
+                    );
+                    // Live cursor: a concurrent entry clearing iter_cursors
+                    // would make this run's fresh iter read as exhausted
+                    // (None) instead of Some(base).
+                    let Some(Value::Dict(first)) = d.map.get("first") else {
+                        panic!("thread {t}: `first` missing or not a dict");
+                    };
+                    assert_eq!(
+                        first.brand.as_deref(),
+                        Some("Some"),
+                        "thread {t} round {round}: live iter cursor was wiped mid-run"
+                    );
+                    assert_eq!(
+                        first.map.get("value"),
+                        Some(&Value::Int(t * 10)),
+                        "thread {t} round {round}: iter yielded another run's element"
+                    );
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    });
+}
+
+/// Re-entering a top-level entry point from *inside* a run (here: a
+/// native fn spinning up a second evaluator over the same Context and
+/// calling `eval_root`) used to silently zero the outer run's step
+/// budget and caches. Under the serialization protocol it must fail
+/// loudly on the same thread instead of deadlocking or corrupting.
+#[test]
+#[should_panic(expected = "re-entrant top-level evaluation")]
+fn reentrant_eval_root_from_native_fn_panics() {
+    use crate::native_fn::{NativeArgs, RelonFunction};
+    use std::sync::OnceLock;
+
+    struct Reenter {
+        ctx: Arc<OnceLock<std::sync::Arc<Context>>>,
+    }
+    impl RelonFunction for Reenter {
+        fn call(
+            &self,
+            _args: NativeArgs,
+            _range: relon_parser::TokenRange,
+        ) -> Result<Value, RuntimeError> {
+            let ctx = std::sync::Arc::clone(self.ctx.get().expect("ctx installed"));
+            // Same thread, same Context, mid-run: must panic, not
+            // deadlock and not silently reset the outer run's budget.
+            TreeWalkEvaluator::new(ctx).eval_root(&Arc::new(Scope::default()))
+        }
+    }
+
+    let ctx_slot: Arc<OnceLock<std::sync::Arc<Context>>> = Arc::new(OnceLock::new());
+    let mut ctx = Context::new().with_root(parse(r#"{ x: reenter() }"#));
+    ctx.register_pure_fn(
+        "reenter",
+        Arc::new(Reenter {
+            ctx: Arc::clone(&ctx_slot),
+        }),
+    );
+    crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+    let ctx = std::sync::Arc::new(ctx);
+    ctx_slot.set(std::sync::Arc::clone(&ctx)).ok();
+    let _ = TreeWalkEvaluator::new(ctx).eval_root(&Arc::new(Scope::default()));
+}

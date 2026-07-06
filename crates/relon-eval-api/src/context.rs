@@ -20,7 +20,8 @@ use crate::value::Value;
 use relon_parser::Node;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::ThreadId;
 
 // Canonical capability data types (`CapabilityBit`, `NativeFnGate`,
 // `Capabilities`) now live in the zero-dependency `relon-cap` leaf crate
@@ -122,6 +123,20 @@ pub struct Context {
     /// outer frame's record. Decrement on drop, remove when zero.
     pub loading_modules: Mutex<HashMap<String, usize>>,
     pub evaluating_paths: Mutex<HashSet<String>>,
+    /// Step-budget accumulator checked against `Capabilities::max_steps`
+    /// by the tree-walking backend (per AST node in `eval_internal`, per
+    /// inner iteration via `NativeFnCaps::tick`). Reset to zero at the
+    /// start of every top-level run (`eval_root` / `run_main`), which is
+    /// exactly why those entry points must hold the guard from
+    /// [`Context::begin_top_level_run`]: an unsynchronized reset would
+    /// zero a concurrent run's accounting and let it escape its budget.
+    ///
+    /// `#[doc(hidden)]`: this is a backend-internal seam — it stays `pub`
+    /// only so backend crates implementing [`crate::Evaluator`] outside
+    /// this crate can charge/reset it. It is not host API; hosts control
+    /// the budget through `Capabilities::max_steps` and must never poke
+    /// the counter directly.
+    #[doc(hidden)]
     pub step_counter: AtomicU64,
     /// Monotonic counter incremented once per closure invocation. Used
     /// by `eval_closure` to derive a fresh `cache_namespace` for each
@@ -164,6 +179,16 @@ pub struct Context {
     /// and a host re-registering an intrinsic isn't silently undone
     /// on a second wrap.
     pub backend_prepared: bool,
+    /// Owner slot for the top-level-run serialization protocol — see
+    /// [`Context::begin_top_level_run`]. `Some(thread)` while that
+    /// thread is inside `eval_root` / `run_main` on this Context,
+    /// `None` when no top-level run is active. Private by design: the
+    /// only way to claim it is the guard entry point, so a backend
+    /// cannot accidentally skip the re-entry check.
+    top_level_run_slot: Mutex<Option<ThreadId>>,
+    /// Wakes threads queued in [`Context::begin_top_level_run`] when
+    /// the active run's [`TopLevelRunGuard`] drops.
+    top_level_run_cv: Condvar,
 }
 
 impl Default for Context {
@@ -201,6 +226,8 @@ impl Context {
             capabilities: Capabilities::default(),
             sandboxed_flag: false,
             backend_prepared: false,
+            top_level_run_slot: Mutex::new(None),
+            top_level_run_cv: Condvar::new(),
         }
     }
 
@@ -457,6 +484,105 @@ impl Context {
             None
         }
     }
+
+    /// Claim this Context for one exclusive **top-level** evaluation.
+    ///
+    /// `eval_root` / `run_main` reset per-run sandbox state that lives
+    /// on the shared `Context` — the step-budget counter
+    /// (`step_counter`), the `&sibling`-reference `path_cache`, and the
+    /// `iter_cursors` table. Two overlapping top-level runs would
+    /// therefore zero each other's step accounting (a budget escape —
+    /// `Capabilities::max_steps` is a security boundary) and serve
+    /// stale / cross-run cached values. Every backend entry point that
+    /// performs those resets MUST hold the guard returned here for the
+    /// full duration of the run; the borrow ties the guard to the
+    /// Context, and `Drop` releases the slot on every exit path
+    /// (including error returns and unwinds).
+    ///
+    /// Blocking semantics:
+    /// * Another thread mid-run → this call blocks until that run's
+    ///   guard drops, then claims the slot. Top-level runs on one
+    ///   Context are serialized, never interleaved.
+    /// * Same thread already mid-run (a native fn / decorator callback
+    ///   re-entering `eval_root` / `run_main` on the same Context) →
+    ///   **panic** with an actionable message instead of self-deadlock.
+    ///   Such re-entry always corrupted the outer run's budget and
+    ///   caches before serialization existed; failing loudly is the
+    ///   only safe reading. Nested evaluation *inside* a run must go
+    ///   through the non-resetting entry points (`eval`,
+    ///   `invoke_closure`, `force_thunk`, `NativeFnCaps::call_relon`),
+    ///   which never take this guard.
+    ///
+    /// Hosts that want parallel evaluation should give each thread its
+    /// own `Context` (and evaluator) — see the `Evaluator` trait docs.
+    pub fn begin_top_level_run(&self) -> TopLevelRunGuard<'_> {
+        let me = std::thread::current().id();
+        // Poison-tolerant locking throughout the protocol: the slot only
+        // holds an `Option<ThreadId>` whose invariant is maintained by
+        // this method and the guard's `Drop` alone, so a poisoned mutex
+        // (from the deliberate re-entry panic below unwinding past a
+        // waiter, or an unwind elsewhere) never invalidates the data.
+        // Recovering via `into_inner` keeps the Context usable instead
+        // of bricking every later run — and keeps the guard's `Drop`
+        // from double-panicking during that very unwind.
+        let mut slot = self
+            .top_level_run_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while let Some(owner) = *slot {
+            if owner == me {
+                // Release the slot lock *before* panicking so the mutex
+                // isn't poisoned while the outer run (same thread, one
+                // frame up) still needs its guard's `Drop` to clear the
+                // slot during this unwind.
+                drop(slot);
+                panic!(
+                    "re-entrant top-level evaluation: this thread called \
+                     `eval_root` / `run_main` on a Context that is already \
+                     mid-run on the same thread. These entry points reset \
+                     per-run sandbox state (step budget, path cache, iter \
+                     cursors), so re-entering would corrupt the active \
+                     run's budget accounting. Finish the outer evaluation \
+                     first, use a non-resetting entry point (`eval`, \
+                     `invoke_closure`, `force_thunk`, \
+                     `NativeFnCaps::call_relon`) for nested work, or \
+                     evaluate the nested document under its own Context."
+                );
+            }
+            slot = self
+                .top_level_run_cv
+                .wait(slot)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *slot = Some(me);
+        TopLevelRunGuard { context: self }
+    }
+}
+
+/// RAII token for one exclusive top-level run over a [`Context`] —
+/// returned by [`Context::begin_top_level_run`], released on `Drop`.
+/// Dropping wakes every thread queued for the same Context.
+#[must_use = "the run slot is released as soon as the guard drops; \
+              bind it for the duration of the top-level evaluation"]
+pub struct TopLevelRunGuard<'a> {
+    context: &'a Context,
+}
+
+impl Drop for TopLevelRunGuard<'_> {
+    fn drop(&mut self) {
+        // Poison-tolerant (see `begin_top_level_run`): this `Drop` runs
+        // during unwinds too, and a second panic here would abort the
+        // process. The slot data stays valid regardless of poisoning.
+        *self
+            .context
+            .top_level_run_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        // `notify_all`, not `notify_one`: cheap here (top-level runs
+        // are rare, long-lived events) and immune to a lost wakeup if
+        // a queued waiter is ever cancelled while another still waits.
+        self.context.top_level_run_cv.notify_all();
+    }
 }
 
 pub struct LoadingModuleGuard<'a> {
@@ -523,6 +649,70 @@ mod pure_fn_intent_tests {
         gate.network = true;
         ctx.register_fn("f", gate, Arc::new(Noop));
         assert!(!ctx.pure_fn_names.contains("f"));
+    }
+}
+
+#[cfg(test)]
+mod top_level_run_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Two threads racing for the run slot never overlap: the "active
+    /// runs" gauge observed from inside a held guard must always read
+    /// exactly 1.
+    #[test]
+    fn top_level_runs_are_mutually_exclusive() {
+        let ctx = Arc::new(Context::new());
+        let active = Arc::new(AtomicUsize::new(0));
+        let overlap_seen = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                let ctx = Arc::clone(&ctx);
+                let active = Arc::clone(&active);
+                let overlap_seen = Arc::clone(&overlap_seen);
+                s.spawn(move || {
+                    for _ in 0..64 {
+                        let _guard = ctx.begin_top_level_run();
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        if now != 1 {
+                            overlap_seen.fetch_add(1, Ordering::SeqCst);
+                        }
+                        // A couple of yields widen the race window so an
+                        // exclusion bug can't hide behind scheduling luck.
+                        std::thread::yield_now();
+                        std::thread::yield_now();
+                        active.fetch_sub(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            overlap_seen.load(Ordering::SeqCst),
+            0,
+            "two top-level runs were active on one Context simultaneously"
+        );
+    }
+
+    /// The guard releases the slot on drop, so sequential runs on one
+    /// thread proceed without blocking or panicking.
+    #[test]
+    fn sequential_runs_on_one_thread_are_fine() {
+        let ctx = Context::new();
+        for _ in 0..3 {
+            let guard = ctx.begin_top_level_run();
+            drop(guard);
+        }
+    }
+
+    /// Same-thread re-entry while a run is active is a host bug that
+    /// previously corrupted the outer run's budget silently; it must
+    /// fail loudly instead of self-deadlocking.
+    #[test]
+    #[should_panic(expected = "re-entrant top-level evaluation")]
+    fn reentrant_run_on_same_thread_panics() {
+        let ctx = Context::new();
+        let _outer = ctx.begin_top_level_run();
+        let _inner = ctx.begin_top_level_run();
     }
 }
 

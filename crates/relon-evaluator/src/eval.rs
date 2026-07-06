@@ -210,6 +210,16 @@ impl TreeWalkEvaluator {
     /// instead — it validates and binds the host-pushed args before the
     /// body walk.
     pub fn eval_root(&self, scope: &Arc<Scope>) -> Result<Value, RuntimeError> {
+        // Serialize top-level runs on this Context. The resets below
+        // wipe per-run sandbox state living on the shared `Context`
+        // (step budget, path cache, iter cursors); without the guard a
+        // concurrent `eval_root` / `run_main` on the same Context would
+        // zero a mid-flight run's step accounting — a budget escape
+        // (`max_steps` is a security boundary) — and cross-contaminate
+        // the caches. Held (RAII) until this run returns on any path.
+        // Same-thread re-entry panics instead of deadlocking; see
+        // `Context::begin_top_level_run`.
+        let _run_guard = self.context.begin_top_level_run();
         // Reset the step budget so hosts that reuse one `TreeWalkEvaluator` for
         // multiple independent top-level evaluations don't carry over
         // counts from prior runs. Module loads happen *inside* this
@@ -273,6 +283,10 @@ impl TreeWalkEvaluator {
         scope: &Arc<Scope>,
         mut args: HashMap<String, Value>,
     ) -> Result<Value, RuntimeError> {
+        // Serialize top-level runs on this Context — same rationale as
+        // the matching guard in `eval_root`: the resets below are only
+        // safe while no other top-level run is mid-flight.
+        let _run_guard = self.context.begin_top_level_run();
         // Reset the step budget — see `eval_root` for rationale.
         self.context.step_counter.store(0, Ordering::Relaxed);
         // Same rationale as `eval_root`: path_cache keys don't include

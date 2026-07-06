@@ -54,7 +54,7 @@ pub mod verifier;
 pub use capability::CapabilityGate;
 pub use context::{
     Capabilities, CapabilityBit, Context, GatedNativeFn, LoadingModuleGuard, NativeFnGate,
-    ResourceBudget, ResourceBudgetProfile,
+    ResourceBudget, ResourceBudgetProfile, TopLevelRunGuard,
 };
 pub use decorator::{DecoratorPlugin, PreEvalOutcome};
 pub use error::RuntimeError;
@@ -87,6 +87,32 @@ use std::sync::Arc;
 /// * [`invoke_closure`](Self::invoke_closure) — call a constructed closure
 ///   value with positional args; the shortest entry point for hosts that
 ///   treat Relon closures as plain callbacks.
+///
+/// # Concurrency contract
+///
+/// `Send + Sync` + `&self` means an evaluator may be shared across
+/// threads, but the **top-level** entry points ([`eval_root`](Self::eval_root)
+/// and [`run_main`](Self::run_main)) reset per-run sandbox state that
+/// lives on the shared [`Context`] — the step-budget counter, the
+/// reference `path_cache`, and the iter-cursor table. Backends MUST
+/// serialize those entry points per `Context` via
+/// [`Context::begin_top_level_run`]; otherwise a concurrent run would
+/// zero a mid-flight run's step accounting (`Capabilities::max_steps`
+/// is a security boundary) and serve values cached under different
+/// `#main` args. Under that protocol:
+///
+/// * Concurrent `eval_root` / `run_main` calls on the same `Context`
+///   (through one evaluator or several sharing it) block until the
+///   active run finishes — they never interleave.
+/// * Re-entering `eval_root` / `run_main` from *within* a run on the
+///   same thread (e.g. from a native-fn or decorator callback) panics
+///   instead of self-deadlocking; nested work must use the
+///   non-resetting entry points ([`eval`](Self::eval),
+///   [`force_thunk`](Self::force_thunk),
+///   [`invoke_closure`](Self::invoke_closure), or
+///   `NativeFnCaps::call_relon`), which are safe mid-run.
+/// * Hosts that want genuinely parallel evaluation give each thread its
+///   own `Context` + evaluator; contexts share nothing mutable.
 pub trait Evaluator: Send + Sync {
     /// Evaluate a single AST node under `scope`.
     fn eval(&self, node: &relon_parser::Node, scope: &Arc<Scope>) -> Result<Value, RuntimeError>;

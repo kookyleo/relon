@@ -19,6 +19,7 @@ Relon itself owns these language-level guarantees:
 | Static capability diagnostics | The analyzer reports missing grants for statically visible gated calls. |
 | Runtime capability denial | The evaluator/backends deny ungranted capability bits instead of silently calling host code. |
 | Correctness traps | Divide-by-zero, numeric overflow, missing `#main` args, unsupported backend shapes, bounds errors, and validation failures surface as errors. |
+| Budget integrity under concurrent reuse | Top-level tree-walk runs (`eval_root` / `run_main`) are serialized per `Context`, so a concurrent run cannot reset another run's step budget or per-run caches. |
 
 ## Not Protected by Relon Alone
 
@@ -73,6 +74,25 @@ backend can enforce the same hard limit automatically.
 
 See [Wasmtime host policy](./wasmtime-host-policy) for the recommended
 untrusted VM wiring.
+
+### Concurrent evaluator reuse
+
+The tree-walk step budget is a per-run limit, but the counter lives on
+the shared `Context`. To keep `max_steps` enforceable, the tree-walk
+backend serializes its top-level entry points (`eval_root` /
+`run_main`) per `Context`:
+
+- Concurrent top-level calls on one `Context` block until the active
+  run finishes; they never interleave, so no run can zero another
+  run's step accounting or clear its per-run caches (reference path
+  cache, iter cursors).
+- Re-entering `eval_root` / `run_main` from inside a run on the same
+  thread (for example, from a native-function callback) panics with an
+  explicit message instead of deadlocking. Nested work inside a run
+  must use the non-resetting entry points (`eval`, `force_thunk`,
+  `invoke_closure`, `NativeFnCaps::call_relon`).
+- For parallel evaluation, give each thread its own `Context` and
+  evaluator; a `Context` is intentionally cheap to construct per run.
 
 ## Operational Rule
 
