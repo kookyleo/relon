@@ -12,7 +12,7 @@
 //! "canonical #main schema" section.
 //!
 //! The canonical form is intentionally narrower than the runtime
-//! [`crate::value::SchemaData`] type:
+//! [`relon_eval_api::value::SchemaData`] type:
 //!
 //! * Fields are stored in **declaration order**, not alphabetical.
 //!   Field order changes are observable on the wire (layout slot
@@ -139,7 +139,7 @@ pub struct Field {
     /// Field type in canonical form.
     pub ty: TypeRepr,
     /// Default value, when the field declared one. `serde_json::Value`
-    /// rather than `crate::value::Value` so the hash stays insulated
+    /// rather than `relon_eval_api::value::Value` so the hash stays insulated
     /// from runtime-only payload variants (`Closure`, `Schema`, ...).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<serde_json::Value>,

@@ -1,11 +1,13 @@
 //! Public, backend-agnostic surface for Relon evaluation.
 //!
-//! This crate is the seam between hosts and evaluator backends; it only
-//! re-exports the types a caller actually sees:
+//! This crate is the seam between hosts and evaluator backends; it
+//! holds the types a caller actually sees:
 //!
-//! * Data shapes: [`Value`], [`Scope`], [`Thunk`], [`RuntimeError`].
+//! * Data shapes: [`Value`], [`Scope`], [`Thunk`], [`RuntimeError`],
+//!   plus the [`SmolStr`] small-string type `Value` is built on.
 //! * Host configuration surface: [`Context`], [`Capabilities`],
-//!   [`NativeFnGate`], native-fn / decorator registration.
+//!   [`NativeFnGate`], native-fn / decorator registration, module
+//!   resolution ([`ModuleResolver`]).
 //! * Policy boundary: the [`CapabilityGate`] trait — single source of
 //!   capability-policy truth consulted by every backend (see
 //!   `capability` module docs for the enforcement-timing diff
@@ -13,6 +15,11 @@
 //!   cranelift checks).
 //! * Backend contract: the [`Evaluator`] trait — five `&self` methods
 //!   covering one full evaluation lifecycle.
+//!
+//! The internal ABI the compiled backends share (binary handshake
+//! buffer, record layout, schema canonicalisation, return-path
+//! verifier) lives in the `relon-abi` crate, not here: hosts never
+//! touch it, backends depend on it directly.
 //!
 //! A backend (tree-walking `relon_evaluator::TreeWalkEvaluator`,
 //! cranelift AOT, LLVM AOT, wasm host wrapper, ...) implements this
@@ -35,21 +42,15 @@
 // evaluator crate's allow and drop it once the rustc fix lands.
 #![allow(unused_assignments)]
 
-pub mod buffer;
 pub mod capability;
 pub mod context;
 pub mod decorator;
 pub mod error;
-pub mod inplace_return;
-pub mod layout;
 pub mod module;
 pub mod native_fn;
-pub mod schema_canonical;
-pub mod schema_lower;
 pub mod scope;
 pub mod smol_str;
 pub mod value;
-pub mod verifier;
 
 pub use capability::CapabilityGate;
 pub use context::{

@@ -15,7 +15,7 @@
 //! / `MAX`.
 //!
 //! Every successful round-trip is *also* fed through
-//! [`relon_eval_api::verifier::verify_record`] over the whole-buffer
+//! [`relon_abi::verifier::verify_record`] over the whole-buffer
 //! region — a clean verify is asserted, so the verifier and the reader
 //! agree on "this buffer is well-formed" for the entire generated value
 //! space (proptest auto-shrinks any counterexample).
@@ -34,11 +34,11 @@ use std::sync::Arc;
 use ordered_float::OrderedFloat;
 use proptest::prelude::*;
 
-use relon_eval_api::buffer::{BufferBuilder, BufferReader};
-use relon_eval_api::layout::SchemaLayout;
-use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
+use relon_abi::buffer::{BufferBuilder, BufferReader};
+use relon_abi::layout::SchemaLayout;
+use relon_abi::schema_canonical::{Field, Schema, TypeRepr};
+use relon_abi::verifier::{verify_record, Region};
 use relon_eval_api::value::{Value, ValueDict};
-use relon_eval_api::verifier::{verify_record, Region};
 
 #[cfg(miri)]
 const PROPTEST_CASES: u32 = 16;
@@ -247,7 +247,7 @@ fn write_list_field(
         }
         TypeRepr::List { element: inner } => {
             // List<List<scalar>>: drive `write_nested_scalar_list`.
-            relon_eval_api::buffer::write_nested_scalar_list(builder, name, inner, items)
+            relon_abi::buffer::write_nested_scalar_list(builder, name, inner, items)
                 .expect("write_nested_scalar_list");
         }
         other => panic!("write_list_field: unhandled element {other:?}"),
@@ -513,8 +513,8 @@ proptest! {
 // verifier over the whole value space. Legal arenas must verify clean;
 // a corrupted pointer must be rejected loudly (never a panic / over-read).
 
-use relon_eval_api::layout::OffsetTable;
-use relon_eval_api::verifier::{verify_record_multi, MultiRegion};
+use relon_abi::layout::OffsetTable;
+use relon_abi::verifier::{verify_record_multi, MultiRegion};
 
 /// `Cfg { name: String, port: Int }` — the cross-region element schema.
 fn xr_cfg_schema() -> Schema {

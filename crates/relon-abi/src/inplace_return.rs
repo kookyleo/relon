@@ -26,10 +26,10 @@ use std::sync::Arc;
 use crate::buffer::BufferReader;
 use crate::layout::{OffsetTable, SchemaLayout};
 use crate::schema_canonical::{Field, Schema, TypeRepr};
-use crate::smol_str::SmolStr;
-use crate::value::Value;
 use crate::verifier::{verify_record_multi, verify_value_at_multi, MultiRegion, VerifyError};
-use crate::RuntimeError;
+use relon_eval_api::smol_str::SmolStr;
+use relon_eval_api::value::Value;
+use relon_eval_api::RuntimeError;
 
 /// Arena region boundaries the in-place decode selects between. The
 /// arena layout (shared by both AOT backends) is

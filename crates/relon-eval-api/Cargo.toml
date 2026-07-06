@@ -17,19 +17,9 @@ ordered-float.workspace = true
 # `rc` enables serde derive support for the Arc-wrapped `Value::List` /
 # `Value::Dict` payloads (see `value.rs` for the design rationale).
 serde = { workspace = true, features = ["derive", "rc"] }
-serde_json = { workspace = true }
-# Used by `schema_canonical` to compute a deterministic 32-byte digest of
-# every `#main` schema. Host and wasm codegen both call into this module
-# so they agree on the schema hash carried in the `relon.abi` custom
-# section.
-sha2 = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
-# Property-based round-trip / verifier fuzzing for the binary handshake
-# buffer (`buffer.rs` writer/reader + `verifier.rs`). Generates target
-# return-shape values, writes them through `BufferBuilder`, reads them
-# back, and asserts equality + a clean verifier pass — exercising the
-# recursive host reader landed in a1660b62 across the value space.
-proptest = { workspace = true }
+# JSON round-trip assertions in the `Value` / `SmolStr` serde tests.
+serde_json = { workspace = true }

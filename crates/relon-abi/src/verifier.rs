@@ -1180,13 +1180,15 @@ mod tests {
         let mut b = BufferBuilder::new(&layout, &schema.fields);
         // Build the `Value` rows the host writer consumes:
         // `[[1, 2], [3], []]`.
-        let rows: Vec<crate::value::Value> = vec![
-            crate::value::Value::List(std::sync::Arc::new(vec![
-                crate::value::Value::Int(1),
-                crate::value::Value::Int(2),
+        let rows: Vec<relon_eval_api::value::Value> = vec![
+            relon_eval_api::value::Value::List(std::sync::Arc::new(vec![
+                relon_eval_api::value::Value::Int(1),
+                relon_eval_api::value::Value::Int(2),
             ])),
-            crate::value::Value::List(std::sync::Arc::new(vec![crate::value::Value::Int(3)])),
-            crate::value::Value::List(std::sync::Arc::new(vec![])),
+            relon_eval_api::value::Value::List(std::sync::Arc::new(vec![
+                relon_eval_api::value::Value::Int(3),
+            ])),
+            relon_eval_api::value::Value::List(std::sync::Arc::new(vec![])),
         ];
         crate::buffer::write_nested_scalar_list(&mut b, "value", &TypeRepr::Int, &rows)
             .expect("write nested list");
@@ -1582,11 +1584,11 @@ mod tests {
     // record. These adversarial probes smash a pointer at each depth and
     // assert a loud reject (never a wild read past the region).
 
-    fn list_str(items: &[&str]) -> crate::value::Value {
-        crate::value::Value::List(std::sync::Arc::new(
+    fn list_str(items: &[&str]) -> relon_eval_api::value::Value {
+        relon_eval_api::value::Value::List(std::sync::Arc::new(
             items
                 .iter()
-                .map(|s| crate::value::Value::String((*s).into()))
+                .map(|s| relon_eval_api::value::Value::String((*s).into()))
                 .collect(),
         ))
     }

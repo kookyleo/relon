@@ -561,7 +561,7 @@ impl<'a> BufferBuilder<'a> {
         &mut self,
         field_name: &str,
         ty: &TypeRepr,
-        value: &crate::value::Value,
+        value: &relon_eval_api::value::Value,
     ) -> Result<(), BufferError> {
         let entry = self.find_entry(field_name)?.clone();
         if !type_matches(&entry.ty, ty) {
@@ -1325,9 +1325,9 @@ impl<'a> BufferBuilder<'a> {
         name: &str,
         slot_offset: usize,
         ty: &TypeRepr,
-        value: &crate::value::Value,
+        value: &relon_eval_api::value::Value,
     ) -> Result<(), BufferError> {
-        use crate::value::Value;
+        use relon_eval_api::value::Value;
         match (ty, value) {
             (TypeRepr::Int, Value::Int(v)) => {
                 self.bytes[slot_offset..slot_offset + 8].copy_from_slice(&v.to_le_bytes());
@@ -1390,9 +1390,9 @@ impl<'a> BufferBuilder<'a> {
         &mut self,
         name: &str,
         schema: &Schema,
-        value: &crate::value::Value,
+        value: &relon_eval_api::value::Value,
     ) -> Result<usize, BufferError> {
-        use crate::value::Value;
+        use relon_eval_api::value::Value;
         let sub_layout =
             SchemaLayout::offsets_for(schema).map_err(|_| BufferError::MalformedPayload {
                 name: name.to_string(),
@@ -1457,7 +1457,7 @@ impl<'a> BufferBuilder<'a> {
         &mut self,
         name: &str,
         ty: &TypeRepr,
-        value: &crate::value::Value,
+        value: &relon_eval_api::value::Value,
     ) -> Result<usize, BufferError> {
         let (tag, payload) = variant_payload_for_value(name, ty, value)?;
         self.pad_to(variant_record_align_runtime(ty));
@@ -1505,9 +1505,9 @@ impl<'a> BufferBuilder<'a> {
     fn append_list_payload(
         &mut self,
         element: &TypeRepr,
-        items: &[crate::value::Value],
+        items: &[relon_eval_api::value::Value],
     ) -> Result<usize, BufferError> {
-        use crate::value::Value;
+        use relon_eval_api::value::Value;
         let count = items.len();
         if count > u32::MAX as usize {
             return Err(BufferError::ValueTooLarge {
@@ -2020,9 +2020,9 @@ pub fn write_nested_scalar_list(
     builder: &mut BufferBuilder<'_>,
     field_name: &str,
     inner: &TypeRepr,
-    items: &[crate::value::Value],
+    items: &[relon_eval_api::value::Value],
 ) -> Result<(), BufferError> {
-    use crate::value::Value;
+    use relon_eval_api::value::Value;
     builder.write_list_list_with(field_name, items.len(), |i, payload| {
         let Value::List(inner_items) = &items[i] else {
             return Err(BufferError::TypeMismatch {
@@ -2104,7 +2104,7 @@ pub fn write_nested_pointer_array_list(
     builder: &mut BufferBuilder<'_>,
     field_name: &str,
     inner_element: &TypeRepr,
-    items: &[crate::value::Value],
+    items: &[relon_eval_api::value::Value],
 ) -> Result<(), BufferError> {
     // The field slot must be a pointer-indirect `List<List<…>>` slot.
     let slot_offset = {
@@ -2150,9 +2150,9 @@ pub fn write_nested_pointer_array_list(
 fn append_outer_pointer_array(
     builder: &mut BufferBuilder<'_>,
     inner_element: &TypeRepr,
-    items: &[crate::value::Value],
+    items: &[relon_eval_api::value::Value],
 ) -> Result<usize, BufferError> {
-    use crate::value::Value;
+    use relon_eval_api::value::Value;
     let count = items.len();
     if count > u32::MAX as usize {
         return Err(BufferError::ValueTooLarge {
@@ -2200,7 +2200,7 @@ fn append_outer_pointer_array(
 fn write_schema_record_into_builder(
     child: &mut BufferBuilder<'_>,
     schema: &Schema,
-    dict: &crate::value::ValueDict,
+    dict: &relon_eval_api::value::ValueDict,
 ) -> Result<(), BufferError> {
     for field in &schema.fields {
         let value =
@@ -2221,7 +2221,7 @@ fn write_schema_record_into_builder(
 fn write_tuple_record_into_builder(
     child: &mut BufferBuilder<'_>,
     schema: &Schema,
-    items: &[crate::value::Value],
+    items: &[relon_eval_api::value::Value],
 ) -> Result<(), BufferError> {
     if items.len() != schema.fields.len() {
         return Err(BufferError::MalformedPayload {
@@ -2239,21 +2239,21 @@ fn write_tuple_record_into_builder(
 fn write_schema_field_into_builder(
     child: &mut BufferBuilder<'_>,
     field: &Field,
-    value: &crate::value::Value,
+    value: &relon_eval_api::value::Value,
 ) -> Result<(), BufferError> {
     child.write_value(field.name.as_str(), &field.ty, value)
 }
 
 /// `(discriminant, optional (payload type, payload value))` produced when
 /// matching a value against a variant slot.
-type VariantPayloadSlot<'a> = (u8, Option<(TypeRepr, &'a crate::value::Value)>);
+type VariantPayloadSlot<'a> = (u8, Option<(TypeRepr, &'a relon_eval_api::value::Value)>);
 
 fn variant_payload_for_value<'a>(
     name: &str,
     ty: &'a TypeRepr,
-    value: &'a crate::value::Value,
+    value: &'a relon_eval_api::value::Value,
 ) -> Result<VariantPayloadSlot<'a>, BufferError> {
-    let crate::value::Value::Dict(dict) = value else {
+    let relon_eval_api::value::Value::Dict(dict) = value else {
         return Err(BufferError::TypeMismatch {
             name: name.to_string(),
             declared: type_label(ty),
@@ -2509,7 +2509,7 @@ impl<'a> BufferReader<'a> {
         &self,
         field_name: &str,
         ty: &TypeRepr,
-    ) -> Result<crate::value::Value, BufferError> {
+    ) -> Result<relon_eval_api::value::Value, BufferError> {
         let entry = self.find_entry(field_name)?;
         if !type_matches(&entry.ty, ty) {
             return Err(BufferError::TypeMismatch {
@@ -3072,8 +3072,8 @@ impl<'a> BufferReader<'a> {
         &self,
         header_off: usize,
         element: &TypeRepr,
-    ) -> Result<Vec<crate::value::Value>, BufferError> {
-        use crate::value::Value;
+    ) -> Result<Vec<relon_eval_api::value::Value>, BufferError> {
+        use relon_eval_api::value::Value;
         match element {
             // Inline-fixed scalar inner list / pointer-array String /
             // nested-list element: dispatch through the existing readers.
@@ -3155,7 +3155,7 @@ impl<'a> BufferReader<'a> {
         &self,
         field_name: &str,
         element: &TypeRepr,
-    ) -> Result<Vec<crate::value::Value>, BufferError> {
+    ) -> Result<Vec<relon_eval_api::value::Value>, BufferError> {
         let entry = self.find_entry(field_name)?;
         if !matches!(entry.kind, FieldKind::PointerIndirect { .. }) {
             return Err(BufferError::MalformedPayload {
@@ -3250,8 +3250,8 @@ impl<'a> BufferReader<'a> {
         &self,
         header_off: usize,
         element: &TypeRepr,
-    ) -> Result<Vec<crate::value::Value>, BufferError> {
-        use crate::value::Value;
+    ) -> Result<Vec<relon_eval_api::value::Value>, BufferError> {
+        use relon_eval_api::value::Value;
         if header_off
             .checked_add(4)
             .map(|end| end > self.bytes.len())
@@ -3338,9 +3338,9 @@ impl<'a> BufferReader<'a> {
         record_base: usize,
         layout: &OffsetTable,
         schema: &Schema,
-    ) -> Result<crate::value::Value, BufferError> {
-        use crate::smol_str::SmolStr;
-        use crate::value::Value;
+    ) -> Result<relon_eval_api::value::Value, BufferError> {
+        use relon_eval_api::smol_str::SmolStr;
+        use relon_eval_api::value::Value;
         if schema.is_tuple {
             let mut items = Vec::with_capacity(schema.fields.len());
             for field in &schema.fields {
@@ -3392,8 +3392,8 @@ impl<'a> BufferReader<'a> {
         &self,
         slot_abs: usize,
         ty: &TypeRepr,
-    ) -> Result<crate::value::Value, BufferError> {
-        use crate::value::Value;
+    ) -> Result<relon_eval_api::value::Value, BufferError> {
+        use relon_eval_api::value::Value;
         let read_inline = |abs: usize, len: usize| -> Result<&[u8], BufferError> {
             let end = abs
                 .checked_add(len)
@@ -3460,9 +3460,9 @@ impl<'a> BufferReader<'a> {
         &self,
         record_off: usize,
         ty: &TypeRepr,
-    ) -> Result<crate::value::Value, BufferError> {
-        use crate::smol_str::SmolStr;
-        use crate::value::Value;
+    ) -> Result<relon_eval_api::value::Value, BufferError> {
+        use relon_eval_api::smol_str::SmolStr;
+        use relon_eval_api::value::Value;
         if record_off
             .checked_add(1)
             .map(|end| end > self.bytes.len())
@@ -3619,7 +3619,7 @@ impl<'a> BufferReader<'a> {
     pub fn read_list_list(
         &self,
         field_name: &str,
-    ) -> Result<Vec<Vec<crate::value::Value>>, BufferError> {
+    ) -> Result<Vec<Vec<relon_eval_api::value::Value>>, BufferError> {
         let entry = self.find_entry(field_name)?;
         let inner = match &entry.ty {
             TypeRepr::List { element } => match element.as_ref() {
@@ -3688,7 +3688,7 @@ impl<'a> BufferReader<'a> {
         &self,
         header_off: usize,
         inner: &TypeRepr,
-    ) -> Result<Vec<Vec<crate::value::Value>>, BufferError> {
+    ) -> Result<Vec<Vec<relon_eval_api::value::Value>>, BufferError> {
         let inner_align: usize = match inner {
             TypeRepr::Int | TypeRepr::Float => 8,
             TypeRepr::Bool => 1,
@@ -3738,8 +3738,8 @@ impl<'a> BufferReader<'a> {
         inner_align: usize,
         count: usize,
         entries_start: usize,
-    ) -> Result<Vec<Vec<crate::value::Value>>, BufferError> {
-        use crate::value::Value;
+    ) -> Result<Vec<Vec<relon_eval_api::value::Value>>, BufferError> {
+        use relon_eval_api::value::Value;
         self.check_pointer_entries_in_bounds(field_name, entries_start, count)?;
         let mut out: Vec<Vec<Value>> = Vec::with_capacity(count);
         for i in 0..count {
@@ -4127,7 +4127,7 @@ mod tests {
     use super::*;
     use crate::layout::SchemaLayout;
     use crate::schema_canonical::{Field, Schema};
-    use crate::value::Value;
+    use relon_eval_api::value::Value;
 
     fn field(name: &str, ty: TypeRepr) -> Field {
         Field {
@@ -4139,13 +4139,13 @@ mod tests {
 
     fn result_ok(value: Value) -> Value {
         let mut map = std::collections::BTreeMap::new();
-        map.insert(crate::smol_str::SmolStr::from("value"), value);
+        map.insert(relon_eval_api::smol_str::SmolStr::from("value"), value);
         Value::variant_dict(map, "Ok".to_string(), "Result".to_string())
     }
 
     fn result_err(value: Value) -> Value {
         let mut map = std::collections::BTreeMap::new();
-        map.insert(crate::smol_str::SmolStr::from("error"), value);
+        map.insert(relon_eval_api::smol_str::SmolStr::from("error"), value);
         Value::variant_dict(map, "Err".to_string(), "Result".to_string())
     }
 
@@ -4236,7 +4236,10 @@ mod tests {
         let layout = SchemaLayout::offsets_for(&outer).expect("layout");
         let mut map = std::collections::BTreeMap::new();
         let payload = Value::option_some(Value::String("hello".into()));
-        map.insert(crate::smol_str::SmolStr::from("maybe"), payload.clone());
+        map.insert(
+            relon_eval_api::smol_str::SmolStr::from("maybe"),
+            payload.clone(),
+        );
         let value = Value::branded_dict(map, Some("Inner".to_string()));
         let mut builder = BufferBuilder::new(&layout, &outer.fields);
         builder
@@ -5271,7 +5274,7 @@ mod tests {
     /// to pin the exact byte layout the compiled backends consume.
     #[test]
     fn write_nested_scalar_list_int_layout() {
-        use crate::value::Value;
+        use relon_eval_api::value::Value;
         let schema = Schema {
             name: "Grid".into(),
             generics: vec![],
@@ -5326,7 +5329,7 @@ mod tests {
     /// bit-for-bit independent of any compiled backend.
     #[test]
     fn read_list_list_roundtrips_nested_scalars() {
-        use crate::value::Value;
+        use relon_eval_api::value::Value;
         let cases: &[(TypeRepr, Vec<Value>)] = &[
             (
                 TypeRepr::Int,
@@ -5391,7 +5394,7 @@ mod tests {
     /// doubly-nested pointer array round-trips through one buffer.
     #[test]
     fn nested_list_inner_string_roundtrips() {
-        use crate::value::Value;
+        use relon_eval_api::value::Value;
         let inner_str = TypeRepr::List {
             element: Box::new(TypeRepr::String),
         };
