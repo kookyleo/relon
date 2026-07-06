@@ -171,7 +171,10 @@ pub(super) fn return_nested_list_canonical(
 /// must be a `TypeRepr::Schema`, never itself a `List`. That keeps
 /// `List<List<Schema>>` (a pointer-array-of-pointer-array the in-place
 /// reader does not decode) rejected as `UnsupportedTypeInMain`.
-pub(super) fn return_list_schema_canonical(t: &TypeNode, resolver: &SchemaResolver<'_>) -> Option<TypeRepr> {
+pub(super) fn return_list_schema_canonical(
+    t: &TypeNode,
+    resolver: &SchemaResolver<'_>,
+) -> Option<TypeRepr> {
     if t.path.len() != 1
         || t.path[0].as_str() != "List"
         || t.generics.len() != 1

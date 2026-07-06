@@ -125,7 +125,10 @@ pub(super) fn lower_reference(
 //   chase field offsets through the schema's layout chain, emitting
 //   `Op::LoadFieldAtAbsolute` per segment.
 
-pub(super) fn enum_payload_field_name(segment: &TokenKey, variant: &CanonicalEnumVariant) -> Option<String> {
+pub(super) fn enum_payload_field_name(
+    segment: &TokenKey,
+    variant: &CanonicalEnumVariant,
+) -> Option<String> {
     match segment {
         TokenKey::String(name, _, optional) if !*optional => Some(name.clone()),
         TokenKey::Index(index, optional) if !*optional && variant.is_tuple => {

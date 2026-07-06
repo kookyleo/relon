@@ -46,7 +46,11 @@ pub(super) enum StaticArmDecision {
 ///     can never satisfy `apply_schema` (which requires a `Dict`) ⇒
 ///     `Never`.
 ///   - any optional / dotted / generic pattern ⇒ `Undecidable`.
-pub(super) fn static_arm_decision(ty: IrType, brand: Option<&str>, pattern: &Expr) -> StaticArmDecision {
+pub(super) fn static_arm_decision(
+    ty: IrType,
+    brand: Option<&str>,
+    pattern: &Expr,
+) -> StaticArmDecision {
     match pattern {
         Expr::Wildcard => StaticArmDecision::Matches,
         Expr::Type(tn) => static_type_pattern_decision(ty, brand, tn),
@@ -177,7 +181,10 @@ pub(super) fn no_match_trap_body_ops(
     ])
 }
 
-pub(super) fn enum_scrutinee_binding(scrutinee: &Node, ctx: &LowerCtx<'_>) -> Option<(String, TypeRepr)> {
+pub(super) fn enum_scrutinee_binding(
+    scrutinee: &Node,
+    ctx: &LowerCtx<'_>,
+) -> Option<(String, TypeRepr)> {
     let Expr::Variable(path) = &*scrutinee.expr else {
         return None;
     };
@@ -503,7 +510,11 @@ pub(super) fn emit_enum_pattern_bindings(
     Ok(added)
 }
 
-pub(super) fn enum_tag_test_ops(scrutinee_let_idx: u32, tag: u8, range: TokenRange) -> Vec<TaggedOp> {
+pub(super) fn enum_tag_test_ops(
+    scrutinee_let_idx: u32,
+    tag: u8,
+    range: TokenRange,
+) -> Vec<TaggedOp> {
     vec![
         TaggedOp {
             op: Op::LetGet {

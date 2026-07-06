@@ -522,7 +522,11 @@ pub(super) fn topo_order_fields(
 /// least one cycle exists (Kahn's algorithm couldn't drain the
 /// graph); we build a representative path so the user sees the field
 /// chain that participates.
-pub(super) fn find_cycle_path(outgoing: &[Vec<usize>], def: &SchemaDef, incoming: &[usize]) -> Vec<String> {
+pub(super) fn find_cycle_path(
+    outgoing: &[Vec<usize>],
+    def: &SchemaDef,
+    incoming: &[usize],
+) -> Vec<String> {
     let n = outgoing.len();
     let mut visited = vec![false; n];
     let mut on_stack = vec![false; n];
@@ -581,7 +585,11 @@ pub(super) fn dfs_find_cycle(
 /// references (`a.b.c`) only contribute the head segment — if the
 /// head resolves to a sibling, the rest of the path is treated as a
 /// post-access we don't track.
-pub(super) fn collect_field_refs(expr: &Expr, name_to_idx: &HashMap<&str, usize>, out: &mut Vec<usize>) {
+pub(super) fn collect_field_refs(
+    expr: &Expr,
+    name_to_idx: &HashMap<&str, usize>,
+    out: &mut Vec<usize>,
+) {
     match expr {
         Expr::Variable(path) | Expr::Reference { path, .. } => {
             if let Some(TokenKey::String(name, _, _)) = path.first() {

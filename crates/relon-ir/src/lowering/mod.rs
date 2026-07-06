@@ -51,9 +51,9 @@ use crate::stdlib::{
 
 #[macro_use]
 pub mod cap;
+mod anon_dict;
 mod closure;
 mod peephole;
-mod anon_dict;
 use anon_dict::*;
 mod return_shape;
 use return_shape::*;
@@ -1875,4 +1875,3 @@ fn lower_expr(expr: &Expr, range: TokenRange, ctx: &mut LowerCtx<'_>) -> Result<
         )),
     }
 }
-

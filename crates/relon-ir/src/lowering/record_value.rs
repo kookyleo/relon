@@ -17,7 +17,9 @@ pub(super) fn align_up_for_lowering(value: usize, align: usize) -> usize {
     }
 }
 
-pub(super) fn payload_slot_layout_for_lowering(ty: &TypeRepr) -> Result<(usize, usize), LoweringError> {
+pub(super) fn payload_slot_layout_for_lowering(
+    ty: &TypeRepr,
+) -> Result<(usize, usize), LoweringError> {
     match ty {
         TypeRepr::Bool | TypeRepr::Unit => Ok((1, 1)),
         TypeRepr::Int | TypeRepr::Float => Ok((8, 8)),
@@ -87,7 +89,9 @@ pub(super) fn variant_record_alignment_for_lowering(ty: &TypeRepr) -> Result<usi
     Ok(align)
 }
 
-pub(super) fn variant_payload_offset_for_lowering(payload_ty: &TypeRepr) -> Result<usize, LoweringError> {
+pub(super) fn variant_payload_offset_for_lowering(
+    payload_ty: &TypeRepr,
+) -> Result<usize, LoweringError> {
     let (_, payload_align) = payload_slot_layout_for_lowering(payload_ty)?;
     Ok(align_up_for_lowering(1, payload_align))
 }
@@ -219,7 +223,12 @@ pub(super) fn lower_schema_value_as_absolute_pointer(
     }
 }
 
-pub(super) fn alloc_record_op(ctx: &LowerCtx<'_>, record_local: u32, root_size: u32, root_align: u32) -> Op {
+pub(super) fn alloc_record_op(
+    ctx: &LowerCtx<'_>,
+    record_local: u32,
+    root_size: u32,
+    root_align: u32,
+) -> Op {
     if ctx.variant_records_in_scratch {
         Op::AllocScratchRecord {
             record_local_idx: record_local,
@@ -235,7 +244,12 @@ pub(super) fn alloc_record_op(ctx: &LowerCtx<'_>, record_local: u32, root_size: 
     }
 }
 
-pub(super) fn store_field_at_record_op(ctx: &LowerCtx<'_>, record_local: u32, offset: u32, ty: IrType) -> Op {
+pub(super) fn store_field_at_record_op(
+    ctx: &LowerCtx<'_>,
+    record_local: u32,
+    offset: u32,
+    ty: IrType,
+) -> Op {
     if ctx.variant_records_in_scratch {
         Op::StoreFieldAtRecordAbsolute {
             record_local_idx: record_local,
@@ -251,7 +265,11 @@ pub(super) fn store_field_at_record_op(ctx: &LowerCtx<'_>, record_local: u32, of
     }
 }
 
-pub(super) fn push_record_base_for_pointer(record_local: u32, range: TokenRange, ctx: &mut LowerCtx<'_>) {
+pub(super) fn push_record_base_for_pointer(
+    record_local: u32,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) {
     if ctx.variant_records_in_scratch {
         ctx.out.push(TaggedOp {
             op: Op::PushRecordBaseAbsolute {
@@ -265,7 +283,11 @@ pub(super) fn push_record_base_for_pointer(record_local: u32, range: TokenRange,
     }
 }
 
-pub(super) fn push_record_base_as_absolute(record_local: u32, range: TokenRange, ctx: &mut LowerCtx<'_>) {
+pub(super) fn push_record_base_as_absolute(
+    record_local: u32,
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) {
     ctx.out.push(TaggedOp {
         op: Op::PushRecordBase {
             record_local_idx: record_local,

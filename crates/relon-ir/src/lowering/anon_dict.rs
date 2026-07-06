@@ -2017,4 +2017,3 @@ pub(super) fn lower_anon_dict_body(
 
     Ok(())
 }
-

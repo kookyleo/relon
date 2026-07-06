@@ -14,7 +14,10 @@ use super::*;
 /// argument exprs lowering to a non-i64 slot — analyzer typing should
 /// have caught this earlier, but the desugar emits raw arithmetic so a
 /// drift would silently corrupt subsequent ops.
-pub(super) fn expect_int_top(ctx: &mut LowerCtx<'_>, range: TokenRange) -> Result<(), LoweringError> {
+pub(super) fn expect_int_top(
+    ctx: &mut LowerCtx<'_>,
+    range: TokenRange,
+) -> Result<(), LoweringError> {
     match ctx.tstack.last().copied() {
         Some(IrType::I64) => Ok(()),
         Some(other) => Err(cap!(
@@ -698,7 +701,11 @@ pub(super) fn scalar_of(t: IrType) -> Option<IrType> {
 /// param `name` adopts that type. Drives `accel(s, i)`'s `s` to
 /// `ListFloat` (it passes `s` as `pair_force`'s first arg without ever
 /// indexing it directly). Returns `None` when no such call pins it.
-pub(super) fn infer_param_from_sibling_call(name: &str, body: &Expr, ctx: &LowerCtx<'_>) -> Option<IrType> {
+pub(super) fn infer_param_from_sibling_call(
+    name: &str,
+    body: &Expr,
+    ctx: &LowerCtx<'_>,
+) -> Option<IrType> {
     fn walk(name: &str, expr: &Expr, ctx: &LowerCtx<'_>) -> Option<IrType> {
         match expr {
             Expr::FnCall { path, args } => {
