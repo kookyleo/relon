@@ -36,7 +36,7 @@ use inkwell::targets::{
 };
 use inkwell::OptimizationLevel;
 
-use relon_eval_api::inplace_return::ArenaRegions;
+use relon_abi::inplace_return::ArenaRegions;
 use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
 use relon_parser::Node;
 
@@ -172,10 +172,10 @@ unsafe impl Sync for JitOwned {}
 /// crate (rather than re-imported) so the LLVM backend stays
 /// independent.
 struct BufferSchema {
-    main_schema: relon_eval_api::schema_canonical::Schema,
-    return_schema: relon_eval_api::schema_canonical::Schema,
-    main_layout: relon_eval_api::layout::OffsetTable,
-    return_layout: relon_eval_api::layout::OffsetTable,
+    main_schema: relon_abi::schema_canonical::Schema,
+    return_schema: relon_abi::schema_canonical::Schema,
+    main_layout: relon_abi::layout::OffsetTable,
+    return_layout: relon_abi::layout::OffsetTable,
 }
 
 /// Phase B LLVM AOT evaluator. Either constructed from a pre-lowered
@@ -317,9 +317,9 @@ impl LlvmAotEvaluator {
         options: Option<&relon_analyzer::AnalyzeOptions>,
     ) -> Result<Self, LlvmError> {
         let (ir, main_schema, return_schema) = Self::lower_source_with_options(src, options)?;
-        let main_layout = relon_eval_api::layout::SchemaLayout::offsets_for(&main_schema)
+        let main_layout = relon_abi::layout::SchemaLayout::offsets_for(&main_schema)
             .map_err(|e| LlvmError::Codegen(format!("main schema layout: {e}")))?;
-        let return_layout = relon_eval_api::layout::SchemaLayout::offsets_for(&return_schema)
+        let return_layout = relon_abi::layout::SchemaLayout::offsets_for(&return_schema)
             .map_err(|e| LlvmError::Codegen(format!("return schema layout: {e}")))?;
         let param_names: Vec<String> = main_schema.fields.iter().map(|f| f.name.clone()).collect();
         let schema = BufferSchema {
@@ -337,8 +337,8 @@ impl LlvmAotEvaluator {
     ) -> Result<
         (
             relon_ir::ir::Module,
-            relon_eval_api::schema_canonical::Schema,
-            relon_eval_api::schema_canonical::Schema,
+            relon_abi::schema_canonical::Schema,
+            relon_abi::schema_canonical::Schema,
         ),
         LlvmError,
     > {
@@ -401,9 +401,9 @@ impl LlvmAotEvaluator {
         host_shim_src: &str,
     ) -> Result<Self, LlvmError> {
         let (ir, main_schema, return_schema) = Self::lower_source_with_options(src, Some(options))?;
-        let main_layout = relon_eval_api::layout::SchemaLayout::offsets_for(&main_schema)
+        let main_layout = relon_abi::layout::SchemaLayout::offsets_for(&main_schema)
             .map_err(|e| LlvmError::Codegen(format!("main schema layout: {e}")))?;
-        let return_layout = relon_eval_api::layout::SchemaLayout::offsets_for(&return_schema)
+        let return_layout = relon_abi::layout::SchemaLayout::offsets_for(&return_schema)
             .map_err(|e| LlvmError::Codegen(format!("return schema layout: {e}")))?;
         let param_names: Vec<String> = main_schema.fields.iter().map(|f| f.name.clone()).collect();
         let schema = BufferSchema {
@@ -1259,10 +1259,8 @@ impl LlvmAotEvaluator {
             })?;
 
         // 1. Pack the args into a buffer using `BufferBuilder`.
-        let mut builder = relon_eval_api::buffer::BufferBuilder::new(
-            &schema.main_layout,
-            &schema.main_schema.fields,
-        );
+        let mut builder =
+            relon_abi::buffer::BufferBuilder::new(&schema.main_layout, &schema.main_schema.fields);
         for field in &schema.main_schema.fields {
             let value = args
                 .get(&field.name)
@@ -1473,7 +1471,7 @@ impl LlvmAotEvaluator {
     /// Two paths, identical to the historical inline decode:
     /// - **negative** `ret`: the in-place region-walk sentinel
     ///   `-(root_abs + 1)`. We recover `root_abs`, then defer entirely to
-    ///   the backend-shared `relon_eval_api::inplace_return` pipeline
+    ///   the backend-shared `relon_abi::inplace_return` pipeline
     ///   (region-select → **verifier** → in-place decode). The verifier
     ///   is non-negotiable: an unverified buffer is never decoded, on the
     ///   wasm linear-memory path exactly as on the host path.
@@ -1498,16 +1496,16 @@ impl LlvmAotEvaluator {
         // a loud error — we never decode an unverified in-place return.
         // The decode pipeline (sentinel → region-select → verifier →
         // decode) is shared with the cranelift backend via
-        // `relon_eval_api::inplace_return`, and reused verbatim by the
+        // `relon_abi::inplace_return`, and reused verbatim by the
         // wasm host (the arena is then a slice of wasm linear memory).
         if ret < 0 {
-            let root_abs = relon_eval_api::inplace_return::decode_inplace_sentinel(ret)?;
+            let root_abs = relon_abi::inplace_return::decode_inplace_sentinel(ret)?;
             if !is_single_value_wrapper(&schema.return_schema) {
                 return Err(RuntimeError::IoError(
                     "llvm-aot in-place return on a non-single-value return schema".into(),
                 ));
             }
-            return relon_eval_api::inplace_return::decode_inplace_return(
+            return relon_abi::inplace_return::decode_inplace_return(
                 "llvm-aot",
                 arena,
                 regions,
@@ -1539,7 +1537,7 @@ impl LlvmAotEvaluator {
         // span to one region (today all in `out`; cross-region object
         // fields stay capped — F1b releases them) and closes the red-line
         // gap where the object path previously decoded with no verifier.
-        relon_eval_api::inplace_return::decode_object_return(
+        relon_abi::inplace_return::decode_object_return(
             "llvm-aot",
             arena,
             out_ptr,
@@ -1576,10 +1574,8 @@ impl LlvmAotEvaluator {
             })?;
 
         // Pack the input record exactly as `run_main_buffer` does.
-        let mut builder = relon_eval_api::buffer::BufferBuilder::new(
-            &schema.main_layout,
-            &schema.main_schema.fields,
-        );
+        let mut builder =
+            relon_abi::buffer::BufferBuilder::new(&schema.main_layout, &schema.main_schema.fields);
         for field in &schema.main_schema.fields {
             let value = args
                 .get(&field.name)
@@ -1644,7 +1640,7 @@ impl LlvmAotEvaluator {
     ///
     /// This routes through the **same** [`Self::decode_buffer_return`] the
     /// host path uses — the in-place sentinel still runs the
-    /// `relon_eval_api::inplace_return` verifier over the linear-memory
+    /// `relon_abi::inplace_return` verifier over the linear-memory
     /// slice before any decode. There is no wasm-specific decode or
     /// wasm-specific verifier.
     pub fn wasm_buffer_decode(
@@ -1752,16 +1748,16 @@ impl Evaluator for LlvmAotEvaluator {
 // `write_value_into_builder` / `is_single_value_wrapper` /
 // `buffer_to_runtime_error`. The object-return *decode* side is no
 // longer mirrored per crate — it lives once in
-// `relon_eval_api::inplace_return::decode_object_return`. Kept inside
+// `relon_abi::inplace_return::decode_object_return`. Kept inside
 // this crate so the LLVM backend has no compile-time dep on
 // cranelift-native.
 // ---------------------------------------------------------------------------
 
-fn buffer_to_runtime_error(e: relon_eval_api::buffer::BufferError) -> RuntimeError {
+fn buffer_to_runtime_error(e: relon_abi::buffer::BufferError) -> RuntimeError {
     RuntimeError::IoError(format!("llvm-aot buffer: {e}"))
 }
 
-fn is_single_value_wrapper(schema: &relon_eval_api::schema_canonical::Schema) -> bool {
+fn is_single_value_wrapper(schema: &relon_abi::schema_canonical::Schema) -> bool {
     schema.name == relon_ir::MAIN_RETURN_SCHEMA_NAME
         && schema.fields.len() == 1
         && schema.fields[0].name == relon_ir::RETURN_VALUE_FIELD_NAME
@@ -1777,8 +1773,8 @@ fn is_single_value_wrapper(schema: &relon_eval_api::schema_canonical::Schema) ->
 /// The strict [`is_single_value_wrapper`] check stays in place for the
 /// `run_main` buffer decoder — branded user dicts must still surface
 /// as `Value::Dict` for the host, not be unwrapped to a bare scalar.
-fn is_single_int_field_record(schema: &relon_eval_api::schema_canonical::Schema) -> bool {
-    use relon_eval_api::schema_canonical::TypeRepr;
+fn is_single_int_field_record(schema: &relon_abi::schema_canonical::Schema) -> bool {
+    use relon_abi::schema_canonical::TypeRepr;
     // A tuple schema (`is_tuple`) decodes positionally to a `Value::Tuple`,
     // never to a scalar / branded dict — so a 1-tuple
     // `Tuple<Int>` must NOT take the typed-i64 fast path (which would
@@ -1797,7 +1793,7 @@ fn is_single_int_field_record(schema: &relon_eval_api::schema_canonical::Schema)
 /// helper rather than living inline in a single fat `match`. Adding a
 /// new leaf type means: (1) add an arm here delegating to a new
 /// `marshal_<type>_in`, (2) add the symmetric arm to the shared
-/// object-return decoder `relon_eval_api::inplace_return` (reached via
+/// object-return decoder `relon_abi::inplace_return` (reached via
 /// `decode_object_return`), and (3) widen the build.rs-visible
 /// [`EmittedFieldType`] triple (see that enum's docs).
 ///
@@ -1807,11 +1803,11 @@ fn is_single_int_field_record(schema: &relon_eval_api::schema_canonical::Schema)
 /// this seam is the runtime marshaller, `EmittedFieldType` is the
 /// AOT-binding signature surface.
 fn write_value_into_builder(
-    builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
-    field: &relon_eval_api::schema_canonical::Field,
+    builder: &mut relon_abi::buffer::BufferBuilder<'_>,
+    field: &relon_abi::schema_canonical::Field,
     value: &Value,
 ) -> Result<(), RuntimeError> {
-    use relon_eval_api::schema_canonical::TypeRepr;
+    use relon_abi::schema_canonical::TypeRepr;
     match (&field.ty, value) {
         (TypeRepr::Int, Value::Int(v)) => marshal_int_in(builder, &field.name, *v),
         (TypeRepr::Float, Value::Float(v)) => {
@@ -1850,7 +1846,7 @@ fn write_value_into_builder(
 // their own helper here without touching sibling arms.
 
 fn marshal_int_in(
-    builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
+    builder: &mut relon_abi::buffer::BufferBuilder<'_>,
     name: &str,
     v: i64,
 ) -> Result<(), RuntimeError> {
@@ -1858,7 +1854,7 @@ fn marshal_int_in(
 }
 
 fn marshal_float_in(
-    builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
+    builder: &mut relon_abi::buffer::BufferBuilder<'_>,
     name: &str,
     v: f64,
 ) -> Result<(), RuntimeError> {
@@ -1868,7 +1864,7 @@ fn marshal_float_in(
 }
 
 fn marshal_bool_in(
-    builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
+    builder: &mut relon_abi::buffer::BufferBuilder<'_>,
     name: &str,
     v: bool,
 ) -> Result<(), RuntimeError> {
@@ -1876,7 +1872,7 @@ fn marshal_bool_in(
 }
 
 fn marshal_unit_in(
-    builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
+    builder: &mut relon_abi::buffer::BufferBuilder<'_>,
     name: &str,
 ) -> Result<(), RuntimeError> {
     builder.write_unit(name).map_err(buffer_to_runtime_error)
@@ -1888,7 +1884,7 @@ fn marshal_unit_in(
 /// back-patches the 4-byte buffer-relative offset slot the JIT's
 /// `LoadStringPtr` reads — the same record shape `ConstString` bakes.
 fn marshal_string_in(
-    builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
+    builder: &mut relon_abi::buffer::BufferBuilder<'_>,
     name: &str,
     s: &str,
 ) -> Result<(), RuntimeError> {
@@ -1909,12 +1905,12 @@ fn marshal_string_in(
 /// `Value`s are type-checked against the declared element type;
 /// `List<Schema>` (and any other element) stays a loud cap.
 fn marshal_list_in(
-    builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
+    builder: &mut relon_abi::buffer::BufferBuilder<'_>,
     name: &str,
-    element: &relon_eval_api::schema_canonical::TypeRepr,
+    element: &relon_abi::schema_canonical::TypeRepr,
     items: &[Value],
 ) -> Result<(), RuntimeError> {
-    use relon_eval_api::schema_canonical::TypeRepr;
+    use relon_abi::schema_canonical::TypeRepr;
     let mismatch = |idx: usize, got: &Value, want: &str| RuntimeError::Unsupported {
         reason: format!(
             "llvm-aot: List<{want}> arg `{name}` element #{idx} got {} but expects {want}",
@@ -1992,17 +1988,17 @@ fn marshal_list_in(
 
 /// Marshal a `List<Schema>` arg: each element is a branded
 /// `Value::Dict` written as a sub-record into the parent buffer's tail
-/// through [`relon_eval_api::buffer::ListRecordWriter`]. The list
+/// through [`relon_abi::buffer::ListRecordWriter`]. The list
 /// header's per-entry offsets and the inner sub-records' own pointer
 /// slots are relocated into the parent's coordinate system by
 /// `finish_entry` / `finish_list_record`. Mirrors the cranelift backend.
 fn marshal_list_schema_in(
-    builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
+    builder: &mut relon_abi::buffer::BufferBuilder<'_>,
     name: &str,
-    schema: &relon_eval_api::schema_canonical::Schema,
+    schema: &relon_abi::schema_canonical::Schema,
     items: &[Value],
 ) -> Result<(), RuntimeError> {
-    let elem_layout = relon_eval_api::layout::SchemaLayout::offsets_for(schema).map_err(|e| {
+    let elem_layout = relon_abi::layout::SchemaLayout::offsets_for(schema).map_err(|e| {
         RuntimeError::Unsupported {
             reason: format!("llvm-aot: List<Schema> arg `{name}` element layout: {e}"),
         }
@@ -2049,21 +2045,21 @@ fn marshal_list_schema_in(
 /// backend; inner pointer-array element lists (`List<List<String>>`)
 /// stay a loud cap at the layout pass.
 fn marshal_list_list_in(
-    builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
+    builder: &mut relon_abi::buffer::BufferBuilder<'_>,
     name: &str,
-    inner: &relon_eval_api::schema_canonical::TypeRepr,
+    inner: &relon_abi::schema_canonical::TypeRepr,
     items: &[Value],
 ) -> Result<(), RuntimeError> {
-    use relon_eval_api::schema_canonical::TypeRepr;
+    use relon_abi::schema_canonical::TypeRepr;
     // `List<List<scalar>>` keeps the inline-fixed inner-record writer;
     // `List<List<String|Schema|List>>` (F5) routes through the recursive
     // doubly-nested pointer-array marshaller.
     match inner {
         TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool => {
-            relon_eval_api::buffer::write_nested_scalar_list(builder, name, inner, items)
+            relon_abi::buffer::write_nested_scalar_list(builder, name, inner, items)
                 .map_err(buffer_to_runtime_error)
         }
-        _ => relon_eval_api::buffer::write_nested_pointer_array_list(builder, name, inner, items)
+        _ => relon_abi::buffer::write_nested_pointer_array_list(builder, name, inner, items)
             .map_err(buffer_to_runtime_error),
     }
 }
@@ -2078,12 +2074,12 @@ fn marshal_list_list_in(
 /// `relocate_pointers` rebases the child's own pointer slots into the
 /// parent's coordinate system.
 fn marshal_schema_in(
-    builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
+    builder: &mut relon_abi::buffer::BufferBuilder<'_>,
     name: &str,
-    schema: &relon_eval_api::schema_canonical::Schema,
+    schema: &relon_abi::schema_canonical::Schema,
     dict: &relon_eval_api::ValueDict,
 ) -> Result<(), RuntimeError> {
-    let sub_layout = relon_eval_api::layout::SchemaLayout::offsets_for(schema).map_err(|e| {
+    let sub_layout = relon_abi::layout::SchemaLayout::offsets_for(schema).map_err(|e| {
         RuntimeError::Unsupported {
             reason: format!("llvm-aot: schema arg `{name}` layout: {e}"),
         }
@@ -2101,12 +2097,12 @@ fn marshal_schema_in(
 /// (`schema.is_tuple`) at the binary layer, with a `Value::Tuple` host
 /// shape at the API layer.
 fn marshal_tuple_in(
-    builder: &mut relon_eval_api::buffer::BufferBuilder<'_>,
+    builder: &mut relon_abi::buffer::BufferBuilder<'_>,
     name: &str,
-    schema: &relon_eval_api::schema_canonical::Schema,
+    schema: &relon_abi::schema_canonical::Schema,
     items: &[Value],
 ) -> Result<(), RuntimeError> {
-    let sub_layout = relon_eval_api::layout::SchemaLayout::offsets_for(schema).map_err(|e| {
+    let sub_layout = relon_abi::layout::SchemaLayout::offsets_for(schema).map_err(|e| {
         RuntimeError::Unsupported {
             reason: format!("llvm-aot: tuple arg `{name}` layout: {e}"),
         }
@@ -2129,8 +2125,8 @@ fn marshal_tuple_in(
 /// `parent_field` is only used for error messages so a missing nested
 /// field names its enclosing slot.
 fn write_schema_into_builder(
-    child: &mut relon_eval_api::buffer::BufferBuilder<'_>,
-    schema: &relon_eval_api::schema_canonical::Schema,
+    child: &mut relon_abi::buffer::BufferBuilder<'_>,
+    schema: &relon_abi::schema_canonical::Schema,
     dict: &relon_eval_api::ValueDict,
     parent_field: &str,
 ) -> Result<(), RuntimeError> {
@@ -2152,8 +2148,8 @@ fn write_schema_into_builder(
 /// Recursively fill `child` from a tuple value, pairing positional items
 /// with the tuple schema's synthetic `"0"`, `"1"`, ... fields.
 fn write_tuple_into_builder(
-    child: &mut relon_eval_api::buffer::BufferBuilder<'_>,
-    schema: &relon_eval_api::schema_canonical::Schema,
+    child: &mut relon_abi::buffer::BufferBuilder<'_>,
+    schema: &relon_abi::schema_canonical::Schema,
     items: &[Value],
     parent_field: &str,
 ) -> Result<(), RuntimeError> {
@@ -2174,15 +2170,15 @@ fn write_tuple_into_builder(
 
 // The object-return field decode (`read_value_from_reader` /
 // `read_record_into_map` and the per-type `marshal_*_out` seam) now
-// lives once in `relon_eval_api::inplace_return` and is reached through
+// lives once in `relon_abi::inplace_return` and is reached through
 // `decode_object_return`; both AOT backends share that single copy, so a
 // new return field type is added in exactly one place.
 
 /// Phase E.1: does the return schema include any pointer-indirect
 /// type (`String` / `List*`)? Drives the output buffer's tail-cap
 /// sizing — fixed-area-only returns don't need the 64 KiB cushion.
-fn return_needs_tail_region(schema: &relon_eval_api::schema_canonical::Schema) -> bool {
-    use relon_eval_api::schema_canonical::TypeRepr;
+fn return_needs_tail_region(schema: &relon_abi::schema_canonical::Schema) -> bool {
+    use relon_abi::schema_canonical::TypeRepr;
     schema.fields.iter().any(|f| {
         matches!(
             f.ty,
@@ -2358,7 +2354,7 @@ fn scan_body_effectful(body: &[relon_ir::ir::TaggedOp], effectful: &mut [bool]) 
 
 /// order to buffer offsets when eligible.
 fn build_fast_path_profile(schema: &BufferSchema) -> Result<FastPathProfile, ()> {
-    use relon_eval_api::schema_canonical::TypeRepr;
+    use relon_abi::schema_canonical::TypeRepr;
     // Every declared #main arg must be `Int`. Pointer-indirect /
     // floating-point / bool / unit are out — those would require
     // f64 / i32 fast-entry slots we don't enumerate.
@@ -2684,9 +2680,9 @@ impl LlvmAotEvaluator {
         target: CodegenTarget,
     ) -> Result<EmitObjectInfo, LlvmError> {
         let (ir, main_schema, return_schema) = Self::lower_source_with_options(src, Some(options))?;
-        let main_layout = relon_eval_api::layout::SchemaLayout::offsets_for(&main_schema)
+        let main_layout = relon_abi::layout::SchemaLayout::offsets_for(&main_schema)
             .map_err(|e| LlvmError::Codegen(format!("main schema layout: {e}")))?;
-        let return_layout = relon_eval_api::layout::SchemaLayout::offsets_for(&return_schema)
+        let return_layout = relon_abi::layout::SchemaLayout::offsets_for(&return_schema)
             .map_err(|e| LlvmError::Codegen(format!("return schema layout: {e}")))?;
         let param_names: Vec<String> = main_schema.fields.iter().map(|f| f.name.clone()).collect();
         let schema = BufferSchema {
@@ -3079,8 +3075,8 @@ impl LlvmAotEvaluator {
 /// [`LlvmError::UnsupportedSignature`] so build.rs never generates a
 /// binding it can't compile.
 fn lower_field_descriptors(
-    schema: &relon_eval_api::schema_canonical::Schema,
-    layout: &relon_eval_api::layout::OffsetTable,
+    schema: &relon_abi::schema_canonical::Schema,
+    layout: &relon_abi::layout::OffsetTable,
 ) -> Result<Vec<EmittedField>, LlvmError> {
     let mut out = Vec::with_capacity(schema.fields.len());
     for (i, f) in schema.fields.iter().enumerate() {
@@ -3121,10 +3117,8 @@ fn lower_field_descriptors(
 /// `None` fall-through keeps every still-unsupported leaf surfacing as
 /// `UnsupportedSignature` rather than silently emitting a tag the shim
 /// can't decode.
-fn emitted_field_type_for(
-    ty: &relon_eval_api::schema_canonical::TypeRepr,
-) -> Option<EmittedFieldType> {
-    use relon_eval_api::schema_canonical::TypeRepr;
+fn emitted_field_type_for(ty: &relon_abi::schema_canonical::TypeRepr) -> Option<EmittedFieldType> {
+    use relon_abi::schema_canonical::TypeRepr;
     match ty {
         TypeRepr::Int => Some(EmittedFieldType::Int),
         TypeRepr::Float => Some(EmittedFieldType::Float),

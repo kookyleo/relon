@@ -22,12 +22,10 @@ use std::sync::Arc;
 
 use cranelift_jit::JITModule;
 
-use relon_eval_api::buffer::{BufferBuilder, BufferError};
-use relon_eval_api::inplace_return::{
-    decode_inplace_return, decode_inplace_sentinel, ArenaRegions,
-};
-use relon_eval_api::layout::{OffsetTable, SchemaLayout};
-use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
+use relon_abi::buffer::{BufferBuilder, BufferError};
+use relon_abi::inplace_return::{decode_inplace_return, decode_inplace_sentinel, ArenaRegions};
+use relon_abi::layout::{OffsetTable, SchemaLayout};
+use relon_abi::schema_canonical::{Field, Schema, TypeRepr};
 use relon_eval_api::{ClosureData, Evaluator, RelonFunction, RuntimeError, Scope, Thunk, Value};
 use relon_ir::ir::NativeImport;
 use relon_parser::{Node, TokenRange};
@@ -1720,7 +1718,7 @@ impl AotEvaluator {
         // so every followed span lands in `out`, but the gate is already
         // cross-region-correct. This closes the red-line gap where the
         // object path previously decoded with no verifier at all.
-        relon_eval_api::inplace_return::decode_object_return(
+        relon_abi::inplace_return::decode_object_return(
             "cranelift",
             arena,
             out_ptr as usize,
@@ -2070,13 +2068,13 @@ fn write_list_arg_into_builder(
             // the recursive doubly-nested pointer-array marshaller.
             match inner.as_ref() {
                 TypeRepr::Int | TypeRepr::Float | TypeRepr::Bool => {
-                    relon_eval_api::buffer::write_nested_scalar_list(builder, name, inner, items)
+                    relon_abi::buffer::write_nested_scalar_list(builder, name, inner, items)
                         .map_err(buffer_to_runtime_error)
                 }
-                _ => relon_eval_api::buffer::write_nested_pointer_array_list(
-                    builder, name, inner, items,
-                )
-                .map_err(buffer_to_runtime_error),
+                _ => {
+                    relon_abi::buffer::write_nested_pointer_array_list(builder, name, inner, items)
+                        .map_err(buffer_to_runtime_error)
+                }
             }
         }
         TypeRepr::Option { .. } | TypeRepr::Result { .. } | TypeRepr::Enum { .. } => {
@@ -2098,7 +2096,7 @@ fn write_list_arg_into_builder(
 
 /// Marshal a `List<Schema>` arg: each element is a branded
 /// `Value::Dict` written as a sub-record into the parent buffer's tail
-/// through [`relon_eval_api::buffer::ListRecordWriter`]. The list
+/// through [`relon_abi::buffer::ListRecordWriter`]. The list
 /// header's per-entry offsets and the inner sub-records' own pointer
 /// slots are relocated into the parent's coordinate system by
 /// `finish_entry` / `finish_list_record`. Mirrors the LLVM backend's
@@ -2199,7 +2197,7 @@ fn write_tuple_fields_into_builder(
 
 // The object-return field decode (`read_value_from_reader` /
 // `read_record_into_map`) now lives once in
-// `relon_eval_api::inplace_return` and is reached through
+// `relon_abi::inplace_return` and is reached through
 // `decode_object_return`; both AOT backends share that single copy.
 
 #[cfg(test)]

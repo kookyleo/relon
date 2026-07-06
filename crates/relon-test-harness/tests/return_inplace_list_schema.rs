@@ -6,7 +6,7 @@
 //! return goes through the in-place region-walk return instead of any
 //! machine-code re-pack: both AOT backends report the negative sentinel
 //! `-(root_abs+1)`; the host decodes in place through the one shared
-//! pipeline (`relon_eval_api::inplace_return`): sentinel -> region-select
+//! pipeline (`relon_abi::inplace_return`): sentinel -> region-select
 //! -> verifier (which recurses to **every sub-record field pointer**) ->
 //! `read_list_record_at` -> branded dict per element.
 //!

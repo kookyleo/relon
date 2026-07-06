@@ -14,7 +14,7 @@
 //! `relon-codegen-llvm/tests/inplace_return_four_way.rs` (the `r13_*` cases
 //! plus the `diff_scratch_list_string_fstring` proptest): Wave R13 routed
 //! the wasm decode through the shared, verifier-gated
-//! `relon_eval_api::inplace_return` decoder over a linear-memory slice
+//! `relon_abi::inplace_return` decoder over a linear-memory slice
 //! (`wasm_buffer_decode`), which handles `List<String>` and the negative
 //! in-place sentinel a scratch-region pointer-array root reports — so the
 //! headline `range(n).map(x => f"v${x}")`, the `String -> String` suffix

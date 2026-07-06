@@ -16,11 +16,12 @@ categories = ["compilers"]
 # `arena_base` / `tail_cursor` / `scratch_cursor` / `scratch_base` at the
 # byte offsets it was emitted against, and (b) a marshalling helper
 # (`call_buffer_entry`) that packs typed Rust args into the arena and
-# decodes the return record. The `relon-eval-api` dep brings the
-# canonical `BufferBuilder` / `BufferReader` / `Schema` / `OffsetTable`
-# types so the generated binding and the in-process LLVM evaluator
-# share one writer/reader implementation.
+# decodes the return record. The `relon-abi` dep brings the canonical
+# `BufferBuilder` / `BufferReader` / `Schema` / `OffsetTable` types so
+# the generated binding and the in-process LLVM evaluator share one
+# writer/reader implementation.
 [dependencies]
 relon-eval-api = { workspace = true }
+relon-abi = { workspace = true }
 # Leaf util: shared `align_up` arena-layout helper.
 relon-util = { workspace = true }

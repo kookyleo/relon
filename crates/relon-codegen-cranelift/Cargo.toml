@@ -17,6 +17,7 @@ relon-util = { workspace = true }
 relon-ir = { workspace = true }
 # Trait Evaluator + shared value types + RuntimeError surface
 relon-eval-api = { workspace = true }
+relon-abi = { workspace = true }
 # Source positions for diagnostics
 relon-parser = { workspace = true }
 # `from_source` runs the per-file analyzer before lowering so the

@@ -19,6 +19,7 @@ relon-analyzer = { workspace = true }
 # by Phase 2.b to package `#main` params into a 1-record schema and
 # resolve field offsets for `Op::LoadField` / `Op::StoreField`.
 relon-eval-api = { workspace = true }
+relon-abi = { workspace = true }
 # Leaf crate holding the Unicode tables / algorithms and the glob
 # matcher that used to live under `relon-ir/src/unicode/` +
 # `relon-ir/src/glob.rs`. Re-exported at the crate root so the codegen

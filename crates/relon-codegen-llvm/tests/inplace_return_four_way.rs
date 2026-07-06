@@ -22,7 +22,7 @@
 //!   2. hands it to `LlvmAotEvaluator::wasm_buffer_decode`, which routes
 //!      through the **same** `decode_buffer_return` the host JIT path uses,
 //!      which on a negative sentinel runs the backend-shared
-//!      `relon_eval_api::inplace_return` pipeline:
+//!      `relon_abi::inplace_return` pipeline:
 //!      region-select → **verifier** → in-place decode.
 //!
 //! The verifier runs over the linear-memory slice exactly as it does over
@@ -452,7 +452,7 @@ fn ls_very_long() {
 // llvm-native) and recorded the wasm leg as honestly unestablished: the
 // old `aot_wasm_parity` hand-rolled decoder had no `List<String>` decode
 // and rejected the negative in-place sentinel. The shared
-// `relon_eval_api::inplace_return` decoder DOES handle `List<String>`
+// `relon_abi::inplace_return` decoder DOES handle `List<String>`
 // (region-select → verifier → `read_list_string_at`), and the wasm host
 // here routes through it via `wasm_buffer_decode` over a linear-memory
 // slice — exactly as Shape 2 does — so the scratch-root case lifts to
@@ -621,7 +621,7 @@ fn comprehension_int_to_string() {
 // fresh scratch `List<String>` pointer-array whose every slot points at an
 // independently arena-allocated segment String record `[len][utf8]` — the
 // same self-contained single-arena invariant the R13 scratch results
-// satisfy, so it returns in place through the `relon_eval_api::inplace_return`
+// satisfy, so it returns in place through the `relon_abi::inplace_return`
 // decoder. The receiver is a `#main` String param (runtime-sourced), the
 // separator a non-empty string literal (the only shape that lowers — an
 // empty separator stays capped because the tree-walk oracle errors on it).

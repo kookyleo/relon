@@ -1383,7 +1383,7 @@ mod w7_closure_boundary_tests {
     /// hook the future implementation will hang behaviour off.
     #[test]
     fn typerepr_closure_digest_distinguishes_signature_shapes() {
-        use relon_eval_api::schema_canonical::{schema_hash, Field, Schema, TypeRepr};
+        use relon_abi::schema_canonical::{schema_hash, Field, Schema, TypeRepr};
 
         let int_to_int = TypeRepr::Closure {
             params: vec![TypeRepr::Int],
@@ -1445,8 +1445,8 @@ mod w7_closure_boundary_tests {
     /// rather than a silent dangle.
     #[test]
     fn closure_field_rejects_at_schema_layout() {
-        use relon_eval_api::layout::{LayoutError, SchemaLayout};
-        use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
+        use relon_abi::layout::{LayoutError, SchemaLayout};
+        use relon_abi::schema_canonical::{Field, Schema, TypeRepr};
 
         let schema = Schema {
             name: "ProbeWithClosure".into(),

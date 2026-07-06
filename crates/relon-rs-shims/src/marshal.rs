@@ -40,10 +40,10 @@
 
 use core::cell::RefCell;
 
-use relon_eval_api::buffer::{BufferBuilder, BufferReader};
-use relon_eval_api::inplace_return::{verify_object_return_multi, ArenaRegions};
-use relon_eval_api::layout::{FieldKind, FieldOffset, ListElementKind, OffsetTable};
-use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
+use relon_abi::buffer::{BufferBuilder, BufferReader};
+use relon_abi::inplace_return::{verify_object_return_multi, ArenaRegions};
+use relon_abi::layout::{FieldKind, FieldOffset, ListElementKind, OffsetTable};
+use relon_abi::schema_canonical::{Field, Schema, TypeRepr};
 
 use crate::sandbox_state::{ArenaState, SandboxState};
 
@@ -440,7 +440,7 @@ fn dispatch_with_arena(
 
     // Return decode uses the F1 arena-absolute slot convention, identical
     // to the in-process LLVM evaluator's object-return path
-    // (`relon_eval_api::inplace_return::decode_object_return`): the JIT
+    // (`relon_abi::inplace_return::decode_object_return`): the JIT
     // body writes every tail pointer as an arena-absolute offset (relative
     // to arena offset 0), and the return record's fixed area sits at
     // `out_ptr`. So the reader must be anchored at `out_ptr` over the

@@ -549,7 +549,7 @@ pub enum Op {
     /// placeholder).
     LoadField {
         /// Byte offset of the field inside the input buffer, supplied
-        /// by `relon_eval_api::layout::OffsetTable`.
+        /// by `relon_abi::layout::OffsetTable`.
         offset: u32,
         /// Field's IR type. Determines which wasm load opcode the
         /// codegen pass picks.

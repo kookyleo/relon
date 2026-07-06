@@ -5,8 +5,8 @@
 //! 1.beta and will land alongside the analyzer-error display
 //! pipeline.
 
-use relon_eval_api::layout::LayoutError;
-use relon_eval_api::schema_lower::SchemaLowerError;
+use relon_abi::layout::LayoutError;
+use relon_abi::schema_lower::SchemaLowerError;
 use relon_parser::{Operator, TokenRange};
 use thiserror::Error;
 
@@ -103,7 +103,7 @@ pub enum LoweringError {
     SchemaLower(#[from] SchemaLowerError),
     /// Phase 2.b: the schema laid out fine canonically but the layout
     /// pass refused to size it (variable-size types, overflow). Wraps
-    /// `relon_eval_api::layout::LayoutError` for the same reason as
+    /// `relon_abi::layout::LayoutError` for the same reason as
     /// `SchemaLower`.
     #[error(transparent)]
     Layout(#[from] LayoutError),

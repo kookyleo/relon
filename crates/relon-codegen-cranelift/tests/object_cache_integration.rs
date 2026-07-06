@@ -344,11 +344,11 @@ fn schema_sidecar_bound_to_object_hash() {
     // loader supplies object hash B. This is the property the
     // production loader relies on after the object-cache layer has
     // already verified its own HMAC tag.
+    use relon_abi::schema_canonical::{Field, Schema, TypeRepr};
     use relon_codegen_cranelift::schema_cache::{
         deserialize, schema_cache_path_for, serialize, SchemaCacheEntry, SerEntryShape,
         SerTokenRange,
     };
-    use relon_eval_api::schema_canonical::{Field, Schema, TypeRepr};
 
     let entry = SchemaCacheEntry {
         main_schema: Schema {

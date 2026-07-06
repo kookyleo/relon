@@ -5,7 +5,7 @@
 //! cranelift-AOT backend, the llvm-AOT backend (S2 — gated behind the
 //! `llvm-aot` feature), and the tree-walk golden oracle. Both AOT
 //! backends decode the value in place at its source region through the
-//! one shared host pipeline (`relon_eval_api::inplace_return`): negative
+//! one shared host pipeline (`relon_abi::inplace_return`): negative
 //! sentinel `-(root_abs+1)` → region-select → verifier → decode.
 //!
 //! Three layers:

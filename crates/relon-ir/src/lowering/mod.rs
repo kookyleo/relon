@@ -23,14 +23,12 @@
 //! `LocalGet` of wasm function locals.
 
 use ordered_float::OrderedFloat;
+use relon_abi::layout::{FieldKind, OffsetTable, SchemaLayout};
+use relon_abi::schema_canonical::{EnumVariant as CanonicalEnumVariant, Field, Schema, TypeRepr};
 use relon_analyzer::main_sig::MainSignature;
 use relon_analyzer::schema::{SchemaDef, SchemaMethodInfo};
 use relon_analyzer::tree::AnalyzedTree;
 use relon_analyzer::workspace::WorkspaceTree;
-use relon_eval_api::layout::{FieldKind, OffsetTable, SchemaLayout};
-use relon_eval_api::schema_canonical::{
-    EnumVariant as CanonicalEnumVariant, Field, Schema, TypeRepr,
-};
 use relon_parser::{
     is_builtin_type_name, CallArg, ClosureParam, Expr, FStringPart, Node, Operator, PatternBinding,
     RefBase, TokenKey, TokenRange, TypeNode,
@@ -767,7 +765,7 @@ fn detect_cross_file_schema_conflicts(
 /// equality walk — the canonical form already collapses every
 /// representation difference that the wasm-AOT pipeline cares about.
 fn schema_hashes_differ(a: &Schema, b: &Schema) -> bool {
-    use relon_eval_api::schema_canonical::schema_hash;
+    use relon_abi::schema_canonical::schema_hash;
     schema_hash(a) != schema_hash(b)
 }
 

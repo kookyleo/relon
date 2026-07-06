@@ -10,7 +10,7 @@
 //! behind the `llvm-aot` feature), and the tree-walk golden oracle. Both
 //! AOT backends report the negative sentinel `-(root_abs+1)` and the host
 //! decodes the value in place at its source region through the one shared
-//! pipeline (`relon_eval_api::inplace_return`): sentinel -> region-select
+//! pipeline (`relon_abi::inplace_return`): sentinel -> region-select
 //! -> verifier -> `read_list_string_at`.
 //!
 //! Three layers:

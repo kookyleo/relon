@@ -41,7 +41,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use relon_eval_api::schema_canonical::Schema;
+use relon_abi::schema_canonical::Schema;
 use relon_object_cache::compute_hmac;
 use relon_parser::TokenRange;
 
@@ -189,7 +189,7 @@ fn hmac_input(
 /// a key must refuse to write the sidecar at all — the integration
 /// layer enforces this above us.
 ///
-/// Uses serde_json for the body because `relon_eval_api::schema_canonical::TypeRepr`
+/// Uses serde_json for the body because `relon_abi::schema_canonical::TypeRepr`
 /// is tagged with `#[serde(tag = "kind")]` (internally tagged), which
 /// bincode 1.x's lack of `deserialize_any` rejects. JSON keeps the
 /// dependency surface narrow and the decode hot path stays under
@@ -299,7 +299,7 @@ pub fn schema_cache_path_for(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use relon_eval_api::schema_canonical::{Field, TypeRepr};
+    use relon_abi::schema_canonical::{Field, TypeRepr};
 
     fn sample_entry() -> SchemaCacheEntry {
         let main = Schema {
