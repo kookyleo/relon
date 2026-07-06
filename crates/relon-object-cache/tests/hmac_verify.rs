@@ -6,10 +6,17 @@
 
 use relon_object_cache::{
     compute_hmac, content_key, ensure_key, hmac_key_path, load, store, verify_hmac, CacheError,
-    HostFnImport, IntegrityMode, Metadata, SignatureHash,
+    HmacError, HostFnImport, IntegrityMode, Metadata, SignatureHash,
 };
 use sha2::{Digest, Sha256};
+use std::sync::Mutex;
 use tempfile::tempdir;
+
+/// Serializes the tests that mutate `XDG_DATA_HOME` / `HOME`.
+/// `std::env::set_var` is process-global while the test harness runs
+/// `#[test]` fns on parallel threads, so every env-touching test must
+/// hold this lock for its whole body.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn sample_meta() -> Metadata {
     Metadata {
@@ -124,12 +131,13 @@ fn compute_and_verify_helper_round_trips() {
 
 #[test]
 fn ensure_key_creates_then_loads_idempotently() {
+    let _guard = ENV_LOCK.lock().unwrap();
     // Isolate XDG_DATA_HOME to a tempdir so we do not touch the
     // user's real key.
     let dir = tempdir().unwrap();
     let saved = std::env::var_os("XDG_DATA_HOME");
-    // SAFETY: tests run single-threaded inside the crate-scoped
-    // test binary; we restore the env var before returning.
+    // SAFETY: ENV_LOCK serializes every env-mutating test in this
+    // binary; we restore the env var before returning.
     unsafe {
         std::env::set_var("XDG_DATA_HOME", dir.path());
     }
@@ -138,7 +146,7 @@ fn ensure_key_creates_then_loads_idempotently() {
     let second = ensure_key().unwrap();
     assert_eq!(first, second, "ensure_key must be idempotent");
 
-    let path = hmac_key_path();
+    let path = hmac_key_path().unwrap();
     assert!(path.starts_with(dir.path()));
     assert!(path.ends_with("cache-key"));
 
@@ -149,4 +157,44 @@ fn ensure_key_creates_then_loads_idempotently() {
             None => std::env::remove_var("XDG_DATA_HOME"),
         }
     }
+}
+
+#[test]
+fn no_key_location_fails_closed() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    // With neither XDG_DATA_HOME nor HOME set there is no trusted
+    // directory for the key. The old behaviour fell back to a
+    // cwd-relative `relon-cache-key` — which would let whoever
+    // controls the working directory inject a key — so both the
+    // path resolution and key generation must refuse instead.
+    let saved_xdg = std::env::var_os("XDG_DATA_HOME");
+    let saved_home = std::env::var_os("HOME");
+    // SAFETY: ENV_LOCK serializes every env-mutating test in this
+    // binary; both vars are restored before returning.
+    unsafe {
+        std::env::remove_var("XDG_DATA_HOME");
+        std::env::remove_var("HOME");
+    }
+
+    let path_err = hmac_key_path().expect_err("no env → key path must fail");
+    let key_err = ensure_key().expect_err("no env → key generation must fail");
+
+    unsafe {
+        match saved_xdg {
+            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        match saved_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    assert!(matches!(path_err, HmacError::NoKeyLocation), "{path_err:?}");
+    assert!(matches!(key_err, HmacError::NoKeyLocation), "{key_err:?}");
+    // And nothing may have been dropped into the working directory.
+    assert!(
+        !std::path::Path::new("relon-cache-key").exists(),
+        "cwd fallback key file must never be created"
+    );
 }

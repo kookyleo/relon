@@ -7,7 +7,8 @@
 //! - [`LoaderError`] — runtime loading problems (memfd, dlopen,
 //!   dlsym, unsupported OS).
 //! - [`HmacError`] — issues with the per-installation HMAC key file
-//!   itself (missing parent dir, wrong mode bits, getrandom failure).
+//!   itself (no resolvable key location, missing parent dir, wrong
+//!   mode bits, getrandom failure).
 //!
 //! They are split rather than merged because callers usually want to
 //! react differently — a stale cache file should be silently
@@ -135,4 +136,17 @@ pub enum HmacError {
     /// silently downgrade security.
     #[error("key file has insecure mode: 0{0:o} (expected 0600)")]
     InsecureMode(u32),
+
+    /// Neither `XDG_DATA_HOME` nor `HOME` is set, so there is no
+    /// trusted directory to hold the key. Falling back to a
+    /// cwd-relative path would let whoever controls the working
+    /// directory inject their own key — defeating the cache
+    /// authentication the key exists to provide — so key resolution
+    /// fails closed. Callers treat this as "native cache disabled"
+    /// until the host provisions `HOME` / `XDG_DATA_HOME`.
+    #[error(
+        "no HMAC key location: neither XDG_DATA_HOME nor HOME is set; \
+         refusing to fall back to a cwd-relative key file"
+    )]
+    NoKeyLocation,
 }

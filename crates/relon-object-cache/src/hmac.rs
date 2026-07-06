@@ -13,8 +13,11 @@
 //!
 //! 1. `$XDG_DATA_HOME/relon/cache-key` if `XDG_DATA_HOME` is set.
 //! 2. `$HOME/.local/share/relon/cache-key` otherwise.
-//! 3. If neither variable is set, the current directory is used as
-//!    a last resort — the host should set `HOME` to avoid that.
+//! 3. If neither variable is set, key resolution fails with
+//!    [`HmacError::NoKeyLocation`]. A cwd-relative fallback would let
+//!    whoever controls the working directory supply the key —
+//!    defeating the very attack this key exists to stop — so we fail
+//!    closed instead; callers treat the error as "cache disabled".
 //!
 //! The file is 32 random bytes, no header, mode `0600`. We refuse
 //! to load it with anything but the right size or mode.
@@ -40,12 +43,17 @@ pub const KEY_LEN: usize = 32;
 /// Compute the canonical path of the HMAC key file. Made public so
 /// hosts and tests can `set_var("XDG_DATA_HOME", ...)` and predict
 /// where the resulting file will land.
-pub fn hmac_key_path() -> PathBuf {
+///
+/// Fails with [`HmacError::NoKeyLocation`] when neither
+/// `XDG_DATA_HOME` nor `HOME` is set: there is no trusted directory
+/// to hold the key, and a cwd-relative fallback would let an
+/// attacker-controlled working directory inject its own key.
+pub fn hmac_key_path() -> Result<PathBuf, HmacError> {
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
         let mut p = PathBuf::from(xdg);
         p.push("relon");
         p.push("cache-key");
-        return p;
+        return Ok(p);
     }
     if let Some(home) = std::env::var_os("HOME") {
         let mut p = PathBuf::from(home);
@@ -53,9 +61,9 @@ pub fn hmac_key_path() -> PathBuf {
         p.push("share");
         p.push("relon");
         p.push("cache-key");
-        return p;
+        return Ok(p);
     }
-    PathBuf::from("relon-cache-key")
+    Err(HmacError::NoKeyLocation)
 }
 
 /// Load the HMAC key, generating one if it does not exist. The
@@ -63,7 +71,7 @@ pub fn hmac_key_path() -> PathBuf {
 /// world-readable keys surface as [`HmacError`] so the caller can
 /// regenerate after a clean-up.
 pub fn ensure_key() -> Result<[u8; KEY_LEN], HmacError> {
-    let path = hmac_key_path();
+    let path = hmac_key_path()?;
 
     if path.exists() {
         return load_key(&path);
