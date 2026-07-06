@@ -155,21 +155,17 @@ fn unique_entry_symbols() {
 }
 
 #[test]
-fn closure_as_value_dict_still_emits() {
-    // W7 closure-as-value production shape. Under the aligned seam the
-    // `.o` path preserves `strict_mode: true`, which trips three
-    // type-surface soft-ban diagnostics (`ClosureParamTypeMissing`,
-    // `ClosureReturnTypeUnknown`, `ExpressionTypeUnknown`) on the
-    // anonymous `(k) => ...` closure. `lower_source_with_options` routes
-    // the frontend through `compile_with_suppressed`, which drops
-    // exactly those three so the shape IR lowering already accepts keeps
-    // compiling — strict must not kill it. A regression that reinstated
-    // a blanket `strict_mode: false`, or dropped the suppression, would
-    // surface here.
+fn annotated_closure_as_value_dict_emits() {
+    // W7 closure-as-value production shape. Strict-mode closure typing
+    // follows TypeScript: a closure with no contextual type must annotate
+    // its parameters and return, so the W7 `fib` field carries an explicit
+    // `(Int k) -> Int`. `lower_source_with_options` runs the shared
+    // frontend `compile` with no suppression, so this annotated shape
+    // passes on the `.o` seam exactly as it does on the cranelift backend.
     let src =
-        "#main(Int n) -> Dict { #internal fib: (k) => k<2?k:fib(k-1)+fib(k-2), result: fib(n) }";
+        "#main(Int n) -> Dict { #internal fib: (Int k) -> Int => k<2?k:fib(k-1)+fib(k-2), result: fib(n) }";
     let info = emit_to_tmp("w7_closure_dict", src)
-        .expect("W7 closure-as-value source must still emit under strict + softban suppression");
+        .expect("annotated W7 closure-as-value source must emit under strict");
     assert_eq!(info.shape, EmittedEntryShape::Buffer);
     assert_eq!(info.param_names, vec!["n".to_string()]);
     // The Dict return projects to its single non-`#internal` field
@@ -177,6 +173,24 @@ fn closure_as_value_dict_still_emits() {
     assert_eq!(info.return_fields.len(), 1);
     assert_eq!(info.return_fields[0].name, "result");
     assert_eq!(info.return_fields[0].ty, EmittedFieldType::Int);
+}
+
+#[test]
+fn unannotated_closure_as_value_dict_rejected() {
+    // Consistency guarantee: the `.o` seam now makes the SAME strict
+    // accept/reject decision as the cranelift backend. An *unannotated*
+    // closure-as-value (no param/return type) is an implicit-any red line
+    // under strict, so the analyzer rejects it and `emit_object` surfaces
+    // an `Analyze` error — previously the LLVM backend suppressed those
+    // diagnostics and let this compile, desyncing it from cranelift.
+    let src =
+        "#main(Int n) -> Dict { #internal fib: (k) => k<2?k:fib(k-1)+fib(k-2), result: fib(n) }";
+    let err = emit_to_tmp("w7_closure_dict_unannotated", src)
+        .expect_err("unannotated W7 closure-as-value must be rejected under strict");
+    assert!(
+        err.contains("Analyze"),
+        "expected an Analyze rejection, got: {err}"
+    );
 }
 
 #[test]

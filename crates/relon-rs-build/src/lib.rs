@@ -548,9 +548,10 @@ fn build_native_options(host_fns: &[NativeHostFn]) -> relon_analyzer::AnalyzeOpt
     // in-process `from_source` path. Every required cap bit is granted
     // above, so the static check passes at build time; the runtime
     // grant/deny decision still rides the host's `caps` mask per call.
-    // The frontend still runs through `compile_with_suppressed` in
-    // `lower_source_with_options`, so closure-as-value shapes keep
-    // compiling.
+    // The frontend runs the shared `compile` with no diagnostic
+    // suppression, so closure-as-value shapes must annotate their
+    // parameters and return under strict (TypeScript-style), matching the
+    // cranelift backend's accept/reject decision.
     relon_analyzer::AnalyzeOptions {
         host_fn_names: names,
         host_fn_signatures: signatures,

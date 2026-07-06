@@ -9,13 +9,14 @@
 //!
 //! The function is policy-free: the caller builds its own
 //! [`relon_analyzer::AnalyzeOptions`] (compiled backends force
-//! `standalone_capability_check: true`; some additionally relax
-//! `strict_mode`) and passes it in. [`compile`] only runs the three
-//! pipeline stages and maps each stage's failure into a
-//! [`FrontendError`] variant the backend translates to its own error
-//! type.
+//! `standalone_capability_check: true`) and passes it in. [`compile`]
+//! only runs the three pipeline stages and maps each stage's failure
+//! into a [`FrontendError`] variant the backend translates to its own
+//! error type. It applies no diagnostic suppression: every backend sees
+//! the exact same strict accept/reject decision, so an unannotated
+//! closure-as-value is rejected identically on cranelift and LLVM.
 
-use relon_analyzer::{AnalyzeOptions, Diagnostic};
+use relon_analyzer::AnalyzeOptions;
 
 use crate::lowering::{lower_workspace_single, LoweredEntry};
 
@@ -59,39 +60,12 @@ pub enum FrontendError {
 /// `standalone_capability_check`, no `strict_mode` relaxation); the
 /// caller owns that.
 pub fn compile(src: &str, options: &AnalyzeOptions) -> Result<LoweredEntry, FrontendError> {
-    compile_with_suppressed(src, options, |_| false)
-}
-
-/// Like [`compile`], but an `Error`-severity diagnostic for which
-/// `suppress` returns `true` is dropped from the analyze gate (it neither
-/// counts toward [`FrontendError::Analyze`] nor blocks lowering).
-///
-/// This is the seam a compiled backend uses to accept a source shape its
-/// IR lowering already handles even though a strict-mode *soft-ban*
-/// diagnostic flags it — e.g. the LLVM backend's closure-as-value dict
-/// surface (`ClosureParamTypeMissing` / `ClosureReturnTypeUnknown` /
-/// `ExpressionTypeUnknown`), which `lower_anon_dict_body` lowers fine.
-///
-/// The predicate is deliberately narrow: it only sees the diagnostics it
-/// explicitly matches, so every hard structural error
-/// (`UnknownTypeName`, `MainReturnTypeMismatch`, …) and the
-/// capability-reachability check keep gating the build. Passing
-/// `|_| false` recovers [`compile`] verbatim.
-pub fn compile_with_suppressed<F>(
-    src: &str,
-    options: &AnalyzeOptions,
-    suppress: F,
-) -> Result<LoweredEntry, FrontendError>
-where
-    F: Fn(&Diagnostic) -> bool,
-{
     let ast = relon_parser::parse_document(src).map_err(|e| FrontendError::Parse(e.to_string()))?;
     let analyzed = relon_analyzer::analyze_with_options(&ast, options);
     let err_count = analyzed
         .diagnostics
         .iter()
         .filter(|d| d.severity() == relon_analyzer::Severity::Error)
-        .filter(|d| !suppress(d))
         .count();
     if err_count > 0 {
         return Err(FrontendError::Analyze(err_count));

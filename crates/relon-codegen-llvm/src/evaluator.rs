@@ -259,21 +259,6 @@ fn step_budget_to_i64(steps: Option<u64>) -> i64 {
     }
 }
 
-/// The three strict-mode closure-as-value *type-surface* soft-ban
-/// diagnostics the LLVM backend softens (see `lower_source_with_options`).
-/// IR lowering (`lower_anon_dict_body`) accepts the shape these flag, so
-/// they must not gate the compiled build — while every other strict and
-/// hard diagnostic (incl. the capability-reachability check) still does.
-fn is_closure_type_surface_softban(d: &relon_analyzer::Diagnostic) -> bool {
-    use relon_analyzer::Diagnostic as D;
-    matches!(
-        d,
-        D::ClosureParamTypeMissing { .. }
-            | D::ClosureReturnTypeUnknown { .. }
-            | D::ExpressionTypeUnknown { .. }
-    )
-}
-
 impl LlvmAotEvaluator {
     /// Compile a pre-lowered IR module into a JIT-resident function
     /// pointer. Accepts either a legacy-i64 entry
@@ -372,27 +357,22 @@ impl LlvmAotEvaluator {
             ..options.cloned().unwrap_or_default()
         };
         let options = &owned;
-        // W7 closure-as-value (Phase F.W7): the production source
-        // `#main(Int n) -> Dict { #internal fib: (k) => ..., result: fib(n) }`
-        // trips exactly three v1.5 / v1.6 strict-mode *type-surface*
-        // soft-ban diagnostics (`ClosureParamTypeMissing`,
-        // `ClosureReturnTypeUnknown`, `ExpressionTypeUnknown`) even
-        // though IR lowering accepts the shape via `lower_anon_dict_body`.
-        // Precisely soften those three variants only — instead of the
-        // former blanket `strict_mode: false`, which also disabled the
-        // strict boundary interception and desynced the capability check
-        // from cranelift.
+        // Strict-mode closure typing follows TypeScript: a closure with no
+        // contextual type must annotate its parameters and return
+        // (`fib: (Int k) -> Int => ...`). The LLVM backend runs the shared
+        // frontend `compile` with no diagnostic suppression, so it makes the
+        // SAME strict accept/reject decision as the cranelift backend — an
+        // unannotated closure-as-value (the W7 `fib` shape) is rejected at
+        // compile time on both backends; the annotated shape passes on both.
+        // Contextual closure typing (`typecheck/mod.rs`) still infers HOF
+        // callback types from the callee signature, so `range(n).map(...)`
+        // and friends stay annotation-free.
         //
         // Map the shared frontend pipeline error onto this backend's
         // surface: Parse → Parse, Analyze(n) → Analyze(n), and Lowering
         // → Codegen with the historical `lower_workspace_single:` prefix
         // (the LLVM backend has no dedicated `Lowering` variant).
-        let lowered = relon_ir::frontend::compile_with_suppressed(
-            src,
-            options,
-            is_closure_type_surface_softban,
-        )
-        .map_err(|e| match e {
+        let lowered = relon_ir::frontend::compile(src, options).map_err(|e| match e {
             relon_ir::FrontendError::Parse(msg) => LlvmError::Parse(msg),
             relon_ir::FrontendError::Analyze(n) => LlvmError::Analyze(n),
             relon_ir::FrontendError::Lowering(msg) => {
@@ -2621,9 +2601,10 @@ impl LlvmAotEvaluator {
         // the pure-source `.o` seam makes the SAME static accept/reject
         // decision as the in-process `from_source` path (a gated call to
         // an ungranted capability is rejected at compile time, not left
-        // to a runtime trap). `lower_source_with_options` still routes
-        // the frontend through `compile_with_suppressed`, so W7
-        // closure-as-value sources keep compiling.
+        // to a runtime trap). `lower_source_with_options` runs the shared
+        // frontend `compile` with no suppression, so an unannotated
+        // closure-as-value (the W7 `fib` shape) is rejected here exactly as
+        // cranelift rejects it; the annotated `(Int k) -> Int` shape passes.
         let options = relon_analyzer::AnalyzeOptions {
             standalone_capability_check: true,
             ..Default::default()
@@ -2817,7 +2798,7 @@ impl LlvmAotEvaluator {
         // (which lowers `Op::ConstString` against the real const-pool).
         let fast_profile = match fast_profile {
             // W7 recursive-closure Dict: a module that declares lambdas
-            // (`#internal fib: (k) => ... fib(...)`) can match the fast
+            // (`#internal fib: (Int k) -> Int => ... fib(...)`) can match the fast
             // `(i64..) -> i64` envelope (Int `#main`, single-Int `result`
             // field) yet its body emits `Op::MakeClosure` /
             // `Op::CallClosure`, which resolve a lambda FunctionValue from

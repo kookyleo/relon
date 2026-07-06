@@ -739,7 +739,7 @@ const FAST: &[Fast] = &[
     Fast {
         name: "w9_nested_reduce",
         src: "#main(Int n) -> Int\n\
-               range(n).reduce(0, (acc, j) => \
+               range(n).reduce(0, (acc, j) -> Int => \
                acc + range(n).reduce(0, (inner, i) => inner + (i * n + j)))",
         args: &[20],
     },
@@ -861,7 +861,7 @@ fn w3_string_return_aligns_native_via_wasmtime() {
         return;
     }
     let src = "#import list from \"std/list\"\n#main(Int n) -> String\n\
-               range(n).map((i) => \"a\").reduce(\"\", (acc, s) => acc + s)";
+               range(n).map((i) => \"a\").reduce(\"\", (acc, String s) => acc + s)";
     let n = 5i64;
     let want = match native_run(src, HashMap::from([("n".to_string(), Value::Int(n))])) {
         Value::String(s) => s,
@@ -1498,7 +1498,7 @@ fn lf_spread_aligns_native_via_wasmtime() {
 fn lf_spread_multi_runtime_aligns_native_via_wasmtime() {
     list_float_parity(
         "lf_spread_multi_runtime",
-        "#main(Int n) -> List<Float>\n[...range(n).map((Int x) => sqrt(0.0 - x * 1.0)), 9.5, \
+        "#main(Int n) -> List<Float>\n[...range(n).map((Int x) -> Float => sqrt(0.0 - x * 1.0)), 9.5, \
          ...range(n).map((Int x) => x * 0.5)]",
         3,
     );
@@ -2226,7 +2226,7 @@ fn w4_filter_contains_aligns_native_via_wasmtime() {
     }
 }
 
-/// W7 production Dict — `#internal fib: (k) => ... fib(...)` first-class
+/// W7 production Dict — `#internal fib: (Int k) -> Int => ... fib(...)` first-class
 /// **recursive** closure. The body lifts `fib` to an internal let-bound
 /// closure handle that captures itself (`fib(k-1) + fib(k-2)`) and the
 /// host-visible `result` field calls it. The IR lowering populates the
@@ -2249,7 +2249,7 @@ fn w4_filter_contains_aligns_native_via_wasmtime() {
 #[test]
 fn w7_recursive_closure_dict_aligns_four_ways_via_wasmtime() {
     let src = "#main(Int n) -> Dict\n{\n#internal\n\
-               fib: (k) => k < 2 ? k : fib(k - 1) + fib(k - 2),\nresult: fib(n)\n}";
+               fib: (Int k) -> Int => k < 2 ? k : fib(k - 1) + fib(k - 2),\nresult: fib(n)\n}";
     let n = 13i64;
     let want = 233i64; // fib(13)
 
