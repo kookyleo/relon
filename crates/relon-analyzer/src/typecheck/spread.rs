@@ -299,7 +299,10 @@ impl<'a> Walker<'a> {
             // Dict-shaped — handled by `spread_source_is_dict`.
             InferredType::Dict(_) | InferredType::Schema(_) => None,
             // Genuinely unknown — `SpreadSourceTypeUnknown` covers it.
-            InferredType::Any => None,
+            // `Never` only ever appears as a collection *element* type
+            // (empty-literal bottom), never as a top-level spread
+            // source, so it is unreachable here; treat it as unknown.
+            InferredType::Any | InferredType::Never => None,
             // Anything else has a known, non-spreadable shape.
             InferredType::Bool => Some("Bool".to_string()),
             InferredType::Int => Some("Int".to_string()),

@@ -142,6 +142,12 @@ pub(crate) fn type_node_for(t: &InferredType) -> TypeNode {
     use crate::sig::{type_node_generic, type_node_simple};
     match t {
         InferredType::Any => type_node_simple("Any"),
+        // `Never` (empty-collection bottom) has no surface syntax;
+        // collapse to `Any` like the `Fn` case. Only reachable when an
+        // empty literal's element type is projected back to a TypeNode
+        // (e.g. a comprehension over `[]`), where `Any` is the correct
+        // unconstrained element view.
+        InferredType::Never => type_node_simple("Any"),
         InferredType::Bool => type_node_simple("Bool"),
         InferredType::Int => type_node_simple("Int"),
         InferredType::Float => type_node_simple("Float"),

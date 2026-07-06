@@ -178,6 +178,17 @@ pub(crate) enum InferredType {
     /// used when an expression can't be classified or the slot's
     /// declared type is `Any`.
     Any,
+    /// Bottom / uninhabited element type. Produced *only* by empty
+    /// collection literals (`[]` → `List(Never)`, `{}` → `Dict(Never)`)
+    /// whose element type is polymorphic and pinned by context, exactly
+    /// like Rust's `!`. `Never.subsumes(any T)` is always `true`, so an
+    /// empty list satisfies *any* `List<T>` slot; joining `Never` with
+    /// any type yields that other type. This is deliberately distinct
+    /// from `List(Any)` (a *non-empty* list whose element really is
+    /// `Any`, e.g. a `#relaxed` call result) — the latter must stay
+    /// fail-closed against a concrete element slot under strict mode, so
+    /// the empty-collection polymorphism must never be spelled `Any`.
+    Never,
     Bool,
     Int,
     Float,
@@ -185,8 +196,9 @@ pub(crate) enum InferredType {
     /// (`Int + Float` → `Number`) and by `Number`-typed slots.
     Number,
     String,
-    /// Homogeneous list. `List(Box::new(Any))` for empty literals or
-    /// for literals whose precise element type is not derivable.
+    /// Homogeneous list. `List(Box::new(Never))` for *empty* literals
+    /// (polymorphic bottom element), `List(Box::new(Any))` for
+    /// non-empty literals whose precise element type is not derivable.
     List(Box<InferredType>),
     /// Dict with String keys and the given value type. We only model the
     /// String-keyed case because the language doesn't admit non-String
@@ -217,6 +229,7 @@ impl InferredType {
     pub(crate) fn name(&self) -> String {
         match self {
             InferredType::Any => "Any".into(),
+            InferredType::Never => "Never".into(),
             InferredType::Bool => "Bool".into(),
             InferredType::Int => "Int".into(),
             InferredType::Float => "Float".into(),
@@ -309,6 +322,17 @@ impl InferredType {
                 folded.path = vec![qualified];
                 return self.subsumes_with_imports(&folded, bases, imports, strict);
             }
+        }
+        // `Never` self: the bottom element of an empty collection
+        // literal. It is polymorphic and satisfies *any* slot (an empty
+        // `List<Never>` is a valid `List<Int>`, `List<String>`, …), so
+        // it passes unconditionally — including under strict mode. This
+        // is safe precisely because `Never` is never produced by a
+        // *value* (only by empty literals); a non-empty list whose
+        // element is really `Any` stays `List(Any)` and is still
+        // fail-closed by the `Any` arm below.
+        if let InferredType::Never = self {
+            return true;
         }
         // `Any` self: normally accepts anything. But in a strict module
         // an internal `Any` must not whitewash a *resolved concrete*
@@ -421,6 +445,11 @@ impl InferredType {
             return a.clone();
         }
         match (a, b) {
+            // `Never` is the bottom element: joining it with any type
+            // yields that other type (`join([], [1])` element side:
+            // `join(Never, Int) = Int`), so a mixed empty/non-empty list
+            // recovers the concrete element type.
+            (InferredType::Never, other) | (other, InferredType::Never) => other.clone(),
             (InferredType::Any, other) | (other, InferredType::Any) => other.clone(),
             (InferredType::Int, InferredType::Float)
             | (InferredType::Float, InferredType::Int)
@@ -1076,7 +1105,11 @@ pub(crate) fn infer_type(node: &Node, scope: &TypeScope) -> Option<InferredType>
             // element types into a single element type; tuple-shaped,
             // position-preserving typing belongs to `Expr::Tuple`.
             if items.is_empty() {
-                return Some(InferredType::List(Box::new(InferredType::Any)));
+                // Empty list: element type is polymorphic (bottom), not
+                // `Any`. `List(Never)` satisfies any `List<T>` slot,
+                // whereas `List(Any)` (a non-empty list of genuine
+                // `Any`) must stay fail-closed against a concrete slot.
+                return Some(InferredType::List(Box::new(InferredType::Never)));
             }
             let mut acc: Option<InferredType> = None;
             for item in items {
@@ -1104,7 +1137,9 @@ pub(crate) fn infer_type(node: &Node, scope: &TypeScope) -> Option<InferredType>
         Expr::Dict(pairs) => {
             // Same idea, joining values into the dict's value type.
             if pairs.is_empty() {
-                return Some(InferredType::Dict(Box::new(InferredType::Any)));
+                // Empty dict: value type is polymorphic (bottom), not
+                // `Any` — same rationale as the empty-list case above.
+                return Some(InferredType::Dict(Box::new(InferredType::Never)));
             }
             let mut acc: Option<InferredType> = None;
             for (_, v) in pairs {
