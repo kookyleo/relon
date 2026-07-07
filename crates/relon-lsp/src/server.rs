@@ -24,7 +24,9 @@ use lsp_types::notification::{
     DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Notification as _,
     PublishDiagnostics,
 };
-use lsp_types::request::{Completion, GotoDefinition, HoverRequest, References, Request as _};
+use lsp_types::request::{
+    Completion, Formatting, GotoDefinition, HoverRequest, References, Request as _,
+};
 use lsp_types::{
     CompletionOptions, GotoDefinitionParams, GotoDefinitionResponse, HoverParams, InitializeParams,
     OneOf, PublishDiagnosticsParams, ServerCapabilities, TextDocumentSyncCapability,
@@ -58,6 +60,10 @@ pub fn run_with_connection(connection: Connection) -> Result<()> {
         references_provider: Some(OneOf::Left(true)),
         hover_provider: Some(lsp_types::HoverProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions::default()),
+        // Whole-document formatting through `relon-fmt`. Range
+        // formatting is not offered — the formatter is canonical and
+        // only defined over a complete, parseable document.
+        document_formatting_provider: Some(OneOf::Left(true)),
         ..ServerCapabilities::default()
     })?;
     let initialize_params = connection.initialize(server_capabilities)?;
@@ -243,6 +249,19 @@ fn handle_request(conn: &Connection, state: &mut ServerState, req: Request) -> R
                 .get(&uri)
                 .and_then(|entry| features::hover::compute(entry, position));
             ok_response(id, &hover)?
+        }
+        Formatting::METHOD => {
+            let params: lsp_types::DocumentFormattingParams = serde_json::from_value(req.params)?;
+            let uri = params.text_document.uri;
+            // `None` (null result) covers three cases uniformly: the
+            // document isn't open, it has syntax errors (rustfmt
+            // convention — never emit a half-broken rewrite), or it is
+            // already canonically formatted. See `features::formatting`.
+            let result = state
+                .docs
+                .get(&uri)
+                .and_then(|entry| features::formatting::compute(&entry.source));
+            ok_response(id, &result)?
         }
         Completion::METHOD => {
             let params: lsp_types::CompletionParams = serde_json::from_value(req.params)?;

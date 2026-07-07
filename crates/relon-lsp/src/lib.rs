@@ -15,6 +15,7 @@
 //! - document-symbols (`textDocument/documentSymbol`)
 //! - inlay-hints (`textDocument/inlayHint`)
 //! - signature-help (`textDocument/signatureHelp`)
+//! - formatting (`textDocument/formatting`, via `relon-fmt`)
 //! - publish-diagnostics (analyzer-derived warnings / errors)
 //!
 //! ## Crate layout
