@@ -3,10 +3,11 @@
 //! Landing surface for [`crate::Backend::Auto`]. An [`AutoEvaluator`]
 //! eagerly constructs a [`TreeWalkEvaluator`] (cheap, ~1 ms) and
 //! lazily initialises the cranelift-AOT backend only when a host
-//! first calls [`relon_eval_api::Evaluator::run_main`]. The other
-//! four `Evaluator` methods (`eval`, `eval_root`, `force_thunk`,
-//! `invoke_closure`) always go through the tree-walker — which is
-//! also the only backend that supports them today.
+//! first calls [`relon_eval_api::Evaluator::run_main`]. `eval_root`
+//! and the tree-walk extension surface
+//! ([`relon_eval_api::TreeWalkEval`]: `eval`, `force_thunk`,
+//! `invoke_closure`) always go through the tree-walker — the only
+//! backend that can carry those methods.
 //!
 //! ## Design notes
 //!

@@ -418,8 +418,9 @@ impl Scope {
 }
 
 /// A lazily-evaluated dict entry. The first access through
-/// `Evaluator::force_thunk` parses + evaluates `node` against `scope` and
-/// caches the result in `value`; later accesses return the cached value.
+/// `TreeWalkEval::force_thunk` parses + evaluates `node` against `scope`
+/// and caches the result in `value`; later accesses return the cached
+/// value.
 ///
 /// All fields are `pub` so that backend crates (currently
 /// `relon-evaluator`) can read the captured node / scope when forcing the
