@@ -15,6 +15,21 @@ state.
 cargo build --release
 ```
 
+A bare `cargo build` / `cargo test` covers the workspace's default
+members, which deliberately exclude the LLVM-backed crates
+(`relon-codegen-llvm` plus the `relon-rs-build` / `relon-rs-demo` /
+`relon-aot-bench` build-time AOT consumers) — no LLVM install is
+needed to build and test the CLI and core runtime. To build the
+**full** workspace including the LLVM AOT backend, install the LLVM 18
+dev libraries (`llvm-config` on `PATH`, or point
+`LLVM_SYS_181_PREFIX` at the install, e.g. `/usr/lib/llvm-18`) and
+pass `--workspace`:
+```bash
+cargo build --workspace
+```
+CI and `./scripts/verify.sh` always run with `--workspace`, so the
+LLVM crates stay fully gated there.
+
 ### Run an Example
 Use the `relon-cli` to evaluate a file and output JSON:
 ```bash
