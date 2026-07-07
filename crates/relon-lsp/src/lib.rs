@@ -2,8 +2,9 @@
 //! Relon Language Server.
 //!
 //! Implements the editor-facing LSP capabilities exposed by relon-cli's
-//! `relon lsp` subcommand and re-used by `relon-wasm-bindings` for the browser
-//! playground:
+//! `relon lsp` subcommand. (The browser playground does not go through
+//! this crate: `relon-wasm-bindings` calls the shared resolvers in
+//! `relon-analyzer` directly.) Capabilities:
 //!
 //! - hover (`textDocument/hover`)
 //! - completion (`textDocument/completion`)
@@ -37,9 +38,8 @@
 //! The `relon-lsp` binary wires [`server::run_stdio`] into a stdio
 //! transport — the default integration path for VS Code, Neovim and
 //! other editors. Hosts that want a custom transport (e.g. embedding
-//! the server in another process, or driving it from the WASM
-//! playground's browser-side adapter) can call into [`server`]
-//! directly without going through stdio.
+//! the server in another process) can call into [`server`] directly
+//! without going through stdio.
 
 pub mod diagnostics;
 pub mod features;

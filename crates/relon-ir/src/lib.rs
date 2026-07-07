@@ -7,22 +7,29 @@
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//! Linear-typed IR between `relon-analyzer`'s `AnalyzedTree` and
-//! codegen backends (WASM, future native / JS).
+//! Linear-typed IR between `relon-analyzer`'s `AnalyzedTree` and the
+//! compiled backends: `relon-codegen-cranelift` (JIT / object cache)
+//! and `relon-codegen-llvm` (native AOT + wasm32 object emission).
 //!
-//! Phase 1.beta scope (locked in
-//! `docs/internal/archive/wasm-backend-design-draft.md` + the binary
-//! layout note dated 2026-05-16):
+//! Current scope (grown well past the original single-function,
+//! scalar-only Phase 1.beta):
 //!
-//! * Single `Func` per module (the `#main` entry, exported as
-//!   `run_main`).
-//! * Scalar value types only — `Int` lowers to `I64`, `Float` to
-//!   `F64`. Composite layouts arrive in Phase 2.
-//! * Arithmetic on uniform-type bodies. Mixed-type expressions and
-//!   non-arithmetic operators fail lowering.
+//! * An [`ir::Module`] carries multiple [`ir::Func`]s — the `#main`
+//!   entry plus lowered closures (via `Module::closure_table`) and
+//!   bundled stdlib bodies — alongside host `#native` imports.
+//! * Value coverage spans scalars (`I64` / `F64` / `Bool` / `String`),
+//!   homogeneous lists, fixed-arity tuples, `#enum` / `Option` /
+//!   `Result` variant records, and schema-rooted dict returns; the
+//!   lowered surface includes `match` dispatch, f-strings, `&sibling`
+//!   / `&root` references, spread, and field decorators.
+//! * Anything outside the supported surface fails lowering *loudly*
+//!   at a registered cap site (`lowering::cap::LOWERING_CAP_IDS`) —
+//!   the auto backend then falls back to the tree-walk evaluator. The
+//!   supported surface is pinned by the coverage ledger and the
+//!   no-fallback tests in `relon-test-harness`.
 //!
-//! See `docs/internal/archive/wasm-crate-structure-2026-05-16.md` for the
-//! IR-first crate split rationale.
+//! See `docs/internal/archive/wasm-crate-structure-2026-05-16.md` for
+//! the historical IR-first crate split rationale.
 
 pub mod effect;
 pub mod error;

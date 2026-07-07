@@ -136,11 +136,10 @@ pub struct AnalyzedTree {
     /// signatures from `#import`ed modules.
     pub workspace_import_index: Option<WorkspaceImportIndex>,
     /// `true` when this module is analyzed under strict mode. Strict
-    /// is the default; the bit is cleared when the module declares
-    /// `#relaxed` (or its synonym `#unstrict`), or when the workspace
-    /// pass propagated the cleared bit from a relaxed entry's
-    /// `#import` graph (transitive). Drives the analyzer's
-    /// no-silent-fallback policy during inference.
+    /// is the default; the bit is cleared only when this module itself
+    /// declares `#relaxed` (or its synonym `#unstrict`) — strictness is
+    /// per-module, never inherited through the `#import` graph. Drives
+    /// the analyzer's no-silent-fallback policy during inference.
     pub strict_mode: bool,
 }
 

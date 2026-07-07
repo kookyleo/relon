@@ -438,10 +438,13 @@ fn analyze_trivial_main_fast(root: &Node, options: &AnalyzeOptions) -> AnalyzedT
 /// top, in which case those positions stay silent and the runtime
 /// type-checks them on the way through.
 ///
-/// The mode is *contagious* across `#import`s — the workspace pass
-/// propagates the entry's mode to every reachable module so a relaxed
-/// entry doesn't accidentally tighten because it imports a strict
-/// library (or vice versa).
+/// The mode is *per-module* (file-local), matching TypeScript / Rust /
+/// Sorbet: each module's effective mode is the global default AND-ed
+/// with its own directive, so a `#relaxed` entry never relaxes the
+/// libraries it imports (and a strict entry never tightens a `#relaxed`
+/// dependency). The whole-program "no silent `Any`" guarantee comes
+/// from boundary enforcement instead: a strict module rejects `Any`
+/// flowing in from a relaxed dependency at the use site.
 #[derive(Debug, Clone)]
 pub struct AnalyzeOptions {
     /// Names registered with the host's `Context::functions`. Empty by
@@ -489,9 +492,10 @@ pub struct AnalyzeOptions {
     /// must have a statically inferable type. Sites that can't be
     /// classified produce error-severity diagnostics describing what
     /// couldn't be inferred. The per-file `#relaxed` / `#unstrict`
-    /// directive overrides this to `false` for that module. The
-    /// workspace pass propagates the entry module's mode to every
-    /// reachable import so the two halves can't disagree.
+    /// directive overrides this to `false` for that module only —
+    /// strictness is per-module, so the workspace pass analyzes every
+    /// import with this same global default and lets each module's own
+    /// directive decide its effective mode.
     pub strict_mode: bool,
     /// v3++ b-2: when `true`, every `#import` whose path looks remote
     /// (`https://`, `http://`) must carry an inline integrity pin
