@@ -25,11 +25,11 @@
 //! that exposes the relevant children:
 //!
 //! * `Expr::Dict(Dict)` — has `.fields()` iterator.
-//! * `Expr::List(List)` / `Expr::Comprehension(Comprehension)`.
 //! * `Expr::Binary(BinaryExpr)` — `.op_kind()` + `.lhs()` + `.rhs()`.
-//! * `Expr::Call(CallExpr)` — `.callee()` + `.args()`.
 //! * `Expr::Closure(Closure)` — `.params()` + `.body()`.
-//! * ...etc, see the impls below.
+//! * ...etc, see the impls below. Variants whose wrapper carries no
+//!   accessor of its own still expose the generated `cast` /
+//!   `syntax` / `text` surface, which is all their callers use.
 //!
 //! When the underlying `SyntaxKind` is `ERROR` (or any unrecognised
 //! node), `Expr::cast` returns `Expr::Error(ErrorNode)`. Downstream
@@ -282,15 +282,6 @@ impl Directive {
             .find(|t| t.kind() == SyntaxKind::IDENT)
             .map(|t| t.text().to_string())
     }
-
-    /// Direct-child expression(s) of the directive body. For
-    /// `#schema X { ... }` this yields the body dict; for
-    /// `#default 0` it yields the value expression. The number of
-    /// items is shape-dependent and the typed-AST layer above this
-    /// crate decides interpretation.
-    pub fn body_exprs(&self) -> impl Iterator<Item = Expr> + '_ {
-        self.0.children().filter_map(Expr::cast)
-    }
 }
 
 impl Decorator {
@@ -300,16 +291,6 @@ impl Decorator {
             .filter_map(|el| el.into_token())
             .find(|t| t.kind() == SyntaxKind::IDENT)
             .map(|t| t.text().to_string())
-    }
-
-    pub fn args(&self) -> impl Iterator<Item = Expr> + '_ {
-        // CALL_ARG is the child node holding the parens; the args
-        // inside it are the actual expressions.
-        self.0
-            .children()
-            .find(|c| c.kind() == SyntaxKind::CALL_ARG)
-            .into_iter()
-            .flat_map(|n| n.children().filter_map(Expr::cast).collect::<Vec<_>>())
     }
 }
 
@@ -339,69 +320,9 @@ impl DictField {
     }
 }
 
-impl List {
-    pub fn items(&self) -> impl Iterator<Item = Expr> + '_ {
-        self.0.children().filter_map(Expr::cast)
-    }
-}
-
-impl Tuple {
-    /// Element expressions in source order. Empty for the unit tuple `()`.
-    pub fn items(&self) -> impl Iterator<Item = Expr> + '_ {
-        self.0.children().filter_map(Expr::cast)
-    }
-}
-
-impl Comprehension {
-    /// `[ element for id in iterable (if cond)? ]`. Returns the
-    /// inner expressions in their structural roles. Falls back on
-    /// CST-order when a malformed comprehension drops one of them.
-    pub fn parts(&self) -> Vec<Expr> {
-        self.0.children().filter_map(Expr::cast).collect()
-    }
-
-    /// The bound identifier between `for` and `in`. `None` on a
-    /// malformed comprehension.
-    pub fn binding(&self) -> Option<String> {
-        let mut after_for = false;
-        for el in self.0.children_with_tokens() {
-            if let Some(t) = el.as_token() {
-                if t.kind() == SyntaxKind::IDENT {
-                    let s = t.text();
-                    if after_for {
-                        return Some(s.to_string());
-                    }
-                    if s == "for" {
-                        after_for = true;
-                    }
-                }
-            }
-        }
-        None
-    }
-}
-
 impl Closure {
     pub fn params(&self) -> impl Iterator<Item = ClosureParam> + '_ {
         self.0.children().filter_map(ClosureParam::cast)
-    }
-
-    /// Optional return type — `-> Type`. The TYPE_NODE child that
-    /// follows the `->` arrow.
-    pub fn return_type(&self) -> Option<TypeNode> {
-        let mut saw_arrow = false;
-        for el in self.0.children_with_tokens() {
-            if let Some(t) = el.as_token() {
-                if t.kind() == SyntaxKind::THIN_ARROW {
-                    saw_arrow = true;
-                }
-            } else if let Some(n) = el.as_node() {
-                if saw_arrow && n.kind() == SyntaxKind::TYPE_NODE {
-                    return TypeNode::cast(n.clone());
-                }
-            }
-        }
-        None
     }
 
     /// The body expression — everything after `=>` (or after `:`
@@ -438,24 +359,6 @@ impl ClosureParam {
 
     pub fn type_hint(&self) -> Option<TypeNode> {
         self.0.children().find_map(TypeNode::cast)
-    }
-}
-
-impl CallExpr {
-    /// The callee expression (the thing being called). It's the
-    /// first expression child — typically a VARIABLE_EXPR but in
-    /// principle any postfix-able expression.
-    pub fn callee(&self) -> Option<Expr> {
-        self.0.children().find_map(Expr::cast)
-    }
-
-    /// Arguments inside the parens.
-    pub fn args(&self) -> impl Iterator<Item = Expr> + '_ {
-        self.0
-            .children()
-            .find(|c| c.kind() == SyntaxKind::CALL_ARG)
-            .into_iter()
-            .flat_map(|n| n.children().filter_map(Expr::cast).collect::<Vec<_>>())
     }
 }
 
@@ -499,54 +402,6 @@ impl BinaryExpr {
     }
 }
 
-impl UnaryExpr {
-    /// Operator token kind (`MINUS` / `BANG` / `PLUS`).
-    pub fn op_kind(&self) -> Option<SyntaxKind> {
-        self.0
-            .children_with_tokens()
-            .filter_map(|el| el.into_token())
-            .map(|t| t.kind())
-            .find(|k| matches!(k, SyntaxKind::MINUS | SyntaxKind::BANG | SyntaxKind::PLUS))
-    }
-
-    pub fn operand(&self) -> Option<Expr> {
-        self.0.children().find_map(Expr::cast)
-    }
-}
-
-impl TernaryExpr {
-    pub fn cond(&self) -> Option<Expr> {
-        self.0.children().find_map(Expr::cast)
-    }
-
-    pub fn then(&self) -> Option<Expr> {
-        self.0.children().filter_map(Expr::cast).nth(1)
-    }
-
-    pub fn els(&self) -> Option<Expr> {
-        self.0.children().filter_map(Expr::cast).nth(2)
-    }
-}
-
-impl ReferenceExpr {
-    /// Reference base identifier (`root`, `sibling`, `uncle`,
-    /// `this`, `prev`, `next`, `index`). The CST keeps the bare
-    /// IDENT token directly under the node.
-    pub fn base_name(&self) -> Option<String> {
-        self.0
-            .children_with_tokens()
-            .filter_map(|el| el.into_token())
-            .find(|t| t.kind() == SyntaxKind::IDENT)
-            .map(|t| t.text().to_string())
-    }
-
-    /// Whole `&base.x.y` text. Cheap fallback when callers don't
-    /// need to inspect each path segment individually.
-    pub fn path_text(&self) -> String {
-        self.text()
-    }
-}
-
 impl VariableExpr {
     /// Every IDENT-shaped path segment in source order.
     pub fn segments(&self) -> Vec<String> {
@@ -559,77 +414,9 @@ impl VariableExpr {
     }
 }
 
-impl Literal {
-    /// Kind of the underlying literal token. Useful for the
-    /// `true`/`false`/NUMBER/STRING dispatch downstream
-    /// callers need to type-check.
-    pub fn kind(&self) -> Option<SyntaxKind> {
-        self.0
-            .children_with_tokens()
-            .filter_map(|el| el.into_token())
-            .map(|t| t.kind())
-            .find(|k| {
-                matches!(
-                    k,
-                    SyntaxKind::NUMBER | SyntaxKind::STRING | SyntaxKind::IDENT
-                )
-            })
-    }
-
-    /// Verbatim text of the literal token (e.g. `"42"`, `r#""hi""#`,
-    /// `"true"`).
-    pub fn value_text(&self) -> String {
-        self.text()
-    }
-}
-
-impl WhereExpr {
-    /// The leading expression (everything before `where`).
-    pub fn expr(&self) -> Option<Expr> {
-        self.0.children().find_map(Expr::cast)
-    }
-
-    /// The binding dict that follows `where`.
-    pub fn bindings(&self) -> Option<Dict> {
-        self.0.children().filter_map(Dict::cast).next()
-    }
-}
-
 impl MatchExpr {
-    /// The scrutinee (everything before `match`).
-    pub fn scrutinee(&self) -> Option<Expr> {
-        self.0.children().find_map(Expr::cast)
-    }
-
     pub fn arms(&self) -> impl Iterator<Item = MatchArm> + '_ {
         self.0.children().filter_map(MatchArm::cast)
-    }
-}
-
-impl MatchArm {
-    /// Pattern — typically a TYPE_NODE; `*` wildcards parse as
-    /// a [`Wildcard`] child.
-    pub fn pattern(&self) -> Option<Expr> {
-        self.0.children().find_map(Expr::cast)
-    }
-
-    /// Arm body (everything after `:`).
-    pub fn body(&self) -> Option<Expr> {
-        self.0.children().filter_map(Expr::cast).nth(1)
-    }
-}
-
-impl SpreadExpr {
-    /// The inner expression being spread.
-    pub fn inner(&self) -> Option<Expr> {
-        self.0.children().find_map(Expr::cast)
-    }
-}
-
-impl VariantCtor {
-    /// Body dict literal `Enum.Variant { ... }`.
-    pub fn body(&self) -> Option<Dict> {
-        self.0.children().find_map(Dict::cast)
     }
 }
 
@@ -653,56 +440,12 @@ impl FString {
     }
 }
 
-impl FStringInterpolation {
-    /// The inner expression — what gets evaluated and formatted in.
-    pub fn expr(&self) -> Option<Expr> {
-        self.0.children().find_map(Expr::cast)
-    }
-}
-
 /// View of one piece of an [`FString`]. Mirrors `crate::FStringPart`
 /// at the rowan side.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FStringPart {
     Literal(String),
     Interpolation(FStringInterpolation),
-}
-
-impl TypeNode {
-    /// Path segments — `Foo` / `Foo.Bar` / `"foo".Bar`. Returns the
-    /// raw text of each IDENT / STRING token preceding the first
-    /// generic / `?`.
-    pub fn path_text(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for el in self.0.children_with_tokens() {
-            if let Some(t) = el.as_token() {
-                match t.kind() {
-                    SyntaxKind::LT => break,
-                    SyntaxKind::QUESTION => break,
-                    SyntaxKind::DOT => continue,
-                    SyntaxKind::IDENT | SyntaxKind::STRING => out.push(t.text().to_string()),
-                    _ => {}
-                }
-            } else {
-                break;
-            }
-        }
-        out
-    }
-
-    /// Direct-child TYPE_NODEs nested inside this one's generic
-    /// argument list.
-    pub fn generics(&self) -> impl Iterator<Item = TypeNode> + '_ {
-        self.0.children().filter_map(TypeNode::cast)
-    }
-
-    /// `Foo?` — true when the trailing `?` is present.
-    pub fn is_optional(&self) -> bool {
-        self.0
-            .children_with_tokens()
-            .filter_map(|el| el.into_token())
-            .any(|t| t.kind() == SyntaxKind::QUESTION)
-    }
 }
 
 // =====================================================================
@@ -716,10 +459,6 @@ impl TypeNode {
 pub fn document_of(syntax: SyntaxNode) -> Option<Document> {
     Document::cast(syntax)
 }
-
-/// Re-export of [`crate::syntax::SyntaxToken`] for callers who need it but don't
-/// otherwise depend on the `syntax` module.
-pub use crate::syntax::SyntaxToken as _Token;
 
 #[cfg(test)]
 mod tests {
