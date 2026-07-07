@@ -122,82 +122,6 @@ pub fn range_from_offsets(source: &str, start: usize, end: usize) -> TokenRange 
     }
 }
 
-/// Decode the text of a NUMBER token into the corresponding
-/// [`Expr::Int`] / [`Expr::Float`]. Mirrors the byte-identical shape of
-/// the legacy `prim::number::parse_number` combinator, but operates on
-/// a `&str` so we don't drag the winnow stream / Span machinery into
-/// the CST-walking lowering path. Returns `None` when the slice doesn't
-/// form a complete numeric literal (hex overflow, malformed exponent,
-/// trailing bytes) — the CST grammar is supposed to guarantee a
-/// well-formed slice, so this acts as a parity smoke test rather than
-/// an expected failure path.
-fn parse_number_text(text: &str) -> Option<crate::Expr> {
-    use ordered_float::OrderedFloat;
-    // Optional leading sign. The CST tokenizer emits the sign as part
-    // of the NUMBER token text when it stuck (e.g. `-1`, `+0.5`,
-    // `-0x10`), matching the legacy combinator's behaviour.
-    let bytes = text.as_bytes();
-    let (sign, rest) = match bytes.first() {
-        Some(b'+') => (1i64, &text[1..]),
-        Some(b'-') => (-1i64, &text[1..]),
-        _ => (1i64, text),
-    };
-    // Hex / oct / bin first — they have explicit prefixes so the
-    // dispatch is unambiguous.
-    if let Some(hex) = rest.strip_prefix("0x") {
-        if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return None;
-        }
-        let v: u64 = u64::from_str_radix(hex, 16).ok()?;
-        let signed = if sign >= 0 {
-            i64::try_from(v).ok()?
-        } else if v > (i64::MAX as u64) + 1 {
-            return None;
-        } else if v == (i64::MAX as u64) + 1 {
-            i64::MIN
-        } else {
-            -(v as i64)
-        };
-        return Some(crate::Expr::Int(signed));
-    }
-    if let Some(oct) = rest.strip_prefix("0o") {
-        if oct.is_empty() {
-            return None;
-        }
-        let v: i64 = i64::from_str_radix(oct, 8).ok()?;
-        return Some(crate::Expr::Int(v.checked_mul(sign)?));
-    }
-    if let Some(bin) = rest.strip_prefix("0b") {
-        if bin.is_empty() {
-            return None;
-        }
-        let v: i64 = i64::from_str_radix(bin, 2).ok()?;
-        return Some(crate::Expr::Int(v.checked_mul(sign)?));
-    }
-    // Special-named floats — the legacy parser accepted bare
-    // `Infinity` / `NaN` as float literals (with optional sign on
-    // Infinity). The CST tokenizer surfaces these as NUMBER tokens
-    // when they sit in numeric position.
-    if rest == "Infinity" {
-        return Some(crate::Expr::Float(OrderedFloat(if sign == 1 {
-            f64::INFINITY
-        } else {
-            f64::NEG_INFINITY
-        })));
-    }
-    if rest == "NaN" {
-        return Some(crate::Expr::Float(OrderedFloat(f64::NAN)));
-    }
-    // Decimal integer or float. The presence of `.` / `e` / `E` is
-    // the legacy parser's dispatch criterion.
-    if rest.contains('.') || rest.contains('e') || rest.contains('E') {
-        let f: f64 = rest.parse().ok()?;
-        return Some(crate::Expr::Float(OrderedFloat(f * sign as f64)));
-    }
-    let i: i64 = rest.parse().ok()?;
-    Some(crate::Expr::Int(i.checked_mul(sign)?))
-}
-
 /// Decode the text of a STRING token (including its surrounding quotes
 /// or raw-string `r#"..."#` envelope) into the contained Rust
 /// [`String`]. Mirrors the legacy `prim::string::parse_string` /
@@ -389,9 +313,11 @@ fn lower_literal_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
         },
         SyntaxKind::NUMBER => {
             // Numbers carry hex / oct / bin / scientific / Infinity /
-            // NaN parsing — decoded by the leaf `&str` decoder.
+            // NaN parsing — decoded by the shared lexical-layer
+            // decoder (`lex::decode_number_text`), the single source
+            // of truth for numeric-literal syntax.
             let slice = source.get(start..end)?;
-            let expr = parse_number_text(slice)?;
+            let expr = crate::lex::decode_number_text(slice)?;
             Some(Node::new(expr, range))
         }
         SyntaxKind::STRING => {
