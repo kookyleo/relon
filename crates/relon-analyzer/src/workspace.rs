@@ -45,11 +45,12 @@ pub struct WorkspaceTree {
     pub nodes: HashMap<String, Arc<Node>>,
     pub import_graph: HashMap<String, Vec<String>>,
     pub workspace_diagnostics: Vec<WorkspaceDiagnostic>,
-    /// v1.3: `true` when the entry module (or any caller-forwarded
-    /// `AnalyzeOptions::strict_mode`) declared strict mode. Mirrored
-    /// onto every reachable module's `AnalyzedTree::strict_mode` by
-    /// the workspace build pass so contagion is observable from a
-    /// single field.
+    /// v1.3: workspace summary of the *entry module's own* effective
+    /// mode (caller-forwarded `AnalyzeOptions::strict_mode` AND-ed with
+    /// the entry's own `#relaxed` directive). Strictness is per-module:
+    /// imports are analyzed with the unchanged global default and each
+    /// carries its own `AnalyzedTree::strict_mode` — this field does
+    /// not describe them.
     pub strict_mode: bool,
 }
 

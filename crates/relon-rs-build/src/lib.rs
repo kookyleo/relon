@@ -249,9 +249,11 @@ impl Compiler {
         self
     }
 
-    /// Set the optimisation level. Phase 1 only accepts the default
-    /// `-O3` pipeline; the setter exists so consumers can express
-    /// intent today without breaking on the Phase 2 widening.
+    /// Set the optimisation level. **The value is currently ignored**:
+    /// Phase 1 always runs the same `-O3` pipeline regardless of what
+    /// is passed (there is no `-O0`..`-O2` today). The setter exists so
+    /// consumers can express intent without breaking on the Phase 2
+    /// widening that will make the level take effect.
     pub fn opt_level(&mut self, _level: u32) -> &mut Self {
         // Phase 1 ignores the value (pipeline is hard-wired to -O3).
         // The signature accepts a generic level so callers can write
