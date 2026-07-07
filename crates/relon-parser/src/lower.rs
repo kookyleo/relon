@@ -315,12 +315,9 @@ fn parse_raw_string_text(after_r: &str) -> Option<String> {
 }
 
 /// Lower an atom (LITERAL / VARIABLE_EXPR / REFERENCE_EXPR /
-/// WILDCARD) by dispatching to the per-kind CST walkers. The
-/// function name survives from the era when it re-parsed the node's
-/// byte slice through the retired combinator chain; today it is a
-/// plain dispatch table.
+/// WILDCARD) by dispatching to the per-kind CST walkers.
 #[allow(dead_code)]
-fn lower_atom_via_legacy(node: &SyntaxNode, source: &str) -> Option<Node> {
+fn lower_atom_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
     match node.kind() {
         // CST walker — no byte-slice re-parse needed. The CST already
         // carries the typed tokens; we read them off in order and
@@ -3236,10 +3233,10 @@ fn lower_match_pattern_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
 #[allow(dead_code)]
 pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
     match expr {
-        ast::Expr::Literal(lit) => lower_atom_via_legacy(lit.syntax(), source),
-        ast::Expr::Variable(v) => lower_atom_via_legacy(v.syntax(), source),
-        ast::Expr::Reference(r) => lower_atom_via_legacy(r.syntax(), source),
-        ast::Expr::Wildcard(w) => lower_atom_via_legacy(w.syntax(), source),
+        ast::Expr::Literal(lit) => lower_atom_v2(lit.syntax(), source),
+        ast::Expr::Variable(v) => lower_atom_v2(v.syntax(), source),
+        ast::Expr::Reference(r) => lower_atom_v2(r.syntax(), source),
+        ast::Expr::Wildcard(w) => lower_atom_v2(w.syntax(), source),
         // Collections — including typed-spread `type_hint` stamping
         // inside dict entries and standalone `#schema` / `#import` /
         // `#main` directive hoisting onto the dict node.
