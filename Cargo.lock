@@ -2196,6 +2196,7 @@ dependencies = [
  "relon-evaluator",
  "relon-fmt",
  "relon-lsp",
+ "relon-object-cache",
  "relon-parser",
  "serde_json",
  "tempfile",

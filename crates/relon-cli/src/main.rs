@@ -530,6 +530,14 @@ enum Commands {
         files: Vec<PathBuf>,
     },
 
+    /// Inspect or clear the on-disk compiled-artifact cache the
+    /// `auto` / `cranelift-aot` backends populate
+    /// (`$XDG_CACHE_HOME/relon`, falling back to `~/.cache/relon`).
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+
     /// Run the Language Server (stdio transport). Equivalent to the
     /// standalone `relon-lsp` binary; editors that want a single
     /// `relon lsp` command can wire to this.
@@ -543,6 +551,18 @@ enum Commands {
     /// `cargo build --features cli-lsp` (or `--features full`).
     #[cfg(feature = "cli-lsp")]
     Lsp,
+}
+
+/// Actions for `relon cache`.
+#[derive(Subcommand)]
+enum CacheAction {
+    /// Print the cache directory path, per-kind entry counts, and
+    /// total size in bytes.
+    Stats,
+    /// Delete every relon cache artifact (native objects, IR blobs,
+    /// schema blobs). Files the toolchain does not recognise are
+    /// left untouched and reported.
+    Clean,
 }
 
 /// v6-fix-D2-J cold-start: hand-rolled argv fast-path for the
@@ -706,6 +726,7 @@ fn main() -> miette::Result<()> {
         } => {
             run_fmt(check, stdout, files)?;
         }
+        Commands::Cache { action } => cmd_cache(action)?,
         #[cfg(feature = "cli-lsp")]
         Commands::Lsp => {
             relon_lsp::server::run_stdio()
@@ -2459,6 +2480,116 @@ fn cmd_run(command: RunCommand) -> miette::Result<()> {
 
     println!("{}", output);
     phase("println");
+    Ok(())
+}
+
+/// Cache artifact kinds the toolchain writes into the cache
+/// directory. One logical entry is a `<source-sha256>` stem with up
+/// to three files: the linked native object, the legacy IR blob, and
+/// the schema blob. The native suffix comes straight from
+/// `relon-object-cache` (the crate that owns the file format); the
+/// other two from the cranelift integration that writes them.
+const CACHE_ARTIFACT_KINDS: &[(&str, &str)] = &[
+    (relon_object_cache::CACHE_FILE_SUFFIX, "native objects"),
+    (
+        relon_codegen_cranelift::object_cache_integration::IR_CACHE_FILE_SUFFIX,
+        "IR blobs",
+    ),
+    (
+        relon_codegen_cranelift::schema_cache::SCHEMA_CACHE_FILE_SUFFIX,
+        "schema blobs",
+    ),
+];
+
+/// One scan over the cache directory, shared by `stats` and `clean`.
+#[derive(Default)]
+struct CacheScan {
+    /// Recognised artifacts: `(path, size_bytes, kind_index)`.
+    artifacts: Vec<(PathBuf, u64, usize)>,
+    /// Entries (files or subdirectories) that do not carry a known
+    /// relon cache suffix. Never touched by `clean`.
+    unrelated: usize,
+}
+
+fn scan_cache_dir(cache_dir: &Path) -> miette::Result<CacheScan> {
+    let mut scan = CacheScan::default();
+    let entries = match std::fs::read_dir(cache_dir) {
+        Ok(entries) => entries,
+        // A missing directory is an empty cache, not an error — the
+        // backends create it lazily on the first store.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(scan),
+        Err(e) => {
+            return Err(miette::miette!(
+                "failed to read cache directory {}: {e}",
+                cache_dir.display()
+            ));
+        }
+    };
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| miette::miette!("failed to list {}: {e}", cache_dir.display()))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let kind = CACHE_ARTIFACT_KINDS
+            .iter()
+            .position(|(suffix, _)| name.ends_with(suffix));
+        match kind {
+            Some(kind) if path.is_file() => {
+                let size = entry
+                    .metadata()
+                    .map_err(|e| miette::miette!("failed to stat {}: {e}", path.display()))?
+                    .len();
+                scan.artifacts.push((path, size, kind));
+            }
+            _ => scan.unrelated += 1,
+        }
+    }
+    Ok(scan)
+}
+
+fn cmd_cache(action: CacheAction) -> miette::Result<()> {
+    let cache_dir = relon_codegen_cranelift::default_cache_dir();
+    let scan = scan_cache_dir(&cache_dir)?;
+    println!("cache dir: {}", cache_dir.display());
+    match action {
+        CacheAction::Stats => {
+            let mut per_kind = [0usize; CACHE_ARTIFACT_KINDS.len()];
+            let mut total_bytes = 0u64;
+            for (_, size, kind) in &scan.artifacts {
+                per_kind[*kind] += 1;
+                total_bytes += size;
+            }
+            let breakdown: Vec<String> = CACHE_ARTIFACT_KINDS
+                .iter()
+                .zip(per_kind)
+                .map(|((_, label), count)| format!("{count} {label}"))
+                .collect();
+            println!(
+                "entries: {} ({})",
+                scan.artifacts.len(),
+                breakdown.join(", ")
+            );
+            println!("total bytes: {total_bytes}");
+            if scan.unrelated > 0 {
+                println!("unrelated entries (not counted): {}", scan.unrelated);
+            }
+        }
+        CacheAction::Clean => {
+            let mut removed = 0usize;
+            let mut freed = 0u64;
+            for (path, size, _) in &scan.artifacts {
+                std::fs::remove_file(path)
+                    .map_err(|e| miette::miette!("failed to remove {}: {e}", path.display()))?;
+                removed += 1;
+                freed += size;
+            }
+            println!("removed {removed} cache artifact(s), freed {freed} bytes");
+            if scan.unrelated > 0 {
+                println!("unrelated entries left untouched: {}", scan.unrelated);
+            }
+        }
+    }
     Ok(())
 }
 
