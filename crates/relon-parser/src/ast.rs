@@ -620,17 +620,7 @@ mod tests {
         // fields yield the actual value; typed and dynamic keys put
         // an expression-shaped node before the value and `value()`
         // returns that node.
-        let cases: &[(&str, fn(&Expr) -> bool)] = &[
-            ("{ a: 1 }", |e| matches!(e, Expr::Literal(_))),
-            ("{ f(x): x + 1 }", |e| matches!(e, Expr::Closure(_))),
-            // Typed key: the leading TYPE_NODE hint is returned.
-            ("{ Int a: 1 }", |e| matches!(e, Expr::Type(_))),
-            // Typed method shorthand: same — the hint, not the closure.
-            ("{ Int f(Check c): c.pass }", |e| matches!(e, Expr::Type(_))),
-            // Dynamic key: the bracketed key expression is returned.
-            ("{ [k]: 1 }", |e| matches!(e, Expr::Variable(_))),
-        ];
-        for (src, expected) in cases {
+        fn first_value(src: &str) -> Expr {
             let p = parse_cst(src);
             let doc = Document::cast(p.syntax()).unwrap();
             let dict = match doc.root_expr().unwrap() {
@@ -642,8 +632,19 @@ mod tests {
                 .next()
                 .and_then(|f| f.value())
                 .unwrap_or_else(|| panic!("{src}: no value"));
-            assert!(expected(&value), "{src}: unexpected value {value:?}");
+            value
         }
+        assert!(matches!(first_value("{ a: 1 }"), Expr::Literal(_)));
+        assert!(matches!(first_value("{ f(x): x + 1 }"), Expr::Closure(_)));
+        // Typed key: the leading TYPE_NODE hint is returned.
+        assert!(matches!(first_value("{ Int a: 1 }"), Expr::Type(_)));
+        // Typed method shorthand: same — the hint, not the closure.
+        assert!(matches!(
+            first_value("{ Int f(Check c): c.pass }"),
+            Expr::Type(_)
+        ));
+        // Dynamic key: the bracketed key expression is returned.
+        assert!(matches!(first_value("{ [k]: 1 }"), Expr::Variable(_)));
     }
 
     #[test]
