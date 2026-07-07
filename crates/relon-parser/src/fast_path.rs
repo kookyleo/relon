@@ -555,13 +555,12 @@ impl<'a> FastParser<'a> {
         }
         let text = &self.source[start..self.pos];
         self.pos_after_last_token = self.pos;
-        if saw_dot || saw_exp {
-            let v: f64 = text.parse().ok()?;
-            Some(Expr::Float(ordered_float::OrderedFloat(v)))
-        } else {
-            let v: i64 = text.parse().ok()?;
-            Some(Expr::Int(v))
-        }
+        // Decode via the shared lexical-layer decoder so the fast
+        // path can never disagree with the slow path on a literal's
+        // value. The envelope recognised above is decimal-only
+        // (digits, fraction, exponent), a strict subset of what the
+        // decoder accepts.
+        crate::lex::decode_number_text(text)
     }
 
     /// Pratt-style peek: returns `(operator, precedence)` if the next

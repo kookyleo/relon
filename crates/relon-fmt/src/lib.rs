@@ -257,9 +257,9 @@ fn parse_strict(source: &str) -> Result<Document, Error> {
 // MUST go through these primitives so directives/decorators stay
 // glued to their pair.
 //
-// P6 round 3: the walkers operate on raw [`SyntaxNode`]s
-// (rowan-typed CST) rather than the legacy `Node` / `Expr` /
-// `TokenKey` tree. The previous AST-based helpers
+// The walkers operate on raw [`SyntaxNode`]s
+// (rowan-typed CST) rather than the `Node` / `Expr` /
+// `TokenKey` AST. The previous AST-based helpers
 // (`dict_body_range`, `pair_span`, `classify_pair`, ...) are gone —
 // the rowan tree exposes byte ranges directly via `text_range()`,
 // so the brace-finder / scope-trackers from the old layer
@@ -2259,6 +2259,59 @@ mod tests {
             blank_count, 1,
             "expected exactly one blank line in body, got {blank_count}:\n{body}"
         );
+    }
+
+    /// Classify the first dict field of `src` through the tier
+    /// classifier. Helper for the `classify_*` regression tests.
+    fn classify_first_field(src: &str) -> PairTier {
+        let parse = parse_cst(src);
+        let doc = ast::document_of(parse.syntax()).expect("document");
+        let dict = match doc.root_expr().expect("root expr") {
+            ast::Expr::Dict(d) => d,
+            other => panic!("{src}: expected dict root, got {other:?}"),
+        };
+        let field = dict.fields().next().expect("at least one field");
+        classify_dict_field(&field)
+    }
+
+    #[test]
+    fn classify_field_and_method_tiers() {
+        // The four tiers the reorder pass sorts by. Guards the
+        // closure-vs-field detection built on `DictField::value()`.
+        assert_eq!(classify_first_field("{ a: 1 }"), PairTier::PublicField);
+        assert_eq!(
+            classify_first_field("{ f(x): x + 1 }"),
+            PairTier::PublicMethod
+        );
+        assert_eq!(
+            classify_first_field("{ #internal\n a: 1 }"),
+            PairTier::PrivateField
+        );
+        assert_eq!(
+            classify_first_field("{ #internal\n f(x): x + 1 }"),
+            PairTier::PrivateMethod
+        );
+    }
+
+    #[test]
+    fn classify_type_hinted_shapes_pin_current_tiers() {
+        // Type-hinted keys put a TYPE_NODE before the value, and
+        // `DictField::value()` returns the first expression-shaped
+        // child — i.e. the hint, which is never a closure. A plain
+        // typed field therefore classifies correctly...
+        assert_eq!(classify_first_field("{ Int a: 1 }"), PairTier::PublicField);
+        // ...while a type-hinted METHOD also reads as a field. This
+        // pins today's behaviour: reclassifying it as a method would
+        // change tier-sorted output ordering across existing
+        // formatted files, so any future fix must ship with fixture
+        // updates, deliberately.
+        assert_eq!(
+            classify_first_field("{ #internal\n Bool ok(Check c): c.pass }"),
+            PairTier::PrivateField
+        );
+        // Dynamic keys surface the key expression from `value()`;
+        // also never a closure, so they land in the field tiers.
+        assert_eq!(classify_first_field("{ [k]: 1 }"), PairTier::PublicField);
     }
 
     #[test]

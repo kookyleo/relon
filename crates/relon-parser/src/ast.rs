@@ -1,17 +1,21 @@
-//! Typed-AST wrappers over the rowan CST.
+//! Typed wrappers over the rowan CST — the `relon-fmt` support layer.
 //!
-//! P3 of the rowan rewrite. Each wrapper is a transparent tuple struct
-//! around a `SyntaxNode` (or `SyntaxToken`) — there is no extra
-//! allocation, and a wrapper can be obtained from a CST node in
-//! O(1) via `cast(node)` (which returns `None` when the kind doesn't
-//! match).
+//! Positioning (final architecture): the parser has exactly two
+//! output layers. The lossless rowan CST ([`crate::cst`] /
+//! [`crate::syntax`]) serves the formatter, LSP features, and
+//! span-accurate diagnostics; the [`crate::Node`] / [`crate::Expr`]
+//! tree is the official AST that the analyzer, evaluator, and IR
+//! lowering consume. This module is *not* a third semantic layer: it
+//! is a small typed-accessor surface over the CST, consumed by
+//! `relon-fmt` (which formats off the lossless tree) and by the
+//! CST → `Node` lowering in `crate::lower`. It grows accessors only
+//! when those two callers need them. New semantic consumers should
+//! parse via [`crate::parse_document`] and walk [`crate::Node`].
 //!
-//! The wrapper API mirrors the existing token-tree types in
-//! [`crate::token`] (`Node`, `Expr`, `TokenKey`, `Directive`,
-//! `Decorator`, `TypeNode`, etc.) as closely as possible. P4 will
-//! migrate downstream crates (analyzer, evaluator, fmt, wasm, lsp)
-//! by swapping their winnow-based parsing for these wrappers; the
-//! parallel API shape keeps that migration mostly mechanical.
+//! Each wrapper is a transparent tuple struct around a `SyntaxNode`
+//! (or `SyntaxToken`) — there is no extra allocation, and a wrapper
+//! can be obtained from a CST node in O(1) via `cast(node)` (which
+//! returns `None` when the kind doesn't match).
 //!
 //! ## Variant kinds
 //!
@@ -21,11 +25,11 @@
 //! that exposes the relevant children:
 //!
 //! * `Expr::Dict(Dict)` — has `.fields()` iterator.
-//! * `Expr::List(List)` / `Expr::Comprehension(Comprehension)`.
 //! * `Expr::Binary(BinaryExpr)` — `.op_kind()` + `.lhs()` + `.rhs()`.
-//! * `Expr::Call(CallExpr)` — `.callee()` + `.args()`.
 //! * `Expr::Closure(Closure)` — `.params()` + `.body()`.
-//! * ...etc, see the impls below.
+//! * ...etc, see the impls below. Variants whose wrapper carries no
+//!   accessor of its own still expose the generated `cast` /
+//!   `syntax` / `text` surface, which is all their callers use.
 //!
 //! When the underlying `SyntaxKind` is `ERROR` (or any unrecognised
 //! node), `Expr::cast` returns `Expr::Error(ErrorNode)`. Downstream
@@ -141,19 +145,18 @@ ast_node!(Literal, LITERAL);
 ast_node!(ErrorNode, ERROR);
 
 // =====================================================================
-// `Expr` — the top-level typed enum. Mirrors `crate::Expr` plus a new
+// `Expr` — the top-level typed enum. Mirrors `crate::Expr` plus an
 // `Error` variant for partial parses.
 // =====================================================================
 
 /// Typed view over any expression-shaped CST node. Returned by
 /// [`Expr::cast`].
 ///
-/// Note the variant naming follows the CST kinds, not the legacy
-/// [`crate::Expr`] enum — `Literal` covers `true` / `false` / numeric / string atoms uniformly,
-/// plus the removed `null` spelling for diagnostics. The legacy enum split
-/// them into `Bool` / `Int` / `Float` / `String` plus internal `Missing`. Downstream
-/// callers that need the specific literal type read it from
-/// [`Literal::kind`] / [`Literal::value_text`].
+/// Note the variant naming follows the CST kinds, not the
+/// [`crate::Expr`] AST enum — `Literal` covers `true` / `false` /
+/// numeric / string atoms uniformly, plus the removed `null` spelling
+/// for diagnostics, where the AST enum splits them into `Bool` /
+/// `Int` / `Float` / `String` plus internal `Missing`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Expr {
     Literal(Literal),
@@ -245,9 +248,8 @@ impl Expr {
 }
 
 // =====================================================================
-// Per-node accessors. Each wrapper exposes the structural data the
-// downstream typed-AST callers will need, mirroring the existing
-// `Node` / `Expr` API in `token.rs`.
+// Per-node accessors. Each wrapper exposes the structural data its
+// callers (relon-fmt and the CST → `Node` lowering) actually consume.
 // =====================================================================
 
 impl Document {
@@ -280,15 +282,6 @@ impl Directive {
             .find(|t| t.kind() == SyntaxKind::IDENT)
             .map(|t| t.text().to_string())
     }
-
-    /// Direct-child expression(s) of the directive body. For
-    /// `#schema X { ... }` this yields the body dict; for
-    /// `#default 0` it yields the value expression. The number of
-    /// items is shape-dependent and the typed-AST layer above this
-    /// crate decides interpretation.
-    pub fn body_exprs(&self) -> impl Iterator<Item = Expr> + '_ {
-        self.0.children().filter_map(Expr::cast)
-    }
 }
 
 impl Decorator {
@@ -298,16 +291,6 @@ impl Decorator {
             .filter_map(|el| el.into_token())
             .find(|t| t.kind() == SyntaxKind::IDENT)
             .map(|t| t.text().to_string())
-    }
-
-    pub fn args(&self) -> impl Iterator<Item = Expr> + '_ {
-        // CALL_ARG is the child node holding the parens; the args
-        // inside it are the actual expressions.
-        self.0
-            .children()
-            .find(|c| c.kind() == SyntaxKind::CALL_ARG)
-            .into_iter()
-            .flat_map(|n| n.children().filter_map(Expr::cast).collect::<Vec<_>>())
     }
 }
 
@@ -332,50 +315,25 @@ impl DictField {
     /// The value expression. For method-shorthand closure fields
     /// (`key(params): body`) this is the closure; otherwise it's
     /// whatever follows the `:`.
+    ///
+    /// Positional heuristic — returns the FIRST expression-shaped
+    /// child of the DICT_FIELD. Two field shapes put a different
+    /// expression-shaped node before the value, and this method
+    /// returns that node instead:
+    ///
+    /// * typed keys (`Int a: 1`, `Int f(x): body`) — the leading
+    ///   TYPE_NODE hint is itself `Expr`-castable, so `value()`
+    ///   yields `Expr::Type`;
+    /// * dynamic keys (`[k]: 1`) — the bracketed key expression
+    ///   comes first, so `value()` yields the key.
+    ///
+    /// relon-fmt's tier classifier (the only consumer) only asks
+    /// "closure or not", which these shapes answer conservatively —
+    /// a type-hinted method reads as a non-closure; see the pinned
+    /// `classify_*` tests in relon-fmt. Guarded here by
+    /// `dict_field_value_shapes`.
     pub fn value(&self) -> Option<Expr> {
         self.0.children().filter_map(Expr::cast).next()
-    }
-}
-
-impl List {
-    pub fn items(&self) -> impl Iterator<Item = Expr> + '_ {
-        self.0.children().filter_map(Expr::cast)
-    }
-}
-
-impl Tuple {
-    /// Element expressions in source order. Empty for the unit tuple `()`.
-    pub fn items(&self) -> impl Iterator<Item = Expr> + '_ {
-        self.0.children().filter_map(Expr::cast)
-    }
-}
-
-impl Comprehension {
-    /// `[ element for id in iterable (if cond)? ]`. Returns the
-    /// inner expressions in their structural roles. Falls back on
-    /// CST-order when a malformed comprehension drops one of them.
-    pub fn parts(&self) -> Vec<Expr> {
-        self.0.children().filter_map(Expr::cast).collect()
-    }
-
-    /// The bound identifier between `for` and `in`. `None` on a
-    /// malformed comprehension.
-    pub fn binding(&self) -> Option<String> {
-        let mut after_for = false;
-        for el in self.0.children_with_tokens() {
-            if let Some(t) = el.as_token() {
-                if t.kind() == SyntaxKind::IDENT {
-                    let s = t.text();
-                    if after_for {
-                        return Some(s.to_string());
-                    }
-                    if s == "for" {
-                        after_for = true;
-                    }
-                }
-            }
-        }
-        None
     }
 }
 
@@ -384,31 +342,18 @@ impl Closure {
         self.0.children().filter_map(ClosureParam::cast)
     }
 
-    /// Optional return type — `-> Type`. The TYPE_NODE child that
-    /// follows the `->` arrow.
-    pub fn return_type(&self) -> Option<TypeNode> {
-        let mut saw_arrow = false;
-        for el in self.0.children_with_tokens() {
-            if let Some(t) = el.as_token() {
-                if t.kind() == SyntaxKind::THIN_ARROW {
-                    saw_arrow = true;
-                }
-            } else if let Some(n) = el.as_node() {
-                if saw_arrow && n.kind() == SyntaxKind::TYPE_NODE {
-                    return TypeNode::cast(n.clone());
-                }
-            }
-        }
-        None
-    }
-
     /// The body expression — everything after `=>` (or after `:`
     /// for the dict-field method shorthand).
+    ///
+    /// Positional heuristic — the CLOSURE CST shape is
+    /// `CLOSURE_PARAM* TYPE_NODE? <body-expr>`: params first, then
+    /// the optional return TYPE_NODE (from `-> Ret`), then the body
+    /// as the LAST expression child. The walk below skips
+    /// CLOSURE_PARAM and TYPE_NODE children, so a body that is
+    /// itself a bare type expression would be skipped too — no
+    /// caller feeds that shape today. Guarded by
+    /// `closure_body_skips_params_and_return_type` and `match_arms`.
     pub fn body(&self) -> Option<Expr> {
-        // The body is the LAST expression child — both the typed
-        // params (which contain their own TYPE_NODEs) and the
-        // return type sit before it in source order. Filter out
-        // the return TYPE_NODE if it exists.
         let mut last: Option<Expr> = None;
         for child in self.0.children() {
             if child.kind() == SyntaxKind::CLOSURE_PARAM || child.kind() == SyntaxKind::TYPE_NODE {
@@ -436,24 +381,6 @@ impl ClosureParam {
 
     pub fn type_hint(&self) -> Option<TypeNode> {
         self.0.children().find_map(TypeNode::cast)
-    }
-}
-
-impl CallExpr {
-    /// The callee expression (the thing being called). It's the
-    /// first expression child — typically a VARIABLE_EXPR but in
-    /// principle any postfix-able expression.
-    pub fn callee(&self) -> Option<Expr> {
-        self.0.children().find_map(Expr::cast)
-    }
-
-    /// Arguments inside the parens.
-    pub fn args(&self) -> impl Iterator<Item = Expr> + '_ {
-        self.0
-            .children()
-            .find(|c| c.kind() == SyntaxKind::CALL_ARG)
-            .into_iter()
-            .flat_map(|n| n.children().filter_map(Expr::cast).collect::<Vec<_>>())
     }
 }
 
@@ -488,60 +415,17 @@ impl BinaryExpr {
             })
     }
 
+    /// Positional heuristics: a BINARY_EXPR carries exactly its two
+    /// operands as expression-shaped children in source order (the
+    /// operator is a token, never a node), so `lhs` is the first
+    /// expression child and `rhs` the second. Guarded by
+    /// `binary_op_kind` and `binary_rhs_is_second_operand`.
     pub fn lhs(&self) -> Option<Expr> {
         self.0.children().find_map(Expr::cast)
     }
 
     pub fn rhs(&self) -> Option<Expr> {
         self.0.children().filter_map(Expr::cast).nth(1)
-    }
-}
-
-impl UnaryExpr {
-    /// Operator token kind (`MINUS` / `BANG` / `PLUS`).
-    pub fn op_kind(&self) -> Option<SyntaxKind> {
-        self.0
-            .children_with_tokens()
-            .filter_map(|el| el.into_token())
-            .map(|t| t.kind())
-            .find(|k| matches!(k, SyntaxKind::MINUS | SyntaxKind::BANG | SyntaxKind::PLUS))
-    }
-
-    pub fn operand(&self) -> Option<Expr> {
-        self.0.children().find_map(Expr::cast)
-    }
-}
-
-impl TernaryExpr {
-    pub fn cond(&self) -> Option<Expr> {
-        self.0.children().find_map(Expr::cast)
-    }
-
-    pub fn then(&self) -> Option<Expr> {
-        self.0.children().filter_map(Expr::cast).nth(1)
-    }
-
-    pub fn els(&self) -> Option<Expr> {
-        self.0.children().filter_map(Expr::cast).nth(2)
-    }
-}
-
-impl ReferenceExpr {
-    /// Reference base identifier (`root`, `sibling`, `uncle`,
-    /// `this`, `prev`, `next`, `index`). The CST keeps the bare
-    /// IDENT token directly under the node.
-    pub fn base_name(&self) -> Option<String> {
-        self.0
-            .children_with_tokens()
-            .filter_map(|el| el.into_token())
-            .find(|t| t.kind() == SyntaxKind::IDENT)
-            .map(|t| t.text().to_string())
-    }
-
-    /// Whole `&base.x.y` text. Cheap fallback when callers don't
-    /// need to inspect each path segment individually.
-    pub fn path_text(&self) -> String {
-        self.text()
     }
 }
 
@@ -557,77 +441,9 @@ impl VariableExpr {
     }
 }
 
-impl Literal {
-    /// Kind of the underlying literal token. Useful for the
-    /// `true`/`false`/NUMBER/STRING dispatch downstream
-    /// callers need to type-check.
-    pub fn kind(&self) -> Option<SyntaxKind> {
-        self.0
-            .children_with_tokens()
-            .filter_map(|el| el.into_token())
-            .map(|t| t.kind())
-            .find(|k| {
-                matches!(
-                    k,
-                    SyntaxKind::NUMBER | SyntaxKind::STRING | SyntaxKind::IDENT
-                )
-            })
-    }
-
-    /// Verbatim text of the literal token (e.g. `"42"`, `r#""hi""#`,
-    /// `"true"`).
-    pub fn value_text(&self) -> String {
-        self.text()
-    }
-}
-
-impl WhereExpr {
-    /// The leading expression (everything before `where`).
-    pub fn expr(&self) -> Option<Expr> {
-        self.0.children().find_map(Expr::cast)
-    }
-
-    /// The binding dict that follows `where`.
-    pub fn bindings(&self) -> Option<Dict> {
-        self.0.children().filter_map(Dict::cast).next()
-    }
-}
-
 impl MatchExpr {
-    /// The scrutinee (everything before `match`).
-    pub fn scrutinee(&self) -> Option<Expr> {
-        self.0.children().find_map(Expr::cast)
-    }
-
     pub fn arms(&self) -> impl Iterator<Item = MatchArm> + '_ {
         self.0.children().filter_map(MatchArm::cast)
-    }
-}
-
-impl MatchArm {
-    /// Pattern — typically a TYPE_NODE; `*` wildcards parse as
-    /// a [`Wildcard`] child.
-    pub fn pattern(&self) -> Option<Expr> {
-        self.0.children().find_map(Expr::cast)
-    }
-
-    /// Arm body (everything after `:`).
-    pub fn body(&self) -> Option<Expr> {
-        self.0.children().filter_map(Expr::cast).nth(1)
-    }
-}
-
-impl SpreadExpr {
-    /// The inner expression being spread.
-    pub fn inner(&self) -> Option<Expr> {
-        self.0.children().find_map(Expr::cast)
-    }
-}
-
-impl VariantCtor {
-    /// Body dict literal `Enum.Variant { ... }`.
-    pub fn body(&self) -> Option<Dict> {
-        self.0.children().find_map(Dict::cast)
     }
 }
 
@@ -651,56 +467,12 @@ impl FString {
     }
 }
 
-impl FStringInterpolation {
-    /// The inner expression — what gets evaluated and formatted in.
-    pub fn expr(&self) -> Option<Expr> {
-        self.0.children().find_map(Expr::cast)
-    }
-}
-
 /// View of one piece of an [`FString`]. Mirrors `crate::FStringPart`
 /// at the rowan side.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FStringPart {
     Literal(String),
     Interpolation(FStringInterpolation),
-}
-
-impl TypeNode {
-    /// Path segments — `Foo` / `Foo.Bar` / `"foo".Bar`. Returns the
-    /// raw text of each IDENT / STRING token preceding the first
-    /// generic / `?`.
-    pub fn path_text(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for el in self.0.children_with_tokens() {
-            if let Some(t) = el.as_token() {
-                match t.kind() {
-                    SyntaxKind::LT => break,
-                    SyntaxKind::QUESTION => break,
-                    SyntaxKind::DOT => continue,
-                    SyntaxKind::IDENT | SyntaxKind::STRING => out.push(t.text().to_string()),
-                    _ => {}
-                }
-            } else {
-                break;
-            }
-        }
-        out
-    }
-
-    /// Direct-child TYPE_NODEs nested inside this one's generic
-    /// argument list.
-    pub fn generics(&self) -> impl Iterator<Item = TypeNode> + '_ {
-        self.0.children().filter_map(TypeNode::cast)
-    }
-
-    /// `Foo?` — true when the trailing `?` is present.
-    pub fn is_optional(&self) -> bool {
-        self.0
-            .children_with_tokens()
-            .filter_map(|el| el.into_token())
-            .any(|t| t.kind() == SyntaxKind::QUESTION)
-    }
 }
 
 // =====================================================================
@@ -714,10 +486,6 @@ impl TypeNode {
 pub fn document_of(syntax: SyntaxNode) -> Option<Document> {
     Document::cast(syntax)
 }
-
-/// Re-export of [`crate::syntax::SyntaxToken`] for callers who need it but don't
-/// otherwise depend on the `syntax` module.
-pub use crate::syntax::SyntaxToken as _Token;
 
 #[cfg(test)]
 mod tests {
@@ -801,6 +569,82 @@ mod tests {
             }
         }
         assert!(has_lit && has_interp);
+    }
+
+    #[test]
+    fn binary_rhs_is_second_operand() {
+        // Precedence: `1 + 2 * 3` parses as `1 + (2 * 3)`, so the
+        // root BINARY_EXPR's second expression child (rhs) must be
+        // the nested multiplication, not a bare literal. Guards the
+        // positional `nth(1)` heuristic in `rhs()`.
+        let p = parse_cst("1 + 2 * 3");
+        let doc = Document::cast(p.syntax()).unwrap();
+        let bin = match doc.root_expr().unwrap() {
+            Expr::Binary(b) => b,
+            other => panic!("not binary: {other:?}"),
+        };
+        assert_eq!(bin.op_kind(), Some(SyntaxKind::PLUS));
+        assert!(matches!(bin.lhs(), Some(Expr::Literal(_))));
+        let rhs = bin.rhs().expect("rhs present");
+        let nested = match rhs {
+            Expr::Binary(b) => b,
+            other => panic!("rhs should be the nested product: {other:?}"),
+        };
+        assert_eq!(nested.op_kind(), Some(SyntaxKind::STAR));
+    }
+
+    #[test]
+    fn closure_body_skips_params_and_return_type() {
+        // `f(Int a) -> Int: a + 1` — the CLOSURE node carries a
+        // CLOSURE_PARAM, the return TYPE_NODE, and the body. `body()`
+        // must return the trailing binary expression, not the return
+        // type. Guards the last-expression-child heuristic.
+        let p = parse_cst("{ f(Int a) -> Int: a + 1 }");
+        let doc = Document::cast(p.syntax()).unwrap();
+        let dict = match doc.root_expr().unwrap() {
+            Expr::Dict(d) => d,
+            _ => panic!(),
+        };
+        let cls = match dict.fields().next().and_then(|f| f.value()).unwrap() {
+            Expr::Closure(c) => c,
+            other => panic!("not closure: {other:?}"),
+        };
+        assert!(matches!(cls.body(), Some(Expr::Binary(_))));
+    }
+
+    #[test]
+    fn dict_field_value_shapes() {
+        // Pins the first-expression-child behaviour of
+        // `DictField::value()` across the three key shapes it can
+        // meet (see the method doc): plain and method-shorthand
+        // fields yield the actual value; typed and dynamic keys put
+        // an expression-shaped node before the value and `value()`
+        // returns that node.
+        fn first_value(src: &str) -> Expr {
+            let p = parse_cst(src);
+            let doc = Document::cast(p.syntax()).unwrap();
+            let dict = match doc.root_expr().unwrap() {
+                Expr::Dict(d) => d,
+                other => panic!("{src}: not a dict root: {other:?}"),
+            };
+            let value = dict
+                .fields()
+                .next()
+                .and_then(|f| f.value())
+                .unwrap_or_else(|| panic!("{src}: no value"));
+            value
+        }
+        assert!(matches!(first_value("{ a: 1 }"), Expr::Literal(_)));
+        assert!(matches!(first_value("{ f(x): x + 1 }"), Expr::Closure(_)));
+        // Typed key: the leading TYPE_NODE hint is returned.
+        assert!(matches!(first_value("{ Int a: 1 }"), Expr::Type(_)));
+        // Typed method shorthand: same — the hint, not the closure.
+        assert!(matches!(
+            first_value("{ Int f(Check c): c.pass }"),
+            Expr::Type(_)
+        ));
+        // Dynamic key: the bracketed key expression is returned.
+        assert!(matches!(first_value("{ [k]: 1 }"), Expr::Variable(_)));
     }
 
     #[test]

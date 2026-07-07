@@ -14,15 +14,21 @@
 //!   offering features while the user is mid-edit (`#`, `&`, `@`,
 //!   `{a:`, ...).
 //!
-//! Internals:
+//! Representation layers (final architecture):
 //!
-//! * [`cst`] / [`syntax`] — rowan CST, the single source of truth
-//!   for what input the parser accepts.
-//! * [`ast`] — typed wrappers over the CST nodes.
-//! * `lower` — CST → legacy [`Node`] / [`Expr`] / [`TokenKey`]
-//!   tree. The legacy tree is still public because the analyzer and
-//!   evaluator depend on its semantic shape; new consumers should
-//!   prefer the [`ast`] wrappers (cheap, ranged, error-tolerant).
+//! * [`cst`] / [`syntax`] — lossless rowan CST, the single source of
+//!   truth for what input the parser accepts. Every source byte
+//!   (trivia included) is a token, which is what the formatter, LSP
+//!   features, and span-accurate diagnostics need.
+//! * [`Node`] / [`Expr`] / [`TokenKey`] (re-exported from [`token`])
+//!   — the official AST. The analyzer, evaluator, and IR lowering
+//!   all consume this tree, and new semantic consumers should too.
+//! * `lower` — the CST → [`Node`] translation that backs both entry
+//!   points above.
+//! * [`ast`] — thin typed wrappers over CST nodes, kept as a support
+//!   layer for `relon-fmt` (the one consumer that works on the
+//!   lossless tree). It is not a general-purpose AST; see the module
+//!   docs.
 
 #![forbid(unsafe_code)]
 
@@ -31,13 +37,12 @@ pub mod cst;
 pub mod directive;
 pub mod fast_path;
 pub mod lex;
-// `lower` is an implementation detail: it owns the CST → legacy `Node`
+// `lower` is an implementation detail: it owns the CST → `Node`
 // translation that backs `parse_document` / `parse_document_recovering`.
 // Downstream callers should only depend on those entry points (and the
 // resulting `Node` / `Expr` tree); the lowering walker, partial-recovery
-// scope guard, and offset-translation helpers are subject to change as
-// the rowan rewrite continues and are deliberately not part of the
-// public API surface.
+// scope guard, and offset-translation helpers are internal plumbing and
+// deliberately not part of the public API surface.
 pub(crate) mod lower;
 pub mod rewrite;
 pub mod syntax;
@@ -77,15 +82,15 @@ impl ParseDocumentError {
     }
 }
 
-/// Parse a Relon document into the legacy [`Node`] tree.
+/// Parse a Relon document into the [`Node`] AST.
 ///
 /// The entry point routes every call through the rowan CST
 /// ([`cst::parse_cst`]) first, then hands off to
 /// `lower::lower_document` for the typed-tree construction. The
 /// CST is the single source of truth for what input the parser
 /// accepts; downstream consumers (analyzer / evaluator / fmt / wasm
-/// / lsp / cli) keep seeing the same `Node` / `Expr` shape they did
-/// pre-rowan-rewrite. See the `lower` module for the migration design note.
+/// / lsp / cli) all see the same `Node` / `Expr` shape. See the
+/// `lower` module for the design note.
 ///
 /// This is the strict-parsing entry point — any CST error or
 /// lowering failure surfaces as a typed [`ParseDocumentError`]. Use
@@ -117,7 +122,7 @@ pub struct ParsedDocument {
     /// Top-level nodes successfully lowered from the CST. Empty if
     /// the CST root is unrecoverable; otherwise contains as many
     /// partial nodes as the lowering could produce. A clean Relon
-    /// document yields exactly one element — the legacy single-root
+    /// document yields exactly one element — the single-root
     /// `Node` — but the API shape is `Vec<_>` for forward
     /// compatibility with future multi-top-level forms.
     pub nodes: Vec<Node>,

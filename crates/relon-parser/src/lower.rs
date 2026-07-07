@@ -1,29 +1,29 @@
-//! CST → legacy `Node` lowering pass.
+//! CST → `Node` / `Expr` lowering pass.
 //!
-//! P4 of the rowan rewrite. This module routes [`crate::parse_document`]
-//! through the new CST parser ([`crate::cst::parse_cst`]) so the v2
-//! tokenizer + grammar become the single source of truth for what Relon
-//! source the parser accepts. Downstream crates (analyzer, evaluator,
-//! fmt, wasm, lsp) keep consuming the legacy [`crate::Node`] /
-//! [`crate::Expr`] tree exactly as before — this lowering pass is what
-//! makes the swap transparent.
+//! This module routes [`crate::parse_document`] through the rowan CST
+//! parser ([`crate::cst::parse_cst`]) — the single source of truth for
+//! what Relon source the parser accepts — and builds the
+//! [`crate::Node`] / [`crate::Expr`] tree. That tree is the official,
+//! permanent AST: the analyzer, evaluator, and IR lowering all consume
+//! it. ("Legacy" in older comments refers to the tree's *origin* as
+//! the retired winnow-combinator parser's output shape, which this
+//! lowering reproduces byte-identically — not to a deprecation.)
 //!
-//! Design — hybrid CST-walking lowering
-//! ====================================
+//! Design — CST-walking lowering
+//! =============================
 //!
-//! The legacy combinator parser produces a *very* specific `Node` shape:
-//! byte-exact ranges, a particular `NodeId::alloc()` order, doc-comment
-//! attachment rules, decorator/directive interleaving, type-hint
-//! lifting, generic-vs-comparison disambiguation, tuple-type encoding,
-//! enum-variant struct bodies, and a dozen other quirks. Re-implementing
-//! every quirk in a from-scratch CST walker would be a multi-week effort
-//! with a long tail of off-by-one failures.
+//! The `Node` tree has a *very* specific shape: byte-exact ranges, a
+//! particular `NodeId::alloc()` order, doc-comment attachment rules,
+//! decorator/directive interleaving, type-hint lifting,
+//! generic-vs-comparison disambiguation, tuple-type encoding,
+//! enum-variant struct bodies, and a dozen other quirks that
+//! downstream consumers depend on.
 //!
 //! The lowering walks the CST directly: each typed `ast::Expr` /
 //! `ast::Directive` / `ast::Decorator` carries a rowan node whose
 //! `text_range()` is byte-exact, and the lowering converts those
-//! ranges into the legacy `Node` shape (`TokenRange` with line /
-//! column resolved against the full source). All dict / list /
+//! ranges into the `Node` shape (`TokenRange` with line / column
+//! resolved against the full source). All dict / list /
 //! comprehension / binary-precedence / call-arg / closure / match /
 //! variant-ctor / f-string / typed-spread / typed-dynamic-key /
 //! with-block-method / schema-method-param / generic / optional /
@@ -33,33 +33,15 @@
 //! --------
 //!
 //! [`lower_document`] is the entry point invoked by
-//! [`crate::parse_document`]. P5 retired the top-level legacy
-//! combinator fallback — the v2 path is now the single source of
-//! truth for what `parse_document` accepts. When the CST cleanly
-//! accepts the input AND [`lower_document_node_v2`] succeeds, the
-//! new path produces the `Node` tree; any failure (CST errors, or
-//! v2-lowering rejecting a byte-slice) surfaces as a typed
-//! [`ParseDocumentError`] without re-running [`parse_base`].
+//! [`crate::parse_document`]. When the CST cleanly accepts the input
+//! AND [`lower_document_node_v2`] succeeds, this path produces the
+//! `Node` tree; any failure (CST errors, or the lowering rejecting a
+//! sub-tree) surfaces as a typed [`ParseDocumentError`]. There is no
+//! fallback parser — the retired winnow-combinator chain is gone.
 //!
-//! The previously-known CST grammar gaps — `#schema X: { ... }`
-//! colon-separated body, optional-chain `?.` / `?[`, and `#import
-//! { a, b as c } from ...` destructure — are closed in `cst.rs`.
-//! Inputs that historically required the legacy fallback now reach
-//! the v2 path directly.
-//!
-//! [`lower_expr_v2`] dispatches per `ast::Expr` variant. Each variant
-//! routes to either [`lower_atom_via_legacy`] (atoms) or
-//! [`lower_expr_via_legacy`] (every composite construct). The
-//! "via_legacy" naming is historical — these helpers re-run the
-//! per-construct winnow combinator on the CST node's byte slice to
-//! produce the byte-identical legacy `Node` shape. They remain
-//! load-bearing because re-implementing typed-Node construction
-//! directly from rowan walks is P6 territory; the [`legacy_parse`]
-//! retired in P5 was specifically the *top-level* `parse_base`
-//! fallback in [`lower_document`], not the per-construct byte-slice
-//! routes used by `lower_*_v2`. Slice-level comparison tests in
-//! [`tests`] assert per-construct byte-identical parity with the
-//! cfg(test)-only [`legacy_parse`] for every construct family.
+//! [`lower_expr_v2`] dispatches per `ast::Expr` variant; every
+//! construct has its own CST-walking `lower_*_v2` function that
+//! builds the `Node` shape directly off the rowan tree.
 
 use crate::ast;
 use crate::cst::Parse;
@@ -106,61 +88,28 @@ impl Drop for RecoveringScope {
 }
 
 // =====================================================================
-// P6 progress notes
-// =====================================================================
+// CST-walking lowering.
 //
-// P6 round 2 retired every remaining `lower_*_via_legacy` bridge.
-// Each construct now has its own CST-walking lowering function that
-// constructs the legacy `Node` shape directly off the rowan tree.
-// `lower.rs` no longer calls into `expr::parse_expr`,
-// `expr::parse_type_node`, `directive::parse_directive`,
-// `prim::number::parse_number`, or `prim::string::parse_string` for
-// any production. The directive shape lookup
-// (`directive::directive_shape`) and the directive name constants
-// (`DERIVE` / `NATIVE` / `INTERNAL` / `NO_AUTO_DERIVE`) are still
-// imported because they're stable lookup tables used by both the
-// CST builder and the lowering walker; they sit in `directive.rs`
-// purely for backwards-compat re-export to downstream crates
-// (`relon-analyzer`, `relon-evaluator`) and aren't tied to the
-// legacy combinator chain.
+// Each construct lives in its own `lower_*_v2` function ("v2" is the
+// historical name of the CST-walking path; the v1 combinator chain is
+// gone). The functions take a typed `ast::*` wrapper plus the original
+// source text and produce a `Node` byte-identical to what the retired
+// combinator chain used to emit. Construct coverage: atoms (bool
+// inline, NUMBER/STRING leaf decoders, `null` → Missing), variable /
+// reference paths (`walk_path_tokens` w/ builtin-name → Type
+// promotion), spread, list + comprehension, dict + dict_field (typed
+// key, dynamic key, method shorthand, schema-colon rewind, standalone
+// directives), binary / unary / ternary, call
+// (`walk_call_arg_node` w/ named-args check), closure, variant
+// constructor, f-string, match / where, type expr
+// (`lower_type_node_from_cst`), directive (5 shapes + schema
+// with-block).
 //
-//   helper / construct           | status              | notes
-//   -----------------------------|---------------------|--------------------------------------------
-//   atoms                        | done (CST walk)     | bool inline, NUMBER/STRING leaf parser; removed `null` lowers to Missing
-//   variable / reference         | done (CST walk)     | `walk_path_tokens` w/ builtin-name → Type promotion
-//   spread (atomic position)     | done (CST walk)     | `lower_spread_expr_v2`
-//   list + comprehension         | done (CST walk)     | leading directive/decorator collection
-//   dict + dict_field            | done (CST walk)     | typed key, dynamic key, method shorthand,
-//                                |                     |   schema-colon rewind, standalone directives
-//   binary / unary / ternary     | done (CST walk)     | operator table, lhs/rhs recursion
-//   call                         | done (CST walk)     | `walk_call_arg_node` w/ named-args check
-//   closure                      | done (CST walk)     | typed params, return type, body
-//   variant constructor          | done (CST walk)     | dotted path + DICT body
-//   f-string                     | done (CST walk)     | literal-chunk decoder + interpolation walk
-//   match / where                | done (CST walk)     | arm pattern/body pairs, where binding dict
-//   type expr                    | done (CST walk)     | `lower_type_node_from_cst`
-//   directive                    | done (CST walk)     | 5 shapes, schema with-block, name constants
-//
-// The legacy module web (`expr.rs`, `directive.rs` parse paths,
-// `decorator.rs`, `fn_call.rs`, `fmt_string.rs`, `var.rs`,
-// `reference_var.rs`, `prim/*`, `structure/*`) is now unreachable
-// from `lower.rs`. Outside callers in `relon-evaluator/eval_tests.rs`
-// (which uses `parse_expr` directly to drive small-fragment eval
-// tests) and `relon-analyzer` / `relon-evaluator` (which import only
-// the directive-name constants) keep the legacy parse paths alive
-// for now. Full deletion is a separate change once the eval-tests
-// migrate to `parse_document`-shaped inputs.
-
-// =====================================================================
-// CST-walking lowering — P4 implementation.
-//
-// Each construct lives in its own `lower_*_v2` function. The functions
-// take a typed `ast::*` wrapper plus the original source text and
-// produce a legacy `Node` byte-identical to what the combinator chain
-// would emit. The CST gives us the exact byte range; the legacy
-// combinator produces the typed Node shape on the slice; the
-// `translate_*_offsets` helpers below lift slice-local ranges onto
-// the full source.
+// The directive shape lookup (`directive::directive_shape`) and the
+// directive name constants (`DERIVE` / `NATIVE` / `INTERNAL` /
+// `NO_AUTO_DERIVE`) live in `directive.rs`: they're stable lookup
+// tables shared by the CST builder, this lowering walker, and
+// downstream crates (`relon-analyzer`, `relon-evaluator`).
 // =====================================================================
 
 /// Compute a [`TokenRange`] for the byte span `[start, end)` against
@@ -171,82 +120,6 @@ pub fn range_from_offsets(source: &str, start: usize, end: usize) -> TokenRange 
         start: position_at_source(source, start),
         end: position_at_source(source, end),
     }
-}
-
-/// Decode the text of a NUMBER token into the corresponding
-/// [`Expr::Int`] / [`Expr::Float`]. Mirrors the byte-identical shape of
-/// the legacy `prim::number::parse_number` combinator, but operates on
-/// a `&str` so we don't drag the winnow stream / Span machinery into
-/// the CST-walking lowering path. Returns `None` when the slice doesn't
-/// form a complete numeric literal (hex overflow, malformed exponent,
-/// trailing bytes) — the CST grammar is supposed to guarantee a
-/// well-formed slice, so this acts as a parity smoke test rather than
-/// an expected failure path.
-fn parse_number_text(text: &str) -> Option<crate::Expr> {
-    use ordered_float::OrderedFloat;
-    // Optional leading sign. The CST tokenizer emits the sign as part
-    // of the NUMBER token text when it stuck (e.g. `-1`, `+0.5`,
-    // `-0x10`), matching the legacy combinator's behaviour.
-    let bytes = text.as_bytes();
-    let (sign, rest) = match bytes.first() {
-        Some(b'+') => (1i64, &text[1..]),
-        Some(b'-') => (-1i64, &text[1..]),
-        _ => (1i64, text),
-    };
-    // Hex / oct / bin first — they have explicit prefixes so the
-    // dispatch is unambiguous.
-    if let Some(hex) = rest.strip_prefix("0x") {
-        if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return None;
-        }
-        let v: u64 = u64::from_str_radix(hex, 16).ok()?;
-        let signed = if sign >= 0 {
-            i64::try_from(v).ok()?
-        } else if v > (i64::MAX as u64) + 1 {
-            return None;
-        } else if v == (i64::MAX as u64) + 1 {
-            i64::MIN
-        } else {
-            -(v as i64)
-        };
-        return Some(crate::Expr::Int(signed));
-    }
-    if let Some(oct) = rest.strip_prefix("0o") {
-        if oct.is_empty() {
-            return None;
-        }
-        let v: i64 = i64::from_str_radix(oct, 8).ok()?;
-        return Some(crate::Expr::Int(v.checked_mul(sign)?));
-    }
-    if let Some(bin) = rest.strip_prefix("0b") {
-        if bin.is_empty() {
-            return None;
-        }
-        let v: i64 = i64::from_str_radix(bin, 2).ok()?;
-        return Some(crate::Expr::Int(v.checked_mul(sign)?));
-    }
-    // Special-named floats — the legacy parser accepted bare
-    // `Infinity` / `NaN` as float literals (with optional sign on
-    // Infinity). The CST tokenizer surfaces these as NUMBER tokens
-    // when they sit in numeric position.
-    if rest == "Infinity" {
-        return Some(crate::Expr::Float(OrderedFloat(if sign == 1 {
-            f64::INFINITY
-        } else {
-            f64::NEG_INFINITY
-        })));
-    }
-    if rest == "NaN" {
-        return Some(crate::Expr::Float(OrderedFloat(f64::NAN)));
-    }
-    // Decimal integer or float. The presence of `.` / `e` / `E` is
-    // the legacy parser's dispatch criterion.
-    if rest.contains('.') || rest.contains('e') || rest.contains('E') {
-        let f: f64 = rest.parse().ok()?;
-        return Some(crate::Expr::Float(OrderedFloat(f * sign as f64)));
-    }
-    let i: i64 = rest.parse().ok()?;
-    Some(crate::Expr::Int(i.checked_mul(sign)?))
 }
 
 /// Decode the text of a STRING token (including its surrounding quotes
@@ -365,21 +238,10 @@ fn parse_raw_string_text(after_r: &str) -> Option<String> {
     Some(content.to_string())
 }
 
-/// Lower a slice 1 atom (LITERAL / VARIABLE_EXPR / REFERENCE_EXPR /
-/// WILDCARD) directly through the legacy combinator parser, sliced to
-/// the CST node's byte range. The combinator chain already knows how
-/// to produce the exact legacy `Node` shape for these atoms —
-/// re-deriving the same shape from the CST without it would
-/// re-implement number / string / unicode-escape parsing for no win
-/// over the legacy code path (slice 1's goal is structural parity, not
-/// independence from the legacy parser yet).
-///
-/// Note this differs in spirit from a full CST walker: it borrows the
-/// legacy parser as a black-box decoder while the CST guarantees the
-/// span is well-formed. Slices 2+ will replace these one-off calls
-/// with direct CST walks as each family ships.
+/// Lower an atom (LITERAL / VARIABLE_EXPR / REFERENCE_EXPR /
+/// WILDCARD) by dispatching to the per-kind CST walkers.
 #[allow(dead_code)]
-fn lower_atom_via_legacy(node: &SyntaxNode, source: &str) -> Option<Node> {
+fn lower_atom_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
     match node.kind() {
         // CST walker — no byte-slice re-parse needed. The CST already
         // carries the typed tokens; we read them off in order and
@@ -451,16 +313,16 @@ fn lower_literal_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
         },
         SyntaxKind::NUMBER => {
             // Numbers carry hex / oct / bin / scientific / Infinity /
-            // NaN parsing. P6 round 2 inlined the leaf parser here as
-            // a direct `&str` decoder so the prim/ module web can be
-            // deleted later in this round.
+            // NaN parsing — decoded by the shared lexical-layer
+            // decoder (`lex::decode_number_text`), the single source
+            // of truth for numeric-literal syntax.
             let slice = source.get(start..end)?;
-            let expr = parse_number_text(slice)?;
+            let expr = crate::lex::decode_number_text(slice)?;
             Some(Node::new(expr, range))
         }
         SyntaxKind::STRING => {
             // Strings own escape decoding (`\n`, `\u{...}`, raw
-            // `r#"..."#`). P6 round 2 inlined the leaf parser here.
+            // `r#"..."#`) — decoded by the leaf `&str` decoder.
             let slice = source.get(start..end)?;
             let s = parse_string_text(slice)?;
             Some(Node::new(Expr::String(s), range))
@@ -736,9 +598,9 @@ fn trim_leading_trivia(slice: &str) -> usize {
 /// methods walk their own [`SCHEMA_METHOD`] / [`SCHEMA_WITH`] CST
 /// children.
 ///
-/// P6 round 2: replaced the byte-slice route into
-/// `directive::parse_directive`. The CST now drives every shape
-/// directly so the legacy `directive.rs` module web can retire.
+/// Lower a `DIRECTIVE` CST node into the typed [`crate::Directive`]
+/// shape. The CST drives every directive shape directly; the shape
+/// lookup table lives in `directive.rs`.
 #[allow(dead_code)]
 fn lower_directive_v2(dir: &ast::Directive, source: &str) -> Option<crate::Directive> {
     let node = dir.syntax();
@@ -3132,9 +2994,7 @@ fn lower_ternary_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
 
 /// Lower a `WHERE_EXPR` CST node. Shape: `<expr> where <dict>`. The
 /// bindings dict is wrapped in a `Node` whose `Expr::Dict` carries
-/// each binding; the legacy `parse_where` produces the dict via
-/// `parse_dict` (which still goes through `lower_expr_via_legacy` for
-/// the dict body — that bridge retires later in P6 round 2).
+/// each binding.
 fn lower_where_expr_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
     let r = node.text_range();
     let start: usize = r.start().into();
@@ -3292,102 +3152,75 @@ fn lower_match_pattern_v2(node: &SyntaxNode, source: &str) -> Option<Node> {
     ))
 }
 
-/// Try to lower an `ast::Expr` to a legacy `Node` using the CST-walking
-/// path. Returns `None` when the construct is outside the currently-
-/// supported set (caller falls back to the legacy combinator chain).
-///
-/// Slice 1 supports atoms (Literal / Variable / Reference / Wildcard).
-/// Slice 2 adds the structural collections (Dict / List / Spread) plus
-/// Comprehension (which the CST parses inline under the `LIST` kind, so
-/// the dispatch entry for it lives on `List` as well). Composite
-/// non-collection forms (Binary, Call, Closure, ...) still return
-/// `None` until later slices.
+/// Lower an `ast::Expr` to a `Node` by dispatching to the
+/// per-construct CST walkers. Returns `None` when a sub-tree is
+/// malformed (strict callers surface that as a parse error; the
+/// recovering path substitutes placeholders).
 #[allow(dead_code)]
 pub(crate) fn lower_expr_v2(expr: &ast::Expr, source: &str) -> Option<Node> {
     match expr {
-        ast::Expr::Literal(lit) => lower_atom_via_legacy(lit.syntax(), source),
-        ast::Expr::Variable(v) => lower_atom_via_legacy(v.syntax(), source),
-        ast::Expr::Reference(r) => lower_atom_via_legacy(r.syntax(), source),
-        ast::Expr::Wildcard(w) => lower_atom_via_legacy(w.syntax(), source),
-        // Slice 2: collections. The byte-slice route through
-        // `parse_expr` produces the exact legacy shape — including
-        // typed-spread `type_hint` stamping inside dict entries and
-        // standalone `#schema` / `#import` / `#main` directive
-        // hoisting onto the dict node — without re-implementing the
-        // dict / list / spread machinery here.
+        ast::Expr::Literal(lit) => lower_atom_v2(lit.syntax(), source),
+        ast::Expr::Variable(v) => lower_atom_v2(v.syntax(), source),
+        ast::Expr::Reference(r) => lower_atom_v2(r.syntax(), source),
+        ast::Expr::Wildcard(w) => lower_atom_v2(w.syntax(), source),
+        // Collections — including typed-spread `type_hint` stamping
+        // inside dict entries and standalone `#schema` / `#import` /
+        // `#main` directive hoisting onto the dict node.
+        // (Comprehension parses inline under the `LIST` kind, so its
+        // dispatch entry mirrors `List`.)
         ast::Expr::Dict(d) => lower_dict_v2(d.syntax(), source),
         ast::Expr::List(l) => lower_list_v2(l.syntax(), source),
         ast::Expr::Tuple(t) => lower_tuple_v2(t.syntax(), source),
         ast::Expr::Spread(s) => lower_spread_expr_v2(s.syntax(), source),
         ast::Expr::Comprehension(c) => lower_comprehension_v2(c.syntax(), source),
-        // Slice 3: operators + calls. The legacy `parse_expr` already
-        // routes binary precedence (`parse_pipe` → `parse_logic_or`
-        // → ... → `parse_multiplicative`), unary, ternary, and
-        // `parse_fn_call` (with positional + named args) — all reached
-        // from `parse_atomic`. Routing each CST node through it keeps
-        // operator associativity, precedence, and call-arg `name:`
-        // detection byte-identical with no separate token-text → enum
-        // table here.
+        // Operators + calls — operator associativity, precedence, and
+        // call-arg `name:` detection.
         ast::Expr::Binary(b) => lower_binary_expr_v2(b.syntax(), source),
         ast::Expr::Unary(u) => lower_unary_expr_v2(u.syntax(), source),
         ast::Expr::Ternary(t) => lower_ternary_expr_v2(t.syntax(), source),
         ast::Expr::Call(c) => lower_call_expr_v2(c.syntax(), source),
-        // Slice 4: control flow. `Closure`, `Match`, `Where`, and
-        // `VariantCtor` all sit on top of expression-shaped CST nodes
-        // whose byte ranges are accepted verbatim by `parse_expr`.
-        // The closure shape (typed params, optional return type,
-        // body) and match-arm pattern/body pairs round-trip
-        // byte-identically through the legacy chain.
+        // Control flow — closures (typed params, optional return
+        // type, body), match-arm pattern/body pairs, where bindings,
+        // variant constructors.
         ast::Expr::Closure(c) => lower_closure_v2(c.syntax(), source),
         ast::Expr::Match(m) => lower_match_expr_v2(m.syntax(), source),
         ast::Expr::Where(w) => lower_where_expr_v2(w.syntax(), source),
         ast::Expr::VariantCtor(v) => lower_variant_ctor_v2(v.syntax(), source),
-        // Slice 5: f-strings. The CST decomposes an f-string into
+        // F-strings. The CST decomposes an f-string into
         // F_STRING_LITERAL chunks + F_STRING_INTERPOLATION sub-nodes
-        // for IDE highlighting, but the legacy parser keeps it as a
-        // single `Expr::FString(Vec<FStringPart>)`. Routing the
-        // F_STRING node's byte slice through `parse_expr` (which
-        // reaches `parse_fmt_string` via `parse_atomic`) reconstructs
-        // the legacy shape byte-identically — including the literal /
-        // interpolation alternation and nested-expression
-        // `TokenRange`s.
+        // for IDE highlighting; the AST keeps it as a single
+        // `Expr::FString(Vec<FStringPart>)` — the walker reconstructs
+        // the literal / interpolation alternation and
+        // nested-expression `TokenRange`s.
         ast::Expr::FString(fs) => lower_fstring_v2(fs.syntax(), source),
-        // Slice 6: type expressions. The CST emits a bare TYPE_NODE
-        // for `Int`, `List<T>`, `Foo?`, `(T1, T2, ...)` tuple types,
-        // and tagged enum variants at any expression-shaped position.
-        // The legacy parser surfaces these via `parse_type_expr`
-        // (inside `parse_atomic`) as `Expr::Type(TypeNode)`. Routing
-        // the TYPE_NODE byte slice through `parse_expr` preserves the
-        // full TypeNode shape — `path` / `generics` / `is_optional` /
-        // `variant_fields` / `range` / `doc_comment` — byte-
-        // identically.
+        // Type expressions. The CST emits a bare TYPE_NODE for `Int`,
+        // `List<T>`, `Foo?`, `(T1, T2, ...)` tuple types, and tagged
+        // enum variants at any expression-shaped position; these
+        // lower to `Expr::Type(TypeNode)` with the full shape —
+        // `path` / `generics` / `is_optional` / `variant_fields` /
+        // `range` / `doc_comment`.
         ast::Expr::Type(t) => lower_type_expr_v2(t.syntax(), source),
-        // The CST emits an `ERROR` node when recovery happens; we don't
-        // have a legacy `Node` shape for partial parses.
+        // The CST emits an `ERROR` node when recovery happens; there
+        // is no `Node` shape for partial parses.
         ast::Expr::Error(_) => None,
     }
 }
 
-/// Lower a full CST [`ast::Document`] to the outer-wrapped legacy
-/// [`Node`] that downstream consumers expect. Mirrors the body of
-/// [`crate::parse_base`] but reads each piece off the CST instead of
-/// the winnow stream: leading doc-comment from the bytes before the
-/// first attribute / root, every leading directive / decorator via
-/// [`lower_directive_v2`] / [`lower_decorator_v2`], the root
-/// expression via [`lower_expr_v2`].
+/// Lower a full CST [`ast::Document`] to the outer-wrapped
+/// [`Node`] that downstream consumers expect: leading doc-comment
+/// from the bytes before the first attribute / root, every leading
+/// directive / decorator via [`lower_directive_v2`] /
+/// [`lower_decorator_v2`], the root expression via [`lower_expr_v2`].
 ///
-/// Returns `None` only when one of the lowering steps fails — by
-/// construction (`parse_base` accepts the same grammar the CST does)
-/// this shouldn't happen on a well-formed source. The fallback to
-/// [`legacy_parse`] in the slice 8 [`lower_document`] body covers any
-/// future grammar drift between the two paths.
+/// Returns `None` only when one of the lowering steps fails — on a
+/// well-formed source this shouldn't happen; strict callers surface
+/// it as a [`ParseDocumentError`].
 #[allow(dead_code)]
 pub fn lower_document_node_v2(doc: &ast::Document, source: &str) -> Option<Node> {
     // 1. Lower every leading directive + decorator. We capture them in
-    //    source order within each kind — the legacy `parse_attributes`
-    //    interleaves them in the input loop but stores them in two
-    //    ordered Vecs, so a per-kind walk over CST children preserves
-    //    the legacy ordering.
+    //    source order within each kind — the `Node` shape stores them
+    //    in two ordered Vecs, so a per-kind walk over CST children
+    //    preserves the expected ordering.
     let mut decorators: Vec<crate::Decorator> = Vec::new();
     for d in doc.decorators() {
         match lower_decorator_v2(&d, source) {
@@ -3492,25 +3325,22 @@ pub(crate) fn first_real_error(parse: &Parse) -> Option<&crate::cst::ParseError>
     parse.errors.first()
 }
 
-/// Lower a successfully-parsed CST into a legacy [`crate::Node`] tree.
+/// Lower a successfully-parsed CST into a [`crate::Node`] tree.
 ///
-/// P5 (final, post-fallback): the CST is the single source of truth
-/// for what inputs `parse_document` accepts. When the CST cleanly
-/// accepts the input AND [`lower_document_node_v2`] succeeds, this
-/// returns `Ok` with a byte-identical legacy `Node` tree. Any other
-/// outcome — CST errors, v2 lowering failure, an empty document —
-/// surfaces as a typed [`ParseDocumentError`] without re-running
-/// the top-level legacy combinator chain.
+/// The CST is the single source of truth for what inputs
+/// `parse_document` accepts. When the CST cleanly accepts the input
+/// AND [`lower_document_node_v2`] succeeds, this returns `Ok` with
+/// the `Node` tree. Any other outcome — CST errors, lowering
+/// failure, an empty document — surfaces as a typed
+/// [`ParseDocumentError`]; there is no fallback parser.
 ///
 /// Trailing-input errors are surfaced as
-/// [`ParseDocumentError::TrailingInput`] (matching the pre-P4 shape)
-/// with the offset stepped past inter-token trivia so callers see
-/// the legacy span the analyzer / fmt expect.
+/// [`ParseDocumentError::TrailingInput`] with the offset stepped
+/// past inter-token trivia so callers see the span the analyzer /
+/// fmt expect.
 pub fn lower_document(parse: &Parse, source: &str) -> Result<crate::Node, ParseDocumentError> {
-    // Fast path: clean CST + v2 lowering succeeds. The v2 path is the
-    // single source of truth post-P5; the top-level legacy combinator
-    // fallback is gone and any failure inside this branch surfaces as
-    // a typed `ParseDocumentError`.
+    // Fast path: clean CST + lowering succeeds. Any failure inside
+    // this branch surfaces as a typed `ParseDocumentError`.
     if !parse.has_errors() {
         if let Some(doc) = ast::document_of(parse.syntax()) {
             if doc.root_expr().is_none() {
@@ -3522,16 +3352,14 @@ pub fn lower_document(parse: &Parse, source: &str) -> Result<crate::Node, ParseD
             if let Some(node) = lower_document_node_v2(&doc, source) {
                 return Ok(node);
             }
-            // CST accepted the source, but a byte-slice lowering step
-            // (one of the `lower_directive_v2` / `lower_decorator_v2`
-            // sub-parses, or the legacy `parse_expr` on a CST node)
-            // rejected the contents on semantic grounds — e.g. a
-            // `with { ... }` block carrying an unknown pragma, a
-            // `#native` method with a body, or an expression form
-            // the legacy expression combinator stops short of (e.g.
-            // a stray leading `+`). Surface as a parse error at
-            // offset 0; the analyzer surfaces a friendlier
-            // diagnostic downstream.
+            // CST accepted the source, but a lowering step (one of
+            // the `lower_directive_v2` / `lower_decorator_v2` walks,
+            // or a `lower_*_v2` expression walker) rejected the
+            // contents on semantic grounds — e.g. a `with { ... }`
+            // block carrying an unknown pragma, a `#native` method
+            // with a body, or a stray leading `+`. Surface as a
+            // parse error at offset 0; the analyzer surfaces a
+            // friendlier diagnostic downstream.
             return Err(ParseDocumentError::Parse {
                 offset: 0,
                 message: "could not lower well-formed CST to legacy Node".to_string(),

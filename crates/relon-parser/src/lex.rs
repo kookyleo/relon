@@ -9,8 +9,8 @@
 //! ```
 //!
 //! Errors are NEVER returned. An unterminated string / block comment
-//! / unknown byte still gets a token covering the bytes; downstream
-//! parser layers (P2) decide whether to emit a diagnostic. The
+//! / unknown byte still gets a token covering the bytes; the
+//! downstream CST builder decides whether to emit a diagnostic. The
 //! "lexer never fails" contract is the bedrock of error-recovering
 //! parsing — without it, the CST couldn't represent partial input.
 
@@ -329,6 +329,99 @@ fn scan_number(bytes: &[u8], start: usize) -> usize {
     idx
 }
 
+// =====================================================================
+// Numeric-literal decoding.
+//
+// `scan_number` above decides the extent of a NUMBER token; the
+// decoder below turns that token text into the typed value. Keeping
+// both in this file makes the lexical layer the single source of
+// truth for numeric-literal syntax — the CST → `Node` lowering
+// (`lower::lower_literal_v2`) and the cold-start fast path
+// (`fast_path`) both call [`decode_number_text`] instead of
+// maintaining decoders of their own.
+// =====================================================================
+
+/// Decode the text of a numeric literal into the corresponding
+/// [`Expr::Int`] / [`Expr::Float`].
+///
+/// Accepts the shapes [`scan_number`] produces — decimal integers,
+/// floats with a fraction and/or exponent, `0x` / `0o` / `0b` radix
+/// payloads — plus the IDENT-lexed special floats `Infinity` / `NaN`,
+/// optionally preceded by a single `+` / `-` sign. NUMBER tokens never
+/// include a sign themselves (`-1` lexes as MINUS + NUMBER and lowers
+/// as a unary expression); the sign tolerance is for callers that fold
+/// a sign into the literal text.
+///
+/// Returns `None` when the text doesn't form a complete numeric
+/// literal (empty radix payload, hex overflow, malformed exponent,
+/// trailing bytes). Note `scan_number` is slightly more permissive
+/// than the decoder — e.g. it captures an uppercase-prefixed `0X10`
+/// as one NUMBER token so diagnostics cover the whole spelling —
+/// and strict callers surface the decode failure as a parse error.
+pub(crate) fn decode_number_text(text: &str) -> Option<crate::token::Expr> {
+    use crate::token::Expr;
+    use ordered_float::OrderedFloat;
+    let bytes = text.as_bytes();
+    let (sign, rest) = match bytes.first() {
+        Some(b'+') => (1i64, &text[1..]),
+        Some(b'-') => (-1i64, &text[1..]),
+        _ => (1i64, text),
+    };
+    // Hex / oct / bin first — they have explicit prefixes so the
+    // dispatch is unambiguous.
+    if let Some(hex) = rest.strip_prefix("0x") {
+        if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let v: u64 = u64::from_str_radix(hex, 16).ok()?;
+        let signed = if sign >= 0 {
+            i64::try_from(v).ok()?
+        } else if v > (i64::MAX as u64) + 1 {
+            return None;
+        } else if v == (i64::MAX as u64) + 1 {
+            i64::MIN
+        } else {
+            -(v as i64)
+        };
+        return Some(Expr::Int(signed));
+    }
+    if let Some(oct) = rest.strip_prefix("0o") {
+        if oct.is_empty() {
+            return None;
+        }
+        let v: i64 = i64::from_str_radix(oct, 8).ok()?;
+        return Some(Expr::Int(v.checked_mul(sign)?));
+    }
+    if let Some(bin) = rest.strip_prefix("0b") {
+        if bin.is_empty() {
+            return None;
+        }
+        let v: i64 = i64::from_str_radix(bin, 2).ok()?;
+        return Some(Expr::Int(v.checked_mul(sign)?));
+    }
+    // Special-named floats — bare `Infinity` / `NaN` are accepted as
+    // float literals (with optional sign on Infinity). These lex as
+    // IDENT tokens; the CST promotes them into literal position.
+    if rest == "Infinity" {
+        return Some(Expr::Float(OrderedFloat(if sign == 1 {
+            f64::INFINITY
+        } else {
+            f64::NEG_INFINITY
+        })));
+    }
+    if rest == "NaN" {
+        return Some(Expr::Float(OrderedFloat(f64::NAN)));
+    }
+    // Decimal integer or float. The presence of `.` / `e` / `E` is
+    // the float-vs-int dispatch criterion.
+    if rest.contains('.') || rest.contains('e') || rest.contains('E') {
+        let f: f64 = rest.parse().ok()?;
+        return Some(Expr::Float(OrderedFloat(f * sign as f64)));
+    }
+    let i: i64 = rest.parse().ok()?;
+    Some(Expr::Int(i.checked_mul(sign)?))
+}
+
 fn single_char_kind(b: u8) -> Option<SyntaxKind> {
     Some(match b {
         b'{' => SyntaxKind::L_BRACE,
@@ -513,6 +606,119 @@ mod tests {
         assert!(kinds.contains(&SyntaxKind::L_BRACE));
         assert!(kinds.contains(&SyntaxKind::R_BRACE));
         assert_round_trip(src);
+    }
+
+    // -----------------------------------------------------------------
+    // decode_number_text — the single source of truth for turning a
+    // numeric-literal spelling into a typed value. Exercised directly
+    // here (rather than through parse_document) so a decode regression
+    // pins to this function.
+    // -----------------------------------------------------------------
+
+    use crate::token::Expr;
+
+    #[test]
+    fn decode_number_decimal_ints_and_floats() {
+        assert_eq!(decode_number_text("0"), Some(Expr::Int(0)));
+        assert_eq!(decode_number_text("42"), Some(Expr::Int(42)));
+        assert_eq!(
+            decode_number_text("1.5"),
+            Some(Expr::Float(ordered_float::OrderedFloat(1.5)))
+        );
+        assert_eq!(
+            decode_number_text("1e10"),
+            Some(Expr::Float(ordered_float::OrderedFloat(1e10)))
+        );
+        assert_eq!(
+            decode_number_text("1.5e-2"),
+            Some(Expr::Float(ordered_float::OrderedFloat(1.5e-2)))
+        );
+    }
+
+    #[test]
+    fn decode_number_radix_prefixes() {
+        assert_eq!(decode_number_text("0x1F"), Some(Expr::Int(31)));
+        assert_eq!(decode_number_text("0o77"), Some(Expr::Int(63)));
+        assert_eq!(decode_number_text("0b101"), Some(Expr::Int(5)));
+        // Empty payloads are incomplete literals.
+        assert_eq!(decode_number_text("0x"), None);
+        assert_eq!(decode_number_text("0o"), None);
+        assert_eq!(decode_number_text("0b"), None);
+        // The decoder only accepts lowercase prefixes; `scan_number`
+        // captures `0X10` as one NUMBER token for diagnostics, and the
+        // strict lowering surfaces this decode failure as a parse error.
+        assert_eq!(decode_number_text("0X10"), None);
+    }
+
+    #[test]
+    fn decode_number_optional_sign() {
+        // NUMBER tokens never carry a sign (`-1` lexes as MINUS +
+        // NUMBER), but the decoder stays total over signed spellings
+        // for callers that fold the sign into the text.
+        assert_eq!(decode_number_text("+5"), Some(Expr::Int(5)));
+        assert_eq!(decode_number_text("-5"), Some(Expr::Int(-5)));
+        assert_eq!(
+            decode_number_text("-0.5"),
+            Some(Expr::Float(ordered_float::OrderedFloat(-0.5)))
+        );
+        assert_eq!(decode_number_text("-0x10"), Some(Expr::Int(-16)));
+    }
+
+    #[test]
+    fn decode_number_hex_i64_boundaries() {
+        assert_eq!(
+            decode_number_text("0x7FFFFFFFFFFFFFFF"),
+            Some(Expr::Int(i64::MAX))
+        );
+        // One past i64::MAX only fits when negated.
+        assert_eq!(decode_number_text("0x8000000000000000"), None);
+        assert_eq!(
+            decode_number_text("-0x8000000000000000"),
+            Some(Expr::Int(i64::MIN))
+        );
+        // Past u64 range — malformed either way.
+        assert_eq!(decode_number_text("0xFFFFFFFFFFFFFFFF0"), None);
+    }
+
+    #[test]
+    fn decode_number_special_floats() {
+        assert_eq!(
+            decode_number_text("Infinity"),
+            Some(Expr::Float(ordered_float::OrderedFloat(f64::INFINITY)))
+        );
+        assert_eq!(
+            decode_number_text("-Infinity"),
+            Some(Expr::Float(ordered_float::OrderedFloat(f64::NEG_INFINITY)))
+        );
+        assert!(matches!(
+            decode_number_text("NaN"),
+            Some(Expr::Float(f)) if f.is_nan()
+        ));
+    }
+
+    #[test]
+    fn decode_number_rejects_incomplete_spellings() {
+        assert_eq!(decode_number_text(""), None);
+        assert_eq!(decode_number_text("-"), None);
+        assert_eq!(decode_number_text("1e"), None);
+        assert_eq!(decode_number_text("1_2"), None);
+        assert_eq!(decode_number_text("12abc"), None);
+    }
+
+    /// Every NUMBER token produced by the lexer over a representative
+    /// corpus must decode — scanning and decoding agree on the
+    /// (lowercase-prefixed) numeric surface.
+    #[test]
+    fn decode_number_accepts_every_scanned_token() {
+        let src = "0 42 0x1F 0b101 0o77 1.5 1e10 1.5e-2 123456789 0.0001 9e+3";
+        for (kind, text) in lex(src) {
+            if kind == SyntaxKind::NUMBER {
+                assert!(
+                    decode_number_text(text).is_some(),
+                    "scanned NUMBER token failed to decode: {text:?}"
+                );
+            }
+        }
     }
 
     #[test]
