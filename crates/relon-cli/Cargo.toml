@@ -44,6 +44,10 @@ relon-evaluator = { workspace = true }
 relon-eval-api = { workspace = true }
 relon-analyzer = { workspace = true }
 relon-codegen-cranelift = { workspace = true }
+# `relon cache` reads the cache-file suffix constant from the crate
+# that owns the on-disk format (already a transitive dep via the
+# cranelift backend; declared directly for the constant).
+relon-object-cache = { workspace = true }
 relon-fmt = { workspace = true }
 # Phase G.W11 Phase 2: `relon-lsp` only links when the `cli-lsp`
 # feature is on. The standalone `relon-lsp` binary remains the

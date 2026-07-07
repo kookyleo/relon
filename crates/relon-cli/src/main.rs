@@ -191,6 +191,19 @@ impl HostPolicyProfileArg {
     }
 }
 
+/// Output format for `relon check` diagnostics.
+#[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
+enum CheckFormatArg {
+    /// Human-readable miette reports (default).
+    #[default]
+    #[value(name = "human")]
+    Human,
+    /// Machine-readable: a single JSON array of diagnostic objects
+    /// printed to stdout.
+    #[value(name = "json")]
+    Json,
+}
+
 /// Output format for `relon host-policy`.
 #[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
 enum HostPolicyFormatArg {
@@ -351,8 +364,23 @@ enum Commands {
     Run {
         /// The path to the .relon file
         file: PathBuf,
-        /// Pretty-print the output JSON
-        #[arg(short, long, default_value_t = true)]
+        /// Pretty-print the output JSON. On by default; pass
+        /// `--pretty=false` for compact single-line output.
+        ///
+        /// The flag takes an optional inline value (`--pretty` /
+        /// `--pretty=true` / `--pretty=false`). It previously derived
+        /// clap's `SetTrue` action, which combined with the `true`
+        /// default made the flag a no-op — the compact serialization
+        /// branch was unreachable from the command line.
+        #[arg(
+            short,
+            long,
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            require_equals = true,
+            default_value_t = true,
+            default_missing_value = "true"
+        )]
         pretty: bool,
         /// v6-fix-D2 cold-start lite mode. Short-circuits every
         /// startup-side lazy init the default `relon run` path
@@ -460,6 +488,16 @@ enum Commands {
         /// Require remote imports to carry inline hash pins.
         #[arg(long, default_value_t = false)]
         require_hash: bool,
+        /// Diagnostic output format. `human` (default) renders
+        /// miette-style reports. `json` prints a single JSON array of
+        /// diagnostic objects to stdout; each object carries `code`,
+        /// `severity` ("error" | "warning"), `message`, `file`,
+        /// `start` / `end` positions (1-based `line` / `column`
+        /// objects, null when no source position is known) and `help`
+        /// (null when the diagnostic has none). Exit-code semantics
+        /// are identical to human mode: non-zero iff the check fails.
+        #[arg(long, value_enum, default_value_t = CheckFormatArg::Human)]
+        format: CheckFormatArg,
     },
 
     /// Emit host-runtime policy for VM deployments. This is intentionally
@@ -492,6 +530,14 @@ enum Commands {
         files: Vec<PathBuf>,
     },
 
+    /// Inspect or clear the on-disk compiled-artifact cache the
+    /// `auto` / `cranelift-aot` backends populate
+    /// (`$XDG_CACHE_HOME/relon`, falling back to `~/.cache/relon`).
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+
     /// Run the Language Server (stdio transport). Equivalent to the
     /// standalone `relon-lsp` binary; editors that want a single
     /// `relon lsp` command can wire to this.
@@ -505,6 +551,18 @@ enum Commands {
     /// `cargo build --features cli-lsp` (or `--features full`).
     #[cfg(feature = "cli-lsp")]
     Lsp,
+}
+
+/// Actions for `relon cache`.
+#[derive(Subcommand)]
+enum CacheAction {
+    /// Print the cache directory path, per-kind entry counts, and
+    /// total size in bytes.
+    Stats,
+    /// Delete every relon cache artifact (native objects, IR blobs,
+    /// schema blobs). Files the toolchain does not recognise are
+    /// left untouched and reported.
+    Clean,
 }
 
 /// v6-fix-D2-J cold-start: hand-rolled argv fast-path for the
@@ -654,7 +712,8 @@ fn main() -> miette::Result<()> {
             trust,
             max_source_bytes,
             require_hash,
-        } => cmd_check(file, backend, trust, max_source_bytes, require_hash)?,
+            format,
+        } => cmd_check(file, backend, trust, max_source_bytes, require_hash, format)?,
         Commands::HostPolicy {
             target,
             profile,
@@ -667,6 +726,7 @@ fn main() -> miette::Result<()> {
         } => {
             run_fmt(check, stdout, files)?;
         }
+        Commands::Cache { action } => cmd_cache(action)?,
         #[cfg(feature = "cli-lsp")]
         Commands::Lsp => {
             relon_lsp::server::run_stdio()
@@ -1403,6 +1463,7 @@ fn cmd_check(
     trust: bool,
     max_source_bytes: Option<usize>,
     require_hash: bool,
+    format: CheckFormatArg,
 ) -> miette::Result<()> {
     let canonical_file = std::fs::canonicalize(&file)
         .into_diagnostic()
@@ -1433,6 +1494,30 @@ fn cmd_check(
         &mut loader,
         &analyze_options,
     );
+
+    match format {
+        CheckFormatArg::Human => render_check_human(
+            &workspace,
+            &cache_namespace,
+            &content,
+            &file,
+            backend,
+            trust,
+        ),
+        CheckFormatArg::Json => {
+            render_check_json(&workspace, &cache_namespace, &content, backend, trust)
+        }
+    }
+}
+
+fn render_check_human(
+    workspace: &WorkspaceTree,
+    cache_namespace: &str,
+    content: &str,
+    file: &Path,
+    backend: BackendArg,
+    trust: bool,
+) -> miette::Result<()> {
     if workspace.has_errors() {
         let mut messages: Vec<String> = workspace
             .workspace_diagnostics
@@ -1448,66 +1533,251 @@ fn cmd_check(
             }
         }
         let joined = messages.join("\n  - ");
-        return Err(miette::miette!("Analyzer reported errors:\n  - {joined}")
-            .with_source_code(NamedSource::new(file.to_string_lossy(), content)));
+        return Err(
+            miette::miette!("Analyzer reported errors:\n  - {joined}").with_source_code(
+                NamedSource::new(file.to_string_lossy(), content.to_string()),
+            ),
+        );
     }
 
-    let has_main = workspace
-        .modules
-        .get(&cache_namespace)
-        .and_then(|tree| tree.main_signature.as_ref())
-        .is_some();
     println!("ok: analyzer");
-    match backend {
-        BackendArg::TreeWalk => {
-            println!("backend tree-walk: compatible (reference evaluator)");
+    // `--trust` cannot be honoured on the cranelift-AOT backend; the
+    // warning goes to stderr so it never pollutes stdout.
+    if trust && backend == BackendArg::CraneliftAot {
+        warn_trust_unsupported_on_aot();
+    }
+    match backend_compat_verdict(workspace, cache_namespace, content, backend) {
+        BackendCompatVerdict::Compatible(line) => {
+            println!("backend {line}");
             Ok(())
         }
-        BackendArg::CraneliftAot => {
-            if trust {
-                warn_trust_unsupported_on_aot();
+        BackendCompatVerdict::Incompatible(message) => Err(miette::miette!("{message}")),
+    }
+}
+
+fn render_check_json(
+    workspace: &WorkspaceTree,
+    cache_namespace: &str,
+    content: &str,
+    backend: BackendArg,
+    trust: bool,
+) -> miette::Result<()> {
+    let mut entries: Vec<JsonValue> = Vec::new();
+
+    // Workspace-level diagnostics (cycles, missing modules, hash
+    // pins, imported-module parse errors) have no single owning
+    // module; mirror the human renderer, which attaches them to the
+    // entry file's source.
+    for d in &workspace.workspace_diagnostics {
+        let mut entry = check_diagnostic_json(
+            d,
+            d.severity(),
+            d.to_string(),
+            cache_namespace,
+            Some(content),
+        );
+        // An entry-module parse error is recorded with a zero span;
+        // re-parse to recover the real error position, matching the
+        // labelled-span treatment `relon run` gives it.
+        if let WorkspaceDiagnostic::ModuleParseError { path, .. } = d {
+            if path == cache_namespace {
+                if let Err(parse_err) = parse_document(content) {
+                    if let Some(span) = parse_err.source_span() {
+                        entry["start"] = json_position(content, span.offset());
+                        entry["end"] = json_position(content, span.offset() + span.len());
+                    }
+                }
             }
-            check_cranelift_compat(&content, has_main, "cranelift-aot", true)
         }
-        BackendArg::Auto => {
-            if !has_main {
-                println!("backend auto: compatible (library-mode routes to tree-walk)");
-                return Ok(());
-            }
-            if relon::is_trivial_scalar_main(&content) {
-                println!("backend auto: compatible (trivial #main routes to tree-walk)");
-                return Ok(());
-            }
-            check_cranelift_compat(&content, has_main, "auto/cranelift-aot", false)
+        entries.push(entry);
+    }
+
+    // Per-module diagnostics, in sorted module order so the output
+    // is deterministic across runs (`modules` is a hash map).
+    let mut module_ids: Vec<&String> = workspace.modules.keys().collect();
+    module_ids.sort();
+    for id in module_ids {
+        let tree = &workspace.modules[id];
+        let module_source = if id == cache_namespace {
+            Some(content.to_string())
+        } else {
+            // Canonical module ids for filesystem imports are real
+            // paths; built-in `std/*` modules aren't on disk, so
+            // positions degrade to null for them.
+            std::fs::read_to_string(id).ok()
+        };
+        for d in &tree.diagnostics {
+            entries.push(check_diagnostic_json(
+                d,
+                d.severity(),
+                d.to_string(),
+                id,
+                module_source.as_deref(),
+            ));
+        }
+    }
+
+    if workspace.has_errors() {
+        print_check_json(&entries)?;
+        let error_count = workspace.all_error_diagnostics().len();
+        return Err(miette::miette!(
+            "relon check found {error_count} error diagnostic(s); see the JSON output on stdout"
+        ));
+    }
+
+    // Mirror the human renderer: the `--trust`-on-AOT warning fires
+    // only once the analyzer gate passed, and only on stderr.
+    if trust && backend == BackendArg::CraneliftAot {
+        warn_trust_unsupported_on_aot();
+    }
+    match backend_compat_verdict(workspace, cache_namespace, content, backend) {
+        BackendCompatVerdict::Compatible(_) => {
+            print_check_json(&entries)?;
+            Ok(())
+        }
+        BackendCompatVerdict::Incompatible(message) => {
+            entries.push(json!({
+                "code": "relon::check::backend_incompatible",
+                "severity": "error",
+                "message": message,
+                "file": cache_namespace,
+                "start": JsonValue::Null,
+                "end": JsonValue::Null,
+                "help": JsonValue::Null,
+            }));
+            print_check_json(&entries)?;
+            Err(miette::miette!("{message}"))
         }
     }
 }
 
-fn check_cranelift_compat(
+fn print_check_json(entries: &[JsonValue]) -> miette::Result<()> {
+    let rendered = serde_json::to_string_pretty(&entries).into_diagnostic()?;
+    println!("{rendered}");
+    Ok(())
+}
+
+/// One diagnostic rendered as a stable machine-readable object. Both
+/// analyzer [`relon_analyzer::Diagnostic`] and
+/// [`WorkspaceDiagnostic`] implement `miette::Diagnostic`, which is
+/// where `code` / `help` / the labelled span come from; severity and
+/// message are passed in because they come from the inherent
+/// (non-trait) surface of each enum.
+fn check_diagnostic_json(
+    diag: &dyn miette::Diagnostic,
+    severity: relon_analyzer::Severity,
+    message: String,
+    file: &str,
+    source: Option<&str>,
+) -> JsonValue {
+    let code = diag.code().map(|c| c.to_string());
+    let help = diag.help().map(|h| h.to_string());
+    let span = diag
+        .labels()
+        .and_then(|mut labels| labels.next())
+        .map(|label| *label.inner());
+    let (start, end) = match (span, source) {
+        (Some(span), Some(src)) => (
+            json_position(src, span.offset()),
+            json_position(src, span.offset() + span.len()),
+        ),
+        _ => (JsonValue::Null, JsonValue::Null),
+    };
+    json!({
+        "code": code,
+        "severity": match severity {
+            relon_analyzer::Severity::Error => "error",
+            relon_analyzer::Severity::Warning => "warning",
+        },
+        "message": message,
+        "file": file,
+        "start": start,
+        "end": end,
+        "help": help,
+    })
+}
+
+/// Convert a byte offset into a 1-based `{line, column}` object.
+/// Column counts characters (not bytes) since the start of the line;
+/// the offset is clamped onto a char boundary so a span that lands
+/// mid-codepoint cannot panic the slice.
+fn json_position(source: &str, byte_offset: usize) -> JsonValue {
+    let mut offset = byte_offset.min(source.len());
+    while offset > 0 && !source.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let before = &source[..offset];
+    let line = before.bytes().filter(|b| *b == b'\n').count() + 1;
+    let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let column = before[line_start..].chars().count() + 1;
+    json!({ "line": line, "column": column })
+}
+
+/// Backend-compatibility outcome shared by the human and JSON
+/// renderers of `relon check`. `Compatible` carries the line the
+/// human renderer prints after the `backend ` prefix; `Incompatible`
+/// carries the message both renderers surface (human as a miette
+/// error, JSON as a synthetic `relon::check::backend_incompatible`
+/// diagnostic entry).
+enum BackendCompatVerdict {
+    Compatible(String),
+    Incompatible(String),
+}
+
+fn backend_compat_verdict(
+    workspace: &WorkspaceTree,
+    cache_namespace: &str,
+    content: &str,
+    backend: BackendArg,
+) -> BackendCompatVerdict {
+    let has_main = workspace
+        .modules
+        .get(cache_namespace)
+        .and_then(|tree| tree.main_signature.as_ref())
+        .is_some();
+    match backend {
+        BackendArg::TreeWalk => BackendCompatVerdict::Compatible(
+            "tree-walk: compatible (reference evaluator)".to_string(),
+        ),
+        BackendArg::CraneliftAot => {
+            cranelift_compat_verdict(content, has_main, "cranelift-aot", true)
+        }
+        BackendArg::Auto => {
+            if !has_main {
+                return BackendCompatVerdict::Compatible(
+                    "auto: compatible (library-mode routes to tree-walk)".to_string(),
+                );
+            }
+            if relon::is_trivial_scalar_main(content) {
+                return BackendCompatVerdict::Compatible(
+                    "auto: compatible (trivial #main routes to tree-walk)".to_string(),
+                );
+            }
+            cranelift_compat_verdict(content, has_main, "auto/cranelift-aot", false)
+        }
+    }
+}
+
+fn cranelift_compat_verdict(
     content: &str,
     has_main: bool,
     label: &str,
     strict: bool,
-) -> miette::Result<()> {
+) -> BackendCompatVerdict {
     if !has_main {
         let message = format!("{label}: incompatible (cranelift-aot requires `#main(...)`)");
         return if strict {
-            Err(miette::miette!("{message}"))
+            BackendCompatVerdict::Incompatible(message)
         } else {
-            println!("backend {message}; auto will route to tree-walk");
-            Ok(())
+            BackendCompatVerdict::Compatible(format!("{message}; auto will route to tree-walk"))
         };
     }
     match AotEvaluator::from_source(content) {
-        Ok(_) => {
-            println!("backend {label}: compatible");
-            Ok(())
-        }
-        Err(e) if e.is_unsupported_shape() && !strict => {
-            println!("backend {label}: not compiled ({e}); auto will fall back to tree-walk");
-            Ok(())
-        }
-        Err(e) => Err(miette::miette!("{label}: incompatible: {e}")),
+        Ok(_) => BackendCompatVerdict::Compatible(format!("{label}: compatible")),
+        Err(e) if e.is_unsupported_shape() && !strict => BackendCompatVerdict::Compatible(format!(
+            "{label}: not compiled ({e}); auto will fall back to tree-walk"
+        )),
+        Err(e) => BackendCompatVerdict::Incompatible(format!("{label}: incompatible: {e}")),
     }
 }
 
@@ -2210,6 +2480,116 @@ fn cmd_run(command: RunCommand) -> miette::Result<()> {
 
     println!("{}", output);
     phase("println");
+    Ok(())
+}
+
+/// Cache artifact kinds the toolchain writes into the cache
+/// directory. One logical entry is a `<source-sha256>` stem with up
+/// to three files: the linked native object, the legacy IR blob, and
+/// the schema blob. The native suffix comes straight from
+/// `relon-object-cache` (the crate that owns the file format); the
+/// other two from the cranelift integration that writes them.
+const CACHE_ARTIFACT_KINDS: &[(&str, &str)] = &[
+    (relon_object_cache::CACHE_FILE_SUFFIX, "native objects"),
+    (
+        relon_codegen_cranelift::object_cache_integration::IR_CACHE_FILE_SUFFIX,
+        "IR blobs",
+    ),
+    (
+        relon_codegen_cranelift::schema_cache::SCHEMA_CACHE_FILE_SUFFIX,
+        "schema blobs",
+    ),
+];
+
+/// One scan over the cache directory, shared by `stats` and `clean`.
+#[derive(Default)]
+struct CacheScan {
+    /// Recognised artifacts: `(path, size_bytes, kind_index)`.
+    artifacts: Vec<(PathBuf, u64, usize)>,
+    /// Entries (files or subdirectories) that do not carry a known
+    /// relon cache suffix. Never touched by `clean`.
+    unrelated: usize,
+}
+
+fn scan_cache_dir(cache_dir: &Path) -> miette::Result<CacheScan> {
+    let mut scan = CacheScan::default();
+    let entries = match std::fs::read_dir(cache_dir) {
+        Ok(entries) => entries,
+        // A missing directory is an empty cache, not an error — the
+        // backends create it lazily on the first store.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(scan),
+        Err(e) => {
+            return Err(miette::miette!(
+                "failed to read cache directory {}: {e}",
+                cache_dir.display()
+            ));
+        }
+    };
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| miette::miette!("failed to list {}: {e}", cache_dir.display()))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let kind = CACHE_ARTIFACT_KINDS
+            .iter()
+            .position(|(suffix, _)| name.ends_with(suffix));
+        match kind {
+            Some(kind) if path.is_file() => {
+                let size = entry
+                    .metadata()
+                    .map_err(|e| miette::miette!("failed to stat {}: {e}", path.display()))?
+                    .len();
+                scan.artifacts.push((path, size, kind));
+            }
+            _ => scan.unrelated += 1,
+        }
+    }
+    Ok(scan)
+}
+
+fn cmd_cache(action: CacheAction) -> miette::Result<()> {
+    let cache_dir = relon_codegen_cranelift::default_cache_dir();
+    let scan = scan_cache_dir(&cache_dir)?;
+    println!("cache dir: {}", cache_dir.display());
+    match action {
+        CacheAction::Stats => {
+            let mut per_kind = [0usize; CACHE_ARTIFACT_KINDS.len()];
+            let mut total_bytes = 0u64;
+            for (_, size, kind) in &scan.artifacts {
+                per_kind[*kind] += 1;
+                total_bytes += size;
+            }
+            let breakdown: Vec<String> = CACHE_ARTIFACT_KINDS
+                .iter()
+                .zip(per_kind)
+                .map(|((_, label), count)| format!("{count} {label}"))
+                .collect();
+            println!(
+                "entries: {} ({})",
+                scan.artifacts.len(),
+                breakdown.join(", ")
+            );
+            println!("total bytes: {total_bytes}");
+            if scan.unrelated > 0 {
+                println!("unrelated entries (not counted): {}", scan.unrelated);
+            }
+        }
+        CacheAction::Clean => {
+            let mut removed = 0usize;
+            let mut freed = 0u64;
+            for (path, size, _) in &scan.artifacts {
+                std::fs::remove_file(path)
+                    .map_err(|e| miette::miette!("failed to remove {}: {e}", path.display()))?;
+                removed += 1;
+                freed += size;
+            }
+            println!("removed {removed} cache artifact(s), freed {freed} bytes");
+            if scan.unrelated > 0 {
+                println!("unrelated entries left untouched: {}", scan.unrelated);
+            }
+        }
+    }
     Ok(())
 }
 

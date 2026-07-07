@@ -2,6 +2,42 @@
 members = [
     "crates/*",
 ]
+# Contributor-friendly default build set: everything except the four
+# crates that hard-require the LLVM 18 dev toolchain (`inkwell` /
+# `llvm-sys` need a system `llvm-config`). A bare `cargo build` /
+# `cargo test` therefore works on a machine without LLVM installed;
+# CI and `scripts/verify.sh` pass `--workspace` explicitly, so the
+# full graph (including the LLVM backend) stays gated there. The
+# excluded crates and why:
+#   * relon-codegen-llvm — links llvm-sys directly.
+#   * relon-rs-build     — hard dep on relon-codegen-llvm (build.rs AOT).
+#   * relon-rs-demo      — consumes relon-rs-build.
+#   * relon-aot-bench    — consumes relon-rs-build.
+# `relon`, `relon-bench`, and `relon-test-harness` only reach LLVM
+# behind their off-by-default `llvm-aot` feature, so they stay in.
+default-members = [
+    "crates/relon",
+    "crates/relon-abi",
+    "crates/relon-analyzer",
+    "crates/relon-bench",
+    "crates/relon-cap",
+    "crates/relon-cli",
+    "crates/relon-codegen-cranelift",
+    "crates/relon-eval-api",
+    "crates/relon-evaluator",
+    "crates/relon-fmt",
+    "crates/relon-ir",
+    "crates/relon-lsp",
+    "crates/relon-object-cache",
+    "crates/relon-object-link",
+    "crates/relon-parser",
+    "crates/relon-rs-macro",
+    "crates/relon-rs-shims",
+    "crates/relon-test-harness",
+    "crates/relon-unicode",
+    "crates/relon-util",
+    "crates/relon-wasm-bindings",
+]
 resolver = "2"
 
 [workspace.package]

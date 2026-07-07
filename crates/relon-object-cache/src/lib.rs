@@ -41,4 +41,6 @@ pub use error::{CacheError, HmacError, LoaderError};
 pub use hmac::{compute_hmac, ensure_key, hmac_key_path, verify_hmac};
 pub use integrity::IntegrityMode;
 pub use loader::{LoadedObject, ObjectHandle};
-pub use storage::{content_key, load, store, CacheEntry, HostFnImport, Metadata, SignatureHash};
+pub use storage::{
+    content_key, load, store, CacheEntry, HostFnImport, Metadata, SignatureHash, CACHE_FILE_SUFFIX,
+};
