@@ -2,16 +2,20 @@
 //!
 //! Hosts extend Relon's `@name(...)` syntax by implementing
 //! [`DecoratorPlugin`] and registering an instance under the decorator's
-//! full dotted path name. The trait lives in `relon-eval-api` so any
-//! backend implementing [`crate::Evaluator`] can dispatch through it; the
-//! built-in decorators (`#import`, `#schema`, `#ensure`, ...) and any
-//! host-side plugin live in their respective backend / host crates.
+//! full dotted path name. Decorator hooks run *inside* a tree-walk
+//! evaluation, so each hook receives a [`crate::TreeWalkEval`] handle —
+//! the fragment surface (`eval` / `force_thunk` / `invoke_closure`) a
+//! plugin may need to evaluate argument nodes or call closures mid-hook.
+//! The trait lives in `relon-eval-api` so plugins need no dependency on a
+//! backend crate; the built-in decorators (`#import`, `#schema`,
+//! `#ensure`, ...) and any host-side plugin live in their respective
+//! backend / host crates.
 
 use crate::error::RuntimeError;
 use crate::native_fn::EvaluatedArg;
 use crate::scope::Scope;
 use crate::value::{SchemaField, Value};
-use crate::Evaluator;
+use crate::TreeWalkEval;
 use relon_parser::{CallArg, Node, TokenRange};
 use std::sync::Arc;
 
@@ -56,7 +60,7 @@ pub enum PreEvalOutcome {
 pub trait DecoratorPlugin: Send + Sync {
     fn pre_eval(
         &self,
-        _eval: &dyn Evaluator,
+        _eval: &dyn TreeWalkEval,
         _node: &Node,
         _scope: &Arc<Scope>,
         _args: &[CallArg],
@@ -67,7 +71,7 @@ pub trait DecoratorPlugin: Send + Sync {
 
     fn wrap(
         &self,
-        _eval: &dyn Evaluator,
+        _eval: &dyn TreeWalkEval,
         value: Value,
         _scope: &Arc<Scope>,
         _args: &[EvaluatedArg],
@@ -89,7 +93,7 @@ pub trait DecoratorPlugin: Send + Sync {
     /// `Weather` doesn't get resolved to a `Value::Schema` first.
     fn wrap_with_ast(
         &self,
-        _eval: &dyn Evaluator,
+        _eval: &dyn TreeWalkEval,
         _node: &Node,
         _value: &Value,
         _scope: &Arc<Scope>,
@@ -101,7 +105,7 @@ pub trait DecoratorPlugin: Send + Sync {
 
     fn schema_field_meta(
         &self,
-        _eval: &dyn Evaluator,
+        _eval: &dyn TreeWalkEval,
         _field: &mut SchemaField,
         _scope: &Arc<Scope>,
         _args: &[EvaluatedArg],

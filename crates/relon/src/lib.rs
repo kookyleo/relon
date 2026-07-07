@@ -60,16 +60,17 @@ pub use relon_codegen_cranelift::AotEvaluator;
 // `Context` / `parse_document` symbol now take a dep on the
 // downstream crate by name. The canonical data shapes every facade
 // caller actually needs (`Value`, `Scope`, `RuntimeError`) plus the
-// backend-agnostic `Evaluator` trait re-export below so the
-// open-the-box [`EvaluatorBuilder`] path doesn't force a second
-// crate dep just to spell the return / arg types.
+// backend-agnostic `Evaluator` core trait and its tree-walk extension
+// `TreeWalkEval` re-export below so the open-the-box
+// [`EvaluatorBuilder`] path doesn't force a second crate dep just to
+// spell the return / arg types.
 // `CapabilityBit` / `NativeFnGate` ride along because they appear in
 // the builder's own public signatures ([`EvaluatorBuilder::grant`] /
 // [`EvaluatorBuilder::register_native_fn`]): least-privilege hosts
 // must be able to spell a grant and a gate without leaving the facade.
 pub use relon_eval_api::{
     CapabilityBit, Evaluator, NativeFnGate, ResourceBudget, ResourceBudgetProfile, RuntimeError,
-    Scope, Value,
+    Scope, TreeWalkEval, Value,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;

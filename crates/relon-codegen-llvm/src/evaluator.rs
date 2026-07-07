@@ -37,8 +37,7 @@ use inkwell::targets::{
 use inkwell::OptimizationLevel;
 
 use relon_abi::inplace_return::ArenaRegions;
-use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
-use relon_parser::Node;
+use relon_eval_api::{Evaluator, RuntimeError, Scope, Value};
 
 use crate::codegen::{
     emit_fast_entry, emit_module_funcs, emit_module_funcs_closed_world,
@@ -1675,13 +1674,11 @@ pub struct WasmBufferDispatch {
     pub regions: ArenaRegions,
 }
 
+// Only the backend-agnostic core trait: the tree-walk extension surface
+// (`TreeWalkEval`: `eval` / `force_thunk` / `invoke_closure`) needs AST +
+// live-environment access this backend discards at codegen time, so it is
+// deliberately not implemented here.
 impl Evaluator for LlvmAotEvaluator {
-    fn eval(&self, _node: &Node, _scope: &Arc<Scope>) -> Result<Value, RuntimeError> {
-        Err(RuntimeError::Unsupported {
-            reason: "llvm-aot: `eval` is not supported".into(),
-        })
-    }
-
     fn eval_root(&self, _scope: &Arc<Scope>) -> Result<Value, RuntimeError> {
         Err(RuntimeError::Unsupported {
             reason: "llvm-aot: `eval_root` is not supported".into(),
@@ -1722,22 +1719,6 @@ impl Evaluator for LlvmAotEvaluator {
                 Ok(Value::Int(r))
             }
         }
-    }
-
-    fn force_thunk(&self, _thunk: &Arc<Thunk>) -> Result<Value, RuntimeError> {
-        Err(RuntimeError::Unsupported {
-            reason: "llvm-aot: `force_thunk` is not supported".into(),
-        })
-    }
-
-    fn invoke_closure(
-        &self,
-        _closure: &ClosureData,
-        _args: &[Value],
-    ) -> Result<Value, RuntimeError> {
-        Err(RuntimeError::Unsupported {
-            reason: "llvm-aot: `invoke_closure` is not supported".into(),
-        })
     }
 }
 

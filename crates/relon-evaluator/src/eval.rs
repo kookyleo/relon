@@ -3321,10 +3321,6 @@ fn prepare_tree_walk_context(mut context: Arc<Context>) -> Arc<Context> {
 // backends store `Box<dyn relon_eval_api::Evaluator>`; hosts that want
 // to call backend-specific methods keep the concrete type.
 impl relon_eval_api::Evaluator for TreeWalkEvaluator {
-    fn eval(&self, node: &Node, scope: &Arc<Scope>) -> Result<Value, RuntimeError> {
-        TreeWalkEvaluator::eval(self, node, scope)
-    }
-
     fn eval_root(&self, scope: &Arc<Scope>) -> Result<Value, RuntimeError> {
         TreeWalkEvaluator::eval_root(self, scope)
     }
@@ -3332,6 +3328,15 @@ impl relon_eval_api::Evaluator for TreeWalkEvaluator {
     fn run_main(&self, args: HashMap<String, Value>) -> Result<Value, RuntimeError> {
         let scope = Arc::clone(self.empty_scope());
         TreeWalkEvaluator::run_main(self, &scope, args)
+    }
+}
+
+// The tree-walking extension surface: fragment evaluation, thunk
+// forcing and closure invocation all need the live AST + environment
+// this backend keeps around, so it is the canonical implementor.
+impl relon_eval_api::TreeWalkEval for TreeWalkEvaluator {
+    fn eval(&self, node: &Node, scope: &Arc<Scope>) -> Result<Value, RuntimeError> {
+        TreeWalkEvaluator::eval(self, node, scope)
     }
 
     fn force_thunk(&self, thunk: &Arc<Thunk>) -> Result<Value, RuntimeError> {

@@ -26,9 +26,9 @@ use relon_abi::buffer::{BufferBuilder, BufferError};
 use relon_abi::inplace_return::{decode_inplace_return, decode_inplace_sentinel, ArenaRegions};
 use relon_abi::layout::{OffsetTable, SchemaLayout};
 use relon_abi::schema_canonical::{Field, Schema, TypeRepr};
-use relon_eval_api::{ClosureData, Evaluator, RelonFunction, RuntimeError, Scope, Thunk, Value};
+use relon_eval_api::{Evaluator, RelonFunction, RuntimeError, Scope, Value};
 use relon_ir::ir::NativeImport;
-use relon_parser::{Node, TokenRange};
+use relon_parser::TokenRange;
 
 use crate::cache::CacheEntry;
 use crate::codegen::{self, CompiledModule, EntryShape};
@@ -1779,13 +1779,11 @@ fn sandbox_matches(a: &SandboxConfig, b: &SandboxConfig) -> bool {
         && a.div_check == b.div_check
 }
 
+// Only the backend-agnostic core trait: the tree-walk extension surface
+// (`TreeWalkEval`: `eval` / `force_thunk` / `invoke_closure`) needs AST +
+// live-environment access this backend discards at codegen time, so it is
+// deliberately not implemented here.
 impl Evaluator for AotEvaluator {
-    fn eval(&self, _node: &Node, _scope: &Arc<Scope>) -> Result<Value, RuntimeError> {
-        Err(RuntimeError::Unsupported {
-            reason: "cranelift-native AOT backend: `eval` requires AST access; use the tree-walking backend instead".to_string(),
-        })
-    }
-
     fn eval_root(&self, _scope: &Arc<Scope>) -> Result<Value, RuntimeError> {
         Err(RuntimeError::Unsupported {
             reason: "cranelift-native AOT backend: `eval_root` requires AST access; use the tree-walking backend instead".to_string(),
@@ -1814,24 +1812,6 @@ impl Evaluator for AotEvaluator {
         })?;
         let result_i64 = self.invoke_legacy_entry(argv)?;
         Ok(Value::Int(result_i64))
-    }
-
-    fn force_thunk(&self, _thunk: &Arc<Thunk>) -> Result<Value, RuntimeError> {
-        Err(RuntimeError::Unsupported {
-            reason: "cranelift-native AOT backend: thunks are not represented in JIT code"
-                .to_string(),
-        })
-    }
-
-    fn invoke_closure(
-        &self,
-        _closure: &ClosureData,
-        _args: &[Value],
-    ) -> Result<Value, RuntimeError> {
-        Err(RuntimeError::Unsupported {
-            reason: "cranelift-native AOT backend: first-class closures land in v5-beta-2"
-                .to_string(),
-        })
     }
 }
 

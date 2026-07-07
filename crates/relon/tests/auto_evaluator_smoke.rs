@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use relon::{new_evaluator, AutoEvaluator, Backend};
-use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
+use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, TreeWalkEval, Value};
 
 /// A library-mode (no `#main`) script the tree-walker can drive but
 /// the wasm-AOT backend rejects. Useful for verifying `eval_root` /

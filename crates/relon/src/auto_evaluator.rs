@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
+use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, TreeWalkEval, Value};
 use relon_evaluator::TreeWalkEvaluator;
 use relon_parser::{Expr, Node, Operator};
 
@@ -331,13 +331,6 @@ impl AutoEvaluator {
 }
 
 impl Evaluator for AutoEvaluator {
-    fn eval(&self, node: &Node, scope: &Arc<Scope>) -> Result<Value, RuntimeError> {
-        // Tree-walker is the only backend that exposes arbitrary
-        // node evaluation today; routing here keeps `eval` cheap
-        // even if a host later mixes it with `run_main`.
-        self.tree_walk.eval(node, scope)
-    }
-
     fn eval_root(&self, scope: &Arc<Scope>) -> Result<Value, RuntimeError> {
         // Static-config / library-mode path; tree-walker always.
         self.tree_walk.eval_root(scope)
@@ -419,6 +412,18 @@ impl Evaluator for AutoEvaluator {
                 })
             }
         }
+    }
+}
+
+// The auto wrapper embeds a live tree-walker, so it can honour the
+// tree-walk extension surface too — every method routes straight to
+// the embedded interpreter and never touches the AOT slot.
+impl TreeWalkEval for AutoEvaluator {
+    fn eval(&self, node: &Node, scope: &Arc<Scope>) -> Result<Value, RuntimeError> {
+        // Tree-walker is the only backend that exposes arbitrary
+        // node evaluation today; routing here keeps `eval` cheap
+        // even if a host later mixes it with `run_main`.
+        self.tree_walk.eval(node, scope)
     }
 
     fn force_thunk(&self, thunk: &Arc<Thunk>) -> Result<Value, RuntimeError> {
