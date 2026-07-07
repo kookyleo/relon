@@ -351,8 +351,23 @@ enum Commands {
     Run {
         /// The path to the .relon file
         file: PathBuf,
-        /// Pretty-print the output JSON
-        #[arg(short, long, default_value_t = true)]
+        /// Pretty-print the output JSON. On by default; pass
+        /// `--pretty=false` for compact single-line output.
+        ///
+        /// The flag takes an optional inline value (`--pretty` /
+        /// `--pretty=true` / `--pretty=false`). It previously derived
+        /// clap's `SetTrue` action, which combined with the `true`
+        /// default made the flag a no-op — the compact serialization
+        /// branch was unreachable from the command line.
+        #[arg(
+            short,
+            long,
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            require_equals = true,
+            default_value_t = true,
+            default_missing_value = "true"
+        )]
         pretty: bool,
         /// v6-fix-D2 cold-start lite mode. Short-circuits every
         /// startup-side lazy init the default `relon run` path
