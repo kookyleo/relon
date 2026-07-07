@@ -29,7 +29,7 @@ facade 之上的消费方：relon-cli、relon-lsp、relon-wasm-bindings、relon-
 | `relon-util` / `relon-cap` / `relon-unicode` / `relon-object-cache` / `relon-object-link` | 依赖图底部的叶子 crate：对齐 / 标识符工具；analyzer 与 eval-api 共享的 capability 数据类型；Unicode 表 + case folding + glob 匹配；`.o` 编译产物磁盘缓存与本机链接 | `align_up`, `CapabilityBit`, `NativeFnGate`、case-fold / normalize 表、cache 读写 |
 | `relon-parser` | 词法 + 语法 → AST。每个 `Node` 携带 process-wide `NodeId` 用于跨层 side-table | `Node`, `Expr`, `TypeNode`, `Decorator`, `NodeId`, `parse_document` |
 | `relon-analyzer` | 多个 pass（schema / extend / main_sig / modules / resolve / typecheck 等）输出 `AnalyzedTree` 侧表 | `AnalyzedTree`, `SchemaDef`, `ResolvedRef`, `Diagnostic`, `analyze` |
-| `relon-eval-api` | 宿主与求值后端之间的接缝：值模型、宿主配置、沙箱面、以及每个后端都实现的 object-safe `Evaluator` trait。tree-walk 求值器、两个 AOT 后端、wasm 宿主包装共同依赖它 | `Value`, `Scope`, `Thunk`, `RuntimeError`, `Context`, `Capabilities`, `CapabilityGate`, `Evaluator` |
+| `relon-eval-api` | 宿主与求值后端之间的接缝：值模型、宿主配置、沙箱面、以及 object-safe 的求值契约——每个后端都实现的后端无关核心 `Evaluator`（`eval_root` / `run_main`），加上只有树遍历实现才能提供的 `TreeWalkEval` 扩展（`eval` / `force_thunk` / `invoke_closure`）。tree-walk 求值器、两个 AOT 后端、wasm 宿主包装共同依赖它 | `Value`, `Scope`, `Thunk`, `RuntimeError`, `Context`, `Capabilities`, `CapabilityGate`, `Evaluator`, `TreeWalkEval` |
 | `relon-evaluator` | 树遍历求值（全语义面的参照后端）；内建装饰器 / stdlib | `TreeWalkEvaluator`、内建装饰器与 stdlib 注册 |
 | `relon-ir` + `relon-codegen-cranelift` / `relon-codegen-llvm` | AST + 侧表 lowering 为 IR，再把已声明支持的形态 AOT 编译为本机机器码；与 tree-walk 对照验证 | IR module、各编译后端入口 |
 | `relon-abi` | 编译执行面共享的内部 ABI：规范化 wire schema + hash、记录布局偏移表、二进制握手 buffer 的 writer/reader、返回路径校验器、就地返回解码。不是宿主 API——宿主永远不接触它 | `schema_canonical`, `layout`, `buffer`, `verifier`, `inplace_return` |

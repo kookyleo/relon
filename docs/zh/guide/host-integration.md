@@ -671,7 +671,9 @@ ctx.register_decorator("my_org.audit", Arc::new(MyAuditPlugin));
 | `wrap` | 在被装饰节点求值**之后** | 校验、转换（如 `@ensure.int`） |
 | `schema_field_meta` | 从 schema 字典提取字段时 | 给字段挂元数据 |
 
-trait 完整签名见 `crates/relon-evaluator/src/decorator.rs`，这里不抄一遍——大多数宿主只需要 `wrap`。
+每个钩子都会拿到一个 `&dyn TreeWalkEval` 句柄——即树遍历的片段求值面（`eval` / `force_thunk` / `invoke_closure`），插件可以在钩子里对参数节点求值或调用闭包。
+
+trait 完整签名见 `crates/relon-eval-api/src/decorator.rs`，这里不抄一遍——大多数宿主只需要 `wrap`。
 
 ## `Projector`：定制 JSON 输出形态
 
