@@ -315,6 +315,23 @@ impl DictField {
     /// The value expression. For method-shorthand closure fields
     /// (`key(params): body`) this is the closure; otherwise it's
     /// whatever follows the `:`.
+    ///
+    /// Positional heuristic — returns the FIRST expression-shaped
+    /// child of the DICT_FIELD. Two field shapes put a different
+    /// expression-shaped node before the value, and this method
+    /// returns that node instead:
+    ///
+    /// * typed keys (`Int a: 1`, `Int f(x): body`) — the leading
+    ///   TYPE_NODE hint is itself `Expr`-castable, so `value()`
+    ///   yields `Expr::Type`;
+    /// * dynamic keys (`[k]: 1`) — the bracketed key expression
+    ///   comes first, so `value()` yields the key.
+    ///
+    /// relon-fmt's tier classifier (the only consumer) only asks
+    /// "closure or not", which these shapes answer conservatively —
+    /// a type-hinted method reads as a non-closure; see the pinned
+    /// `classify_*` tests in relon-fmt. Guarded here by
+    /// `dict_field_value_shapes`.
     pub fn value(&self) -> Option<Expr> {
         self.0.children().filter_map(Expr::cast).next()
     }
@@ -327,11 +344,16 @@ impl Closure {
 
     /// The body expression — everything after `=>` (or after `:`
     /// for the dict-field method shorthand).
+    ///
+    /// Positional heuristic — the CLOSURE CST shape is
+    /// `CLOSURE_PARAM* TYPE_NODE? <body-expr>`: params first, then
+    /// the optional return TYPE_NODE (from `-> Ret`), then the body
+    /// as the LAST expression child. The walk below skips
+    /// CLOSURE_PARAM and TYPE_NODE children, so a body that is
+    /// itself a bare type expression would be skipped too — no
+    /// caller feeds that shape today. Guarded by
+    /// `closure_body_skips_params_and_return_type` and `match_arms`.
     pub fn body(&self) -> Option<Expr> {
-        // The body is the LAST expression child — both the typed
-        // params (which contain their own TYPE_NODEs) and the
-        // return type sit before it in source order. Filter out
-        // the return TYPE_NODE if it exists.
         let mut last: Option<Expr> = None;
         for child in self.0.children() {
             if child.kind() == SyntaxKind::CLOSURE_PARAM || child.kind() == SyntaxKind::TYPE_NODE {
@@ -393,6 +415,11 @@ impl BinaryExpr {
             })
     }
 
+    /// Positional heuristics: a BINARY_EXPR carries exactly its two
+    /// operands as expression-shaped children in source order (the
+    /// operator is a token, never a node), so `lhs` is the first
+    /// expression child and `rhs` the second. Guarded by
+    /// `binary_op_kind` and `binary_rhs_is_second_operand`.
     pub fn lhs(&self) -> Option<Expr> {
         self.0.children().find_map(Expr::cast)
     }
@@ -542,6 +569,81 @@ mod tests {
             }
         }
         assert!(has_lit && has_interp);
+    }
+
+    #[test]
+    fn binary_rhs_is_second_operand() {
+        // Precedence: `1 + 2 * 3` parses as `1 + (2 * 3)`, so the
+        // root BINARY_EXPR's second expression child (rhs) must be
+        // the nested multiplication, not a bare literal. Guards the
+        // positional `nth(1)` heuristic in `rhs()`.
+        let p = parse_cst("1 + 2 * 3");
+        let doc = Document::cast(p.syntax()).unwrap();
+        let bin = match doc.root_expr().unwrap() {
+            Expr::Binary(b) => b,
+            other => panic!("not binary: {other:?}"),
+        };
+        assert_eq!(bin.op_kind(), Some(SyntaxKind::PLUS));
+        assert!(matches!(bin.lhs(), Some(Expr::Literal(_))));
+        let rhs = bin.rhs().expect("rhs present");
+        let nested = match rhs {
+            Expr::Binary(b) => b,
+            other => panic!("rhs should be the nested product: {other:?}"),
+        };
+        assert_eq!(nested.op_kind(), Some(SyntaxKind::STAR));
+    }
+
+    #[test]
+    fn closure_body_skips_params_and_return_type() {
+        // `f(Int a) -> Int: a + 1` — the CLOSURE node carries a
+        // CLOSURE_PARAM, the return TYPE_NODE, and the body. `body()`
+        // must return the trailing binary expression, not the return
+        // type. Guards the last-expression-child heuristic.
+        let p = parse_cst("{ f(Int a) -> Int: a + 1 }");
+        let doc = Document::cast(p.syntax()).unwrap();
+        let dict = match doc.root_expr().unwrap() {
+            Expr::Dict(d) => d,
+            _ => panic!(),
+        };
+        let cls = match dict.fields().next().and_then(|f| f.value()).unwrap() {
+            Expr::Closure(c) => c,
+            other => panic!("not closure: {other:?}"),
+        };
+        assert!(matches!(cls.body(), Some(Expr::Binary(_))));
+    }
+
+    #[test]
+    fn dict_field_value_shapes() {
+        // Pins the first-expression-child behaviour of
+        // `DictField::value()` across the three key shapes it can
+        // meet (see the method doc): plain and method-shorthand
+        // fields yield the actual value; typed and dynamic keys put
+        // an expression-shaped node before the value and `value()`
+        // returns that node.
+        let cases: &[(&str, fn(&Expr) -> bool)] = &[
+            ("{ a: 1 }", |e| matches!(e, Expr::Literal(_))),
+            ("{ f(x): x + 1 }", |e| matches!(e, Expr::Closure(_))),
+            // Typed key: the leading TYPE_NODE hint is returned.
+            ("{ Int a: 1 }", |e| matches!(e, Expr::Type(_))),
+            // Typed method shorthand: same — the hint, not the closure.
+            ("{ Int f(Check c): c.pass }", |e| matches!(e, Expr::Type(_))),
+            // Dynamic key: the bracketed key expression is returned.
+            ("{ [k]: 1 }", |e| matches!(e, Expr::Variable(_))),
+        ];
+        for (src, expected) in cases {
+            let p = parse_cst(src);
+            let doc = Document::cast(p.syntax()).unwrap();
+            let dict = match doc.root_expr().unwrap() {
+                Expr::Dict(d) => d,
+                other => panic!("{src}: not a dict root: {other:?}"),
+            };
+            let value = dict
+                .fields()
+                .next()
+                .and_then(|f| f.value())
+                .unwrap_or_else(|| panic!("{src}: no value"));
+            assert!(expected(&value), "{src}: unexpected value {value:?}");
+        }
     }
 
     #[test]
