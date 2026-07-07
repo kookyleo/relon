@@ -80,7 +80,7 @@ pub struct EmittedField {
 /// for the master contract. **Adding a variant here means**: (1) add
 /// the matching [`ArgValue`] / [`RetValue`] variant; (2) add the
 /// `pack_<type>` / `unpack_<type>` sibling helper used by
-/// [`call_buffer_entry`] + extend [`ty_to_repr`] / [`synthesise_layout`];
+/// [`call_buffer_entry`] + extend `ty_to_repr` / `synthesise_layout`;
 /// (3) widen codegen-llvm's `emitted_field_type_for` + the build
 /// generator's `rust_type_for`; (4) extend the cross-crate round-trip
 /// guard test (`relon-rs-build/tests/marshal_roundtrip.rs`).

@@ -92,7 +92,7 @@ pub enum VtableSlot {
     /// Dynamic host-fn dispatch for source-lowered `Op::CallNative`
     /// whose `cap_bit` is `NO_CAPABILITY_BIT`. Resolves the
     /// `Arc<dyn RelonFunction>` registered at `import_idx`, packs the
-    /// scalar args, and invokes it. See [`SandboxState::call_native`].
+    /// scalar args, and invokes it. See `SandboxState::call_native`.
     RelonCallNative = 4,
     /// Wave B (Float rendering): `extern "C" fn(state: *const
     /// SandboxState, bits: i64, dest_off: i32) -> i32`.

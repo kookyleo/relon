@@ -22,6 +22,7 @@ run() {
 run cargo fmt --all -- --check
 run cargo build --workspace --all-targets
 run cargo clippy --workspace --all-targets -- -D warnings
+run env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features remote-http
 run cargo test --workspace
 run cargo run -q -p relon-fmt -- --check \
     fixtures/*.relon fixtures/modules/*.relon fixtures/errors/*.relon \

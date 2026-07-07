@@ -194,7 +194,7 @@ const F64_TO_STR_MAX_PAYLOAD: usize = 352;
 ///
 /// On success writes `[len: u32 LE][utf8 payload]` at `dest` and
 /// returns the payload length. Returns `-1` on a null `dest` or a
-/// payload exceeding [`F64_TO_STR_MAX_PAYLOAD`] (unreachable for real
+/// payload exceeding `F64_TO_STR_MAX_PAYLOAD` (unreachable for real
 /// IEEE-754 doubles); the emitted code traps loudly on a negative
 /// return instead of consuming a corrupt record.
 ///

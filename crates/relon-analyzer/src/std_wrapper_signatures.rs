@@ -6,7 +6,7 @@
 //! ordinary `.relon` closures — e.g. `sum(l): l | _list_reduce(0, ...)`
 //! — authored under `#relaxed` with **no return annotation**. The
 //! closure-signature extractor
-//! ([`crate::typecheck::helpers::extract_closure_signature`]) defaults
+//! (`crate::typecheck::helpers::extract_closure_signature`) defaults
 //! an un-annotated return to `Any`, so every call through the public
 //! surface (`#import list from "std/list"; Int t: list.sum(xs)`)
 //! collapses to `Any` and silently short-circuits the caller's typed
@@ -26,7 +26,7 @@
 //! The signatures reuse the same generic machinery as
 //! [`crate::stdlib_signatures`]: `<T>`/`<U>` placeholders in `List<T>`,
 //! `Closure<T, U>`, etc. are bound at the call site by
-//! [`crate::generics::collect_bindings`] and substituted into the
+//! `crate::generics::collect_bindings` and substituted into the
 //! return slot by [`crate::sig::instantiate`]. This mirrors the native
 //! intrinsics each wrapper forwards to (`_list_map`, `_list_reduce`, …)
 //! so a wrapper call types identically to the intrinsic it wraps.

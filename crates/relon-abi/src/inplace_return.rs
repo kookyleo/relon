@@ -9,7 +9,7 @@
 //!
 //! 1. recovers `root_abs` from the sentinel ([`decode_inplace_sentinel`]),
 //! 2. selects the arena region `root_abs` lands in,
-//! 3. runs the bounds [`verify_value_at`] over the whole reachable graph
+//! 3. runs the bounds [`crate::verifier::verify_value_at`] over the whole reachable graph
 //!    confined to that region — **a verify failure aborts the decode**,
 //! 4. only on a clean verify decodes the value in place via the matching
 //!    positional reader (`read_list_list_at` / `read_list_string_at` /
@@ -345,7 +345,7 @@ pub fn verify_object_return_multi(
 /// return-schema field is decoded directly, otherwise the whole record is
 /// drained into a branded dict.
 ///
-/// The decode walks the shared [`read_object_field`] / [`BufferReader`]
+/// The decode walks the shared `read_object_field` / [`BufferReader`]
 /// path for both backends, so the produced [`Value`] is byte-identical
 /// regardless of which AOT backend invoked it.
 #[allow(clippy::too_many_arguments)]

@@ -1047,7 +1047,7 @@ impl<'a> BufferBuilder<'a> {
     /// point, so it bakes it into every slot here once, and the machine
     /// code's param-read drops its old `+ in_ptr` rebase (the slot is
     /// already arena-absolute). The same recursive walk
-    /// [`finish_sub_record`] uses to paste a child into a parent applies
+    /// [`Self::finish_sub_record`] uses to paste a child into a parent applies
     /// — a rebase by `arena_base` is structurally identical to a paste at
     /// `arena_base`, relocating every nested-schema and pointer-array
     /// entry too. `arena_base == 0` is a no-op (the slots are already
@@ -2779,14 +2779,14 @@ impl<'a> BufferReader<'a> {
     /// code reports the arena-relative offset of the outer
     /// `[len][off_0]…[off_{N-1}]` header, the host rebases it to
     /// `header_off`, and — after the verifier certifies the whole graph
-    /// stays in-region — this walks the same bytes [`read_list_string`]
+    /// stays in-region — this walks the same bytes [`Self::read_list_string`]
     /// would, so a top-level (field-slot) and an in-place decode of the
     /// same buffer are byte-identical, including each string's content.
     ///
     /// Every offset / length is bounds-checked against the buffer end
     /// before any read (the verifier already proved the tighter
     /// single-region bound); a non-UTF-8 payload is a loud error, matching
-    /// [`read_list_string`] and the `Value::String` invariant (Relon
+    /// [`Self::read_list_string`] and the `Value::String` invariant (Relon
     /// strings are always valid UTF-8).
     pub fn read_list_string_at(&self, header_off: usize) -> Result<Vec<&'a str>, BufferError> {
         // Header: `[len: u32][off_0]…`. `entries_start = header_off + 4`.
@@ -3681,7 +3681,7 @@ impl<'a> BufferReader<'a> {
     /// graph, and only then calls this to decode in place. `inner` is the
     /// innermost scalar element type (`Int` / `Float` / `Bool`) drained
     /// from the return layout. The decode shares
-    /// [`Self::decode_list_list_rows`] with the field-slot
+    /// `Self::decode_list_list_rows` with the field-slot
     /// [`Self::read_list_list`] path, so a top-level and an in-place
     /// decode of the same bytes are bit-identical.
     pub fn read_list_list_at(

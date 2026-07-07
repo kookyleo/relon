@@ -67,7 +67,7 @@ pub enum VtableSlot {
     /// `extern "C" fn(state: *const ArenaState, import_idx: u32,
     /// args_ptr: *const i64, arg_count: u32) -> i64`. Dynamic host-fn
     /// dispatch; the LLVM mirror of cranelift's `RelonCallNative`. See
-    /// [`crate::state::relon_llvm_call_native`].
+    /// `crate::state::relon_llvm_call_native`.
     RelonCallNative = 1,
     /// `extern "C" fn(bits: i64, dest: *mut u8) -> i32`. Wave B float
     /// Display renderer; the LLVM mirror of cranelift's

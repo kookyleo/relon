@@ -50,7 +50,7 @@
 //!
 //! The shim is registered with the MCJIT execution engine through
 //! `engine.add_global_mapping` in
-//! [`crate::evaluator::LlvmAotEvaluator::from_ir`] before the entry
+//! `crate::evaluator::LlvmAotEvaluator::from_ir` before the entry
 //! pointer is resolved. The shim's address is exposed verbatim via
 //! [`relon_llvm_str_contains_arena_addr`] so the registration code
 //! doesn't have to materialise a function pointer cast inline.
@@ -72,12 +72,12 @@
 //! Phase G restructures the surface into two halves:
 //!   * [`relon_llvm_str_contains_arena`] — the externally-mapped
 //!     entry, minimal-frame shape. Performs an inlined IC check
-//!     ([`ic_hit_slot`]) against a process-global atomic slot
+//!     (`ic_hit_slot`) against a process-global atomic slot
 //!     (no TLS init guard required, three `Relaxed` loads compile
 //!     to plain `mov`s on x86_64). Tail-calls
-//!     [`str_contains_arena_slow`] on a miss. The hot-path body fits
+//!     `str_contains_arena_slow` on a miss. The hot-path body fits
 //!     in ~11 instructions with a `push rax / pop rcx / ret` frame.
-//!   * [`str_contains_arena_slow`] — `#[cold] #[inline(never)]` so
+//!   * `str_contains_arena_slow` — `#[cold] #[inline(never)]` so
 //!     the optimizer no longer hoists `compute_contains`'s scratch
 //!     space into the outer frame.
 //!
@@ -176,14 +176,14 @@ static STR_CONTAINS_ARENA_IC: StrContainsArenaIc = StrContainsArenaIc {
 ///
 /// Phase G splits the entry: the outer [`relon_llvm_str_contains_arena`]
 /// only performs the IC pointer-equality check inline (no `with()`
-/// closure, no thread-local re-entry guard — see [`ic_hit_slot`]
+/// closure, no thread-local re-entry guard — see `ic_hit_slot`
 /// below) and tail-calls into a [`#[cold] #[inline(never)]`] slow
 /// path when the IC misses. The shrink keeps the hot-path prologue to
 /// `push rbp; sub $0x?, %rsp` and a small spill set, which on x86_64
 /// is the difference between ~30 ns / call (Phase F.1) and ~5 ns /
 /// call.
 ///
-/// Consults [`STR_CONTAINS_ARENA_IC`] before doing the scan; the W4
+/// Consults `STR_CONTAINS_ARENA_IC` before doing the scan; the W4
 /// / W4_long workloads call this with stable const-pool pointers so
 /// the steady-state path skips the FFI / memmem cost after iter 0.
 ///

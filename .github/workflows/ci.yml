@@ -47,6 +47,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: cargo clippy -D warnings
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo doc -D warnings
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features remote-http
       - name: cargo test
         run: cargo test --workspace
       - name: relon-fmt --check fixtures

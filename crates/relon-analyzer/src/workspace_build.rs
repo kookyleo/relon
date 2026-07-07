@@ -819,7 +819,7 @@ fn locate_import_range(ws: &WorkspaceTree, importer: &str, target: &str) -> Opti
 /// Names from cross-module `#import` directives that *one specific
 /// importer* can see, organized by binding kind.
 ///
-/// Built per-module by [`build_import_index`] using the workspace's
+/// Built per-module by `build_import_index` using the workspace's
 /// module graph + already-analyzed `root_schemas` lists. Stage 2 uses
 /// it for two purposes: (a) re-checking `UnknownTypeName` (this file)
 /// and (b) `pkg.Type` multi-segment subsumption (`infer.rs`).

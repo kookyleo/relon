@@ -11,7 +11,7 @@
 //!
 //! The accepted leaf types for `#main` parameters and the return slot
 //! are `Int`, `Float`, `Bool`, `String`, and `List<Int>`; internal unit slots map to Rust `()` (the
-//! [`rust_type_for`] table is the authoritative list — a new
+//! `rust_type_for` table is the authoritative list — a new
 //! codegen-llvm leaf variant fails the exhaustive `match` until a row
 //! is added). Each `.relon` source contributes:
 //!
@@ -102,7 +102,7 @@ struct SourceEntry {
 
 /// Declaration of one host-provided `#native` function a `.relon`
 /// source calls by name. The consuming crate's `build.rs` registers
-/// it via [`Compiler::native_fn`] / [`Compiler::source_with_native_fns`].
+/// it via `Compiler::native_fn` / [`Compiler::source_with_native_fns`].
 ///
 /// The closed-world emit path uses this to (1) resolve the call name in
 /// the analyzer (`host_fn_names` / `host_fn_signatures`), (2) bake the

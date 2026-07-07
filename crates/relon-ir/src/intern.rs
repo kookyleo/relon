@@ -4,7 +4,7 @@
 //! ## Problem this solves
 //!
 //! Before #151 the lowering pass kept four `next_*_idx` counters on
-//! each [`crate::lowering::LowerCtx`] and minted a fresh idx for every
+//! each `crate::lowering::LowerCtx` and minted a fresh idx for every
 //! literal it walked past — even when two `Op::ConstString` shared the
 //! same bytes. Two downstream consequences:
 //!
@@ -29,7 +29,7 @@
 //!
 //! [`ConstInternTables`] holds one [`StringInternTable`] plus a
 //! shared id-allocator per `ConstList*` variant. The table is built
-//! once per [`crate::lowering::lower_workspace_*`] call and threaded
+//! once per `crate::lowering::lower_workspace_*` call and threaded
 //! through every `LowerCtx::new_with_intern` ctor so all funcs in the
 //! same `Module` share one idx space. `Rc<RefCell<...>>` keeps the
 //! API ergonomic for the recursive walker (nested closures /

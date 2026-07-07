@@ -414,7 +414,7 @@ impl CapabilityVtable {
 /// risked silent corruption (the `unsafe impl Sync` was unsound).
 ///
 /// Stage 5 reverts to **per-call ownership**: the evaluator stores an
-/// immutable [`SandboxShared`] template, and each `run_main` allocates
+/// immutable `SandboxShared` template, and each `run_main` allocates
 /// a fresh `Box<SandboxState>` (or fishes one out of an optional pool),
 /// installs its arena, runs the JIT entry, and drops the state at the
 /// end of the dispatch. Two threads dispatching on the same evaluator
@@ -502,7 +502,7 @@ pub struct SandboxState {
 /// runtime stay in sync.
 pub const STATE_OFFSET_DEADLINE_NS: i32 = 0;
 /// Byte offset of `SandboxState::trap_code`. Read from cranelift IR by
-/// [`crate::codegen`]'s `emit_call_native_dynamic`: after the
+/// `crate::codegen`'s `emit_call_native_dynamic`: after the
 /// `relon_call_native` helper records a failure code here and returns,
 /// the call site `load`s this offset and routes a non-zero value to the
 /// trap epilogue. Other trap paths set it indirectly via `raise_trap`.
@@ -640,8 +640,8 @@ impl SandboxState {
     ///
     /// Direct callers are tests / direct-IR fixtures; production
     /// dispatch goes through the evaluator's
-    /// [`SandboxShared::new`] template + per-call
-    /// [`Self::from_template`] path so the per-call state is
+    /// `SandboxShared::new` template + per-call
+    /// `Self::from_template` path so the per-call state is
     /// thread-local rather than shared.
     pub fn new(capabilities: Arc<CapabilityVtable>) -> Self {
         Self {
@@ -830,7 +830,7 @@ impl SandboxState {
     /// previous dispatch (i.e. the slot was never set, no reset
     /// required). This shaves a Relaxed store off the hot dispatch
     /// path for the success case. See
-    /// [`Self::take_trap_code_and_reset`] for the after-the-fact
+    /// `Self::take_trap_code_and_reset` for the after-the-fact
     /// pattern that lets the post-dispatch path own the reset.
     pub fn reset_trap(&self) {
         self.trap_code.store(0, Ordering::Relaxed);

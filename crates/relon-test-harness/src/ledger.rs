@@ -1,6 +1,6 @@
 //! Coverage ledger for the lowering capability-cap sites.
 //!
-//! Every loud "unsupported" cap in the lowering pass (each [`cap!`] site,
+//! Every loud "unsupported" cap in the lowering pass (each `cap!` site,
 //! see `relon_ir::lowering::cap::LOWERING_CAP_IDS`) has exactly one
 //! [`LedgerEntry`] here. The ledger is the human-auditable companion to
 //! the machine registry: it records, per cap id, which family the

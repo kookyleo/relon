@@ -21,7 +21,7 @@
 //!
 //! ## Per-call ownership
 //!
-//! `SandboxState` is constructed per-dispatch by [`call_buffer_entry`]
+//! `SandboxState` is constructed per-dispatch by [`crate::marshal::call_buffer_entry`]
 //! and reset between calls; user code should treat the struct as
 //! opaque (only `Default::default()` is exposed). Phase 2 doesn't yet
 //! expose `with_arena_cap` / `with_caps` builders — those land with
@@ -173,7 +173,7 @@ const _: () = assert!(
 ///
 /// The fast path (`extern "C" fn(i64, ...) -> i64`) ignores it — every
 /// value lives in a register and the body has no capability gate. The
-/// buffer-protocol path reads [`Self::caps_mask`] and forwards it as
+/// buffer-protocol path reads `Self::caps_mask` and forwards it as
 /// the entry's trailing `i64 caps` argument so a `#native` body's
 /// `Op::CheckCap` gate consults the host's actual grant: a granted bit
 /// lets the gated call run, a clear bit traps `CapabilityDenied`.
@@ -181,13 +181,13 @@ const _: () = assert!(
 /// Construction is grant-explicit: [`SandboxState::default`] /
 /// [`SandboxState::new`] grant **nothing** (zero-trust, same posture as
 /// the evaluator's `Capabilities::default`). Hosts opt into a capability
-/// by building a [`Capabilities`] and passing it to
+/// by building a [`crate::Capabilities`] and passing it to
 /// [`SandboxState::with_capabilities`], or flip a single
-/// [`CapabilityBit`] via [`SandboxState::grant`].
+/// [`crate::CapabilityBit`] via [`SandboxState::grant`].
 #[derive(Debug, Default)]
 pub struct SandboxState {
     /// Granted capability bitmask — bit `b` set means the host granted
-    /// [`CapabilityBit`] index `b`. Forwarded verbatim as the buffer
+    /// [`crate::CapabilityBit`] index `b`. Forwarded verbatim as the buffer
     /// entry's `caps` argument. Zero (the default) denies every gated
     /// `#native` call.
     caps_mask: i64,
@@ -202,7 +202,7 @@ impl SandboxState {
 
     /// Build a sandbox state granting exactly the capabilities set in
     /// `caps`. The per-bit booleans map onto the canonical
-    /// [`CapabilityBit`] indices so the resulting mask byte-matches the
+    /// [`crate::CapabilityBit`] indices so the resulting mask byte-matches the
     /// `(caps & (1 << bit))` test the LLVM `Op::CheckCap` gate bakes
     /// into a gated `#native` body.
     pub fn with_capabilities(caps: &relon_eval_api::Capabilities) -> Self {
@@ -211,7 +211,7 @@ impl SandboxState {
         s
     }
 
-    /// Grant a single [`CapabilityBit`], leaving the others untouched.
+    /// Grant a single [`crate::CapabilityBit`], leaving the others untouched.
     /// Chainable: `SandboxState::new().grant(CapabilityBit::ReadsClock)`.
     pub fn grant(mut self, bit: relon_eval_api::CapabilityBit) -> Self {
         self.caps_mask |= 1i64 << bit.bit_index();

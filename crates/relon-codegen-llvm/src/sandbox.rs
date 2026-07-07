@@ -116,7 +116,7 @@ impl SandboxConfig {
 
 /// Trap kind raised by a guard inside LLVM-emitted native code. The
 /// numeric values match the cranelift backend's `TrapKind` and the
-/// [`crate::state::NativeTrap`] subset the JIT-side dynamic dispatch
+/// `crate::state::NativeTrap` subset the JIT-side dynamic dispatch
 /// helper already records, so the host decodes the same cause numbering
 /// across backends. Encoded as `u64` so it fits the `ArenaState::trap_code`
 /// slot the emitted object writes through `relon_llvm_call_native` /
@@ -142,7 +142,7 @@ pub enum SandboxTrapKind {
     /// An `Op::CheckCap { cap_bit }` found the matching bit clear in the
     /// host-granted `caps` mask. Lifts to `RuntimeError::CapabilityDenied`.
     /// Matches cranelift's `TrapKind::CapabilityDenied` and
-    /// [`crate::state::NativeTrap::CapabilityDenied`] (= 3).
+    /// `crate::state::NativeTrap::CapabilityDenied` (= 3).
     CapabilityDenied = 3,
     /// Per-call resource budget exhausted. LLVM currently raises this
     /// through deterministic step-budget fuel; a future wall-clock
@@ -150,17 +150,17 @@ pub enum SandboxTrapKind {
     ResourceExhausted = 4,
     /// No host fn registered at the requested `import_idx`, or no
     /// registry installed. Matches cranelift's `TrapKind::Unreachable`
-    /// (= 5) and [`crate::state::NativeTrap::HostFnMissing`]; lifts to
+    /// (= 5) and `crate::state::NativeTrap::HostFnMissing`; lifts to
     /// `RuntimeError::Unsupported`.
     HostFnMissing = 5,
     /// Signed integer overflow. Matches cranelift's
     /// `TrapKind::NumericOverflow` (= 6) and
-    /// [`crate::state::NativeTrap::NumericOverflow`]. Raised by checked
+    /// `crate::state::NativeTrap::NumericOverflow`. Raised by checked
     /// `Op::Add` / `Op::Sub` / `Op::Mul`, the `INT_MIN / -1` div/rem
     /// guard, and bundled checked reductions such as `list_int_sum`.
     NumericOverflow = 6,
     /// A host fn returned an error, or a value outside the scalar return
-    /// envelope. Matches [`crate::state::NativeTrap::HostFnError`] (= 7);
+    /// envelope. Matches `crate::state::NativeTrap::HostFnError` (= 7);
     /// lifts to `RuntimeError::Unsupported`.
     HostFnError = 7,
 }
@@ -187,7 +187,7 @@ impl SandboxTrapKind {
     /// All trap mappings carry the entry function's source range so the
     /// diagnostic at least points at the `#main` declaration. Mirrors
     /// cranelift's `TrapKind::to_runtime_error` and the
-    /// [`crate::state::NativeTrap::runtime_error_from_code`] subset.
+    /// `crate::state::NativeTrap::runtime_error_from_code` subset.
     pub fn to_runtime_error(self, range: TokenRange) -> RuntimeError {
         match self {
             SandboxTrapKind::DivisionByZero => RuntimeError::DivisionByZero(range),
@@ -345,7 +345,7 @@ impl CapabilityVtable {
     }
 
     /// Borrow the underlying [`HostFnRegistry`] so the evaluator can
-    /// install it on a per-call [`crate::state::ArenaState`] via
+    /// install it on a per-call `crate::state::ArenaState` via
     /// `ArenaState::install_host_fns`.
     pub fn host_fns(&self) -> &HostFnRegistry {
         &self.host_fns

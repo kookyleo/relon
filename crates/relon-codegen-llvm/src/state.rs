@@ -349,10 +349,10 @@ impl ArenaState {
 ///
 /// Mirrors the `host_fns` half of the cranelift backend's
 /// `CapabilityVtable`. The LLVM evaluator owns one of these (built via
-/// [`Self::with_host_fns`]) and points each per-call [`ArenaState`] at
-/// it through [`ArenaState::install_host_fns`]; a source-lowered
+/// `Self::with_host_fns`) and points each per-call `ArenaState` at
+/// it through `ArenaState::install_host_fns`; a source-lowered
 /// `Op::CallNative` then resolves the `import_idx`-keyed callable via
-/// [`relon_llvm_call_native`].
+/// `relon_llvm_call_native`.
 ///
 /// Keying off `import_idx` (the IR-side private namespace) keeps it
 /// distinct from the capability-bit namespace the `Op::CheckCap`

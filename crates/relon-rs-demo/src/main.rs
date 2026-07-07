@@ -18,7 +18,7 @@
 //!   Float : x * 2.5 + n / 2.0`). Exercises the widened native
 //!   signature surface: an `f64` parameter packed into / decoded out
 //!   of the arena alongside a mixed-type (`Int`) param.
-//! - `src/quux.relon` — Int → List<Int> (`#main(Int n) -> List<Int> :
+//! - `src/quux.relon` — Int → `List<Int>` (`#main(Int n) -> List<Int> :
 //!   [n, n + 1, 7]`). Exercises a `Vec<i64>` return marshalled out of
 //!   the arena's `[len][i64…]` tail record.
 //!

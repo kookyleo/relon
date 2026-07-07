@@ -1,8 +1,8 @@
 //! Capability-cap site registry for the lowering pass.
 //!
-//! Every place in `lowering` that constructs a [`LoweringError`] — a loud
+//! Every place in `lowering` that constructs a [`crate::error::LoweringError`] — a loud
 //! "this construct is not yet expressible in the IR" cap — is wrapped in
-//! the [`cap!`] macro with a stable, descriptive id. The wrapping is
+//! the `cap!` macro with a stable, descriptive id. The wrapping is
 //! deliberately codegen-neutral:
 //!
 //! * In a normal (non-test) build `cap!(id, err)` is a **pure identity
@@ -12,8 +12,8 @@
 //!   byte-identical to a tree without the wrapping, so the codegen
 //!   `GENERATOR_VERSION` does not move.
 //! * Under `#[cfg(test)]` `cap!` additionally records that `id` fired
-//!   (see [`record`]) before returning `err` unchanged. A later wave's
-//!   no-fallback test reads [`fired_caps`] to learn which caps a corpus
+//!   (see `record`) before returning `err` unchanged. A later wave's
+//!   no-fallback test reads `fired_caps` to learn which caps a corpus
 //!   probe actually hit. The recording is side-effect-free with respect
 //!   to the returned error value.
 //!
@@ -49,7 +49,7 @@ macro_rules! cap {
     }};
 }
 
-/// Stable ids for every [`cap!`] site in the lowering pass. Append-only in
+/// Stable ids for every `cap!` site in the lowering pass. Append-only in
 /// spirit: a new cap site must add its id here (and a ledger entry), or the
 /// completeness test fails. Ids are `<fn>.<variant_snake>[.<n>]`, where the
 /// trailing index disambiguates multiple physical sites of the same variant

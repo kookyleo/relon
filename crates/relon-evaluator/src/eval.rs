@@ -76,7 +76,7 @@ impl TreeWalkEvaluator {
     }
 
     /// Opt this evaluator into AST-level high-level fusion fast-paths
-    /// (see [`Self::try_eval_fused`]). Intended for a production
+    /// (see `Self::try_eval_fused`). Intended for a production
     /// interpreter deployment that wants the materialisation-free perf and
     /// is *not* acting as the differential oracle. The default
     /// ([`Self::new`]) leaves fusion off so the oracle keeps reference

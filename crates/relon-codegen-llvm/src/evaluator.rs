@@ -1637,7 +1637,7 @@ impl LlvmAotEvaluator {
     /// the negative sentinel resolve exactly as they do on the host JIT
     /// path. `ret` is the i32 the wasm entry returned.
     ///
-    /// This routes through the **same** [`Self::decode_buffer_return`] the
+    /// This routes through the **same** `Self::decode_buffer_return` the
     /// host path uses — the in-place sentinel still runs the
     /// `relon_abi::inplace_return` verifier over the linear-memory
     /// slice before any decode. There is no wasm-specific decode or
@@ -2440,14 +2440,14 @@ pub struct EmittedField {
 /// generator don't take a dep on this codegen crate:
 ///
 /// 1. `relon_codegen_llvm` (this enum) — produced by
-///    [`lower_field_descriptors`].
+///    `lower_field_descriptors`.
 /// 2. `relon_rs_shims::EmittedFieldType` — the runtime mirror;
 ///    `call_buffer_entry` packs/unpacks per variant.
 /// 3. `relon_rs_build` — `rust_type_for` maps each variant to the Rust
 ///    surface type + `ArgValue` / `RetValue` constructor.
 ///
 /// **Adding a variant is a four-touch change**: (1) add the variant
-/// here + its arm in [`lower_field_descriptors`]; (2) add the mirror
+/// here + its arm in `lower_field_descriptors`; (2) add the mirror
 /// variant + the `*_in` / `*_out` sibling helpers in
 /// `relon_rs_shims::marshal`; (3) add the `rust_type_for` table row in
 /// `relon_rs_build`; (4) extend the cross-crate round-trip guard test.
