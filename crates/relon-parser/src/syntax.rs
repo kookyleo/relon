@@ -146,12 +146,11 @@ pub enum SyntaxKind {
     /// Closing `}` of an interpolation.
     F_STRING_INTERP_END,
 
-    // ----- composite-node kinds (populated through P2/P3) ------------
+    // ----- composite-node kinds ---------------------------------------
     //
     // Each kind below names a grammar production. Their byte content
     // is reachable through their child tokens / nodes; rowan stitches
-    // it all back into source via `SyntaxNode::text`. P2 fills these
-    // in; P1 only needs `DOCUMENT` + `ERROR` to round-trip-lex.
+    // it all back into source via `SyntaxNode::text`.
     //
     /// Whole-file root. Always present. Children:
     /// trivia*, top-level directives*, top-level value, trivia*.

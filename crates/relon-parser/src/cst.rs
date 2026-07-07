@@ -1,7 +1,8 @@
 //! Concrete syntax tree (CST) builder over the lossless [`lex`]
-//! output. P2 of the rowan rewrite — translates the existing winnow
-//! grammar into rowan `GreenNode`s while preserving every source byte
-//! (including whitespace and comments) as first-class tokens.
+//! output. Builds rowan `GreenNode`s while preserving every source
+//! byte (including whitespace and comments) as first-class tokens —
+//! this grammar is the single source of truth for what input the
+//! parser accepts.
 //!
 //! Architecture
 //! ============
@@ -24,7 +25,7 @@
 //! Scope
 //! =====
 //!
-//! P2 (now complete) covers the full surface grammar:
+//! The grammar covers the full Relon surface:
 //!
 //! * Literals, identifiers, dotted paths, references.
 //! * Lists, dicts (with pair attributes + method-shorthand closures
@@ -40,9 +41,11 @@
 //!   (name + generics + body + optional `with`), `#import`
 //!   (`<spec> from "path"`), `#main(typed-params) [-> Ret]`.
 //!
-//! P3 lives in `crate::ast` — typed-AST wrappers on top of this
-//! CST. P4 will migrate downstream crates (analyzer, evaluator,
-//! fmt, wasm, lsp) onto the new wrappers.
+//! Two consumers sit on top of this CST: `crate::lower`, which
+//! builds the official [`crate::Node`] / [`crate::Expr`] AST that
+//! the analyzer / evaluator / IR consume, and `crate::ast`, a thin
+//! typed-wrapper layer kept for `relon-fmt` (which formats off the
+//! lossless tree directly).
 
 use crate::lex;
 use crate::lex::utf8_codepoint_len_for_cst as utf8_codepoint_len;
@@ -963,15 +966,13 @@ impl<'a> Parser<'a> {
         // precedence — lower than every binary operator (so the binary
         // chain absorbs into `cond`) but higher than the trailing
         // `match` / `where` postfix forms (which wrap whatever ternary
-        // produces). The legacy `parse_ternary` (`expr.rs`) sits at the
-        // same level — see the precedence chain notes there.
+        // produces).
         //
         // Disambiguation: `?` may also be a path-access prefix
         // (`a?.b`, `a?[0]`) or a type-optional marker (`Foo?` inside a
-        // typed context). Path access is consumed earlier — the CST's
-        // current postfix loop doesn't fold `?.` / `?[`, but the legacy
-        // pre-P4 path always took those bytes itself, so no fixture
-        // reaches this branch with them in postfix position. Type
+        // typed context). Path access is consumed earlier — the
+        // postfix loop folds `?.` / `?[` into the VARIABLE_EXPR, so no
+        // input reaches this branch with them in postfix position. Type
         // optionals only appear inside committed `parse_type` calls
         // (match arms, closure params, directive bodies), never at the
         // outermost expression level — so seeing `?` here is
@@ -1990,8 +1991,8 @@ impl<'a> Parser<'a> {
         self.expect(SyntaxKind::R_PAREN);
     }
 
-    /// One closure parameter — either `name` or `Type name`. P2
-    /// records the type, when present, as a TYPE_NODE child preceding
+    /// One closure parameter — either `name` or `Type name`. The
+    /// type, when present, is recorded as a TYPE_NODE child preceding
     /// the IDENT.
     fn parse_closure_param(&mut self) {
         self.open(SyntaxKind::CLOSURE_PARAM);
@@ -3464,11 +3465,8 @@ mod tests {
     }
 
     /// Monotonic floor on how many checked-in `.relon` fixtures parse
-    /// without ANY ERROR nodes. Each P2 slice MUST raise this number;
-    /// regressions need a deliberate, recorded reason.
-    ///
-    /// The floor starts at 30 (closures slice). Bump it as more P2
-    /// grammar lands.
+    /// without ANY ERROR nodes. Grammar-coverage work MUST raise this
+    /// number; regressions need a deliberate, recorded reason.
     #[test]
     fn fixtures_clean_parse_floor() {
         // Each P2 slice bumps the floor. At slice 1 (closures) we hit

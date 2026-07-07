@@ -10,7 +10,7 @@
 //! parsed body.
 //!
 //! This module used to host a full winnow-based combinator parser as
-//! well; P6 retired the runtime parser in favour of the rowan CST
+//! well; that runtime parser was retired in favour of the rowan CST
 //! walker in `lower.rs`. Only the lookup table + name constants
 //! survive — they're re-exported by `relon-analyzer` and
 //! `relon-evaluator` so every layer dispatches off the same string

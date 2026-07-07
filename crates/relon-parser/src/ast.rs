@@ -1,17 +1,21 @@
-//! Typed-AST wrappers over the rowan CST.
+//! Typed wrappers over the rowan CST — the `relon-fmt` support layer.
 //!
-//! P3 of the rowan rewrite. Each wrapper is a transparent tuple struct
-//! around a `SyntaxNode` (or `SyntaxToken`) — there is no extra
-//! allocation, and a wrapper can be obtained from a CST node in
-//! O(1) via `cast(node)` (which returns `None` when the kind doesn't
-//! match).
+//! Positioning (final architecture): the parser has exactly two
+//! output layers. The lossless rowan CST ([`crate::cst`] /
+//! [`crate::syntax`]) serves the formatter, LSP features, and
+//! span-accurate diagnostics; the [`crate::Node`] / [`crate::Expr`]
+//! tree is the official AST that the analyzer, evaluator, and IR
+//! lowering consume. This module is *not* a third semantic layer: it
+//! is a small typed-accessor surface over the CST, consumed by
+//! `relon-fmt` (which formats off the lossless tree) and by the
+//! CST → `Node` lowering in `crate::lower`. It grows accessors only
+//! when those two callers need them. New semantic consumers should
+//! parse via [`crate::parse_document`] and walk [`crate::Node`].
 //!
-//! The wrapper API mirrors the existing token-tree types in
-//! [`crate::token`] (`Node`, `Expr`, `TokenKey`, `Directive`,
-//! `Decorator`, `TypeNode`, etc.) as closely as possible. P4 will
-//! migrate downstream crates (analyzer, evaluator, fmt, wasm, lsp)
-//! by swapping their winnow-based parsing for these wrappers; the
-//! parallel API shape keeps that migration mostly mechanical.
+//! Each wrapper is a transparent tuple struct around a `SyntaxNode`
+//! (or `SyntaxToken`) — there is no extra allocation, and a wrapper
+//! can be obtained from a CST node in O(1) via `cast(node)` (which
+//! returns `None` when the kind doesn't match).
 //!
 //! ## Variant kinds
 //!
@@ -141,19 +145,18 @@ ast_node!(Literal, LITERAL);
 ast_node!(ErrorNode, ERROR);
 
 // =====================================================================
-// `Expr` — the top-level typed enum. Mirrors `crate::Expr` plus a new
+// `Expr` — the top-level typed enum. Mirrors `crate::Expr` plus an
 // `Error` variant for partial parses.
 // =====================================================================
 
 /// Typed view over any expression-shaped CST node. Returned by
 /// [`Expr::cast`].
 ///
-/// Note the variant naming follows the CST kinds, not the legacy
-/// [`crate::Expr`] enum — `Literal` covers `true` / `false` / numeric / string atoms uniformly,
-/// plus the removed `null` spelling for diagnostics. The legacy enum split
-/// them into `Bool` / `Int` / `Float` / `String` plus internal `Missing`. Downstream
-/// callers that need the specific literal type read it from
-/// [`Literal::kind`] / [`Literal::value_text`].
+/// Note the variant naming follows the CST kinds, not the
+/// [`crate::Expr`] AST enum — `Literal` covers `true` / `false` /
+/// numeric / string atoms uniformly, plus the removed `null` spelling
+/// for diagnostics, where the AST enum splits them into `Bool` /
+/// `Int` / `Float` / `String` plus internal `Missing`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Expr {
     Literal(Literal),
@@ -245,9 +248,8 @@ impl Expr {
 }
 
 // =====================================================================
-// Per-node accessors. Each wrapper exposes the structural data the
-// downstream typed-AST callers will need, mirroring the existing
-// `Node` / `Expr` API in `token.rs`.
+// Per-node accessors. Each wrapper exposes the structural data its
+// callers (relon-fmt and the CST → `Node` lowering) actually consume.
 // =====================================================================
 
 impl Document {

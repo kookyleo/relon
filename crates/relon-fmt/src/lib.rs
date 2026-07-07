@@ -257,9 +257,9 @@ fn parse_strict(source: &str) -> Result<Document, Error> {
 // MUST go through these primitives so directives/decorators stay
 // glued to their pair.
 //
-// P6 round 3: the walkers operate on raw [`SyntaxNode`]s
-// (rowan-typed CST) rather than the legacy `Node` / `Expr` /
-// `TokenKey` tree. The previous AST-based helpers
+// The walkers operate on raw [`SyntaxNode`]s
+// (rowan-typed CST) rather than the `Node` / `Expr` /
+// `TokenKey` AST. The previous AST-based helpers
 // (`dict_body_range`, `pair_span`, `classify_pair`, ...) are gone —
 // the rowan tree exposes byte ranges directly via `text_range()`,
 // so the brace-finder / scope-trackers from the old layer

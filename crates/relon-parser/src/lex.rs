@@ -9,8 +9,8 @@
 //! ```
 //!
 //! Errors are NEVER returned. An unterminated string / block comment
-//! / unknown byte still gets a token covering the bytes; downstream
-//! parser layers (P2) decide whether to emit a diagnostic. The
+//! / unknown byte still gets a token covering the bytes; the
+//! downstream CST builder decides whether to emit a diagnostic. The
 //! "lexer never fails" contract is the bedrock of error-recovering
 //! parsing — without it, the CST couldn't represent partial input.
 
