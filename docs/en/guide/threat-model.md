@@ -89,8 +89,9 @@ backend serializes its top-level entry points (`eval_root` /
 - Re-entering `eval_root` / `run_main` from inside a run on the same
   thread (for example, from a native-function callback) panics with an
   explicit message instead of deadlocking. Nested work inside a run
-  must use the non-resetting entry points (`eval`, `force_thunk`,
-  `invoke_closure`, `NativeFnCaps::call_relon`).
+  must use the non-resetting entry points (`eval` / `force_thunk` /
+  `invoke_closure` on the `TreeWalkEval` extension trait, or
+  `NativeFnCaps::call_relon`).
 - For parallel evaluation, give each thread its own `Context` and
   evaluator; a `Context` is intentionally cheap to construct per run.
 

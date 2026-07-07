@@ -27,7 +27,7 @@ use crate::scope::Scope;
 use crate::value::{SchemaField, Value};
 use relon_analyzer::format_type;
 use relon_eval_api::context::Context;
-use relon_eval_api::Evaluator;
+use relon_eval_api::TreeWalkEval;
 use relon_parser::{is_builtin_type_name, TokenRange, TypeNode};
 use std::sync::Arc;
 
@@ -46,7 +46,7 @@ struct ValueDecorator;
 impl DecoratorPlugin for ValueDecorator {
     fn wrap(
         &self,
-        _eval: &dyn Evaluator,
+        _eval: &dyn TreeWalkEval,
         value: Value,
         _scope: &Arc<Scope>,
         args: &[EvaluatedArg],
@@ -68,7 +68,7 @@ struct MessageDecorator;
 impl DecoratorPlugin for MessageDecorator {
     fn schema_field_meta(
         &self,
-        _eval: &dyn Evaluator,
+        _eval: &dyn TreeWalkEval,
         field: &mut SchemaField,
         _scope: &Arc<Scope>,
         args: &[EvaluatedArg],
@@ -88,7 +88,7 @@ struct DefaultDecorator;
 impl DecoratorPlugin for DefaultDecorator {
     fn schema_field_meta(
         &self,
-        _eval: &dyn Evaluator,
+        _eval: &dyn TreeWalkEval,
         field: &mut SchemaField,
         _scope: &Arc<Scope>,
         args: &[EvaluatedArg],

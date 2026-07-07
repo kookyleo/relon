@@ -3,10 +3,11 @@
 //! Landing surface for [`crate::Backend::Auto`]. An [`AutoEvaluator`]
 //! eagerly constructs a [`TreeWalkEvaluator`] (cheap, ~1 ms) and
 //! lazily initialises the cranelift-AOT backend only when a host
-//! first calls [`relon_eval_api::Evaluator::run_main`]. The other
-//! four `Evaluator` methods (`eval`, `eval_root`, `force_thunk`,
-//! `invoke_closure`) always go through the tree-walker — which is
-//! also the only backend that supports them today.
+//! first calls [`relon_eval_api::Evaluator::run_main`]. `eval_root`
+//! and the tree-walk extension surface
+//! ([`relon_eval_api::TreeWalkEval`]: `eval`, `force_thunk`,
+//! `invoke_closure`) always go through the tree-walker — the only
+//! backend that can carry those methods.
 //!
 //! ## Design notes
 //!
@@ -34,7 +35,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, Value};
+use relon_eval_api::{ClosureData, Evaluator, RuntimeError, Scope, Thunk, TreeWalkEval, Value};
 use relon_evaluator::TreeWalkEvaluator;
 use relon_parser::{Expr, Node, Operator};
 
@@ -331,13 +332,6 @@ impl AutoEvaluator {
 }
 
 impl Evaluator for AutoEvaluator {
-    fn eval(&self, node: &Node, scope: &Arc<Scope>) -> Result<Value, RuntimeError> {
-        // Tree-walker is the only backend that exposes arbitrary
-        // node evaluation today; routing here keeps `eval` cheap
-        // even if a host later mixes it with `run_main`.
-        self.tree_walk.eval(node, scope)
-    }
-
     fn eval_root(&self, scope: &Arc<Scope>) -> Result<Value, RuntimeError> {
         // Static-config / library-mode path; tree-walker always.
         self.tree_walk.eval_root(scope)
@@ -419,6 +413,18 @@ impl Evaluator for AutoEvaluator {
                 })
             }
         }
+    }
+}
+
+// The auto wrapper embeds a live tree-walker, so it can honour the
+// tree-walk extension surface too — every method routes straight to
+// the embedded interpreter and never touches the AOT slot.
+impl TreeWalkEval for AutoEvaluator {
+    fn eval(&self, node: &Node, scope: &Arc<Scope>) -> Result<Value, RuntimeError> {
+        // Tree-walker is the only backend that exposes arbitrary
+        // node evaluation today; routing here keeps `eval` cheap
+        // even if a host later mixes it with `run_main`.
+        self.tree_walk.eval(node, scope)
     }
 
     fn force_thunk(&self, thunk: &Arc<Thunk>) -> Result<Value, RuntimeError> {

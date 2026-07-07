@@ -284,7 +284,11 @@ impl EvaluatorBuilder {
 
     /// Assemble the configured evaluator. Returns `Box<dyn Evaluator>`
     /// so backend swap stays a runtime concern; the trait surface is
-    /// the same five `&self` methods every backend implements.
+    /// the backend-agnostic core (`eval_root` / `run_main`) every
+    /// backend implements. Hosts that need the tree-walk extension
+    /// surface (`TreeWalkEval`: `eval` / `force_thunk` /
+    /// `invoke_closure`) construct a concrete `TreeWalkEvaluator` or
+    /// [`crate::AutoEvaluator`] instead of going through the builder.
     pub fn build(self) -> Result<Box<dyn Evaluator>, BackendError> {
         let EvaluatorBuilder {
             source,

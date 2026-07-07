@@ -60,16 +60,17 @@ pub use relon_codegen_cranelift::AotEvaluator;
 // `Context` / `parse_document` symbol now take a dep on the
 // downstream crate by name. The canonical data shapes every facade
 // caller actually needs (`Value`, `Scope`, `RuntimeError`) plus the
-// backend-agnostic `Evaluator` trait re-export below so the
-// open-the-box [`EvaluatorBuilder`] path doesn't force a second
-// crate dep just to spell the return / arg types.
+// backend-agnostic `Evaluator` core trait and its tree-walk extension
+// `TreeWalkEval` re-export below so the open-the-box
+// [`EvaluatorBuilder`] path doesn't force a second crate dep just to
+// spell the return / arg types.
 // `CapabilityBit` / `NativeFnGate` ride along because they appear in
 // the builder's own public signatures ([`EvaluatorBuilder::grant`] /
 // [`EvaluatorBuilder::register_native_fn`]): least-privilege hosts
 // must be able to spell a grant and a gate without leaving the facade.
 pub use relon_eval_api::{
     CapabilityBit, Evaluator, NativeFnGate, ResourceBudget, ResourceBudgetProfile, RuntimeError,
-    Scope, Value,
+    Scope, TreeWalkEval, Value,
 };
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -591,11 +592,10 @@ pub fn analyze_from_str(source: &str) -> Result<AnalyzedTree> {
 ///
 /// [`Backend::Auto`] is the default. The returned evaluator eagerly
 /// constructs a tree-walker (cheap, ~1 ms) and lazily spins up the
-/// cranelift-AOT backend only on first `run_main`. The other four
-/// `Evaluator` methods always go through the tree-walker — which is
-/// the only backend that supports them today and stays the
-/// canonical surface for `eval` / `eval_root` / `force_thunk` /
-/// `invoke_closure`.
+/// cranelift-AOT backend only on first `run_main`. `eval_root` and
+/// the whole tree-walk extension surface ([`TreeWalkEval`]: `eval` /
+/// `force_thunk` / `invoke_closure`) always go through the
+/// tree-walker — the only backend that can carry those methods.
 ///
 /// v5-β-2 stage 4: the wasm-AOT backend retired here. The cranelift
 /// path covers every IR op the corpus exercises (51/52 corpus parity,
@@ -611,15 +611,17 @@ pub enum Backend {
     /// Auto-tier (default). Returns an [`AutoEvaluator`] that routes
     /// `run_main` through the cranelift-AOT backend (lazily
     /// constructed on first call, cached for subsequent invocations)
-    /// and every other `Evaluator` method through the tree-walker.
+    /// and `eval_root` plus the [`TreeWalkEval`] extension methods
+    /// through the tree-walker.
     /// If the cranelift path fails to set up — for example, this
     /// build dropped the `cranelift-aot` feature, or the source uses
     /// constructs the AOT backend rejects — only `run_main` returns
     /// an error; the tree-walker surface stays usable.
     #[default]
     Auto,
-    /// Tree-walking interpreter only. Supports the full surface:
-    /// lazy thunks, first-class closures, `eval` on arbitrary nodes,
+    /// Tree-walking interpreter only. Supports the full surface —
+    /// core [`Evaluator`] plus the [`TreeWalkEval`] extension: lazy
+    /// thunks, first-class closures, `eval` on arbitrary nodes,
     /// host-registered native fns with capability gating. Pick this
     /// when a host wants to guarantee no AOT construction happens,
     /// even on `run_main`.
@@ -628,8 +630,9 @@ pub enum Backend {
     /// JIT module surface to produce native machine code; `run_main`
     /// invokes the JIT entry through a panic-shielded trampoline.
     /// Covers the full IR envelope the corpus exercises (51/52
-    /// corpus parity with the tree-walker). The four non-`run_main`
-    /// `Evaluator` methods surface `RuntimeError::Unsupported`.
+    /// corpus parity with the tree-walker). `eval_root` surfaces
+    /// `RuntimeError::Unsupported`; the [`TreeWalkEval`] extension
+    /// trait is not implemented (compiled code keeps no AST).
     /// Pick this when a host wants to pay the AOT cold-start cost
     /// up-front (e.g. before a latency-sensitive serving loop)
     /// rather than on first `run_main`.
@@ -700,9 +703,10 @@ pub enum BackendError {
 }
 
 /// Construct an [`relon_eval_api::Evaluator`] over `source` using the
-/// requested [`Backend`]. The returned trait object can drive
-/// `run_main` (both backends) plus — for [`Backend::TreeWalk`] — the
-/// full `Evaluator` surface.
+/// requested [`Backend`]. The returned trait object carries the core
+/// contract (`eval_root` / `run_main`); hosts that need the tree-walk
+/// extension surface ([`TreeWalkEval`]) keep a concrete
+/// [`AutoEvaluator`] / `TreeWalkEvaluator` instead of the box.
 ///
 /// The tree-walking variant deliberately mirrors what `value_from_str`
 /// does internally: workspace analysis runs first, the default

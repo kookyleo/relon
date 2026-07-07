@@ -852,8 +852,12 @@ the ones you need:
 | `wrap` | After the decorated node evaluates | Validation, transformation (e.g. `@ensure.int`) |
 | `schema_field_meta` | When extracting a field from a schema dict | Attach metadata to the field |
 
+Each hook receives a `&dyn TreeWalkEval` handle — the tree-walk
+fragment surface (`eval` / `force_thunk` / `invoke_closure`) — so a
+plugin can evaluate argument nodes or call closures mid-hook.
+
 The full trait signature lives in
-`crates/relon-evaluator/src/decorator.rs`; we won't repeat it here —
+`crates/relon-eval-api/src/decorator.rs`; we won't repeat it here —
 most hosts only need `wrap`.
 
 ## `Projector`: customize JSON output
