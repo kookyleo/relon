@@ -11,6 +11,19 @@
     cargo run -q -p relon-cli -- run --backend tree-walk examples/workflow.relon \
         --args '{"input": {"state": "placed", "event": "pay"}}'
 */
+#enum State {
+    Placed,
+    Paid,
+    Shipped,
+    Delivered,
+    Cancelled
+}
+#enum Event {
+    Pay,
+    Ship,
+    Deliver,
+    Cancel
+}
 
 #schema WorkflowInput {
     #expect "state must be placed / paid / shipped"
@@ -21,35 +34,79 @@
 
 #main(WorkflowInput input) -> Dict
 {
+    // The host speaks strings; map them onto the typed state machine at
+    // the boundary, then let `match` carry every transition rule.
     #internal
-    Bool is_event(String state, String event): input.state == state && input.event == event,
+    State parse_state(String s): s == "placed" ? State.Placed: s == "paid" ? State.Paid: State.Shipped,
     #internal
-    String route_state(): is_event("placed", "pay") ? "paid": is_event("paid", "ship") ? "shipped": is_event("shipped", "deliver") ? "delivered": is_event("placed", "cancel") || is_event("paid", "cancel") ? "cancelled": input.state,
+    Event parse_event(String e): e == "pay" ? Event.Pay: e == "ship" ? Event.Ship: e == "deliver" ? Event.Deliver: Event.Cancel,
     #internal
-    List<String> pay_effects: [
-        "charge_card",
-        "log_payment"
-    ],
+    String label(State s): s match {
+        Placed: "placed",
+        Paid: "paid",
+        Shipped: "shipped",
+        Delivered: "delivered",
+        Cancelled: "cancelled"
+    },
     #internal
-    List<String> ship_effects: [
-        "notify_shipper",
-        "email_user"
-    ],
+    State step(State s, Event e): e match {
+        Pay: s match {
+            Placed: State.Paid,
+            _: s
+        },
+        Ship: s match {
+            Paid: State.Shipped,
+            _: s
+        },
+        Deliver: s match {
+            Shipped: State.Delivered,
+            _: s
+        },
+        Cancel: s match {
+            Placed: State.Cancelled,
+            Paid: State.Cancelled,
+            _: s
+        }
+    },
     #internal
-    List<String> deliver_effects: [
-        "email_user"
-    ],
+    List<String> effects(State s, Event e): e match {
+        Pay: s match {
+            Placed: [
+                "charge_card",
+                "log_payment"
+            ],
+            _: unhandled()
+        },
+        Ship: s match {
+            Paid: [
+                "notify_shipper",
+                "email_user"
+            ],
+            _: unhandled()
+        },
+        Deliver: s match {
+            Shipped: [
+                "email_user"
+            ],
+            _: unhandled()
+        },
+        Cancel: s match {
+            Placed: [],
+            Paid: [
+                "refund_card"
+            ],
+            _: unhandled()
+        }
+    },
     #internal
-    List<String> refund_effects: [
-        "refund_card"
-    ],
-    #internal
-    List<String> no_effects: [],
-    #internal
-    List<String> unhandled_effects: [
+    List<String> unhandled(): [
         "unhandled_event"
     ],
+    #internal
+    State state: parse_state(input.state),
+    #internal
+    Event event: parse_event(input.event),
 
-    String next_state: route_state(),
-    List<String> emit: is_event("placed", "pay") ? &sibling.pay_effects: is_event("paid", "ship") ? &sibling.ship_effects: is_event("shipped", "deliver") ? &sibling.deliver_effects: is_event("paid", "cancel") ? &sibling.refund_effects: is_event("placed", "cancel") ? &sibling.no_effects: &sibling.unhandled_effects
+    String next_state: label(step(&sibling.state, &sibling.event)),
+    List<String> emit: effects(&sibling.state, &sibling.event)
 }
