@@ -191,6 +191,19 @@ impl HostPolicyProfileArg {
     }
 }
 
+/// Output format for `relon check` diagnostics.
+#[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
+enum CheckFormatArg {
+    /// Human-readable miette reports (default).
+    #[default]
+    #[value(name = "human")]
+    Human,
+    /// Machine-readable: a single JSON array of diagnostic objects
+    /// printed to stdout.
+    #[value(name = "json")]
+    Json,
+}
+
 /// Output format for `relon host-policy`.
 #[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
 enum HostPolicyFormatArg {
@@ -475,6 +488,16 @@ enum Commands {
         /// Require remote imports to carry inline hash pins.
         #[arg(long, default_value_t = false)]
         require_hash: bool,
+        /// Diagnostic output format. `human` (default) renders
+        /// miette-style reports. `json` prints a single JSON array of
+        /// diagnostic objects to stdout; each object carries `code`,
+        /// `severity` ("error" | "warning"), `message`, `file`,
+        /// `start` / `end` positions (1-based `line` / `column`
+        /// objects, null when no source position is known) and `help`
+        /// (null when the diagnostic has none). Exit-code semantics
+        /// are identical to human mode: non-zero iff the check fails.
+        #[arg(long, value_enum, default_value_t = CheckFormatArg::Human)]
+        format: CheckFormatArg,
     },
 
     /// Emit host-runtime policy for VM deployments. This is intentionally
@@ -669,7 +692,8 @@ fn main() -> miette::Result<()> {
             trust,
             max_source_bytes,
             require_hash,
-        } => cmd_check(file, backend, trust, max_source_bytes, require_hash)?,
+            format,
+        } => cmd_check(file, backend, trust, max_source_bytes, require_hash, format)?,
         Commands::HostPolicy {
             target,
             profile,
@@ -1418,6 +1442,7 @@ fn cmd_check(
     trust: bool,
     max_source_bytes: Option<usize>,
     require_hash: bool,
+    format: CheckFormatArg,
 ) -> miette::Result<()> {
     let canonical_file = std::fs::canonicalize(&file)
         .into_diagnostic()
@@ -1448,6 +1473,30 @@ fn cmd_check(
         &mut loader,
         &analyze_options,
     );
+
+    match format {
+        CheckFormatArg::Human => render_check_human(
+            &workspace,
+            &cache_namespace,
+            &content,
+            &file,
+            backend,
+            trust,
+        ),
+        CheckFormatArg::Json => {
+            render_check_json(&workspace, &cache_namespace, &content, backend, trust)
+        }
+    }
+}
+
+fn render_check_human(
+    workspace: &WorkspaceTree,
+    cache_namespace: &str,
+    content: &str,
+    file: &Path,
+    backend: BackendArg,
+    trust: bool,
+) -> miette::Result<()> {
     if workspace.has_errors() {
         let mut messages: Vec<String> = workspace
             .workspace_diagnostics
@@ -1463,66 +1512,251 @@ fn cmd_check(
             }
         }
         let joined = messages.join("\n  - ");
-        return Err(miette::miette!("Analyzer reported errors:\n  - {joined}")
-            .with_source_code(NamedSource::new(file.to_string_lossy(), content)));
+        return Err(
+            miette::miette!("Analyzer reported errors:\n  - {joined}").with_source_code(
+                NamedSource::new(file.to_string_lossy(), content.to_string()),
+            ),
+        );
     }
 
-    let has_main = workspace
-        .modules
-        .get(&cache_namespace)
-        .and_then(|tree| tree.main_signature.as_ref())
-        .is_some();
     println!("ok: analyzer");
-    match backend {
-        BackendArg::TreeWalk => {
-            println!("backend tree-walk: compatible (reference evaluator)");
+    // `--trust` cannot be honoured on the cranelift-AOT backend; the
+    // warning goes to stderr so it never pollutes stdout.
+    if trust && backend == BackendArg::CraneliftAot {
+        warn_trust_unsupported_on_aot();
+    }
+    match backend_compat_verdict(workspace, cache_namespace, content, backend) {
+        BackendCompatVerdict::Compatible(line) => {
+            println!("backend {line}");
             Ok(())
         }
-        BackendArg::CraneliftAot => {
-            if trust {
-                warn_trust_unsupported_on_aot();
+        BackendCompatVerdict::Incompatible(message) => Err(miette::miette!("{message}")),
+    }
+}
+
+fn render_check_json(
+    workspace: &WorkspaceTree,
+    cache_namespace: &str,
+    content: &str,
+    backend: BackendArg,
+    trust: bool,
+) -> miette::Result<()> {
+    let mut entries: Vec<JsonValue> = Vec::new();
+
+    // Workspace-level diagnostics (cycles, missing modules, hash
+    // pins, imported-module parse errors) have no single owning
+    // module; mirror the human renderer, which attaches them to the
+    // entry file's source.
+    for d in &workspace.workspace_diagnostics {
+        let mut entry = check_diagnostic_json(
+            d,
+            d.severity(),
+            d.to_string(),
+            cache_namespace,
+            Some(content),
+        );
+        // An entry-module parse error is recorded with a zero span;
+        // re-parse to recover the real error position, matching the
+        // labelled-span treatment `relon run` gives it.
+        if let WorkspaceDiagnostic::ModuleParseError { path, .. } = d {
+            if path == cache_namespace {
+                if let Err(parse_err) = parse_document(content) {
+                    if let Some(span) = parse_err.source_span() {
+                        entry["start"] = json_position(content, span.offset());
+                        entry["end"] = json_position(content, span.offset() + span.len());
+                    }
+                }
             }
-            check_cranelift_compat(&content, has_main, "cranelift-aot", true)
         }
-        BackendArg::Auto => {
-            if !has_main {
-                println!("backend auto: compatible (library-mode routes to tree-walk)");
-                return Ok(());
-            }
-            if relon::is_trivial_scalar_main(&content) {
-                println!("backend auto: compatible (trivial #main routes to tree-walk)");
-                return Ok(());
-            }
-            check_cranelift_compat(&content, has_main, "auto/cranelift-aot", false)
+        entries.push(entry);
+    }
+
+    // Per-module diagnostics, in sorted module order so the output
+    // is deterministic across runs (`modules` is a hash map).
+    let mut module_ids: Vec<&String> = workspace.modules.keys().collect();
+    module_ids.sort();
+    for id in module_ids {
+        let tree = &workspace.modules[id];
+        let module_source = if id == cache_namespace {
+            Some(content.to_string())
+        } else {
+            // Canonical module ids for filesystem imports are real
+            // paths; built-in `std/*` modules aren't on disk, so
+            // positions degrade to null for them.
+            std::fs::read_to_string(id).ok()
+        };
+        for d in &tree.diagnostics {
+            entries.push(check_diagnostic_json(
+                d,
+                d.severity(),
+                d.to_string(),
+                id,
+                module_source.as_deref(),
+            ));
+        }
+    }
+
+    if workspace.has_errors() {
+        print_check_json(&entries)?;
+        let error_count = workspace.all_error_diagnostics().len();
+        return Err(miette::miette!(
+            "relon check found {error_count} error diagnostic(s); see the JSON output on stdout"
+        ));
+    }
+
+    // Mirror the human renderer: the `--trust`-on-AOT warning fires
+    // only once the analyzer gate passed, and only on stderr.
+    if trust && backend == BackendArg::CraneliftAot {
+        warn_trust_unsupported_on_aot();
+    }
+    match backend_compat_verdict(workspace, cache_namespace, content, backend) {
+        BackendCompatVerdict::Compatible(_) => {
+            print_check_json(&entries)?;
+            Ok(())
+        }
+        BackendCompatVerdict::Incompatible(message) => {
+            entries.push(json!({
+                "code": "relon::check::backend_incompatible",
+                "severity": "error",
+                "message": message,
+                "file": cache_namespace,
+                "start": JsonValue::Null,
+                "end": JsonValue::Null,
+                "help": JsonValue::Null,
+            }));
+            print_check_json(&entries)?;
+            Err(miette::miette!("{message}"))
         }
     }
 }
 
-fn check_cranelift_compat(
+fn print_check_json(entries: &[JsonValue]) -> miette::Result<()> {
+    let rendered = serde_json::to_string_pretty(&entries).into_diagnostic()?;
+    println!("{rendered}");
+    Ok(())
+}
+
+/// One diagnostic rendered as a stable machine-readable object. Both
+/// analyzer [`relon_analyzer::Diagnostic`] and
+/// [`WorkspaceDiagnostic`] implement `miette::Diagnostic`, which is
+/// where `code` / `help` / the labelled span come from; severity and
+/// message are passed in because they come from the inherent
+/// (non-trait) surface of each enum.
+fn check_diagnostic_json(
+    diag: &dyn miette::Diagnostic,
+    severity: relon_analyzer::Severity,
+    message: String,
+    file: &str,
+    source: Option<&str>,
+) -> JsonValue {
+    let code = diag.code().map(|c| c.to_string());
+    let help = diag.help().map(|h| h.to_string());
+    let span = diag
+        .labels()
+        .and_then(|mut labels| labels.next())
+        .map(|label| *label.inner());
+    let (start, end) = match (span, source) {
+        (Some(span), Some(src)) => (
+            json_position(src, span.offset()),
+            json_position(src, span.offset() + span.len()),
+        ),
+        _ => (JsonValue::Null, JsonValue::Null),
+    };
+    json!({
+        "code": code,
+        "severity": match severity {
+            relon_analyzer::Severity::Error => "error",
+            relon_analyzer::Severity::Warning => "warning",
+        },
+        "message": message,
+        "file": file,
+        "start": start,
+        "end": end,
+        "help": help,
+    })
+}
+
+/// Convert a byte offset into a 1-based `{line, column}` object.
+/// Column counts characters (not bytes) since the start of the line;
+/// the offset is clamped onto a char boundary so a span that lands
+/// mid-codepoint cannot panic the slice.
+fn json_position(source: &str, byte_offset: usize) -> JsonValue {
+    let mut offset = byte_offset.min(source.len());
+    while offset > 0 && !source.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    let before = &source[..offset];
+    let line = before.bytes().filter(|b| *b == b'\n').count() + 1;
+    let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let column = before[line_start..].chars().count() + 1;
+    json!({ "line": line, "column": column })
+}
+
+/// Backend-compatibility outcome shared by the human and JSON
+/// renderers of `relon check`. `Compatible` carries the line the
+/// human renderer prints after the `backend ` prefix; `Incompatible`
+/// carries the message both renderers surface (human as a miette
+/// error, JSON as a synthetic `relon::check::backend_incompatible`
+/// diagnostic entry).
+enum BackendCompatVerdict {
+    Compatible(String),
+    Incompatible(String),
+}
+
+fn backend_compat_verdict(
+    workspace: &WorkspaceTree,
+    cache_namespace: &str,
+    content: &str,
+    backend: BackendArg,
+) -> BackendCompatVerdict {
+    let has_main = workspace
+        .modules
+        .get(cache_namespace)
+        .and_then(|tree| tree.main_signature.as_ref())
+        .is_some();
+    match backend {
+        BackendArg::TreeWalk => BackendCompatVerdict::Compatible(
+            "tree-walk: compatible (reference evaluator)".to_string(),
+        ),
+        BackendArg::CraneliftAot => {
+            cranelift_compat_verdict(content, has_main, "cranelift-aot", true)
+        }
+        BackendArg::Auto => {
+            if !has_main {
+                return BackendCompatVerdict::Compatible(
+                    "auto: compatible (library-mode routes to tree-walk)".to_string(),
+                );
+            }
+            if relon::is_trivial_scalar_main(content) {
+                return BackendCompatVerdict::Compatible(
+                    "auto: compatible (trivial #main routes to tree-walk)".to_string(),
+                );
+            }
+            cranelift_compat_verdict(content, has_main, "auto/cranelift-aot", false)
+        }
+    }
+}
+
+fn cranelift_compat_verdict(
     content: &str,
     has_main: bool,
     label: &str,
     strict: bool,
-) -> miette::Result<()> {
+) -> BackendCompatVerdict {
     if !has_main {
         let message = format!("{label}: incompatible (cranelift-aot requires `#main(...)`)");
         return if strict {
-            Err(miette::miette!("{message}"))
+            BackendCompatVerdict::Incompatible(message)
         } else {
-            println!("backend {message}; auto will route to tree-walk");
-            Ok(())
+            BackendCompatVerdict::Compatible(format!("{message}; auto will route to tree-walk"))
         };
     }
     match AotEvaluator::from_source(content) {
-        Ok(_) => {
-            println!("backend {label}: compatible");
-            Ok(())
-        }
-        Err(e) if e.is_unsupported_shape() && !strict => {
-            println!("backend {label}: not compiled ({e}); auto will fall back to tree-walk");
-            Ok(())
-        }
-        Err(e) => Err(miette::miette!("{label}: incompatible: {e}")),
+        Ok(_) => BackendCompatVerdict::Compatible(format!("{label}: compatible")),
+        Err(e) if e.is_unsupported_shape() && !strict => BackendCompatVerdict::Compatible(format!(
+            "{label}: not compiled ({e}); auto will fall back to tree-walk"
+        )),
+        Err(e) => BackendCompatVerdict::Incompatible(format!("{label}: incompatible: {e}")),
     }
 }
 
