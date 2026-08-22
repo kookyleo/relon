@@ -347,6 +347,14 @@ pub(super) fn lower_fn_call(
     if let Some(()) = try_lower_list_map(path, args, range, ctx)? {
         return Ok(());
     }
+    // std/list stable sort family free-call form `_list_sort_by(xs, k)` /
+    // `_list_sort_by_desc(xs, k)` — the desugar target of the `sort` /
+    // `sort_by` / `sort_desc` / `sort_by_desc` surface wrappers. Sits
+    // beside `_list_map`; `List<Int>` / `List<Float>` sources with an
+    // Int / Float key lower four-way, everything else caps loudly.
+    if let Some(()) = try_lower_list_sort_by(path, args, range, ctx)? {
+        return Ok(());
+    }
     // review-improvement-160 bytecode M3 phase 2: peephole-desugar
     // `list.sum(range(end))` / `list.sum(range(start, end))` into an
     // explicit `Op::Loop` accumulator before normal lowering kicks in.
@@ -665,6 +673,14 @@ pub(super) fn lower_fn_call(
             return Ok(());
         }
     }
+    // NOTE: there is deliberately no method-form (`xs.sort_by(k)`)
+    // dispatch for the sort family. The tree-walk oracle exposes the
+    // sort wrappers only as `std/list` module members (`list.sort_by`),
+    // never as UFCS list methods, so `xs.sort_by(...)` traps
+    // `FunctionNotFound` there. Compiling that shape would make the
+    // compiled backends diverge from the oracle. The four-way surface is
+    // the intrinsic free-call `_list_sort_by(xs, k)` that every wrapper
+    // desugars to (handled in the free-call peephole above).
     let Some(fn_index) = stdlib_method_index(receiver_ty, method_name) else {
         return Err(cap!(
             "lower_fn_call.unknown_stdlib_method.4",

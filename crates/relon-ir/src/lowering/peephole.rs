@@ -3351,6 +3351,114 @@ pub(super) fn try_lower_list_map(
     emit_list_hof_call(ListHofKind::Map, args, range, ctx)
 }
 
+/// Resolve the bundled sort body for a concrete
+/// `(source element, key, direction)` shape. Returns `None` for element
+/// or key types outside the four-way `Int` / `Float` envelope (String /
+/// Bool receivers, String-return keys) so the caller caps loudly.
+fn sort_builtin_name(src_elem: IrType, key_ty: IrType, desc: bool) -> Option<&'static str> {
+    Some(match (src_elem, key_ty, desc) {
+        (IrType::I64, IrType::I64, false) => "list_sort_by_ii_asc",
+        (IrType::I64, IrType::I64, true) => "list_sort_by_ii_desc",
+        (IrType::I64, IrType::F64, false) => "list_sort_by_if_asc",
+        (IrType::I64, IrType::F64, true) => "list_sort_by_if_desc",
+        (IrType::F64, IrType::I64, false) => "list_sort_by_fi_asc",
+        (IrType::F64, IrType::I64, true) => "list_sort_by_fi_desc",
+        (IrType::F64, IrType::F64, false) => "list_sort_by_ff_asc",
+        (IrType::F64, IrType::F64, true) => "list_sort_by_ff_desc",
+        _ => return None,
+    })
+}
+
+/// std/list stable sort family, free-call form
+/// `_list_sort_by(xs, key)` / `_list_sort_by_desc(xs, key)` — the
+/// desugar target of the `sort` / `sort_by` / `sort_desc` /
+/// `sort_by_desc` surface wrappers. Speculatively lowers the list source
+/// (`args[0]`), rolls back on a non-`List<Int>` / non-`List<Float>`
+/// source so dispatch caps loudly, then probes the key closure's return
+/// type (`Int` first, then `Float`) to pick the bundled merge-sort body,
+/// lowers the closure, and emits `Op::Call(<builtin>)`. The result list
+/// type equals the source list type — the key only orders.
+///
+/// `List<String>` / `List<Bool>` sources and String-return keys are
+/// outside the four-way envelope (no proven four-way String ordering);
+/// they fall through here and cap on the tree-walk fallback.
+pub(super) fn try_lower_list_sort_by(
+    path: &[TokenKey],
+    args: &[relon_parser::CallArg],
+    range: TokenRange,
+    ctx: &mut LowerCtx<'_>,
+) -> Result<Option<()>, LoweringError> {
+    if path.len() != 1 || args.len() != 2 || args.iter().any(|a| a.name.is_some()) {
+        return Ok(None);
+    }
+    let desc = match &path[0] {
+        TokenKey::String(s, _, _) if s == "_list_sort_by" => false,
+        TokenKey::String(s, _, _) if s == "_list_sort_by_desc" => true,
+        _ => return Ok(None),
+    };
+    let Expr::Closure { params, .. } = &*args[1].value.expr else {
+        return Ok(None);
+    };
+    if params.len() != 1 {
+        return Ok(None);
+    }
+
+    // Speculatively lower the source list; roll the ctx back on a
+    // non-list / unsupported-element source (identical discipline to
+    // `emit_list_hof_call`).
+    let saved_out = std::mem::take(&mut ctx.out);
+    let saved_stack = std::mem::take(&mut ctx.tstack);
+    let saved_next_let = ctx.next_let_idx;
+    let saved_lambda_len = ctx.lambda_table.borrow().len();
+    let restore = |ctx: &mut LowerCtx<'_>, out: Vec<TaggedOp>, stack: Vec<IrType>| {
+        ctx.out = out;
+        ctx.tstack = stack;
+        ctx.next_let_idx = saved_next_let;
+        ctx.lambda_table.borrow_mut().truncate(saved_lambda_len);
+    };
+    let lower_res = lower_expr(&args[0].value.expr, args[0].value.range, ctx);
+    let produced = ctx.tstack.last().copied();
+    let src_elem = match produced {
+        Some(IrType::ListInt) => IrType::I64,
+        Some(IrType::ListFloat) => IrType::F64,
+        _ => {
+            restore(ctx, saved_out, saved_stack);
+            return Ok(None);
+        }
+    };
+    if lower_res.is_err() {
+        restore(ctx, saved_out, saved_stack);
+        return Ok(None);
+    }
+    // Detach the committed source stream; splice it back only once the
+    // key closure half is decided (lowered into a fresh empty buffer).
+    let src_stream = std::mem::take(&mut ctx.out);
+    let src_stack = std::mem::take(&mut ctx.tstack);
+
+    // Probe the key closure's return type (Int first, then Float); a
+    // String (or otherwise non-scalar) return matches neither and caps.
+    for key_ty in [IrType::I64, IrType::F64] {
+        let Some(builtin) = sort_builtin_name(src_elem, key_ty, desc) else {
+            continue;
+        };
+        if try_lower_closure_with_ret(&args[1].value, &[src_elem], key_ty, ctx)? {
+            // Commit `saved_out ++ src ++ closure`, then emit the call.
+            let closure_stream = std::mem::take(&mut ctx.out);
+            let closure_stack = std::mem::take(&mut ctx.tstack);
+            ctx.out = saved_out;
+            ctx.out.extend(src_stream);
+            ctx.out.extend(closure_stream);
+            ctx.tstack = saved_stack;
+            ctx.tstack.extend(src_stack);
+            ctx.tstack.extend(closure_stack);
+            return finish_list_hof(builtin, range, ctx);
+        }
+    }
+    // No key candidate matched; nothing committed. Restore for the cap.
+    restore(ctx, saved_out, saved_stack);
+    Ok(None)
+}
+
 /// Wave R3: general `_list_reduce(xs, <init>, (acc, x) => <body>)` over
 /// an arbitrary `List<Int>`-typed first argument, folding to an `Int`
 /// accumulator. Speculatively lowers the list source (same composition

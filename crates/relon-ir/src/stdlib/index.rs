@@ -251,6 +251,22 @@ pub fn stdlib_closure_arg_signature(name: &str, arg_idx: u32) -> Option<(Vec<IrT
         ("list_float_map_to_variant_list", 1) => Some((vec![IrType::F64], IrType::I32)),
         ("list_string_map_to_variant_list", 1) => Some((vec![IrType::String], IrType::I32)),
         ("list_list_filter", 1) => Some((vec![IrType::I32], IrType::Bool)),
+        // std/list sort family — key closure `(elem) -> key` at arg 1.
+        // The element type is the receiver's; the key type (Int / Float)
+        // is what the merge comparator uses. String-return keys are not
+        // listed — they cap loudly to the tree-walk fallback.
+        ("list_sort_by_ii_asc", 1) | ("list_sort_by_ii_desc", 1) => {
+            Some((vec![IrType::I64], IrType::I64))
+        }
+        ("list_sort_by_if_asc", 1) | ("list_sort_by_if_desc", 1) => {
+            Some((vec![IrType::I64], IrType::F64))
+        }
+        ("list_sort_by_fi_asc", 1) | ("list_sort_by_fi_desc", 1) => {
+            Some((vec![IrType::F64], IrType::I64))
+        }
+        ("list_sort_by_ff_asc", 1) | ("list_sort_by_ff_desc", 1) => {
+            Some((vec![IrType::F64], IrType::F64))
+        }
         _ => None,
     }
 }
