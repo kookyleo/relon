@@ -260,6 +260,39 @@ fn build_list() -> HashMap<String, FnSignature> {
         ],
         list_of(tvar("T")),
     ));
+    // take(l, n): `<T>(List<T>, Int) -> List<T>` — a prefix, so the
+    // element type is preserved. Pure wrapper over `range` + index +
+    // comprehension; no backing intrinsic.
+    ins(sig(
+        "take",
+        &["T"],
+        vec![param("l", list_of(tvar("T"))), param("n", tn!(Int))],
+        list_of(tvar("T")),
+    ));
+    // slice(l, start, end): `<T>(List<T>, Int, Int) -> List<T>` — a
+    // sub-range, element type preserved. Pure wrapper.
+    ins(sig(
+        "slice",
+        &["T"],
+        vec![
+            param("l", list_of(tvar("T"))),
+            param("start", tn!(Int)),
+            param("end", tn!(Int)),
+        ],
+        list_of(tvar("T")),
+    ));
+    // zip(a, b): `<T, U>(List<T>, List<U>) -> List<Tuple<T, U>>` — pairs
+    // positionally, truncating to the shorter side. Pure wrapper over a
+    // comprehension of `(a[i], b[i])` tuples.
+    ins(sig(
+        "zip",
+        &["T", "U"],
+        vec![
+            param("a", list_of(tvar("T"))),
+            param("b", list_of(tvar("U"))),
+        ],
+        list_of(type_node_generic("Tuple", vec![tvar("T"), tvar("U")])),
+    ));
     m
 }
 

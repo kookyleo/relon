@@ -51,6 +51,9 @@ in source, but the stable API is the `std/<module>` export.
 | `std/list.sort_by` | `forall T, K: (list: List[T], key: Closure[(T) -> K]) -> List[T]` | list module | stable portable (Int/Float keys); tree-walk only for String keys | Stable ascending sort by the key closure; key must be a homogeneous orderable scalar. |
 | `std/list.sort_desc` | `forall T: (list: List[T]) -> List[T]` | list module | stable portable (Int/Float); tree-walk only for String/Bool | Stable descending sort; equal-key ties stay in input order (not `reverse(sort(...))`). |
 | `std/list.sort_by_desc` | `forall T, K: (list: List[T], key: Closure[(T) -> K]) -> List[T]` | list module | stable portable (Int/Float keys); tree-walk only for String keys | Stable descending sort by the key closure; equal-key ties stay in input order. |
+| `std/list.take` | `forall T: (list: List[T], n: Int) -> List[T]` | list module | tree-walk only | Total: `n <= 0` gives `[]`, `n >= len` copies the whole list; never errors. |
+| `std/list.slice` | `forall T: (list: List[T], start: Int, end: Int) -> List[T]` | list module | tree-walk only | Total: `start`/`end` clamp into `[0, len]`; `start >= end` after clamping gives `[]`; never errors. |
+| `std/list.zip` | `forall T, U: (a: List[T], b: List[U]) -> List[Tuple[T, U]]` | list module | tree-walk only | Total: pairs positionally, truncating to the shorter side. |
 | `std/dict.merge` | `forall V: (base: Dict[String, V], overlay: Dict[String, V]) -> Dict[String, V]` | dict module | stable portable | Overlay keys overwrite base keys. |
 | `std/dict.keys` | `forall V: (dict: Dict[String, V]) -> List[String]` | dict module | stable portable | Returns deterministic map order. |
 | `std/dict.values` | `forall V: (dict: Dict[String, V]) -> List[V]` | dict module | stable portable | Order matches `std/dict.keys`. |

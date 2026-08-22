@@ -56,6 +56,8 @@ mod import_pin_tests;
 #[cfg(test)]
 mod sandbox_tests;
 #[cfg(test)]
+mod slicing_tests;
+#[cfg(test)]
 mod sort_tests;
 #[cfg(test)]
 mod stdlib_drift_tests;

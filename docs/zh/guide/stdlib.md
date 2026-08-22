@@ -45,6 +45,9 @@ Relon 标准库是**语言的一部分**——下列模块随运行时一起发�
 | `std/list.sort_by` | `forall T, K: (list: List[T], key: Closure[(T) -> K]) -> List[T]` | list 模块 | stable portable（Int/Float 键）；String 键仅 tree-walk | 按键闭包稳定升序排序；键必须是同型可排序标量。 |
 | `std/list.sort_desc` | `forall T: (list: List[T]) -> List[T]` | list 模块 | stable portable（Int/Float）；String/Bool 仅 tree-walk | 稳定降序排序；等键并列保持输入原序（不等于 `reverse(sort(...))`）。 |
 | `std/list.sort_by_desc` | `forall T, K: (list: List[T], key: Closure[(T) -> K]) -> List[T]` | list 模块 | stable portable（Int/Float 键）；String 键仅 tree-walk | 按键闭包稳定降序排序；等键并列保持输入原序。 |
+| `std/list.take` | `forall T: (list: List[T], n: Int) -> List[T]` | list 模块 | 仅 tree-walk | 全总：`n <= 0` 返回 `[]`，`n >= len` 拷贝整表；永不报错。 |
+| `std/list.slice` | `forall T: (list: List[T], start: Int, end: Int) -> List[T]` | list 模块 | 仅 tree-walk | 全总：`start`/`end` 都 clamp 到 `[0, len]`；clamp 后 `start >= end` 返回 `[]`；永不报错。 |
+| `std/list.zip` | `forall T, U: (a: List[T], b: List[U]) -> List[Tuple[T, U]]` | list 模块 | 仅 tree-walk | 全总：按位配对，截断到较短的一侧。 |
 | `std/dict.merge` | `forall V: (base: Dict[String, V], overlay: Dict[String, V]) -> Dict[String, V]` | dict 模块 | stable portable | overlay key 覆盖 base key。 |
 | `std/dict.keys` | `forall V: (dict: Dict[String, V]) -> List[String]` | dict 模块 | stable portable | 返回确定性的 map 顺序。 |
 | `std/dict.values` | `forall V: (dict: Dict[String, V]) -> List[V]` | dict 模块 | stable portable | 顺序与 `std/dict.keys` 一致。 |
