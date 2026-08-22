@@ -1147,6 +1147,26 @@ pub fn all_cases() -> Vec<CorpusCase> {
             tier: Tier::StdlibList,
             supported_by: TW_CR,
         },
+        // std/list stable sort family (`_list_sort_by` / `_list_sort_by_desc`).
+        // The pipe form feeds a tie-heavy, non-monotone `range(n).map(...)`
+        // permutation into the sort so the full bottom-up merge body runs;
+        // it also dodges the analyzer's `_list_sort_by(<map-expr>, key)`
+        // direct-argument inference limitation (the pipe desugars to the
+        // same free-call the sort peephole lowers).
+        CorpusCase {
+            name: "list_sort_by_asc",
+            source: "#main(Int n) -> List<Int>\nrange(n).map((Int x) => (x * 5) % 7) | _list_sort_by((Int x) => x)",
+            args_factory: || one_int("n", 10),
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
+        CorpusCase {
+            name: "list_sort_by_desc",
+            source: "#main(Int n) -> List<Int>\nrange(n).map((Int x) => (x * 5) % 7) | _list_sort_by_desc((Int x) => x)",
+            args_factory: || one_int("n", 10),
+            tier: Tier::StdlibList,
+            supported_by: TW_CR,
+        },
         CorpusCase {
             name: "r3_comprehension",
             source: "#main(Int n) -> List<Int>\n[x * 2 for x in range(n)]",

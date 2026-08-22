@@ -1,0 +1,88 @@
+// Golden fixture for the pure `std/list` slicing helpers `take` /
+// `slice` / `zip`, exercised end-to-end through the analyzer (strict
+// mode) + the import surface + the tree-walk evaluator + the JSON
+// boundary. These are total (never error): bounds clamp into
+// `[0, len]` and `range(lo, hi)` with `lo >= hi` yields the empty list.
+// All cases are JSON-safe; `zip` tuples serialize as JSON arrays.
+
+#import list from "std/list"
+
+{
+    // take: n <= 0 -> []; n >= len -> whole list; else the prefix.
+    "take_zero": list.take([
+        1,
+        2,
+        3,
+        4
+    ], 0), // []
+    "take_negative": list.take([
+        1,
+        2,
+        3,
+        4
+    ], -2), // []
+    "take_over": list.take([
+        1,
+        2,
+        3,
+        4
+    ], 99), // [1, 2, 3, 4]
+    "take_mid": list.take([
+        1,
+        2,
+        3,
+        4
+    ], 2), // [1, 2]
+    "take_empty": list.take([], 3), // []
+    // slice: both bounds clamp into [0, len]; start >= end -> [].
+    "slice_open_end": list.slice([
+        1,
+        2,
+        3,
+        4
+    ], 2, 99), // [3, 4]
+    "slice_inverted": list.slice([
+        1,
+        2,
+        3,
+        4
+    ], 3, 1), // []
+    "slice_neg_start": list.slice([
+        1,
+        2,
+        3,
+        4
+    ], -1, 2), // [1, 2]
+    "slice_neg_end": list.slice([
+        1,
+        2,
+        3,
+        4
+    ], 0, -1), // []
+    "slice_full": list.slice([
+        1,
+        2,
+        3,
+        4
+    ], 0, 4), // [1, 2, 3, 4]
+    // zip: pair positionally, truncate to the shorter side.
+    "zip_ragged": list.zip([
+        1,
+        2,
+        3
+    ], [
+        "a",
+        "b"
+    ]), // [(1,"a"),(2,"b")]
+    "zip_even": list.zip([
+        1,
+        2
+    ], [
+        "x",
+        "y"
+    ]), // [(1,"x"),(2,"y")]
+    "zip_empty": list.zip([], [
+        1,
+        2
+    ]) // []
+}

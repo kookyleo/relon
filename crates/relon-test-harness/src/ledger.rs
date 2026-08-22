@@ -696,7 +696,10 @@ pub const LEDGER: &[LedgerEntry] = &[
         category: Category::ExprShape,
         status: Status::Capped,
         corpus: "",
-        reason: "method/function name + arity matches no stdlib signature",
+        reason: "method/function name + arity matches no stdlib signature — e.g. a \
+                 `_list_sort_by` / `_list_sort_by_desc` over a `List<Bool>` element or with a \
+                 String-return key closure, which the sort peephole declines (no four-way String \
+                 ordering), falling through to the tree-walk sort",
     },
     LedgerEntry {
         id: "lower_fn_call.unknown_stdlib_method.2",
@@ -2849,6 +2852,26 @@ pub const SUPPORTED_SURFACE: &[SurfaceEntry] = &[
         status: Status::Covered,
         proof: "tree-walk + cranelift + llvm-native (three-way in list_string_hof_three_way; \
                 wasm List<String> decode pending — capped, not claimed here)",
+    },
+    // ---- std/list stable sort family (`_list_sort_by` / `_list_sort_by_desc`) ----
+    SurfaceEntry {
+        construct: "list sort (`_list_sort_by`, Int/Float element, Int/Float key, asc)",
+        wave: "sort",
+        corpus: "list_sort_by_asc",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift; llvm-native + llvm-wasm in \
+                aot_wasm_parity::sort_* ; edges (empty/single/ties/±0/NaN/inf, \
+                desc-vs-reverse) in list_sort_four_way",
+    },
+    SurfaceEntry {
+        construct: "list sort descending (`_list_sort_by_desc`, stable, ties keep input order)",
+        wave: "sort",
+        corpus: "list_sort_by_desc",
+        status: Status::Covered,
+        proof: "tree-walk + cranelift; llvm-native + llvm-wasm in \
+                aot_wasm_parity::sort_* . `List<String>` / `List<Bool>` element and \
+                String-return keys stay capped (see lower_fn_call.unknown_stdlib_method.1 \
+                and the List<String>-return marshalling cap)",
     },
     // ---- Wave R4: type() static const-fold ----
     SurfaceEntry {

@@ -119,6 +119,15 @@ roadmap 体现。（capability 的静态可达性分析已落地：analyzer 的
     范的显式选择，让 `Dict<String, Float>` 等可序列化）
   * `-0.0 == 0.0` 为 `true`
   * 排序中 `NaN` 视为大于一切非 NaN。
+  * 排序中 `-0.0` 与 `+0.0` 视为**相等**——排序键序会把带符号的
+    零折叠到一起（与裸的 `OrderedFloat::total_cmp` 不同，后者会把
+    `-0.0 < +0.0` 拆开）。它们的相对次序由稳定性决定，即保持输入
+    原序。完整的浮点键序为 `-inf < … < -0.0 == +0.0 < … < +inf < NaN`。
+* `std/list` 排序族（`sort` / `sort_by` / `sort_desc` /
+  `sort_by_desc`）是**稳定的自底向上（迭代）归并排序**，在此固定，
+  所有后端逐字节共享同一算法。稳定性保证等键元素保持输入原序，因此
+  `sort_desc` **不等于** `reverse(sort(...))`——降序只翻转键的比较
+  方向，等键的并列项仍按输入的升序次序排列。
 * 浮点运算遵守 IEEE-754；**禁止** fast-math、FMA 自动融合或编译期
   常量折叠产生不同舍入。**一个显式例外**：除数为零（含 Float
   `0.0` / `-0.0`）一律抛 `DivisionByZero`，**不**产生 IEEE-754 的
@@ -712,6 +721,25 @@ tree-walk fallback，编译后端响亮拒编）；`multiple_of` 的 Float 参�
 `unique` 的 `List<String>` / `List<Bool>` 元素形；以及 `count` 的
 count-empty FastInt 入口形（`count(range(0))`，无 buffer 操作数——
 wasm 对象发射对它响亮拒绝，等价的 Buffer 入口源已四方验证）。
+
+**`std/list` 排序族（`sort` / `sort_by` / `sort_desc` /
+`sort_by_desc`）。** 参考 tree-walk oracle 今天已对任意可排序标量键
+（Int / Float / String / Bool）实现全部四个函数，采用 §2.3 固定的
+稳定自底向上归并排序。后端覆盖沿着与 `List<String>` 相同的「字符串
+比较缝」划分：
+
+* `List<Int>` / `List<Float>` 元素（键返回 Int / Float）：指定为
+  **四方**——编译后端携带完全相同的内置 IR 归并排序 body，与 oracle
+  逐字节相等。Float 键把 `-0.0 == +0.0` 折叠、并把所有 `NaN` 排在
+  `+inf` 之后（§2.3），因此各后端产出的置换完全一致。
+* `List<String>` / `List<Bool>` 元素，以及键闭包返回 `String` 的
+  **任何**情形：诚实 **cap 到 tree-walk**。编译后端响亮回退 / 拒编
+  （绝不悄悄编错值），与既有 `List<String>` 比较缝的边界一致。每处
+  cap 都记入账本。
+
+只有 `n` 次键闭包调用计入 `max_steps`（每个被 decorate 的元素一次
+`tick`，与 `map` / `filter` 一致）；归并比较是 native、不计费，因此
+预算完全可由输入长度预测。
 
 **遗留 runtime-only 注册不属于稳定 stdlib。** tree-walker 的内部
 free-fn 注册表里仍保留一些历史 `register_pure_fn` 名字；它们没有

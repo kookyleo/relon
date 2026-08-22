@@ -219,6 +219,80 @@ fn build_list() -> HashMap<String, FnSignature> {
         vec![param("l", list_of(list_of(tvar("T"))))],
         list_of(tvar("T")),
     ));
+    // sort(l): `<T>(List<T>) -> List<T>` — sorts by the element itself.
+    ins(sig(
+        "sort",
+        &["T"],
+        vec![param("l", list_of(tvar("T")))],
+        list_of(tvar("T")),
+    ));
+    // sort_by(l, k): `<T, K>(List<T>, Closure<(T) -> K>) -> List<T>` —
+    // the key type does not surface; the element type is preserved.
+    ins(sig(
+        "sort_by",
+        &["T", "K"],
+        vec![
+            param("l", list_of(tvar("T"))),
+            param(
+                "k",
+                type_node_generic("Closure", vec![tvar("T"), tvar("K")]),
+            ),
+        ],
+        list_of(tvar("T")),
+    ));
+    // sort_desc(l): `<T>(List<T>) -> List<T>` — descending by element.
+    ins(sig(
+        "sort_desc",
+        &["T"],
+        vec![param("l", list_of(tvar("T")))],
+        list_of(tvar("T")),
+    ));
+    // sort_by_desc(l, k): `<T, K>(List<T>, Closure<(T) -> K>) -> List<T>`.
+    ins(sig(
+        "sort_by_desc",
+        &["T", "K"],
+        vec![
+            param("l", list_of(tvar("T"))),
+            param(
+                "k",
+                type_node_generic("Closure", vec![tvar("T"), tvar("K")]),
+            ),
+        ],
+        list_of(tvar("T")),
+    ));
+    // take(l, n): `<T>(List<T>, Int) -> List<T>` — a prefix, so the
+    // element type is preserved. Pure wrapper over `range` + index +
+    // comprehension; no backing intrinsic.
+    ins(sig(
+        "take",
+        &["T"],
+        vec![param("l", list_of(tvar("T"))), param("n", tn!(Int))],
+        list_of(tvar("T")),
+    ));
+    // slice(l, start, end): `<T>(List<T>, Int, Int) -> List<T>` — a
+    // sub-range, element type preserved. Pure wrapper.
+    ins(sig(
+        "slice",
+        &["T"],
+        vec![
+            param("l", list_of(tvar("T"))),
+            param("start", tn!(Int)),
+            param("end", tn!(Int)),
+        ],
+        list_of(tvar("T")),
+    ));
+    // zip(a, b): `<T, U>(List<T>, List<U>) -> List<Tuple<T, U>>` — pairs
+    // positionally, truncating to the shorter side. Pure wrapper over a
+    // comprehension of `(a[i], b[i])` tuples.
+    ins(sig(
+        "zip",
+        &["T", "U"],
+        vec![
+            param("a", list_of(tvar("T"))),
+            param("b", list_of(tvar("U"))),
+        ],
+        list_of(type_node_generic("Tuple", vec![tvar("T"), tvar("U")])),
+    ));
     m
 }
 

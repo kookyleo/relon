@@ -1250,6 +1250,49 @@ fn r3_range_map_aligns_native_via_wasmtime() {
     );
 }
 
+/// std/list sort — `_list_sort_by(<scrambled range>, key)` → List<Int>.
+/// The `(x * 5) % 7` key produces a tie-heavy, non-monotone permutation
+/// that straddles the merge widths, so this exercises the full stable
+/// bottom-up merge sort body (not a trivially-ordered input) on the
+/// llvm-native and (when `wasm-ld` is present) llvm-wasm legs.
+#[test]
+fn sort_int_asc_aligns_native_via_wasmtime() {
+    r3_list_parity(
+        "sort_int_asc",
+        "relon_parity_sort_int_asc",
+        "#main(Int n) -> List<Int>\n\
+         range(n).map((Int x) => (x * 5) % 7) | _list_sort_by((Int x) => x)",
+        10,
+    );
+}
+
+/// std/list sort — descending. Sorting the plain ascending `range(n)`
+/// descending yields `[n-1, .., 0]`, proving the desc merge direction
+/// four-way.
+#[test]
+fn sort_int_desc_aligns_native_via_wasmtime() {
+    r3_list_parity(
+        "sort_int_desc",
+        "relon_parity_sort_int_desc",
+        "#main(Int n) -> List<Int>\n\
+         range(n).map((Int x) => (x * 5) % 7) | _list_sort_by_desc((Int x) => x)",
+        8,
+    );
+}
+
+/// std/list sort — Int elements ordered by a Float key (`x * 1.0`),
+/// proving the Int-element / Float-key merge-sort body four-way.
+#[test]
+fn sort_int_by_float_key_aligns_native_via_wasmtime() {
+    r3_list_parity(
+        "sort_int_by_float_key",
+        "relon_parity_sort_int_by_float_key",
+        "#main(Int n) -> List<Int>\n\
+         range(n).map((Int x) => (x * 5) % 7) | _list_sort_by((Int x) => x * 1.0)",
+        10,
+    );
+}
+
 /// Wave R12 — list spread over a single RUNTIME source `[100, ...range(n), 200]`:
 /// the source length is only known at runtime, so the materialiser allocs a
 /// scratch record, stores the static scalars inline, and `memory.copy`-s the
@@ -1457,6 +1500,33 @@ fn lf_range_map_scale_aligns_native_via_wasmtime() {
         "#import list from \"std/list\"\n#main(Int n) -> List<Float>\n\
          range(n).map((Int x) => x * 2.0)",
         5,
+    );
+}
+
+/// std/list sort — Float elements sorted ascending by identity key. The
+/// `((x * 5) % 7) * 1.0` source is tie-heavy and non-monotone, so this
+/// drives the Float-key merge comparator (ordered `<=`, ±0 / NaN-aware)
+/// four-way. NaN / signed-zero bit edges are covered by the harness
+/// `list_sort_four_way` tests (arg-driven); the wasm leg here proves the
+/// body compiles and orders finite Floats bit-equal to native.
+#[test]
+fn sort_float_asc_aligns_native_via_wasmtime() {
+    list_float_parity(
+        "sort_float_asc",
+        "#main(Int n) -> List<Float>\n\
+         range(n).map((Int x) => ((x * 5) % 7) * 1.0) | _list_sort_by((Float x) => x)",
+        10,
+    );
+}
+
+/// std/list sort — Float elements sorted descending by identity key.
+#[test]
+fn sort_float_desc_aligns_native_via_wasmtime() {
+    list_float_parity(
+        "sort_float_desc",
+        "#main(Int n) -> List<Float>\n\
+         range(n).map((Int x) => x * 1.0) | _list_sort_by_desc((Float x) => x)",
+        8,
     );
 }
 

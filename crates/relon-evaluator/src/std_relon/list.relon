@@ -19,5 +19,29 @@
     first(l): l[0],
     last(l): l[_len(l) - 1],
     compact(l): l | _list_filter((x) => x != None),
-    flatten(l): l | _list_reduce([], (acc, x) => [...acc, ...x])
+    flatten(l): l | _list_reduce([], (acc, x) => [...acc, ...x]),
+    // Stable sort family. `sort` / `sort_desc` sort by the element
+    // itself; `sort_by` / `sort_by_desc` sort by a key closure. Keys
+    // must be a homogeneous orderable scalar (Int/Float/String/Bool);
+    // `sort_desc` keeps equal-key elements in input order (it is NOT
+    // `reverse(sort(...))`).
+    sort(l): _list_sort_by(l, (x) => x),
+    sort_by(l, k): _list_sort_by(l, k),
+    sort_desc(l): _list_sort_by_desc(l, (x) => x),
+    sort_by_desc(l, k): _list_sort_by_desc(l, k),
+    // Prefix / sub-range / pairing, written over `range` + index +
+    // comprehension + tuple. All three are total (never error): the
+    // bounds are clamped to `[0, len]` before any index is taken, and
+    // `range(lo, hi)` with `lo >= hi` yields the empty list.
+    // take(l, n): first `n` elements. `n <= 0` -> []; `n >= len` ->
+    // whole list (copy); else the first `n`. `range(k)` with `k <= 0`
+    // is already empty, so only the upper bound needs clamping.
+    take(l, n): [l[i] for i in range(n > _len(l) ? _len(l): n)],
+    // slice(l, start, end): the half-open `[start, end)` window. Both
+    // bounds clamp into `[0, len]` (negatives to 0, past-end to len);
+    // after clamping `start >= end` yields [].
+    slice(l, start, end): [l[i] for i in range((start < 0 ? 0: (start > _len(l) ? _len(l): start)), (end < 0 ? 0: (end > _len(l) ? _len(l): end)))],
+    // zip(a, b): pair positionally, truncating to the shorter side.
+    // Returns List[Tuple[T, U]].
+    zip(a, b): [(a[i], b[i]) for i in range(_len(a) < _len(b) ? _len(a): _len(b))]
 }

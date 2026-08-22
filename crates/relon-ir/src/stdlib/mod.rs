@@ -335,12 +335,15 @@ mod glob_match_index_tests {
     /// `is_uri`) append at 65..69; the RFC 3339 date validator
     /// `is_iso_date` appends at 70; the stdlib tail wave (`every` /
     /// `some` / `unique` predicate loops + `pow`) appends at 71..77;
-    /// `list_int_min` (the `max` mirror) appends at 78.
+    /// `list_int_min` (the `max` mirror) appends at 78; the std/list
+    /// stable sort family (`_list_sort_by` / `_list_sort_by_desc`, the
+    /// eight `(element, key, direction)` merge-sort bodies) appends at
+    /// 79..86.
     /// All are at the tail so every position-pinned index above stays
     /// put. Pinning the count catches accidental double-registrations.
     #[test]
-    fn bundle_has_79_entries() {
-        assert_eq!(stdlib_function_count(), 79);
+    fn bundle_has_87_entries() {
+        assert_eq!(stdlib_function_count(), 87);
         assert_eq!(stdlib_function_index("glob_match"), Some(37));
         assert_eq!(stdlib_function_index("list_list_length"), Some(38));
         // Wave R3b tail appends (order-pinned wire format).
@@ -407,6 +410,16 @@ mod glob_match_index_tests {
         assert_eq!(stdlib_function_index("pow"), Some(77));
         // `min` symmetry append: the `list_int_max` mirror.
         assert_eq!(stdlib_function_index("list_int_min"), Some(78));
+        // std/list stable sort family: eight (element, key, direction)
+        // merge-sort bodies, order-pinned wire format.
+        assert_eq!(stdlib_function_index("list_sort_by_ii_asc"), Some(79));
+        assert_eq!(stdlib_function_index("list_sort_by_ii_desc"), Some(80));
+        assert_eq!(stdlib_function_index("list_sort_by_if_asc"), Some(81));
+        assert_eq!(stdlib_function_index("list_sort_by_if_desc"), Some(82));
+        assert_eq!(stdlib_function_index("list_sort_by_fi_asc"), Some(83));
+        assert_eq!(stdlib_function_index("list_sort_by_fi_desc"), Some(84));
+        assert_eq!(stdlib_function_index("list_sort_by_ff_asc"), Some(85));
+        assert_eq!(stdlib_function_index("list_sort_by_ff_desc"), Some(86));
     }
 }
 

@@ -243,6 +243,41 @@ fn build() -> HashMap<String, FnSignature> {
         None,
     );
     m.insert(k, v);
+    // `_list_sort_by<T, K>(List<T>, Closure<(T) -> K>) -> List<T>`. The
+    // key type `K` is bound from the closure body but does not appear
+    // in the return — the element type `T` is preserved. The runtime
+    // enforces that `K` is a homogeneous orderable scalar.
+    let (k, v) = sig_generic(
+        "_list_sort_by",
+        vec!["T".into(), "K".into()],
+        vec![
+            param("list", type_node_generic("List", vec![tn_var("T")])),
+            param(
+                "key",
+                type_node_generic("Closure", vec![tn_var("T"), tn_var("K")]),
+            ),
+        ],
+        type_node_generic("List", vec![tn_var("T")]),
+        None,
+    );
+    m.insert(k, v);
+    // `_list_sort_by_desc<T, K>(List<T>, Closure<(T) -> K>) -> List<T>`.
+    // Identical signature to `_list_sort_by`; only the runtime ordering
+    // direction differs.
+    let (k, v) = sig_generic(
+        "_list_sort_by_desc",
+        vec!["T".into(), "K".into()],
+        vec![
+            param("list", type_node_generic("List", vec![tn_var("T")])),
+            param(
+                "key",
+                type_node_generic("Closure", vec![tn_var("T"), tn_var("K")]),
+            ),
+        ],
+        type_node_generic("List", vec![tn_var("T")]),
+        None,
+    );
+    m.insert(k, v);
 
     // -- string intrinsics ----------------------------------------------
     let (k, v) = sig(

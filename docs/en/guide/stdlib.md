@@ -25,7 +25,8 @@ nothing extra.
 
 ## Stable user API manifest
 
-This table is the first-release public stdlib surface. Module rows name
+This table is the stable public stdlib surface (frozen at first release,
+grown only by deliberate, reviewed additions). Module rows name
 the module path and exported member; users may choose any import alias
 in source, but the stable API is the `std/<module>` export.
 
@@ -46,6 +47,13 @@ in source, but the stable API is the `std/<module>` export.
 | `std/list.last` | `forall T: (list: List[T]) -> T` | list module | stable portable | Empty lists raise an index/list error. |
 | `std/list.compact` | `forall T: (list: List[T]) -> List[T]` | list module | stable portable | Removes `None` elements. |
 | `std/list.flatten` | `forall T: (list: List[List[T]]) -> List[T]` | list module | stable portable | Non-list elements raise type errors. |
+| `std/list.sort` | `forall T: (list: List[T]) -> List[T]` | list module | stable portable (Int/Float); tree-walk only for String/Bool | Stable ascending sort by the element; key must be a homogeneous orderable scalar (mixed/non-scalar keys raise a type error). |
+| `std/list.sort_by` | `forall T, K: (list: List[T], key: Closure[(T) -> K]) -> List[T]` | list module | stable portable (Int/Float keys); tree-walk only for String keys | Stable ascending sort by the key closure; key must be a homogeneous orderable scalar. |
+| `std/list.sort_desc` | `forall T: (list: List[T]) -> List[T]` | list module | stable portable (Int/Float); tree-walk only for String/Bool | Stable descending sort; equal-key ties stay in input order (not `reverse(sort(...))`). |
+| `std/list.sort_by_desc` | `forall T, K: (list: List[T], key: Closure[(T) -> K]) -> List[T]` | list module | stable portable (Int/Float keys); tree-walk only for String keys | Stable descending sort by the key closure; equal-key ties stay in input order. |
+| `std/list.take` | `forall T: (list: List[T], n: Int) -> List[T]` | list module | tree-walk only | Total: `n <= 0` gives `[]`, `n >= len` copies the whole list; never errors. |
+| `std/list.slice` | `forall T: (list: List[T], start: Int, end: Int) -> List[T]` | list module | tree-walk only | Total: `start`/`end` clamp into `[0, len]`; `start >= end` after clamping gives `[]`; never errors. |
+| `std/list.zip` | `forall T, U: (a: List[T], b: List[U]) -> List[Tuple[T, U]]` | list module | tree-walk only | Total: pairs positionally, truncating to the shorter side. |
 | `std/dict.merge` | `forall V: (base: Dict[String, V], overlay: Dict[String, V]) -> Dict[String, V]` | dict module | stable portable | Overlay keys overwrite base keys. |
 | `std/dict.keys` | `forall V: (dict: Dict[String, V]) -> List[String]` | dict module | stable portable | Returns deterministic map order. |
 | `std/dict.values` | `forall V: (dict: Dict[String, V]) -> List[V]` | dict module | stable portable | Order matches `std/dict.keys`. |
@@ -91,6 +99,8 @@ above and `#expect` for schemas.
 | `_list_filter` | `forall T: (list: List[T], f: Closure[(T) -> Bool]) -> List[T]` | backing intrinsic | portable internal | Predicate must return `Bool`; closure errors abort the call. |
 | `_list_reduce` | `forall T, U: (list: List[T], init: U, f: Closure[(U, T) -> U]) -> U` | backing intrinsic | portable internal | Closure errors abort the call. |
 | `_list_contains` | `forall T: (list: List[T], needle: T) -> Bool` | backing intrinsic | portable internal | Uses Relon value equality. |
+| `_list_sort_by` | `forall T, K: (list: List[T], key: Closure[(T) -> K]) -> List[T]` | backing intrinsic | portable internal (Int/Float keys); tree-walk only for String keys | Stable bottom-up merge sort, ascending; key must be a homogeneous orderable scalar. |
+| `_list_sort_by_desc` | `forall T, K: (list: List[T], key: Closure[(T) -> K]) -> List[T]` | backing intrinsic | portable internal (Int/Float keys); tree-walk only for String keys | Stable bottom-up merge sort, descending; ties stay in input order. |
 | `_string_split` | `(s: String, sep: String) -> List[String]` | backing intrinsic | portable internal | Byte-oriented string semantics. |
 | `_string_join` | `forall T: (list: List[T], sep: String) -> String` | backing intrinsic | portable internal | Elements are rendered with Relon value formatting. |
 | `_string_replace` | `(s: String, from: String, to: String) -> String` | backing intrinsic | portable internal | Byte-oriented string semantics. |
@@ -175,7 +185,10 @@ capability model.
     head: list.first([10, 20, 30]),                 // 10
     tail: list.last([10, 20, 30]),                  // 30
     cleaned: list.compact([1, None, 2]),            // [1, 2]
-    flat: list.flatten([[1, 2], [3]])               // [1, 2, 3]
+    flat: list.flatten([[1, 2], [3]]),              // [1, 2, 3]
+    sorted: list.sort([3, 1, 2]),                   // [1, 2, 3]
+    by_len: list.sort_by(["ccc", "a", "bb"], (s) => list.len(s)), // ["a", "bb", "ccc"]
+    desc: list.sort_desc([1, 3, 2])                 // [3, 2, 1]
 }
 ```
 

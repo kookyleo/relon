@@ -141,6 +141,17 @@ sorting are forbidden.
     `Dict<String, Float>` etc. round-trip).
   * `-0.0 == 0.0` is `true`.
   * In sorts, `NaN` is greater than every non-NaN.
+  * In sorts, `-0.0` and `+0.0` compare **equal** — the sort key order
+    collapses signed zero (unlike bare `OrderedFloat::total_cmp`, which
+    splits `-0.0 < +0.0`). Their relative position is decided by
+    stability, i.e. their original input order. The full float key
+    order is `-inf < … < -0.0 == +0.0 < … < +inf < NaN`.
+* The `std/list` sort family (`sort` / `sort_by` / `sort_desc` /
+  `sort_by_desc`) is a **stable bottom-up (iterative) merge sort**,
+  pinned here and shared byte-for-byte by every backend. Stability
+  keeps equal-key elements in their original input order, so
+  `sort_desc` is NOT `reverse(sort(...))` — descending flips the key
+  comparison but leaves equal-key ties in ascending input order.
 * Float arithmetic obeys IEEE-754; fast-math, automatic FMA fusing,
   and compile-time constant folding that changes rounding are
   forbidden. **One explicit exception**: a zero divisor (including
@@ -872,6 +883,28 @@ but the body is not compiled yet); `every` / `some` / `unique` over
 entry shape for `count` (`count(range(0))`, no buffer operand — the
 wasm object emitter rejects it loudly; the equivalent Buffer-entry
 source is verified four-way).
+
+**`std/list` sort family (`sort` / `sort_by` / `sort_desc` /
+`sort_by_desc`).** The reference tree-walk oracle implements all four
+today over any orderable-scalar key (Int / Float / String / Bool),
+via the stable bottom-up merge sort pinned in §2.3. Backend coverage
+splits along the same String-comparison seam as `List<String>`:
+
+* `List<Int>` / `List<Float>` elements (key returns Int / Float):
+  designated **four-way** — the compiled backends carry the identical
+  bundled IR merge-sort body and are byte-equal to the oracle. Float
+  keys collapse `-0.0 == +0.0` and sort every `NaN` after `+inf`
+  (§2.3), so the permutation is identical across backends.
+* `List<String>` / `List<Bool>` elements, and **any** case where the
+  key closure returns `String`: an honest **cap to tree-walk**. The
+  compiled backends refuse / fall back loudly (never silently
+  miscompile), the same boundary the existing `List<String>`
+  comparison seam already draws. Each cap is recorded in the ledger.
+
+Only the `n` key-closure invocations are charged to `max_steps` (one
+`tick` per decorated element, matching `map` / `filter`); the merge
+comparisons are native and uncharged, so the budget is predictable
+from the input length alone.
 
 **Legacy runtime-only registrations are not stable stdlib.** The
 tree-walker's internal free-fn registry still contains historical

@@ -87,10 +87,11 @@ use peephole::{
     emit_list_value_materialize, flatten_list_spread, list_has_computed_element, list_has_spread,
     list_is_float_shaped, match_bare_range, match_materializable_outer_map, probe_expr_ir_ty,
     try_lower_len_filter_range, try_lower_list_count, try_lower_list_filter, try_lower_list_len,
-    try_lower_list_map, try_lower_list_pred, try_lower_list_reduce, try_lower_list_sum_range,
-    try_lower_list_sum_value, try_lower_list_unique, try_lower_materialized_list_reduce,
-    try_lower_nested_range_map_reduce, try_lower_range_chain_len, try_lower_range_chain_reduce,
-    try_lower_range_value, try_lower_type_const,
+    try_lower_list_map, try_lower_list_pred, try_lower_list_reduce, try_lower_list_sort_by,
+    try_lower_list_sum_range, try_lower_list_sum_value, try_lower_list_unique,
+    try_lower_materialized_list_reduce, try_lower_nested_range_map_reduce,
+    try_lower_range_chain_len, try_lower_range_chain_reduce, try_lower_range_value,
+    try_lower_type_const,
 };
 
 /// Per-function lowering state shared across the recursive walk.

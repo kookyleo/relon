@@ -1713,6 +1713,668 @@ pub(super) fn list_int_min() -> StdlibFunction {
     )
 }
 
+// =====================================================================
+// std/list sort family — compiled backend (`_list_sort_by` /
+// `_list_sort_by_desc`).
+//
+// A stable, bottom-up (iterative) merge sort of the element indices by a
+// decorated key, byte-reproducing the tree-walk oracle
+// (`relon_evaluator::stdlib::{compare_sort_keys, compare_sort_floats,
+// list_sort_by_impl}`). The oracle's contract is pinned in
+// `docs/en/guide/spec.md` §2.3 / §6.7:
+//
+//   1. Decorate: `key[i] = closure(list[i])` for `i in 0..n`, in
+//      ascending index order (exactly `n` closure calls). The tree-walk
+//      backend charges one `max_steps` tick per call; the compiled
+//      backends have no per-step budget (they use a wall-clock budget),
+//      so the closure is simply invoked `n` times with no tick op.
+//   2. Sort: stable bottom-up merge sort of the indices `0..n` by the
+//      total preorder on the keys, ties broken by original index.
+//      - asc: take the left run's head when `key[left] <= key[right]`.
+//      - desc: take the left run's head when `key[left] >= key[right]`.
+//   3. Undecorate: `result[j] = list[perm[j]]` (a blind 8-byte copy —
+//      the `List<Int>` / `List<Float>` element slot layout is identical).
+//
+// Float key order reproduces `compare_sort_floats` exactly with only
+// *ordered* IEEE comparisons (`Op::Le`/`Op::Ge` on `F64` lower to
+// `FloatCC::LessThanOrEqual` / `GreaterThanOrEqual` on cranelift and
+// `OLE` / `OGE` on LLVM — both false when either operand is NaN):
+//
+//   * `-0.0 == +0.0`: ordered `<=` / `>=` already treat `+0.0` and
+//     `-0.0` as equal, so a tie keeps the lower original index (stable) —
+//     matching the oracle's explicit ±0 collapse. No `total_cmp`.
+//   * NaN is the single greatest class (all NaN equal, after `+inf`):
+//     `Op::Ne(F64)` here follows `OrderedFloat` (`NaN != NaN` is *false*)
+//     and is unusable for a NaN probe, so NaN is detected structurally.
+//     `is_nan(x) == 1 - (x <= x)` because an ordered self-compare is
+//     true for every non-NaN and false for NaN. The two terms below are
+//     mutually exclusive, so their sum is a canonical `0`/`1`:
+//       - asc  take_left = (1 - (kr <= kr)) + (kl <= kr)
+//                        =  kr_is_nan       |  ordered kl <= kr
+//       - desc take_left = (1 - (kl <= kl)) + (kl >= kr)
+//                        =  kl_is_nan       |  ordered kl >= kr
+//
+// The branch inside the merge is expressed arithmetically
+// (`chosen = ib + take_left * (ia - ib)`, `a += take_left`,
+// `b += 1 - take_left`) so no `Op::If` / `Op::Select` is needed.
+//
+// Parameterised by the source element representation (which typed load
+// feeds the closure and which register class the closure param uses),
+// the key representation (which typed load + comparison the merge uses),
+// and the sort direction. The element is always moved as a raw 8-byte
+// value, so gather is a single `LoadI64AtAbsolute` / `StoreI64AtAbsolute`
+// for both Int and Float receivers (bit-identical, no NaN canonicalise).
+//
+// Locals (all `LetGet`/`LetSet`, disjoint from the two `LocalGet`
+// params — `0` = source list handle, `1` = key closure handle):
+//   * 0  — n:            I32   element count
+//   * 1  — result_base:  I32   result record base (arena-relative)
+//   * 2  — key_buf:      I32   decorated key buffer payload (8-aligned)
+//   * 3  — idx_a:        I32   index buffer A payload (4-aligned)
+//   * 4  — idx_b:        I32   index buffer B payload (4-aligned)
+//   * 5  — src_payload:  I32   source element payload
+//   * 6  — dst_payload:  I32   result element payload
+//   * 7  — i:            I32   loop counter
+//   * 8  — width:        I32   current run width
+//   * 9  — left:         I32   run boundaries
+//   * 10 — mid:          I32
+//   * 11 — right:        I32
+//   * 12 — a:            I32   merge cursors
+//   * 13 — b:            I32
+//   * 14 — k:            I32
+//   * 15 — cur:          I32   ping-pong: current permutation buffer
+//   * 16 — tmp:          I32   ping-pong: scratch permutation buffer
+//   * 17 — ia:           I32   src[a] / gather index
+//   * 18 — ib:           I32   src[b]
+//   * 19 — kl:           key   key[ia]
+//   * 20 — kr:           key   key[ib]
+//   * 21 — tl:           I32   take_left (0/1)
+//   * 22 — t:            I32   min() scratch
+#[allow(clippy::too_many_lines)]
+fn list_sort_body_typed(
+    elem_load: fn(u32) -> Op,
+    src_elem: IrType,
+    key_load: fn(u32) -> Op,
+    key_store: fn(u32) -> Op,
+    key_ty: IrType,
+    desc: bool,
+) -> Vec<TaggedOp> {
+    const N: u32 = 0;
+    const RESULT_BASE: u32 = 1;
+    const KEY_BUF: u32 = 2;
+    const IDX_A: u32 = 3;
+    const IDX_B: u32 = 4;
+    const SRC_PAYLOAD: u32 = 5;
+    const DST_PAYLOAD: u32 = 6;
+    const I: u32 = 7;
+    const WIDTH: u32 = 8;
+    const LEFT: u32 = 9;
+    const MID: u32 = 10;
+    const RIGHT: u32 = 11;
+    const A: u32 = 12;
+    const B: u32 = 13;
+    const K: u32 = 14;
+    const CUR: u32 = 15;
+    const TMP: u32 = 16;
+    const IA: u32 = 17;
+    const IB: u32 = 18;
+    const KL: u32 = 19;
+    const KR: u32 = 20;
+    const TL: u32 = 21;
+    const T: u32 = 22;
+
+    let i32t = IrType::I32;
+    let lg = |idx: u32, ty: IrType| tt(Op::LetGet { idx, ty });
+    let ls = |idx: u32, ty: IrType| tt(Op::LetSet { idx, ty });
+    let ci = |v: i32| tt(Op::ConstI32(v));
+    // `base_slot + idx_slot * scale` as an i32 address.
+    let addr = |base: u32, idx: u32, scale: i32| -> Vec<TaggedOp> {
+        vec![
+            lg(base, i32t),
+            lg(idx, i32t),
+            ci(scale),
+            tt(Op::Mul(i32t)),
+            tt(Op::Add(i32t)),
+        ]
+    };
+    // `dst_slot = min(i_slot + span, n)` (branch-free:
+    // `t = i + span; dst = t + (n - t) * (t >= n)`), leaving nothing on
+    // the operand stack.
+    let min_into = |dst: u32, i_slot: u32, span: Vec<TaggedOp>| -> Vec<TaggedOp> {
+        let mut v = vec![lg(i_slot, i32t)];
+        v.extend(span);
+        v.push(tt(Op::Add(i32t)));
+        v.push(ls(T, i32t));
+        v.extend(vec![
+            lg(T, i32t),
+            lg(N, i32t),
+            lg(T, i32t),
+            tt(Op::Sub(i32t)),
+            lg(T, i32t),
+            lg(N, i32t),
+            tt(Op::Ge(i32t)),
+            tt(Op::Mul(i32t)),
+            tt(Op::Add(i32t)),
+            ls(dst, i32t),
+        ]);
+        v
+    };
+    // take_left (0/1) from kl (slot KL) vs kr (slot KR).
+    let compare_take_left = || -> Vec<TaggedOp> {
+        if key_ty == IrType::I64 {
+            let cmp = if desc { Op::Ge(key_ty) } else { Op::Le(key_ty) };
+            vec![lg(KL, key_ty), lg(KR, key_ty), tt(cmp)]
+        } else if desc {
+            // (1 - (kl <= kl)) + (kl >= kr)
+            vec![
+                ci(1),
+                lg(KL, key_ty),
+                lg(KL, key_ty),
+                tt(Op::Le(IrType::F64)),
+                tt(Op::Sub(i32t)),
+                lg(KL, key_ty),
+                lg(KR, key_ty),
+                tt(Op::Ge(IrType::F64)),
+                tt(Op::Add(i32t)),
+            ]
+        } else {
+            // (1 - (kr <= kr)) + (kl <= kr)
+            vec![
+                ci(1),
+                lg(KR, key_ty),
+                lg(KR, key_ty),
+                tt(Op::Le(IrType::F64)),
+                tt(Op::Sub(i32t)),
+                lg(KL, key_ty),
+                lg(KR, key_ty),
+                tt(Op::Le(IrType::F64)),
+                tt(Op::Add(i32t)),
+            ]
+        }
+    };
+
+    let mut body: Vec<TaggedOp> = Vec::new();
+
+    // n = list[0]
+    body.extend(vec![
+        tt(Op::LocalGet(0)),
+        tt(Op::LoadI32AtAbsolute { offset: 0 }),
+        ls(N, i32t),
+    ]);
+    // result_base = AllocScratchDyn(16 + 8*n); store header len.
+    body.extend(vec![
+        ci(16),
+        lg(N, i32t),
+        ci(8),
+        tt(Op::Mul(i32t)),
+        tt(Op::Add(i32t)),
+        tt(Op::AllocScratchDyn),
+        ls(RESULT_BASE, i32t),
+        lg(RESULT_BASE, i32t),
+        lg(N, i32t),
+        tt(Op::StoreI32AtAbsolute { offset: 0 }),
+    ]);
+    // src_payload = (list + 4 + 7) & -8
+    body.extend(vec![
+        tt(Op::LocalGet(0)),
+        ci(4 + 7),
+        tt(Op::Add(i32t)),
+        ci(-8),
+        tt(Op::BitAnd(i32t)),
+        ls(SRC_PAYLOAD, i32t),
+    ]);
+    // dst_payload = (result_base + 4 + 7) & -8
+    body.extend(vec![
+        lg(RESULT_BASE, i32t),
+        ci(4 + 7),
+        tt(Op::Add(i32t)),
+        ci(-8),
+        tt(Op::BitAnd(i32t)),
+        ls(DST_PAYLOAD, i32t),
+    ]);
+    // key_buf = (AllocScratchDyn(8*n + 8) + 7) & -8
+    body.extend(vec![
+        lg(N, i32t),
+        ci(8),
+        tt(Op::Mul(i32t)),
+        ci(8),
+        tt(Op::Add(i32t)),
+        tt(Op::AllocScratchDyn),
+        ci(7),
+        tt(Op::Add(i32t)),
+        ci(-8),
+        tt(Op::BitAnd(i32t)),
+        ls(KEY_BUF, i32t),
+    ]);
+    // idx_a = (AllocScratchDyn(4*n + 4) + 3) & -4
+    body.extend(vec![
+        lg(N, i32t),
+        ci(4),
+        tt(Op::Mul(i32t)),
+        ci(4),
+        tt(Op::Add(i32t)),
+        tt(Op::AllocScratchDyn),
+        ci(3),
+        tt(Op::Add(i32t)),
+        ci(-4),
+        tt(Op::BitAnd(i32t)),
+        ls(IDX_A, i32t),
+    ]);
+    // idx_b = (AllocScratchDyn(4*n + 4) + 3) & -4
+    body.extend(vec![
+        lg(N, i32t),
+        ci(4),
+        tt(Op::Mul(i32t)),
+        ci(4),
+        tt(Op::Add(i32t)),
+        tt(Op::AllocScratchDyn),
+        ci(3),
+        tt(Op::Add(i32t)),
+        ci(-4),
+        tt(Op::BitAnd(i32t)),
+        ls(IDX_B, i32t),
+    ]);
+
+    // Decorate: key[i] = closure(elem[i]); idx_a[i] = i, for i in 0..n.
+    let mut decorate: Vec<TaggedOp> = Vec::new();
+    decorate.extend(vec![
+        lg(I, i32t),
+        lg(N, i32t),
+        tt(Op::Ge(i32t)),
+        tt(Op::BrIf { label_depth: 1 }),
+    ]);
+    // key addr, closure handle, decoded element, call, store key.
+    decorate.extend(addr(KEY_BUF, I, 8));
+    decorate.push(tt(Op::LocalGet(1)));
+    decorate.extend(addr(SRC_PAYLOAD, I, 8));
+    decorate.push(tt(elem_load(0)));
+    decorate.push(tt(Op::CallClosure {
+        param_tys: vec![src_elem],
+        ret_ty: key_ty,
+    }));
+    decorate.push(tt(key_store(0)));
+    // idx_a[i] = i
+    decorate.extend(addr(IDX_A, I, 4));
+    decorate.push(lg(I, i32t));
+    decorate.push(tt(Op::StoreI32AtAbsolute { offset: 0 }));
+    // i += 1
+    decorate.extend(vec![
+        lg(I, i32t),
+        ci(1),
+        tt(Op::Add(i32t)),
+        ls(I, i32t),
+        tt(Op::Br { label_depth: 0 }),
+    ]);
+    body.extend(vec![
+        ci(0),
+        ls(I, i32t),
+        tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
+                result_ty: None,
+                body: decorate,
+            })],
+        }),
+    ]);
+
+    // cur = idx_a; tmp = idx_b; width = 1.
+    body.extend(vec![
+        lg(IDX_A, i32t),
+        ls(CUR, i32t),
+        lg(IDX_B, i32t),
+        ls(TMP, i32t),
+        ci(1),
+        ls(WIDTH, i32t),
+    ]);
+
+    // Merge main loop body: while a < mid && b < right.
+    let mut merge_main: Vec<TaggedOp> = Vec::new();
+    merge_main.extend(vec![
+        lg(A, i32t),
+        lg(MID, i32t),
+        tt(Op::Ge(i32t)),
+        tt(Op::BrIf { label_depth: 1 }),
+        lg(B, i32t),
+        lg(RIGHT, i32t),
+        tt(Op::Ge(i32t)),
+        tt(Op::BrIf { label_depth: 1 }),
+    ]);
+    // ia = cur[a]; ib = cur[b]
+    merge_main.extend(addr(CUR, A, 4));
+    merge_main.push(tt(Op::LoadI32AtAbsolute { offset: 0 }));
+    merge_main.push(ls(IA, i32t));
+    merge_main.extend(addr(CUR, B, 4));
+    merge_main.push(tt(Op::LoadI32AtAbsolute { offset: 0 }));
+    merge_main.push(ls(IB, i32t));
+    // kl = key[ia]; kr = key[ib]
+    merge_main.extend(addr(KEY_BUF, IA, 8));
+    merge_main.push(tt(key_load(0)));
+    merge_main.push(ls(KL, key_ty));
+    merge_main.extend(addr(KEY_BUF, IB, 8));
+    merge_main.push(tt(key_load(0)));
+    merge_main.push(ls(KR, key_ty));
+    // tl = take_left
+    merge_main.extend(compare_take_left());
+    merge_main.push(ls(TL, i32t));
+    // tmp[k] = ib + tl * (ia - ib)
+    merge_main.extend(addr(TMP, K, 4));
+    merge_main.extend(vec![
+        lg(IB, i32t),
+        lg(TL, i32t),
+        lg(IA, i32t),
+        lg(IB, i32t),
+        tt(Op::Sub(i32t)),
+        tt(Op::Mul(i32t)),
+        tt(Op::Add(i32t)),
+        tt(Op::StoreI32AtAbsolute { offset: 0 }),
+    ]);
+    // a += tl; b += 1 - tl; k += 1
+    merge_main.extend(vec![
+        lg(A, i32t),
+        lg(TL, i32t),
+        tt(Op::Add(i32t)),
+        ls(A, i32t),
+        lg(B, i32t),
+        ci(1),
+        lg(TL, i32t),
+        tt(Op::Sub(i32t)),
+        tt(Op::Add(i32t)),
+        ls(B, i32t),
+        lg(K, i32t),
+        ci(1),
+        tt(Op::Add(i32t)),
+        ls(K, i32t),
+        tt(Op::Br { label_depth: 0 }),
+    ]);
+
+    // Tail copy of a run: while <cursor> < <bound>: tmp[k] = cur[cursor].
+    let tail = |cursor: u32, bound: u32| -> Vec<TaggedOp> {
+        let mut v = vec![
+            lg(cursor, i32t),
+            lg(bound, i32t),
+            tt(Op::Ge(i32t)),
+            tt(Op::BrIf { label_depth: 1 }),
+        ];
+        v.extend(addr(TMP, K, 4));
+        v.extend(addr(CUR, cursor, 4));
+        v.push(tt(Op::LoadI32AtAbsolute { offset: 0 }));
+        v.push(tt(Op::StoreI32AtAbsolute { offset: 0 }));
+        v.extend(vec![
+            lg(cursor, i32t),
+            ci(1),
+            tt(Op::Add(i32t)),
+            ls(cursor, i32t),
+            lg(K, i32t),
+            ci(1),
+            tt(Op::Add(i32t)),
+            ls(K, i32t),
+            tt(Op::Br { label_depth: 0 }),
+        ]);
+        v
+    };
+
+    // One run-pair merge: set left/mid/right, a/b/k, then the three loops.
+    let mut merge_pass: Vec<TaggedOp> = Vec::new();
+    merge_pass.extend(vec![
+        lg(I, i32t),
+        lg(N, i32t),
+        tt(Op::Ge(i32t)),
+        tt(Op::BrIf { label_depth: 1 }),
+        lg(I, i32t),
+        ls(LEFT, i32t),
+    ]);
+    // mid = min(i + width, n)
+    merge_pass.extend(min_into(MID, I, vec![lg(WIDTH, i32t)]));
+    // right = min(i + 2*width, n)
+    merge_pass.extend(min_into(
+        RIGHT,
+        I,
+        vec![lg(WIDTH, i32t), ci(2), tt(Op::Mul(i32t))],
+    ));
+    merge_pass.extend(vec![
+        lg(LEFT, i32t),
+        ls(A, i32t),
+        lg(MID, i32t),
+        ls(B, i32t),
+        lg(LEFT, i32t),
+        ls(K, i32t),
+    ]);
+    merge_pass.push(tt(Op::Block {
+        result_ty: None,
+        body: vec![tt(Op::Loop {
+            result_ty: None,
+            body: merge_main,
+        })],
+    }));
+    merge_pass.push(tt(Op::Block {
+        result_ty: None,
+        body: vec![tt(Op::Loop {
+            result_ty: None,
+            body: tail(A, MID),
+        })],
+    }));
+    merge_pass.push(tt(Op::Block {
+        result_ty: None,
+        body: vec![tt(Op::Loop {
+            result_ty: None,
+            body: tail(B, RIGHT),
+        })],
+    }));
+    // i += 2*width
+    merge_pass.extend(vec![
+        lg(I, i32t),
+        lg(WIDTH, i32t),
+        ci(2),
+        tt(Op::Mul(i32t)),
+        tt(Op::Add(i32t)),
+        ls(I, i32t),
+        tt(Op::Br { label_depth: 0 }),
+    ]);
+
+    // Outer loop body: while width < n.
+    let mut outer: Vec<TaggedOp> = vec![
+        lg(WIDTH, i32t),
+        lg(N, i32t),
+        tt(Op::Ge(i32t)),
+        tt(Op::BrIf { label_depth: 1 }),
+        ci(0),
+        ls(I, i32t),
+    ];
+    outer.push(tt(Op::Block {
+        result_ty: None,
+        body: vec![tt(Op::Loop {
+            result_ty: None,
+            body: merge_pass,
+        })],
+    }));
+    // swap cur/tmp; width *= 2
+    outer.extend(vec![
+        lg(CUR, i32t),
+        ls(T, i32t),
+        lg(TMP, i32t),
+        ls(CUR, i32t),
+        lg(T, i32t),
+        ls(TMP, i32t),
+        lg(WIDTH, i32t),
+        ci(2),
+        tt(Op::Mul(i32t)),
+        ls(WIDTH, i32t),
+        tt(Op::Br { label_depth: 0 }),
+    ]);
+    body.push(tt(Op::Block {
+        result_ty: None,
+        body: vec![tt(Op::Loop {
+            result_ty: None,
+            body: outer,
+        })],
+    }));
+
+    // Gather: result[j] = list[cur[j]] as a raw 8-byte move, for j in 0..n.
+    let mut gather: Vec<TaggedOp> = vec![
+        lg(I, i32t),
+        lg(N, i32t),
+        tt(Op::Ge(i32t)),
+        tt(Op::BrIf { label_depth: 1 }),
+    ];
+    // ia = cur[j]
+    gather.extend(addr(CUR, I, 4));
+    gather.push(tt(Op::LoadI32AtAbsolute { offset: 0 }));
+    gather.push(ls(IA, i32t));
+    // dst addr = dst_payload + j*8
+    gather.extend(addr(DST_PAYLOAD, I, 8));
+    // value = list[ia] (8 raw bytes)
+    gather.extend(addr(SRC_PAYLOAD, IA, 8));
+    gather.push(tt(Op::LoadI64AtAbsolute { offset: 0 }));
+    gather.push(tt(Op::StoreI64AtAbsolute { offset: 0 }));
+    gather.extend(vec![
+        lg(I, i32t),
+        ci(1),
+        tt(Op::Add(i32t)),
+        ls(I, i32t),
+        tt(Op::Br { label_depth: 0 }),
+    ]);
+    body.extend(vec![
+        ci(0),
+        ls(I, i32t),
+        tt(Op::Block {
+            result_ty: None,
+            body: vec![tt(Op::Loop {
+                result_ty: None,
+                body: gather,
+            })],
+        }),
+    ]);
+
+    // return result_base
+    body.push(lg(RESULT_BASE, i32t));
+    body.push(tt(Op::Return));
+    body
+}
+
+/// Build a `_list_sort_by[_desc]` stdlib entry. `list_ty` is both the
+/// receiver's list type and the result list type — the key only orders,
+/// it never changes the element type.
+fn list_sort_entry(
+    name: &'static str,
+    list_ty: IrType,
+    body_builder: fn() -> Vec<TaggedOp>,
+) -> StdlibFunction {
+    StdlibFunction::new(name, vec![list_ty, IrType::Closure], list_ty, body_builder)
+}
+
+fn i64_load(o: u32) -> Op {
+    Op::LoadI64AtAbsolute { offset: o }
+}
+fn i64_store(o: u32) -> Op {
+    Op::StoreI64AtAbsolute { offset: o }
+}
+fn f64_load(o: u32) -> Op {
+    Op::LoadF64AtAbsolute { offset: o }
+}
+fn f64_store(o: u32) -> Op {
+    Op::StoreF64AtAbsolute { offset: o }
+}
+
+// The eight `(element, key, direction)` instantiations. Naming:
+// `list_sort_by_<elem><key>_<dir>` where elem/key ∈ {i, f}.
+
+pub(super) fn list_sort_by_ii_asc() -> StdlibFunction {
+    list_sort_entry("list_sort_by_ii_asc", IrType::ListInt, || {
+        list_sort_body_typed(
+            i64_load,
+            IrType::I64,
+            i64_load,
+            i64_store,
+            IrType::I64,
+            false,
+        )
+    })
+}
+pub(super) fn list_sort_by_ii_desc() -> StdlibFunction {
+    list_sort_entry("list_sort_by_ii_desc", IrType::ListInt, || {
+        list_sort_body_typed(
+            i64_load,
+            IrType::I64,
+            i64_load,
+            i64_store,
+            IrType::I64,
+            true,
+        )
+    })
+}
+pub(super) fn list_sort_by_if_asc() -> StdlibFunction {
+    list_sort_entry("list_sort_by_if_asc", IrType::ListInt, || {
+        list_sort_body_typed(
+            i64_load,
+            IrType::I64,
+            f64_load,
+            f64_store,
+            IrType::F64,
+            false,
+        )
+    })
+}
+pub(super) fn list_sort_by_if_desc() -> StdlibFunction {
+    list_sort_entry("list_sort_by_if_desc", IrType::ListInt, || {
+        list_sort_body_typed(
+            i64_load,
+            IrType::I64,
+            f64_load,
+            f64_store,
+            IrType::F64,
+            true,
+        )
+    })
+}
+pub(super) fn list_sort_by_fi_asc() -> StdlibFunction {
+    list_sort_entry("list_sort_by_fi_asc", IrType::ListFloat, || {
+        list_sort_body_typed(
+            f64_load,
+            IrType::F64,
+            i64_load,
+            i64_store,
+            IrType::I64,
+            false,
+        )
+    })
+}
+pub(super) fn list_sort_by_fi_desc() -> StdlibFunction {
+    list_sort_entry("list_sort_by_fi_desc", IrType::ListFloat, || {
+        list_sort_body_typed(
+            f64_load,
+            IrType::F64,
+            i64_load,
+            i64_store,
+            IrType::I64,
+            true,
+        )
+    })
+}
+pub(super) fn list_sort_by_ff_asc() -> StdlibFunction {
+    list_sort_entry("list_sort_by_ff_asc", IrType::ListFloat, || {
+        list_sort_body_typed(
+            f64_load,
+            IrType::F64,
+            f64_load,
+            f64_store,
+            IrType::F64,
+            false,
+        )
+    })
+}
+pub(super) fn list_sort_by_ff_desc() -> StdlibFunction {
+    list_sort_entry("list_sort_by_ff_desc", IrType::ListFloat, || {
+        list_sort_body_typed(
+            f64_load,
+            IrType::F64,
+            f64_load,
+            f64_store,
+            IrType::F64,
+            true,
+        )
+    })
+}
+
 fn list_int_min_body() -> Vec<TaggedOp> {
     const N: u32 = 0;
     const I: u32 = 1;

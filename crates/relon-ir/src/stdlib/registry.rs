@@ -29,7 +29,9 @@ use super::defs::{
     list_float_some, list_float_unique, list_int_every, list_int_filter, list_int_fold,
     list_int_length_to_int, list_int_map, list_int_map_to_float, list_int_map_to_string,
     list_int_map_to_variant_list, list_int_max, list_int_min, list_int_some, list_int_sum,
-    list_int_unique, list_list_filter, list_list_length, list_schema_length, list_string_length,
+    list_int_unique, list_list_filter, list_list_length, list_schema_length, list_sort_by_ff_asc,
+    list_sort_by_ff_desc, list_sort_by_fi_asc, list_sort_by_fi_desc, list_sort_by_if_asc,
+    list_sort_by_if_desc, list_sort_by_ii_asc, list_sort_by_ii_desc, list_string_length,
     list_string_map, list_string_map_to_variant_list, max_int, min_int, pow_float,
     round_float_to_int, sqrt_float, starts_with_string, substring_string,
 };
@@ -451,6 +453,33 @@ pub fn builtin_stdlib() -> &'static [StdlibFunction] {
             list_float_unique(),
             pow_float(),
             list_int_min(),
+            // std/list stable sort family (`_list_sort_by` /
+            // `_list_sort_by_desc`), appended at the tail so every
+            // earlier slot keeps its wire index. Eight
+            // `(element, key, direction)` instantiations — the element
+            // is moved as a raw 8 bytes, so the body only varies with
+            // the closure-return key type and the sort direction:
+            //   * `79` — `list_sort_by_ii_asc`  (List<Int>,   Int key,   asc)
+            //   * `80` — `list_sort_by_ii_desc` (List<Int>,   Int key,   desc)
+            //   * `81` — `list_sort_by_if_asc`  (List<Int>,   Float key, asc)
+            //   * `82` — `list_sort_by_if_desc` (List<Int>,   Float key, desc)
+            //   * `83` — `list_sort_by_fi_asc`  (List<Float>, Int key,   asc)
+            //   * `84` — `list_sort_by_fi_desc` (List<Float>, Int key,   desc)
+            //   * `85` — `list_sort_by_ff_asc`  (List<Float>, Float key, asc)
+            //   * `86` — `list_sort_by_ff_desc` (List<Float>, Float key, desc)
+            // `List<String>` / `List<Bool>` receivers and String-return
+            // key closures stay capped on the tree-walk fallback (the
+            // existing String comparison seam — no four-way String
+            // ordering yet); the lowering peephole declines those shapes
+            // loudly rather than miscompiling.
+            list_sort_by_ii_asc(),
+            list_sort_by_ii_desc(),
+            list_sort_by_if_asc(),
+            list_sort_by_if_desc(),
+            list_sort_by_fi_asc(),
+            list_sort_by_fi_desc(),
+            list_sort_by_ff_asc(),
+            list_sort_by_ff_desc(),
         ]
     })
 }

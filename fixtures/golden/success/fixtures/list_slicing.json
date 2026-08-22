@@ -1,0 +1,52 @@
+{
+  "slice_full": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "slice_inverted": [],
+  "slice_neg_end": [],
+  "slice_neg_start": [
+    1,
+    2
+  ],
+  "slice_open_end": [
+    3,
+    4
+  ],
+  "take_empty": [],
+  "take_mid": [
+    1,
+    2
+  ],
+  "take_negative": [],
+  "take_over": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "take_zero": [],
+  "zip_empty": [],
+  "zip_even": [
+    [
+      1,
+      "x"
+    ],
+    [
+      2,
+      "y"
+    ]
+  ],
+  "zip_ragged": [
+    [
+      1,
+      "a"
+    ],
+    [
+      2,
+      "b"
+    ]
+  ]
+}

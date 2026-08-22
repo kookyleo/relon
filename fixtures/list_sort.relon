@@ -1,0 +1,64 @@
+// Golden fixture for the `std/list` sort family, exercised end-to-end
+// through the analyzer (strict mode) + the import surface + the
+// tree-walk evaluator + the JSON boundary. Every case here is JSON-safe
+// (no bare NaN / Infinity); the signed-zero / NaN / non-orderable-key
+// edges live in `crates/relon-evaluator/src/sort_tests.rs`, which drives
+// the tree-walk oracle directly.
+
+#import list from "std/list"
+
+{
+    // Ascending / descending by the element itself.
+    "asc": list.sort([
+        3,
+        1,
+        2
+    ]), // [1, 2, 3]
+    "desc": list.sort_desc([
+        1,
+        3,
+        2
+    ]), // [3, 2, 1]
+    // Already-sorted and reverse-sorted inputs round-trip.
+    "already": list.sort([
+        1,
+        2,
+        3
+    ]), // [1, 2, 3]
+    "reverse": list.sort([
+        3,
+        2,
+        1
+    ]), // [1, 2, 3]
+    // String keys sort by Unicode code point: 'A'=0x41 < 'Z'=0x5A <
+    // 'a'=0x61, so uppercase precedes lowercase (no case folding).
+    "strings": list.sort([
+        "a",
+        "Z",
+        "b",
+        "A"
+    ]), // ["A", "Z", "a", "b"]
+    // Key-closure sort: bucket by integer-divided decade. Keys tie
+    // (10 and 11 share key 1; 20 and 21 share key 2) so this also pins
+    // stability — equal-key elements keep their input order.
+    "by_key_asc": list.sort_by([
+        10,
+        20,
+        11,
+        21
+    ], (x) => x / 10), // [10, 11, 20, 21]
+    // Descending is NOT reverse(ascending): the key-2 bucket comes
+    // first but 20 still precedes 21 (ties stay in input order). A
+    // reverse of the ascending result would instead be [21,20,11,10].
+    "by_key_desc": list.sort_by_desc([
+        10,
+        20,
+        11,
+        21
+    ], (x) => x / 10), // [20, 21, 10, 11]
+    // Empty and single-element lists return as-is.
+    "empty": list.sort([]),
+    "single": list.sort([
+        42
+    ])
+}
