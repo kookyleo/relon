@@ -25,7 +25,8 @@ nothing extra.
 
 ## Stable user API manifest
 
-This table is the first-release public stdlib surface. Module rows name
+This table is the stable public stdlib surface (frozen at first release,
+grown only by deliberate, reviewed additions). Module rows name
 the module path and exported member; users may choose any import alias
 in source, but the stable API is the `std/<module>` export.
 
