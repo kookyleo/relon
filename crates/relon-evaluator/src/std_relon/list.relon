@@ -19,5 +19,14 @@
     first(l): l[0],
     last(l): l[_len(l) - 1],
     compact(l): l | _list_filter((x) => x != None),
-    flatten(l): l | _list_reduce([], (acc, x) => [...acc, ...x])
+    flatten(l): l | _list_reduce([], (acc, x) => [...acc, ...x]),
+    // Stable sort family. `sort` / `sort_desc` sort by the element
+    // itself; `sort_by` / `sort_by_desc` sort by a key closure. Keys
+    // must be a homogeneous orderable scalar (Int/Float/String/Bool);
+    // `sort_desc` keeps equal-key elements in input order (it is NOT
+    // `reverse(sort(...))`).
+    sort(l): _list_sort_by(l, (x) => x),
+    sort_by(l, k): _list_sort_by(l, k),
+    sort_desc(l): _list_sort_by_desc(l, (x) => x),
+    sort_by_desc(l, k): _list_sort_by_desc(l, k)
 }

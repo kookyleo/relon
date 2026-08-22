@@ -40,6 +40,10 @@ Relon 标准库是**语言的一部分**——下列模块随运行时一起发�
 | `std/list.last` | `forall T: (list: List[T]) -> T` | list 模块 | stable portable | 空列表抛 index/list 错误。 |
 | `std/list.compact` | `forall T: (list: List[T]) -> List[T]` | list 模块 | stable portable | 移除 `None` 元素。 |
 | `std/list.flatten` | `forall T: (list: List[List[T]]) -> List[T]` | list 模块 | stable portable | 非列表元素抛类型错误。 |
+| `std/list.sort` | `forall T: (list: List[T]) -> List[T]` | list 模块 | stable portable（Int/Float）；String/Bool 仅 tree-walk | 按元素稳定升序排序；键必须是同型可排序标量（混型/非标量键抛类型错误）。 |
+| `std/list.sort_by` | `forall T, K: (list: List[T], key: Closure[(T) -> K]) -> List[T]` | list 模块 | stable portable（Int/Float 键）；String 键仅 tree-walk | 按键闭包稳定升序排序；键必须是同型可排序标量。 |
+| `std/list.sort_desc` | `forall T: (list: List[T]) -> List[T]` | list 模块 | stable portable（Int/Float）；String/Bool 仅 tree-walk | 稳定降序排序；等键并列保持输入原序（不等于 `reverse(sort(...))`）。 |
+| `std/list.sort_by_desc` | `forall T, K: (list: List[T], key: Closure[(T) -> K]) -> List[T]` | list 模块 | stable portable（Int/Float 键）；String 键仅 tree-walk | 按键闭包稳定降序排序；等键并列保持输入原序。 |
 | `std/dict.merge` | `forall V: (base: Dict[String, V], overlay: Dict[String, V]) -> Dict[String, V]` | dict 模块 | stable portable | overlay key 覆盖 base key。 |
 | `std/dict.keys` | `forall V: (dict: Dict[String, V]) -> List[String]` | dict 模块 | stable portable | 返回确定性的 map 顺序。 |
 | `std/dict.values` | `forall V: (dict: Dict[String, V]) -> List[V]` | dict 模块 | stable portable | 顺序与 `std/dict.keys` 一致。 |
@@ -83,6 +87,8 @@ callable 契约。记录它们是为了让实现保持一致；用户代码应�
 | `_list_filter` | `forall T: (list: List[T], f: Closure[(T) -> Bool]) -> List[T]` | backing intrinsic | portable internal | predicate 必须返回 `Bool`；closure 错误会终止调用。 |
 | `_list_reduce` | `forall T, U: (list: List[T], init: U, f: Closure[(U, T) -> U]) -> U` | backing intrinsic | portable internal | closure 错误会终止调用。 |
 | `_list_contains` | `forall T: (list: List[T], needle: T) -> Bool` | backing intrinsic | portable internal | 使用 Relon 值相等语义。 |
+| `_list_sort_by` | `forall T, K: (list: List[T], key: Closure[(T) -> K]) -> List[T]` | backing intrinsic | portable internal（Int/Float 键）；String 键仅 tree-walk | 稳定自底向上归并排序，升序；键必须是同型可排序标量。 |
+| `_list_sort_by_desc` | `forall T, K: (list: List[T], key: Closure[(T) -> K]) -> List[T]` | backing intrinsic | portable internal（Int/Float 键）；String 键仅 tree-walk | 稳定自底向上归并排序，降序；等键并列保持输入原序。 |
 | `_string_split` | `(s: String, sep: String) -> List[String]` | backing intrinsic | portable internal | 字节级字符串语义。 |
 | `_string_join` | `forall T: (list: List[T], sep: String) -> String` | backing intrinsic | portable internal | 元素按 Relon 值格式渲染。 |
 | `_string_replace` | `(s: String, from: String, to: String) -> String` | backing intrinsic | portable internal | 字节级字符串语义。 |
@@ -165,7 +171,11 @@ builtin。这保证语言本身始终是纯函数 —— 同输入必同输出�
     Int head: list.first([10, 20, 30]),               // 10
     Int tail: list.last([10, 20, 30]),                // 30
     List<Int> compact_empty: list.compact([None]),    // []
-    List<Int> flat: list.flatten([[1, 2], [3]])       // [1, 2, 3]
+    List<Int> flat: list.flatten([[1, 2], [3]]),      // [1, 2, 3]
+    List<Int> sorted: list.sort([3, 1, 2]),           // [1, 2, 3]
+    List<String> by_len:
+        list.sort_by(["ccc", "a", "bb"], (String s) -> Int => list.len(s)), // ["a", "bb", "ccc"]
+    List<Int> desc: list.sort_desc([1, 3, 2])         // [3, 2, 1]
 }
 ```
 

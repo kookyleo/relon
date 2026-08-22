@@ -219,6 +219,47 @@ fn build_list() -> HashMap<String, FnSignature> {
         vec![param("l", list_of(list_of(tvar("T"))))],
         list_of(tvar("T")),
     ));
+    // sort(l): `<T>(List<T>) -> List<T>` — sorts by the element itself.
+    ins(sig(
+        "sort",
+        &["T"],
+        vec![param("l", list_of(tvar("T")))],
+        list_of(tvar("T")),
+    ));
+    // sort_by(l, k): `<T, K>(List<T>, Closure<(T) -> K>) -> List<T>` —
+    // the key type does not surface; the element type is preserved.
+    ins(sig(
+        "sort_by",
+        &["T", "K"],
+        vec![
+            param("l", list_of(tvar("T"))),
+            param(
+                "k",
+                type_node_generic("Closure", vec![tvar("T"), tvar("K")]),
+            ),
+        ],
+        list_of(tvar("T")),
+    ));
+    // sort_desc(l): `<T>(List<T>) -> List<T>` — descending by element.
+    ins(sig(
+        "sort_desc",
+        &["T"],
+        vec![param("l", list_of(tvar("T")))],
+        list_of(tvar("T")),
+    ));
+    // sort_by_desc(l, k): `<T, K>(List<T>, Closure<(T) -> K>) -> List<T>`.
+    ins(sig(
+        "sort_by_desc",
+        &["T", "K"],
+        vec![
+            param("l", list_of(tvar("T"))),
+            param(
+                "k",
+                type_node_generic("Closure", vec![tvar("T"), tvar("K")]),
+            ),
+        ],
+        list_of(tvar("T")),
+    ));
     m
 }
 

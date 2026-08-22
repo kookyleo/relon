@@ -30,10 +30,14 @@ pub fn register_to(ctx: &mut Context) {
     // and the `List.contains` method both dispatch to that closure.
     let list_contains: Arc<dyn RelonFunction> =
         Arc::new(RelonSourcedFn::new(StdModule::List, "contains"));
+    let list_sort_by: Arc<dyn RelonFunction> = Arc::new(ListSortBy);
+    let list_sort_by_desc: Arc<dyn RelonFunction> = Arc::new(ListSortByDesc);
     ctx.register_pure_fn("_list_map", Arc::clone(&list_map));
     ctx.register_pure_fn("_list_filter", Arc::clone(&list_filter));
     ctx.register_pure_fn("_list_reduce", Arc::clone(&list_reduce));
     ctx.register_pure_fn("_list_contains", Arc::clone(&list_contains));
+    ctx.register_pure_fn("_list_sort_by", Arc::clone(&list_sort_by));
+    ctx.register_pure_fn("_list_sort_by_desc", Arc::clone(&list_sort_by_desc));
 
     let string_split: Arc<dyn RelonFunction> = Arc::new(StringSplit);
     let string_join: Arc<dyn RelonFunction> = Arc::new(StringJoin);
@@ -385,6 +389,215 @@ impl RelonFunction for ListReduce {
             acc = caps.call_relon(func, vec![acc, item.clone()], range)?;
         }
         Ok(acc)
+    }
+}
+
+/// Sort direction for the `_list_sort_by{,_desc}` intrinsics.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortDir {
+    Asc,
+    Desc,
+}
+
+/// Total preorder on sort keys, shared by every backend (contract
+/// `sort-contract.md` §"Total preorder on keys"). The equivalence
+/// classes are EXACTLY Relon value-equality (`==`): `-0.0 == +0.0`,
+/// every `NaN == NaN`, but `1 == 1.0` is false (Int and Float are
+/// disjoint orders — mixing them is a loud error, never a silent
+/// widen).
+///
+/// Keys must be a homogeneous orderable scalar (`Int` / `Float` /
+/// `String` / `Bool`). Any other key type — or a mix of two scalar
+/// types — raises a `RuntimeError` the first time two such keys meet
+/// in a merge comparison. Because a length-0 / length-1 list performs
+/// no comparison, a single-element list with a non-orderable key
+/// returns as-is and never errors (contract §"Non-orderable / mixed
+/// keys").
+fn compare_sort_keys(
+    a: &Value,
+    b: &Value,
+    range: relon_parser::TokenRange,
+) -> Result<std::cmp::Ordering, RuntimeError> {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => Ok(x.cmp(y)),
+        // `false < true`.
+        (Value::Bool(x), Value::Bool(y)) => Ok(x.cmp(y)),
+        // Unicode scalar-value (code point) order. For well-formed
+        // UTF-8, `str::cmp` (byte-wise) already equals code-point order,
+        // so `"Z" < "a"`. No locale / collation.
+        (Value::String(x), Value::String(y)) => Ok(x.as_str().cmp(y.as_str())),
+        (Value::Float(x), Value::Float(y)) => Ok(compare_sort_floats(x.0, y.0)),
+        _ => Err(RuntimeError::TypeMismatch {
+            expected: "sort key must be a homogeneous orderable scalar (Int, Float, String, or \
+                       Bool)"
+                .to_string(),
+            found: format!("{} vs {}", a.type_name(), b.type_name()),
+            range,
+        }),
+    }
+}
+
+/// Float key order: `-inf < … < -0.0 == +0.0 < … < +inf < NaN`.
+///
+/// Two deliberate departures from `OrderedFloat::total_cmp`, both
+/// pinned by the contract so the compiled merge-sort body byte-matches:
+///   * `-0.0` and `+0.0` collapse to EQUAL (`total_cmp` splits them).
+///     We fold any zero to `+0.0` before comparing; stability then
+///     decides their relative order.
+///   * every `NaN` is EQUAL to every other `NaN` and sorts AFTER
+///     `+inf` (spec §2.3: "In sorts, NaN is greater than every
+///     non-NaN"). `total_cmp` would instead order NaNs by sign/payload
+///     bits.
+fn compare_sort_floats(x: f64, y: f64) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    // `x == 0.0` is true for both `+0.0` and `-0.0`, so this folds the
+    // negative zero onto the positive representative before comparison.
+    let xn = if x == 0.0 { 0.0 } else { x };
+    let yn = if y == 0.0 { 0.0 } else { y };
+    match (xn.is_nan(), yn.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        // Neither is NaN, so `partial_cmp` is total over the remaining
+        // finite / ±inf domain.
+        (false, false) => xn
+            .partial_cmp(&yn)
+            .expect("non-NaN floats are totally ordered"),
+    }
+}
+
+/// Merge two adjacent runs `src[left..mid]` and `src[mid..right]` into
+/// `dst[left..right]`, comparing the decorated `keys`. Stable: on an
+/// equal-key comparison the LEFT run's head wins, and because indices
+/// enter in ascending order the lower original index stays first.
+///
+/// `asc` takes the left head when `key[left] <= key[right]`; `desc`
+/// takes the left head when `key[left] >= key[right]`. Comparisons are
+/// native work and are NOT charged to `max_steps`.
+#[allow(clippy::too_many_arguments)]
+fn merge_sort_runs(
+    src: &[usize],
+    dst: &mut [usize],
+    left: usize,
+    mid: usize,
+    right: usize,
+    keys: &[Value],
+    dir: SortDir,
+    range: relon_parser::TokenRange,
+) -> Result<(), RuntimeError> {
+    use std::cmp::Ordering;
+    let (mut a, mut b, mut k) = (left, mid, left);
+    while a < mid && b < right {
+        let ord = compare_sort_keys(&keys[src[a]], &keys[src[b]], range)?;
+        let take_left = match dir {
+            // left <= right
+            SortDir::Asc => ord != Ordering::Greater,
+            // left >= right
+            SortDir::Desc => ord != Ordering::Less,
+        };
+        if take_left {
+            dst[k] = src[a];
+            a += 1;
+        } else {
+            dst[k] = src[b];
+            b += 1;
+        }
+        k += 1;
+    }
+    while a < mid {
+        dst[k] = src[a];
+        a += 1;
+        k += 1;
+    }
+    while b < right {
+        dst[k] = src[b];
+        b += 1;
+        k += 1;
+    }
+    Ok(())
+}
+
+/// Stable, bottom-up (iterative) merge sort of the indices `0..n` by the
+/// decorated `keys`, ties broken by original index. Pinned as the
+/// shared algorithm in the spec so every backend produces the identical
+/// permutation. Returns the sorted index permutation.
+fn stable_merge_sort_indices(
+    keys: &[Value],
+    dir: SortDir,
+    range: relon_parser::TokenRange,
+) -> Result<Vec<usize>, RuntimeError> {
+    let n = keys.len();
+    let mut idx: Vec<usize> = (0..n).collect();
+    if n <= 1 {
+        return Ok(idx);
+    }
+    let mut buf: Vec<usize> = vec![0usize; n];
+    let mut width = 1usize;
+    while width < n {
+        let mut i = 0usize;
+        while i < n {
+            let left = i;
+            let mid = (i + width).min(n);
+            let right = (i + 2 * width).min(n);
+            merge_sort_runs(&idx, &mut buf, left, mid, right, keys, dir, range)?;
+            i += 2 * width;
+        }
+        std::mem::swap(&mut idx, &mut buf);
+        width *= 2;
+    }
+    Ok(idx)
+}
+
+/// Shared body for `_list_sort_by` / `_list_sort_by_desc`.
+///
+/// decorate → stable-merge → undecorate (contract §"Algorithm"):
+///   1. Decorate: call the key closure once per element in ascending
+///      index order, charging `tick(1)` each (the ONLY budget charge —
+///      merge comparisons are native and uncharged).
+///   2. Sort: stable bottom-up merge sort of the indices by the total
+///      preorder on the keys.
+///   3. Undecorate: reorder the original elements by the permutation.
+fn list_sort_by_impl(
+    args: NativeArgs,
+    range: relon_parser::TokenRange,
+    dir: SortDir,
+) -> Result<Value, RuntimeError> {
+    expect_arg_count(&args.positional, 2, range)?;
+    let list = expect_list(&args.positional[0], range)?;
+    let key = &args.positional[1];
+    let caps = args.caps();
+    let mut keys = Vec::with_capacity(list.len());
+    for item in list {
+        // One tick per decorated element — identical convention to
+        // `_list_map` / `_list_filter`, so budget is predictable from
+        // input length alone.
+        caps.tick(1, range)?;
+        keys.push(caps.call_relon(key, vec![item.clone()], range)?);
+    }
+    let perm = stable_merge_sort_indices(&keys, dir, range)?;
+    let result: Vec<Value> = perm.into_iter().map(|i| list[i].clone()).collect();
+    Ok(Value::list(result))
+}
+
+struct ListSortBy;
+impl RelonFunction for ListSortBy {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        list_sort_by_impl(args, range, SortDir::Asc)
+    }
+}
+
+struct ListSortByDesc;
+impl RelonFunction for ListSortByDesc {
+    fn call(
+        &self,
+        args: NativeArgs,
+        range: relon_parser::TokenRange,
+    ) -> Result<Value, RuntimeError> {
+        list_sort_by_impl(args, range, SortDir::Desc)
     }
 }
 
