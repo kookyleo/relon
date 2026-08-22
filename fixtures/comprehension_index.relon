@@ -1,0 +1,26 @@
+// Pins the `&index` binding inside a list comprehension: it is the
+// SOURCE index (the position in the iterated sequence), NOT the output
+// position after a filter drops elements. This is the semantics issue
+// #4 relies on to justify not shipping a separate `enumerate` — the
+// enumerate-equivalent `(&index, x)` and a filtered `&index` both read
+// the source index directly. The plain-list coverage lives in
+// `fixtures/steps.relon`; this fixture adds the comprehension + filter
+// case that was previously uncovered.
+{
+    src: [
+        10,
+        20,
+        30,
+        40
+    ],
+    // Filter drops the first element; the survivors report their SOURCE
+    // indices [1, 2, 3], not the compacted output positions [0, 1, 2].
+    filtered_index: [
+        &index for x in &sibling.src if x > 10
+    ],
+    // enumerate-equivalent: `(&index, element)` pairs over the whole
+    // source. No filter, so source index == output position here.
+    enumerated: [
+        (&index, x) for x in &sibling.src
+    ]
+}
