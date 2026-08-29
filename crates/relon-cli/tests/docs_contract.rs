@@ -211,11 +211,11 @@ fn public_release_language_is_0_1_not_1_0_or_2_0() {
     let docs_package = std::fs::read_to_string(&docs_package_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", docs_package_path.display()));
     assert!(
-        docs_package.contains(r#""version": "0.1.0-rc2""#),
+        docs_package.contains(r#""version": "0.1.0-rc3""#),
         "docs/package.json must not imply a 1.0 docs package for the first public release"
     );
     assert!(
-        docs_package.contains(r#""description": "Documentation for Relon 0.1 RC2""#),
+        docs_package.contains(r#""description": "Documentation for Relon 0.1 RC3""#),
         "docs/package.json description must match the 0.1 RC release posture"
     );
     assert!(
@@ -227,12 +227,12 @@ fn public_release_language_is_0_1_not_1_0_or_2_0() {
     let docs_lock = std::fs::read_to_string(&docs_lock_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", docs_lock_path.display()));
     assert!(
-        docs_lock.starts_with("{\n  \"name\": \"relon-docs\",\n  \"version\": \"0.1.0-rc2\""),
+        docs_lock.starts_with("{\n  \"name\": \"relon-docs\",\n  \"version\": \"0.1.0-rc3\""),
         "docs/package-lock.json top-level relon-docs version must mirror docs/package.json"
     );
     assert!(
         docs_lock
-            .contains("\"\": {\n      \"name\": \"relon-docs\",\n      \"version\": \"0.1.0-rc2\""),
+            .contains("\"\": {\n      \"name\": \"relon-docs\",\n      \"version\": \"0.1.0-rc3\""),
         "docs/package-lock.json root package version must mirror docs/package.json"
     );
 

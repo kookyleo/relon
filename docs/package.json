@@ -1,7 +1,7 @@
 {
   "name": "relon-docs",
-  "version": "0.1.0-rc2",
-  "description": "Documentation for Relon 0.1 RC2",
+  "version": "0.1.0-rc3",
+  "description": "Documentation for Relon 0.1 RC3",
   "private": true,
   "scripts": {
     "docs:dev": "vitepress dev",

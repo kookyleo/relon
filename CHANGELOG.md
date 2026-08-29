@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.1.0-rc3] — 2026-08-29
+
+This release candidate rolls up the language, host API, security, and
+tooling work completed since rc2.
+
+### Language and host fixes
+
+- Disambiguate list literals in ternary branches from optional indexing.
+- Preserve index and field segments during static type inference, including
+  postfix access on function-call results.
+- Expose one type-directed JSON decoder through the `relon` facade and use it
+  consistently from the CLI and WASM hosts.
+- Add the stable `list.sort*`, `take`, `slice`, and `zip` families.
+
+### Hardening and tooling
+
+- Tighten strict analysis, capability enforcement, remote-import handling,
+  object-cache integrity, parser depth limits, and top-level evaluator runs.
+- Split the backend ABI and evaluator traits into narrower public contracts.
+- Add JSON diagnostics and formatter integration to the CLI and LSP.
+- Upgrade Rust and documentation dependencies to patched releases; both
+  `cargo audit` and `npm audit` report zero known vulnerabilities.
+
 ## [0.1.0-rc2] — 2026-06-11
 
 This release track narrows the public contract before the first public
