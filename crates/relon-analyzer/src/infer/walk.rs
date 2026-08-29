@@ -22,7 +22,7 @@
 //! their qualified form.
 
 use super::{infer_from_type_node_with_imports, is_known_builtin_alt, InferredType, TypeScope};
-use relon_parser::{TokenKey, TypeNode};
+use relon_parser::{Expr, TokenKey, TypeNode};
 use std::collections::HashMap;
 
 pub(crate) fn path_segments(path: &[TokenKey]) -> Vec<String> {
@@ -38,9 +38,11 @@ pub(crate) fn path_segments(path: &[TokenKey]) -> Vec<String> {
 }
 
 /// v1.8 tuple-position access: walker-friendly view of a path that
-/// preserves Index segments alongside named ones. Stops at the
-/// first segment we can't statically classify (`Dynamic` /
-/// `Spread`).
+/// preserves Index segments alongside named ones. Bracket accesses
+/// arrive from the parser as `TokenKey::Dynamic` even when their key
+/// is a literal, so integer and string literals are promoted back to
+/// static walk segments here. Stops at the first segment we genuinely
+/// can't classify (`items[i]`, spreads, and other computed keys).
 #[derive(Debug, Clone)]
 enum WalkSeg {
     Name(String),
@@ -53,6 +55,16 @@ fn walk_segments(path: &[TokenKey]) -> Vec<WalkSeg> {
         match seg {
             TokenKey::String(s, _, _) => out.push(WalkSeg::Name(s.clone())),
             TokenKey::Index(i, _) => out.push(WalkSeg::Index(*i)),
+            TokenKey::Dynamic(node, _) => match &*node.expr {
+                Expr::Int(i) => {
+                    let Ok(index) = usize::try_from(*i) else {
+                        break;
+                    };
+                    out.push(WalkSeg::Index(index));
+                }
+                Expr::String(s) => out.push(WalkSeg::Name(s.clone())),
+                _ => break,
+            },
             _ => break,
         }
     }
@@ -329,6 +341,15 @@ pub(crate) fn walk_path(path: &[TokenKey], scope: &TypeScope) -> PathTailOutcome
                     };
                 };
                 let Some(field_ty) = fields.get(name) else {
+                    // A bracket string (`value["key"]`) is also the
+                    // dispatch surface for user-defined Indexable
+                    // schemas. If it is not a declared record field,
+                    // leave the result to the dedicated index-method
+                    // checker/runtime instead of treating it like a
+                    // misspelled `.field` access.
+                    if matches!(path.get(at_segment), Some(TokenKey::Dynamic(_, _))) {
+                        return PathTailOutcome::Resolved(InferredType::Schema(schema_name));
+                    }
                     return PathTailOutcome::UnknownStep {
                         at_segment,
                         running_name: schema_name,
@@ -390,6 +411,14 @@ pub(crate) fn walk_path(path: &[TokenKey], scope: &TypeScope) -> PathTailOutcome
             }
             (InferredType::Schema(schema_name), WalkSeg::Index(i)) => {
                 let Some(elements) = schema_tuple_elements(scope, &schema_name) else {
+                    // Numeric bracket access on a non-tuple schema may
+                    // dispatch through an `index()` witness. Static
+                    // tuple-position syntax (`value.0`) still reports a
+                    // hard unknown step; only parser-Dynamic `[0]`
+                    // defers to Indexable handling.
+                    if matches!(path.get(at_segment), Some(TokenKey::Dynamic(_, _))) {
+                        return PathTailOutcome::Resolved(InferredType::Schema(schema_name));
+                    }
                     return PathTailOutcome::UnknownStep {
                         at_segment,
                         running_name: schema_name,

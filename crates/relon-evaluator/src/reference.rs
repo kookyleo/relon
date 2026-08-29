@@ -201,15 +201,26 @@ impl TreeWalkEvaluator {
             ));
         }
         let first = &path[0];
-        let first_name = first.to_string_key();
-        let mut current_val = if let Some(val) = scope.get_local(&first_name) {
-            val
-        } else if let Some(thunk) = scope.get_thunk(&first_name) {
-            self.force_thunk(&thunk)?
-        } else if let Some(value) = prelude_unit_variant(path) {
-            return Ok(value);
+        // A postfix chain may start from an arbitrary expression rather
+        // than a named binding: `make().field`, `all()[0]`, or
+        // `({ a: 1 }).a`. CST lowering represents that receiver as a
+        // Dynamic token in the first path slot. It is a *value source*,
+        // not a dynamic lookup key, so evaluate it before walking the
+        // remaining segments.
+        let (first_name, mut current_val) = if let TokenKey::Dynamic(receiver, _) = first {
+            ("<value>".to_string(), self.eval(receiver, scope)?)
         } else {
-            return Err(RuntimeError::VariableNotFound(first_name, range));
+            let first_name = first.to_string_key();
+            let current_val = if let Some(val) = scope.get_local(&first_name) {
+                val
+            } else if let Some(thunk) = scope.get_thunk(&first_name) {
+                self.force_thunk(&thunk)?
+            } else if let Some(value) = prelude_unit_variant(path) {
+                return Ok(value);
+            } else {
+                return Err(RuntimeError::VariableNotFound(first_name, range));
+            };
+            (first_name, current_val)
         };
         // Fast path: single-segment variable references (`x`, the
         // dominant shape in comprehension bodies) don't need the

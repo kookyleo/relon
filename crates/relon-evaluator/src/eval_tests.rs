@@ -2347,6 +2347,93 @@ fn run_main_with_multiple_params() {
 }
 
 #[test]
+fn postfix_access_on_call_result_evaluates_receiver_first() {
+    use std::collections::{BTreeMap, HashMap};
+
+    let source = r#"
+#schema Item { String id: *, Int n: * }
+#main(Item item, List<Item> items)
+{
+    #internal
+    Item echo(): item,
+    List<Item> all(): items,
+    field: echo().id,
+    indexed: all()[0].id
+}
+"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    assert!(
+        analyzed.diagnostics.is_empty(),
+        "unexpected analyzer diagnostics: {:?}",
+        analyzed.diagnostics
+    );
+
+    let mut item = BTreeMap::new();
+    item.insert("id".to_string(), Value::String("a".into()));
+    item.insert("n".to_string(), Value::Int(1));
+    let item = Value::dict(item);
+    let mut args = HashMap::new();
+    args.insert("item".to_string(), item.clone());
+    args.insert("items".to_string(), Value::list(vec![item]));
+
+    let ctx = Context::new()
+        .with_root(node)
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let result = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }))
+    .run_main(&std::sync::Arc::new(Scope::default()), args)
+    .unwrap();
+
+    let Value::Dict(d) = result else { panic!() };
+    assert_eq!(d.map.get("field"), Some(&Value::String("a".into())));
+    assert_eq!(d.map.get("indexed"), Some(&Value::String("a".into())));
+}
+
+#[test]
+fn run_main_ternary_can_return_list_literals_without_parentheses() {
+    let source = r#"
+#main(Bool flag)
+{
+    #internal
+    List<Int> picked:
+        flag ? [1, 2]:
+        [3],
+    out: picked
+}
+"#;
+    let node = parse_doc(source);
+    let analyzed = std::sync::Arc::new(relon_analyzer::analyze(&node));
+    assert!(
+        analyzed.diagnostics.is_empty(),
+        "unexpected analyzer diagnostics: {:?}",
+        analyzed.diagnostics
+    );
+    let ctx = Context::new()
+        .with_root(node)
+        .with_analyzed(std::sync::Arc::clone(&analyzed));
+    let evaluator = TreeWalkEvaluator::new(std::sync::Arc::new({
+        let mut ctx = ctx;
+        crate::TreeWalkEvaluator::prepare_in_place(&mut ctx);
+        ctx
+    }));
+
+    for (flag, expected) in [(true, vec![1, 2]), (false, vec![3])] {
+        let mut args = HashMap::new();
+        args.insert("flag".to_string(), Value::Bool(flag));
+        let result = evaluator
+            .run_main(&std::sync::Arc::new(Scope::default()), args)
+            .expect("run main");
+        let Value::Dict(dict) = result else { panic!() };
+        let expected = Value::list(expected.into_iter().map(Value::Int).collect::<Vec<_>>());
+        assert_eq!(dict.map.get("out"), Some(&expected));
+    }
+}
+
+#[test]
 fn run_main_missing_arg_errors() {
     // Host fails to push a value for a declared parameter — surface a
     // `MissingMainArg` immediately.

@@ -1087,6 +1087,37 @@ fn variant_payload_fields(
     None
 }
 
+fn infer_variable_path(path: &[TokenKey], scope: &TypeScope) -> Option<InferredType> {
+    if let Some(TokenKey::Dynamic(receiver, _)) = path.first() {
+        let receiver_ty = infer_type(receiver, scope)?;
+        if path.len() == 1 {
+            return Some(receiver_ty);
+        }
+
+        // Reuse the regular path walker by binding the already-inferred
+        // receiver type to a parser-impossible synthetic local. This keeps
+        // schema fields, list/tuple indexes, imported schema metadata, and
+        // optional unwrapping on exactly the same code path as named
+        // receivers while supporting `call().field` / `call()[i]`.
+        const RECEIVER: &str = "\0postfix_receiver";
+        let mut locals = HashMap::new();
+        locals.insert(RECEIVER.to_string(), receiver_ty);
+        let receiver_scope = scope.child_with_locals(locals);
+        let mut synthetic_path = Vec::with_capacity(path.len());
+        synthetic_path.push(TokenKey::String(
+            RECEIVER.to_string(),
+            Default::default(),
+            false,
+        ));
+        synthetic_path.extend(path[1..].iter().cloned());
+        return infer_path_inferred(&synthetic_path, &receiver_scope);
+    }
+
+    prelude_unit_variant_type(path)
+        .or_else(|| user_enum_variant_type(path, scope))
+        .or_else(|| infer_path_inferred(path, scope))
+}
+
 /// Infer the static type of `node` under `scope`. Returns `None` for
 /// expressions whose result depends on runtime computation we can't
 /// statically classify (FnCall without a known signature, fully
@@ -1199,9 +1230,7 @@ pub(crate) fn infer_type(node: &Node, scope: &TypeScope) -> Option<InferredType>
             }
             Some(joined)
         }
-        Expr::Variable(path) => prelude_unit_variant_type(path)
-            .or_else(|| user_enum_variant_type(path, scope))
-            .or_else(|| infer_path_inferred(path, scope)),
+        Expr::Variable(path) => infer_variable_path(path, scope),
         Expr::Reference { base, path } => infer_reference(base, path, node, scope),
         Expr::Closure {
             params,

@@ -202,6 +202,56 @@ impl<'a> Parser<'a> {
         self.current().is_none()
     }
 
+    /// Whether the current `?` starts optional path access.
+    ///
+    /// `?.` is unambiguous, but `?[` competes with a ternary whose
+    /// then-branch is a list literal (`cond ? [a] : [b]`). Look ahead
+    /// for a top-level `:` before the surrounding expression boundary;
+    /// when one exists, the question mark is the ternary head. This
+    /// keeps both compact/spaced optional indexes (`a?[0]`, `a ?[0]`)
+    /// and whitespace-insensitive ternary lists (`a?[0]:[1]`).
+    fn at_optional_path_prefix(&self) -> bool {
+        if !self.at(SyntaxKind::QUESTION) {
+            return false;
+        }
+        match self.nth(1) {
+            Some(SyntaxKind::DOT) => true,
+            Some(SyntaxKind::L_BRACK) => !self.question_heads_ternary_list(),
+            _ => false,
+        }
+    }
+
+    fn question_heads_ternary_list(&self) -> bool {
+        let mut idx = self.pos_skip_trivia() + 1;
+        let (mut square, mut round, mut brace) = (0usize, 0usize, 0usize);
+        while idx < self.tokens.len() {
+            let kind = self.tokens[idx].0;
+            idx += 1;
+            if kind.is_trivia() {
+                continue;
+            }
+            match kind {
+                SyntaxKind::L_BRACK => square += 1,
+                SyntaxKind::L_PAREN => round += 1,
+                SyntaxKind::L_BRACE => brace += 1,
+                SyntaxKind::R_BRACK if square > 0 => square -= 1,
+                SyntaxKind::R_PAREN if round > 0 => round -= 1,
+                SyntaxKind::R_BRACE if brace > 0 => brace -= 1,
+                SyntaxKind::COLON if square == 0 && round == 0 && brace == 0 => return true,
+                SyntaxKind::COMMA
+                | SyntaxKind::R_BRACK
+                | SyntaxKind::R_PAREN
+                | SyntaxKind::R_BRACE
+                    if square == 0 && round == 0 && brace == 0 =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     // ----- consumption --------------------------------------------------
 
     /// Emit any pending trivia tokens to the builder. Trivia tokens
@@ -981,8 +1031,7 @@ impl<'a> Parser<'a> {
             // Guard: don't claim a ternary on `?.` / `?[`. Those forms
             // belong to path access and are handled (or rejected) by the
             // atom layer; consuming `?` here would steal the prefix.
-            let next = self.nth(1);
-            if !matches!(next, Some(SyntaxKind::DOT) | Some(SyntaxKind::L_BRACK)) {
+            if !self.at_optional_path_prefix() {
                 self.open_at(ck, SyntaxKind::TERNARY_EXPR);
                 self.bump(); // ?
                 self.parse_expr();
@@ -1223,11 +1272,7 @@ impl<'a> Parser<'a> {
                 self.close();
             } else if self.at(SyntaxKind::DOT)
                 || self.at(SyntaxKind::L_BRACK)
-                || (self.at(SyntaxKind::QUESTION)
-                    && matches!(
-                        self.nth(1),
-                        Some(SyntaxKind::DOT) | Some(SyntaxKind::L_BRACK)
-                    ))
+                || self.at_optional_path_prefix()
             {
                 // Path access — fold into VARIABLE_EXPR so dotted
                 // paths like `a.b.c` end up as a single node. v1.8
@@ -1238,11 +1283,7 @@ impl<'a> Parser<'a> {
                 // marks the segment as optional.
                 self.open_at(ck, SyntaxKind::VARIABLE_EXPR);
                 loop {
-                    let is_optional_prefix = self.at(SyntaxKind::QUESTION)
-                        && matches!(
-                            self.nth(1),
-                            Some(SyntaxKind::DOT) | Some(SyntaxKind::L_BRACK)
-                        );
+                    let is_optional_prefix = self.at_optional_path_prefix();
                     if is_optional_prefix {
                         self.bump(); // ?
                     } else if !self.at(SyntaxKind::DOT) && !self.at(SyntaxKind::L_BRACK) {
@@ -2231,12 +2272,7 @@ impl<'a> Parser<'a> {
         loop {
             // `?.` and `?[` — eat the `?` prefix first, then fall
             // through to the regular dot / bracket handling.
-            if self.at(SyntaxKind::QUESTION)
-                && matches!(
-                    self.nth(1),
-                    Some(SyntaxKind::DOT) | Some(SyntaxKind::L_BRACK)
-                )
-            {
+            if self.at_optional_path_prefix() {
                 self.bump(); // ?
             } else if !self.at(SyntaxKind::DOT) && !self.at(SyntaxKind::L_BRACK) {
                 break;
@@ -3292,6 +3328,55 @@ mod tests {
             .filter(|n| n.kind() == SyntaxKind::TERNARY_EXPR)
             .collect();
         assert_eq!(ts.len(), 1, "expected one TERNARY_EXPR");
+    }
+
+    #[test]
+    fn list_literal_in_each_ternary_branch_parses() {
+        for source in [
+            "{ x: flag ? [1, 2] : [3] }",
+            "{ x: flag ? [7] : [3] }",
+            "{ x: flag ?\n  [1, 2] :\n  [3] }",
+        ] {
+            let parsed = parse_round_trip(source);
+            assert!(
+                !parsed.has_errors(),
+                "unexpected errors for {source:?}: {:?}",
+                parsed.errors
+            );
+            let ternaries = parsed
+                .syntax()
+                .descendants()
+                .filter(|n| n.kind() == SyntaxKind::TERNARY_EXPR)
+                .count();
+            let lists = parsed
+                .syntax()
+                .descendants()
+                .filter(|n| n.kind() == SyntaxKind::LIST)
+                .count();
+            assert_eq!(ternaries, 1, "expected one ternary for {source:?}");
+            assert_eq!(lists, 2, "expected two list branches for {source:?}");
+        }
+    }
+
+    #[test]
+    fn optional_index_and_ternary_list_are_structurally_disambiguated() {
+        for source in ["{ x: items?[0] }", "{ x: items ?[0] }"] {
+            let optional = parse_round_trip(source);
+            assert!(
+                !optional.has_errors(),
+                "optional index regressed for {source:?}: {:?}",
+                optional.errors
+            );
+        }
+
+        for source in ["{ x: flag ? [0] : [1] }", "{ x: flag?[0]:[1] }"] {
+            let ternary = parse_round_trip(source);
+            assert!(
+                !ternary.has_errors(),
+                "ternary list misparsed for {source:?}: {:?}",
+                ternary.errors
+            );
+        }
     }
 
     #[test]

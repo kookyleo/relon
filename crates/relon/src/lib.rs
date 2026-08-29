@@ -4,7 +4,8 @@
 //!
 //! Hosts open the box through the typed surface exposed here:
 //! [`from_str`] / [`from_file`] (+ their `_trusted` / `value_` /
-//! `json_` variants), [`EvaluatorBuilder`], [`Backend`],
+//! `json_` variants), [`decode_main_args`] / [`decode_json_for_type`]
+//! for type-directed host input, [`EvaluatorBuilder`], [`Backend`],
 //! [`TrustLevel`], per-bit capability grants ([`CapabilityBit`] /
 //! [`NativeFnGate`]), the [`Projector`] trait, and the canonical
 //! [`Value`] / [`Scope`] / [`RuntimeError`] re-exports below.
@@ -27,6 +28,7 @@
 
 pub mod auto_evaluator;
 pub mod builder;
+pub mod json_decode;
 pub mod projector;
 
 use relon_analyzer::{
@@ -48,6 +50,7 @@ pub use auto_evaluator::{
     is_trivial_scalar_main, is_trivial_scalar_main_node, AutoEvaluator, DispatchRoute,
 };
 pub use builder::{EvaluatorBuilder, TrustLevel};
+pub use json_decode::{decode_json_for_type, decode_main_args, JsonDecodeError};
 pub use projector::{JsonProjector, Projector};
 // Dart-style canonical AOT entry, re-exported through the facade so
 // hosts can spell `relon::AotEvaluator` without a second crate dep.

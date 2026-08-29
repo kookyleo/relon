@@ -69,6 +69,82 @@ fn flags_static_type_mismatch_on_typed_field() {
 }
 
 #[test]
+fn annotated_binding_uses_static_bracket_index_type() {
+    let tree = analyze_str(
+        r#"
+        #schema Item { String id: *, Int n: * }
+        #main(List<Item> items)
+        {
+            #internal
+            Item first: items[0],
+            String first_id(): items[0].id,
+            out: first.id
+        }
+        "#,
+    );
+    assert!(
+        !tree
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, Diagnostic::StaticTypeMismatch { field, .. }
+                if field == "first" || field == "first_id")),
+        "{:?}",
+        tree.diagnostics
+    );
+}
+
+#[test]
+fn static_bracket_index_reports_the_element_type_on_mismatch() {
+    let tree = analyze_str(
+        r#"
+        #schema Item { String id: *, Int n: * }
+        #main(List<Item> items)
+        { List<Item> wrong: items[0] }
+        "#,
+    );
+    assert!(
+        tree.diagnostics.iter().any(|d| matches!(
+            d,
+            Diagnostic::StaticTypeMismatch {
+                field,
+                expected,
+                found,
+                ..
+            } if field == "wrong" && expected == "List<Item>" && found == "Item"
+        )),
+        "{:?}",
+        tree.diagnostics
+    );
+}
+
+#[test]
+fn annotated_binding_uses_postfix_type_from_call_result() {
+    let tree = analyze_str(
+        r#"
+        #schema Item { String id: *, Int n: * }
+        #main(Item item, List<Item> items)
+        {
+            #internal
+            Item echo(): item,
+            List<Item> all(): items,
+            String field: echo().id,
+            String indexed: all()[0].id,
+            out: field + indexed
+        }
+        "#,
+    );
+    assert!(
+        !tree
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, Diagnostic::StaticTypeMismatch { field, .. }
+                if field == "field" || field == "indexed")),
+        "{:?}",
+        tree.diagnostics
+    );
+}
+
+#[test]
 fn allows_optional_none() {
     let tree = analyze_str(r#"{ Option<Int> port: None }"#);
     let mismatches: Vec<_> = tree
