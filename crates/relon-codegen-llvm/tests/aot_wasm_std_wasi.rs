@@ -269,7 +269,7 @@ fn standard_wasi_clock_runs_under_wasmtime_wasi_host() {
     };
 
     use wasmtime::{Engine, Extern, Linker, Module, Store, Val};
-    use wasmtime_wasi::p1::{self, WasiP1Ctx};
+    use wasmtime_wasi::preview1::{self, WasiP1Ctx};
     use wasmtime_wasi::WasiCtxBuilder;
 
     // A reference reading from the SAME wall clock the WASI host reads,
@@ -283,12 +283,12 @@ fn standard_wasi_clock_runs_under_wasmtime_wasi_host() {
     let module = Module::new(&engine, &bytes).expect("wasmtime Module::new");
 
     // THE PROOF: the import is satisfied by the *standard* wasmtime-wasi
-    // preview1 host — `p1::add_to_linker_sync` wires `clock_time_get` (and the
+    // preview1 host — `preview1::add_to_linker_sync` wires `clock_time_get` (and the
     // rest of WASIp1) against `WasiP1Ctx`. No relon-custom `func_wrap`.
     let wasi: WasiP1Ctx = WasiCtxBuilder::new().build_p1();
     let mut store = Store::new(&engine, wasi);
     let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
-    p1::add_to_linker_sync(&mut linker, |cx| cx).expect("add standard WASIp1 to linker");
+    preview1::add_to_linker_sync(&mut linker, |cx| cx).expect("add standard WASIp1 to linker");
 
     let instance = linker
         .instantiate(&mut store, &module)
